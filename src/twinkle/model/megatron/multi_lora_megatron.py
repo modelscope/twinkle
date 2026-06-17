@@ -26,6 +26,9 @@ from ..multi_lora import MultiLora
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
+from twinkle.utils import get_logger
+
+logger = get_logger()
 
 
 @remote_class(execute='all')
@@ -261,7 +264,7 @@ class MultiLoraMegatronModel(MegatronModel):
 
     def _load_multi_lora_optimizer(self, checkpoint_dir: str, adapter_name: str = '', **kwargs):
         no_load_optim = kwargs.pop('no_load_optim', False)
-        no_load_rng = kwargs.pop('no_load_rng', False)
+        no_load_rng = kwargs.pop('no_load_rng', True)
         optimizer_config = self.optimizer_group.get(adapter_name)
         state_dict = torch.load(self._rank_local_optimizer_path(checkpoint_dir), map_location='cpu', weights_only=False)
 
@@ -277,8 +280,14 @@ class MultiLoraMegatronModel(MegatronModel):
                             group_state[k] = v.to(device)
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+        # RNG state is intentionally not restored in multi-tenant mode:
+        # restoring the global RNG would silently affect other active tenants'
+        # dropout / initialization behaviour.
         if not no_load_rng and 'rng_state' in state_dict:
-            self._load_local_training_rng_state(state_dict['rng_state'])
+            logger.warning(
+                'Skipping RNG state restoration in multi-tenant mode. '
+                'Global RNG is shared across tenants; restoring it would '
+                'affect other active adapters.')
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
@@ -369,6 +378,11 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(adapter_name)
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        if not os.path.isfile(trainer_state_path):
+            raise FileNotFoundError(
+                f'trainer_state.json not found in {checkpoint_dir}. '
+                f'Ensure the checkpoint was saved with save_optimizer=True.')
+
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 
