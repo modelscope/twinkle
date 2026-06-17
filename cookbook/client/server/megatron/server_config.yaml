@@ -38,6 +38,8 @@ applications:
     args:
       server_config:
         per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
+      supported_models:
+        - Qwen/Qwen3.6-27B
 
     deployments:
       - name: TinkerCompatServer
