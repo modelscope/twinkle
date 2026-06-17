@@ -17,6 +17,8 @@ RUN --mount=type=cache,target=/opt/conda/pkgs \
 ENV TWINKLE_PYTHON="/opt/conda/envs/twinkle/bin/python"
 ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
 RUN ${TWINKLE_PYTHON} --version && ${TWINKLE_PYTHON} -m pip --version
+RUN ${TWINKLE_PYTHON} -m pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
+    ${TWINKLE_PYTHON} -m pip config set install.trusted-host mirrors.cloud.aliyuncs.com
 
 ENV SETUPTOOLS_USE_DISTUTILS=local
 
