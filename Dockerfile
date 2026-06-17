@@ -18,7 +18,7 @@ RUN ${TWINKLE_PYTHON} --version && ${TWINKLE_PYTHON} -m pip --version
 ENV SETUPTOOLS_USE_DISTUTILS=local
 
 # Install base packages
-RUN ${TWINKLE_PYTHON} -m pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
+RUN ${TWINKLE_PYTHON} -m pip install --no-cache-dir -U "peft<=0.18" accelerate transformers "modelscope[framework]"
 
 # Install vllm
 RUN ${TWINKLE_PYTHON} -m pip install vllm==0.19.1 --no-cache-dir
@@ -44,7 +44,7 @@ RUN ${TWINKLE_PYTHON} -m pip install flash-linear-attention -U --no-cache-dir
 RUN ${TWINKLE_PYTHON} -m pip install numpy==2.2 --no-cache-dir
 
 # Install tinker, ray, and other deps
-RUN ${TWINKLE_PYTHON} -m pip install --no-cache-dir tinker==0.16.1 "ray[serve]" transformers "peft<=0.18" accelerate -U
+RUN ${TWINKLE_PYTHON} -m pip install --no-cache-dir tinker==0.16.1 "ray[serve]"
 
 # Clone and install twinkle, checkout to latest v-tag
 RUN git clone https://github.com/modelscope/twinkle.git
