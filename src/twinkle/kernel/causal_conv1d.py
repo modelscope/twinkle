@@ -1028,8 +1028,6 @@ class CausalConv1dFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.Tensor] = None,
         output_final_state: bool = False,
     ):
-        if _is_arch35():
-            raise NotImplementedError("causal_conv1d is not supported on arch35")
 
         y, final_state = causal_conv1d_fwd_impl(
             x=x,
@@ -1116,12 +1114,20 @@ def npu_causal_conv1d_fn(
 ):
     """Adapter matching twinkle's ``causal_conv1d_fn`` call signature.
 
-    Bridges between twinkle's [B, T, D] interface and the native [B, T, D] format.
-    Drops ``seq_idx`` and ``backend`` kwargs (not supported by this implementation).
-    Returns single tensor y (not tuple), matching twinkle's existing usage pattern.
+    Bridges between twinkle's (and FLA's) channel‑first [B, D, T] interface
+    and the native NPU kernel's [B, T, D] format.
     """
     del seq_idx, backend
-    y, _ = causal_conv1d(
-        x=x, weight=weight, bias=bias, activation=activation, cu_seqlens=cu_seqlens,
+
+    # Original input shape: x -> (B, D, T), weight -> (D, W)
+    # NPU kernel expects:  x -> (B, T, D), weight -> (W, D)
+    x_t = x.transpose(1, 2).contiguous()          # (B, T, D)
+    weight_t = weight.transpose(0, 1).contiguous() # (W, D)
+
+    y_t, _ = causal_conv1d(
+        x=x_t, weight=weight_t, bias=bias,
+        activation=activation, cu_seqlens=cu_seqlens,
     )
+    # y_t is (B, T, D), transpose back to (B, D, T)
+    y = y_t.transpose(1, 2).contiguous()
     return y
