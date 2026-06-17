@@ -658,7 +658,10 @@ class Template:
         assert self.truncation_strategy != 'split', (
             'encode() does not support truncation_strategy=="split" because it may produce multiple outputs. '
             'Use batch_encode() instead.')
-        return self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)[0]
+        encoded = self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)
+        if encoded:
+            return encoded[0]
+        return None
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
