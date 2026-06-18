@@ -69,8 +69,8 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                     checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
                     adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
-                # Validate adapter URI
-                if not adapter_uri or not os.path.exists(adapter_uri):
+                # Base-model sampling is valid when no model_path was provided.
+                if adapter_uri and not os.path.exists(adapter_uri):
                     return types.RequestFailedResponse(
                         error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
                         category=types.RequestErrorCategory.User,

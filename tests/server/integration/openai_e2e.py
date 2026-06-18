@@ -4,11 +4,10 @@
 # Tests both non-streaming and streaming /v1/chat/completions via OpenAI SDK.
 #
 # Usage:
-#   python -u openai_e2e.py
+#   python -u tests/server/integration/openai_e2e.py
 
 import sys
 import time
-
 from openai import OpenAI
 
 BASE_URL = 'http://127.0.0.1:8000/api/v1'
@@ -31,8 +30,14 @@ def test_non_streaming(client: OpenAI):
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {'role': 'user', 'content': 'What is 2+2? Answer in one word.'},
+            {
+                'role': 'system',
+                'content': 'You are a helpful assistant.'
+            },
+            {
+                'role': 'user',
+                'content': 'What is 2+2? Answer in one word.'
+            },
         ],
         max_tokens=32,
         temperature=0.1,
@@ -56,7 +61,10 @@ def test_streaming(client: OpenAI):
     stream = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {'role': 'user', 'content': 'Count from 1 to 5.'},
+            {
+                'role': 'user',
+                'content': 'Count from 1 to 5.'
+            },
         ],
         max_tokens=64,
         temperature=0.1,
@@ -70,7 +78,8 @@ def test_streaming(client: OpenAI):
         delta = chunk.choices[0].delta
         if delta.content:
             full_content += delta.content
-            print(f'  chunk: {delta.content[:60]!r}...' if len(delta.content or '') > 60 else f'  chunk: {delta.content!r}')
+            print(f'  chunk: {delta.content[:60]!r}...' if len(delta.content or '') >
+                  60 else f'  chunk: {delta.content!r}')
 
     elapsed = time.time() - t0
     print(f'  Total chunks: {len(chunks)}')
@@ -94,10 +103,22 @@ def test_multi_turn(client: OpenAI):
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {'role': 'system', 'content': 'You are a math tutor.'},
-            {'role': 'user', 'content': 'What is 3*7?'},
-            {'role': 'assistant', 'content': '3*7 = 21'},
-            {'role': 'user', 'content': 'Now add 4 to that.'},
+            {
+                'role': 'system',
+                'content': 'You are a math tutor.'
+            },
+            {
+                'role': 'user',
+                'content': 'What is 3*7?'
+            },
+            {
+                'role': 'assistant',
+                'content': '3*7 = 21'
+            },
+            {
+                'role': 'user',
+                'content': 'Now add 4 to that.'
+            },
         ],
         max_tokens=32,
         temperature=0.1,
@@ -128,7 +149,10 @@ def test_sticky_session(base_url: str):
             f'{base_url}/chat/completions',
             json={
                 'model': MODEL,
-                'messages': [{'role': 'user', 'content': f'Say {i}.'}],
+                'messages': [{
+                    'role': 'user',
+                    'content': f'Say {i}.'
+                }],
                 'max_tokens': 5,
                 'temperature': 0.1,
             },
@@ -143,9 +167,7 @@ def test_sticky_session(base_url: str):
     # All requests with same model must hit the same replica
     unique = set(replica_ids)
     assert None not in unique, 'X-Twinkle-Replica-Id header missing from responses'
-    assert len(unique) == 1, (
-        f'Sticky session broken: requests routed to {len(unique)} different replicas: {unique}'
-    )
+    assert len(unique) == 1, (f'Sticky session broken: requests routed to {len(unique)} different replicas: {unique}')
     print(f'  All 5 requests → replica {replica_ids[0]}')
     print('  PASS\n')
 
