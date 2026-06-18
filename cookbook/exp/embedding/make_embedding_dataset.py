@@ -8,7 +8,6 @@ Output schema: {anchor_text, positive_text, negative_texts, source}
 Launch (8 GPUs — 4 for vLLM condenser):
     python cookbook/exp/embedding/make_embedding_dataset.py
 """
-import hashlib
 import json
 import os
 import re
@@ -61,12 +60,11 @@ COMPRESS_API_KEY = os.environ.get('COMPRESS_API_KEY', '')
 COMPRESS_BASE_URL = os.environ.get('COMPRESS_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
 COMPRESS_MODEL = os.environ.get('COMPRESS_MODEL', 'qwen3.7-max')
 API_MIN_INTERVAL = float(os.environ.get('API_MIN_INTERVAL', 0.1))
-API_CONCURRENCY = int(os.environ.get('API_CONCURRENCY', 8))
+API_CONCURRENCY = int(os.environ.get('API_CONCURRENCY', 32))
 SAMPLER_TIMEOUT = float(os.environ.get('SAMPLER_TIMEOUT', 300))
 
 # -- Output -------------------------------------------------------------------
 OUTPUT_DIR = os.environ.get('EMB_DATASET_OUTPUT', './output/embedding_dataset')
-FAILURE_LOG = os.environ.get('FAILURE_LOG', f'{OUTPUT_DIR}/failures.jsonl')
 RESULTS_JSONL = f'{OUTPUT_DIR}/results.jsonl'
 PROGRESS_FILE = f'{OUTPUT_DIR}/progress.json'
 
@@ -243,16 +241,30 @@ def _is_truncated_compression(text: str, schema: str = 'new') -> bool:
     return False
 
 
-_api_throttle_lock = threading.Lock()
-_api_last_call = [0.0]
+_api_semaphore = threading.Semaphore(API_CONCURRENCY)
+_api_bucket_lock = threading.Lock()
+_api_tokens = [float(API_CONCURRENCY)]
+_api_last_refill = [time.monotonic()]
 
 
 def _api_throttle():
-    with _api_throttle_lock:
-        gap = time.monotonic() - _api_last_call[0]
-        if gap < API_MIN_INTERVAL:
-            time.sleep(API_MIN_INTERVAL - gap)
-        _api_last_call[0] = time.monotonic()
+    """Token-bucket rate limiter: API_CONCURRENCY requests per API_MIN_INTERVAL*API_CONCURRENCY window."""
+    _api_semaphore.acquire()
+    try:
+        with _api_bucket_lock:
+            now = time.monotonic()
+            elapsed = now - _api_last_refill[0]
+            refill = elapsed / API_MIN_INTERVAL
+            _api_tokens[0] = min(float(API_CONCURRENCY), _api_tokens[0] + refill)
+            _api_last_refill[0] = now
+            if _api_tokens[0] >= 1.0:
+                _api_tokens[0] -= 1.0
+            else:
+                wait = (1.0 - _api_tokens[0]) * API_MIN_INTERVAL
+                _api_tokens[0] = 0.0
+                time.sleep(wait)
+    finally:
+        _api_semaphore.release()
 
 
 def _api_compress(api_client: OpenAIClient, prompt: Dict[str, Any]) -> Optional[str]:
@@ -271,33 +283,6 @@ def _api_compress(api_client: OpenAIClient, prompt: Dict[str, Any]) -> Optional[
     if m:
         content = m.group(1).strip()
     return content
-
-
-_failure_lock: Optional[PosixFileLock] = None
-
-
-def _log_failure(source_text: str, query: str, compressed: str, row_id: str):
-    global _failure_lock
-    if _failure_lock is None:
-        os.makedirs(os.path.dirname(FAILURE_LOG) or '.', exist_ok=True)
-        _failure_lock = PosixFileLock(FAILURE_LOG + '.lock')
-    qhash = hashlib.md5(query.strip().encode('utf-8')).hexdigest()[:8]
-    record = {
-        'id': f'{row_id}__{qhash}',
-        'source': 'compress_failure',
-        'query': query,
-        'original_len': len(source_text),
-        'compressed_len': len(compressed),
-        'messages': [
-            {'role': 'system', 'content': COMPRESS_SYSTEM},
-            {'role': 'user', 'content': COMPRESS_USER.format(query=query, text=source_text)},
-            {'role': 'assistant', 'content': compressed},
-        ],
-    }
-    line = json.dumps(record, ensure_ascii=False, default=str) + '\n'
-    with _failure_lock:
-        with open(FAILURE_LOG, 'a', encoding='utf-8') as f:
-            f.write(line)
 
 
 # =============================================================================
@@ -415,7 +400,8 @@ def _compress_batch_phase2(
     is_hard = state.get('hard', False)
     meta = state.get('meta')  # None for hard
 
-    # API fallback for failed items
+    # Track which prompts used API fallback
+    api_set: set = set()
     if fallback_indices:
         api_futures = {}
         with ThreadPoolExecutor(max_workers=API_CONCURRENCY) as pool:
@@ -427,7 +413,9 @@ def _compress_batch_phase2(
                 schema = 'new' if is_hard else meta[ri // 2]['schema']
                 if api_result and not _is_truncated_compression(api_result, schema):
                     decoded[ri] = api_result
+                    api_set.add(ri)
 
+    state['api_set'] = api_set
     if is_hard:
         return _build_hard_results(state)
     return _build_think_index_results(state)
@@ -436,17 +424,24 @@ def _compress_batch_phase2(
 def _build_think_index_results(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     meta = state['meta']
     decoded = state['decoded']
+    api_set = state.get('api_set', set())
     results = []
     for pair_idx in range(len(meta)):
         q_text = decoded[pair_idx * 2]
         c_text = decoded[pair_idx * 2 + 1]
         if not q_text or not c_text:
             continue
+        q_method = 'api' if (pair_idx * 2) in api_set else 'vllm'
+        c_method = 'api' if (pair_idx * 2 + 1) in api_set else 'vllm'
         results.append({
             'anchor_text': q_text,
             'positive_text': c_text,
             'negative_texts': [],
             'source': meta[pair_idx]['source'],
+            'query_raw': meta[pair_idx]['query_raw'],
+            'cot_raw': meta[pair_idx]['cot_raw'],
+            'anchor_method': q_method,
+            'positive_method': c_method,
         })
     return results
 
@@ -455,24 +450,38 @@ def _build_hard_results(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     group_sizes = state['group_sizes']
     decoded = state['decoded']
     source_type = state['source_type']
+    raw_groups = state['raw_groups']
+    api_set = state.get('api_set', set())
     results = []
     offset = 0
-    for gs in group_sizes:
+    for gi, gs in enumerate(group_sizes):
         q_text = decoded[offset]
         c_text = decoded[offset + 1]
         if not q_text or not c_text:
             offset += gs
             continue
         neg_texts = []
+        neg_raws = []
+        neg_methods = []
         for ni in range(2, gs):
             nt = decoded[offset + ni]
             if nt:
                 neg_texts.append(nt)
+                neg_raws.append(raw_groups[gi]['negs_raw'][ni - 2])
+                neg_methods.append('api' if (offset + ni) in api_set else 'vllm')
+        q_method = 'api' if offset in api_set else 'vllm'
+        c_method = 'api' if (offset + 1) in api_set else 'vllm'
         results.append({
             'anchor_text': q_text,
             'positive_text': c_text,
             'negative_texts': neg_texts,
             'source': source_type,
+            'query_raw': raw_groups[gi]['query_raw'],
+            'cot_raw': raw_groups[gi]['cot_raw'],
+            'negs_raw': neg_raws,
+            'anchor_method': q_method,
+            'positive_method': c_method,
+            'neg_methods': neg_methods,
         })
         offset += gs
     return results
@@ -491,13 +500,13 @@ def _compress_hard_phase1(
     prompts: List[Dict[str, Any]] = []
     group_sizes: List[int] = []
     row_ids: List[str] = []
+    raw_groups: List[Dict[str, Any]] = []
 
     for row in rows:
         query, cot = _extract_query_cot(row)
         if not query or not cot or len(cot) > _MAX_COT_CHARS:
             continue
-        neg_json = row.get('negatives_json', '')
-        negatives = json.loads(neg_json) if neg_json else []
+        negatives = row.get('negatives') or []
         valid_negs = [n for n in negatives
                       if n and len(n) <= _MAX_COT_CHARS]
 
@@ -519,10 +528,12 @@ def _compress_hard_phase1(
             ]})
         group_sizes.append(2 + len(valid_negs))
         row_ids.append(row.get('id', ''))
+        raw_groups.append({'query_raw': query, 'cot_raw': cot, 'negs_raw': valid_negs})
 
     if not prompts:
         return {'hard': True, 'prompts': [], 'group_sizes': [], 'row_ids': [],
-                'decoded': [], 'fallback_indices': [], 'source_type': source_type}
+                'decoded': [], 'fallback_indices': [], 'source_type': source_type,
+                'raw_groups': []}
 
     try:
         responses = condenser_sampler.sample(prompts, compress_params)
@@ -548,7 +559,8 @@ def _compress_hard_phase1(
 
     return {'hard': True, 'prompts': prompts, 'group_sizes': group_sizes,
             'row_ids': row_ids, 'decoded': decoded,
-            'fallback_indices': fallback_indices, 'source_type': source_type}
+            'fallback_indices': fallback_indices, 'source_type': source_type,
+            'raw_groups': raw_groups}
 
 
 # =============================================================================
@@ -572,17 +584,12 @@ def main():
     if THINK_CAP and len(dataset_think.dataset) > THINK_CAP:
         dataset_think.dataset = dataset_think.dataset.select(range(THINK_CAP))
     ds_think = dataset_think.dataset
-    # Ensure negatives_json column exists
-    if 'negatives_json' not in ds_think.column_names:
-        ds_think = ds_think.add_column('negatives_json', [''] * len(ds_think))
     logger.info(f'[load] think={len(ds_think)}')
 
     ds_index_obj = get_dataset_index(total=None, load_from_cache_file=True)
     ds_index = ds_index_obj.dataset
     if INDEX_CAP and len(ds_index) > INDEX_CAP:
         ds_index = ds_index.select(range(INDEX_CAP))
-    if 'negatives_json' not in ds_index.column_names:
-        ds_index = ds_index.add_column('negatives_json', [''] * len(ds_index))
     logger.info(f'[load] index={len(ds_index)}')
 
     ds_hard_raw = get_dataset_hard(max_negatives=HARD_MAX_NEGATIVES, load_from_cache_file=True)
@@ -594,22 +601,25 @@ def main():
     # Convert hard to messages schema
     hard_rows_list = []
     if n_hard > 0:
+        h_ids = ds_hard_raw['id']
+        h_queries = ds_hard_raw['query']
+        h_cots = ds_hard_raw['cot']
+        h_responses = ds_hard_raw['response'] if 'response' in ds_hard_raw.column_names else [''] * n_hard
+        h_negatives = ds_hard_raw['negatives']
         for i in range(n_hard):
-            row = ds_hard_raw[i]
             hard_rows_list.append({
-                'id': row['id'],
+                'id': h_ids[i],
                 'messages': [
-                    {'role': 'user', 'content': row['query']},
-                    {'role': 'assistant', 'reasoning_content': row['cot'],
-                     'content': row.get('response', '') or ''},
+                    {'role': 'user', 'content': h_queries[i]},
+                    {'role': 'assistant', 'reasoning_content': h_cots[i],
+                     'content': h_responses[i] or ''},
                 ],
-                'negatives_json': json.dumps(row['negatives'], ensure_ascii=False),
+                'negatives': h_negatives[i],
             })
 
     # Batch-convert HF Datasets to list-of-dicts
     def _ds_to_rows(ds):
-        cols = {k: ds[k] for k in ds.column_names}
-        return [{k: cols[k][i] for k in cols} for i in range(len(ds))]
+        return [dict(zip(ds.column_names, vals)) for vals in zip(*(ds[c] for c in ds.column_names))]
 
     think_rows = _ds_to_rows(ds_think)
     index_rows = _ds_to_rows(ds_index)
@@ -663,6 +673,11 @@ def main():
 
     # -- Process in batches (pipelined: vLLM batch N+1 overlaps API fallback N) -
     total_flushed = 0
+    if os.path.exists(RESULTS_JSONL):
+        with open(RESULTS_JSONL, 'r', encoding='utf-8') as f:
+            total_flushed = sum(1 for l in f if l.strip())
+        if total_flushed:
+            logger.info(f'[resume] {total_flushed} records already in results.jsonl')
 
     def _process_source(rows, source_type, label):
         nonlocal total_flushed
@@ -678,7 +693,7 @@ def main():
         pending = None  # (future, batch_start, batch_len)
 
         def _drain_pending():
-            nonlocal total_flushed
+            nonlocal total_flushed, pending
             if pending is None:
                 return
             fut, p_start, p_len = pending
@@ -687,6 +702,7 @@ def main():
             total_flushed += len(batch_results)
             progress[source_type] = p_start + p_len
             _save_progress()
+            pending = None
 
         for start in range(skip, n_total, BATCH_SIZE):
             batch = rows[start:start + BATCH_SIZE]
@@ -714,15 +730,22 @@ def main():
     logger.info(f'[save] converting results.jsonl to HF Dataset...')
     all_results = []
     with open(RESULTS_JSONL, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
+        for line_no, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
                 all_results.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning(f'[save] skipping malformed line {line_no} (truncated resume?)')
     logger.info(f'[save] total records: {len(all_results)}')
     out_ds = HFDataset.from_dict({
         'anchor_text': [r['anchor_text'] for r in all_results],
         'positive_text': [r['positive_text'] for r in all_results],
         'negative_texts': [r['negative_texts'] for r in all_results],
         'source': [r['source'] for r in all_results],
+        'query_raw': [r.get('query_raw', '') for r in all_results],
+        'cot_raw': [r.get('cot_raw', '') for r in all_results],
+        'negs_raw': [r.get('negs_raw', []) for r in all_results],
     })
     out_ds.save_to_disk(OUTPUT_DIR + '/dataset')
     logger.info(f'[save] dataset saved to {OUTPUT_DIR}/dataset')
