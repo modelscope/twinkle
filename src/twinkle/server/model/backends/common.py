@@ -176,45 +176,38 @@ class TwinkleCompatModelBase:
 
     def _tinker_build_output(self, inputs, outputs, return_full_logprobs: bool = False):
         """Extract logits/logps from model outputs and build per-datum output list."""
-        logits = self._normalize_tensor_output(outputs.get('logits'))
-        logps = self._normalize_tensor_output(outputs.get('logps'))
+        logits = self._tensor_output_to_rows(outputs.get('logits'))
+        logps = self._tensor_output_to_rows(outputs.get('logps'))
         if logits is None and logps is None:
             # non-last PP stage: no outputs produced, collector will discard this
             return []
         return self._get_forward_output(inputs, logits, logps, return_full_logprobs=return_full_logprobs)
 
     @staticmethod
-    def _normalize_tensor_output(value):
-        """Normalize various output formats (tensor, list of tensors, nested lists, floats) to a single tensor.
-
-        Handles:
-        - None or empty list: returns None
-        - torch.Tensor: detach and move to cpu
-        - list of torch.Tensor: cat along dim=0
-        - list of floats/int: convert to tensor
-        """
+    def _tensor_output_to_rows(value):
+        """Expand tensor or microbatch tensor-list outputs into one row per input sample."""
         if value is None:
             return None
 
+        tensors = value
         if isinstance(value, torch.Tensor):
-            return value.detach().cpu()
+            tensors = [value]
+        elif not (isinstance(value, list) and all(isinstance(item, torch.Tensor) for item in value)):
+            tensors = [torch.as_tensor(value, dtype=torch.float32)]
 
-        if isinstance(value, list):
-            if not value:  # empty list (e.g. non-last PP stage): treat as missing
-                return None
-            if isinstance(value[0], torch.Tensor):
-                return torch.cat(value, dim=0).detach().cpu()
-            return torch.as_tensor(value, dtype=torch.float32).detach().cpu()
-
-        if isinstance(value, (int, float)):
-            return torch.tensor([value], dtype=torch.float32)
-
-        raise ValueError(f'Unexpected type for tensor output: {type(value)}')
+        rows = []
+        for tensor in tensors:
+            tensor = tensor.detach().cpu()
+            if tensor.dim() <= 1:
+                rows.append(tensor)
+            else:
+                rows.extend(tensor.unbind(0))
+        return rows
 
     @staticmethod
     def _get_forward_output(inputs: list[types.Datum],
-                            logits: torch.Tensor,
-                            logps: torch.Tensor,
+                            logits: list[torch.Tensor] | None,
+                            logps: list[torch.Tensor] | None,
                             return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
@@ -226,24 +219,30 @@ class TwinkleCompatModelBase:
         elementwise_loss is always computed on the original (unpadded) length because the
         per-datum weights tensor has that length.
         """
-        from twinkle.utils.torch_utils import selective_log_softmax
         if logps is not None:
-            device = logps.device
+            if len(logps) != len(inputs):
+                raise ValueError(f'Expected {len(inputs)} logps rows, got {len(logps)}')
+            device = logps[0].device
         elif logits is not None:
-            device = logits.device
+            if len(logits) != len(inputs):
+                raise ValueError(f'Expected {len(inputs)} logits rows, got {len(logits)}')
+            device = logits[0].device
         else:
             raise ValueError('At least one of logits or logps must be provided.')
         results = []
         if logits is None:
             logits = [None] * len(inputs)
-        for idx, (feature, logit) in enumerate(zip(inputs, logits)):
+        if logps is None:
+            logps = [None] * len(inputs)
+        for feature, logit, feature_logps in zip(inputs, logits, logps):
             labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(device)
             weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(device)
 
             seq_len = labels.numel()  # original unpadded length
 
-            if logps is None:
+            if feature_logps is None:
                 assert logit is not None, 'logit must not be None when logps is None'
+                from twinkle.utils.torch_utils import selective_log_softmax
                 feature_logits = logit[:seq_len, :]
                 token_log_probs_orig = selective_log_softmax(feature_logits, labels)
                 if return_full_logprobs:
@@ -258,10 +257,11 @@ class TwinkleCompatModelBase:
                 else:
                     token_log_probs_full = token_log_probs_orig
             else:
-                token_log_probs_orig = logps[idx, :seq_len]
+                feature_logps = feature_logps.to(device)
+                token_log_probs_orig = feature_logps[:seq_len]
                 # When return_full_logprobs is True, retain the full TP/CP-padded slice.
                 # Positions beyond seq_len have label -100 and are masked by _compute_sequence_logps.
-                token_log_probs_full = logps[idx] if return_full_logprobs else token_log_probs_orig
+                token_log_probs_full = feature_logps if return_full_logprobs else token_log_probs_orig
 
             # elementwise_loss: positive NLL loss (0.0 where masked)
             token_log_probs_orig = token_log_probs_orig.to(weights.device)
