@@ -209,6 +209,23 @@ wait_for_redis_ready() {
     return 1
 }
 
+wait_for_redis_stopped() {
+    local timeout="${1:-30}"
+
+    for ((i=1; i<=timeout; i++)); do
+        if command -v ss &> /dev/null; then
+            if ! ss -lnt 2>/dev/null | grep -q ':6380 '; then
+                return 0
+            fi
+        elif ! redis-cli -p 6380 ping 2>/dev/null | grep -q '^PONG$'; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
 wait_for_lgtm_ready() {
     local lgtm_pid="$1"
     local timeout="${2:-90}"
@@ -321,7 +338,18 @@ print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
 
 print_info "停止已有的 Redis..."
-pkill redis-server 2>/dev/null || true
+redis-cli -p 6380 shutdown nosave 2>/dev/null || pkill redis-server 2>/dev/null || true
+if ! wait_for_redis_stopped 30; then
+    print_warning "Redis 未在 30 秒内退出，强制终止..."
+    pkill -9 redis-server 2>/dev/null || true
+    if ! wait_for_redis_stopped 10; then
+        print_error "Redis 端口 6380 未释放"
+        if command -v ss &> /dev/null; then
+            ss -lntp 2>/dev/null | grep ':6380 ' || true
+        fi
+        exit 1
+    fi
+fi
 
 print_info "停止已有的 LGTM 观测栈..."
 pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
