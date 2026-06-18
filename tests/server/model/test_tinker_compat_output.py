@@ -52,6 +52,14 @@ def test_tinker_build_output_handles_ragged_microbatch_logps_from_megatron_backe
     torch.testing.assert_close(result[3]['logprobs'].to_torch(), torch.full((63,), 2.0))
 
 
+def test_tinker_build_output_ignores_empty_pipeline_stage_outputs():
+    inputs = [_datum(3), _datum(2)]
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, {'logps': []})
+
+    assert result == []
+
+
 def test_tinker_build_output_handles_ragged_microbatch_logits_fallback():
     inputs = [_datum(2), _datum(1), _datum(1)]
     logits = [

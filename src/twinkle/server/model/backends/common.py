@@ -192,6 +192,9 @@ class TwinkleCompatModelBase:
         tensors = value
         if isinstance(value, torch.Tensor):
             tensors = [value]
+        elif isinstance(value, list) and not value:
+            # Non-last PP stages can legitimately produce no logits/logps.
+            return None
         elif not (isinstance(value, list) and all(isinstance(item, torch.Tensor) for item in value)):
             tensors = [torch.as_tensor(value, dtype=torch.float32)]
 
