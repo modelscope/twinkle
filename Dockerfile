@@ -10,13 +10,6 @@ ENV LD_LIBRARY_PATH="/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packa
 RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
     pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
     pip install --no-cache-dir \
-        torch==2.11.0 \
-        triton==3.6.0 \
-        nvidia-cudnn-cu13==9.19.0.56 \
-        nvidia-cusparselt-cu13==0.8.0 \
-        nvidia-nccl-cu13==2.28.9 \
-        numpy==2.2.6 \
-        setuptools==80.9.0 \
         tinker==0.16.1 \
         "ray[serve]" && \
     pip install --no-cache-dir --no-deps \
