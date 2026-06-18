@@ -1,7 +1,7 @@
 # ---------- Stage 0: grab pre-built binaries ----------
 FROM redis:7.4.9 AS redis
 FROM grafana/otel-lgtm:0.28.0 AS lgtm
-FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
 
 # Forward-compat user-mode CUDA driver shim, then pip cuDNN ahead of apt cuDNN (transformer_engine undefined-symbol fix). Path must match base image's Python version.
 ENV LD_LIBRARY_PATH="/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
