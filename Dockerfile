@@ -10,11 +10,12 @@ ENV LD_LIBRARY_PATH="/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packa
 RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
     pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
     pip install --no-cache-dir \
-        flash-linear-attention \
-        apache-tvm-ffi==0.1.9 \
-        tilelang==0.1.9 \
         tinker==0.16.1 \
         "ray[serve]" && \
+    pip install --no-cache-dir --no-deps \
+        flash-linear-attention \
+        apache-tvm-ffi==0.1.9 \
+        tilelang==0.1.9 && \
     rm -rf /root/.cache /tmp/*
 
 # Clone and install twinkle, checkout to latest v-tag
