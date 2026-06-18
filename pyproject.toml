@@ -28,7 +28,7 @@ transformers = [
   "torchvision",
 ]
 kernels = ["kernels"]
-megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge", "ms-swift==4.1.3"]
+megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]
 vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 datajuicer = ["py-data-juicer"]
