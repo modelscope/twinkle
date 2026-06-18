@@ -11,6 +11,8 @@ RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simp
     pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
     pip install --no-cache-dir \
         flash-linear-attention \
+        apache-tvm-ffi==0.1.9 \
+        tilelang==0.1.9 \
         tinker==0.16.1 \
         "ray[serve]" && \
     rm -rf /root/.cache /tmp/*
