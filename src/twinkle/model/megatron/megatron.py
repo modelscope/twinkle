@@ -600,7 +600,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         success, grad_norm, num_zeros = optimizer.step()
         # Store grad_norm for later retrieval
-        optimizer_config._last_grad_norm = grad_norm.detach().cpu().item() if grad_norm is not None else 0.0
+        if grad_norm is not None:
+            grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+        optimizer_config._last_grad_norm = float(grad_norm) if grad_norm is not None else 0.0
         optimizer_config._last_step_success = success
 
     def _is_model_ddp_wrapped(self) -> bool:

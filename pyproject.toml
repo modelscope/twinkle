@@ -15,7 +15,6 @@ dependencies = [
   "peft>=0.11.0,<=0.19.0",
   "transformers",
   "typer>=0.9.0",
-  "pyzmq",
 ]
 
 [project.scripts]
@@ -28,12 +27,11 @@ transformers = [
   "torchvision",
 ]
 kernels = ["kernels"]
-megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]
+megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge", "ms-swift==4.1.3"]
 vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
-datajuicer = ["py-data-juicer"]
 tinker = ["tinker==0.16.1"]
-test = ["hypothesis>=6.0", "pytest", "pytest-asyncio"]
+test = ["hypothesis>=6.0"]
 server = [
   "redis>=5.0",
   "psutil>=5.9.0",
