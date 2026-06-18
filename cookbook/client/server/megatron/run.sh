@@ -365,7 +365,7 @@ pkill pyroscope 2>/dev/null || true
 # ============================================
 print_header "启动 Redis"
 
-if command -v redis-server &> /dev/null; then
+if command -v redis-server &> /dev/null && command -v redis-cli &> /dev/null; then
     print_info "启动 Redis..."
     redis-server --daemonize yes --port 6380 --save "" --appendonly no --logfile "$REDIS_LOG_FILE"
     if wait_for_redis_ready 30; then
@@ -378,7 +378,7 @@ if command -v redis-server &> /dev/null; then
         exit 1
     fi
 else
-    print_error "未检测到 redis-server，但 server_config.yaml 使用 redis persistence"
+    print_error "未检测到 redis-server 或 redis-cli，但 server_config.yaml 使用 redis persistence"
     exit 1
 fi
 
