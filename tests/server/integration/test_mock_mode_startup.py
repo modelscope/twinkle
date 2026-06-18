@@ -305,6 +305,13 @@ def _exercise_tinker_client(base: str) -> None:
     training.forward_backward([datum], loss_fn='cross_entropy').result()
     training.optim_step(types.AdamParams(learning_rate=1e-4)).result()
 
+    base_sampling = client.create_sampling_client(base_model='mock-model')
+    base_sampling.sample(
+        prompt=types.ModelInput.from_ints([1, 2, 3]),
+        num_samples=1,
+        sampling_params=types.SamplingParams(max_tokens=4),
+    ).result()
+
     sampler_ckpt = training.save_weights_for_sampler(name='step-1').result()
     # Gateway's /asample resolves ``base_model`` from ``body.base_model`` or
     # ``sampling_session_id``; pass it explicitly because the SDK only sets

@@ -4,7 +4,7 @@
 # Tests both non-streaming and streaming /v1/chat/completions via OpenAI SDK.
 #
 # Usage:
-#   python -u openai_e2e.py
+#   python -u tests/server/integration/openai_e2e.py
 
 import sys
 import time
