@@ -208,6 +208,25 @@ class TwinkleCompatModelBase:
         return rows
 
     @staticmethod
+    def _maybe_split_packed_row(rows: list[torch.Tensor] | None, seq_lens: list[int]) -> list[torch.Tensor] | None:
+        if rows is None or len(rows) == len(seq_lens):
+            return rows
+        if len(rows) != 1 or len(seq_lens) <= 1:
+            return rows
+
+        packed = rows[0]
+        total_len = sum(seq_lens)
+        if packed.dim() == 0 or packed.shape[0] < total_len:
+            return rows
+
+        split_rows = []
+        offset = 0
+        for seq_len in seq_lens:
+            split_rows.append(packed[offset:offset + seq_len])
+            offset += seq_len
+        return split_rows
+
+    @staticmethod
     def _get_forward_output(inputs: list[types.Datum],
                             logits: list[torch.Tensor] | None,
                             logps: list[torch.Tensor] | None,
@@ -222,6 +241,10 @@ class TwinkleCompatModelBase:
         elementwise_loss is always computed on the original (unpadded) length because the
         per-datum weights tensor has that length.
         """
+        seq_lens = [feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).numel() for feature in inputs]
+        logps = TwinkleCompatModelBase._maybe_split_packed_row(logps, seq_lens)
+        logits = TwinkleCompatModelBase._maybe_split_packed_row(logits, seq_lens)
+
         if logps is not None:
             if len(logps) != len(inputs):
                 raise ValueError(f'Expected {len(inputs)} logps rows, got {len(logps)}')

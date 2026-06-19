@@ -28,10 +28,8 @@ def test_tinker_build_output_handles_tensor_rows_from_transformers_backend():
 
     result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs)
 
-    assert [item['logprobs'].to_torch().tolist() for item in result] == [[0.0, 1.0, 2.0],
-                                                                         [4.0, 5.0]]
-    assert [item['elementwise_loss'].to_torch().tolist()
-            for item in result] == [[-0.0, -1.0, -2.0], [-4.0, -5.0]]
+    assert [item['logprobs'].to_torch().tolist() for item in result] == [[0.0, 1.0, 2.0], [4.0, 5.0]]
+    assert [item['elementwise_loss'].to_torch().tolist() for item in result] == [[-0.0, -1.0, -2.0], [-4.0, -5.0]]
 
 
 def test_tinker_build_output_handles_ragged_microbatch_logps_from_megatron_backend():
@@ -48,8 +46,8 @@ def test_tinker_build_output_handles_ragged_microbatch_logps_from_megatron_backe
     assert [item['logprobs'].to_torch().shape[0] for item in result] == [66, 65, 64, 63]
     torch.testing.assert_close(result[0]['logprobs'].to_torch(), torch.ones(66))
     torch.testing.assert_close(result[1]['logprobs'].to_torch(), torch.ones(65))
-    torch.testing.assert_close(result[2]['logprobs'].to_torch(), torch.full((64,), 2.0))
-    torch.testing.assert_close(result[3]['logprobs'].to_torch(), torch.full((63,), 2.0))
+    torch.testing.assert_close(result[2]['logprobs'].to_torch(), torch.full((64, ), 2.0))
+    torch.testing.assert_close(result[3]['logprobs'].to_torch(), torch.full((63, ), 2.0))
 
 
 def test_tinker_build_output_ignores_empty_pipeline_stage_outputs():
@@ -93,14 +91,22 @@ def test_tinker_build_output_keeps_full_ragged_logps_for_dpo_reference_forward()
     ]
 
 
+def test_tinker_build_output_splits_single_packed_logps_row():
+    inputs = [_datum(3), _datum(2)]
+    outputs = {'logps': torch.arange(5, dtype=torch.float32).view(1, 5)}
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+
+    assert [item['logprobs'].to_torch().tolist() for item in result] == [[0.0, 1.0, 2.0], [3.0, 4.0]]
+
+
 def test_extract_rl_features_pads_ragged_dpo_ref_logps():
     result = extract_rl_features_for_loss([
         _datum(3, ref_logps=[1.0, 2.0, 3.0]),
         _datum(2, ref_logps=[4.0, 5.0]),
     ])
 
-    torch.testing.assert_close(result['ref_outputs']['logps'], torch.tensor([[1.0, 2.0, 3.0],
-                                                                             [4.0, 5.0, 0.0]]))
+    torch.testing.assert_close(result['ref_outputs']['logps'], torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 0.0]]))
 
 
 def test_extract_rl_features_keeps_grpo_logps_and_advantages_ragged():
