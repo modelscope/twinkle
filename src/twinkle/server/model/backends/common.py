@@ -176,16 +176,24 @@ class TwinkleCompatModelBase:
 
     def _tinker_build_output(self, inputs, outputs, return_full_logprobs: bool = False):
         """Extract logits/logps from model outputs and build per-datum output list."""
-        logits = self._tensor_output_to_rows(outputs.get('logits'))
-        logps = self._tensor_output_to_rows(outputs.get('logps'))
+        seq_lens = [feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).numel() for feature in inputs]
+        logits = self._tensor_output_to_rows(outputs.get('logits'), seq_lens, kind='logits')
+        logps = self._tensor_output_to_rows(outputs.get('logps'), seq_lens, kind='logps')
         if logits is None and logps is None:
             # non-last PP stage: no outputs produced, collector will discard this
             return []
         return self._get_forward_output(inputs, logits, logps, return_full_logprobs=return_full_logprobs)
 
     @staticmethod
-    def _tensor_output_to_rows(value):
-        """Expand tensor or microbatch tensor-list outputs into one row per input sample."""
+    def _tensor_output_to_rows(value, seq_lens: list[int], *, kind: str) -> list[torch.Tensor] | None:
+        """Normalize backend tensors to one row per Tinker datum.
+
+        Accepted backend shapes:
+        - per-datum lists: ``[[T], [T]]`` for logps, ``[[T, V], [T, V]]`` for logits.
+        - batch-major tensors: ``[B, T]`` for logps, ``[B, T, V]`` for logits.
+        - packed tensors: ``[sum(T)]`` for logps, ``[sum(T), V]`` for logits.
+        - Megatron wrappers: an extra leading singleton dimension around any of the above.
+        """
         if value is None:
             return None
 
@@ -198,33 +206,79 @@ class TwinkleCompatModelBase:
         elif not (isinstance(value, list) and all(isinstance(item, torch.Tensor) for item in value)):
             tensors = [torch.as_tensor(value, dtype=torch.float32)]
 
+        tensors = [tensor.detach().cpu() for tensor in tensors]
+        if len(tensors) == len(seq_lens) and all(tensor.dim() <= 1 or tensor.shape[0] == 1 for tensor in tensors):
+            return [TwinkleCompatModelBase._normalize_single_row_tensor(tensor, kind=kind) for tensor in tensors]
+
         rows = []
         for tensor in tensors:
-            tensor = tensor.detach().cpu()
-            if tensor.dim() <= 1:
-                rows.append(tensor)
-            else:
-                rows.extend(tensor.unbind(0))
+            chunk_rows = TwinkleCompatModelBase._tensor_chunk_to_rows(tensor, seq_lens[len(rows):], kind=kind)
+            rows.extend(chunk_rows)
         return rows
 
     @staticmethod
-    def _maybe_split_packed_row(rows: list[torch.Tensor] | None, seq_lens: list[int]) -> list[torch.Tensor] | None:
-        if rows is None or len(rows) == len(seq_lens):
-            return rows
-        if len(rows) != 1 or len(seq_lens) <= 1:
-            return rows
+    def _normalize_single_row_tensor(tensor: torch.Tensor, *, kind: str) -> torch.Tensor:
+        if kind == 'logits':
+            if tensor.dim() >= 3 and tensor.shape[0] == 1:
+                return tensor.squeeze(0)
+            return tensor
 
-        packed = rows[0]
-        total_len = sum(seq_lens)
-        if packed.dim() == 0 or packed.shape[0] < total_len:
-            return rows
+        while tensor.dim() > 1 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor
 
+    @staticmethod
+    def _split_packed_tensor(tensor: torch.Tensor, seq_lens: list[int]) -> list[torch.Tensor] | None:
+        if tensor.dim() == 0 or not seq_lens:
+            return None
         split_rows = []
         offset = 0
         for seq_len in seq_lens:
-            split_rows.append(packed[offset:offset + seq_len])
+            if offset + seq_len > tensor.shape[0]:
+                break
+            split_rows.append(tensor[offset:offset + seq_len])
             offset += seq_len
-        return split_rows
+            if offset == tensor.shape[0]:
+                break
+        return split_rows or None
+
+    @staticmethod
+    def _tensor_chunk_to_rows(tensor: torch.Tensor, seq_lens: list[int], *, kind: str) -> list[torch.Tensor]:
+        if tensor.dim() == 0 or len(seq_lens) <= 1:
+            return [TwinkleCompatModelBase._normalize_single_row_tensor(tensor, kind=kind)]
+
+        if kind == 'logps':
+            while tensor.dim() > 1 and tensor.shape[0] == 1:
+                tensor = tensor.squeeze(0)
+            if tensor.dim() >= 2:
+                batch_size = tensor.shape[0]
+                if batch_size <= len(seq_lens) and tensor.shape[1] >= max(seq_lens[:batch_size]):
+                    return [
+                        TwinkleCompatModelBase._normalize_single_row_tensor(row, kind=kind) for row in tensor.unbind(0)
+                    ]
+            packed_rows = TwinkleCompatModelBase._split_packed_tensor(tensor, seq_lens)
+            if packed_rows is not None:
+                return packed_rows
+            return [tensor]
+
+        if kind == 'logits':
+            if tensor.dim() >= 3 and tensor.shape[0] == 1:
+                packed_rows = TwinkleCompatModelBase._split_packed_tensor(tensor.squeeze(0), seq_lens)
+                if packed_rows is not None:
+                    return packed_rows
+                tensor = tensor.squeeze(0)
+            if tensor.dim() >= 3:
+                batch_size = tensor.shape[0]
+                if batch_size <= len(seq_lens) and tensor.shape[1] >= max(seq_lens[:batch_size]):
+                    return [
+                        TwinkleCompatModelBase._normalize_single_row_tensor(row, kind=kind) for row in tensor.unbind(0)
+                    ]
+            packed_rows = TwinkleCompatModelBase._split_packed_tensor(tensor, seq_lens)
+            if packed_rows is not None:
+                return packed_rows
+            return [tensor]
+
+        raise ValueError(f'Unsupported tensor output kind: {kind}')
 
     @staticmethod
     def _get_forward_output(inputs: list[types.Datum],
@@ -241,10 +295,6 @@ class TwinkleCompatModelBase:
         elementwise_loss is always computed on the original (unpadded) length because the
         per-datum weights tensor has that length.
         """
-        seq_lens = [feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).numel() for feature in inputs]
-        logps = TwinkleCompatModelBase._maybe_split_packed_row(logps, seq_lens)
-        logits = TwinkleCompatModelBase._maybe_split_packed_row(logits, seq_lens)
-
         if logps is not None:
             if len(logps) != len(inputs):
                 raise ValueError(f'Expected {len(inputs)} logps rows, got {len(logps)}')

@@ -100,6 +100,38 @@ def test_tinker_build_output_splits_single_packed_logps_row():
     assert [item['logprobs'].to_torch().tolist() for item in result] == [[0.0, 1.0, 2.0], [3.0, 4.0]]
 
 
+def test_tinker_build_output_splits_batched_row_from_megatron_reference_forward():
+    inputs = [_datum(4), _datum(4)]
+    outputs = {'logps': torch.arange(8, dtype=torch.float32).view(1, 2, 4)}
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+
+    assert [item['logprobs'].to_torch().tolist() for item in result] == [
+        [0.0, 1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0, 7.0],
+    ]
+
+
+def test_tinker_build_output_does_not_treat_packed_logits_as_batch_major():
+    inputs = [_datum(1), _datum(1)]
+    outputs = {'logits': torch.tensor([[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0]]])}
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs)
+
+    assert len(result) == 2
+    assert [item['logprobs'].to_torch().shape for item in result] == [torch.Size([1]), torch.Size([1])]
+
+
+def test_tinker_build_output_squeezes_singleton_reference_logps():
+    inputs = [_datum(4)]
+    outputs = {'logps': [torch.arange(4, dtype=torch.float32).view(1, 4)]}
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+
+    assert result[0]['logprobs'].to_torch().shape == torch.Size([4])
+    assert result[0]['logprobs'].to_torch().tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
 def test_extract_rl_features_pads_ragged_dpo_ref_logps():
     result = extract_rl_features_for_loss([
         _datum(3, ref_logps=[1.0, 2.0, 3.0]),
