@@ -41,6 +41,3 @@ COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
 COPY --from=lgtm /otel-lgtm /otel-lgtm
 COPY cookbook/observability/grafana/dashboards/twinkle-overview.json \
      /otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json
-
-
-WORKDIR /twinkle

@@ -179,6 +179,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         datum_list = body.forward_backward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
         batch_size = len(datum_list)
+        loss_fn = body.forward_backward_input.loss_fn
         return await self.schedule_task(
             _do_forward_backward,
             model_id=body.model_id,
@@ -186,6 +187,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             input_tokens=input_tokens,
             batch_size=batch_size,
             data_world_size=self.data_world_size,
+            batch_size_multiple=2 if loss_fn == 'importance_sampling' else None,
             task_type='forward_backward',
         )
 

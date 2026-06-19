@@ -1,5 +1,5 @@
-from fastapi import FastAPI
 import pytest
+from fastapi import FastAPI
 from starlette.requests import Request
 from tinker import types
 
@@ -31,14 +31,11 @@ class _DummySampler:
         self.adapter_paths.append(adapter_path)
         return [
             SampleResponse(
-                sequences=[
-                    SampledSequence(
-                        stop_reason='length',
-                        tokens=[1, 2],
-                        logprobs=[[(1, -0.1)], [(2, -0.2)]],
-                    )
-                ]
-            )
+                sequences=[SampledSequence(
+                    stop_reason='length',
+                    tokens=[1, 2],
+                    logprobs=[[(1, -0.1)], [(2, -0.2)]],
+                )])
         ]
 
 
