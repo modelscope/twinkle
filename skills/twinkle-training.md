@@ -789,6 +789,72 @@ for i, seq in enumerate(result.sequences):
 
 **Key difference:** Cloud mode uses `base_url='http://www.modelscope.cn/twinkle'` + `MODELSCOPE_TOKEN`. Everything else (dataset loading, training loop, client API) is identical.
 
+## Plugin Architecture & Component System
+
+Twinkle is a **plugin-based framework**. All core components (loss functions, preprocessors, metrics, samplers, etc.) are registered as plugins and can be extended by writing new implementations.
+
+### Local Self-Hosted Mode (Full Plugin Support)
+
+When running against a self-hosted Twinkle Server, you have **full extensibility**:
+
+```python
+# Register a custom loss function (local mode only)
+from twinkle.loss import BaseLoss, register_loss
+
+@register_loss('MyCustomLoss')
+class MyCustomLoss(BaseLoss):
+    def forward(self, logits, labels, **kwargs):
+        # Custom loss logic
+        ...
+
+# Then use in training script:
+model.set_loss('MyCustomLoss', my_param=0.5)
+```
+
+You can write custom:
+- **Loss functions** — inherit from `BaseLoss`, register with `@register_loss`
+- **Preprocessors** — inherit from `BasePreprocessor`, register with `@register_preprocessor`
+- **Metrics** — inherit from `BaseMetric`
+- **Reward functions** — any callable `(responses) -> scores`
+- **Samplers** — custom sampling strategies
+
+### Cloud Service Mode (Built-in Components Only)
+
+**IMPORTANT RESTRICTION**: The ModelScope online environment (`http://www.modelscope.cn/twinkle`) **does NOT support**:
+- Passing custom classes or functions
+- Pickle-based serialization of user code
+- Any dynamically defined components
+
+This is due to **security sandboxing** on the cloud platform.
+
+In Cloud Service Mode, you can **only use built-in (pre-registered) components**:
+
+| Component | Available Built-in Options |
+|-----------|---------------------------|
+| Loss | `CrossEntropyLoss`, `GRPOLoss`, `DPOLoss`, `GKDLoss` |
+| Preprocessor | `SFTPreprocessor`, `RLPreprocessor`, `DPOPreprocessor` |
+| Sampler | `vLLMSampler` |
+
+```python
+# ✅ Cloud-safe: use built-in by name
+model.set_loss('GRPOLoss', epsilon=0.2)
+
+# ❌ NOT possible in cloud: custom class
+# model.set_loss(MyCustomLoss())  # Will fail — cannot serialize class
+```
+
+### Decision Rule
+
+| Scenario | Mode | Custom Components? |
+|----------|------|--------------------|
+| Need custom loss/preprocessor | Local self-hosted | ✅ Full support |
+| Standard training (SFT/GRPO/DPO) | Either | Use built-in by name |
+| No local GPU, quick experiment | Cloud service | ❌ Built-in only |
+
+**When writing scripts for the TUI Agent**: Always check whether the target is local or cloud. If cloud, restrict to built-in component names passed as strings.
+
+---
+
 ## Training Methods
 
 ### SFT (Supervised Fine-Tuning)

@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
 from textual.message import Message as TextualMessage
-from textual.widgets import Input, Markdown, Static
+from textual.widgets import Input, RichLog, Static
 from textual.widget import Widget
 
 
@@ -28,7 +27,7 @@ class ChatPanel(Widget):
         text-align: center;
     }
 
-    ChatPanel > #chat-scroll {
+    ChatPanel > #chat-log {
         height: 1fr;
         padding: 0 1;
     }
@@ -46,16 +45,6 @@ class ChatPanel(Widget):
         text-style: italic;
         padding: 0 1;
     }
-
-    .chat-user {
-        color: $success;
-        margin: 1 0 0 0;
-    }
-
-    .chat-assistant {
-        color: $secondary;
-        margin: 0 0 1 0;
-    }
     """
 
     class UserSubmitted(TextualMessage):
@@ -67,7 +56,7 @@ class ChatPanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static('Chat', id='chat-title')
-        yield VerticalScroll(id='chat-scroll')
+        yield RichLog(id='chat-log', wrap=True, markup=True, max_lines=200)
         yield Static('', id='thinking-indicator')
         yield Input(placeholder='Ask the agent anything...', id='chat-input')
 
@@ -81,16 +70,12 @@ class ChatPanel(Widget):
         self.post_message(self.UserSubmitted(text))
 
     def add_user_message(self, text: str) -> None:
-        """Add a user message to the chat scroll."""
-        scroll = self.query_one('#chat-scroll', VerticalScroll)
-        scroll.mount(Static(f'[bold green]You:[/] {text}', classes='chat-user'))
-        scroll.scroll_end(animate=False)
+        """Add a user message to the chat log."""
+        self.query_one('#chat-log', RichLog).write(f'[bold green]You:[/] {text}')
 
     def add_assistant_message(self, text: str) -> None:
-        """Add an assistant message to the chat scroll."""
-        scroll = self.query_one('#chat-scroll', VerticalScroll)
-        scroll.mount(Static(f'[bold cyan]Agent:[/] {text}', classes='chat-assistant'))
-        scroll.scroll_end(animate=False)
+        """Add an assistant message to the chat log."""
+        self.query_one('#chat-log', RichLog).write(f'[bold cyan]Agent:[/] {text}')
 
     def set_thinking(self, thinking: bool) -> None:
         """Show/hide thinking indicator."""

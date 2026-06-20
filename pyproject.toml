@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 twinkle-server = "twinkle.server.cli:main"
-twinkle-tui = "twinkle_tui:main"
+twinkle-tui = "twinkle_client.tui:main"
 
 [project.optional-dependencies]
 transformers = [
@@ -67,7 +67,6 @@ packages = [
   { include = "twinkle", from = "src" },
   { include = "twinkle_client", from = "src" },
   { include = "twinkle_agentic", from = "src" },
-  { include = "twinkle_tui", from = "src" },
 ]
 
 [build-system]

@@ -31,6 +31,10 @@ class StatusBar(Widget):
         text-style: bold;
     }
 
+    StatusBar > #status-run {
+        color: $text-muted;
+    }
+
     StatusBar > #status-model {
         color: $text;
     }
@@ -48,6 +52,7 @@ class StatusBar(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static('⏸ Idle', id='status-state', classes='status-item')
+        yield Static('Run: -', id='status-run', classes='status-item')
         yield Static('Model: -', id='status-model', classes='status-item')
         yield Static('Step: 0', id='status-step', classes='status-item')
         yield Static('', id='status-progress', classes='status-item')
@@ -58,6 +63,7 @@ class StatusBar(Widget):
         model: str | None = None,
         step: int | None = None,
         total_steps: int | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Update status bar fields."""
         if state is not None:
@@ -73,6 +79,8 @@ class StatusBar(Widget):
             )
         if model is not None:
             self.query_one('#status-model', Static).update(f'Model: {model}')
+        if run_id is not None:
+            self.query_one('#status-run', Static).update(f'Run: {run_id}')
         if step is not None:
             self.query_one('#status-step', Static).update(f'Step: {step}')
         if total_steps is not None and step is not None:

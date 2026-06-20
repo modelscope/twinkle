@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from twinkle_tui.skills.base import Skill, SkillProvider
+from twinkle_client.tui.skills.base import Skill, SkillProvider
 
 logger = logging.getLogger(__name__)
 

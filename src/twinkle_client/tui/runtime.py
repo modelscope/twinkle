@@ -4,16 +4,18 @@
 This module provides helpers that training scripts import to:
 1. Write structured metrics and logs to local JSONL files
 2. Manage run lifecycle (start/end)
+3. Register SIGTERM handler for graceful shutdown with checkpoint
 
 In Server Mode, the client is stateless - killing the client process is
 equivalent to "pause" (server retains all optimizer/model state in GPU memory).
 Restarting the script with the same adapter_name seamlessly continues training.
 
 Usage in training scripts:
-    from twinkle_tui.runtime import TrainingRuntime
+    from twinkle_client.tui.runtime import TrainingRuntime
 
     rt = TrainingRuntime(run_id='my-grpo-run')
     rt.start(model_id='Qwen/Qwen3.5-4B', config={...})
+    rt.register_graceful_shutdown(model, dataloader)
 
     for step, batch in enumerate(dataloader):
         # ... training logic ...
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -41,33 +44,26 @@ if TYPE_CHECKING:
 DEFAULT_BASE_DIR = Path.home() / '.cache' / 'twinkle'
 
 
-class TrainingStoppedError(Exception):
-    """Raised when a stop signal is detected."""
-    pass
-
-
 class TrainingRuntime:
     """Runtime helper for training scripts to integrate with TUI.
 
     Manages:
     - Writing metrics.jsonl (structured step data)
     - Writing logs.jsonl (timestamped log messages)
-    - Checking pause/stop signal files
     - Run metadata (meta.json)
+    - SIGTERM graceful shutdown with checkpoint saving
     """
 
-    def __init__(self, run_id: str, base_dir: Path | str | None = None, poll_interval: float = 1.0):
+    def __init__(self, run_id: str, base_dir: Path | str | None = None):
         """Initialize the training runtime.
 
         Args:
             run_id: Unique identifier for this training run.
             base_dir: Base directory for run data. Defaults to ~/.cache/twinkle/
-            poll_interval: Seconds between checks when paused.
         """
         self.run_id = run_id
         self.base_dir = Path(base_dir) if base_dir else DEFAULT_BASE_DIR
         self.run_dir = self.base_dir / run_id
-        self.poll_interval = poll_interval
 
         self._metrics_file: Any = None
         self._logs_file: Any = None
@@ -104,11 +100,15 @@ class TrainingRuntime:
             if src.exists():
                 # Archive existing train.py if present
                 if dst.exists():
-                    # Find next available version number
-                    existing_versions = list(self.run_dir.glob('train_v*.py'))
-                    script_version = len(existing_versions) + 2  # +2: v1 is the archive, new is v2+
-                    archive_name = f'train_v{script_version - 1}.py'
-                    shutil.copy2(dst, self.run_dir / archive_name)
+                    # Find max existing version number (regex-based, consistent with connection.py)
+                    max_v = 0
+                    for f in self.run_dir.glob('train_v*.py'):
+                        m = re.match(r'train_v(\d+)\.py$', f.name)
+                        if m:
+                            max_v = max(max_v, int(m.group(1)))
+                    archive_v = max_v + 1
+                    shutil.copy2(dst, self.run_dir / f'train_v{archive_v}.py')
+                    script_version = archive_v + 1
                 shutil.copy2(src, dst)
                 stored_script = str(dst)
 
@@ -157,35 +157,6 @@ class TrainingRuntime:
         entry = {'ts': time.time(), 'msg': message}
         self._logs_file.write(json.dumps(entry) + '\n')
 
-    def check_signals(self) -> None:
-        """Legacy signal check (optional in Server Mode).
-
-        In Server Mode, training control is done by killing/restarting the client
-        process. The server retains all state. This method is kept for backward
-        compatibility but is NOT required in typical Server Mode usage.
-
-        - If stop signal exists: raises TrainingStoppedError
-        - If pause signal exists: blocks until signal is removed
-
-        Raises:
-            TrainingStoppedError: When stop signal is detected.
-        """
-        # Check stop first
-        if (self.run_dir / 'stop').exists():
-            self.log('Stop signal received, terminating training')
-            raise TrainingStoppedError('Stop signal received')
-
-        # Check pause
-        if (self.run_dir / 'pause').exists():
-            self.log('Pause signal received, waiting for resume...')
-            while (self.run_dir / 'pause').exists():
-                # Also check stop while paused
-                if (self.run_dir / 'stop').exists():
-                    self.log('Stop signal received while paused')
-                    raise TrainingStoppedError('Stop signal received while paused')
-                time.sleep(self.poll_interval)
-            self.log('Resumed')
-
     def finish(self, status: str = 'completed') -> None:
         """Mark training as finished and close files.
 
@@ -214,16 +185,6 @@ class TrainingRuntime:
             self._logs_file = None
 
         self._started = False
-
-    @property
-    def is_paused(self) -> bool:
-        """Check if currently paused (non-blocking)."""
-        return (self.run_dir / 'pause').exists()
-
-    @property
-    def is_stopped(self) -> bool:
-        """Check if stop signal exists (non-blocking)."""
-        return (self.run_dir / 'stop').exists()
 
     def register_graceful_shutdown(
         self,

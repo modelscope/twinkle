@@ -14,8 +14,14 @@ To create a new provider, subclass SkillProvider and implement:
 from __future__ import annotations
 
 import dataclasses
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# File stems to skip when scanning for skill markdown files
+_SKIP_STEMS = frozenset({'license', 'readme', 'contributing', 'changelog'})
 
 
 @dataclasses.dataclass
@@ -44,10 +50,10 @@ class SkillProvider(ABC):
 
         Args:
             cache_dir: Local directory to cache fetched skill files.
-                       If None, uses ~/.cache/twinkle_tui/skills/<provider_name>
+                       If None, uses ~/.cache/twinkle/tui/skills/<provider_name>
         """
         if cache_dir is None:
-            cache_dir = Path.home() / '.cache' / 'twinkle_tui' / 'skills' / self.name
+            cache_dir = Path.home() / '.cache' / 'twinkle' / 'tui' / 'skills' / self.name
         self.cache_dir = cache_dir
 
     @property
@@ -65,14 +71,46 @@ class SkillProvider(ABC):
         """
         ...
 
-    @abstractmethod
     async def load_skills(self) -> list[Skill]:
-        """Load all skills from the local cache.
+        """Load all .md skill files from the provider's root directory.
 
-        Returns:
-            List of Skill objects with their content loaded.
+        Override `_skills_root` if the scan directory differs from cache_dir.
         """
-        ...
+        root = self._skills_root()
+        if not root.exists():
+            logger.warning(f'[{self.name}] Skills directory not found: {root}')
+            return []
+        return self._scan_markdown_files(root)
+
+    def _skills_root(self) -> Path:
+        """Return the root directory to scan for .md files. Override as needed."""
+        return self.cache_dir
+
+    def _scan_markdown_files(self, root: Path) -> list[Skill]:
+        """Scan a directory tree for markdown skill files.
+
+        Skips hidden directories and common non-skill files (README, LICENSE, etc.).
+        """
+        skills: list[Skill] = []
+        for md_file in sorted(root.rglob('*.md')):
+            rel = md_file.relative_to(root)
+            # Skip hidden directories
+            if any(part.startswith('.') for part in rel.parts):
+                continue
+            # Skip common non-skill files
+            if md_file.stem.lower() in _SKIP_STEMS:
+                continue
+            try:
+                content = md_file.read_text(encoding='utf-8')
+                skills.append(Skill(
+                    name=md_file.stem,
+                    content=content,
+                    source=f'{self.name}/{rel}',
+                ))
+            except Exception as e:
+                logger.warning(f'[{self.name}] Failed to read {md_file}: {e}')
+        logger.info(f'[{self.name}] Loaded {len(skills)} skills from {root}')
+        return skills
 
     async def get_skills(self) -> list[Skill]:
         """Convenience method: fetch then load.

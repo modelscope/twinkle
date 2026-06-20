@@ -185,3 +185,20 @@ Agent 在编写训练脚本前，必须完成以下评估（本地模式）：
 两种客户端 API：
 - **Twinkle 原生**：`init_twinkle_client()` → `MultiLoraTransformersModel` → `forward_backward()` → `clip_grad_and_step()`
 - **Tinker 兼容**：`init_tinker_client()` → `ServiceClient` → `create_lora_training_client()` → `forward_backward()` → `optim_step()`
+
+
+## 九、插件化架构与组件约束
+
+Twinkle 是一个插件化框架，所有核心组件（loss、preprocessor、metric、sampler 等）均以插件形式注册，本地模式下支持用户编写新组件。
+
+### 本地自建模式
+- 完全可扩展：可编写自定义 loss、preprocessor、metric、reward function
+- 通过装饰器注册（如 `@register_loss('MyLoss')`），然后在训练脚本中以字符串名引用
+
+### 线上云服务模式（ModelScope 托管）
+- **安全限制**：不支持传入类、函数对象或 pickle 序列化
+- **只能使用已注册的内置组件**，以字符串名引用
+- 内置 Loss：`CrossEntropyLoss`、`GRPOLoss`、`DPOLoss`、`GKDLoss`
+- 内置 Preprocessor：`SFTPreprocessor`、`RLPreprocessor`、`DPOPreprocessor`
+
+Agent 编写脚本时必须判断目标环境：本地可用自定义组件，云端只能用内置名称。
