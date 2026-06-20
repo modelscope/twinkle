@@ -1236,18 +1236,21 @@ rt.finish(status='completed')
 
 ```
 ~/.cache/twinkle/{run_id}/
-├── meta.json          # Run metadata (model_id, config, status, pid, script_path)
-├── train.py           # Training script copy (auto-stored for restart/resume)
+├── meta.json          # Run metadata (model_id, config, status, pid, script_path, script_version)
+├── train.py           # Current active script (always the latest version)
+├── train_v1.py        # Archived: version 1 (original, possibly failed)
+├── train_v2.py        # Archived: version 2 (first fix attempt)
 ├── metrics.jsonl      # One JSON line per step (all metrics)
 └── logs.jsonl         # One JSON line per event (ts + msg)
 ```
 
-**Script naming convention:**
-- The script is always stored as `train.py` inside the run directory
+**Script naming & versioning:**
+- `train.py` is ALWAYS the current/active version. `resume_training` executes only this file.
+- When script is updated (via `update_script` tool), old `train.py` is archived as `train_v{N}.py`
+- `meta.json` tracks `script_version` (integer), `script_path`, and `pid`
 - `run_id` is user-defined (e.g. `'grpo-gsm8k'`, `'sft-self-cognition'`)
-- `meta.json` records `script_path` and `pid` for automatic pause/resume/stop
 
-**How it works:**
+**Initial script storage:**
 ```python
 rt = TrainingRuntime(run_id='my-experiment')
 rt.start(
@@ -1257,10 +1260,11 @@ rt.start(
 )
 ```
 
-When `script_path=__file__` is passed, `TrainingRuntime.start()` will:
-1. Copy the training script to `~/.cache/twinkle/{run_id}/train.py`
-2. Record PID in `meta.json` for signal-based control
-3. TUI can then `pause` (SIGKILL by PID), `stop` (SIGTERM by PID), `resume` (re-execute `train.py`)
+**Script update flow (when fixing errors):**
+1. Script fails → Agent reads logs/metrics to diagnose
+2. Agent calls `update_script(run_id, new_code)` → archives old `train.py` as `train_v{N}.py`, writes new code
+3. Agent calls `resume_training(run_id)` → re-executes the updated `train.py`
+4. Same `run_id`, same server adapter state — only client logic changes
 
 ## Experiment Management
 
