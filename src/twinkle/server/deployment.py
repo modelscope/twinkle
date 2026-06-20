@@ -25,9 +25,11 @@ the outermost layer wrapping tracing.
 """
 from __future__ import annotations
 
+import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
@@ -147,6 +149,15 @@ def build_deployment_app(
             except Exception:
                 pass
             return response
+
+    @app.middleware('http')
+    async def catch_unhandled_exceptions(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            error = traceback.format_exc()
+            logger.error(error)
+            return JSONResponse(status_code=500, content={'detail': error})
 
     register_routes(app, get_servable)
     return app

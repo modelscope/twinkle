@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Deque
 
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
@@ -243,7 +244,12 @@ class ComputeWorker:
             error = traceback.format_exc()
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
+            await self._state.store_future_status(
+                task.request_id,
+                TaskStatus.FAILED.value,
+                task.model_id,
+                result=task_error_payload(error),
+                queue_state=QueueState.ACTIVE.value)
         finally:
             q.task_done()
             self._record_execution_time(task_type, exec_time)

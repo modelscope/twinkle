@@ -16,6 +16,7 @@ from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from twinkle.server.telemetry.middleware import get_task_metrics
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
@@ -329,7 +330,7 @@ class TaskQueueMixin:
                     queue_state=QueueState.ACTIVE.value)
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
             except Exception:
-                error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
+                error_payload = task_error_payload(traceback.format_exc())
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,
