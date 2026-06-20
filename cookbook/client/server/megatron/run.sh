@@ -8,7 +8,7 @@
 # 用法：./run.sh [选项]
 #
 # 选项：
-#   --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务
+#   --restart           如果已有 run.sh 实例正在运行，请求其在原 supervisor 进程内重启服务
 #   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
@@ -32,7 +32,7 @@
 #   bash /twinkle/cookbook/client/server/megatron/run.sh
 #                                               # 容器启动时直接运行，默认进入前台 watchdog
 #   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
-#                                               # 更新代码后主动重启线上服务
+#                                               # 更新代码后请求已有 supervisor 重启服务
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
 #   ./run.sh --head "0,1,2,3" --gpu-workers "" --cpu-workers 0
 #   ./run.sh --head "" --cpu-workers 4          # 纯 CPU 模式
@@ -92,10 +92,12 @@ TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS="${TWINKLE_SUPERVISOR_RESTART_BACKOFF
 TWINKLE_SUPERVISOR_MAX_RESTARTS="${TWINKLE_SUPERVISOR_MAX_RESTARTS:-0}"
 TWINKLE_RUN_LOCK_FILE="${TWINKLE_RUN_LOCK_FILE:-/tmp/twinkle-megatron-run.lock}"
 TWINKLE_RUN_PID_FILE="${TWINKLE_RUN_PID_FILE:-/tmp/twinkle-megatron-run.pid}"
+TWINKLE_RUN_RESTART_REQUEST_FILE="${TWINKLE_RUN_RESTART_REQUEST_FILE:-/tmp/twinkle-megatron-run.restart}"
 TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-exit}"
 TWINKLE_RUN_RESTART_TIMEOUT_SECONDS="${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS:-120}"
 SERVER_PID=""
 TAIL_PID=""
+RESTART_REQUESTED_BY_SIGNAL=0
 
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
@@ -114,7 +116,7 @@ print_usage() {
 用法: ./run.sh [选项]
 
 选项:
-  --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务
+  --restart           如果已有 run.sh 实例正在运行，请求其在原 supervisor 进程内重启服务
   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
   --cpu-workers N      CPU Worker 数量 (默认: 1)
@@ -134,15 +136,15 @@ print_usage() {
   TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)
   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)
   TWINKLE_HEALTH_URL                       HTTP health 检查地址 (默认: http://127.0.0.1:9000/api/v1/healthz)
-  TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待旧实例退出秒数 (默认: 120)
+  TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
 示例:
   bash /twinkle/cookbook/client/server/megatron/run.sh
                                                 # 容器启动时直接运行，默认进入前台 watchdog
   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
-                                                # 更新代码后主动重启线上服务
+                                                # 更新代码后请求已有 supervisor 重启服务
   ./run.sh                                      # 使用默认配置
-  ./run.sh --restart                            # 更新代码后主动重启线上服务
+  ./run.sh --restart                            # 更新代码后请求已有 supervisor 重启服务
   ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'
   ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡
   ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker
@@ -266,6 +268,7 @@ acquire_run_lock() {
     exec 9>"$TWINKLE_RUN_LOCK_FILE"
     if flock -n 9; then
         echo "$$" > "$TWINKLE_RUN_PID_FILE"
+        rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
         return 0
     fi
 
@@ -288,24 +291,35 @@ acquire_run_lock() {
     fi
 
     print_warning "检测到已有 run.sh 实例 (PID: $old_pid)，准备重启..."
-    kill "$old_pid" 2>/dev/null || true
+    echo "$$" > "$TWINKLE_RUN_RESTART_REQUEST_FILE"
+    if ! kill -USR1 "$old_pid" 2>/dev/null; then
+        rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
+        print_error "无法向已有 run.sh 实例发送重启请求 (PID: $old_pid)"
+        exit 1
+    fi
 
     for ((i=1; i<=TWINKLE_RUN_RESTART_TIMEOUT_SECONDS; i++)); do
-        if flock -n 9; then
-            echo "$$" > "$TWINKLE_RUN_PID_FILE"
-            print_success "旧 run.sh 已退出，当前实例获得锁"
-            return 0
+        if [ ! -f "$TWINKLE_RUN_RESTART_REQUEST_FILE" ]; then
+            print_success "已有 run.sh 已接收重启请求，将在原 supervisor 进程内重启服务"
+            exit 0
+        fi
+        if ! kill -0 "$old_pid" 2>/dev/null; then
+            rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
+            print_error "已有 run.sh 实例在处理重启请求时退出 (PID: $old_pid)"
+            exit 1
         fi
         sleep 1
     done
 
-    print_error "等待旧 run.sh 退出超时 (${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS}s)"
+    rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
+    print_error "等待已有 run.sh 接收重启请求超时 (${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS}s)"
     exit 1
 }
 
 cleanup_pid_file() {
     if [ -f "$TWINKLE_RUN_PID_FILE" ] && [ "$(cat "$TWINKLE_RUN_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
         rm -f "$TWINKLE_RUN_PID_FILE"
+        rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
     fi
 }
 
@@ -499,6 +513,22 @@ cleanup_script_exit() {
 handle_shutdown_signal() {
     cleanup_script_exit
     exit 143
+}
+
+handle_restart_signal() {
+    RESTART_REQUESTED_BY_SIGNAL=1
+}
+
+consume_restart_request() {
+    if [ "$RESTART_REQUESTED_BY_SIGNAL" -ne 1 ] && [ ! -f "$TWINKLE_RUN_RESTART_REQUEST_FILE" ]; then
+        return 1
+    fi
+
+    RESTART_REQUESTED_BY_SIGNAL=0
+    rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
+    print_warning "收到 run.sh 重启请求，准备在当前 supervisor 进程内重启服务"
+    SERVICE_RESTART_REQUESTED=1
+    return 0
 }
 
 check_http_health() {
@@ -720,6 +750,10 @@ watch_runtime() {
     WATCHDOG_FAILURES=0
     WATCHDOG_STARTED_AT=$(date +%s)
     while true; do
+        if consume_restart_request; then
+            return 0
+        fi
+
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
             print_watchdog_diagnostics
@@ -761,7 +795,7 @@ watch_runtime() {
             return 0
         fi
 
-        sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
+        sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS" || true
     done
 }
 
@@ -781,6 +815,7 @@ validate_runtime_config
 validate_runtime_dependencies
 mkdir -p "$TWINKLE_WORK_DIR"
 cd "$TWINKLE_WORK_DIR"
+trap handle_restart_signal USR1
 acquire_run_lock
 trap cleanup_script_exit EXIT
 trap handle_shutdown_signal INT TERM
