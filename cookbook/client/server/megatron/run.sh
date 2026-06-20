@@ -8,6 +8,7 @@
 # 用法：./run.sh [选项]
 #
 # 选项：
+#   --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务
 #   --head NODE          Head 节点 GPU 配置，格式 "设备列表:数量" (默认: 0,1,2,3:4)
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7:4)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
@@ -16,8 +17,20 @@
 #   --server-config FILE Twinkle 服务器配置文件路径 (默认: /twinkle/cookbook/client/server/megatron/server_config.yaml)
 #   --help               显示帮助信息
 #
+# 环境变量：
+#   MODELSCOPE_CACHE                         默认 /dashscope/caches/application/.cache
+#   TWINKLE_WORK_DIR                         默认 /dashscope/caches/application/twinkle
+#   TWINKLE_RUN_EXISTING_ACTION              已有实例运行时的行为：exit 或 restart（默认 exit）
+#   TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启（默认 0）
+#   TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数（默认 10）
+#   TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数（默认 10）
+#   TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值（默认 3）
+#   TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数（默认 30）
+#   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数（默认 300）
+#
 # 示例：
 #   ./run.sh                                    # 使用默认配置
+#   ./run.sh --restart                          # 更新代码后主动重启线上服务
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
 #   ./run.sh --head "0,1,2,3" --gpu-workers "" --cpu-workers 0
 #   ./run.sh --head "" --cpu-workers 4          # 纯 CPU 模式
@@ -49,6 +62,8 @@ RAY_PORT=6379
 RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 
 # --- 路径配置 ---
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/dashscope/caches/application/.cache}"
+TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-/dashscope/caches/application/twinkle}"
 DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
 LOG_FILE="run.log"
 REDIS_LOG_FILE="/twinkle/redis.log"
@@ -74,6 +89,9 @@ TWINKLE_HEALTH_GRACE_SECONDS="${TWINKLE_HEALTH_GRACE_SECONDS:-${TWINKLE_WATCHDOG
 TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS="${TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS:-10}"
 TWINKLE_SUPERVISOR_MAX_RESTARTS="${TWINKLE_SUPERVISOR_MAX_RESTARTS:-0}"
 TWINKLE_RUN_LOCK_FILE="${TWINKLE_RUN_LOCK_FILE:-/tmp/twinkle-megatron-run.lock}"
+TWINKLE_RUN_PID_FILE="${TWINKLE_RUN_PID_FILE:-/tmp/twinkle-megatron-run.pid}"
+TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-exit}"
+TWINKLE_RUN_RESTART_TIMEOUT_SECONDS="${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS:-120}"
 SERVER_PID=""
 TAIL_PID=""
 
@@ -92,6 +110,10 @@ SERVER_CONFIG_FILE="$DEFAULT_SERVER_CONFIG_FILE"
 # 解析命名参数
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --restart)
+            TWINKLE_RUN_EXISTING_ACTION="restart"
+            shift
+            ;;
         --head)
             HEAD_NODE="$2"
             shift 2
@@ -144,6 +166,7 @@ while [[ $# -gt 0 ]]; do
             echo "用法: ./run.sh [选项]"
             echo ""
             echo "选项:"
+            echo "  --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务"
             echo "  --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)"
             echo "  --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)"
             echo "  --cpu-workers N      CPU Worker 数量 (默认: 1)"
@@ -152,8 +175,20 @@ while [[ $# -gt 0 ]]; do
             echo "  --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)"
             echo "  --help, -h           显示帮助信息"
             echo ""
+            echo "环境变量:"
+            echo "  MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache"
+            echo "  TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle"
+            echo "  TWINKLE_RUN_EXISTING_ACTION              exit 或 restart (默认: exit)"
+            echo "  TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启 (默认: 0)"
+            echo "  TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数 (默认: 10)"
+            echo "  TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数 (默认: 10)"
+            echo "  TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值 (默认: 3)"
+            echo "  TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)"
+            echo "  TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)"
+            echo ""
             echo "示例:"
             echo "  ./run.sh                                      # 默认配置"
+            echo "  ./run.sh --restart                            # 更新代码后主动重启线上服务"
             echo "  ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'"
             echo "  ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡"
             echo "  ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker"
@@ -161,12 +196,15 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            print_error "未知参数: $1"
+            echo -e "\033[31m[ERROR]\033[0m 未知参数: $1"
             echo "使用 --help 查看帮助"
             exit 1
             ;;
     esac
 done
+
+mkdir -p "$TWINKLE_WORK_DIR"
+cd "$TWINKLE_WORK_DIR"
 
 # 将 SAVE_DIR export 给子进程（python server 通过环境变量读取）
 export TWINKLE_DEFAULT_SAVE_DIR="$SAVE_DIR"
@@ -215,9 +253,48 @@ acquire_run_lock() {
     fi
 
     exec 9>"$TWINKLE_RUN_LOCK_FILE"
-    if ! flock -n 9; then
+    if flock -n 9; then
+        echo "$$" > "$TWINKLE_RUN_PID_FILE"
+        return 0
+    fi
+
+    if [ "$TWINKLE_RUN_EXISTING_ACTION" != "restart" ]; then
         print_error "已有 run.sh 实例正在运行，退出以避免中断当前服务"
+        print_error "如需主动重启，请使用 --restart 或设置 TWINKLE_RUN_EXISTING_ACTION=restart"
         exit 1
+    fi
+
+    if [ ! -f "$TWINKLE_RUN_PID_FILE" ]; then
+        print_error "已有 run.sh 实例持有锁，但未找到 PID 文件: $TWINKLE_RUN_PID_FILE"
+        exit 1
+    fi
+
+    local old_pid
+    old_pid="$(cat "$TWINKLE_RUN_PID_FILE" 2>/dev/null || true)"
+    if [ -z "$old_pid" ] || ! kill -0 "$old_pid" 2>/dev/null; then
+        print_error "PID 文件中的旧 run.sh 进程不存在: ${old_pid:-empty}"
+        exit 1
+    fi
+
+    print_warning "检测到已有 run.sh 实例 (PID: $old_pid)，准备重启..."
+    kill "$old_pid" 2>/dev/null || true
+
+    for ((i=1; i<=TWINKLE_RUN_RESTART_TIMEOUT_SECONDS; i++)); do
+        if flock -n 9; then
+            echo "$$" > "$TWINKLE_RUN_PID_FILE"
+            print_success "旧 run.sh 已退出，当前实例获得锁"
+            return 0
+        fi
+        sleep 1
+    done
+
+    print_error "等待旧 run.sh 退出超时 (${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS}s)"
+    exit 1
+}
+
+cleanup_pid_file() {
+    if [ -f "$TWINKLE_RUN_PID_FILE" ] && [ "$(cat "$TWINKLE_RUN_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+        rm -f "$TWINKLE_RUN_PID_FILE"
     fi
 }
 
@@ -294,15 +371,20 @@ stop_pid() {
     kill -9 "$pid" 2>/dev/null || true
 }
 
-cleanup_watchdog_children() {
-    trap - EXIT INT TERM
+cleanup_runtime_children() {
     stop_pid "$TAIL_PID" "日志 tail"
     stop_pid "$SERVER_PID" "Twinkle Server"
     ray stop --force >/dev/null 2>&1 || true
 }
 
+cleanup_script_exit() {
+    trap - EXIT INT TERM
+    cleanup_runtime_children
+    cleanup_pid_file
+}
+
 handle_shutdown_signal() {
-    cleanup_watchdog_children
+    cleanup_script_exit
     exit 143
 }
 
@@ -390,6 +472,8 @@ fi
 echo ""
 print_info "运行参数："
 echo "  - Ray 地址: $RAY_ADDRESS"
+echo "  - 工作目录: $TWINKLE_WORK_DIR"
+echo "  - ModelScope 缓存: $MODELSCOPE_CACHE"
 echo "  - 临时目录: $TEMP_DIR"
 echo "  - 保存目录: $TWINKLE_DEFAULT_SAVE_DIR"
 echo "  - 服务配置: $SERVER_CONFIG_FILE"
@@ -580,7 +664,7 @@ print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
 
 # 实时显示日志。tail 只负责输出日志，不能作为服务健康的唯一保活进程。
 start_log_tail
-trap cleanup_watchdog_children EXIT
+trap cleanup_script_exit EXIT
 trap handle_shutdown_signal INT TERM
 
 print_info "Watchdog 已启动"
@@ -651,7 +735,7 @@ while true; do
         exit 0
     fi
 
-    cleanup_watchdog_children
+    cleanup_runtime_children
     SUPERVISOR_RESTARTS=$((SUPERVISOR_RESTARTS + 1))
     if [ "$TWINKLE_SUPERVISOR_MAX_RESTARTS" -gt 0 ] && [ "$SUPERVISOR_RESTARTS" -gt "$TWINKLE_SUPERVISOR_MAX_RESTARTS" ]; then
         print_error "服务重启次数超过上限 ($TWINKLE_SUPERVISOR_MAX_RESTARTS)，退出"
