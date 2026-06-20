@@ -9,8 +9,8 @@
 #
 # 选项：
 #   --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务
-#   --head NODE          Head 节点 GPU 配置，格式 "设备列表:数量" (默认: 0,1,2,3:4)
-#   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7:4)
+#   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
+#   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
 #   --temp-dir DIR       Ray 临时目录 (默认: /dashscope/caches/application/ray_logs)
 #   --save-dir DIR       Twinkle 模型保存目录 (默认: /dashscope/caches/application/save)
@@ -29,8 +29,10 @@
 #   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数（默认 300）
 #
 # 示例：
-#   ./run.sh                                    # 使用默认配置
-#   ./run.sh --restart                          # 更新代码后主动重启线上服务
+#   bash /twinkle/cookbook/client/server/megatron/run.sh
+#                                               # 容器启动时直接运行，默认进入前台 watchdog
+#   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
+#                                               # 更新代码后主动重启线上服务
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
 #   ./run.sh --head "0,1,2,3" --gpu-workers "" --cpu-workers 0
 #   ./run.sh --head "" --cpu-workers 4          # 纯 CPU 模式
@@ -45,13 +47,13 @@ set -e  # 遇到错误立即退出
 
 # --- Ray 集群配置 ---
 # Head 节点（必须是第一个启动）
-# 格式："GPU设备列表:GPU数量"，如 "0,1,2,3:4"
+# 格式："GPU设备列表"，如 "0,1,2,3"
 # 如果不需要 GPU，设为空字符串 ""
 # 可通过命令行参数 $1 传入
 
 # GPU Worker 节点列表（可以有多个）
-# 格式：用分号分隔的 "GPU设备列表:GPU数量"
-# 示例："4,5,6,7:4" 或 "4,5,6,7:4;8,9,10,11:4"
+# 格式：用分号分隔的 "GPU设备列表"
+# 示例："4,5,6,7" 或 "4,5,6,7;8,9,10,11"
 # 可通过命令行参数 $2 传入
 
 # CPU Worker 数量
@@ -131,8 +133,14 @@ print_usage() {
   TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值 (默认: 3)
   TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)
   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)
+  TWINKLE_HEALTH_URL                       HTTP health 检查地址 (默认: http://127.0.0.1:9000/api/v1/healthz)
+  TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待旧实例退出秒数 (默认: 120)
 
 示例:
+  bash /twinkle/cookbook/client/server/megatron/run.sh
+                                                # 容器启动时直接运行，默认进入前台 watchdog
+  bash /twinkle/cookbook/client/server/megatron/run.sh --restart
+                                                # 更新代码后主动重启线上服务
   ./run.sh                                      # 使用默认配置
   ./run.sh --restart                            # 更新代码后主动重启线上服务
   ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'
@@ -337,6 +345,26 @@ validate_runtime_config() {
     require_non_negative_int "TWINKLE_SUPERVISOR_MAX_RESTARTS" "$TWINKLE_SUPERVISOR_MAX_RESTARTS"
     require_positive_int "TWINKLE_RUN_RESTART_TIMEOUT_SECONDS" "$TWINKLE_RUN_RESTART_TIMEOUT_SECONDS"
     require_non_negative_int "CPU_WORKER_COUNT" "$CPU_WORKER_COUNT"
+}
+
+require_command() {
+    local command_name="$1"
+    if ! command -v "$command_name" &> /dev/null; then
+        print_error "缺少必需命令: $command_name"
+        exit 1
+    fi
+}
+
+validate_runtime_dependencies() {
+    require_command flock
+    require_command tail
+    require_command timeout
+    require_command python
+    require_command ray
+    require_command redis-server
+    require_command redis-cli
+    require_command pkill
+    require_command pgrep
 }
 
 wait_for_redis_ready() {
@@ -750,6 +778,7 @@ run_service_once() {
 }
 
 validate_runtime_config
+validate_runtime_dependencies
 mkdir -p "$TWINKLE_WORK_DIR"
 cd "$TWINKLE_WORK_DIR"
 acquire_run_lock
