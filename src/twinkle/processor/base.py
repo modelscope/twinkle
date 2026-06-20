@@ -30,6 +30,7 @@ class InputProcessor:
         'inputs_embeds': 0.0,
         'attention_mask': 0,
         'labels': -100,
+        'completion_mask': 0,
         'loss_scale': 0.0,
         'position_ids': -1,
         'length': -1,

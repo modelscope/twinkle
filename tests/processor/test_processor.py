@@ -37,6 +37,28 @@ class TestNormalMode:
         out = proc.collate_fn(batch)
         assert out[0]['input_ids'].shape == (2, 5)
 
+    def test_completion_mask_padding(self):
+        proc = InputProcessor(padding_free=False, padding_side='right')
+        batch = [
+            {
+                'input_ids': torch.tensor([1, 2, 3]),
+                'position_ids': torch.arange(3),
+                'labels': torch.tensor([-100, 10, 11]),
+                'completion_mask': torch.tensor([0, 1, 1]),
+            },
+            {
+                'input_ids': torch.tensor([4, 5]),
+                'position_ids': torch.arange(2),
+                'labels': torch.tensor([-100, 12]),
+                'completion_mask': torch.tensor([0, 1]),
+            },
+        ]
+        out = proc.collate_fn(batch)
+        assert len(out) == 1
+        b = out[0]
+        assert b['completion_mask'].shape == b['input_ids'].shape == (2, 3)
+        assert b['completion_mask'].tolist() == [[0, 1, 1], [0, 1, 0]]
+
 
 class TestPaddingFreeMode:
     """padding_free: concatenate multiple samples into single row."""
@@ -97,7 +119,7 @@ class TestMultimodalMode:
         assert 'pixel_values' in b
         # 2 images x 3 channels after squeeze, cat along dim=0 -> shape[0]=6
         assert b['pixel_values'].shape[0] == 6
-        assert b['image_grid_thw'].shape[0] == 6
+        assert b['image_grid_thw'].shape == (2, 3)
 
 
 class TestGRPOMode:

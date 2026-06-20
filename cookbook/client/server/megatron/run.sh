@@ -65,6 +65,18 @@ PYROSCOPE_VERSION="${PYROSCOPE_VERSION:-v2.0.2}"
 OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
 OBI_VERSION="${OBI_VERSION:-v0.9.0}"
 
+# --- Watchdog 配置 ---
+TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:9000/api/v1/healthz}"
+TWINKLE_WATCHDOG_INTERVAL_SECONDS="${TWINKLE_WATCHDOG_INTERVAL_SECONDS:-10}"
+TWINKLE_WATCHDOG_FAILURE_THRESHOLD="${TWINKLE_WATCHDOG_FAILURE_THRESHOLD:-3}"
+TWINKLE_RAY_GRACE_SECONDS="${TWINKLE_RAY_GRACE_SECONDS:-30}"
+TWINKLE_HEALTH_GRACE_SECONDS="${TWINKLE_HEALTH_GRACE_SECONDS:-${TWINKLE_WATCHDOG_STARTUP_GRACE_SECONDS:-300}}"
+TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS="${TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS:-10}"
+TWINKLE_SUPERVISOR_MAX_RESTARTS="${TWINKLE_SUPERVISOR_MAX_RESTARTS:-0}"
+TWINKLE_RUN_LOCK_FILE="${TWINKLE_RUN_LOCK_FILE:-/tmp/twinkle-megatron-run.lock}"
+SERVER_PID=""
+TAIL_PID=""
+
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
 # ============================================
@@ -196,6 +208,19 @@ print_header() {
     print_separator
 }
 
+acquire_run_lock() {
+    if ! command -v flock &> /dev/null; then
+        print_error "flock 不存在，无法安全保证 run.sh 单实例运行"
+        exit 1
+    fi
+
+    exec 9>"$TWINKLE_RUN_LOCK_FILE"
+    if ! flock -n 9; then
+        print_error "已有 run.sh 实例正在运行，退出以避免中断当前服务"
+        exit 1
+    fi
+}
+
 wait_for_redis_ready() {
     local timeout="${1:-30}"
 
@@ -243,6 +268,74 @@ wait_for_lgtm_ready() {
     return 1
 }
 
+start_log_tail() {
+    tail -F "$LOG_FILE" &
+    TAIL_PID=$!
+    print_info "日志 tail 已启动 (PID: $TAIL_PID)"
+}
+
+stop_pid() {
+    local pid="$1"
+    local name="$2"
+
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    print_info "停止 $name (PID: $pid)..."
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..10}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    print_warning "$name 未正常退出，强制终止..."
+    kill -9 "$pid" 2>/dev/null || true
+}
+
+cleanup_watchdog_children() {
+    trap - EXIT INT TERM
+    stop_pid "$TAIL_PID" "日志 tail"
+    stop_pid "$SERVER_PID" "Twinkle Server"
+    ray stop --force >/dev/null 2>&1 || true
+}
+
+handle_shutdown_signal() {
+    cleanup_watchdog_children
+    exit 143
+}
+
+check_http_health() {
+    python - "$TWINKLE_HEALTH_URL" <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+try:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        sys.exit(0 if response.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+print_watchdog_diagnostics() {
+    print_warning "Watchdog 诊断信息："
+    echo "  - health url: $TWINKLE_HEALTH_URL"
+    echo "  - server pid: ${SERVER_PID:-unset}"
+    echo "  - tail pid: ${TAIL_PID:-unset}"
+    echo "  - Ray logs: $TEMP_DIR/session_latest/logs"
+
+    print_warning "ray status 输出："
+    ray status 2>&1 || true
+
+    if [ -f "$LOG_FILE" ]; then
+        print_warning "最近 100 行 Twinkle Server 日志："
+        tail -n 100 "$LOG_FILE" || true
+    fi
+}
+
 # 解析节点配置 "devices" -> 返回 devices 和自动计算 _gpu_count
 # 示例: "0,1,2,3" -> devices="0,1,2,3", count=4
 parse_node_config() {
@@ -261,6 +354,7 @@ parse_node_config() {
 # ============================================
 # 开始启动
 # ============================================
+run_service_once() {
 print_header "Twinkle Megatron 服务启动脚本"
 
 # 打印配置信息
@@ -484,5 +578,86 @@ nohup python -m twinkle.server launch --config "$SERVER_CONFIG_FILE" > "$LOG_FIL
 SERVER_PID=$!
 print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
 
-# 实时显示日志（阻塞进程）
-tail -f "$LOG_FILE"
+# 实时显示日志。tail 只负责输出日志，不能作为服务健康的唯一保活进程。
+start_log_tail
+trap cleanup_watchdog_children EXIT
+trap handle_shutdown_signal INT TERM
+
+print_info "Watchdog 已启动"
+echo "  - Health URL: $TWINKLE_HEALTH_URL"
+echo "  - Interval: ${TWINKLE_WATCHDOG_INTERVAL_SECONDS}s"
+echo "  - Failure threshold: $TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
+echo "  - Ray grace: ${TWINKLE_RAY_GRACE_SECONDS}s"
+echo "  - Health grace: ${TWINKLE_HEALTH_GRACE_SECONDS}s"
+
+WATCHDOG_FAILURES=0
+WATCHDOG_STARTED_AT=$(date +%s)
+while true; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
+        print_watchdog_diagnostics
+        SERVICE_RESTART_REQUESTED=1
+        return 0
+    fi
+
+    if ! kill -0 "$TAIL_PID" 2>/dev/null; then
+        print_warning "日志 tail 进程已退出，重新启动..."
+        start_log_tail
+    fi
+
+    WATCHDOG_FAILURE_REASON=""
+    WATCHDOG_GRACE_SECONDS=0
+    if ! timeout 10 ray status >/dev/null 2>&1; then
+        WATCHDOG_FAILURE_REASON="ray status failed"
+        WATCHDOG_GRACE_SECONDS="$TWINKLE_RAY_GRACE_SECONDS"
+    elif ! check_http_health; then
+        WATCHDOG_FAILURE_REASON="http health check failed: $TWINKLE_HEALTH_URL"
+        WATCHDOG_GRACE_SECONDS="$TWINKLE_HEALTH_GRACE_SECONDS"
+    fi
+
+    if [ -z "$WATCHDOG_FAILURE_REASON" ]; then
+        WATCHDOG_FAILURES=0
+    else
+        WATCHDOG_ELAPSED=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
+        if [ "$WATCHDOG_ELAPSED" -lt "$WATCHDOG_GRACE_SECONDS" ]; then
+            print_warning "Watchdog 启动宽限期内检查失败 (${WATCHDOG_ELAPSED}s/${WATCHDOG_GRACE_SECONDS}s): $WATCHDOG_FAILURE_REASON"
+        else
+            WATCHDOG_FAILURES=$((WATCHDOG_FAILURES + 1))
+            print_warning "Watchdog 检查失败 ($WATCHDOG_FAILURES/$TWINKLE_WATCHDOG_FAILURE_THRESHOLD): $WATCHDOG_FAILURE_REASON"
+        fi
+    fi
+
+    if [ "$WATCHDOG_FAILURES" -ge "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD" ]; then
+        print_error "Watchdog 连续失败达到阈值，准备重启服务"
+        print_watchdog_diagnostics
+        SERVICE_RESTART_REQUESTED=1
+        return 0
+    fi
+
+    sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
+done
+}
+
+acquire_run_lock
+
+SUPERVISOR_RESTARTS=0
+while true; do
+    SERVER_PID=""
+    TAIL_PID=""
+    SERVICE_RESTART_REQUESTED=0
+
+    run_service_once
+    if [ "$SERVICE_RESTART_REQUESTED" -ne 1 ]; then
+        exit 0
+    fi
+
+    cleanup_watchdog_children
+    SUPERVISOR_RESTARTS=$((SUPERVISOR_RESTARTS + 1))
+    if [ "$TWINKLE_SUPERVISOR_MAX_RESTARTS" -gt 0 ] && [ "$SUPERVISOR_RESTARTS" -gt "$TWINKLE_SUPERVISOR_MAX_RESTARTS" ]; then
+        print_error "服务重启次数超过上限 ($TWINKLE_SUPERVISOR_MAX_RESTARTS)，退出"
+        exit 1
+    fi
+
+    print_warning "服务将在 ${TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS}s 后自动重启 (restart #$SUPERVISOR_RESTARTS)"
+    sleep "$TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS"
+done
