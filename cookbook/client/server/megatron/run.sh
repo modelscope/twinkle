@@ -8,7 +8,7 @@
 # 用法：./run.sh [选项]
 #
 # 选项：
-#   --restart           如果已有 run.sh 实例正在运行，请求其在原 supervisor 进程内重启服务
+#   --restart           如果已有 run.sh 实例正在运行，请求其退出并由 entrypoint 重启服务
 #   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
@@ -21,20 +21,15 @@
 #   MODELSCOPE_CACHE                         默认 /dashscope/caches/application/.cache
 #   TWINKLE_WORK_DIR                         默认 /dashscope/caches/application/twinkle
 #   TWINKLE_RUN_EXISTING_ACTION              已有实例运行时的行为：exit 或 restart（默认 exit）
-#   TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启（默认 0）
-#   TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数（默认 10）
-#   TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数（默认 10）
-#   TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值（默认 3）
-#   TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数（默认 30）
-#   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数（默认 300）
+#   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数（默认 120）
 #
 # 示例：
 #   bash /twinkle/cookbook/client/server/megatron/entrypoint.sh
-#                                               # 容器启动入口，负责 run.sh 进程级保活
+#                                               # 容器启动入口，负责 run.sh 保活和外部 health 检查
 #   bash /twinkle/cookbook/client/server/megatron/run.sh
-#                                               # 直接启动服务，默认进入前台 watchdog
+#                                               # 直接启动服务，前台等待 server 子进程
 #   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
-#                                               # 更新代码后请求已有 supervisor 重启服务
+#                                               # 更新代码后请求已有 run.sh 退出并由 entrypoint 重启
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
 #   ./run.sh --head "0,1,2,3" --gpu-workers "" --cpu-workers 0
 #   ./run.sh --head "" --cpu-workers 4          # 纯 CPU 模式
@@ -84,14 +79,7 @@ PYROSCOPE_VERSION="${PYROSCOPE_VERSION:-v2.0.2}"
 OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
 OBI_VERSION="${OBI_VERSION:-v0.9.0}"
 
-# --- Watchdog 配置 ---
-TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:9000/api/v1/healthz}"
-TWINKLE_WATCHDOG_INTERVAL_SECONDS="${TWINKLE_WATCHDOG_INTERVAL_SECONDS:-10}"
-TWINKLE_WATCHDOG_FAILURE_THRESHOLD="${TWINKLE_WATCHDOG_FAILURE_THRESHOLD:-3}"
-TWINKLE_RAY_GRACE_SECONDS="${TWINKLE_RAY_GRACE_SECONDS:-30}"
-TWINKLE_HEALTH_GRACE_SECONDS="${TWINKLE_HEALTH_GRACE_SECONDS:-${TWINKLE_WATCHDOG_STARTUP_GRACE_SECONDS:-300}}"
-TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS="${TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS:-10}"
-TWINKLE_SUPERVISOR_MAX_RESTARTS="${TWINKLE_SUPERVISOR_MAX_RESTARTS:-0}"
+# --- 单实例与重启请求配置 ---
 TWINKLE_RUN_LOCK_FILE="${TWINKLE_RUN_LOCK_FILE:-/tmp/twinkle-megatron-run.lock}"
 TWINKLE_RUN_PID_FILE="${TWINKLE_RUN_PID_FILE:-/tmp/twinkle-megatron-run.pid}"
 TWINKLE_RUN_RESTART_REQUEST_FILE="${TWINKLE_RUN_RESTART_REQUEST_FILE:-/tmp/twinkle-megatron-run.restart}"
@@ -118,7 +106,7 @@ print_usage() {
 用法: ./run.sh [选项]
 
 选项:
-  --restart           如果已有 run.sh 实例正在运行，请求其在原 supervisor 进程内重启服务
+  --restart           如果已有 run.sh 实例正在运行，请求其退出并由 entrypoint 重启服务
   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
   --cpu-workers N      CPU Worker 数量 (默认: 1)
@@ -131,24 +119,17 @@ print_usage() {
   MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache
   TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle
   TWINKLE_RUN_EXISTING_ACTION              exit 或 restart (默认: exit)
-  TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启 (默认: 0)
-  TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数 (默认: 10)
-  TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数 (默认: 10)
-  TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值 (默认: 3)
-  TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)
-  TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)
-  TWINKLE_HEALTH_URL                       HTTP health 检查地址 (默认: http://127.0.0.1:9000/api/v1/healthz)
   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
 示例:
   bash /twinkle/cookbook/client/server/megatron/entrypoint.sh
-                                                # 容器启动入口，负责 run.sh 进程级保活
+                                                # 容器启动入口，负责 run.sh 保活和外部 health 检查
   bash /twinkle/cookbook/client/server/megatron/run.sh
-                                                # 直接启动服务，默认进入前台 watchdog
+                                                # 直接启动服务，前台等待 server 子进程
   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
-                                                # 更新代码后请求已有 supervisor 重启服务
+                                                # 更新代码后请求已有 run.sh 退出并由 entrypoint 重启
   ./run.sh                                      # 使用默认配置
-  ./run.sh --restart                            # 更新代码后请求已有 supervisor 重启服务
+  ./run.sh --restart                            # 更新代码后请求已有 run.sh 退出并由 entrypoint 重启
   ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'
   ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡
   ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker
@@ -304,7 +285,7 @@ acquire_run_lock() {
 
     for ((i=1; i<=TWINKLE_RUN_RESTART_TIMEOUT_SECONDS; i++)); do
         if [ ! -f "$TWINKLE_RUN_RESTART_REQUEST_FILE" ]; then
-            print_success "已有 run.sh 已接收重启请求，将在原 supervisor 进程内重启服务"
+            print_success "已有 run.sh 已接收重启请求，将退出并由 entrypoint 重启服务"
             exit 0
         fi
         if ! kill -0 "$old_pid" 2>/dev/null; then
@@ -355,12 +336,6 @@ validate_runtime_config() {
             ;;
     esac
 
-    require_positive_int "TWINKLE_WATCHDOG_INTERVAL_SECONDS" "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
-    require_positive_int "TWINKLE_WATCHDOG_FAILURE_THRESHOLD" "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
-    require_non_negative_int "TWINKLE_RAY_GRACE_SECONDS" "$TWINKLE_RAY_GRACE_SECONDS"
-    require_non_negative_int "TWINKLE_HEALTH_GRACE_SECONDS" "$TWINKLE_HEALTH_GRACE_SECONDS"
-    require_non_negative_int "TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS" "$TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS"
-    require_non_negative_int "TWINKLE_SUPERVISOR_MAX_RESTARTS" "$TWINKLE_SUPERVISOR_MAX_RESTARTS"
     require_positive_int "TWINKLE_RUN_RESTART_TIMEOUT_SECONDS" "$TWINKLE_RUN_RESTART_TIMEOUT_SECONDS"
     require_non_negative_int "CPU_WORKER_COUNT" "$CPU_WORKER_COUNT"
 }
@@ -376,7 +351,6 @@ require_command() {
 validate_runtime_dependencies() {
     require_command flock
     require_command tail
-    require_command timeout
     require_command python
     require_command ray
     require_command redis-server
@@ -530,39 +504,8 @@ consume_restart_request() {
 
     RESTART_REQUESTED_BY_SIGNAL=0
     rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
-    print_warning "收到 run.sh 重启请求，准备在当前 supervisor 进程内重启服务"
-    SERVICE_RESTART_REQUESTED=1
+    print_warning "收到 run.sh 重启请求，准备退出并由 entrypoint 重启服务"
     return 0
-}
-
-check_http_health() {
-    python - "$TWINKLE_HEALTH_URL" <<'PY'
-import sys
-import urllib.request
-
-url = sys.argv[1]
-try:
-    with urllib.request.urlopen(url, timeout=10) as response:
-        sys.exit(0 if response.status == 200 else 1)
-except Exception:
-    sys.exit(1)
-PY
-}
-
-print_watchdog_diagnostics() {
-    print_warning "Watchdog 诊断信息："
-    echo "  - health url: $TWINKLE_HEALTH_URL"
-    echo "  - server pid: ${SERVER_PID:-unset}"
-    echo "  - tail pid: ${TAIL_PID:-unset}"
-    echo "  - Ray logs: $TEMP_DIR/session_latest/logs"
-
-    print_warning "ray status 输出："
-    ray status 2>&1 || true
-
-    if [ -f "$LOG_FILE" ]; then
-        print_warning "最近 100 行 Twinkle Server 日志："
-        tail -n 100 "$LOG_FILE" || true
-    fi
 }
 
 # 解析节点配置 "devices" -> 返回 devices 和自动计算 _gpu_count
@@ -743,16 +686,8 @@ start_twinkle_server() {
     start_log_tail
 }
 
-watch_runtime() {
-    print_info "Watchdog 已启动"
-    echo "  - Health URL: $TWINKLE_HEALTH_URL"
-    echo "  - Interval: ${TWINKLE_WATCHDOG_INTERVAL_SECONDS}s"
-    echo "  - Failure threshold: $TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
-    echo "  - Ray grace: ${TWINKLE_RAY_GRACE_SECONDS}s"
-    echo "  - Health grace: ${TWINKLE_HEALTH_GRACE_SECONDS}s"
-
-    WATCHDOG_FAILURES=0
-    WATCHDOG_STARTED_AT=$(date +%s)
+wait_runtime() {
+    print_info "Twinkle runtime 已启动，等待 server 进程..."
     while true; do
         if consume_restart_request; then
             return 0
@@ -760,9 +695,7 @@ watch_runtime() {
 
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
-            print_watchdog_diagnostics
-            SERVICE_RESTART_REQUESTED=1
-            return 0
+            return 1
         fi
 
         if ! kill -0 "$TAIL_PID" 2>/dev/null; then
@@ -770,36 +703,7 @@ watch_runtime() {
             start_log_tail
         fi
 
-        WATCHDOG_FAILURE_REASON=""
-        WATCHDOG_GRACE_SECONDS=0
-        if ! timeout 10 ray status >/dev/null 2>&1; then
-            WATCHDOG_FAILURE_REASON="ray status failed"
-            WATCHDOG_GRACE_SECONDS="$TWINKLE_RAY_GRACE_SECONDS"
-        elif ! check_http_health; then
-            WATCHDOG_FAILURE_REASON="http health check failed: $TWINKLE_HEALTH_URL"
-            WATCHDOG_GRACE_SECONDS="$TWINKLE_HEALTH_GRACE_SECONDS"
-        fi
-
-        if [ -z "$WATCHDOG_FAILURE_REASON" ]; then
-            WATCHDOG_FAILURES=0
-        else
-            WATCHDOG_ELAPSED=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
-            if [ "$WATCHDOG_ELAPSED" -lt "$WATCHDOG_GRACE_SECONDS" ]; then
-                print_warning "Watchdog 启动宽限期内检查失败 (${WATCHDOG_ELAPSED}s/${WATCHDOG_GRACE_SECONDS}s): $WATCHDOG_FAILURE_REASON"
-            else
-                WATCHDOG_FAILURES=$((WATCHDOG_FAILURES + 1))
-                print_warning "Watchdog 检查失败 ($WATCHDOG_FAILURES/$TWINKLE_WATCHDOG_FAILURE_THRESHOLD): $WATCHDOG_FAILURE_REASON"
-            fi
-        fi
-
-        if [ "$WATCHDOG_FAILURES" -ge "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD" ]; then
-            print_error "Watchdog 连续失败达到阈值，准备重启服务"
-            print_watchdog_diagnostics
-            SERVICE_RESTART_REQUESTED=1
-            return 0
-        fi
-
-        sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS" || true
+        sleep 1 || true
     done
 }
 
@@ -812,7 +716,7 @@ run_service_once() {
     start_ray_cluster
     start_lgtm
     start_twinkle_server
-    watch_runtime
+    wait_runtime
 }
 
 validate_runtime_config
@@ -824,24 +728,8 @@ acquire_run_lock
 trap cleanup_script_exit EXIT
 trap handle_shutdown_signal INT TERM
 
-SUPERVISOR_RESTARTS=0
-while true; do
-    SERVER_PID=""
-    TAIL_PID=""
-    SERVICE_RESTART_REQUESTED=0
-
-    run_service_once
-    if [ "$SERVICE_RESTART_REQUESTED" -ne 1 ]; then
-        exit 0
-    fi
-
-    cleanup_existing_runtime
-    SUPERVISOR_RESTARTS=$((SUPERVISOR_RESTARTS + 1))
-    if [ "$TWINKLE_SUPERVISOR_MAX_RESTARTS" -gt 0 ] && [ "$SUPERVISOR_RESTARTS" -gt "$TWINKLE_SUPERVISOR_MAX_RESTARTS" ]; then
-        print_error "服务重启次数超过上限 ($TWINKLE_SUPERVISOR_MAX_RESTARTS)，退出"
-        exit 1
-    fi
-
-    print_warning "服务将在 ${TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS}s 后自动重启 (restart #$SUPERVISOR_RESTARTS)"
-    sleep "$TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS"
-done
+if run_service_once; then
+    exit 0
+else
+    exit 1
+fi
