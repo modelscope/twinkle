@@ -107,6 +107,41 @@ TEMP_DIR="$DEFAULT_TEMP_DIR"
 SAVE_DIR="$DEFAULT_SAVE_DIR"
 SERVER_CONFIG_FILE="$DEFAULT_SERVER_CONFIG_FILE"
 
+print_usage() {
+    cat <<EOF
+用法: ./run.sh [选项]
+
+选项:
+  --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务
+  --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
+  --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
+  --cpu-workers N      CPU Worker 数量 (默认: 1)
+  --temp-dir DIR       Ray 临时目录
+  --save-dir DIR       Twinkle 模型保存目录 (默认: $DEFAULT_SAVE_DIR)
+  --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)
+  --help, -h           显示帮助信息
+
+环境变量:
+  MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache
+  TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle
+  TWINKLE_RUN_EXISTING_ACTION              exit 或 restart (默认: exit)
+  TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启 (默认: 0)
+  TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数 (默认: 10)
+  TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数 (默认: 10)
+  TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值 (默认: 3)
+  TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)
+  TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)
+
+示例:
+  ./run.sh                                      # 使用默认配置
+  ./run.sh --restart                            # 更新代码后主动重启线上服务
+  ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'
+  ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡
+  ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker
+  ./run.sh --cpu-workers 4 --head ''            # 纯 CPU 模式
+EOF
+}
+
 # 解析命名参数
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -163,36 +198,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "用法: ./run.sh [选项]"
-            echo ""
-            echo "选项:"
-            echo "  --restart           如果已有 run.sh 实例正在运行，先停止旧实例再启动新服务"
-            echo "  --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)"
-            echo "  --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)"
-            echo "  --cpu-workers N      CPU Worker 数量 (默认: 1)"
-            echo "  --temp-dir DIR       Ray 临时目录"
-            echo "  --save-dir DIR       Twinkle 模型保存目录 (默认: $DEFAULT_SAVE_DIR)"
-            echo "  --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)"
-            echo "  --help, -h           显示帮助信息"
-            echo ""
-            echo "环境变量:"
-            echo "  MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache"
-            echo "  TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle"
-            echo "  TWINKLE_RUN_EXISTING_ACTION              exit 或 restart (默认: exit)"
-            echo "  TWINKLE_SUPERVISOR_MAX_RESTARTS          自动重启次数上限，0 表示无限重启 (默认: 0)"
-            echo "  TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS 自动重启间隔秒数 (默认: 10)"
-            echo "  TWINKLE_WATCHDOG_INTERVAL_SECONDS        Watchdog 检查间隔秒数 (默认: 10)"
-            echo "  TWINKLE_WATCHDOG_FAILURE_THRESHOLD       连续失败阈值 (默认: 3)"
-            echo "  TWINKLE_RAY_GRACE_SECONDS                Ray 启动宽限秒数 (默认: 30)"
-            echo "  TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数 (默认: 300)"
-            echo ""
-            echo "示例:"
-            echo "  ./run.sh                                      # 默认配置"
-            echo "  ./run.sh --restart                            # 更新代码后主动重启线上服务"
-            echo "  ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'"
-            echo "  ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡"
-            echo "  ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker"
-            echo "  ./run.sh --cpu-workers 4 --head ''            # 纯 CPU 模式"
+            print_usage
             exit 0
             ;;
         *)
@@ -202,9 +208,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-mkdir -p "$TWINKLE_WORK_DIR"
-cd "$TWINKLE_WORK_DIR"
 
 # 将 SAVE_DIR export 给子进程（python server 通过环境变量读取）
 export TWINKLE_DEFAULT_SAVE_DIR="$SAVE_DIR"
@@ -298,6 +301,44 @@ cleanup_pid_file() {
     fi
 }
 
+require_non_negative_int() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        print_error "$name 必须是非负整数，当前值: $value"
+        exit 1
+    fi
+}
+
+require_positive_int() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        print_error "$name 必须是正整数，当前值: $value"
+        exit 1
+    fi
+}
+
+validate_runtime_config() {
+    case "$TWINKLE_RUN_EXISTING_ACTION" in
+        exit|restart)
+            ;;
+        *)
+            print_error "TWINKLE_RUN_EXISTING_ACTION 只能是 exit 或 restart，当前值: $TWINKLE_RUN_EXISTING_ACTION"
+            exit 1
+            ;;
+    esac
+
+    require_positive_int "TWINKLE_WATCHDOG_INTERVAL_SECONDS" "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
+    require_positive_int "TWINKLE_WATCHDOG_FAILURE_THRESHOLD" "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
+    require_non_negative_int "TWINKLE_RAY_GRACE_SECONDS" "$TWINKLE_RAY_GRACE_SECONDS"
+    require_non_negative_int "TWINKLE_HEALTH_GRACE_SECONDS" "$TWINKLE_HEALTH_GRACE_SECONDS"
+    require_non_negative_int "TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS" "$TWINKLE_SUPERVISOR_RESTART_BACKOFF_SECONDS"
+    require_non_negative_int "TWINKLE_SUPERVISOR_MAX_RESTARTS" "$TWINKLE_SUPERVISOR_MAX_RESTARTS"
+    require_positive_int "TWINKLE_RUN_RESTART_TIMEOUT_SECONDS" "$TWINKLE_RUN_RESTART_TIMEOUT_SECONDS"
+    require_non_negative_int "CPU_WORKER_COUNT" "$CPU_WORKER_COUNT"
+}
+
 wait_for_redis_ready() {
     local timeout="${1:-30}"
 
@@ -371,15 +412,59 @@ stop_pid() {
     kill -9 "$pid" 2>/dev/null || true
 }
 
-cleanup_runtime_children() {
+cleanup_existing_runtime() {
     stop_pid "$TAIL_PID" "日志 tail"
     stop_pid "$SERVER_PID" "Twinkle Server"
+    TAIL_PID=""
+    SERVER_PID=""
+
+    print_info "停止已有的 Twinkle Server..."
+    pkill -f "twinkle.server" 2>/dev/null || true
+
+    print_info "停止已有的 vLLM 进程..."
+    pkill -if "vLLM" 2>/dev/null || true
+
+    sleep 2
+
+    if pgrep -f "twinkle.server" > /dev/null 2>&1; then
+        print_warning "Twinkle Server 未退出，强制终止..."
+        pkill -9 -f "twinkle.server" 2>/dev/null || true
+    fi
+    if pgrep -if "vLLM" > /dev/null 2>&1; then
+        print_warning "vLLM 进程未退出，强制终止..."
+        pkill -9 -i -f "vLLM" 2>/dev/null || true
+    fi
+
+    print_info "停止已有的 Ray 集群..."
     ray stop --force >/dev/null 2>&1 || true
+
+    print_info "停止已有的 Redis..."
+    redis-cli -p 6380 shutdown nosave 2>/dev/null || pkill redis-server 2>/dev/null || true
+    if ! wait_for_redis_stopped 30; then
+        print_warning "Redis 未在 30 秒内退出，强制终止..."
+        pkill -9 redis-server 2>/dev/null || true
+        if ! wait_for_redis_stopped 10; then
+            print_error "Redis 端口 6380 未释放"
+            if command -v ss &> /dev/null; then
+                ss -lntp 2>/dev/null | grep ':6380 ' || true
+            fi
+            return 1
+        fi
+    fi
+
+    print_info "停止已有的 LGTM 观测栈..."
+    pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
+    pkill prometheus 2>/dev/null || true
+    pkill grafana 2>/dev/null || true
+    pkill otelcol 2>/dev/null || true
+    pkill loki 2>/dev/null || true
+    pkill tempo 2>/dev/null || true
+    pkill pyroscope 2>/dev/null || true
 }
 
 cleanup_script_exit() {
     trap - EXIT INT TERM
-    cleanup_runtime_children
+    cleanup_existing_runtime || true
     cleanup_pid_file
 }
 
@@ -436,293 +521,240 @@ parse_node_config() {
 # ============================================
 # 开始启动
 # ============================================
-run_service_once() {
-print_header "Twinkle Megatron 服务启动脚本"
+print_runtime_config() {
+    print_header "Twinkle Megatron 服务启动脚本"
 
-# 打印配置信息
-print_info "集群配置："
-echo ""
-
-# 解析并显示 Head 节点
-parse_node_config "$HEAD_NODE"
-if [ -n "$_gpu_devices" ]; then
-    echo "  [Head 节点]"
-    echo "    - GPU 设备: $_gpu_devices"
-    echo "    - GPU 数量: $_gpu_count"
-else
-    echo "  [Head 节点] CPU only"
-fi
-
-# 显示 GPU Worker 节点
-if [ ${#GPU_WORKERS[@]} -gt 0 ]; then
+    print_info "集群配置："
     echo ""
-    echo "  [GPU Worker 节点] 共 ${#GPU_WORKERS[@]} 个"
-    for i in "${!GPU_WORKERS[@]}"; do
-        parse_node_config "${GPU_WORKERS[$i]}"
-        echo "    Worker $((i+1)): GPU=$_gpu_devices, Count=$_gpu_count"
-    done
-fi
 
-# 显示 CPU Worker
-if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
+    parse_node_config "$HEAD_NODE"
+    if [ -n "$_gpu_devices" ]; then
+        echo "  [Head 节点]"
+        echo "    - GPU 设备: $_gpu_devices"
+        echo "    - GPU 数量: $_gpu_count"
+    else
+        echo "  [Head 节点] CPU only"
+    fi
+
+    if [ ${#GPU_WORKERS[@]} -gt 0 ]; then
+        echo ""
+        echo "  [GPU Worker 节点] 共 ${#GPU_WORKERS[@]} 个"
+        for i in "${!GPU_WORKERS[@]}"; do
+            parse_node_config "${GPU_WORKERS[$i]}"
+            echo "    Worker $((i+1)): GPU=$_gpu_devices, Count=$_gpu_count"
+        done
+    fi
+
+    if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
+        echo ""
+        echo "  [CPU Worker 节点] $CPU_WORKER_COUNT 个"
+    fi
+
     echo ""
-    echo "  [CPU Worker 节点] $CPU_WORKER_COUNT 个"
-fi
-
-echo ""
-print_info "运行参数："
-echo "  - Ray 地址: $RAY_ADDRESS"
-echo "  - 工作目录: $TWINKLE_WORK_DIR"
-echo "  - ModelScope 缓存: $MODELSCOPE_CACHE"
-echo "  - 临时目录: $TEMP_DIR"
-echo "  - 保存目录: $TWINKLE_DEFAULT_SAVE_DIR"
-echo "  - 服务配置: $SERVER_CONFIG_FILE"
-echo "  - 日志文件: $LOG_FILE"
-echo ""
-
-# 检查临时目录
-if [ ! -d "$TEMP_DIR" ]; then
-    print_info "创建临时目录: $TEMP_DIR"
-    mkdir -p "$TEMP_DIR"
-fi
-
-# ============================================
-# 停止已有服务（Redis / Ray / LGTM / Twinkle）
-# ============================================
-print_header "清理环境"
-
-# 停止 Twinkle server.py（twinkle.server 模块）
-print_info "停止已有的 Twinkle Server..."
-pkill -f "twinkle.server" 2>/dev/null || true
-
-# 停止 vLLM 进程
-print_info "停止已有的 vLLM 进程..."
-pkill -if "vLLM" 2>/dev/null || true
-
-# 等待上述进程退出
-sleep 2
-
-# 若仍有残留则强制 SIGKILL
-if pgrep -f "twinkle.server" > /dev/null 2>&1; then
-    print_warning "Twinkle Server 未退出，强制终止..."
-    pkill -9 -f "twinkle.server" 2>/dev/null || true
-fi
-if pgrep -if "vLLM" > /dev/null 2>&1; then
-    print_warning "vLLM 进程未退出，强制终止..."
-    pkill -9 -i -f "vLLM" 2>/dev/null || true
-fi
-
-print_info "停止已有的 Ray 集群..."
-ray stop --force 2>/dev/null || true
-
-print_info "停止已有的 Redis..."
-redis-cli -p 6380 shutdown nosave 2>/dev/null || pkill redis-server 2>/dev/null || true
-if ! wait_for_redis_stopped 30; then
-    print_warning "Redis 未在 30 秒内退出，强制终止..."
-    pkill -9 redis-server 2>/dev/null || true
-    if ! wait_for_redis_stopped 10; then
-        print_error "Redis 端口 6380 未释放"
-        if command -v ss &> /dev/null; then
-            ss -lntp 2>/dev/null | grep ':6380 ' || true
-        fi
-        exit 1
-    fi
-fi
-
-print_info "停止已有的 LGTM 观测栈..."
-pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
-pkill prometheus 2>/dev/null || true
-pkill grafana 2>/dev/null || true
-pkill otelcol 2>/dev/null || true
-pkill loki 2>/dev/null || true
-pkill tempo 2>/dev/null || true
-pkill pyroscope 2>/dev/null || true
-
-# ============================================
-# 启动 Redis
-# ============================================
-print_header "启动 Redis"
-
-if command -v redis-server &> /dev/null && command -v redis-cli &> /dev/null; then
-    print_info "启动 Redis..."
-    redis-server --daemonize yes --port 6380 --save "" --appendonly no --logfile "$REDIS_LOG_FILE"
-    if wait_for_redis_ready 30; then
-        print_success "Redis 已启动 (port 6380)"
-    else
-        print_error "Redis 未能在 30 秒内启动或响应 PING (port 6380)"
-        if [ -f "$REDIS_LOG_FILE" ]; then
-            tail -n 50 "$REDIS_LOG_FILE"
-        fi
-        exit 1
-    fi
-else
-    print_error "未检测到 redis-server 或 redis-cli，但 server_config.yaml 使用 redis persistence"
-    exit 1
-fi
-
-# ============================================
-# 启动 Ray Head 节点
-# ============================================
-print_header "启动 Ray 集群"
-
-parse_node_config "$HEAD_NODE"
-if [ -n "$_gpu_devices" ]; then
-    print_info "启动 Head 节点 (GPU: $_gpu_devices)..."
-    CUDA_VISIBLE_DEVICES="$_gpu_devices" ray start --head \
-        --port=$RAY_PORT \
-        --num-gpus=$_gpu_count \
-        --disable-usage-stats \
-        --include-dashboard=true \
-        --temp-dir="$TEMP_DIR"
-else
-    print_info "启动 Head 节点 (CPU only)..."
-    CUDA_VISIBLE_DEVICES="" ray start --head \
-        --port=$RAY_PORT \
-        --num-gpus=0 \
-        --disable-usage-stats \
-        --include-dashboard=true \
-        --temp-dir="$TEMP_DIR"
-fi
-print_success "Head 节点启动成功！"
-
-# ============================================
-# 启动 GPU Worker 节点
-# ============================================
-for i in "${!GPU_WORKERS[@]}"; do
-    parse_node_config "${GPU_WORKERS[$i]}"
-    print_info "启动 GPU Worker $((i+1)) (GPU: $_gpu_devices)..."
-    CUDA_VISIBLE_DEVICES="$_gpu_devices" ray start \
-        --address=$RAY_ADDRESS \
-        --num-gpus=$_gpu_count
-    print_success "GPU Worker $((i+1)) 启动成功！"
-done
-
-# ============================================
-# 启动 CPU Worker 节点
-# ============================================
-if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
-    print_info "启动 $CPU_WORKER_COUNT 个 CPU Worker..."
-    for ((i=1; i<=CPU_WORKER_COUNT; i++)); do
-        CUDA_VISIBLE_DEVICES="" ray start \
-            --address=$RAY_ADDRESS \
-            --num-gpus=0
-    done
-    print_success "CPU Worker 启动成功！"
-fi
-
-# ============================================
-# 显示集群状态
-# ============================================
-echo ""
-print_info "集群状态："
-ray status 2>/dev/null || true
-
-# ============================================
-# 启动 LGTM 观测栈（Grafana + OTel Collector + Prometheus + Tempo + Loki）
-# ============================================
-print_header "启动 LGTM 观测栈（可选）"
-
-if [ -d "/otel-lgtm" ]; then
-    if [ -f /otel-lgtm/prometheus.yaml.orig ]; then
-        cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
-    fi
-
-    print_info "启动 LGTM 观测栈..."
-    rm -f /tmp/ready
-    export LGTM_VERSION GRAFANA_VERSION PROMETHEUS_VERSION TEMPO_VERSION LOKI_VERSION
-    export PYROSCOPE_VERSION OPENTELEMETRY_COLLECTOR_VERSION OBI_VERSION
-    (cd /otel-lgtm && exec nohup ./run-all.sh > /twinkle/lgtm.log 2>&1) &
-    LGTM_PID=$!
-
-    if wait_for_lgtm_ready "$LGTM_PID" 120; then
-        print_success "LGTM 观测栈已启动"
-        echo "  - Grafana:   http://localhost:3000 (admin/admin)"
-        echo "  - OTLP gRPC: localhost:4317"
-        echo "  - OTLP HTTP: localhost:4318"
-        echo "  - 日志文件:  /twinkle/lgtm.log"
-    else
-        print_warning "LGTM 观测栈未在 120 秒内就绪，Twinkle 将继续启动"
-        echo "  - 日志文件: /twinkle/lgtm.log"
-    fi
-else
-    print_warning "未检测到 LGTM 观测栈 (/otel-lgtm)，跳过"
-fi
-
-# ============================================
-# 启动 Twinkle 服务器
-# ============================================
-print_header "启动 Twinkle 服务器"
-
-print_info "日志输出到: $LOG_FILE"
-echo ""
-
-# 启动服务器并实时显示日志
-touch "$LOG_FILE"  # 预创建文件，避免 tail -f 在文件尚未写入时报错
-nohup python -m twinkle.server launch --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
-SERVER_PID=$!
-print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
-
-# 实时显示日志。tail 只负责输出日志，不能作为服务健康的唯一保活进程。
-start_log_tail
-trap cleanup_script_exit EXIT
-trap handle_shutdown_signal INT TERM
-
-print_info "Watchdog 已启动"
-echo "  - Health URL: $TWINKLE_HEALTH_URL"
-echo "  - Interval: ${TWINKLE_WATCHDOG_INTERVAL_SECONDS}s"
-echo "  - Failure threshold: $TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
-echo "  - Ray grace: ${TWINKLE_RAY_GRACE_SECONDS}s"
-echo "  - Health grace: ${TWINKLE_HEALTH_GRACE_SECONDS}s"
-
-WATCHDOG_FAILURES=0
-WATCHDOG_STARTED_AT=$(date +%s)
-while true; do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
-        print_watchdog_diagnostics
-        SERVICE_RESTART_REQUESTED=1
-        return 0
-    fi
-
-    if ! kill -0 "$TAIL_PID" 2>/dev/null; then
-        print_warning "日志 tail 进程已退出，重新启动..."
-        start_log_tail
-    fi
-
-    WATCHDOG_FAILURE_REASON=""
-    WATCHDOG_GRACE_SECONDS=0
-    if ! timeout 10 ray status >/dev/null 2>&1; then
-        WATCHDOG_FAILURE_REASON="ray status failed"
-        WATCHDOG_GRACE_SECONDS="$TWINKLE_RAY_GRACE_SECONDS"
-    elif ! check_http_health; then
-        WATCHDOG_FAILURE_REASON="http health check failed: $TWINKLE_HEALTH_URL"
-        WATCHDOG_GRACE_SECONDS="$TWINKLE_HEALTH_GRACE_SECONDS"
-    fi
-
-    if [ -z "$WATCHDOG_FAILURE_REASON" ]; then
-        WATCHDOG_FAILURES=0
-    else
-        WATCHDOG_ELAPSED=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
-        if [ "$WATCHDOG_ELAPSED" -lt "$WATCHDOG_GRACE_SECONDS" ]; then
-            print_warning "Watchdog 启动宽限期内检查失败 (${WATCHDOG_ELAPSED}s/${WATCHDOG_GRACE_SECONDS}s): $WATCHDOG_FAILURE_REASON"
-        else
-            WATCHDOG_FAILURES=$((WATCHDOG_FAILURES + 1))
-            print_warning "Watchdog 检查失败 ($WATCHDOG_FAILURES/$TWINKLE_WATCHDOG_FAILURE_THRESHOLD): $WATCHDOG_FAILURE_REASON"
-        fi
-    fi
-
-    if [ "$WATCHDOG_FAILURES" -ge "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD" ]; then
-        print_error "Watchdog 连续失败达到阈值，准备重启服务"
-        print_watchdog_diagnostics
-        SERVICE_RESTART_REQUESTED=1
-        return 0
-    fi
-
-    sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
-done
+    print_info "运行参数："
+    echo "  - Ray 地址: $RAY_ADDRESS"
+    echo "  - 工作目录: $TWINKLE_WORK_DIR"
+    echo "  - ModelScope 缓存: $MODELSCOPE_CACHE"
+    echo "  - 临时目录: $TEMP_DIR"
+    echo "  - 保存目录: $TWINKLE_DEFAULT_SAVE_DIR"
+    echo "  - 服务配置: $SERVER_CONFIG_FILE"
+    echo "  - 日志文件: $LOG_FILE"
+    echo ""
 }
 
+prepare_runtime_dirs() {
+    if [ ! -d "$TEMP_DIR" ]; then
+        print_info "创建临时目录: $TEMP_DIR"
+        mkdir -p "$TEMP_DIR"
+    fi
+}
+
+start_redis() {
+    print_header "启动 Redis"
+
+    if command -v redis-server &> /dev/null && command -v redis-cli &> /dev/null; then
+        print_info "启动 Redis..."
+        redis-server --daemonize yes --port 6380 --save "" --appendonly no --logfile "$REDIS_LOG_FILE"
+        if wait_for_redis_ready 30; then
+            print_success "Redis 已启动 (port 6380)"
+        else
+            print_error "Redis 未能在 30 秒内启动或响应 PING (port 6380)"
+            if [ -f "$REDIS_LOG_FILE" ]; then
+                tail -n 50 "$REDIS_LOG_FILE"
+            fi
+            exit 1
+        fi
+    else
+        print_error "未检测到 redis-server 或 redis-cli，但 server_config.yaml 使用 redis persistence"
+        exit 1
+    fi
+}
+
+start_ray_cluster() {
+    print_header "启动 Ray 集群"
+
+    parse_node_config "$HEAD_NODE"
+    if [ -n "$_gpu_devices" ]; then
+        print_info "启动 Head 节点 (GPU: $_gpu_devices)..."
+        CUDA_VISIBLE_DEVICES="$_gpu_devices" ray start --head \
+            --port=$RAY_PORT \
+            --num-gpus=$_gpu_count \
+            --disable-usage-stats \
+            --include-dashboard=true \
+            --temp-dir="$TEMP_DIR"
+    else
+        print_info "启动 Head 节点 (CPU only)..."
+        CUDA_VISIBLE_DEVICES="" ray start --head \
+            --port=$RAY_PORT \
+            --num-gpus=0 \
+            --disable-usage-stats \
+            --include-dashboard=true \
+            --temp-dir="$TEMP_DIR"
+    fi
+    print_success "Head 节点启动成功！"
+
+    for i in "${!GPU_WORKERS[@]}"; do
+        parse_node_config "${GPU_WORKERS[$i]}"
+        print_info "启动 GPU Worker $((i+1)) (GPU: $_gpu_devices)..."
+        CUDA_VISIBLE_DEVICES="$_gpu_devices" ray start \
+            --address=$RAY_ADDRESS \
+            --num-gpus=$_gpu_count
+        print_success "GPU Worker $((i+1)) 启动成功！"
+    done
+
+    if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
+        print_info "启动 $CPU_WORKER_COUNT 个 CPU Worker..."
+        for ((i=1; i<=CPU_WORKER_COUNT; i++)); do
+            CUDA_VISIBLE_DEVICES="" ray start \
+                --address=$RAY_ADDRESS \
+                --num-gpus=0
+        done
+        print_success "CPU Worker 启动成功！"
+    fi
+
+    echo ""
+    print_info "集群状态："
+    ray status 2>/dev/null || true
+}
+
+start_lgtm() {
+    print_header "启动 LGTM 观测栈（可选）"
+
+    if [ -d "/otel-lgtm" ]; then
+        if [ -f /otel-lgtm/prometheus.yaml.orig ]; then
+            cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
+        fi
+
+        print_info "启动 LGTM 观测栈..."
+        rm -f /tmp/ready
+        export LGTM_VERSION GRAFANA_VERSION PROMETHEUS_VERSION TEMPO_VERSION LOKI_VERSION
+        export PYROSCOPE_VERSION OPENTELEMETRY_COLLECTOR_VERSION OBI_VERSION
+        (cd /otel-lgtm && exec nohup ./run-all.sh > /twinkle/lgtm.log 2>&1) &
+        LGTM_PID=$!
+
+        if wait_for_lgtm_ready "$LGTM_PID" 120; then
+            print_success "LGTM 观测栈已启动"
+            echo "  - Grafana:   http://localhost:3000 (admin/admin)"
+            echo "  - OTLP gRPC: localhost:4317"
+            echo "  - OTLP HTTP: localhost:4318"
+            echo "  - 日志文件:  /twinkle/lgtm.log"
+        else
+            print_warning "LGTM 观测栈未在 120 秒内就绪，Twinkle 将继续启动"
+            echo "  - 日志文件: /twinkle/lgtm.log"
+        fi
+    else
+        print_warning "未检测到 LGTM 观测栈 (/otel-lgtm)，跳过"
+    fi
+}
+
+start_twinkle_server() {
+    print_header "启动 Twinkle 服务器"
+
+    print_info "日志输出到: $LOG_FILE"
+    echo ""
+
+    touch "$LOG_FILE"
+    nohup python -m twinkle.server launch --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    SERVER_PID=$!
+    print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
+
+    start_log_tail
+}
+
+watch_runtime() {
+    print_info "Watchdog 已启动"
+    echo "  - Health URL: $TWINKLE_HEALTH_URL"
+    echo "  - Interval: ${TWINKLE_WATCHDOG_INTERVAL_SECONDS}s"
+    echo "  - Failure threshold: $TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
+    echo "  - Ray grace: ${TWINKLE_RAY_GRACE_SECONDS}s"
+    echo "  - Health grace: ${TWINKLE_HEALTH_GRACE_SECONDS}s"
+
+    WATCHDOG_FAILURES=0
+    WATCHDOG_STARTED_AT=$(date +%s)
+    while true; do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
+            print_watchdog_diagnostics
+            SERVICE_RESTART_REQUESTED=1
+            return 0
+        fi
+
+        if ! kill -0 "$TAIL_PID" 2>/dev/null; then
+            print_warning "日志 tail 进程已退出，重新启动..."
+            start_log_tail
+        fi
+
+        WATCHDOG_FAILURE_REASON=""
+        WATCHDOG_GRACE_SECONDS=0
+        if ! timeout 10 ray status >/dev/null 2>&1; then
+            WATCHDOG_FAILURE_REASON="ray status failed"
+            WATCHDOG_GRACE_SECONDS="$TWINKLE_RAY_GRACE_SECONDS"
+        elif ! check_http_health; then
+            WATCHDOG_FAILURE_REASON="http health check failed: $TWINKLE_HEALTH_URL"
+            WATCHDOG_GRACE_SECONDS="$TWINKLE_HEALTH_GRACE_SECONDS"
+        fi
+
+        if [ -z "$WATCHDOG_FAILURE_REASON" ]; then
+            WATCHDOG_FAILURES=0
+        else
+            WATCHDOG_ELAPSED=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
+            if [ "$WATCHDOG_ELAPSED" -lt "$WATCHDOG_GRACE_SECONDS" ]; then
+                print_warning "Watchdog 启动宽限期内检查失败 (${WATCHDOG_ELAPSED}s/${WATCHDOG_GRACE_SECONDS}s): $WATCHDOG_FAILURE_REASON"
+            else
+                WATCHDOG_FAILURES=$((WATCHDOG_FAILURES + 1))
+                print_warning "Watchdog 检查失败 ($WATCHDOG_FAILURES/$TWINKLE_WATCHDOG_FAILURE_THRESHOLD): $WATCHDOG_FAILURE_REASON"
+            fi
+        fi
+
+        if [ "$WATCHDOG_FAILURES" -ge "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD" ]; then
+            print_error "Watchdog 连续失败达到阈值，准备重启服务"
+            print_watchdog_diagnostics
+            SERVICE_RESTART_REQUESTED=1
+            return 0
+        fi
+
+        sleep "$TWINKLE_WATCHDOG_INTERVAL_SECONDS"
+    done
+}
+
+run_service_once() {
+    print_runtime_config
+    prepare_runtime_dirs
+    print_header "清理环境"
+    cleanup_existing_runtime
+    start_redis
+    start_ray_cluster
+    start_lgtm
+    start_twinkle_server
+    watch_runtime
+}
+
+validate_runtime_config
+mkdir -p "$TWINKLE_WORK_DIR"
+cd "$TWINKLE_WORK_DIR"
 acquire_run_lock
+trap cleanup_script_exit EXIT
+trap handle_shutdown_signal INT TERM
 
 SUPERVISOR_RESTARTS=0
 while true; do
@@ -735,7 +767,7 @@ while true; do
         exit 0
     fi
 
-    cleanup_runtime_children
+    cleanup_existing_runtime
     SUPERVISOR_RESTARTS=$((SUPERVISOR_RESTARTS + 1))
     if [ "$TWINKLE_SUPERVISOR_MAX_RESTARTS" -gt 0 ] && [ "$SUPERVISOR_RESTARTS" -gt "$TWINKLE_SUPERVISOR_MAX_RESTARTS" ]; then
         print_error "服务重启次数超过上限 ($TWINKLE_SUPERVISOR_MAX_RESTARTS)，退出"
