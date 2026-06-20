@@ -29,8 +29,10 @@
 #   TWINKLE_HEALTH_GRACE_SECONDS             HTTP health 启动宽限秒数（默认 300）
 #
 # 示例：
+#   bash /twinkle/cookbook/client/server/megatron/entrypoint.sh
+#                                               # 容器启动入口，负责 run.sh 进程级保活
 #   bash /twinkle/cookbook/client/server/megatron/run.sh
-#                                               # 容器启动时直接运行，默认进入前台 watchdog
+#                                               # 直接启动服务，默认进入前台 watchdog
 #   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
 #                                               # 更新代码后请求已有 supervisor 重启服务
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
@@ -139,8 +141,10 @@ print_usage() {
   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
 示例:
+  bash /twinkle/cookbook/client/server/megatron/entrypoint.sh
+                                                # 容器启动入口，负责 run.sh 进程级保活
   bash /twinkle/cookbook/client/server/megatron/run.sh
-                                                # 容器启动时直接运行，默认进入前台 watchdog
+                                                # 直接启动服务，默认进入前台 watchdog
   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
                                                 # 更新代码后请求已有 supervisor 重启服务
   ./run.sh                                      # 使用默认配置
