@@ -132,6 +132,15 @@ def build_deployment_app(
             return await call_next(request)
 
     @app.middleware('http')
+    async def catch_unhandled_exceptions(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            error = traceback.format_exc()
+            logger.error(error)
+            return JSONResponse(status_code=500, content={'detail': error})
+
+    @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
@@ -149,15 +158,6 @@ def build_deployment_app(
             except Exception:
                 pass
             return response
-
-    @app.middleware('http')
-    async def catch_unhandled_exceptions(request: Request, call_next):
-        try:
-            return await call_next(request)
-        except Exception:
-            error = traceback.format_exc()
-            logger.error(error)
-            return JSONResponse(status_code=500, content={'detail': error})
 
     register_routes(app, get_servable)
     return app

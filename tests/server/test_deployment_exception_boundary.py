@@ -31,3 +31,30 @@ def test_deployment_app_returns_traceback_and_keeps_serving_after_unhandled_rout
     response = client.get('/healthz')
     assert response.status_code == 200
     assert response.json() == {'ok': True, 'health_calls': 1}
+
+
+def test_deployment_app_adds_replica_header_to_unhandled_route_exception(monkeypatch):
+
+    class _ReplicaId:
+        unique_id = 'replica-test'
+
+    class _Context:
+        replica_id = _ReplicaId()
+
+    from twinkle.server import deployment
+
+    monkeypatch.setattr(deployment.serve, 'get_replica_context', lambda: _Context())
+
+    def register_routes(app: FastAPI, _get_self):
+
+        @app.get('/boom')
+        async def boom():
+            raise RuntimeError('boom with replica header')
+
+    app = build_deployment_app('Test', register_routes, attach_replica_id_header=True)
+    client = TestClient(app)
+
+    response = client.get('/boom', headers={'x-request-id': 'boundary-test'})
+    assert response.status_code == 500
+    assert response.headers['X-Twinkle-Replica-Id'] == 'replica-test'
+    assert 'RuntimeError: boom with replica header' in response.json()['detail']

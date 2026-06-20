@@ -137,10 +137,7 @@ class ComputeWorker:
             task.request_id,
             TaskStatus.FAILED.value,
             task.model_id,
-            result={
-                'error': error,
-                'category': 'Server'
-            },
+            result=task_error_payload(error),
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
         )
@@ -244,12 +241,7 @@ class ComputeWorker:
             error = traceback.format_exc()
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.FAILED.value,
-                task.model_id,
-                result=task_error_payload(error),
-                queue_state=QueueState.ACTIVE.value)
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
         finally:
             q.task_done()
             self._record_execution_time(task_type, exec_time)
