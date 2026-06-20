@@ -317,25 +317,50 @@ class ToolExecutor:
         """Unified ModelScope Hub search for models or datasets."""
 
         def _search():
-            from modelscope.hub.api import HubApi
-            api = HubApi()
             if resource_type == 'datasets':
-                results = api.list_datasets(dataset_name=query, limit=limit)
-                id_field, name_field = 'dataset_id', 'dataset_name'
+                return self._search_datasets_impl(query, limit)
             else:
-                results = api.list_models(model_name=query, limit=limit)
-                id_field, name_field = 'model_id', 'model_name'
-            return [
-                {'id': getattr(r, id_field, getattr(r, 'id', str(r))),
-                 'name': getattr(r, name_field, getattr(r, 'name', str(r)))}
-                for r in results
-            ]
+                return self._search_models_impl(query, limit)
 
         try:
             items = await asyncio.get_event_loop().run_in_executor(None, _search)
             return {'query': query, 'results': items}
         except Exception as e:
             return {'error': f'{resource_type.title()} search failed: {e}'}
+
+    @staticmethod
+    def _search_datasets_impl(query: str, limit: int) -> list[dict]:
+        """Search datasets via ModelScope SDK (new API)."""
+        from modelscope.hub.api import HubApi
+        api = HubApi()
+        result = api.list_datasets('', search=query, page_size=limit)
+        datasets = result.get('datasets', [])
+        return [
+            {'id': d.get('id', ''), 'name': d.get('display_name', d.get('id', ''))}
+            for d in datasets
+        ]
+
+    @staticmethod
+    def _search_models_impl(query: str, limit: int) -> list[dict]:
+        """Search models via ModelScope HTTP API (SDK doesn't support search)."""
+        import requests
+        resp = requests.put(
+            'https://modelscope.cn/api/v1/models/',
+            json={'Name': query, 'PageSize': limit, 'PageNumber': 1},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get('Success'):
+            raise RuntimeError(data.get('Message', 'Unknown error'))
+        models = data.get('Data', {}).get('Models', [])
+        return [
+            {
+                'id': f"{m.get('Path', '')}/{m.get('Name', '')}",
+                'name': m.get('ChineseName') or m.get('Name', ''),
+            }
+            for m in models
+        ]
 
     # ── Metrics chart ──
 
