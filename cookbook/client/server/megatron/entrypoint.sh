@@ -7,9 +7,8 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TWINKLE_RUN_SCRIPT="${TWINKLE_RUN_SCRIPT:-$SCRIPT_DIR/run.sh}"
+RUN_SCRIPT="$SCRIPT_DIR/run.sh"
 RESTART_BACKOFF_SECONDS=10
-export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/dashscope/caches/application/.cache}"
 
 CHILD_PID=""
 
@@ -25,12 +24,12 @@ trap stop_child_and_exit TERM INT
 
 case "${1:-}" in
     --help|-h|--restart)
-        exec bash "$TWINKLE_RUN_SCRIPT" "$@"
+        exec bash "$RUN_SCRIPT" "$@"
         ;;
 esac
 
 while true; do
-    bash "$TWINKLE_RUN_SCRIPT" "$@" &
+    bash "$RUN_SCRIPT" "$@" &
     CHILD_PID=$!
 
     wait "$CHILD_PID"
