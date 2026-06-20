@@ -62,12 +62,31 @@ validate_entrypoint_config() {
 
     require_command timeout
     require_command ray
-    require_command python
     require_command tail
+
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null \
+        && ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+        print_error "缺少 HTTP health 检查命令: curl, wget, python3 或 python"
+        exit 1
+    fi
 }
 
 check_http_health() {
-    python - "$TWINKLE_HEALTH_URL" <<'PY'
+    if command -v curl &> /dev/null; then
+        curl -fsS --max-time 10 "$TWINKLE_HEALTH_URL" >/dev/null
+        return
+    fi
+
+    if command -v wget &> /dev/null; then
+        wget -q --spider --timeout=10 "$TWINKLE_HEALTH_URL"
+        return
+    fi
+
+    local python_bin="python3"
+    if ! command -v "$python_bin" &> /dev/null; then
+        python_bin="python"
+    fi
+    "$python_bin" - "$TWINKLE_HEALTH_URL" <<'PY'
 import sys
 import urllib.request
 
@@ -123,7 +142,7 @@ while true; do
     CHILD_PID=$!
 
     WATCHDOG_FAILURES=0
-    WATCHDOG_STARTED_AT=$(date +%s)
+    WATCHDOG_STARTED_AT=$SECONDS
     EXIT_CODE=0
 
     while true; do
@@ -147,7 +166,7 @@ while true; do
         if [ -z "$WATCHDOG_FAILURE_REASON" ]; then
             WATCHDOG_FAILURES=0
         else
-            WATCHDOG_ELAPSED=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
+            WATCHDOG_ELAPSED=$(( SECONDS - WATCHDOG_STARTED_AT ))
             if [ "$WATCHDOG_ELAPSED" -lt "$WATCHDOG_GRACE_SECONDS" ]; then
                 print_warning "EntryPoint watchdog 启动宽限期内检查失败 (${WATCHDOG_ELAPSED}s/${WATCHDOG_GRACE_SECONDS}s): $WATCHDOG_FAILURE_REASON"
             else

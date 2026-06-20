@@ -264,10 +264,11 @@ def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_
     it the outermost middleware.
     """
     names = _registered_http_middleware_names(app)
-    expected = ['catch_unhandled_exceptions']
+    expected = []
     if expect_replica_id:
         expected.append('inject_replica_id')
     expected.extend(['metrics_middleware', 'tracing_middleware', 'verify_token'])
+    expected.append('catch_unhandled_exceptions')
     if expect_cleanup:
         expected.append('ensure_state_cleanup_started')
     assert names == expected, (f'middleware ordering mismatch — expected (outermost→innermost) '
