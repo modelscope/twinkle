@@ -138,7 +138,7 @@ esac
 validate_entrypoint_config
 
 while true; do
-    bash "$RUN_SCRIPT" "$@" &
+    TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-restart}" bash "$RUN_SCRIPT" "$@" &
     CHILD_PID=$!
 
     WATCHDOG_FAILURES=0
