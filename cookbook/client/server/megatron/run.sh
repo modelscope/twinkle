@@ -280,7 +280,7 @@ find_existing_run_pid() {
             echo "$pid"
             return 0
         fi
-    done < <(pgrep -f "$RUN_SCRIPT_PATH" 2>/dev/null || true)
+    done < <(ps -eo pid= 2>/dev/null || true)
 
     return 1
 }
