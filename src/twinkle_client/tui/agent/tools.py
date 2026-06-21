@@ -655,7 +655,7 @@ class ToolExecutor:
                 'ray_actor_options': {
                     'num_cpus': 0.1,
                     'runtime_env': {
-                        'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '0'},
+                        'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'},
                     },
                 },
             }],
@@ -710,7 +710,7 @@ class ToolExecutor:
                     'ray_actor_options': {
                         'num_cpus': 0.1,
                         'runtime_env': {
-                            'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '0'},
+                            'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'},
                         },
                     },
                 }],

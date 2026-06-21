@@ -1,36 +1,94 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
-"""Training monitor - LLM-driven periodic analysis of metrics and logs."""
+"""Training monitor - LLM-driven periodic health check.
+
+Every poll cycle, the monitor gathers ALL available signals about the current
+training run (process status, stderr, metrics, logs) and feeds them to the LLM.
+The LLM decides:
+- LGTM: everything normal, no action needed
+- WARNING: report an observation to the user (metrics anomaly, slow progress, etc.)
+- FIX: the script has a bug → LLM outputs a fixed script → monitor applies it and restarts
+
+This unified approach handles crashes, hangs, abnormal training, and metrics
+anomalies in a single loop without separate hard-coded detection logic.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from twinkle.utils.logger import get_logger
+import re
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 from openai import AsyncOpenAI
 
-from twinkle_client.tui.agent.prompts import MONITOR_SYSTEM_PROMPT
+from twinkle.utils.logger import get_logger
 from twinkle_client.tui.connection import LocalConnection
 
 logger = get_logger()
 
-# Prefix the LLM must use when no issue is found
-_NORMAL_PREFIX = 'LGTM'
+# Maximum auto-fix attempts per run (prevent infinite retry loops)
+_MAX_FIX_ATTEMPTS = 3
+
+MONITOR_SYSTEM_PROMPT = """\
+You are an automated ML training health monitor. Every ~30 seconds you receive a \
+snapshot of ALL signals from a training run. Your job is to analyze and decide \
+what action (if any) to take.
+
+## Signals you will receive
+
+- **Process status**: alive / zombie / exited / unknown
+- **stderr.log tail**: recent stderr output (may contain errors or warnings)
+- **Metrics**: recent training metrics (loss, reward, lr, etc.)
+- **Stall duration**: seconds since last new metric was produced
+
+## Decision framework
+
+1. **LGTM** — training is progressing normally.
+   - Process alive, metrics flowing, no errors in stderr, loss trending down.
+   - Respond: `LGTM`
+
+2. **WARNING** — something worth noting but not script-breaking.
+   - Loss plateau, reward hacking, KL explosion, entropy collapse, stall < 5 min, etc.
+   - Respond with a BRIEF (1-3 sentence) observation + suggestion.
+
+3. **FIX** — the script has crashed or is broken and needs code changes.
+   - Process dead/zombie with error traceback in stderr.
+   - Server returned an error (400/500) that indicates a code bug.
+   - Process stuck > 10 minutes with no metrics AND stderr shows an error.
+   - Respond in this EXACT format:
+```diagnosis
+<1-2 sentence root cause>
+```
+```python
+<complete fixed training script>
+```
+
+## Rules
+- Be direct and actionable.
+- Respond in the same language as the log content (Chinese or English).
+- NEVER start with LGTM if there is any issue.
+- For FIX: output the COMPLETE fixed script, not a diff.
+- Common fixes:
+  - "Batch size N must be >= data world size M" → increase batch_size to M
+  - "save_dir does not exist on the server" → remove the save_dir parameter
+  - Import errors → fix the import
+  - Connection refused → check base_url
+- Do NOT suggest FIX for transient issues (network blip, temporary stall < 5 min).
+- If process is alive and metrics are flowing but stale for < 3 min, say LGTM.
+"""
 
 
 class TrainingMonitor:
-    """Background task that periodically feeds metrics to LLM for analysis.
+    """Unified LLM-driven training health monitor.
 
-    Instead of hard-coded rules, the LLM reasons about training signals:
-    loss trends, reward dynamics, gradient norms, KL divergence, entropy, etc.
-
-    Uses get_metrics() (full read with last_n) instead of get_new_metrics()
-    to avoid offset contention with the UI polling loop.
+    Every poll cycle, collects all available signals and asks the LLM
+    to analyze. The LLM may respond with LGTM, a warning, or a FIX
+    (complete fixed script). The monitor applies fixes automatically.
     """
 
-    # Maximum data points to send to LLM per analysis cycle
-    _MAX_METRICS_FOR_LLM = 50
+    _MAX_METRICS_FOR_LLM = 30
 
     def __init__(
         self,
@@ -47,14 +105,19 @@ class TrainingMonitor:
         self.poll_interval = poll_interval
         self._client = AsyncOpenAI(base_url=llm_base_url, api_key=llm_api_key)
         self._running = True
-        self._last_analyzed_step: int = -1
+        # Track state per run
         self._last_analyzed_run_id: str | None = None
+        self._last_metric_time: float = time.time()
+        self._last_metric_step: int = -1
+        self._fix_attempts: dict[str, int] = {}
+        # Avoid spamming: don't re-analyze if nothing changed
+        self._last_snapshot_hash: str = ''
 
     async def run(self) -> None:
         """Main monitoring loop."""
         while self._running:
             try:
-                await self._analyze()
+                await self._check()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -64,102 +127,254 @@ class TrainingMonitor:
     def stop(self) -> None:
         self._running = False
 
-    async def _analyze(self) -> None:
-        """Collect recent metrics + logs, ask LLM to analyze.
+    # ──────────────────────────────────────────────────────────────────────
+    # Core: gather signals → ask LLM → act on response
+    # ──────────────────────────────────────────────────────────────────────
 
-        Uses get_metrics(last_n=N) which is a full read (no offset).
-        This avoids competing with the UI's incremental poll for the same offset.
-        The _last_analyzed_step guard prevents re-analyzing unchanged data.
-        """
+    async def _check(self) -> None:
+        """Single monitoring cycle."""
         if not self.connection.current_run_id:
             return
 
         run_id = self.connection.current_run_id
 
-        # Auto-reset when monitoring a different run
+        # Reset when switching runs
         if run_id != self._last_analyzed_run_id:
-            self._last_analyzed_step = -1
             self._last_analyzed_run_id = run_id
+            self._last_metric_time = time.time()
+            self._last_metric_step = -1
+            self._last_snapshot_hash = ''
 
-        # Full read of last N metrics (does NOT advance any shared offset)
-        metrics = self.connection.get_metrics(run_id, last_n=self._MAX_METRICS_FOR_LLM)
-        if not metrics:
-            return
-
-        # Skip if no new steps since last analysis
-        latest_step = metrics[-1].get('step', 0)
-        if latest_step <= self._last_analyzed_step:
-            return
-
-        # Get status to check if training is still active
+        # Skip if already completed/stopped by user
         status = self.connection.get_status(run_id)
-        if status in ('stopped', 'completed', 'error', 'paused'):
-            return  # Don't analyze inactive runs
+        if status in ('completed', 'stopped', 'paused'):
+            return
 
-        # Format and analyze
-        data_summary = self._format_for_llm(metrics)
-        response = await self._call_llm(data_summary)
+        # Gather all signals
+        snapshot = self._gather_snapshot(run_id, status)
 
-        # Always update step marker
-        self._last_analyzed_step = latest_step
+        # Dedup: skip if snapshot hasn't meaningfully changed
+        snapshot_hash = self._hash_snapshot(snapshot)
+        if snapshot_hash == self._last_snapshot_hash:
+            return
+        self._last_snapshot_hash = snapshot_hash
 
-        if response:
-            self.on_message(f'[Monitor] {response}')
+        # Ask LLM
+        llm_response = await self._ask_llm(snapshot)
+        if llm_response is None:
+            return
 
-    def _format_for_llm(self, metrics: list[dict[str, Any]]) -> str:
-        """Format metrics into a concise text block for LLM."""
+        # Parse and act
+        await self._act_on_response(run_id, llm_response, snapshot)
+
+    def _gather_snapshot(self, run_id: str, status: str) -> dict[str, Any]:
+        """Gather all health signals for the run."""
+        run_dir = self.connection.base_dir / run_id
+
+        # Process status
+        meta = self.connection.get_meta(run_id) or {}
+        pid = meta.get('pid')
+        process_status = 'unknown'
+        if pid:
+            if self.connection._is_process_alive(pid):
+                process_status = 'alive'
+            else:
+                process_status = 'dead'
+
+        # stderr.log tail (last 1500 chars, focus on errors)
+        stderr_tail = ''
+        stderr_file = run_dir / 'stderr.log'
+        if stderr_file.exists():
+            try:
+                content = stderr_file.read_text(errors='replace')
+                # Extract traceback if present
+                tb_idx = content.rfind('Traceback (most recent call last)')
+                if tb_idx >= 0:
+                    stderr_tail = content[tb_idx:][-1500:]
+                elif len(content) > 1500:
+                    stderr_tail = content[-1500:]
+                else:
+                    stderr_tail = content
+            except Exception:
+                pass
+
+        # Metrics
+        metrics = self.connection.get_metrics(run_id, last_n=self._MAX_METRICS_FOR_LLM)
+
+        # Update stall tracking
+        if metrics:
+            latest_step = metrics[-1].get('step', 0)
+            if latest_step > self._last_metric_step:
+                self._last_metric_step = latest_step
+                self._last_metric_time = time.time()
+
+        stall_seconds = time.time() - self._last_metric_time
+
+        return {
+            'run_id': run_id,
+            'meta_status': status,
+            'process_status': process_status,
+            'stderr_tail': stderr_tail.strip(),
+            'metrics': metrics,
+            'stall_seconds': int(stall_seconds),
+            'fix_attempts': self._fix_attempts.get(run_id, 0),
+        }
+
+    def _hash_snapshot(self, snapshot: dict[str, Any]) -> str:
+        """Simple hash to detect meaningful changes between cycles."""
+        # Key factors: process status, stderr tail hash, latest step, stall bucket
+        parts = [
+            snapshot['process_status'],
+            str(len(snapshot['stderr_tail'])),
+            str(snapshot['metrics'][-1].get('step', 0) if snapshot['metrics'] else 0),
+            str(snapshot['stall_seconds'] // 60),  # bucket by minute
+        ]
+        return '|'.join(parts)
+
+    def _format_snapshot(self, snapshot: dict[str, Any]) -> str:
+        """Format snapshot into text for LLM."""
         parts = []
-        keys = [k for k in metrics[0].keys() if k != 'ts']
-        parts.append(f'## Recent Metrics ({len(metrics)} entries)')
-        parts.append(f'Fields: {", ".join(keys)}')
+        parts.append(f'## Run: {snapshot["run_id"]}')
+        parts.append(f'- Meta status: {snapshot["meta_status"]}')
+        parts.append(f'- Process: {snapshot["process_status"]}')
+        parts.append(f'- Time since last metric: {snapshot["stall_seconds"]}s')
+        parts.append(f'- Auto-fix attempts so far: {snapshot["fix_attempts"]}/{_MAX_FIX_ATTEMPTS}')
         parts.append('')
 
-        # Show last 10 in detail
-        parts.append('Last 10:')
-        for m in metrics[-10:]:
-            row = {k: v for k, v in m.items() if k != 'ts'}
-            parts.append(f'  {json.dumps(row, default=str)}')
-
-        # Trend summary (first half vs second half)
-        if len(metrics) >= 10:
-            mid = len(metrics) // 2
+        # stderr
+        if snapshot['stderr_tail']:
+            parts.append('## stderr.log (tail)')
+            parts.append(f'```\n{snapshot["stderr_tail"]}\n```')
             parts.append('')
-            parts.append('Trend (first half \u2192 second half):')
-            for key in keys:
-                if key in ('step', 'epoch'):
-                    continue
-                first_vals = [m.get(key) for m in metrics[:mid] if isinstance(m.get(key), (int, float))]
-                last_vals = [m.get(key) for m in metrics[mid:] if isinstance(m.get(key), (int, float))]
-                if first_vals and last_vals:
-                    avg_first = sum(first_vals) / len(first_vals)
-                    avg_last = sum(last_vals) / len(last_vals)
-                    parts.append(f'  {key}: {avg_first:.6g} \u2192 {avg_last:.6g}')
+
+        # Metrics
+        metrics = snapshot['metrics']
+        if metrics:
+            keys = [k for k in metrics[0].keys() if k != 'ts']
+            parts.append(f'## Metrics ({len(metrics)} entries)')
+            parts.append(f'Fields: {", ".join(keys)}')
+            # Last 8 entries
+            for m in metrics[-8:]:
+                row = {k: v for k, v in m.items() if k != 'ts'}
+                parts.append(f'  {json.dumps(row, default=str)}')
+            # Trend
+            if len(metrics) >= 6:
+                mid = len(metrics) // 2
+                parts.append('')
+                parts.append('Trend (first half → second half avg):')
+                for key in keys:
+                    if key in ('step', 'epoch', 'total_steps'):
+                        continue
+                    first_vals = [m.get(key) for m in metrics[:mid] if isinstance(m.get(key), (int, float))]
+                    last_vals = [m.get(key) for m in metrics[mid:] if isinstance(m.get(key), (int, float))]
+                    if first_vals and last_vals:
+                        avg_first = sum(first_vals) / len(first_vals)
+                        avg_last = sum(last_vals) / len(last_vals)
+                        parts.append(f'  {key}: {avg_first:.6g} → {avg_last:.6g}')
+        else:
+            parts.append('## Metrics: NONE (no metrics produced yet)')
 
         return '\n'.join(parts)
 
-    async def _call_llm(self, data_summary: str) -> str | None:
-        """Call LLM for analysis. Returns diagnosis text or None if normal.
+    async def _ask_llm(self, snapshot: dict[str, Any]) -> str | None:
+        """Send snapshot to LLM, return response or None on failure."""
+        user_content = self._format_snapshot(snapshot)
 
-        The prompt instructs the LLM to start with 'LGTM' if everything is normal.
-        This makes filtering reliable regardless of the LLM's phrasing style.
-        """
-        messages = [
-            {'role': 'system', 'content': MONITOR_SYSTEM_PROMPT},
-            {'role': 'user', 'content': data_summary},
-        ]
+        # If fix attempts exhausted, tell LLM not to suggest FIX
+        extra = ''
+        if snapshot['fix_attempts'] >= _MAX_FIX_ATTEMPTS:
+            extra = '\n\nNOTE: Auto-fix attempts exhausted. Do NOT suggest FIX. Only report warnings.'
+
         try:
             response = await self._client.chat.completions.create(
                 model=self.llm_model,
-                messages=messages,
+                messages=[
+                    {'role': 'system', 'content': MONITOR_SYSTEM_PROMPT + extra},
+                    {'role': 'user', 'content': user_content},
+                ],
                 temperature=0.3,
-                max_tokens=300,
+                max_tokens=4096,
             )
             content = (response.choices[0].message.content or '').strip()
-            if not content:
-                return None
-            # LLM is instructed to start with LGTM when normal
-            if content.upper().startswith(_NORMAL_PREFIX):
-                return None
-            return content
-        except Exception:
+            return content if content else None
+        except Exception as e:
+            logger.debug(f'Monitor LLM call failed: {e}')
             return None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Act on LLM response
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _act_on_response(self, run_id: str, response: str, snapshot: dict[str, Any]) -> None:
+        """Parse LLM response and take appropriate action."""
+        # Case 1: LGTM — no action
+        if response.upper().startswith('LGTM'):
+            return
+
+        # Case 2: FIX — contains a ```python block
+        diagnosis, fixed_script = self._parse_fix_response(response)
+        if fixed_script:
+            await self._apply_fix(run_id, diagnosis, fixed_script)
+            return
+
+        # Case 3: WARNING — just relay to user
+        self.on_message(f'[Monitor] {response}')
+
+    async def _apply_fix(self, run_id: str, diagnosis: str, fixed_script: str) -> None:
+        """Apply auto-fix: update script + resume training."""
+        attempts = self._fix_attempts.get(run_id, 0)
+        if attempts >= _MAX_FIX_ATTEMPTS:
+            self.on_message(
+                f'[Monitor] 已达最大自动修复次数 ({_MAX_FIX_ATTEMPTS})，不再尝试。'
+                '请手动检查或输入指令。'
+            )
+            return
+
+        self.on_message(f'[Monitor] 检测到问题，正在自动修复 (第{attempts + 1}次)...\n诊断: {diagnosis}')
+
+        try:
+            # Update script (archives old version)
+            self.connection.update_script(run_id, fixed_script)
+            # Resume (re-launch)
+            result = self.connection.resume_training(run_id)
+            if result.get('status') == 'error':
+                self.on_message(f'[Monitor] 重启失败: {result.get("error", "unknown")}')
+            else:
+                self.on_message(f'[Monitor] 脚本已修复并重启 (PID: {result.get("pid", "?")})')
+                # Reset stall tracking for the new attempt
+                self._last_metric_time = time.time()
+                self._last_metric_step = -1
+                self._last_snapshot_hash = ''
+        except Exception as e:
+            self.on_message(f'[Monitor] 自动修复失败: {e}')
+
+        self._fix_attempts[run_id] = attempts + 1
+
+    @staticmethod
+    def _parse_fix_response(response: str) -> tuple[str, str]:
+        """Parse LLM response for diagnosis + fixed script.
+
+        Returns (diagnosis, fixed_script). fixed_script is empty if
+        no ```python block found (meaning it's a WARNING, not a FIX).
+        """
+        diagnosis = ''
+        fixed_script = ''
+
+        # Extract python code block
+        code_match = re.search(r'```python\s*\n(.*?)```', response, re.DOTALL)
+        if not code_match:
+            return '', ''
+
+        fixed_script = code_match.group(1).strip()
+
+        # Extract diagnosis block
+        diag_match = re.search(r'```diagnosis\s*\n(.*?)```', response, re.DOTALL)
+        if diag_match:
+            diagnosis = diag_match.group(1).strip()
+        else:
+            # Fallback: text before the python block
+            before = response[:response.find('```python')]
+            lines = [l.strip() for l in before.splitlines() if l.strip() and not l.startswith('```')]
+            diagnosis = lines[-1] if lines else 'Auto-fix applied'
+
+        return diagnosis, fixed_script

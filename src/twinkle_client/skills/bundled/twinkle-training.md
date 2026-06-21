@@ -13,6 +13,8 @@ You are an expert at writing training scripts for the Twinkle framework.
 3. **Scripts MUST use Server Mode** (`twinkle_client` for model + `twinkle` for data)
 4. **DO NOT modify the Twinkle SDK** (`src/twinkle/` or `src/twinkle_client/`)
 5. **Every script MUST register graceful shutdown** via `rt.register_graceful_shutdown(model, dataloader)`
+6. **All imports MUST be explicit** — never use a class/function without importing it first
+7. **`batch_size` MUST be >= `data_world_size`** (number of data-parallel GPUs on the server). Use `list_supported_models()` to check GPU count; when in doubt, default to `batch_size=8`
 
 ## Pre-Training Planning
 
@@ -48,155 +50,798 @@ ray status  # if Ray running
 Large models: 2× TP for 32B, 4× TP for 72B
 ```
 
+---
+
 ## Core API Reference
 
-### Initialization
+### 1. Initialization
 
 ```python
-# Server Mode (primary)
 from twinkle import init_twinkle_client
+
+# Server Mode (primary — self-hosted)
 client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
 
-# Cloud Mode
-client = init_twinkle_client(base_url='http://www.modelscope.cn/twinkle', api_key=os.environ['MODELSCOPE_TOKEN'])
+# Cloud Mode (ModelScope hosted)
+import os
+client = init_twinkle_client(
+    base_url='http://www.modelscope.cn/twinkle',
+    api_key=os.environ['MODELSCOPE_TOKEN']
+)
+
+# Check available models
+caps = client.get_server_capabilities()
+for m in caps.supported_models:
+    print(f'- {m.model_name}')
 ```
 
-### Dataset
+**Parameters:**
+- `base_url`: Server URL (fallback: `TWINKLE_SERVER_URL` env var)
+- `api_key`: Auth token (fallback: `TWINKLE_SERVER_TOKEN` env var)
+- `session_heartbeat_interval`: Seconds between heartbeats (default: 10)
+
+### 2. Dataset & DatasetMeta
 
 ```python
-from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.dataloader import DataLoader
-
-dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(5000)))
-dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=8192)
-dataset.map(GSM8KProcessor())                      # preprocessor: raw → Trajectory
-dataset.encode(add_generation_prompt=True)          # True=sampling input, False=training labels
-dataloader = DataLoader(dataset=dataset, batch_size=4)
+from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
 ```
 
-### Model (Server Mode)
+**DatasetMeta** — describes a data source:
+```python
+DatasetMeta(
+    dataset_id='ms://modelscope/gsm8k',  # ModelScope/HF ID or local path
+    subset_name='main',                    # subset (default: 'default')
+    split='train',                         # split (default: 'train')
+    data_slice=range(5000),                # pick first N samples (optional)
+)
+```
+
+**In-memory data** (no external dataset):
+```python
+DatasetMeta(data=[
+    {'messages': [{'role': 'user', 'content': 'Hi'}, {'role': 'assistant', 'content': 'Hello!'}]},
+    ...
+])
+```
+
+**Dataset** — load, preprocess, encode:
+```python
+dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(5000)))
+dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=8192)
+dataset.map(GSM8KProcessor(system='Solve the math problem.'))
+dataset.encode(add_generation_prompt=True)  # True=for sampling, False=for training labels
+```
+
+**LazyDataset** — defers map/encode to `__getitem__` (for multimodal / large datasets):
+```python
+dataset = LazyDataset(DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(500)))
+dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+dataset.map(LatexOCRProcessor)
+dataset.encode(batched=True)
+```
+
+**Key Dataset methods:**
+| Method | Description |
+|--------|-------------|
+| `set_template(name, model_id=..., max_length=...)` | Set chat template for encoding |
+| `map(processor, init_args={...})` | Apply preprocessor (class, instance, or string name) |
+| `encode(add_generation_prompt=False)` | Tokenize into InputFeature |
+| `filter(filter_func)` | Filter rows |
+| `add_dataset(DatasetMeta(...))` | Add another dataset |
+| `mix_dataset(interleave=True)` | Combine added datasets |
+
+### 3. DataLoader
+
+```python
+from twinkle.dataloader import DataLoader
+
+dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+```
+
+**Parameters:**
+- `dataset`: Dataset or LazyDataset instance
+- `batch_size`: Samples per batch
+- `min_batch_size`: Minimum batch size (optional)
+- `num_workers`: DataLoader workers (default: 2; use 0 for debugging)
+
+**Checkpoint/Resume:**
+```python
+# Resume
+dataloader.resume_from_checkpoint(consumed_train_samples=progress['consumed_train_samples'])
+
+# Save state
+state = dataloader.get_state()  # → {'consumed_train_samples': int}
+```
+
+### 4. MultiLoraTransformersModel
 
 ```python
 from twinkle_client.model import MultiLoraTransformersModel
 from peft import LoraConfig
 
 model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
-model.add_adapter_to_model('my-exp', LoraConfig(target_modules='all-linear', r=8, lora_alpha=32),
-                           gradient_accumulation_steps=2)
-model.set_template('Qwen3_5Template')
-model.set_processor('InputProcessor', padding_side='right')
-model.set_loss('CrossEntropyLoss')       # or 'GRPOLoss', 'DPOLoss', 'GKDLoss'
-model.set_optimizer('Adam', lr=1e-4)
-model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
 ```
 
-### Sampler
+**Setup methods (call in order):**
+```python
+# 1. Add LoRA adapter
+lora_config = LoraConfig(
+    target_modules='all-linear',
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.05,
+)
+model.add_adapter_to_model(
+    'default',                          # adapter_name (unique per experiment)
+    lora_config,
+    gradient_accumulation_steps=2,      # effective_batch = batch_size × grad_accum
+    # NOTE: Do NOT pass save_dir — the server manages checkpoint paths automatically
+)
+
+# 2. Set template (same as dataset)
+model.set_template('Qwen3_5Template')
+
+# 3. Set input processor
+model.set_processor('InputProcessor', padding_side='right')
+
+# 4. Set loss function
+model.set_loss('CrossEntropyLoss')  # or 'GRPOLoss', 'DPOLoss', 'GKDLoss'
+
+# 5. Set optimizer (only Adam supported for Megatron backend)
+model.set_optimizer('Adam', lr=1e-4)
+
+# 6. Set LR scheduler (optional, NOT supported for Megatron backend)
+model.set_lr_scheduler('CosineAnnealingLR', T_max=100, eta_min=0)
+# model.set_lr_scheduler('CosineWarmupScheduler', num_warmup_steps=50, num_training_steps=1000)
+```
+
+**Training loop methods:**
+| Method | Description |
+|--------|-------------|
+| `forward_backward(inputs, **kwargs)` | Forward + backward in one call |
+| `forward_only(inputs, disable_lora=False)` | Forward without grad (for ref model in DPO) |
+| `clip_grad_and_step()` | Clip grad → optimizer step → zero_grad → lr_step (all-in-one) |
+| `clip_grad_norm(max_grad_norm=1.0)` | Only clip gradients |
+| `step()` | Only optimizer step |
+| `zero_grad()` | Only zero gradients |
+| `lr_step()` | Only LR scheduler step |
+| `calculate_metric(is_training=True)` | Get metrics (returns `.result` dict) |
+| `add_metric('DPOMetric', beta=0.1)` | Register additional metric |
+
+**Save/Load/Upload:**
+```python
+# Save checkpoint (returns SaveResponse with .twinkle_path)
+result = model.save(
+    name='my-checkpoint',
+    save_optimizer=True,
+    consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    is_sampler=False,  # True = sampler-only checkpoint (deletes old sampler saves)
+)
+
+# Resume from checkpoint
+progress = model.resume_from_checkpoint(result.twinkle_path)
+# progress → {'cur_step': int, 'consumed_train_samples': int}
+dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+start_step = progress['cur_step']
+
+# Upload to ModelScope Hub
+model.upload_to_hub(
+    checkpoint_dir=result.twinkle_path,
+    hub_model_id='your_username/model-name',
+    hub_token=None,  # uses server default if None
+)
+```
+
+### 5. vLLMSampler
 
 ```python
 from twinkle_client.sampler import vLLMSampler
 
 sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
 sampler.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
-
-# Weight sync + sample
-result = model.save(name='sampler-weights', save_optimizer=False, is_sampler=True)
-responses = sampler.sample(inputs=batch, sampling_params={...}, adapter_uri=result.twinkle_path)
 ```
 
-### TrainingRuntime (Observability)
+**Sampling:**
+```python
+sampling_params = {
+    'max_tokens': 1024,
+    'temperature': 1.0,
+    'top_p': 0.95,
+    'num_samples': 4,    # completions per prompt
+    'logprobs': 1,       # return log probabilities
+}
+
+# Sync weights from training model
+result = model.save(name='sampler-weights', save_optimizer=False, is_sampler=True)
+
+# Sample
+responses = sampler.sample(
+    inputs=batch,                        # List[Trajectory] or List[InputFeature]
+    sampling_params=sampling_params,
+    adapter_uri=result.twinkle_path,     # use latest trained weights
+)
+
+# Parse responses
+for response in responses:
+    for seq in response.sequences:
+        seq.new_input_feature  # Dict: full trajectory as InputFeature (for training)
+        seq.tokens             # List[int]: generated token ids
+        seq.logprobs           # List[List[Tuple[int, float]]]: [(token_id, logp), ...]
+        seq.stop_reason        # str: 'stop' or 'length'
+```
+
+### 6. Preprocessors
+
+```python
+from twinkle.preprocessor import GSM8KProcessor, SelfCognitionProcessor, EmojiDPOProcessor
+from twinkle.preprocessor import Preprocessor  # base class for custom
+```
+
+| Preprocessor | Usage | Init Args |
+|---|---|---|
+| `GSM8KProcessor` | Math QA → Trajectory | `system=None, add_assistant=False` |
+| `SelfCognitionProcessor` | Self-cognition SFT | `model_name='twinkle robot', model_author='twinkle lab'` |
+| `EmojiDPOProcessor` | DPO preference pairs | `system=None, chosen_key='answer_zh', rejected_key='answer_en', prompt_key='prompt'` |
+
+**Using preprocessors:**
+```python
+# By instance (with args)
+dataset.map(GSM8KProcessor(system='Solve step by step.'))
+dataset.map(SelfCognitionProcessor(model_name='My Bot', model_author='Me'))
+
+# By string name + init_args (for cloud mode / serialization)
+dataset.map('SelfCognitionProcessor', init_args={'model_name': 'My Bot', 'model_author': 'Me'})
+
+# By class reference
+dataset.map(EmojiDPOProcessor, init_args={'system': 'You are helpful.'})
+```
+
+**Custom preprocessor:**
+```python
+from twinkle.preprocessor import Preprocessor
+from twinkle.data_format import Trajectory, Message
+
+class MyProcessor(Preprocessor):
+    def __call__(self, rows):
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
+        return Trajectory(messages=[
+            Message(role='user', content=row['question']),
+            Message(role='assistant', content=row['answer']),
+        ])
+```
+
+### 7. Loss Functions
+
+```python
+model.set_loss('CrossEntropyLoss')
+model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
+model.set_loss('DPOLoss', beta=0.1, loss_type='sigmoid', reference_free=False, sft_weight=1.0)
+model.set_loss('GKDLoss', beta=0.5, temperature=1.0)
+```
+
+| Loss | Use Case | Key Params |
+|------|----------|------------|
+| `CrossEntropyLoss` | SFT | `ignore_index=-100, dft=False` |
+| `GRPOLoss` | GRPO/PPO RL | `epsilon=0.2, beta=0.0 (KL), entropy_coef=0.0` |
+| `DPOLoss` | DPO preference | `beta=0.1, loss_type='sigmoid'/'hinge'/'ipo'/'kto_pair', sft_weight=0.0` |
+| `GKDLoss` | Knowledge distillation | `beta=0.5 (JSD mix), temperature=1.0, chunk_size=512` |
+
+### 8. Rewards & Advantages
+
+```python
+from twinkle.reward import GSM8KAccuracyReward
+from twinkle.reward.base import Reward
+from twinkle.advantage import GRPOAdvantage
+```
+
+**Built-in rewards:**
+```python
+reward_fn = GSM8KAccuracyReward()
+rewards = reward_fn(trajectories)  # → List[float] (1.0=correct, 0.0=wrong)
+```
+
+**Custom reward (MUST subclass Reward):**
+```python
+class MyReward(Reward):
+    def __call__(self, trajectories, **kwargs) -> List[float]:
+        rewards = []
+        for traj in trajectories:
+            messages = traj.get('messages', [])
+            completion = ''
+            for msg in reversed(messages):
+                if msg.get('role') == 'assistant':
+                    completion = msg.get('content', '')
+                    break
+            # Your scoring logic here
+            rewards.append(score)
+        return rewards
+```
+
+**Advantage computation:**
+```python
+advantage_fn = GRPOAdvantage()
+advantages = advantage_fn(
+    rewards,                    # List[float] or Tensor
+    num_generations=4,          # samples per prompt
+    scale='group',              # 'group'=per-prompt, 'batch'=global, 'none'=no normalization
+).tolist()
+```
+
+### 9. Metrics
+
+```python
+from twinkle.metric import CompletionRewardMetric, DPOMetric
+```
+
+**CompletionRewardMetric** (for GRPO):
+```python
+metrics = CompletionRewardMetric()
+metrics.accumulate(
+    completion_lengths=all_completion_lengths,
+    rewards={'total': total_rewards, 'accuracy': acc_rewards},
+)
+log_dict = metrics.calculate()  # → {'train/total_reward': ..., 'train/completion_length': ...}
+metrics.reset()
+```
+
+**DPOMetric** (for DPO — added to model):
+```python
+model.add_metric('DPOMetric', beta=0.1)
+# Then after forward_backward:
+metric = model.calculate_metric(is_training=True)
+# metric.result → {'logps/chosen': ..., 'rewards/margins': ..., 'rewards/accuracies': ...}
+```
+
+### 10. TrainingRuntime (Observability)
 
 ```python
 from twinkle_client.tui.runtime import TrainingRuntime
 
-rt = TrainingRuntime(run_id='my-experiment')
+rt = TrainingRuntime()  # auto-reads TWINKLE_RUN_ID env var (set by TUI launcher)
 rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)  # MUST register
 
-# In loop:
+# In training loop:
 rt.log_metrics(step=step, total_steps=MAX_STEPS, loss=loss, reward=reward, grad_norm=gn, lr=lr)
-rt.log(f'[Step {step}/{MAX_STEPS}] loss={loss:.4f} reward={reward:.3f}')
+rt.log(f'[Step {step}/{MAX_STEPS}] loss={loss:.4f}')
 
-# Done:
+# When done:
 rt.finish(status='completed')
 ```
 
-## Training Patterns
-
-### SFT
+### 11. Data Types
 
 ```python
-model.set_loss('CrossEntropyLoss')
-dataset.encode(add_generation_prompt=False)  # include assistant in labels
-
-for step, batch in enumerate(dataloader):
-    model.forward_backward(inputs=batch)
-    model.clip_grad_and_step()
-    metric = model.calculate_metric(is_training=True)
-    rt.log_metrics(step=step, total_steps=len(dataloader), **metric.result)
-
-model.save(name='sft-final', save_optimizer=True)
+from twinkle.data_format import Trajectory, Message, InputFeature
 ```
 
-### GRPO
+**Trajectory** (conversation format — used as input to dataset/sampler):
+```python
+Trajectory(
+    messages=[
+        Message(role='system', content='You are helpful.'),
+        Message(role='user', content='What is 2+2?'),
+        Message(role='assistant', content='4'),
+    ],
+    images=[...],   # optional: for multimodal
+    videos=[...],   # optional
+)
+```
+
+**Message fields:** `role` ('system'/'user'/'assistant'/'tool'), `content` (str), `tool_calls`, `reasoning_content`
+
+**InputFeature** (tokenized — output of encode):
+```python
+InputFeature(
+    input_ids=[...],        # token ids
+    attention_mask=[...],   # 0/1 mask
+    labels=[...],           # -100 for ignored positions
+    completion_mask=[...],  # for RL: which tokens to optimize
+    length=512,
+)
+```
+
+---
+
+## Complete Training Examples
+
+### Example 1: SFT (Self-Cognition Fine-Tuning)
 
 ```python
+import os
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataloader import DataLoader
+from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.tui.runtime import TrainingRuntime
+
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+MAX_STEPS = 50
+
+# 1. Init client
+client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
+
+# 2. Prepare dataset
+dataset = Dataset(DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=512)
+dataset.map(SelfCognitionProcessor(model_name='Twinkle助手', model_author='ModelScope'))
+dataset.encode(batched=True)
+dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+
+# 3. Configure model
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear'), gradient_accumulation_steps=2)
+model.set_template('Qwen3_5Template')
+model.set_processor('InputProcessor', padding_side='right')
+model.set_loss('CrossEntropyLoss')
+model.set_optimizer('Adam', lr=1e-4)
+
+# 4. Runtime (observability)
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4, 'batch_size': 4}, script_path=__file__)
+rt.register_graceful_shutdown(model, dataloader)
+
+# 5. Training loop
+global_step = 0
+for epoch in range(3):
+    for batch in dataloader:
+        model.forward_backward(inputs=batch)
+        model.clip_grad_and_step()
+        global_step += 1
+
+        if global_step % 2 == 0:
+            metric = model.calculate_metric(is_training=True)
+            loss = metric.result.get('loss', 0)
+            rt.log_metrics(step=global_step, total_steps=MAX_STEPS, loss=loss)
+            rt.log(f'[Step {global_step}/{MAX_STEPS}] loss={loss:.4f}')
+
+        if global_step >= MAX_STEPS:
+            break
+
+    if global_step >= MAX_STEPS:
+        break
+
+    # Save per epoch
+    result = model.save(
+        name=f'sft-epoch-{epoch}',
+        save_optimizer=True,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    )
+    rt.log(f'Saved checkpoint: {result.twinkle_path}')
+
+rt.finish(status='completed')
+```
+
+### Example 2: GRPO (Reinforcement Learning)
+
+```python
+import gc
+from typing import List, Dict, Any
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataloader import DataLoader
+from twinkle.preprocessor import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.advantage import GRPOAdvantage
+from twinkle.metric import CompletionRewardMetric
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.sampler import vLLMSampler
+from twinkle_client.tui.runtime import TrainingRuntime
 
-model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+NUM_GENERATIONS = 4
+MAX_STEPS = 100
+BATCH_SIZE = 2
+LEARNING_RATE = 2e-5
+
+# 1. Init client
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_API_KEY')
+
+# 2. Prepare dataset (encode with generation prompt for sampling)
+dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(2000)))
+dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
+dataset.map(GSM8KProcessor(system='Solve the math problem and put answer in \\boxed{}.'))
 dataset.encode(add_generation_prompt=True)
+dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
+
+# 3. Configure model with GRPOLoss
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
+                           gradient_accumulation_steps=1)
+model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
+model.set_optimizer('Adam', lr=LEARNING_RATE)
+model.set_processor('InputProcessor')
+model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+
+# 4. Configure sampler
+sampler = vLLMSampler(model_id=MODEL_ID)
+sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+
+# 5. Setup
 advantage_fn = GRPOAdvantage()
 reward_fn = GSM8KAccuracyReward()
+metrics = CompletionRewardMetric()
+sampling_params = {'max_tokens': 1024, 'temperature': 1.0, 'top_p': 0.95, 'num_samples': NUM_GENERATIONS, 'logprobs': 1}
+current_adapter_uri = None
 
-for step, batch in enumerate(dataloader):
-    if step >= MAX_STEPS: break
+# 6. Runtime
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': LEARNING_RATE, 'method': 'GRPO'}, script_path=__file__)
+rt.register_graceful_shutdown(model, dataloader)
 
-    # 1. Sync weights → sample
-    result = model.save(name='sampler-weights', save_optimizer=False, is_sampler=True)
-    responses = sampler.sample(inputs=batch,
-        sampling_params={'max_tokens': 1024, 'temperature': 1.0, 'num_samples': NUM_GENERATIONS, 'logprobs': 1},
-        adapter_uri=result.twinkle_path)
+# 7. Training loop
+step = 0
+for batch in dataloader:
+    if step >= MAX_STEPS:
+        break
+    metrics.reset()
 
-    # 2. Collect inputs + logprobs
-    all_inputs, all_old_logps = [], []
-    for resp in responses:
-        for seq in resp.sequences:
+    # 7a. Sync weights to sampler
+    result = model.save(name='grpo-sampler-weights', save_optimizer=False, is_sampler=True)
+    current_adapter_uri = result.twinkle_path
+
+    # 7b. Sample completions
+    responses = sampler.sample(inputs=batch, sampling_params=sampling_params, adapter_uri=current_adapter_uri)
+
+    all_inputs: List[Dict[str, Any]] = []
+    all_old_logps: List[List[float]] = []
+    all_completion_lengths: List[int] = []
+
+    for response in responses:
+        for seq in response.sequences:
             all_inputs.append(seq.new_input_feature)
             all_old_logps.append([lp[0][1] for lp in seq.logprobs])
+            all_completion_lengths.append(len(seq.tokens))
 
-    # 3. Reward → advantage → train
+    # 7c. Compute rewards
     rewards = reward_fn(all_inputs)
+    metrics.accumulate(completion_lengths=all_completion_lengths, rewards={'accuracy': rewards})
+
+    # 7d. Compute advantages
     advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+
+    # Skip if all advantages are zero (no learning signal)
+    if all(abs(a) < 1e-8 for a in advantages):
+        step += 1
+        continue
+
+    # 7e. Train
     model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
     model.clip_grad_and_step()
+    gc.collect()
+
+    # 7f. Log
+    log_dict = metrics.calculate()
+    log_dict.update(model.calculate_metric(is_training=True).result)
+    rt.log_metrics(step=step, total_steps=MAX_STEPS, **log_dict)
+    rt.log(f'[Step {step}/{MAX_STEPS}] {log_dict}')
+    step += 1
+
+# Save final
+model.save(name='grpo-final', save_optimizer=True)
+rt.finish(status='completed')
 ```
 
-### DPO
+### Example 3: DPO (Preference Optimization)
 
 ```python
-model.set_loss('DPOLoss', beta=0.1, loss_type='sigmoid', reference_free=False, sft_weight=1.0)
-model.add_metric('DPOMetric', beta=0.1)
-# Data: chosen + rejected concatenated (first half chosen, second half rejected)
-# Preprocessor: EmojiDPOProcessor or custom → Trajectory with extend_message=[('rejected_messages', ...)]
+import numpy as np
+import torch
+from typing import Any, Dict, List
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataloader import DataLoader
+from twinkle.preprocessor import EmojiDPOProcessor
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.tui.runtime import TrainingRuntime
 
-for batch in dataloader:
-    dpo_batch = prepare_dpo_batch(batch)  # expand positive/negative
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+DPO_BETA = 0.1
+LEARNING_RATE = 1e-4
+
+# 1. Init
+client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
+
+# 2. Prepare DPO dataset
+dataset = Dataset(DatasetMeta('ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji', data_slice=range(100)))
+dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
+dataset.map(EmojiDPOProcessor, init_args={'system': 'You are a helpful assistant.'})
+dataset.encode()  # DPO: no add_generation_prompt
+dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+
+# 3. Configure model with DPO loss
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
+                           gradient_accumulation_steps=2)
+model.set_template('Qwen3_5Template')
+model.set_processor('InputProcessor', padding_side='right')
+model.set_loss('DPOLoss', beta=DPO_BETA, loss_type='sigmoid', reference_free=False, sft_weight=1.0)
+model.add_metric('DPOMetric', beta=DPO_BETA)
+model.set_optimizer('Adam', lr=LEARNING_RATE)
+
+# 4. Runtime
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'method': 'DPO', 'beta': DPO_BETA}, script_path=__file__)
+rt.register_graceful_shutdown(model, dataloader)
+
+
+def prepare_dpo_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Interleave positive/negative for DP-safe training: [pos1, neg1, pos2, neg2, ...]"""
+    result = []
+    for row in batch:
+        base_fields = {k: v for k, v in row.items() if k not in ('positive', 'negative')}
+        result.append({**base_fields, **row['positive']})
+        result.append({**base_fields, **row['negative']})
+    return result
+
+
+# 5. Training loop
+max_steps = len(dataloader)
+for step, batch in enumerate(dataloader):
+    # Convert numpy/torch tensors for serialization
+    for row in batch:
+        for key in row:
+            if isinstance(row[key], np.ndarray):
+                row[key] = row[key].tolist()
+            elif isinstance(row[key], torch.Tensor):
+                row[key] = row[key].cpu().numpy().tolist()
+
+    dpo_batch = prepare_dpo_batch(batch)
+
+    # Get reference logps from base model (disable LoRA)
     ref_outputs = model.forward_only(inputs=dpo_batch, disable_lora=True)
+
+    # Train with DPO loss
     model.forward_backward(inputs=dpo_batch, ref_outputs=ref_outputs.result)
     model.clip_grad_and_step()
+
+    if step % 2 == 0:
+        metric = model.calculate_metric(is_training=True)
+        rt.log_metrics(step=step, total_steps=max_steps, **metric.result)
+        rt.log(f'[Step {step}/{max_steps}] {metric.result}')
+
+result = model.save(name='dpo-final', save_optimizer=True)
+rt.finish(status='completed')
 ```
+
+### Example 4: Multimodal SFT (Image Understanding)
+
+```python
+import numpy as np
+import torch
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.dataset import LazyDataset, DatasetMeta
+from twinkle.dataloader import DataLoader
+from twinkle.preprocessor import Preprocessor
+from twinkle.data_format import Trajectory, Message
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.tui.runtime import TrainingRuntime
+
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+
+
+class LatexOCRProcessor(Preprocessor):
+    """Custom preprocessor for LaTeX OCR dataset."""
+    def __call__(self, rows):
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
+        return Trajectory(messages=[
+            Message(role='user', content='<image>Using LaTeX to perform OCR on the image.', images=[row['image']]),
+            Message(role='assistant', content=row['text']),
+        ])
+
+
+# 1. Init
+client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
+
+# 2. LazyDataset for multimodal (defers processing to avoid OOM)
+dataset = LazyDataset(DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(500)))
+dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=512)
+dataset.map(LatexOCRProcessor)
+dataset.encode(batched=True)
+dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+
+# 3. Model setup
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear'), gradient_accumulation_steps=2)
+model.set_template('Qwen3_5Template')
+model.set_processor('InputProcessor', padding_side='right')
+model.set_loss('CrossEntropyLoss')
+model.set_optimizer('Adam', lr=1e-4)
+
+# 4. Runtime
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'task': 'multimodal-sft'}, script_path=__file__)
+rt.register_graceful_shutdown(model, dataloader)
+
+# 5. Train
+for epoch in range(3):
+    for step, batch in enumerate(dataloader):
+        # Important: convert numpy/torch for serialization
+        for sample in batch:
+            for key in sample:
+                if isinstance(sample[key], np.ndarray):
+                    sample[key] = sample[key].tolist()
+                elif isinstance(sample[key], torch.Tensor):
+                    sample[key] = sample[key].cpu().numpy().tolist()
+
+        model.forward_backward(inputs=batch)
+        model.clip_grad_and_step()
+
+        if step % 2 == 0:
+            metric = model.calculate_metric(is_training=True)
+            rt.log_metrics(step=step, total_steps=len(dataloader), **metric.result)
+
+    model.save(name=f'multimodal-epoch-{epoch}', save_optimizer=True)
+
+rt.finish(status='completed')
+```
+
+### Example 5: Sampling / Inference Only
+
+```python
+from twinkle_client import init_twinkle_client
+from twinkle_client.sampler import vLLMSampler
+
+# 1. Init
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_API_KEY')
+
+# 2. Create sampler
+sampler = vLLMSampler(model_id='Qwen/Qwen3.5-4B')
+sampler.set_template('Qwen3_5Template', model_id='Qwen/Qwen3.5-4B')
+
+# 3. Prepare input as Trajectory
+trajectory = {
+    'messages': [
+        {'role': 'system', 'content': 'You are a helpful assistant.'},
+        {'role': 'user', 'content': 'Who are you?'},
+    ]
+}
+
+# 4. Sample (with optional LoRA adapter)
+responses = sampler.sample(
+    inputs=[trajectory] * 4,  # 4 prompts
+    sampling_params={'max_tokens': 128, 'temperature': 1.0, 'num_samples': 2},
+    adapter_uri='twinkle://...',  # optional: from a model.save() result
+)
+
+# 5. Decode
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3.5-4B', trust_remote_code=True)
+for response in responses:
+    for seq in response.sequences:
+        text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
+        print(text)
+```
+
+---
 
 ## Server Mode Architecture
 
 ```
-┌─ Twinkle Server (Ray + GPU) ─────────────────────────┐
-│  Base Model → adapter 'exp-01' (weights + optimizer)  │
-│            → adapter 'exp-02' (weights + optimizer)  │
-└───────────────────────────────────────────────────────┘
-         ↑ HTTP (forward_backward, clip_grad_and_step, save)
-┌─ Client Script (CPU only, stateless) ────────────────┐
-│  Data loading + Training loop + Reward computation    │
-└───────────────────────────────────────────────────────┘
+┌─ Twinkle Server (Ray + GPU) ─────────────────────────────┐
+│  Base Model → adapter 'exp-01' (weights + optimizer)      │
+│            → adapter 'exp-02' (weights + optimizer)      │
+│  vLLM Sampler → shared inference engine                   │
+└───────────────────────────────────────────────────────────┘
+         ↑ HTTP (forward_backward, clip_grad_and_step, save, sample)
+┌─ Client Script (CPU only, stateless) ────────────────────┐
+│  Data loading + Training loop + Reward computation        │
+└───────────────────────────────────────────────────────────┘
 ```
 
 **Key implications:**
@@ -218,24 +863,23 @@ python server.py  # reads server_config.yaml, blocks
 
 The TUI agent's `start_server` tool handles this automatically — generates config + starts Ray + launches server.
 
-## Data Format
+---
 
-- `Trajectory`: `{'messages': [Message(role, content)], 'extend_message': [('key', value)]}`
-- `Message`: TypedDict with `role` and `content` (access via `msg['role']`)
-- DPO: `Trajectory(messages=chosen, extend_message=[('rejected_messages', rejected)])`
-- SamplingParams: `{'max_tokens': 4096, 'temperature': 1.0, 'top_p': 1.0, 'num_samples': 1, 'logprobs': 1}`
+## Built-in Components Summary
 
-## Built-in Components
-
-| Type | Available |
-|------|-----------|
-| Loss | `CrossEntropyLoss`, `GRPOLoss`, `DPOLoss`, `GKDLoss` |
-| Preprocessor | `GSM8KProcessor`, `SelfCognitionProcessor`, `EmojiDPOProcessor` |
-| Reward | `GSM8KAccuracyReward` |
-| Advantage | `GRPOAdvantage` |
-| Template | `Qwen3_5Template` |
+| Type | Available | Import Path |
+|------|-----------|-------------|
+| **Loss** | `CrossEntropyLoss`, `GRPOLoss`, `DPOLoss`, `GKDLoss` | `twinkle.loss` |
+| **Preprocessor** | `GSM8KProcessor`, `SelfCognitionProcessor`, `EmojiDPOProcessor` | `twinkle.preprocessor` |
+| **Reward** | `GSM8KAccuracyReward`, `GSM8KFormatReward` | `twinkle.reward` |
+| **Advantage** | `GRPOAdvantage` | `twinkle.advantage` |
+| **Metric** | `CompletionRewardMetric`, `DPOMetric` | `twinkle.metric` |
+| **Template** | `Qwen3_5Template` | (string name to `set_template`) |
+| **Processor** | `InputProcessor` | (string name to `set_processor`) |
 
 **Cloud mode restriction:** Only built-in components (by name string). Custom classes cannot be serialized.
+
+---
 
 ## Tinker-Compatible API (Alternative)
 
@@ -252,6 +896,8 @@ training_client.optim_step(types.AdamParams(learning_rate=2e-5)).result()
 sampling_client = training_client.save_weights_and_get_sampling_client(name='step-N')
 ```
 
+---
+
 ## File Layout
 
 ```
@@ -260,30 +906,27 @@ sampling_client = training_client.save_weights_and_get_sampling_client(name='ste
 ├── train.py        # Current active script
 ├── train_v1.py     # Archived versions
 ├── metrics.jsonl   # One JSON line per step
-└── logs.jsonl      # One JSON line per event
+├── logs.jsonl      # One JSON line per event
+└── stderr.log      # Script stderr output
 ```
 
-## Ray Mode (Direct, No Server)
+---
 
-For multi-node distributed training without server:
+## OpenAI-Compatible Endpoint
+
+The server also exposes OpenAI-compatible `/v1/chat/completions`:
 
 ```python
-import twinkle
-from twinkle import DeviceMesh, DeviceGroup
-from twinkle.model import TransformersModel
+from openai import OpenAI
 
-device_groups = [
-    DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-    DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
-]
-twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
-
-model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B', device_mesh=model_mesh, remote_group='model')
-# Megatron: MegatronModel(model_id=..., device_mesh=mesh_with_tp, mixed_precision='bf16')
+client = OpenAI(base_url='http://127.0.0.1:8000/api/v1', api_key='EMPTY_API_KEY')
+resp = client.chat.completions.create(
+    model='Qwen/Qwen3.5-4B',
+    messages=[{'role': 'user', 'content': 'Hello!'}],
+    max_tokens=128,
+    temperature=0.7,
+    stream=True,  # streaming supported
+)
+for chunk in resp:
+    print(chunk.choices[0].delta.content, end='')
 ```
-
-| | Ray Mode | Server Mode |
-|---|---|---|
-| Import | `twinkle.model.TransformersModel` | `twinkle_client.model.MultiLoraTransformersModel` |
-| Prerequisites | `twinkle.initialize(mode='ray')` | `init_twinkle_client(base_url=...)` |
-| Kill client | Loses state | Zero-cost (server keeps all) |

@@ -54,15 +54,23 @@ class TrainingRuntime:
     - SIGTERM graceful shutdown with checkpoint saving
     """
 
-    def __init__(self, run_id: str, base_dir: Path | str | None = None):
+    def __init__(self, run_id: str | None = None, base_dir: Path | str | None = None):
         """Initialize the training runtime.
 
         Args:
             run_id: Unique identifier for this training run.
+                If None, reads from TWINKLE_RUN_ID environment variable
+                (automatically set by TUI launcher).
             base_dir: Base directory for run data. Defaults to ~/.cache/twinkle/
         """
-        self.run_id = run_id
         self.base_dir = Path(base_dir) if base_dir else DEFAULT_BASE_DIR
+        if run_id is None:
+            run_id = os.environ.get('TWINKLE_RUN_ID', '')
+            if not run_id:
+                raise ValueError(
+                    'run_id must be provided or TWINKLE_RUN_ID env var must be set'
+                )
+        self.run_id = run_id
         self.run_dir = self.base_dir / run_id
 
         self._metrics_file: Any = None
@@ -97,7 +105,7 @@ class TrainingRuntime:
             import shutil
             src = Path(script_path).resolve()
             dst = self.run_dir / 'train.py'
-            if src.exists():
+            if src.exists() and src != dst.resolve():
                 # Archive existing train.py if present
                 if dst.exists():
                     # Find max existing version number (regex-based, consistent with connection.py)
@@ -110,7 +118,7 @@ class TrainingRuntime:
                     shutil.copy2(dst, self.run_dir / f'train_v{archive_v}.py')
                     script_version = archive_v + 1
                 shutil.copy2(src, dst)
-                stored_script = str(dst)
+            stored_script = str(dst)
 
         # Write run metadata
         meta = {

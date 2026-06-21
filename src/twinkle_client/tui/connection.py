@@ -48,6 +48,7 @@ class LocalConnection:
         self.current_run_id: str | None = None
         self._metrics_offsets: dict[str, int] = {}
         self._logs_offsets: dict[str, int] = {}
+        self._crash_detected: set[str] = set()  # run_ids whose crash has already been reported
 
     # ──────────────────────────────────────────────────────────────────────
     # Meta
@@ -131,26 +132,101 @@ class LocalConnection:
             return []
 
     def get_new_logs(self, run_id: str) -> list[dict[str, Any]]:
-        """Read only new logs since last read (incremental, per-run)."""
+        """Read only new logs since last read (incremental, per-run).
+
+        Also detects process crashes: if the process is dead and status is
+        still 'running', reads stderr.log tail and injects it as error logs,
+        then updates meta.status to 'error'.
+        """
         logs_file = self.base_dir / run_id / 'logs.jsonl'
-        if not logs_file.exists():
-            return []
-        try:
-            offset = self._logs_offsets.get(run_id, 0)
-            with open(logs_file, 'r') as f:
-                f.seek(offset)
-                new_data = f.read()
-                self._logs_offsets[run_id] = f.tell()
-            if not new_data.strip():
-                return []
-            return [json.loads(line) for line in new_data.strip().splitlines() if line.strip()]
-        except Exception:
-            return []
+        entries: list[dict[str, Any]] = []
+
+        # Read new log entries from logs.jsonl
+        if logs_file.exists():
+            try:
+                offset = self._logs_offsets.get(run_id, 0)
+                with open(logs_file, 'r') as f:
+                    f.seek(offset)
+                    new_data = f.read()
+                    self._logs_offsets[run_id] = f.tell()
+                if new_data.strip():
+                    entries = [json.loads(line) for line in new_data.strip().splitlines() if line.strip()]
+            except Exception:
+                pass
+
+        # Detect crashed process and inject stderr.log content
+        if run_id not in self._crash_detected:
+            meta = self.get_meta(run_id)
+            if meta and meta.get('status') in ('running', 'starting'):
+                pid = meta.get('pid')
+                if pid and not self._is_process_alive(pid):
+                    # Process died — inject stderr as error log
+                    self._crash_detected.add(run_id)
+                    stderr_file = self.base_dir / run_id / 'stderr.log'
+                    error_msg = self._read_stderr_tail(stderr_file)
+                    if error_msg:
+                        entries.append({'ts': time.time(), 'msg': f'[ERROR] Process crashed:\n{error_msg}'})
+                    else:
+                        entries.append({'ts': time.time(), 'msg': '[ERROR] Process exited unexpectedly (no stderr output)'})
+                    # Update meta status
+                    meta['status'] = 'error'
+                    self._write_meta(run_id, meta)
+                    # Also persist the error into logs.jsonl for future reads
+                    for entry in entries[-1:]:
+                        self._append_log(run_id, entry['msg'])
+
+        return entries
 
     def reset_offsets(self, run_id: str) -> None:
         """Reset incremental read offsets for a run (e.g., after switching runs)."""
         self._metrics_offsets.pop(run_id, None)
         self._logs_offsets.pop(run_id, None)
+        self._crash_detected.discard(run_id)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Process health helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Check if a process is still running (POSIX).
+
+        Returns False for zombie processes (state 'Z') since they have
+        already exited even though the PID still exists.
+        """
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        # PID exists — but check if it's a zombie via /proc
+        try:
+            status_file = Path(f'/proc/{pid}/status')
+            if status_file.exists():
+                for line in status_file.read_text().splitlines():
+                    if line.startswith('State:'):
+                        # State: Z (zombie) / R (running) / S (sleeping) / D (disk sleep)
+                        return 'Z' not in line
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _read_stderr_tail(stderr_file: Path, max_chars: int = 2000) -> str:
+        """Read the tail of stderr.log, focusing on the traceback/error."""
+        if not stderr_file.exists():
+            return ''
+        try:
+            content = stderr_file.read_text(errors='replace')
+            if not content.strip():
+                return ''
+            # Try to extract just the traceback (from last 'Traceback' onwards)
+            tb_marker = content.rfind('Traceback (most recent call last)')
+            if tb_marker >= 0:
+                return content[tb_marker:][-max_chars:]
+            # No traceback found, return tail
+            return content[-max_chars:]
+        except Exception:
+            return ''
 
     # ──────────────────────────────────────────────────────────────────────
     # Process management
@@ -179,9 +255,12 @@ class LocalConnection:
             return {'status': 'error', 'run_id': run_id, 'error': f'Cannot open stderr log: {e}'}
 
         try:
+            env = os.environ.copy()
+            env['TWINKLE_RUN_ID'] = run_id
             proc = subprocess.Popen(
                 ['python', script_path],
                 cwd=str(run_dir),
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_fh,
                 start_new_session=True,
@@ -189,8 +268,10 @@ class LocalConnection:
         except OSError as e:
             stderr_fh.close()
             return {'status': 'error', 'run_id': run_id, 'error': f'Failed to launch script: {e}'}
-        finally:
-            stderr_fh.close()
+        # NOTE: Do NOT close stderr_fh here. The subprocess inherits the fd;
+        # closing it in the parent is safe only after Popen duplicates it.
+        # On POSIX, Popen dups the fd so we can close safely in parent.
+        stderr_fh.close()
 
         # Non-blocking check: if process already exited (e.g., syntax error)
         retcode = proc.poll()
