@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from twinkle.utils.logger import get_logger
 from typing import Any, Callable
 
 from openai import AsyncOpenAI
@@ -12,6 +13,8 @@ from openai import AsyncOpenAI
 from twinkle_client.tui.agent.prompts import SYSTEM_PROMPT
 from twinkle_client.tui.agent.tools import TOOL_SCHEMAS, ToolExecutor
 from twinkle_client.tui.connection import LocalConnection
+
+logger = get_logger()
 
 
 class AgentLoop:
@@ -60,21 +63,25 @@ class AgentLoop:
 
         Returns the final assistant text response.
         """
+        logger.info(f'User message: {user_input[:200]}')
         self.history.append({'role': 'user', 'content': user_input})
         self._prune_history()
 
-        for _ in range(self.MAX_TOOL_ROUNDS):
+        for round_idx in range(self.MAX_TOOL_ROUNDS):
+            logger.debug(f'LLM call round {round_idx + 1}/{self.MAX_TOOL_ROUNDS}')
             content, tool_calls = await self._call_llm_stream(on_token=on_token)
 
             # If no tool calls, we're done — content was correctly streamed
             if not tool_calls:
                 self.history.append({'role': 'assistant', 'content': content})
+                logger.info(f'Assistant response ({len(content)} chars): {content[:150]}...')
                 return content
 
             # Tool calls detected — discard any leaked intermediate tokens
             if on_stream_reset:
                 on_stream_reset()
 
+            logger.info(f'Tool calls detected: {[tc["function"]["name"] for tc in tool_calls]}')
             self.history.append({
                 'role': 'assistant',
                 'content': content,
@@ -82,8 +89,16 @@ class AgentLoop:
             })
 
             for tc in tool_calls:
-                args = json.loads(tc['function']['arguments']) if tc['function']['arguments'] else {}
-                result = await self._tool_executor.execute(tc['function']['name'], args)
+                func_name = tc['function']['name']
+                raw_args = tc['function']['arguments']
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError as e:
+                    logger.error(f'Tool {func_name}: invalid JSON args: {e}\n  raw={raw_args[:500]}')
+                    args = {}
+                logger.info(f'Executing tool: {func_name}({", ".join(f"{k}={v!r}" for k, v in list(args.items())[:5])})')
+                result = await self._tool_executor.execute(func_name, args)
+                logger.debug(f'Tool {func_name} result ({len(result)} chars): {result[:300]}')
                 self.history.append({
                     'role': 'tool',
                     'tool_call_id': tc['id'],
@@ -91,6 +106,7 @@ class AgentLoop:
                 })
 
         # Exceeded max rounds
+        logger.warning(f'Exceeded max tool rounds ({self.MAX_TOOL_ROUNDS})')
         fallback = 'I reached the maximum number of tool calls. Please try a simpler request.'
         self.history.append({'role': 'assistant', 'content': fallback})
         return fallback
@@ -104,13 +120,17 @@ class AgentLoop:
         Streams text tokens via on_token only if the response has no tool calls.
         Returns (full_content, tool_calls_list).
         """
-        stream = await self._client.chat.completions.create(
-            model=self.llm_model,
-            messages=self.history,
-            tools=TOOL_SCHEMAS,
-            tool_choice='auto',
-            stream=True,
-        )
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self.llm_model,
+                messages=self.history,
+                tools=TOOL_SCHEMAS,
+                tool_choice='auto',
+                stream=True,
+            )
+        except Exception as e:
+            logger.error(f'LLM API call failed: {type(e).__name__}: {e}')
+            raise
 
         content_parts: list[str] = []
         tool_calls_map: dict[int, dict[str, Any]] = {}

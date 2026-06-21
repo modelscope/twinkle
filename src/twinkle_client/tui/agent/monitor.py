@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+from twinkle.utils.logger import get_logger
 from typing import Any, Callable
 
 from openai import AsyncOpenAI
@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 from twinkle_client.tui.agent.prompts import MONITOR_SYSTEM_PROMPT
 from twinkle_client.tui.connection import LocalConnection
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 # Prefix the LLM must use when no issue is found
 _NORMAL_PREFIX = 'LGTM'

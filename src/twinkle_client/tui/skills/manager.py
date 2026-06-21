@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import logging
+from twinkle.utils.logger import get_logger
 
 from twinkle_client.tui.skills.base import Skill, SkillProvider
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 class SkillManager:

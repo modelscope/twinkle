@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from twinkle.utils.logger import get_logger
 from pathlib import Path
 
 from twinkle_client.tui.skills.base import SkillProvider
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 _DEFAULT_REPO_URL = 'https://github.com/modelscope/modelscope-skills.git'
 _DEFAULT_BRANCH = 'main'

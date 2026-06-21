@@ -8,7 +8,10 @@ import json
 import os
 from typing import Any, Callable
 
+from twinkle.utils.logger import get_logger
 from twinkle_client.tui.connection import LocalConnection
+
+logger = get_logger()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tool schemas (OpenAI function calling format)
@@ -336,11 +339,13 @@ class ToolExecutor:
         """Execute a tool by name and return the result as a JSON string."""
         handler = getattr(self, f'_tool_{name}', None)
         if handler is None:
+            logger.warning(f'Unknown tool called: {name}')
             return json.dumps({'error': f'Unknown tool: {name}'})
         try:
             result = await handler(**arguments)
             return json.dumps(result, ensure_ascii=False, default=str)
         except Exception as e:
+            logger.error(f'Tool {name} raised exception: {type(e).__name__}: {e}', exc_info=True)
             return json.dumps({'error': f'{name} failed: {e}'})
 
     # ── Training lifecycle ──

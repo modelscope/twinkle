@@ -1,6 +1,55 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
 """Twinkle TUI - Terminal User Interface for training control."""
 
+import logging
+from pathlib import Path
+
+from twinkle.utils.logger import get_logger
+
+# ── Log file: ./tui.log (current working directory) ──
+_LOG_FILE = Path.cwd() / 'tui.log'
+
+
+def _configure_logging(verbose: bool = False) -> None:
+    """Configure file-only logging for TUI.
+
+    All logs are written to ./tui.log in the current working directory.
+    NO console output — avoids corrupting Textual's alt-screen buffer.
+    The file is rotated at 5MB with 3 backups.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    handler = RotatingFileHandler(
+        _LOG_FILE,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+        encoding='utf-8',
+    )
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+
+    level = logging.DEBUG if verbose else logging.INFO
+
+    # Get the 'twinkle' logger (same one returned by get_logger())
+    twinkle_logger = logging.getLogger('twinkle')
+    twinkle_logger.setLevel(level)
+    twinkle_logger.propagate = False
+
+    # Remove any existing handlers (especially StreamHandlers that print to terminal)
+    twinkle_logger.handlers.clear()
+
+    # Only attach the file handler — no terminal output
+    twinkle_logger.addHandler(handler)
+
+    # Mark as initialized so get_logger() won't re-add a StreamHandler
+    from twinkle.utils.logger import init_loggers
+    init_loggers[twinkle_logger.name] = True
+
+    # Also capture warnings from third-party libs
+    logging.captureWarnings(True)
+
 
 def main(argv: list[str] | None = None) -> int:
     """Programmatic entry point for ``twinkle-tui``.
@@ -45,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
             envvar='TWINKLE_LLM_API_KEY',
             help='LLM API key.',
         ),
+        verbose: bool = typer.Option(
+            False, '--verbose', '-v',
+            envvar='TWINKLE_TUI_VERBOSE',
+            help='Enable verbose (DEBUG) logging.',
+        ),
         version: bool = typer.Option(
             False, '--version', '-V',
             callback=_version_callback, is_eager=True,
@@ -52,6 +106,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     ) -> None:
         """Launch the Twinkle TUI."""
+        _configure_logging(verbose=verbose)
+        logger = get_logger()
+        logger.info(
+            f'TUI starting — model={llm_model}, base_url={llm_base_url}, '
+            f'run_id={run_id}, log_file={_LOG_FILE}'
+        )
+
         from twinkle_client.tui.app import TwinkleTUI
 
         tui = TwinkleTUI(

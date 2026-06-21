@@ -14,11 +14,11 @@ To create a new provider, subclass SkillProvider and implement:
 from __future__ import annotations
 
 import dataclasses
-import logging
+from twinkle.utils.logger import get_logger
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 # File stems to skip when scanning for skill markdown files
 _SKIP_STEMS = frozenset({'license', 'readme', 'contributing', 'changelog'})

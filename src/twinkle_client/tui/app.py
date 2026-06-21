@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from twinkle.utils.logger import get_logger
 from typing import ClassVar
 
 from textual.app import App, ComposeResult
@@ -19,7 +19,7 @@ from twinkle_client.tui.widgets.logs import LogPanel
 from twinkle_client.tui.widgets.metrics import MetricsPanel
 from twinkle_client.tui.widgets.status_bar import StatusBar
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 # Timeout for remote skills fetching (seconds)
 _SKILLS_FETCH_TIMEOUT = 10.0

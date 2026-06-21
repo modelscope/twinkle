@@ -20,7 +20,7 @@ File layout under run_dir (~/.cache/twinkle/{run_id}/):
 from __future__ import annotations
 
 import json
-import logging
+from twinkle.utils.logger import get_logger
 import os
 import re
 import shutil
@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 DEFAULT_BASE_DIR = Path.home() / '.cache' / 'twinkle'
 
