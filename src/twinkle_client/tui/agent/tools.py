@@ -938,9 +938,10 @@ class ToolExecutor:
             return None
 
         try:
-            # Connect to existing cluster without starting a new one
+            # Connect to existing cluster without starting a new one.
+            # Use short timeout (5s) to avoid long GCS connection hangs.
             if not ray.is_initialized():
-                ray.init(address='auto', ignore_reinit_error=True)
+                ray.init(address='auto', ignore_reinit_error=True, _timeout_s=5)
             resources = ray.cluster_resources()
             available = ray.available_resources()
             nodes = ray.nodes()
@@ -961,7 +962,13 @@ class ToolExecutor:
                 'memory_bytes': resources.get('memory', 0),
             }
         except Exception:
-            # Ray not reachable (no cluster running)
+            # Ray not reachable (no cluster running) — disconnect cleanly
+            try:
+                import ray as _ray
+                if _ray.is_initialized():
+                    _ray.shutdown()
+            except Exception:
+                pass
             return None
 
     @staticmethod

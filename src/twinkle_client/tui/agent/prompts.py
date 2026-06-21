@@ -18,6 +18,8 @@ Rules:
 - If you detect training anomalies (NaN loss, reward plateau), proactively suggest fixes.
 - For chart zoom requests, call the `zoom_metrics` tool with appropriate parameters.
 - Always confirm destructive actions (stopping training, changing dataset) before executing.
+- When user mentions a model or dataset by short name (e.g. "Qwen3.5-4B", "gsm8k"), \
+ALWAYS call `search_models` or `search_datasets` first to resolve the full org/name ID before using it.
 - Respond in the same language the user uses.
 """
 
