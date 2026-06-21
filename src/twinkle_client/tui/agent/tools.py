@@ -412,7 +412,7 @@ class ToolExecutor:
 
         def _probe():
             try:
-                req = urllib.request.Request(f'{url}/api/v1/-/healthy', method='GET')
+                req = urllib.request.Request(f'{url}/api/v1/healthz', method='GET')
                 urllib.request.urlopen(req, timeout=3)
                 return True
             except (urllib.error.URLError, OSError):
@@ -536,7 +536,7 @@ class ToolExecutor:
                     }
                 try:
                     import urllib.request
-                    urllib.request.urlopen(f'{server_url}/api/v1/-/healthy', timeout=2)
+                    urllib.request.urlopen(f'{server_url}/api/v1/healthz', timeout=2)
                     return {
                         'status': 'started',
                         'server_url': server_url,
@@ -820,7 +820,7 @@ class ToolExecutor:
             import urllib.request
             import urllib.error
 
-            endpoint = f'{url}/twinkle/get_server_capabilities'
+            endpoint = f'{url}/api/v1/twinkle/get_server_capabilities'
             req = urllib.request.Request(endpoint, method='GET')
             resp = urllib.request.urlopen(req, timeout=10)
             data = json.loads(resp.read().decode())

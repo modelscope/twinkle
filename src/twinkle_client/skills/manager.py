@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from twinkle.utils.logger import get_logger
 
-from twinkle_client.tui.skills.base import Skill, SkillProvider
+from twinkle_client.skills.base import Skill, SkillProvider
 
 logger = get_logger()
 

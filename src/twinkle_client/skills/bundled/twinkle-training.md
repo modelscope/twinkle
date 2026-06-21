@@ -106,7 +106,7 @@ responses = sampler.sample(inputs=batch, sampling_params={...}, adapter_uri=resu
 ### TrainingRuntime (Observability)
 
 ```python
-from twinkle_tui.runtime import TrainingRuntime
+from twinkle_client.tui.runtime import TrainingRuntime
 
 rt = TrainingRuntime(run_id='my-experiment')
 rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4}, script_path=__file__)

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from twinkle_client.tui.skills.base import SkillProvider
+from twinkle_client.skills.base import SkillProvider
 
 # Default: user-local skills directory (user drops .md files here)
 _DEFAULT_SKILLS_DIR = Path.home() / '.cache' / 'twinkle' / 'tui' / 'skills' / 'local'

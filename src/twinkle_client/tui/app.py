@@ -13,7 +13,7 @@ from textual.binding import Binding
 from twinkle_client.tui.agent.core import AgentLoop
 from twinkle_client.tui.agent.monitor import TrainingMonitor
 from twinkle_client.tui.connection import LocalConnection
-from twinkle_client.tui.skills import LocalSkillProvider, ModelScopeSkillProvider, SkillManager
+from twinkle_client.skills import LocalSkillProvider, ModelScopeSkillProvider, SkillManager
 from twinkle_client.tui.widgets.chat import ChatPanel
 from twinkle_client.tui.widgets.logs import LogPanel
 from twinkle_client.tui.widgets.metrics import MetricsPanel
@@ -148,7 +148,16 @@ class TwinkleTUI(App):
     async def _load_skills_async(self) -> None:
         """Load skills in background and inject into agent when ready."""
         manager = SkillManager()
+
+        # 1. Bundled skills shipped inside the twinkle_client package (pip-installable)
+        from pathlib import Path as _Path
+        _bundled_skills = _Path(__file__).resolve().parent.parent / 'skills' / 'bundled'
+        if _bundled_skills.is_dir():
+            manager.register(LocalSkillProvider(skills_dir=_bundled_skills))
+
+        # 2. User-local custom skills (~/.cache/twinkle/tui/skills/local/)
         manager.register(LocalSkillProvider())
+        # 3. Community skills from ModelScope (remote, best-effort)
         manager.register(ModelScopeSkillProvider())
         try:
             await asyncio.wait_for(manager.load_all(), timeout=_SKILLS_FETCH_TIMEOUT)

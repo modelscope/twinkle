@@ -218,10 +218,14 @@ class LocalConnection:
         """Create a new training run and launch the script.
 
         Args:
-            run_id: Unique identifier for the run.
+            run_id: Unique identifier for the run (timestamp suffix auto-appended).
             script_content: Full Python source of the training script.
             model_id: Model identifier for metadata.
         """
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_id = f'{run_id}_{timestamp}'
+
         run_dir = self.base_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 

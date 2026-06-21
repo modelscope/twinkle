@@ -48,9 +48,9 @@ class CompetitionMathGRPOProcessor(Preprocessor):
 
 class SelfCognitionProcessor(Preprocessor):
 
-    def __init__(self, model_name, model_author):
-        self.model_name = model_name
-        self.model_author = model_author
+    def __init__(self, model_name=None, model_author=None):
+        self.model_name = model_name or 'twinkle robot'
+        self.model_author = model_author or 'twinkle lab'
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)

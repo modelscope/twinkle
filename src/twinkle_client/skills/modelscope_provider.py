@@ -7,7 +7,7 @@ import asyncio
 from twinkle.utils.logger import get_logger
 from pathlib import Path
 
-from twinkle_client.tui.skills.base import SkillProvider
+from twinkle_client.skills.base import SkillProvider
 
 logger = get_logger()
 
