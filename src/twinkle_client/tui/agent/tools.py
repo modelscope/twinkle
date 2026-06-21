@@ -930,6 +930,43 @@ class ToolExecutor:
         return await asyncio.get_event_loop().run_in_executor(None, _query)
 
     @staticmethod
+    def _suppress_fds():
+        """Context-manager-like helpers to suppress stdout/stderr at OS fd level.
+
+        Ray's C++ runtime writes directly to fd 1/2, bypassing Python's
+        sys.stdout/stderr. We must redirect at the OS level to prevent
+        corrupting Textual's alt-screen buffer.
+        """
+        import sys
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        _saved_stdout_fd = os.dup(1)
+        _saved_stderr_fd = os.dup(2)
+        os.dup2(_devnull_fd, 1)
+        os.dup2(_devnull_fd, 2)
+        # Also redirect Python-level streams
+        _old_stdout, _old_stderr = sys.stdout, sys.stderr
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+        return _devnull_fd, _saved_stdout_fd, _saved_stderr_fd, _old_stdout, _old_stderr
+
+    @staticmethod
+    def _restore_fds(state):
+        """Restore stdout/stderr from state returned by _suppress_fds()."""
+        import sys
+        _devnull_fd, _saved_stdout_fd, _saved_stderr_fd, _old_stdout, _old_stderr = state
+        # Restore Python-level
+        sys.stdout.close()
+        sys.stderr.close()
+        sys.stdout = _old_stdout
+        sys.stderr = _old_stderr
+        # Restore OS-level
+        os.dup2(_saved_stdout_fd, 1)
+        os.dup2(_saved_stderr_fd, 2)
+        os.close(_saved_stdout_fd)
+        os.close(_saved_stderr_fd)
+        os.close(_devnull_fd)
+
+    @staticmethod
     def _try_ray_cluster() -> dict | None:
         """Attempt to query an existing Ray cluster. Returns None if unavailable."""
         try:
@@ -937,11 +974,28 @@ class ToolExecutor:
         except ImportError:
             return None
 
+        import logging as _logging
+
         try:
             # Connect to existing cluster without starting a new one.
             # Use short timeout (5s) to avoid long GCS connection hangs.
+            # IMPORTANT: Suppress stdout/stderr at OS fd level during ray.init()
+            # to prevent corrupting Textual's alt-screen buffer (Ray's C++ runtime
+            # writes directly to fd 1/2, causing UI glitches like duplicated Input
+            # widgets filling the screen).
             if not ray.is_initialized():
-                ray.init(address='auto', ignore_reinit_error=True, _timeout_s=5)
+                state = ToolExecutor._suppress_fds()
+                try:
+                    ray.init(
+                        address='auto',
+                        ignore_reinit_error=True,
+                        _timeout_s=5,
+                        logging_level=_logging.ERROR,
+                        configure_logging=False,
+                    )
+                finally:
+                    ToolExecutor._restore_fds(state)
+
             resources = ray.cluster_resources()
             available = ray.available_resources()
             nodes = ray.nodes()
