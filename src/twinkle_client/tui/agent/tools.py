@@ -807,21 +807,33 @@ class ToolExecutor:
     async def _tool_list_supported_models(self, base_url: str | None = None) -> dict:
         """Query the Twinkle server for supported models."""
         url = base_url or self._resolve_server_url()
-        key = os.environ.get('MODELSCOPE_TOKEN') or os.environ.get('TWINKLE_SERVER_TOKEN') or 'EMPTY_API_KEY'
 
         def _query():
-            from twinkle_client import init_twinkle_client
-            client = init_twinkle_client(base_url=url, api_key=key)
-            caps = client.get_server_capabilities()
+            # Use a lightweight HTTP GET instead of init_twinkle_client() which
+            # creates a session + heartbeat thread that would leak since we never
+            # call close().
+            import urllib.request
+            import urllib.error
+
+            endpoint = f'{url}/twinkle/get_server_capabilities'
+            req = urllib.request.Request(endpoint, method='GET')
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode())
+            models = data.get('supported_models', [])
+            # Each model entry may be a dict with 'model_name' or a plain string
+            model_names = []
+            for m in models:
+                if isinstance(m, dict):
+                    model_names.append(m.get('model_name', ''))
+                else:
+                    model_names.append(str(m))
             return {
                 'base_url': url,
-                'supported_models': [m.model_name for m in caps.supported_models],
+                'supported_models': model_names,
             }
 
         try:
             return await asyncio.get_event_loop().run_in_executor(None, _query)
-        except ImportError:
-            return {'error': 'twinkle_client not installed. Run: pip install twinkle-kit'}
         except Exception as e:
             return {'error': f'Failed to query {url}: {e}'}
 
