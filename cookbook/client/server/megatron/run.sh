@@ -249,7 +249,7 @@ is_run_script_process() {
     local pid="$1"
     local command_line
 
-    if [ -z "$pid" ] || [ "$pid" = "$$" ] || ! kill -0 "$pid" 2>/dev/null; then
+    if [ -z "$pid" ] || [ "$pid" = "$$" ] || [ "$pid" = "${BASHPID:-}" ] || ! kill -0 "$pid" 2>/dev/null; then
         return 1
     fi
 
@@ -274,13 +274,6 @@ find_existing_run_pid() {
             return 0
         fi
     fi
-
-    while read -r pid; do
-        if is_run_script_process "$pid"; then
-            echo "$pid"
-            return 0
-        fi
-    done < <(ps -eo pid= 2>/dev/null || true)
 
     return 1
 }
