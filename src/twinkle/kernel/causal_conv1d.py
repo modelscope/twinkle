@@ -85,7 +85,14 @@ def _prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 
 
 def _prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
-    indices = torch.cat([torch.arange(n) for n in triton.cdiv(_prepare_lens(cu_seqlens), chunk_size).tolist()])
+    num_chunks = triton.cdiv(_prepare_lens(cu_seqlens), chunk_size)
+    total_chunks = num_chunks.sum().item()
+    diffs = torch.ones(total_chunks, dtype=torch.long, device=cu_seqlens.device)
+    diffs[0] = 0
+    if len(num_chunks) > 1:
+        starts = num_chunks.cumsum(0)[:-1]
+        diffs[starts] = -num_chunks[:-1] + 1
+    indices = diffs.cumsum(0)
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
 
@@ -381,8 +388,9 @@ def causal_conv1d_bwd_kernel(
                     b_db += tl.sum(b_dy_sub, 0)
                 b_dx += b_wdy
 
-            p_dw = tl.make_block_ptr(dw + i_tg * W * D, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
-            tl.store(p_dw, b_dw.to(dw.dtype.element_ty))
+            if HAS_WEIGHT:
+                p_dw = tl.make_block_ptr(dw + i_tg * W * D, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
+                tl.store(p_dw, b_dw.to(dw.dtype.element_ty))
         elif i_t * BT >= W:
             for i_w in tl.static_range(0, W):
                 if is_tail_chunk:
@@ -612,7 +620,7 @@ def causal_conv1d_fwd_impl(
         BD = 32
         BT = min(16, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
     else:
-        BD = 256
+        BD = min(triton.next_power_of_2(D), 256)
         BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
     if D % BD != 0:
         raise ValueError('D must be divisible by BD.')
@@ -906,6 +914,11 @@ def causal_conv1d_update_kernel_bdt_fwd(
             out_block += x_mul_chl_wi
         out_block = tl.trans(out_block, (1, 0))
 
+        if HAS_BIAS:
+            bias_offset = di * D_CHK_SIZE + tl.arange(0, D_CHK_SIZE)
+            bias = tl.load(bias_ptr + bias_offset, mask=(bias_offset < dim), other=0.0).to(out_block.dtype)
+            out_block += bias[:, None]
+
         if SILU_ACTIVATION:
             out_block = out_block * tl.sigmoid(out_block)
         tl.store(
@@ -1079,25 +1092,15 @@ def npu_causal_conv1d_fn(
     backend: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
 ):
-    """Adapter matching twinkle's ``causal_conv1d_fn`` call signature.
-
-    Bridges between twinkle's (and FLA's) channel‑first [B, D, T] interface
-    and the native NPU kernel's [B, T, D] format.
-    """
+    """Adapter matching twinkle's ``causal_conv1d_fn`` call signature."""
     del seq_idx, backend
 
-    # Original input shape: x -> (B, D, T), weight -> (D, W)
-    # NPU kernel expects:  x -> (B, T, D), weight -> (W, D)
-    x_t = x.transpose(1, 2).contiguous()  # (B, T, D)
-    weight_t = weight.transpose(0, 1).contiguous()  # (W, D)
-
-    y_t, _ = causal_conv1d(
-        x=x_t,
-        weight=weight_t,
-        bias=bias,
-        activation=activation,
-        cu_seqlens=cu_seqlens,
-    )
-    # y_t is (B, T, D), transpose back to (B, D, T)
-    y = y_t.transpose(1, 2).contiguous()
-    return y
+    if x.dim() == 3 and weight.dim() == 2 and x.shape[-1] == weight.shape[0] and x.shape[-1] != weight.shape[-1]:
+        weight_t = weight.transpose(0, 1).contiguous()
+        y_t, _ = causal_conv1d(x=x, weight=weight_t, bias=bias, activation=activation, cu_seqlens=cu_seqlens)
+        return y_t
+    else:
+        x_t = x.transpose(1, 2).contiguous()
+        weight_t = weight.transpose(0, 1).contiguous()
+        y_t, _ = causal_conv1d(x=x_t, weight=weight_t, bias=bias, activation=activation, cu_seqlens=cu_seqlens)
+        return y_t.transpose(1, 2).contiguous()
