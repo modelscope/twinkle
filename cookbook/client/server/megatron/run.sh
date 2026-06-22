@@ -20,7 +20,7 @@
 # 环境变量：
 #   MODELSCOPE_CACHE                         默认 /dashscope/caches/application/.cache
 #   TWINKLE_WORK_DIR                         默认 /dashscope/caches/application/twinkle
-#   TWINKLE_RUN_EXISTING_ACTION              已有实例运行时的行为：exit 或 restart（默认 exit）
+#   TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart（默认 exit）
 #   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数（默认 120）
 #
 # 示例：
@@ -80,8 +80,8 @@ OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
 OBI_VERSION="${OBI_VERSION:-v0.9.0}"
 
 # --- 单实例与重启请求配置 ---
+RUN_SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 TWINKLE_RUN_OWNER="${USER:-shared}"
-TWINKLE_RUN_LOCK_FILE="${TWINKLE_RUN_LOCK_FILE:-/tmp/twinkle-megatron-run-${TWINKLE_RUN_OWNER}.lock}"
 TWINKLE_RUN_PID_FILE="${TWINKLE_RUN_PID_FILE:-/tmp/twinkle-megatron-run-${TWINKLE_RUN_OWNER}.pid}"
 TWINKLE_RUN_RESTART_REQUEST_FILE="${TWINKLE_RUN_RESTART_REQUEST_FILE:-/tmp/twinkle-megatron-run-${TWINKLE_RUN_OWNER}.restart}"
 TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-exit}"
@@ -119,7 +119,7 @@ print_usage() {
 环境变量:
   MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache
   TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle
-  TWINKLE_RUN_EXISTING_ACTION              exit 或 restart (默认: exit)
+  TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart (默认: exit)
   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
 示例:
@@ -245,14 +245,44 @@ print_header() {
     print_separator
 }
 
-acquire_run_lock() {
-    if ! command -v flock &> /dev/null; then
-        print_error "flock 不存在，无法安全保证 run.sh 单实例运行"
-        exit 1
+is_run_script_process() {
+    local pid="$1"
+    local command_line
+
+    if [ -z "$pid" ] || [ "$pid" = "$$" ] || [ "$pid" = "${BASHPID:-}" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 1
     fi
 
-    exec 9>"$TWINKLE_RUN_LOCK_FILE"
-    if flock -n 9; then
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+        *"$RUN_SCRIPT_PATH"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+find_existing_run_pid() {
+    local pid
+
+    if [ -f "$TWINKLE_RUN_PID_FILE" ]; then
+        pid="$(cat "$TWINKLE_RUN_PID_FILE" 2>/dev/null || true)"
+        if is_run_script_process "$pid"; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+register_run_instance() {
+    local old_pid
+
+    old_pid="$(find_existing_run_pid || true)"
+    if [ -z "$old_pid" ]; then
         echo "$$" > "$TWINKLE_RUN_PID_FILE"
         rm -f "$TWINKLE_RUN_RESTART_REQUEST_FILE"
         return 0
@@ -261,18 +291,6 @@ acquire_run_lock() {
     if [ "$TWINKLE_RUN_EXISTING_ACTION" != "restart" ]; then
         print_error "已有 run.sh 实例正在运行，退出以避免中断当前服务"
         print_error "如需主动重启，请使用 --restart 或设置 TWINKLE_RUN_EXISTING_ACTION=restart"
-        exit 1
-    fi
-
-    if [ ! -f "$TWINKLE_RUN_PID_FILE" ]; then
-        print_error "已有 run.sh 实例持有锁，但未找到 PID 文件: $TWINKLE_RUN_PID_FILE"
-        exit 1
-    fi
-
-    local old_pid
-    old_pid="$(cat "$TWINKLE_RUN_PID_FILE" 2>/dev/null || true)"
-    if [ -z "$old_pid" ] || ! kill -0 "$old_pid" 2>/dev/null; then
-        print_error "PID 文件中的旧 run.sh 进程不存在: ${old_pid:-empty}"
         exit 1
     fi
 
@@ -350,7 +368,6 @@ require_command() {
 }
 
 validate_runtime_dependencies() {
-    require_command flock
     require_command tail
     require_command python
     require_command ray
@@ -569,10 +586,7 @@ print_runtime_config() {
 }
 
 prepare_runtime_dirs() {
-    if [ ! -d "$TEMP_DIR" ]; then
-        print_info "创建临时目录: $TEMP_DIR"
-        mkdir -p "$TEMP_DIR"
-    fi
+    mkdir -p "$MODELSCOPE_CACHE" "$TEMP_DIR" "$SAVE_DIR"
 }
 
 start_redis() {
@@ -725,12 +739,9 @@ validate_runtime_dependencies
 mkdir -p "$TWINKLE_WORK_DIR"
 cd "$TWINKLE_WORK_DIR"
 trap handle_restart_signal USR1
-acquire_run_lock
+register_run_instance
 trap cleanup_script_exit EXIT
 trap handle_shutdown_signal INT TERM
 
-if run_service_once; then
-    exit 0
-else
-    exit 1
-fi
+run_service_once
+exit 0
