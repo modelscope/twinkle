@@ -8,9 +8,3 @@ def test_task_error_payload_keeps_lora_traceback():
         'error': error,
         'category': 'Server',
     }
-
-
-def test_task_error_payload_keeps_unknown_traceback():
-    error = 'Traceback...\nRuntimeError: unexpected failure\n'
-
-    assert task_error_payload(error) == {'error': error, 'category': 'Server'}

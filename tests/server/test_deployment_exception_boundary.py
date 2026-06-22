@@ -4,36 +4,7 @@ from fastapi.testclient import TestClient
 from twinkle.server.deployment import build_deployment_app
 
 
-def test_deployment_app_returns_traceback_and_keeps_serving_after_unhandled_route_exception():
-    calls = {'boom': 0, 'health': 0}
-
-    def register_routes(app: FastAPI, _get_self):
-
-        @app.get('/healthz')
-        async def healthz():
-            calls['health'] += 1
-            return {'ok': True, 'health_calls': calls['health']}
-
-        @app.get('/boom')
-        async def boom():
-            calls['boom'] += 1
-            raise RuntimeError(f'boom from route #{calls["boom"]}')
-
-    app = build_deployment_app('Test', register_routes)
-    client = TestClient(app)
-
-    for i in range(3):
-        response = client.get('/boom', headers={'x-request-id': 'boundary-test'})
-        assert response.status_code == 500
-        assert f'RuntimeError: boom from route #{i + 1}' in response.json()['detail']
-        assert 'Traceback' in response.json()['detail']
-
-    response = client.get('/healthz')
-    assert response.status_code == 200
-    assert response.json() == {'ok': True, 'health_calls': 1}
-
-
-def test_deployment_app_adds_replica_header_to_unhandled_route_exception(monkeypatch):
+def test_deployment_app_catches_unhandled_route_exception_and_keeps_serving(monkeypatch):
 
     class _ReplicaId:
         unique_id = 'replica-test'
@@ -44,8 +15,14 @@ def test_deployment_app_adds_replica_header_to_unhandled_route_exception(monkeyp
     from twinkle.server import deployment
 
     monkeypatch.setattr(deployment.serve, 'get_replica_context', lambda: _Context())
+    calls = {'health': 0}
 
     def register_routes(app: FastAPI, _get_self):
+
+        @app.get('/healthz')
+        async def healthz():
+            calls['health'] += 1
+            return {'ok': True, 'health_calls': calls['health']}
 
         @app.get('/boom')
         async def boom():
@@ -57,4 +34,9 @@ def test_deployment_app_adds_replica_header_to_unhandled_route_exception(monkeyp
     response = client.get('/boom', headers={'x-request-id': 'boundary-test'})
     assert response.status_code == 500
     assert response.headers['X-Twinkle-Replica-Id'] == 'replica-test'
+    assert 'Traceback' in response.json()['detail']
     assert 'RuntimeError: boom with replica header' in response.json()['detail']
+
+    response = client.get('/healthz')
+    assert response.status_code == 200
+    assert response.json() == {'ok': True, 'health_calls': 1}

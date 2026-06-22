@@ -247,21 +247,61 @@ print_header() {
 
 is_run_script_process() {
     local pid="$1"
+    local command_arg
     local command_line
+    local process_cwd
 
     if [ -z "$pid" ] || [ "$pid" = "$$" ] || [ "$pid" = "${BASHPID:-}" ] || ! kill -0 "$pid" 2>/dev/null; then
         return 1
     fi
 
+    if [ -r "/proc/$pid/cmdline" ]; then
+        process_cwd="$(cd "/proc/$pid/cwd" 2>/dev/null && pwd || true)"
+        while IFS= read -r -d '' command_arg; do
+            if is_run_script_arg "$command_arg" "$process_cwd"; then
+                return 0
+            fi
+        done < "/proc/$pid/cmdline"
+        return 1
+    fi
+
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
-        *"$RUN_SCRIPT_PATH"*)
+        *"$RUN_SCRIPT_PATH"*|*" ./$(basename "$RUN_SCRIPT_PATH")"*|*" $(basename "$RUN_SCRIPT_PATH")"*)
             return 0
             ;;
         *)
             return 1
             ;;
     esac
+}
+
+is_run_script_arg() {
+    local command_arg="$1"
+    local process_cwd="$2"
+    local command_dir
+
+    if [ "$command_arg" = "$RUN_SCRIPT_PATH" ]; then
+        return 0
+    fi
+
+    if [ "$(basename "$command_arg")" != "$(basename "$RUN_SCRIPT_PATH")" ]; then
+        return 1
+    fi
+
+    case "$command_arg" in
+        /*)
+            [ "$command_arg" = "$RUN_SCRIPT_PATH" ]
+            return
+            ;;
+    esac
+
+    if [ -z "$process_cwd" ]; then
+        return 1
+    fi
+
+    command_dir="$(cd "$process_cwd/$(dirname "$command_arg")" 2>/dev/null && pwd || true)"
+    [ "$command_dir/$(basename "$RUN_SCRIPT_PATH")" = "$RUN_SCRIPT_PATH" ]
 }
 
 find_existing_run_pid() {
@@ -368,6 +408,7 @@ require_command() {
 }
 
 validate_runtime_dependencies() {
+    require_command ps
     require_command tail
     require_command python
     require_command ray
