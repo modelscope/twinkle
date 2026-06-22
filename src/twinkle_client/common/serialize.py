@@ -16,10 +16,7 @@ supported_types = {
 primitive_types = (str, Number, bool, bytes, type(None))
 container_types = (Mapping, list, tuple, set, frozenset)
 basic_types = (*primitive_types, *container_types)
-
-
-def _dataset_meta_field_names() -> set[str]:
-    return {field.name for field in fields(DatasetMeta)}
+_DATASET_META_FIELDS = {field.name for field in fields(DatasetMeta)}
 
 
 def _serialize_data_slice(data_slice):
@@ -50,7 +47,7 @@ def _deserialize_data_slice(data_slice):
 
 def serialize_object(obj) -> str:
     if isinstance(obj, DatasetMeta):
-        data = {name: getattr(obj, name) for name in _dataset_meta_field_names()}
+        data = {name: getattr(obj, name) for name in _DATASET_META_FIELDS}
         data['data_slice'] = _serialize_data_slice(data.get('data_slice'))
         data['_TWINKLE_TYPE_'] = 'DatasetMeta'
         return json.dumps(data, ensure_ascii=False)
@@ -85,7 +82,7 @@ def deserialize_object(data: str) -> Any:
     if '_TWINKLE_TYPE_' in data:
         _type = data.pop('_TWINKLE_TYPE_')
         if _type == 'DatasetMeta':
-            data = {key: value for key, value in data.items() if key in _dataset_meta_field_names()}
+            data = {key: value for key, value in data.items() if key in _DATASET_META_FIELDS}
             data['data_slice'] = _deserialize_data_slice(data.get('data_slice'))
             return DatasetMeta(**data)
         elif _type == 'LoraConfig':

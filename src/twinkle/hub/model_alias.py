@@ -19,7 +19,7 @@ def extract_model_alias(route_prefix: str, service_type: str = 'model') -> str |
     marker = f'/{service_type}/'
     if not route_prefix or marker not in route_prefix:
         return None
-    alias = route_prefix.split(marker, 1)[1].lstrip('/')
+    alias = route_prefix.split(marker, 1)[1].strip('/')
     return alias or None
 
 
@@ -55,5 +55,5 @@ def load_model_alias_map(raw: str | Mapping[str, str] | None = None) -> dict[str
 def resolve_model_id_alias(model_id_or_path: str | None, alias_map: Mapping[str, str] | None = None) -> str | None:
     if not model_id_or_path:
         return model_id_or_path
-    aliases = dict(alias_map) if alias_map is not None else load_model_alias_map()
+    aliases = alias_map if alias_map is not None else load_model_alias_map()
     return aliases.get(model_id_or_path, model_id_or_path)
