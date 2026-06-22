@@ -56,7 +56,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
 ) -> torch.Tensor:
     is_npu = getattr(mod, '_twinkle_npu_patched', False)
     if is_npu:
-        ms_causal_conv1d = _get_mindspeed_ops_causal_conv1d()
+        from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
     else:
         causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
 
@@ -69,12 +69,17 @@ def _patch_gdn_kernels_for_cu_seqlens(
             x = kwargs.pop('x')
             del kwargs['seq_idx']
             del kwargs['backend']
-            y, _ = ms_causal_conv1d(
+
+            if len(args) > 0:
+                kwargs['weight'] = args[0]
+                args = args[1:]
+            if len(args) > 0:
+                kwargs['bias'] = args[0]
+            return npu_causal_conv1d_fn(
                 x=x,
                 cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
                 **kwargs,
             )
-            return y
     else:
 
         def causal_conv1d_wrapper(*args, **kwargs):
