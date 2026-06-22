@@ -2,7 +2,7 @@
 """Training monitor - LLM-driven periodic health check.
 
 Every poll cycle, the monitor gathers ALL available signals about the current
-training run (process status, stderr, metrics, logs) and feeds them to the LLM.
+training run (process status, output logs, metrics) and feeds them to the LLM.
 The LLM decides:
 - LGTM: everything normal, no action needed
 - WARNING: report an observation to the user (metrics anomaly, slow progress, etc.)
@@ -39,14 +39,15 @@ what action (if any) to take.
 ## Signals you will receive
 
 - **Process status**: alive / zombie / exited / unknown
-- **stderr.log tail**: recent stderr output (may contain errors or warnings)
+- **output.log tail**: recent process output (stdout+stderr combined, may contain errors or warnings)
 - **Metrics**: recent training metrics (loss, reward, lr, etc.)
 - **Stall duration**: seconds since last new metric was produced
+- **Current train.py**: the full training script source (provided for accurate fixes)
 
 ## Decision framework
 
 1. **LGTM** — training is progressing normally.
-   - Process alive, metrics flowing, no errors in stderr, loss trending down.
+   - Process alive, metrics flowing, no errors in output, loss trending down.
    - Respond: `LGTM`
 
 2. **WARNING** — something worth noting but not script-breaking.
@@ -54,9 +55,9 @@ what action (if any) to take.
    - Respond with a BRIEF (1-3 sentence) observation + suggestion.
 
 3. **FIX** — the script has crashed or is broken and needs code changes.
-   - Process dead/zombie with error traceback in stderr.
+   - Process dead/zombie with error traceback in output.
    - Server returned an error (400/500) that indicates a code bug.
-   - Process stuck > 10 minutes with no metrics AND stderr shows an error.
+   - Process stuck > 10 minutes with no metrics AND output shows an error.
    - Respond in this EXACT format:
 ```diagnosis
 <1-2 sentence root cause>
@@ -69,12 +70,13 @@ what action (if any) to take.
 - Be direct and actionable.
 - Respond in the same language as the log content (Chinese or English).
 - NEVER start with LGTM if there is any issue.
-- For FIX: output the COMPLETE fixed script, not a diff.
+- For FIX: output the COMPLETE fixed script based on the provided "Current train.py". Only modify the lines that cause the error — do NOT rewrite from scratch or change the overall architecture.
 - Common fixes:
   - "Batch size N must be >= data world size M" → increase batch_size to M
   - "save_dir does not exist on the server" → remove the save_dir parameter
   - Import errors → fix the import
   - Connection refused → check base_url
+  - "Unknown format code 'f' for object of type 'str'" → remove float format specifiers (:.4f etc.) from print statements
 - Do NOT suggest FIX for transient issues (network blip, temporary stall < 5 min).
 - If process is alive and metrics are flowing but stale for < 3 min, say LGTM.
 """
@@ -181,20 +183,20 @@ class TrainingMonitor:
             else:
                 process_status = 'dead'
 
-        # stderr.log tail (last 1500 chars, focus on errors)
-        stderr_tail = ''
-        stderr_file = run_dir / 'stderr.log'
-        if stderr_file.exists():
+        # output.log tail (last 1500 chars, focus on errors)
+        output_tail = ''
+        output_file = run_dir / 'output.log'
+        if output_file.exists():
             try:
-                content = stderr_file.read_text(errors='replace')
+                content = output_file.read_text(errors='replace')
                 # Extract traceback if present
                 tb_idx = content.rfind('Traceback (most recent call last)')
                 if tb_idx >= 0:
-                    stderr_tail = content[tb_idx:][-1500:]
+                    output_tail = content[tb_idx:][-1500:]
                 elif len(content) > 1500:
-                    stderr_tail = content[-1500:]
+                    output_tail = content[-1500:]
                 else:
-                    stderr_tail = content
+                    output_tail = content
             except Exception:
                 pass
 
@@ -210,22 +212,32 @@ class TrainingMonitor:
 
         stall_seconds = time.time() - self._last_metric_time
 
+        # Current train.py script content (for LLM to fix)
+        script_content = ''
+        script_file = run_dir / 'train.py'
+        if script_file.exists():
+            try:
+                script_content = script_file.read_text(errors='replace')
+            except Exception:
+                pass
+
         return {
             'run_id': run_id,
             'meta_status': status,
             'process_status': process_status,
-            'stderr_tail': stderr_tail.strip(),
+            'output_tail': output_tail.strip(),
             'metrics': metrics,
             'stall_seconds': int(stall_seconds),
             'fix_attempts': self._fix_attempts.get(run_id, 0),
+            'script_content': script_content,
         }
 
     def _hash_snapshot(self, snapshot: dict[str, Any]) -> str:
         """Simple hash to detect meaningful changes between cycles."""
-        # Key factors: process status, stderr tail hash, latest step, stall bucket
+        # Key factors: process status, output tail hash, latest step, stall bucket
         parts = [
             snapshot['process_status'],
-            str(len(snapshot['stderr_tail'])),
+            str(len(snapshot['output_tail'])),
             str(snapshot['metrics'][-1].get('step', 0) if snapshot['metrics'] else 0),
             str(snapshot['stall_seconds'] // 60),  # bucket by minute
         ]
@@ -241,10 +253,10 @@ class TrainingMonitor:
         parts.append(f'- Auto-fix attempts so far: {snapshot["fix_attempts"]}/{_MAX_FIX_ATTEMPTS}')
         parts.append('')
 
-        # stderr
-        if snapshot['stderr_tail']:
-            parts.append('## stderr.log (tail)')
-            parts.append(f'```\n{snapshot["stderr_tail"]}\n```')
+        # output
+        if snapshot['output_tail']:
+            parts.append('## output.log (tail)')
+            parts.append(f'```\n{snapshot["output_tail"]}\n```')
             parts.append('')
 
         # Metrics
@@ -273,6 +285,12 @@ class TrainingMonitor:
                         parts.append(f'  {key}: {avg_first:.6g} → {avg_last:.6g}')
         else:
             parts.append('## Metrics: NONE (no metrics produced yet)')
+
+        # Script content (for accurate fixes)
+        if snapshot.get('script_content'):
+            parts.append('')
+            parts.append('## Current train.py')
+            parts.append(f'```python\n{snapshot["script_content"]}\n```')
 
         return '\n'.join(parts)
 

@@ -2,9 +2,10 @@
 """Training runtime utilities for TUI integration.
 
 This module provides helpers that training scripts import to:
-1. Write structured metrics and logs to local JSONL files
-2. Manage run lifecycle (start/end)
-3. Register SIGTERM handler for graceful shutdown with checkpoint
+1. Write structured metrics to metrics.jsonl
+2. Print log messages to stdout (captured as output.log by TUI launcher)
+3. Manage run lifecycle (start/end)
+4. Register SIGTERM handler for graceful shutdown with checkpoint
 
 In Server Mode, the client is stateless - killing the client process is
 equivalent to "pause" (server retains all optimizer/model state in GPU memory).
@@ -49,7 +50,7 @@ class TrainingRuntime:
 
     Manages:
     - Writing metrics.jsonl (structured step data)
-    - Writing logs.jsonl (timestamped log messages)
+    - Printing logs to stdout (captured by TUI launcher as output.log)
     - Run metadata (meta.json)
     - SIGTERM graceful shutdown with checkpoint saving
     """
@@ -74,7 +75,6 @@ class TrainingRuntime:
         self.run_dir = self.base_dir / run_id
 
         self._metrics_file: Any = None
-        self._logs_file: Any = None
         self._started = False
 
     def start(
@@ -133,9 +133,8 @@ class TrainingRuntime:
         }
         (self.run_dir / 'meta.json').write_text(json.dumps(meta, indent=2))
 
-        # Open files for append
+        # Open metrics file for append
         self._metrics_file = open(self.run_dir / 'metrics.jsonl', 'a', buffering=1)
-        self._logs_file = open(self.run_dir / 'logs.jsonl', 'a', buffering=1)
 
         self._started = True
         self.log('Training started')
@@ -145,25 +144,28 @@ class TrainingRuntime:
 
         All keyword arguments are written as a single JSON line.
         A timestamp is automatically added.
+        Values are auto-converted to float where possible; unconvertible values are dropped.
 
         Example:
             rt.log_metrics(step=10, loss=0.5, reward=1.2, grad_norm=0.8, lr=1e-5)
         """
         if not self._metrics_file:
             return
-        entry = {'ts': time.time(), **kwargs}
-        self._metrics_file.write(json.dumps(entry, default=str) + '\n')
+        entry = {'ts': time.time()}
+        for k, v in kwargs.items():
+            try:
+                entry[k] = float(v)
+            except (TypeError, ValueError):
+                pass  # skip unconvertible values
+        self._metrics_file.write(json.dumps(entry) + '\n')
 
     def log(self, message: str) -> None:
-        """Write a log message to logs.jsonl.
+        """Print a log message to stdout (captured as output.log by TUI).
 
         Args:
             message: Human-readable log message.
         """
-        if not self._logs_file:
-            return
-        entry = {'ts': time.time(), 'msg': message}
-        self._logs_file.write(json.dumps(entry) + '\n')
+        print(f'[twinkle] {message}', flush=True)
 
     def finish(self, status: str = 'completed') -> None:
         """Mark training as finished and close files.
@@ -188,9 +190,6 @@ class TrainingRuntime:
         if self._metrics_file:
             self._metrics_file.close()
             self._metrics_file = None
-        if self._logs_file:
-            self._logs_file.close()
-            self._logs_file = None
 
         self._started = False
 

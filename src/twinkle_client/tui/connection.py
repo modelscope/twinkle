@@ -1,7 +1,7 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
 """Local file-based connection layer for TUI.
 
-Reads metrics/logs from JSONL files written by the training script.
+Reads metrics from JSONL and raw logs from output.log.
 
 In Server Mode, training control is done by killing/restarting the client
 process. The server retains all model/optimizer state in GPU memory.
@@ -11,7 +11,7 @@ process. The server retains all model/optimizer state in GPU memory.
 
 File layout under run_dir (~/.cache/twinkle/{run_id}/):
     metrics.jsonl  — one JSON object per line, written after each step
-    logs.jsonl     — one JSON object per line (ts + msg)
+    output.log     — combined stdout+stderr (raw text, read by TUI log panel)
     meta.json      — run metadata (model_id, config, status, pid)
     train.py       — current active training script
     train_v{N}.py  — archived previous versions
@@ -48,7 +48,6 @@ class LocalConnection:
         self.current_run_id: str | None = None
         self._metrics_offsets: dict[str, int] = {}
         self._logs_offsets: dict[str, int] = {}
-        self._crash_detected: set[str] = set()  # run_ids whose crash has already been reported
 
     # ──────────────────────────────────────────────────────────────────────
     # Meta
@@ -132,48 +131,27 @@ class LocalConnection:
             return []
 
     def get_new_logs(self, run_id: str) -> list[dict[str, Any]]:
-        """Read only new logs since last read (incremental, per-run).
+        """Read new raw log lines from output.log (incremental, per-run).
 
-        Also detects process crashes: if the process is dead and status is
-        still 'running', reads stderr.log tail and injects it as error logs,
-        then updates meta.status to 'error'.
+        Returns list of dicts with 'msg' key for each new line.
         """
-        logs_file = self.base_dir / run_id / 'logs.jsonl'
+        output_file = self.base_dir / run_id / 'output.log'
         entries: list[dict[str, Any]] = []
 
-        # Read new log entries from logs.jsonl
-        if logs_file.exists():
-            try:
-                offset = self._logs_offsets.get(run_id, 0)
-                with open(logs_file, 'r') as f:
-                    f.seek(offset)
-                    new_data = f.read()
-                    self._logs_offsets[run_id] = f.tell()
-                if new_data.strip():
-                    entries = [json.loads(line) for line in new_data.strip().splitlines() if line.strip()]
-            except Exception:
-                pass
+        if not output_file.exists():
+            return entries
 
-        # Detect crashed process and inject stderr.log content
-        if run_id not in self._crash_detected:
-            meta = self.get_meta(run_id)
-            if meta and meta.get('status') in ('running', 'starting'):
-                pid = meta.get('pid')
-                if pid and not self._is_process_alive(pid):
-                    # Process died — inject stderr as error log
-                    self._crash_detected.add(run_id)
-                    stderr_file = self.base_dir / run_id / 'stderr.log'
-                    error_msg = self._read_stderr_tail(stderr_file)
-                    if error_msg:
-                        entries.append({'ts': time.time(), 'msg': f'[ERROR] Process crashed:\n{error_msg}'})
-                    else:
-                        entries.append({'ts': time.time(), 'msg': '[ERROR] Process exited unexpectedly (no stderr output)'})
-                    # Update meta status
-                    meta['status'] = 'error'
-                    self._write_meta(run_id, meta)
-                    # Also persist the error into logs.jsonl for future reads
-                    for entry in entries[-1:]:
-                        self._append_log(run_id, entry['msg'])
+        try:
+            offset = self._logs_offsets.get(run_id, 0)
+            with open(output_file, 'r', errors='replace') as f:
+                f.seek(offset)
+                new_data = f.read()
+                self._logs_offsets[run_id] = f.tell()
+            if new_data:
+                for line in new_data.splitlines():
+                    entries.append({'msg': line})
+        except Exception:
+            pass
 
         return entries
 
@@ -181,7 +159,6 @@ class LocalConnection:
         """Reset incremental read offsets for a run (e.g., after switching runs)."""
         self._metrics_offsets.pop(run_id, None)
         self._logs_offsets.pop(run_id, None)
-        self._crash_detected.discard(run_id)
 
     # ──────────────────────────────────────────────────────────────────────
     # Process health helpers
@@ -210,24 +187,6 @@ class LocalConnection:
             pass
         return True
 
-    @staticmethod
-    def _read_stderr_tail(stderr_file: Path, max_chars: int = 2000) -> str:
-        """Read the tail of stderr.log, focusing on the traceback/error."""
-        if not stderr_file.exists():
-            return ''
-        try:
-            content = stderr_file.read_text(errors='replace')
-            if not content.strip():
-                return ''
-            # Try to extract just the traceback (from last 'Traceback' onwards)
-            tb_marker = content.rfind('Traceback (most recent call last)')
-            if tb_marker >= 0:
-                return content[tb_marker:][-max_chars:]
-            # No traceback found, return tail
-            return content[-max_chars:]
-        except Exception:
-            return ''
-
     # ──────────────────────────────────────────────────────────────────────
     # Process management
     # ──────────────────────────────────────────────────────────────────────
@@ -247,53 +206,41 @@ class LocalConnection:
             return {'status': 'error', 'run_id': run_id, 'error': f'Script not found: {script_path}'}
 
         run_dir = self.base_dir / run_id
-        stderr_file = run_dir / 'stderr.log'
+        output_file = run_dir / 'output.log'
 
         try:
-            stderr_fh = open(stderr_file, 'w')
+            output_fh = open(output_file, 'w')
         except OSError as e:
-            return {'status': 'error', 'run_id': run_id, 'error': f'Cannot open stderr log: {e}'}
+            return {'status': 'error', 'run_id': run_id, 'error': f'Cannot open output log: {e}'}
 
         try:
             env = os.environ.copy()
             env['TWINKLE_RUN_ID'] = run_id
             proc = subprocess.Popen(
-                ['python', script_path],
+                ['python', '-u', script_path],
                 cwd=str(run_dir),
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_fh,
+                stdout=output_fh,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         except OSError as e:
-            stderr_fh.close()
+            output_fh.close()
             return {'status': 'error', 'run_id': run_id, 'error': f'Failed to launch script: {e}'}
-        # NOTE: Do NOT close stderr_fh here. The subprocess inherits the fd;
-        # closing it in the parent is safe only after Popen duplicates it.
-        # On POSIX, Popen dups the fd so we can close safely in parent.
-        stderr_fh.close()
+        output_fh.close()
 
         # Non-blocking check: if process already exited (e.g., syntax error)
         retcode = proc.poll()
         if retcode is not None:
-            error_msg = stderr_file.read_text().strip()[-500:] if stderr_file.exists() else ''
+            error_msg = output_file.read_text().strip()[-500:] if output_file.exists() else ''
             meta['status'] = 'error'
             self._write_meta(run_id, meta)
-            self._append_log(run_id, f'Script failed (exit={retcode}): {error_msg}')
             return {'status': 'error', 'run_id': run_id, 'error': error_msg or f'Process exited immediately (code={retcode})'}
 
         meta['pid'] = proc.pid
         meta['status'] = 'running'
         self._write_meta(run_id, meta)
         return {'status': 'running', 'run_id': run_id, 'pid': proc.pid, 'script_path': script_path}
-
-    def _append_log(self, run_id: str, message: str) -> None:
-        """Append a log entry to a run's logs.jsonl."""
-        logs_file = self.base_dir / run_id / 'logs.jsonl'
-        logs_file.parent.mkdir(parents=True, exist_ok=True)
-        entry = {'ts': time.time(), 'msg': message}
-        with open(logs_file, 'a') as f:
-            f.write(json.dumps(entry) + '\n')
 
     def start_training(self, run_id: str, script_content: str, model_id: str = '') -> dict[str, Any]:
         """Create a new training run and launch the script.

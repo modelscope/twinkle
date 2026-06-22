@@ -14,7 +14,10 @@ You are an expert at writing training scripts for the Twinkle framework.
 4. **DO NOT modify the Twinkle SDK** (`src/twinkle/` or `src/twinkle_client/`)
 5. **Every script MUST register graceful shutdown** via `rt.register_graceful_shutdown(model, dataloader)`
 6. **All imports MUST be explicit** — never use a class/function without importing it first
-7. **`batch_size` MUST be >= `data_world_size`** (number of data-parallel GPUs on the server). Use `list_supported_models()` to check GPU count; when in doubt, default to `batch_size=8`
+7. **`batch_size` MUST be >= `data_world_size`** (number of data-parallel GPUs on the server). Call `list_supported_models()` to get GPU count. **Always set `drop_last=True`** in DataLoader to prevent the last incomplete batch from being smaller than `data_world_size`
+8. **`rt.start()` MUST be called BEFORE `model.add_adapter_to_model()`** — `add_adapter_to_model` triggers NCCL init (60-120s) and no logs appear until `rt.start()` runs
+9. **`metric.result` values are auto-converted** inside `rt.log_metrics()` — no manual `float()` needed
+10. **NEVER use float format specifiers** (like `:.4f`, `:.2e`) on metric values in `print()` — they may be strings. Just use `{loss}`
 
 ## Pre-Training Planning
 
@@ -135,7 +138,7 @@ dataset.encode(batched=True)
 ```python
 from twinkle.dataloader import DataLoader
 
-dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+dataloader = DataLoader(dataset=dataset, batch_size=8, num_workers=0, drop_last=True)
 ```
 
 **Parameters:**
@@ -403,12 +406,16 @@ metric = model.calculate_metric(is_training=True)
 from twinkle_client.tui.runtime import TrainingRuntime
 
 rt = TrainingRuntime()  # auto-reads TWINKLE_RUN_ID env var (set by TUI launcher)
+# IMPORTANT: call rt.start() BEFORE model.add_adapter_to_model() so TUI can show logs immediately.
+# add_adapter_to_model triggers NCCL init across all GPUs which can take 60-120s.
 rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)  # MUST register
 
-# In training loop:
+# In training loop — use print() for logs (stdout goes to output.log, shown in TUI):
+metric = model.calculate_metric(is_training=True)
+loss = metric.result.get('loss', 0)
 rt.log_metrics(step=step, total_steps=MAX_STEPS, loss=loss, reward=reward, grad_norm=gn, lr=lr)
-rt.log(f'[Step {step}/{MAX_STEPS}] loss={loss:.4f}')
+print(f'[Step {step}/{MAX_STEPS}] loss={loss}')
 
 # When done:
 rt.finish(status='completed')
@@ -468,24 +475,24 @@ MAX_STEPS = 50
 # 1. Init client
 client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
 
-# 2. Prepare dataset
+# 2. Runtime (MUST be before model setup — add_adapter_to_model takes 60-120s for NCCL init)
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4, 'batch_size': 4}, script_path=__file__)
+
+# 3. Prepare dataset
 dataset = Dataset(DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=512)
 dataset.map(SelfCognitionProcessor(model_name='Twinkle助手', model_author='ModelScope'))
 dataset.encode(batched=True)
-dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+dataloader = DataLoader(dataset=dataset, batch_size=8, num_workers=0, drop_last=True)
 
-# 3. Configure model
+# 4. Configure model
 model = MultiLoraTransformersModel(model_id=MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear'), gradient_accumulation_steps=2)
 model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 model.set_optimizer('Adam', lr=1e-4)
-
-# 4. Runtime (observability)
-rt = TrainingRuntime()
-rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4, 'batch_size': 4}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)
 
 # 5. Training loop
@@ -500,7 +507,7 @@ for epoch in range(3):
             metric = model.calculate_metric(is_training=True)
             loss = metric.result.get('loss', 0)
             rt.log_metrics(step=global_step, total_steps=MAX_STEPS, loss=loss)
-            rt.log(f'[Step {global_step}/{MAX_STEPS}] loss={loss:.4f}')
+            print(f'[Step {global_step}/{MAX_STEPS}] loss={loss}')
 
         if global_step >= MAX_STEPS:
             break
@@ -514,7 +521,7 @@ for epoch in range(3):
         save_optimizer=True,
         consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
-    rt.log(f'Saved checkpoint: {result.twinkle_path}')
+    print(f'Saved checkpoint: {result.twinkle_path}')
 
 rt.finish(status='completed')
 ```
@@ -545,14 +552,18 @@ LEARNING_RATE = 2e-5
 # 1. Init client
 client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_API_KEY')
 
-# 2. Prepare dataset (encode with generation prompt for sampling)
+# 2. Runtime (before model setup)
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': LEARNING_RATE, 'method': 'GRPO'}, script_path=__file__)
+
+# 3. Prepare dataset (encode with generation prompt for sampling)
 dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(2000)))
 dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
 dataset.map(GSM8KProcessor(system='Solve the math problem and put answer in \\boxed{}.'))
 dataset.encode(add_generation_prompt=True)
-dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
+dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0, drop_last=True)
 
-# 3. Configure model with GRPOLoss
+# 4. Configure model with GRPOLoss
 model = MultiLoraTransformersModel(model_id=MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
                            gradient_accumulation_steps=1)
@@ -560,22 +571,18 @@ model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
 model.set_optimizer('Adam', lr=LEARNING_RATE)
 model.set_processor('InputProcessor')
 model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+rt.register_graceful_shutdown(model, dataloader)
 
-# 4. Configure sampler
+# 5. Configure sampler
 sampler = vLLMSampler(model_id=MODEL_ID)
 sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
-# 5. Setup
+# 6. Setup
 advantage_fn = GRPOAdvantage()
 reward_fn = GSM8KAccuracyReward()
 metrics = CompletionRewardMetric()
 sampling_params = {'max_tokens': 1024, 'temperature': 1.0, 'top_p': 0.95, 'num_samples': NUM_GENERATIONS, 'logprobs': 1}
 current_adapter_uri = None
-
-# 6. Runtime
-rt = TrainingRuntime()
-rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': LEARNING_RATE, 'method': 'GRPO'}, script_path=__file__)
-rt.register_graceful_shutdown(model, dataloader)
 
 # 7. Training loop
 step = 0
@@ -622,7 +629,7 @@ for batch in dataloader:
     log_dict = metrics.calculate()
     log_dict.update(model.calculate_metric(is_training=True).result)
     rt.log_metrics(step=step, total_steps=MAX_STEPS, **log_dict)
-    rt.log(f'[Step {step}/{MAX_STEPS}] {log_dict}')
+    print(f'[Step {step}/{MAX_STEPS}] {log_dict}')
     step += 1
 
 # Save final
@@ -651,14 +658,18 @@ LEARNING_RATE = 1e-4
 # 1. Init
 client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
 
-# 2. Prepare DPO dataset
+# 2. Runtime (before model setup)
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'method': 'DPO', 'beta': DPO_BETA}, script_path=__file__)
+
+# 3. Prepare DPO dataset
 dataset = Dataset(DatasetMeta('ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji', data_slice=range(100)))
 dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
 dataset.map(EmojiDPOProcessor, init_args={'system': 'You are a helpful assistant.'})
 dataset.encode()  # DPO: no add_generation_prompt
-dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+dataloader = DataLoader(dataset=dataset, batch_size=8, num_workers=0, drop_last=True)
 
-# 3. Configure model with DPO loss
+# 4. Configure model with DPO loss
 model = MultiLoraTransformersModel(model_id=MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
                            gradient_accumulation_steps=2)
@@ -667,10 +678,6 @@ model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('DPOLoss', beta=DPO_BETA, loss_type='sigmoid', reference_free=False, sft_weight=1.0)
 model.add_metric('DPOMetric', beta=DPO_BETA)
 model.set_optimizer('Adam', lr=LEARNING_RATE)
-
-# 4. Runtime
-rt = TrainingRuntime()
-rt.start(model_id='Qwen/Qwen3.5-4B', config={'method': 'DPO', 'beta': DPO_BETA}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)
 
 
@@ -707,7 +714,7 @@ for step, batch in enumerate(dataloader):
     if step % 2 == 0:
         metric = model.calculate_metric(is_training=True)
         rt.log_metrics(step=step, total_steps=max_steps, **metric.result)
-        rt.log(f'[Step {step}/{max_steps}] {metric.result}')
+        print(f'[Step {step}/{max_steps}] {metric.result}')
 
 result = model.save(name='dpo-final', save_optimizer=True)
 rt.finish(status='completed')
@@ -748,24 +755,24 @@ class LatexOCRProcessor(Preprocessor):
 # 1. Init
 client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
 
-# 2. LazyDataset for multimodal (defers processing to avoid OOM)
+# 2. Runtime (before model setup)
+rt = TrainingRuntime()
+rt.start(model_id='Qwen/Qwen3.5-4B', config={'task': 'multimodal-sft'}, script_path=__file__)
+
+# 3. LazyDataset for multimodal (defers processing to avoid OOM)
 dataset = LazyDataset(DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(500)))
 dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=512)
 dataset.map(LatexOCRProcessor)
 dataset.encode(batched=True)
-dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=0)
+dataloader = DataLoader(dataset=dataset, batch_size=8, num_workers=0, drop_last=True)
 
-# 3. Model setup
+# 4. Model setup
 model = MultiLoraTransformersModel(model_id=MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear'), gradient_accumulation_steps=2)
 model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 model.set_optimizer('Adam', lr=1e-4)
-
-# 4. Runtime
-rt = TrainingRuntime()
-rt.start(model_id='Qwen/Qwen3.5-4B', config={'task': 'multimodal-sft'}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)
 
 # 5. Train
