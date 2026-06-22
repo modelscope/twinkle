@@ -8,6 +8,7 @@ public dotted paths ``twinkle.server.launcher.ServerLauncher`` /
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from twinkle import get_logger
+from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
@@ -220,6 +222,12 @@ class ServerLauncher:
         for k, v in persistence.to_env_vars().items():
             os.environ[k] = v
         logger.info(f'Persistence backend configured: mode={persistence.mode}')
+
+        model_alias_map = build_model_alias_map(self.config.applications)
+        if model_alias_map:
+            os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(model_alias_map, ensure_ascii=False)
+        else:
+            os.environ.pop(MODEL_ID_ALIASES_ENV, None)
 
         self._init_ray()
         self._start_serve()
