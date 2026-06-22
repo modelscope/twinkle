@@ -9,8 +9,8 @@ from textual.app import ComposeResult
 from textual.widgets import RichLog, Static
 from textual.widget import Widget
 
-# Regex to strip ANSI escape sequences for accurate width measurement
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+# Regex to strip ALL terminal escape sequences (colors, cursor movement, etc.)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^\[\]]')
 
 
 class LogPanel(Widget):
@@ -51,11 +51,15 @@ class LogPanel(Widget):
         if width < 20:
             width = 60
 
-        # Strip ANSI codes for display (RichLog with markup=False can't handle them)
+        # Strip ALL terminal control sequences and \r (progress bar carriage returns)
         clean = _ANSI_RE.sub('', message)
+        clean = clean.replace('\r', '\n')  # \r from progress bars → treat as newline
 
-        # Hard-wrap long lines
-        for line in clean.splitlines() or ['']:
+        # Hard-wrap long lines to prevent overflow into adjacent panels
+        for line in clean.splitlines():
+            line = line.rstrip()
+            if not line:
+                continue
             while len(line) > width:
                 log_widget.write(line[:width])
                 line = line[width:]

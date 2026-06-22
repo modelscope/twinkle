@@ -76,6 +76,8 @@ class TrainingRuntime:
 
         self._metrics_file: Any = None
         self._started = False
+        self._last_progress_save: float = 0.0  # timestamp of last progress write
+        self._progress_save_interval: float = 5.0  # write at most every 5 seconds
 
     def start(
         self,
@@ -159,6 +161,17 @@ class TrainingRuntime:
                 pass  # skip unconvertible values
         self._metrics_file.write(json.dumps(entry) + '\n')
 
+        # Auto-save training progress to meta.json (for resume after crash)
+        step = entry.get('step')
+        if step is not None:
+            now = time.time()
+            if now - self._last_progress_save >= self._progress_save_interval:
+                progress = {'last_step': int(step)}
+                if 'total_steps' in entry:
+                    progress['total_steps'] = int(entry['total_steps'])
+                self._save_progress(progress)
+                self._last_progress_save = now
+
     def log(self, message: str) -> None:
         """Print a log message to stdout (captured as output.log by TUI).
 
@@ -166,6 +179,45 @@ class TrainingRuntime:
             message: Human-readable log message.
         """
         print(f'[twinkle] {message}', flush=True)
+
+    def get_resume_info(self) -> dict[str, int]:
+        """Get resume info from a previous run (if any).
+
+        Reads the 'progress' field from meta.json, which is auto-saved
+        during training by log_metrics().
+
+        Returns:
+            dict with 'last_step' (int, default 0) and optionally 'total_steps'.
+            Always returns a dict — never None. Fresh start returns {'last_step': 0}.
+
+        Usage:
+            resume = rt.get_resume_info()
+            global_step = resume['last_step']
+            if global_step > 0:
+                dataloader.skip_consumed_samples(global_step * BATCH_SIZE)
+                print(f'[twinkle] Resuming from step {global_step}')
+        """
+        meta_path = self.run_dir / 'meta.json'
+        if not meta_path.exists():
+            return {'last_step': 0}
+        try:
+            meta = json.loads(meta_path.read_text())
+            progress = meta.get('progress')
+            if progress and progress.get('last_step', 0) > 0:
+                return progress
+        except Exception:
+            pass
+        return {'last_step': 0}
+
+    def _save_progress(self, progress: dict[str, int]) -> None:
+        """Save training progress to meta.json (throttled, non-blocking)."""
+        meta_path = self.run_dir / 'meta.json'
+        try:
+            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            meta['progress'] = progress
+            meta_path.write_text(json.dumps(meta, indent=2))
+        except Exception:
+            pass  # never crash training for progress bookkeeping
 
     def finish(self, status: str = 'completed') -> None:
         """Mark training as finished and close files.

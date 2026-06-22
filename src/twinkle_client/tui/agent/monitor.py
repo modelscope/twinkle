@@ -71,6 +71,7 @@ what action (if any) to take.
 - Respond in the same language as the log content (Chinese or English).
 - NEVER start with LGTM if there is any issue.
 - For FIX: output the COMPLETE fixed script based on the provided "Current train.py". Only modify the lines that cause the error — do NOT rewrite from scratch or change the overall architecture.
+- **MUST preserve resume logic** in fixed scripts: `rt.get_resume_info()` + `dataloader.skip_consumed_samples()`. Never hardcode `global_step = 0` if resume logic exists in the original.
 - Common fixes:
   - "Batch size N must be >= data world size M" → increase batch_size to M
   - "save_dir does not exist on the server" → remove the save_dir parameter

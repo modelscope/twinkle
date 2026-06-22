@@ -148,8 +148,15 @@ class LocalConnection:
                 new_data = f.read()
                 self._logs_offsets[run_id] = f.tell()
             if new_data:
-                for line in new_data.splitlines():
-                    entries.append({'msg': line})
+                for line in new_data.split('\n'):
+                    if not line:
+                        continue
+                    # For \r-separated content (progress bars), keep only the last segment
+                    # This simulates terminal behavior where \r overwrites the current line
+                    if '\r' in line:
+                        line = line.rsplit('\r', 1)[-1]
+                    if line.strip():
+                        entries.append({'msg': line})
         except Exception:
             pass
 
@@ -298,6 +305,8 @@ class LocalConnection:
 
         Server state (LoRA weights, optimizer, LR scheduler) is preserved in GPU memory.
         """
+        # Reset log/metrics offsets since output.log will be truncated on re-launch
+        self.reset_offsets(run_id)
         return self._launch_script(run_id)
 
     def stop_training(self, run_id: str) -> dict[str, Any]:

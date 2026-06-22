@@ -14,10 +14,26 @@ You are an expert at writing training scripts for the Twinkle framework.
 4. **DO NOT modify the Twinkle SDK** (`src/twinkle/` or `src/twinkle_client/`)
 5. **Every script MUST register graceful shutdown** via `rt.register_graceful_shutdown(model, dataloader)`
 6. **All imports MUST be explicit** — never use a class/function without importing it first
-7. **`batch_size` MUST be >= `data_world_size`** (number of data-parallel GPUs on the server). Call `list_supported_models()` to get GPU count. **Always set `drop_last=True`** in DataLoader to prevent the last incomplete batch from being smaller than `data_world_size`
+7. **`batch_size` constraints** — **Always set `drop_last=True`** in DataLoader.
+   - **All modes**: `batch_size >= model_dp` (number of model data-parallel GPUs). Call `list_supported_models()` to get GPU count.
+   - **GRPO**: `batch_size >= sampler_dp` (sampler's data-parallel worker count = `sampler_gpus / tp`). The sampler dispatches input batch across `dp` workers, each worker must get at least 1 item. This is often the tighter constraint (e.g., 6 sampler GPUs with tp=1 → need batch_size >= 6).
 8. **`rt.start()` MUST be called BEFORE `model.add_adapter_to_model()`** — `add_adapter_to_model` triggers NCCL init (60-120s) and no logs appear until `rt.start()` runs
 9. **`metric.result` values are auto-converted** inside `rt.log_metrics()` — no manual `float()` needed
 10. **NEVER use float format specifiers** (like `:.4f`, `:.2e`) on metric values in `print()` — they may be strings. Just use `{loss}`
+11. **NEVER access internal fields** of model/optimizer/scheduler objects (e.g. `model.optimizer.param_groups[0]['lr']`). Training runs on a remote Ray cluster — only public API methods are available. Use `model.calculate_metric()` to get metrics like loss/lr
+12. **Log ALL available metrics** via `rt.log_metrics(step=step, total_steps=MAX_STEPS, **metric.result)`. NEVER cherry-pick only `loss` — always pass the full `metric.result` dict. Different training types produce different metrics:
+    - **SFT**: loss, grad_norm, lr
+    - **GRPO**: loss, reward, reward_std, kl, entropy, grad_norm, lr
+    - **DPO**: loss, chosen_reward, rejected_reward, reward_margin, grad_norm, lr
+    - Use `**metric.result` to capture all of them automatically
+13. **Every script MUST include resume logic** after DataLoader creation. This enables seamless continuation when the script is auto-fixed and restarted:
+    ```python
+    resume = rt.get_resume_info()
+    global_step = resume['last_step']
+    if global_step > 0:
+        dataloader.skip_consumed_samples(global_step * BATCH_SIZE)
+        print(f'[twinkle] Resuming from step {global_step}')
+    ```
 
 ## Pre-Training Planning
 
@@ -411,11 +427,17 @@ rt = TrainingRuntime()  # auto-reads TWINKLE_RUN_ID env var (set by TUI launcher
 rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-4}, script_path=__file__)
 rt.register_graceful_shutdown(model, dataloader)  # MUST register
 
+# Resume logic — MUST be after dataloader creation, before training loop:
+resume = rt.get_resume_info()
+global_step = resume['last_step']
+if global_step > 0:
+    dataloader.skip_consumed_samples(global_step * BATCH_SIZE)
+    print(f'[twinkle] Resuming from step {global_step}')
+
 # In training loop — use print() for logs (stdout goes to output.log, shown in TUI):
 metric = model.calculate_metric(is_training=True)
-loss = metric.result.get('loss', 0)
-rt.log_metrics(step=step, total_steps=MAX_STEPS, loss=loss, reward=reward, grad_norm=gn, lr=lr)
-print(f'[Step {step}/{MAX_STEPS}] loss={loss}')
+rt.log_metrics(step=step, total_steps=MAX_STEPS, **metric.result)
+print(f'[Step {step}/{MAX_STEPS}] {metric.result}')
 
 # When done:
 rt.finish(status='completed')
@@ -495,8 +517,14 @@ model.set_loss('CrossEntropyLoss')
 model.set_optimizer('Adam', lr=1e-4)
 rt.register_graceful_shutdown(model, dataloader)
 
-# 5. Training loop
-global_step = 0
+# 5. Resume logic (enables seamless restart after auto-fix)
+resume = rt.get_resume_info()
+global_step = resume['last_step']
+if global_step > 0:
+    dataloader.skip_consumed_samples(global_step * 8)
+    print(f'[twinkle] Resuming from step {global_step}')
+
+# 6. Training loop
 for epoch in range(3):
     for batch in dataloader:
         model.forward_backward(inputs=batch)
@@ -505,9 +533,8 @@ for epoch in range(3):
 
         if global_step % 2 == 0:
             metric = model.calculate_metric(is_training=True)
-            loss = metric.result.get('loss', 0)
-            rt.log_metrics(step=global_step, total_steps=MAX_STEPS, loss=loss)
-            print(f'[Step {global_step}/{MAX_STEPS}] loss={loss}')
+            rt.log_metrics(step=global_step, total_steps=MAX_STEPS, **metric.result)
+            print(f'[Step {global_step}/{MAX_STEPS}] {metric.result}')
 
         if global_step >= MAX_STEPS:
             break
@@ -546,7 +573,7 @@ from twinkle_client.tui.runtime import TrainingRuntime
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 4
 MAX_STEPS = 100
-BATCH_SIZE = 2
+BATCH_SIZE = 8   # MUST be >= sampler_dp (sampler workers) AND >= model_dp
 LEARNING_RATE = 2e-5
 
 # 1. Init client

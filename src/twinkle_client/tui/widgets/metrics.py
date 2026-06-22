@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import plotext as plt
+from rich.text import Text
 
 from textual.app import ComposeResult
 from textual.widgets import Static
@@ -93,7 +94,9 @@ class MetricsPanel(Widget):
         if not self._metrics_history:
             return []
         sample = self._metrics_history[0]
-        return [k for k in sample.keys() if k not in ('step', 'ts', 'epoch')]
+        # Exclude metadata fields that are not meaningful as plotted metrics
+        exclude = ('step', 'ts', 'epoch', 'total_steps')
+        return [k for k in sample.keys() if k not in exclude]
 
     def get_selected_keys(self) -> list[str]:
         """Return the currently displayed metric keys."""
@@ -191,6 +194,6 @@ class MetricsPanel(Widget):
         plt.title('Training Metrics')
         plt.xlabel('Step')
 
-        # Render to string
+        # Render to string and convert ANSI to Rich Text for Textual
         plot_str = plt.build()
-        plot_widget.update(plot_str)
+        plot_widget.update(Text.from_ansi(plot_str))
