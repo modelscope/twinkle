@@ -18,6 +18,8 @@ from __future__ import annotations
 import httpx
 import os
 import pytest
+import subprocess
+import sys
 import time
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG, MOCK_SERVER_CONFIG_REDIS
@@ -36,11 +38,25 @@ SELECTED_CONFIG = (
     MOCK_SERVER_CONFIG_REDIS if os.environ.get('TWINKLE_TEST_REDIS_PERSISTENCE', '0') == '1' else MOCK_SERVER_CONFIG)
 
 READY_BUDGET_SECONDS = 30.0
+RAY_NODE_CPUS = 8
+
+
+def _run_ray_command(*args: str) -> None:
+    ray_bin = os.path.join(os.path.dirname(sys.executable), 'ray')
+    result = subprocess.run(
+        [ray_bin, *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'ray {" ".join(args)} failed with code {result.returncode}:\n{result.stdout}')
 
 
 @pytest.fixture(scope='module')
 def ray_cluster():
-    """Start a local Ray cluster for the duration of the module.
+    """Start a fresh local Ray head node for the duration of the module.
 
     Bypasses ``twinkle.server.launcher`` (which would normally inject
     ``TWINKLE_PERSISTENCE_*`` into the cluster), so we mirror that injection
@@ -60,11 +76,20 @@ def ray_cluster():
         for k, v in persistence_env.items():
             os.environ[k] = v
 
+    if ray.is_initialized():
+        ray.shutdown()
+    _run_ray_command('stop', '--force')
+    _run_ray_command(
+        'start',
+        '--head',
+        '--port=0',
+        f'--num-cpus={RAY_NODE_CPUS}',
+        '--num-gpus=0',
+        '--include-dashboard=false',
+        '--disable-usage-stats',
+    )
     ray.init(
-        num_cpus=4,
-        num_gpus=0,
-        ignore_reinit_error=True,
-        include_dashboard=False,
+        address='auto',
         runtime_env={'env_vars': persistence_env} if persistence_env else None,
     )
     yield
@@ -74,6 +99,10 @@ def ray_cluster():
         pass
     try:
         ray.shutdown()
+    except Exception:
+        pass
+    try:
+        _run_ray_command('stop', '--force')
     except Exception:
         pass
 
@@ -134,11 +163,8 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
             http_opts['port'] = port
             args.setdefault('http_options', http_opts)
         # Strip ray_actor_options runtime_env to keep the test light, BUT keep
-        # ``num_cpus`` low so the three deployments fit on a small local Ray
-        # cluster — Ray Serve defaults to ``num_cpus=1`` per replica when the
-        # field is absent, so without this each replica would need a full CPU
-        # and the cluster (2 CPUs after ``ignore_reinit_error=True`` silently
-        # accepts the existing one) would deadlock waiting for resources.
+        # ``num_cpus`` low so the three deployments leave room for the mock
+        # distributed runtime workers in the dedicated local Ray node.
         deploy_options: dict = {'ray_actor_options': {'num_cpus': 0.1}}
         for raw in app_spec.deployments:
             if isinstance(raw, dict):
@@ -304,6 +330,13 @@ def _exercise_tinker_client(base: str) -> None:
     )
     training.forward_backward([datum], loss_fn='cross_entropy').result()
     training.optim_step(types.AdamParams(learning_rate=1e-4)).result()
+
+    base_sampling = client.create_sampling_client(base_model='mock-model')
+    base_sampling.sample(
+        prompt=types.ModelInput.from_ints([1, 2, 3]),
+        num_samples=1,
+        sampling_params=types.SamplingParams(max_tokens=4),
+    ).result()
 
     sampler_ckpt = training.save_weights_for_sampler(name='step-1').result()
     # Gateway's /asample resolves ``base_model`` from ``body.base_model`` or

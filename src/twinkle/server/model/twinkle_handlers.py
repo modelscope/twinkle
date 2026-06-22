@@ -48,10 +48,11 @@ def _parse_inputs(inputs: Any):
 
 
 def _get_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Build the per-request adapter name from the request_id prefix."""
+    """Build a stable per-session adapter name, falling back to request_id for older clients."""
     if adapter_name is None or adapter_name == '':
         return None
-    return request.state.request_id + '-' + adapter_name
+    owner_id = get_session_id_from_request(request) or request.state.request_id
+    return owner_id + '-' + adapter_name
 
 
 def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:

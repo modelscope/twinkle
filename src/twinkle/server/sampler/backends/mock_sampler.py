@@ -16,7 +16,7 @@ import numpy as np
 import time
 from typing import Any
 
-from twinkle import remote_class
+from twinkle import remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.utils.logger import get_logger
 from twinkle.utils.seed import stable_seed
@@ -44,6 +44,7 @@ class MockSampler:
 
     # ----- Sampler interface --------------------------------------------- #
 
+    @remote_function()
     def sample(
         self,
         inputs: Any,
@@ -85,6 +86,7 @@ class MockSampler:
             responses.append(SampleResponse(sequences=sequences))
         return responses
 
+    @remote_function()
     def sample_stream(
         self,
         inputs: Any,
@@ -111,20 +113,25 @@ class MockSampler:
         from . import stream_to_queue
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
+    @remote_function()
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None
 
+    @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
         self.template = template_cls
 
+    @remote_function()
     def reset_prefix_cache(self) -> None:
         return None
 
     # ----- Adapter management -------------------------------------------- #
 
+    @remote_function()
     def add_adapter_to_sampler(self, adapter_name: str, config: Any) -> None:
         self._adapters[adapter_name] = config
 
+    @remote_function()
     def has_adapter(self, adapter_name: str) -> bool:
         return adapter_name in self._adapters
 

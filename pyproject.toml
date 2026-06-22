@@ -32,7 +32,7 @@ megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridg
 vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 datajuicer = ["py-data-juicer"]
-tinker = ["tinker==0.14.0"]
+tinker = ["tinker==0.16.1"]
 test = ["hypothesis>=6.0", "pytest", "pytest-asyncio"]
 server = [
   "redis>=5.0",

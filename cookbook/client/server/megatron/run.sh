@@ -51,15 +51,19 @@ RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 # --- 路径配置 ---
 DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
 LOG_FILE="run.log"
+REDIS_LOG_FILE="/twinkle/redis.log"
 DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
-# --- Ray Prometheus 配置路径（Ray 自动生成，用于注入 LGTM） ---
-RAY_PROMETHEUS_CONFIG_SUFFIX="session_latest/metrics/prometheus/prometheus.yml"
-
-# --- Ray 日志轮转配置 ---
-export RAY_ROTATION_MAX_BYTES=1024
-export RAY_ROTATION_BACKUP_COUNT=1
+# --- LGTM 版本配置（与 grafana/otel-lgtm:0.28.0 保持一致） ---
+LGTM_VERSION="${LGTM_VERSION:-0.28.0}"
+GRAFANA_VERSION="${GRAFANA_VERSION:-v13.0.1}"
+PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-v3.11.3}"
+TEMPO_VERSION="${TEMPO_VERSION:-v2.10.5}"
+LOKI_VERSION="${LOKI_VERSION:-v3.7.1}"
+PYROSCOPE_VERSION="${PYROSCOPE_VERSION:-v2.0.2}"
+OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
+OBI_VERSION="${OBI_VERSION:-v0.9.0}"
 
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
@@ -162,8 +166,6 @@ else
     IFS=';' read -ra GPU_WORKERS <<< "$GPU_WORKERS_INPUT"
 fi
 
-RAY_PROMETHEUS_CONFIG="${TEMP_DIR}/${RAY_PROMETHEUS_CONFIG_SUFFIX}"
-
 # ============================================
 # 辅助函数
 # ============================================
@@ -192,6 +194,53 @@ print_header() {
     print_separator
     echo -e "\033[1;34m $1 \033[0m"
     print_separator
+}
+
+wait_for_redis_ready() {
+    local timeout="${1:-30}"
+
+    for ((i=1; i<=timeout; i++)); do
+        if redis-cli -p 6380 ping 2>/dev/null | grep -q '^PONG$'; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+wait_for_redis_stopped() {
+    local timeout="${1:-30}"
+
+    for ((i=1; i<=timeout; i++)); do
+        if command -v ss &> /dev/null; then
+            if ! ss -lnt 2>/dev/null | grep -q ':6380 '; then
+                return 0
+            fi
+        elif ! redis-cli -p 6380 ping 2>/dev/null | grep -q '^PONG$'; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+wait_for_lgtm_ready() {
+    local lgtm_pid="$1"
+    local timeout="${2:-90}"
+
+    for ((i=1; i<=timeout; i++)); do
+        if [ -f /tmp/ready ]; then
+            return 0
+        fi
+        if ! kill -0 "$lgtm_pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 1
+    done
+
+    return 1
 }
 
 # 解析节点配置 "devices" -> 返回 devices 和自动计算 _gpu_count
@@ -282,14 +331,25 @@ if pgrep -f "twinkle.server" > /dev/null 2>&1; then
 fi
 if pgrep -if "vLLM" > /dev/null 2>&1; then
     print_warning "vLLM 进程未退出，强制终止..."
-    pkill -9if "vLLM" 2>/dev/null || true
+    pkill -9 -i -f "vLLM" 2>/dev/null || true
 fi
 
 print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
 
 print_info "停止已有的 Redis..."
-pkill redis-server 2>/dev/null || true
+redis-cli -p 6380 shutdown nosave 2>/dev/null || pkill redis-server 2>/dev/null || true
+if ! wait_for_redis_stopped 30; then
+    print_warning "Redis 未在 30 秒内退出，强制终止..."
+    pkill -9 redis-server 2>/dev/null || true
+    if ! wait_for_redis_stopped 10; then
+        print_error "Redis 端口 6380 未释放"
+        if command -v ss &> /dev/null; then
+            ss -lntp 2>/dev/null | grep ':6380 ' || true
+        fi
+        exit 1
+    fi
+fi
 
 print_info "停止已有的 LGTM 观测栈..."
 pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
@@ -305,12 +365,21 @@ pkill pyroscope 2>/dev/null || true
 # ============================================
 print_header "启动 Redis"
 
-if command -v redis-server &> /dev/null; then
+if command -v redis-server &> /dev/null && command -v redis-cli &> /dev/null; then
     print_info "启动 Redis..."
-    redis-server --daemonize yes --port 6380 --save "" --appendonly no
-    print_success "Redis 已启动 (port 6380)"
+    redis-server --daemonize yes --port 6380 --save "" --appendonly no --logfile "$REDIS_LOG_FILE"
+    if wait_for_redis_ready 30; then
+        print_success "Redis 已启动 (port 6380)"
+    else
+        print_error "Redis 未能在 30 秒内启动或响应 PING (port 6380)"
+        if [ -f "$REDIS_LOG_FILE" ]; then
+            tail -n 50 "$REDIS_LOG_FILE"
+        fi
+        exit 1
+    fi
 else
-    print_warning "未检测到 redis-server，跳过"
+    print_error "未检测到 redis-server 或 redis-cli，但 server_config.yaml 使用 redis persistence"
+    exit 1
 fi
 
 # ============================================
@@ -376,28 +445,27 @@ ray status 2>/dev/null || true
 print_header "启动 LGTM 观测栈（可选）"
 
 if [ -d "/otel-lgtm" ]; then
-    # 等待 Ray 生成 Prometheus scrape 配置
-    sleep 2
-
-    # 还原原始配置（防止重复执行时累积追加）再注入 Ray scrape 配置
-    [ -f /otel-lgtm/prometheus.yaml.orig ] || cp /otel-lgtm/prometheus.yaml /otel-lgtm/prometheus.yaml.orig
-    cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
-
-    if [ -f "$RAY_PROMETHEUS_CONFIG" ]; then
-        print_info "注入 Ray metrics scrape 配置到 LGTM Prometheus..."
-        cat "$RAY_PROMETHEUS_CONFIG" >> /otel-lgtm/prometheus.yaml
-    else
-        print_warning "Ray Prometheus 配置未生成，跳过 scrape 注入"
-        echo "  - 预期路径: $RAY_PROMETHEUS_CONFIG"
+    if [ -f /otel-lgtm/prometheus.yaml.orig ]; then
+        cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
     fi
 
     print_info "启动 LGTM 观测栈..."
-    (cd /otel-lgtm && nohup ./run-all.sh > /twinkle/lgtm.log 2>&1 &)
-    print_success "LGTM 观测栈已启动"
-    echo "  - Grafana:   http://localhost:3000 (admin/admin)"
-    echo "  - OTLP gRPC: localhost:4317"
-    echo "  - OTLP HTTP: localhost:4318"
-    echo "  - 日志文件:  /twinkle/lgtm.log"
+    rm -f /tmp/ready
+    export LGTM_VERSION GRAFANA_VERSION PROMETHEUS_VERSION TEMPO_VERSION LOKI_VERSION
+    export PYROSCOPE_VERSION OPENTELEMETRY_COLLECTOR_VERSION OBI_VERSION
+    (cd /otel-lgtm && exec nohup ./run-all.sh > /twinkle/lgtm.log 2>&1) &
+    LGTM_PID=$!
+
+    if wait_for_lgtm_ready "$LGTM_PID" 120; then
+        print_success "LGTM 观测栈已启动"
+        echo "  - Grafana:   http://localhost:3000 (admin/admin)"
+        echo "  - OTLP gRPC: localhost:4317"
+        echo "  - OTLP HTTP: localhost:4318"
+        echo "  - 日志文件:  /twinkle/lgtm.log"
+    else
+        print_warning "LGTM 观测栈未在 120 秒内就绪，Twinkle 将继续启动"
+        echo "  - 日志文件: /twinkle/lgtm.log"
+    fi
 else
     print_warning "未检测到 LGTM 观测栈 (/otel-lgtm)，跳过"
 fi
@@ -412,7 +480,7 @@ echo ""
 
 # 启动服务器并实时显示日志
 touch "$LOG_FILE"  # 预创建文件，避免 tail -f 在文件尚未写入时报错
-nohup python -m twinkle.server --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+nohup python -m twinkle.server launch --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
 
