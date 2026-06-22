@@ -573,7 +573,7 @@ def _patch_qwen3_5_fla(model=None) -> None:
 
             if hasattr(_module, 'causal_conv1d_fn'):
                 current = getattr(_module, 'causal_conv1d_fn')
-                # 如果已经是 npu_causal_conv1d_fn，跳过
+
                 if current is npu_causal_conv1d_fn:
                     continue
                 _module.causal_conv1d_fn = npu_causal_conv1d_fn
