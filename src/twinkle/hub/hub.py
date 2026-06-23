@@ -9,6 +9,7 @@ from requests.exceptions import HTTPError
 from typing import Dict, List, Literal, Optional, Union
 
 from ..utils import requires
+from .model_alias import resolve_model_id_alias
 
 _executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
 _futures = {}
@@ -204,6 +205,7 @@ class HubOperation:
         Returns:
             The local dir
         """
+        model_id_or_path = resolve_model_id_alias(model_id_or_path)
         if kwargs.pop('ignore_model', False):
             ignore_patterns = set(ignore_patterns or []) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
