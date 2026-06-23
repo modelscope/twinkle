@@ -15,6 +15,7 @@ Twinkle DOCUMENTATION
    使用指引/NPU的支持.md
    使用指引/训练服务.md
    使用指引/Qwen3.5最佳实践.md
+   使用指引/Embedding训练.md
 
 .. toctree::
    :maxdepth: 2
@@ -43,6 +44,8 @@ Twinkle DOCUMENTATION
    组件/训练中间件/index.rst
    组件/CLI/index.rst
    组件/通知器/index.rst
+   组件/Agentic/index.rst
+   组件/TUI/index.rst
 
 Indices and tables
 ==================

@@ -15,6 +15,7 @@ Twinkle DOCUMENTATION
    Usage Guide/NPU-Support.md
    Usage Guide/Train-as-a-Service.md
    Usage Guide/Introduction-with-Qwen3.5.md
+   Usage Guide/Embedding-Training.md
 
 .. toctree::
    :maxdepth: 2
@@ -43,6 +44,8 @@ Twinkle DOCUMENTATION
    Components/Training Middleware/index.rst
    Components/CLI/index.rst
    Components/Notifier/index.rst
+   Components/Agentic/index.rst
+   Components/TUI/index.rst
 
 Indices and tables
 ==================
