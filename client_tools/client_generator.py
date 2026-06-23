@@ -231,8 +231,15 @@ def generate_processors():
         """Generate client wrapper class code."""
 
         def build_imports() -> Tuple[List[str], str]:
-            # Include both method signatures and __init__ signature for import detection
-            signatures = [sig for _, sig in methods]
+            # Include both method signatures and __init__ signature for import detection.
+            # Use the timeout-injected signature for ``encode`` so the ``Optional``
+            # import introduced by ``_inject_timeout`` is detected.
+            signatures = []
+            for name, sig in methods:
+                if name == 'encode' and class_name in ('Dataset', 'LazyDataset'):
+                    signatures.append(_inject_timeout(sig))
+                else:
+                    signatures.append(sig)
             if init_signature:
                 signatures.append(init_signature)
 
@@ -262,20 +269,22 @@ def generate_processors():
             return lines, inheritance
 
         def _inject_timeout(signature: str) -> str:
-            """Insert `timeout: int = 600` before any **kwargs in the signature."""
+            """Insert `timeout: Optional[int] = 600` before any **kwargs in the signature."""
+            if 'timeout' in signature:
+                return signature
             if ', **' in signature:
                 pre, post = signature.rsplit(', **', 1)
-                return f'{pre}, timeout: int = 600, **{post}'
+                return f'{pre}, timeout: Optional[int] = 600, **{post}'
             if signature.startswith('**'):
-                return f'timeout: int = 600, {signature}'
+                return f'timeout: Optional[int] = 600, {signature}'
             if signature:
-                return f'{signature}, timeout: int = 600'
-            return 'timeout: int = 600'
+                return f'{signature}, timeout: Optional[int] = 600'
+            return 'timeout: Optional[int] = 600'
 
         def build_method(name: str, signature: str) -> str:
             param_names = parse_params_from_signature(signature)
             kwargs_dict = '{' + ', '.join(f"'{p}': {p}" for p in param_names) + '}' if param_names else '{}'
-            wants_timeout = name == 'encode'
+            wants_timeout = name == 'encode' and class_name in ('Dataset', 'LazyDataset')
             effective_sig = _inject_timeout(signature) if wants_timeout else signature
             sig_part = f', {effective_sig}' if effective_sig else ''
             if 'kwargs' in sig_part:

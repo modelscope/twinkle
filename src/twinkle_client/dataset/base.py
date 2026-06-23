@@ -50,7 +50,7 @@ class Dataset(object):
         return response.json()["result"]
     
 
-    def encode(self, add_generation_prompt: bool = False, timeout: int = 600, **kwargs):
+    def encode(self, add_generation_prompt: bool = False, timeout: Optional[int] = 600, **kwargs):
         response = http_post(
             url=f'{self.server_url}/call',
             json_data={

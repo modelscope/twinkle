@@ -120,7 +120,7 @@ def http_post(
     json_data: Optional[Dict[str, Any]] = {},
     data: Optional[Any] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 600,
+    timeout: Optional[int] = 600,
 ) -> requests.Response:
     """
     Send HTTP POST request with required headers.
@@ -130,7 +130,7 @@ def http_post(
         json_data: JSON data to send in request body
         data: Form data or raw data to send in request body
         additional_headers: Additional headers to include
-        timeout: Request timeout in seconds
+        timeout: Request timeout in seconds; None disables the timeout.
 
     Returns:
         requests.Response object
