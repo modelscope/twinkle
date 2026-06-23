@@ -87,13 +87,14 @@ def _prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 def _prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
     num_chunks = triton.cdiv(_prepare_lens(cu_seqlens), chunk_size)
     total_chunks = num_chunks.sum().item()
-    diffs = torch.ones(total_chunks, dtype=torch.long, device=cu_seqlens.device)
+    target_dtype = cu_seqlens.dtype
+    diffs = torch.ones(total_chunks, dtype=target_dtype, device=cu_seqlens.device)
     diffs[0] = 0
     if len(num_chunks) > 1:
         starts = num_chunks.cumsum(0)[:-1]
-        diffs[starts] = -num_chunks[:-1] + 1
+        diffs[starts] = (-num_chunks[:-1] + 1).to(target_dtype)
     indices = diffs.cumsum(0)
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
 
 
 @triton.heuristics({
