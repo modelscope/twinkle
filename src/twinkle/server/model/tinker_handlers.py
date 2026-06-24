@@ -272,11 +272,15 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if metadata.get('base_model'):
                     payload['base_model'] = metadata['base_model']
                 sampling_session_id = await self.state.create_sampling_session(payload)
-                # Return ``tinker_path`` (not None): tinker SDK's
-                # ``_save_weights_for_sampler_async`` asserts ``result.path is not None``.
-                # ``sampling_session_id`` is still the canonical handle.
-                return types.SaveWeightsForSamplerResponseInternal(
-                    path=tinker_path, sampling_session_id=sampling_session_id)
+                # Tinker SDK distinguishes two modes by whether sampling_session_seq_id is set:
+                # 1. save_weights_for_sampler(name): expects path != None
+                # 2. save_weights_and_get_sampling_client(): expects path == None, sampling_session_id != None
+                if body.sampling_session_seq_id is not None:
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=None, sampling_session_id=sampling_session_id)
+                else:
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=tinker_path, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())
                 return types.RequestFailedResponse(

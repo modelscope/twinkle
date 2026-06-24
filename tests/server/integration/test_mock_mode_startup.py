@@ -339,11 +339,22 @@ def _exercise_tinker_client(base: str) -> None:
     ).result()
 
     sampler_ckpt = training.save_weights_for_sampler(name='step-1').result()
+    # path mode: save_weights_for_sampler(name) must return path != None
+    assert sampler_ckpt.path is not None
     # Gateway's /asample resolves ``base_model`` from ``body.base_model`` or
     # ``sampling_session_id``; pass it explicitly because the SDK only sets
     # ``model_path`` and the gateway doesn't parse ``twinkle://`` URIs.
     sampling = client.create_sampling_client(base_model='mock-model', model_path=sampler_ckpt.path)
     sampling.sample(
+        prompt=types.ModelInput.from_ints([1, 2, 3]),
+        num_samples=1,
+        sampling_params=types.SamplingParams(max_tokens=4),
+    ).result()
+
+    # sampling_session_seq_id mode: save_weights_and_get_sampling_client()
+    # must return path == None and sampling_session_id != None (asserted by SDK internally)
+    sampling_client = training.save_weights_and_get_sampling_client()
+    sampling_client.sample(
         prompt=types.ModelInput.from_ints([1, 2, 3]),
         num_samples=1,
         sampling_params=types.SamplingParams(max_tokens=4),
