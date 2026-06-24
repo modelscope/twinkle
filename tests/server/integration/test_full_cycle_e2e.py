@@ -29,9 +29,8 @@ Phase E + F — vLLM LoRA-effect greedy probe: for each prompt in
 
 ## How to run
 
-Not collected by pytest (no ``test_`` prefix) — needs a real GPU box
-and an externally-booted server. Bring the cluster up, then run this
-script directly:
+Direct execution (needs a real GPU box + externally-booted server).
+Bring the cluster up, then run this script directly:
 
     # 1. Boot a 3-node Ray cluster (2 GPUs for model, 1 for sampler)
     ray stop --force
@@ -47,7 +46,11 @@ script directly:
 
     # 3. Run this script
     mkdir -p /tmp/twinkle_e2e_full_cycle
-    python -u tests/server/integration/full_cycle_e2e.py
+    python -u tests/server/integration/test_full_cycle_e2e.py
+
+Pytest execution (requires TWINKLE_TEST_GPU_E2E=1):
+
+    TWINKLE_TEST_GPU_E2E=1 pytest tests/server/integration/test_full_cycle_e2e.py -v
 
 Expected last line: ``ALL PHASES PASSED``. Total wall time ~3 minutes
 (dominated by Phase A's STEPS_PHASE_A training steps).
@@ -61,7 +64,14 @@ dotenv.load_dotenv('.env')
 import os  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
+
+import pytest  # noqa: E402
 from peft import LoraConfig  # noqa: E402
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get('TWINKLE_TEST_GPU_E2E', '0') != '1',
+    reason='Set TWINKLE_TEST_GPU_E2E=1 to run real GPU E2E tests (requires running server)',
+)
 
 from twinkle import get_logger, init_twinkle_client  # noqa: E402
 from twinkle.dataloader import DataLoader  # noqa: E402
@@ -72,7 +82,7 @@ from twinkle_client.sampler import vLLMSampler  # noqa: E402
 logger = get_logger()
 
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
-BASE_URL = 'http://localhost:8000'
+BASE_URL = 'http://localhost:9000'
 API_KEY = 'EMPTY_API_KEY'
 SAVE_DIR = '/tmp/twinkle_e2e_full_cycle'
 STEPS_PHASE_A = 100
@@ -320,6 +330,14 @@ def main() -> int:
         logger.info(f'    {marker:>15} : {prompt!r}')
     logger.info('ALL PHASES PASSED')
     return 0
+
+
+# ── pytest entry point ──
+
+def test_full_cycle_e2e():
+    """Pytest-collected entry point for the full-cycle E2E suite."""
+    rc = main()
+    assert rc == 0, 'Full-cycle E2E test failed'
 
 
 if __name__ == '__main__':

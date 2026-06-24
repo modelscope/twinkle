@@ -93,7 +93,7 @@ class InputProcessor:
             return inputs[0]
         else:
             for _input in inputs:
-                if 'position_ids' in _input and _input['position_ids'].dim() > 2:
+                if 'position_ids' in _input and _input['position_ids'] is not None and _input['position_ids'].dim() > 2:
                     # megatron needs 3, 1, N
                     _input['position_ids'] = _input['position_ids'][1:]
             return inputs

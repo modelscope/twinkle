@@ -42,6 +42,7 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.nccl_safe import nccl_safe
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
@@ -621,6 +622,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @nccl_safe
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Do forward, calculate loss, and backward.

@@ -407,6 +407,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     output_tensor = model(**batch)
             else:
                 output_tensor = model(**batch)
+
             batch['labels'] = labels
             logps = None
             unpacked_logits = None

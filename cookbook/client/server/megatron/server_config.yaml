@@ -54,6 +54,7 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "1"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -66,7 +67,7 @@ applications:
       nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
-        max_model_len: 65536           # Maximum sequence length the engine supports
+        max_model_len: 32768           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.75   # 80% utilization, ~64GB/GPU, leaves buffer for safety
         enable_lora: true             # Allow loading LoRA adapters during inference
         max_loras: 5                  # Max allowed loras working on vLLM at the same time
@@ -84,7 +85,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
-        max_input_tokens: 65536
+        max_input_tokens: 32768
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -97,6 +98,7 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "1"
 
   # 2. Model Service - Hosts the base model for training.
   #    Config: PP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, comfortable for LoRA training
@@ -106,7 +108,7 @@ applications:
     args:
       backend: megatron                          # Use Megatron-LM backend
       model_id: "ms://Qwen/Qwen3.6-27B" # ModelScope model identifier
-      max_length: 65536                           # model max length
+      max_length: 32768                           # model max length
       max_loras: 3                                # model max loras
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
@@ -121,7 +123,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
-        max_input_tokens: 65536
+        max_input_tokens: 32768
       adapter_config:
         adapter_timeout: 120                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
@@ -137,6 +139,7 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "1"
 
   # 4. Processor Service
   - name: processor
@@ -159,3 +162,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"
