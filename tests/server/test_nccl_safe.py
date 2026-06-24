@@ -126,6 +126,12 @@ class TestSafeLoss:
         assert w.require_logits is False
         assert w._nccl_safe_wrapped is True
 
+    def test_wrapper_is_loss_subclass(self):
+        """Wrapped instance must satisfy isinstance(..., Loss) assertions."""
+        loss = DummyLoss()
+        w = safe_loss(loss)
+        assert isinstance(w, Loss)
+
     def test_preserves_custom_entropy_flag(self):
         loss = GRPOLoss(entropy_coef=0.1)
         assert loss.require_entropy is True
@@ -280,6 +286,29 @@ class TestNcclSafeDecorator:
         model.model = MagicMock()
         model.model.parameters = MagicMock(
             return_value=iter([torch.randn(3, requires_grad=True)]))
+
+        result = method(model, inputs=[], adapter_name='default')
+        model.backward.assert_called_once()
+        assert result['loss'] == 0.0
+
+    def test_post_forward_model_list_forces_backward(self):
+        """Fallback path must tolerate ``model.model`` being a list (Megatron multi-LoRA)."""
+        outputs_after = {'logps': torch.tensor([1.0], requires_grad=True)}
+
+        @nccl_safe
+        def method(self, *, inputs, **kwargs):
+            og = self.optimizer_group['default']
+            og.train_status.outputs = outputs_after
+            og.train_status.loss_value = torch.tensor(1.0)
+            raise RuntimeError('mid-pipeline')
+
+        model, _ = _make_model(outputs=None, loss_value=None)
+        model.backward = MagicMock()
+        param1 = torch.randn(3, requires_grad=True)
+        param2 = torch.randn(3, requires_grad=True)
+        model.model = [MagicMock(), MagicMock()]
+        model.model[0].parameters = MagicMock(return_value=iter([param1]))
+        model.model[1].parameters = MagicMock(return_value=iter([param2]))
 
         result = method(model, inputs=[], adapter_name='default')
         model.backward.assert_called_once()

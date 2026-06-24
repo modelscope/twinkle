@@ -21,6 +21,7 @@ import functools
 import os
 
 from twinkle.data_format import LossOutput
+from twinkle.loss import Loss
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -55,24 +56,33 @@ def safe_loss(loss_instance):
     """
     if getattr(loss_instance, '_nccl_safe_wrapped', False):
         return loss_instance
+    return SafeLossWrapper(loss_instance)
 
-    @functools.wraps(type(loss_instance).__call__)
-    def wrapper(inputs, outputs, **kwargs):
+
+class SafeLossWrapper(Loss):
+    """Loss subclass that catches computation errors and returns graph-connected zero loss.
+
+    Inherits from :class:`twinkle.loss.Loss` so ``isinstance(wrapper, Loss)``
+    assertions in the training pipeline continue to pass.
+    """
+
+    def __init__(self, loss_instance):
+        super().__init__()
+        self._loss_instance = loss_instance
+        self.require_logps = getattr(loss_instance, 'require_logps', True)
+        self.require_entropy = getattr(loss_instance, 'require_entropy', False)
+        self.require_logits = getattr(loss_instance, 'require_logits', False)
+        self._nccl_safe_wrapped = True
+
+    def __call__(self, inputs, outputs, **kwargs):
         if _is_fail_fast():
-            return loss_instance(inputs, outputs, **kwargs)
+            return self._loss_instance(inputs, outputs, **kwargs)
         try:
-            return loss_instance(inputs, outputs, **kwargs)
+            return self._loss_instance(inputs, outputs, **kwargs)
         except Exception as e:
             logger.warning(f'[nccl_safe] Loss computation skipped due to error: '
                            f'{type(e).__name__}: {e}')
             return _zero_loss(outputs)
-
-    # Forward known loss attributes
-    wrapper.require_logps = getattr(loss_instance, 'require_logps', True)
-    wrapper.require_entropy = getattr(loss_instance, 'require_entropy', False)
-    wrapper.require_logits = getattr(loss_instance, 'require_logits', False)
-    wrapper._nccl_safe_wrapped = True
-    return wrapper
 
 
 def _zero_loss(outputs) -> 'LossOutput':
@@ -188,6 +198,18 @@ def nccl_safe(func=None, *, tinker=False):
     return decorator
 
 
+def _iter_model_params(model):
+    """Iterate parameters from ``model.model``, supporting single model or list of models."""
+    raw_model = getattr(model, 'model', None)
+    if raw_model is None:
+        return iter([])
+    if isinstance(raw_model, (list, tuple)):
+        for m in raw_model:
+            yield from m.parameters()
+    else:
+        yield from raw_model.parameters()
+
+
 def _force_zero_backward(model, og, adapter_name, kwargs):
     """Force a zero-gradient backward pass to prevent NCCL hang.
 
@@ -208,13 +230,18 @@ def _force_zero_backward(model, og, adapter_name, kwargs):
                 break
 
     if zero_loss is None:
-        # Fallback: use first model parameter to maintain graph connectivity
+        # Fallback: use first model parameter to maintain graph connectivity.
+        # Do NOT detach() the parameter -- the zero loss must remain connected
+        # to the model's autograd graph so FSDP ReduceScatter hooks fire.
         try:
-            param = next(p for p in model.model.parameters() if p.requires_grad)
-            zero_loss = (param.flatten()[0] * 0).detach().requires_grad_(True)
-        except StopIteration:
-            device = next(model.model.parameters()).device if hasattr(model, 'model') else 'cuda'
-            zero_loss = torch.zeros((), device=device, requires_grad=True)
+            params = [p for p in _iter_model_params(model) if p.requires_grad]
+            if params:
+                param = params[0]
+                zero_loss = (param.flatten()[0] * 0).sum()
+            else:
+                zero_loss = torch.zeros((), device='cuda', requires_grad=True)
+        except Exception:
+            zero_loss = torch.zeros((), device='cuda', requires_grad=True)
 
     og.train_status.loss_value = zero_loss
 

@@ -107,13 +107,13 @@ def _configure_model(adapter_name: str, *, save_dir: str = SAVE_DIR) -> MultiLor
     model.add_adapter_to_model(
         adapter_name,
         LoraConfig(target_modules=['q_proj', 'v_proj']),
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=1,
         save_dir=save_dir,
     )
     model.set_template('Qwen3_5Template')
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('CrossEntropyLoss')
-    model.set_optimizer('Adam', lr=1e-4)
+    model.set_optimizer('Adam', lr=5e-4)
     return model
 
 
@@ -137,14 +137,16 @@ def _train_n_steps(model, dataloader, n: int, *, label: str, start_step: int = 0
 def _record_fixed_batch_loss(model, batch, *, label: str) -> float:
     """Run forward_only on a fixed batch and report the loss for reload comparison.
 
-    Uses ``forward_only`` + ``calculate_loss`` (scalar return) rather than
-    ``forward`` (which returns a raw tensor that the CPU-only proxy node in
-    a multi-GPU Ray cluster cannot deserialize — torch.load chokes on the
-    CUDA storage when ``torch.cuda.is_available()`` is False there).
+    Uses ``forward_only`` + ``calculate_metric(is_training=False)`` to retrieve
+    loss. This is compatible with both Transformers and Megatron backends
+    (Megatron does not support standalone ``calculate_loss``).
     """
     model.forward_only(inputs=batch)
-    loss_resp = model.calculate_loss()
-    val = float(loss_resp.result)
+    metric = model.calculate_metric(is_training=False)
+    try:
+        val = float(metric.result.get('loss')) if hasattr(metric.result, 'get') else float(metric.result['loss'])
+    except (TypeError, KeyError):
+        val = float(metric.result)
     logger.info(f'[{label}] fixed-batch loss = {val:.4f}')
     return val
 

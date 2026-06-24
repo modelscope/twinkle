@@ -51,7 +51,7 @@ applications:
           num_cpus: 0.1                  # CPU resources allocated to this actor
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 2. Model Service - Hosts the base model for training.
   - name: models-Qwen3.5-4B
@@ -85,7 +85,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -122,7 +122,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 4. Processor Service
   - name: processor
@@ -147,4 +147,4 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"

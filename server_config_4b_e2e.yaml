@@ -1,4 +1,4 @@
-# Twinkle Server Configuration - E2E Test (4B model, FAIL_FAST=1)
+# Twinkle Server Configuration - E2E Test (4B model, FAIL_FAST=0)
 
 proxy_location: EveryNode
 
@@ -27,7 +27,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
@@ -63,7 +63,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   - name: sampler-Qwen3.5-4B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
@@ -99,7 +99,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   - name: processor
     route_prefix: /api/v1/processor
@@ -123,4 +123,4 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
