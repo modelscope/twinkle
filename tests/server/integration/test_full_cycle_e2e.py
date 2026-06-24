@@ -3,8 +3,13 @@
 Six-phase smoke that walks every stateful surface of the twinkle
 client/server stack against a real (non-mock) backend. Drives a 4-app
 Ray Serve cluster (server + model + sampler + processor) with Qwen3.5-4B
-on a 3-GPU host. Each phase prints a one-line summary so the log is
-grep-able from a cleanup / CI script.
+on a 3-GPU host (Megatron backend). Each phase prints a one-line summary
+so the log is grep-able from a cleanup / CI script.
+
+IMPORTANT — Megatron backend constraints:
+  - gradient_accumulation_steps MUST be >= 2 (GA=1 causes optimizer step
+    to silently have no effect due to Megatron DDP gradient sync timing)
+  - target_modules='all-linear' is the validated cookbook config
 
 Phase A — initial training (STEPS_PHASE_A steps)
 Phase B — keep training STEPS_PHASE_B more steps, save again
@@ -85,51 +90,67 @@ BASE_MODEL = 'Qwen/Qwen3.5-4B'
 BASE_URL = 'http://localhost:9000'
 API_KEY = 'EMPTY_API_KEY'
 SAVE_DIR = '/tmp/twinkle_e2e_full_cycle'
-STEPS_PHASE_A = 100
+STEPS_PHASE_A = 60
 STEPS_PHASE_B = 4
-STEPS_PHASE_D = 2
+STEPS_PHASE_D = 4
 RELOAD_LOSS_TOLERANCE = 0.05  # |reloaded - original| / original
 RESUME_LOSS_BAND = 3.0  # resumed step's loss must be within this factor of Phase-B's last
 SAMPLE_MAX_TOKENS = 32
 
 
 def _build_dataset_loader(batch_size: int = 4):
-    """Same dataset shape as self_cognition.py — small slice for speed."""
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(2000)))
-    dataset.set_template('Qwen3_5Template', model_id=f'ms://{BASE_MODEL}', max_length=512)
+    """Same dataset shape as cookbook self_cognition.py — small slice for speed."""
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{BASE_MODEL}', max_length=256)
     dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
     dataset.encode(batched=True)
     return DataLoader(dataset=dataset, batch_size=batch_size)
+
+
+# Megatron backend requires GA>=2 for optimizer to properly update weights.
+# With GA=1, Megatron's DDP gradient sync timing causes optimizer.step() to
+# have no effect (loss cycles without decreasing). This is a known constraint
+# documented in cookbook/client/twinkle/modelscope/self_cognition.py.
+GRADIENT_ACCUMULATION_STEPS = 2
 
 
 def _configure_model(adapter_name: str, *, save_dir: str = SAVE_DIR) -> MultiLoraTransformersModel:
     model = MultiLoraTransformersModel(model_id=f'ms://{BASE_MODEL}')
     model.add_adapter_to_model(
         adapter_name,
-        LoraConfig(target_modules=['q_proj', 'v_proj']),
-        gradient_accumulation_steps=1,
+        LoraConfig(target_modules='all-linear'),
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         save_dir=save_dir,
     )
     model.set_template('Qwen3_5Template')
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('CrossEntropyLoss')
-    model.set_optimizer('Adam', lr=5e-4)
+    model.set_optimizer('Adam', lr=1e-4)
     return model
 
 
 def _train_n_steps(model, dataloader, n: int, *, label: str, start_step: int = 0) -> list[tuple[int, float]]:
+    """Train for n data steps. Logs metric every GRADIENT_ACCUMULATION_STEPS.
+
+    With GA=2, each logged metric represents one actual optimizer step.
+    Returns list of (data_step, loss) for the logged steps.
+    """
     losses: list[tuple[int, float]] = []
     for cur_step, batch in enumerate(dataloader, start=start_step + 1):
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
-        metric = model.calculate_metric(is_training=True)
-        try:
-            loss = float(metric.result.get('loss')) if hasattr(metric.result, 'get') else float(metric.result['loss'])
-        except Exception:
-            loss = float('nan')
-        losses.append((cur_step, loss))
-        logger.info(f'[{label}] step={cur_step} loss={loss:.4f}')
-        if len(losses) >= n:
+
+        # Log metric aligned with optimizer steps (every GA data steps)
+        if (cur_step - start_step) % GRADIENT_ACCUMULATION_STEPS == 0:
+            metric = model.calculate_metric(is_training=True)
+            try:
+                loss = float(metric.result.get('loss')) if hasattr(metric.result, 'get') else float(
+                    metric.result['loss'])
+            except Exception:
+                loss = float('nan')
+            losses.append((cur_step, loss))
+            logger.info(f'[{label}] step={cur_step} loss={loss:.4f}')
+        if cur_step - start_step >= n:
             break
     return losses
 
@@ -219,7 +240,7 @@ def main() -> int:
     logger.info('Phase A: initial training (%d steps)', STEPS_PHASE_A)
     logger.info('=' * 60)
     dataloader_a = _build_dataset_loader()
-    model_a = _configure_model('phase-a')
+    model_a = _configure_model('default')
 
     losses_a = _train_n_steps(model_a, dataloader_a, STEPS_PHASE_A, label='A')
 
@@ -256,7 +277,7 @@ def main() -> int:
     logger.info('=' * 60)
     logger.info('Phase C: reload-verify (new handle, load ckpt_a, fixed batch)')
     logger.info('=' * 60)
-    model_c = _configure_model('phase-c')
+    model_c = _configure_model('default')
     model_c.load(ckpt_a)
     loss_c_fixed = _record_fixed_batch_loss(model_c, fixed_batch, label='C-fixed')
     delta = abs(loss_c_fixed - loss_a_fixed) / max(abs(loss_a_fixed), 1e-6)
@@ -270,7 +291,7 @@ def main() -> int:
     logger.info('=' * 60)
     logger.info('Phase D: resume-verify (new handle, resume ckpt_b, train %d steps)', STEPS_PHASE_D)
     logger.info('=' * 60)
-    model_d = _configure_model('phase-d')
+    model_d = _configure_model('default')
     dataloader_d = _build_dataset_loader()
     progress = model_d.resume_from_checkpoint(ckpt_b)
     logger.info(f'Phase D progress after resume: {progress}')

@@ -103,7 +103,6 @@ def make_input_features(
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': [1] * seq_len,
-            'position_ids': list(range(seq_len)),
         })
 
         if bad_old_logps_len is not None:

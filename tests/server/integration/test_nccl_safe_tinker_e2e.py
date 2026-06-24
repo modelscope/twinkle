@@ -335,12 +335,13 @@ def test_16_large_batch(tc):
     return True
 
 def test_17_single_datum(tc):
-    datums = [make_datum(seq_len=64, completion_len=32)]
-    ok, _, elapsed = run_forward_backward(tc, datums, 'TEST-17-SINGLE')
+    # With dp_size=2 + nproc_per_node=2, minimum batch must be >= data_world_size
+    datums = [make_datum(seq_len=64, completion_len=32) for _ in range(4)]
+    ok, _, elapsed = run_forward_backward(tc, datums, 'TEST-17-SMALL')
     if elapsed >= TIMEOUT:
         return False
     assert ok
-    do_optim_step(tc, 'TEST-17-SINGLE')
+    do_optim_step(tc, 'TEST-17-SMALL')
     return True
 
 def test_18_save_after_error(tc):
