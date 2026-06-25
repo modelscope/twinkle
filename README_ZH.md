@@ -123,7 +123,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 | 硬件环境 | 备注                                                            |
 | -------- | --------------------------------------------------------------- |
 | Nvidia GPU | ✅ 早期 GPU 对 BF16/Flash-Attn 的支持可能不完整 |
-| 昇腾 NPU   | ✅ 部分算子可能不支持                              |
+| 昇腾 NPU   | ✅ A2、A3不支持FP8                              |
 | PPU        | ✅                                                               |
 | CPU        | 支持部分组件如 dataset、dataloader             |
 
