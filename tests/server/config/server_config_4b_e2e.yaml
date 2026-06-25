@@ -13,7 +13,7 @@ applications:
     import_path: server
     args:
       server_config:
-        per_token_model_limit: 3
+        per_token_model_limit: 30
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:

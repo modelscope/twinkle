@@ -22,6 +22,7 @@ from twinkle.utils.nccl_safe import (
     _is_fail_fast,
     _zero_loss,
     nccl_safe,
+    nccl_safe_megatron,
     safe_loss,
 )
 
@@ -650,3 +651,310 @@ class TestBackwardCompat:
         assert og.loss_instance._nccl_safe_wrapped is True
         with pytest.raises(RuntimeError, match='Simulated'):
             og.loss_instance({}, {'logps': torch.tensor([1.0])})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 10. Unit Tests: @nccl_safe_megatron decorator
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestNcclSafeMegatron:
+
+    # ── Dev mode: transparent ──
+
+    def test_transparent_in_dev_mode(self, _dev_mode):
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            raise ValueError('should propagate')
+
+        with pytest.raises(ValueError, match='should propagate'):
+            method(MagicMock(), inputs=[])
+
+    def test_transparent_tinker_in_dev_mode(self, _dev_mode):
+        @nccl_safe_megatron(tinker=True)
+        def method(self, *, inputs, **kwargs):
+            raise RuntimeError('dev error')
+
+        with pytest.raises(RuntimeError, match='dev error'):
+            method(MagicMock(), inputs=[])
+
+    def test_transparent_forward_only_in_dev_mode(self, _dev_mode):
+        @nccl_safe_megatron(forward_only=True)
+        def method(self, *, inputs, **kwargs):
+            raise RuntimeError('dev error')
+
+        with pytest.raises(RuntimeError, match='dev error'):
+            method(MagicMock(), inputs=[])
+
+    # ── Production mode: catch all exceptions ──
+
+    def test_normal_call_passes(self):
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            return {'loss': 1.5, 'logps': 'data'}
+
+        result = method(MagicMock(), inputs=[])
+        assert result == {'loss': 1.5, 'logps': 'data'}
+
+    def test_exception_returns_fallback_dict(self):
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            raise RuntimeError('Megatron internal error')
+
+        result = method(MagicMock(), inputs=[])
+        assert result == {'loss': 0.0}
+
+    def test_tinker_exception_returns_list(self):
+        @nccl_safe_megatron(tinker=True)
+        def method(self, *, inputs, **kwargs):
+            raise ValueError('data preprocessing failed')
+
+        result = method(MagicMock(), inputs=[])
+        assert result == [[], 0.0]
+
+    def test_forward_only_exception_returns_empty_dict(self):
+        @nccl_safe_megatron(forward_only=True)
+        def method(self, *, inputs, **kwargs):
+            raise AssertionError('invalid inputs')
+
+        result = method(MagicMock(), inputs=[])
+        assert result == {}
+
+    def test_consecutive_errors_all_caught(self):
+        call_count = [0]
+
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            call_count[0] += 1
+            raise RuntimeError(f'error #{call_count[0]}')
+
+        model = MagicMock()
+        for _ in range(5):
+            result = method(model, inputs=[])
+            assert result == {'loss': 0.0}
+        assert call_count[0] == 5
+
+    def test_error_then_normal(self):
+        call_count = [0]
+
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError('first call fails')
+            return {'loss': 2.0}
+
+        model = MagicMock()
+        r1 = method(model, inputs=[])
+        assert r1 == {'loss': 0.0}
+
+        r2 = method(model, inputs=[])
+        assert r2 == {'loss': 2.0}
+
+    def test_keyboard_interrupt_propagates(self):
+        """KeyboardInterrupt is BaseException, NOT caught."""
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            method(MagicMock(), inputs=[])
+
+    def test_system_exit_propagates(self):
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            raise SystemExit(1)
+
+        with pytest.raises(SystemExit):
+            method(MagicMock(), inputs=[])
+
+    # ── DPO-specific scenarios ──
+
+    def test_dpo_forward_only_data_error_caught(self):
+        """DPO reference forward: data preprocessing error is caught."""
+        @nccl_safe_megatron(forward_only=True)
+        def forward_only(self, *, inputs, **kwargs):
+            # Simulate template.batch_encode failure
+            raise AssertionError('Use set_template to add a template')
+
+        result = forward_only(MagicMock(), inputs=[])
+        assert result == {}
+
+    def test_dpo_forward_backward_assertion_caught(self):
+        """DPO training forward_backward: assertion error is caught."""
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            # Simulate batch_size assertion failure
+            raise AssertionError('Batch size must be even (chosen + rejected pairs)')
+
+        result = forward_backward(MagicMock(), inputs=[])
+        assert result == {'loss': 0.0}
+
+    def test_dpo_tinker_ref_logps_mismatch_caught(self):
+        """DPO via Tinker: ref_logps mismatch is caught."""
+        @nccl_safe_megatron(tinker=True)
+        def tinker_forward_backward(self, *, inputs, **kwargs):
+            raise ValueError('Cannot align ref_logps shape')
+
+        result = tinker_forward_backward(MagicMock(), inputs=[])
+        assert result == [[], 0.0]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 11. Multi-adapter concurrent scenarios
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestMultiAdapterConcurrency:
+    """Verify nccl_safe handles multi-adapter scenarios correctly."""
+
+    def test_different_adapters_independent_state(self):
+        """Two adapters with independent state: one failing shouldn't corrupt the other."""
+        @nccl_safe
+        def method(self, *, inputs, adapter_name, **kwargs):
+            og = self.optimizer_group[adapter_name]
+            og.train_status.outputs = {'logps': torch.tensor([1.0], requires_grad=True)}
+            if adapter_name == 'adapter_bad':
+                og.train_status.loss_value = torch.tensor(1.0)
+                raise RuntimeError('adapter_bad fails after forward')
+            og.train_status.loss_value = None  # backward done
+            return {'loss': 0.5}
+
+        # Setup model with two adapters
+        model = MagicMock()
+        ts_good = TrainStatus()
+        ts_bad = TrainStatus()
+        og_good = MagicMock()
+        og_good.train_status = ts_good
+        og_bad = MagicMock()
+        og_bad.train_status = ts_bad
+        model.optimizer_group = {'adapter_good': og_good, 'adapter_bad': og_bad}
+        model.backward = MagicMock()
+        model.model = MagicMock()
+        model.model.parameters = MagicMock(
+            return_value=iter([torch.randn(3, requires_grad=True)]))
+
+        # adapter_good should succeed normally
+        result_good = method(model, inputs=[], adapter_name='adapter_good')
+        assert result_good == {'loss': 0.5}
+
+        # adapter_bad should be caught and force backward
+        result_bad = method(model, inputs=[], adapter_name='adapter_bad')
+        assert result_bad['loss'] == 0.0
+        model.backward.assert_called_once()
+
+    def test_sequential_adapter_failures_isolated(self):
+        """Sequential failures on different adapters don't accumulate state."""
+        call_count = [0]
+
+        @nccl_safe
+        def method(self, *, inputs, adapter_name, **kwargs):
+            call_count[0] += 1
+            og = self.optimizer_group[adapter_name]
+            og.train_status.outputs = {'logps': torch.tensor([float(call_count[0])], requires_grad=True)}
+            og.train_status.loss_value = None  # backward done
+            raise RuntimeError(f'post-backward error #{call_count[0]}')
+
+        model = MagicMock()
+        for name in ['a1', 'a2', 'a3']:
+            ts = TrainStatus()
+            og = MagicMock()
+            og.train_status = ts
+            model.optimizer_group = {name: og}
+            model.backward = MagicMock()
+            result = method(model, inputs=[], adapter_name=name)
+            assert result['loss'] == 0.0
+            # backward should NOT be called (post-backward error)
+            model.backward.assert_not_called()
+
+    def test_megatron_multi_adapter_all_caught(self):
+        """nccl_safe_megatron catches errors for any adapter."""
+        @nccl_safe_megatron
+        def method(self, *, inputs, adapter_name, **kwargs):
+            if adapter_name == 'bad':
+                raise RuntimeError('bad adapter data')
+            return {'loss': 1.0}
+
+        model = MagicMock()
+        assert method(model, inputs=[], adapter_name='good') == {'loss': 1.0}
+        assert method(model, inputs=[], adapter_name='bad') == {'loss': 0.0}
+        # After error, good adapter still works
+        assert method(model, inputs=[], adapter_name='good') == {'loss': 1.0}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 12. Megatron communication timeout simulation
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class TestMegatronTimeoutSimulation:
+    """Simulate Megatron internal communication failures."""
+
+    def test_nccl_timeout_exception_caught(self):
+        """NCCL timeout RuntimeError inside Megatron is caught."""
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            # Simulate NCCL timeout
+            raise RuntimeError(
+                'Watchdog caught collective operation timeout: '
+                'WorkNCCL(SeqNum=42, OpType=ALLREDUCE) ran for 300000 milliseconds')
+
+        result = forward_backward(MagicMock(), inputs=[])
+        assert result == {'loss': 0.0}
+
+    def test_nccl_timeout_in_forward_only(self):
+        """NCCL timeout during forward_only (reference model) is caught."""
+        @nccl_safe_megatron(forward_only=True)
+        def forward_only(self, *, inputs, **kwargs):
+            raise RuntimeError(
+                'NCCL communicator was aborted on rank 1. Original reason: '
+                'ProcessGroupNCCL abort')
+
+        result = forward_only(MagicMock(), inputs=[])
+        assert result == {}
+
+    def test_cuda_oom_in_megatron_caught(self):
+        """CUDA OOM during Megatron forward is caught."""
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            raise RuntimeError('CUDA out of memory. Tried to allocate 2.00 GiB')
+
+        result = forward_backward(MagicMock(), inputs=[])
+        assert result == {'loss': 0.0}
+
+    def test_recovery_after_timeout(self):
+        """System recovers after a simulated timeout."""
+        call_count = [0]
+
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                raise RuntimeError('NCCL timeout')
+            return {'loss': 1.5}
+
+        model = MagicMock()
+        # First two calls timeout
+        assert forward_backward(model, inputs=[]) == {'loss': 0.0}
+        assert forward_backward(model, inputs=[]) == {'loss': 0.0}
+        # Third call succeeds
+        assert forward_backward(model, inputs=[]) == {'loss': 1.5}
+
+    def test_megatron_transparent_in_fail_fast(self, _dev_mode):
+        """In dev mode (TWINKLE_FAIL_FAST=1), exceptions propagate normally."""
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            raise RuntimeError('would cause NCCL hang in production')
+
+        # In dev mode, exception propagates
+        with pytest.raises(RuntimeError, match='would cause NCCL hang'):
+            forward_backward(MagicMock(), inputs=[])
+
+    def test_base_exception_still_propagates_in_dev_mode(self, _dev_mode):
+        """BaseException (KeyboardInterrupt, SystemExit) always propagates."""
+        @nccl_safe_megatron
+        def method(self, *, inputs, **kwargs):
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            method(MagicMock(), inputs=[])

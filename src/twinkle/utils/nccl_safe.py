@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """NCCL-safe utilities for production distributed training.
 
-Provides two layers of protection to prevent NCCL hangs:
+Provides three layers of protection to prevent NCCL hangs:
 
 Layer 1 - safe_loss():
     Wraps loss instances to catch computation errors and return
@@ -10,6 +10,12 @@ Layer 1 - safe_loss():
 Layer 2 - @nccl_safe decorator:
     Wraps forward_backward methods to ensure backward() always executes
     after forward() has started, even if intermediate code raises.
+
+Layer 3 - @nccl_safe_megatron decorator:
+    Wraps Megatron backend methods (forward_only, forward_backward) where
+    the entire function body involves NCCL communication (sync=True).
+    Catches pre-communication errors (e.g. data preprocessing failures)
+    that would otherwise leave other DP ranks waiting at a collective.
 
 Controlled by environment variable:
     TWINKLE_FAIL_FAST=1 (default, development): all protection is transparent,
@@ -251,3 +257,72 @@ def _force_zero_backward(model, og, adapter_name, kwargs):
     if gas is not None:
         bwd_kwargs['gradient_accumulation_steps'] = gas
     model.backward(**bwd_kwargs)
+
+
+# ─── Layer 3: @nccl_safe_megatron decorator ──────────────────────────────────
+
+
+def nccl_safe_megatron(func=None, *, tinker=False, forward_only=False):
+    """Decorator for Megatron backend methods where the entire body is NCCL-critical.
+
+    Unlike @nccl_safe (which detects forward/backward boundaries), this decorator
+    treats the **entire function** as a NCCL-critical section. In Megatron,
+    forward_only and forward_backward both call get_forward_backward_func() which
+    requires all DP ranks to enter synchronously. If one rank fails during data
+    preprocessing (before entering Megatron's scheduler), other ranks will hang
+    waiting for the collective.
+
+    This decorator catches ALL exceptions (when TWINKLE_FAIL_FAST=0) and returns
+    a safe fallback value, preventing NCCL hang from asymmetric failures.
+
+    Args:
+        func: The function to decorate (when used without arguments).
+        tinker: If True, fallback returns ``[[], 0.0]`` (tinker format).
+        forward_only: If True, fallback returns empty dict ``{}`` (forward_only format).
+
+    Usage::
+
+        @remote_function(dispatch='slice_dp', collect=..., sync=True)
+        @nccl_safe_megatron
+        def forward_backward(self, *, inputs, **kwargs):
+            ...
+
+        @remote_function(dispatch='slice_dp', collect=...)
+        @nccl_safe_megatron(forward_only=True)
+        def forward_only(self, *, inputs, **kwargs):
+            ...
+
+        @remote_function(dispatch='slice_dp', collect=..., sync=True)
+        @nccl_safe_megatron(tinker=True)
+        def tinker_forward_backward(self, *, inputs, **kwargs):
+            ...
+    """
+
+    def decorator(fn):
+
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            if _is_fail_fast():
+                return fn(self, *args, **kwargs)
+
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as e:
+                logger.warning(f'[nccl_safe_megatron] Exception in Megatron method '
+                               f'{fn.__name__}: {type(e).__name__}: {e}')
+
+                # Return safe fallback to prevent NCCL hang on other ranks
+                if tinker:
+                    return [[], 0.0]
+                if forward_only:
+                    return {}
+                # forward_backward fallback: return dict with loss=0.0
+                return {'loss': 0.0}
+
+        return wrapper
+
+    if func is not None:
+        # @nccl_safe_megatron without arguments
+        return decorator(func)
+    # @nccl_safe_megatron(tinker=True) with arguments
+    return decorator
