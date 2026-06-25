@@ -148,6 +148,7 @@ dataset.encode()
 > 1. Dataset 的 `map`、`encode`、`filter` 等方法均使用 `datasets` 的 `map` 方式进行，因此在对应方法的 kwargs 中均可以使用对应的参数
 > 2. `load_from_cache_file` 参数默认为 False，因为该参数设置为 True 时会引发一些数据集改变但训练仍然使用缓存的头疼问题。如果你的数据集较大而且更新不频繁，可以直接置为 True
 > 3. encode 不需要指定 `DatasetMeta`，因为预处理过后所有数据集格式都是相同的
+> 4. `encode` 默认使用单进程分词。数据量较大时可通过 `num_proc` 开启多进程并行加速，例如 `dataset.encode(num_proc=8)`
 
 6. 获取数据
 
