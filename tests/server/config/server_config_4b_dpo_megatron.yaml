@@ -1,4 +1,5 @@
-# Twinkle Server Configuration - E2E Test (4B model, Megatron backend)
+# Twinkle Server Configuration - DPO E2E Test (4B model, Megatron PP=2, no sampler)
+# Minimal config for reproducing PP deadlock during DPO forward_backward.
 
 proxy_location: EveryNode
 
@@ -13,7 +14,7 @@ applications:
     import_path: server
     args:
       server_config:
-        per_token_model_limit: 20
+        per_token_model_limit: 30
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
@@ -27,7 +28,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
@@ -62,43 +63,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
-              TWINKLE_FAIL_FAST: "1"
-
-  # - name: sampler-Qwen3.5-4B
-  #   route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
-  #   import_path: sampler
-  #   args:
-  #     model_id: "ms://Qwen/Qwen3.5-4B"
-  #     nproc_per_node: 1
-  #     sampler_type: vllm
-  #     engine_args:
-  #       max_model_len: 4096
-  #       gpu_memory_utilization: 0.5
-  #       enable_lora: true
-  #       max_loras: 5
-  #       logprobs_mode: processed_logprobs
-  #     device_group:
-  #       name: sampler
-  #       ranks: 1
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       dp_size: 1
-  #     queue_config:
-  #       rps_limit: 100
-  #       tps_limit: 100000
-  #   deployments:
-  #     - name: SamplerManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
-  #         runtime_env:
-  #           env_vars:
-  #             TWINKLE_TRUST_REMOTE_CODE: "1"
-  #             TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   - name: processor
     route_prefix: /api/v1/processor
@@ -122,4 +87,4 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_FAIL_FAST: "0"

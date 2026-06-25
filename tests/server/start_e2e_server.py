@@ -25,7 +25,7 @@ SERVER_LOG = os.path.join(WORKDIR, "server_e2e.log")
 # ── Server check ──
 SERVER_URL = "http://localhost:9000/-/routes"
 READY_KEYWORD = "processor"
-TIMEOUT = 180
+TIMEOUT = 600
 POLL_INTERVAL = 5
 
 
@@ -62,25 +62,25 @@ def kill_server():
 
 
 def restart_ray():
-    """Stop and restart the Ray cluster (3 GPU + 1 CPU nodes)."""
+    """Stop and restart the Ray cluster (5 GPU + 1 CPU nodes)."""
     print("[2/4] Restarting Ray cluster...")
     run(f"{RAY} stop --force", check=False)
     time.sleep(2)
 
-    # Head node: GPU 0,1
-    run(f"{RAY} start --head --port=6379 --num-gpus=2 "
+    # Head node: GPU 0,1,2,3 (4 GPUs for model PP=2 x DP=2)
+    run(f"{RAY} start --head --port=6379 --num-gpus=4 "
         f"--disable-usage-stats --temp-dir={RAY_TEMP_DIR}",
-        env={"CUDA_VISIBLE_DEVICES": "0,1"})
+        env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"})
 
-    # Worker: GPU 2
+    # Worker: GPU 4 (1 GPU for sampler)
     run(f"{RAY} start --address=127.0.0.1:6379 --num-gpus=1",
-        env={"CUDA_VISIBLE_DEVICES": "2"})
+        env={"CUDA_VISIBLE_DEVICES": "4"})
 
-    # CPU-only worker
+    # CPU-only worker (processor + server)
     run(f"{RAY} start --address=127.0.0.1:6379 --num-gpus=0",
         env={"CUDA_VISIBLE_DEVICES": ""})
 
-    print("    Ray cluster started (2+1+0 GPUs)")
+    print("    Ray cluster started (4+1+0 GPUs)")
 
 
 def launch_server(config: str):
