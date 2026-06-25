@@ -235,6 +235,11 @@ class TwinkleCompatMockModel:
     def has_adapter(self, adapter_name: str) -> bool:
         return adapter_name in self._adapters
 
+    @remote_function(collect='first', lazy_collect=False)
+    def ping(self) -> bool:
+        """Lightweight liveness probe for watchdog health checks."""
+        return True
+
 
 def _to_tinker_loss_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Wrap mock's plain numpy-derived dicts into ``tinker.TensorData`` instances.

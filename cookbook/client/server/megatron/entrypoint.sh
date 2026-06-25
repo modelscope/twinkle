@@ -11,10 +11,12 @@ TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-/dashscope/caches/application/twinkle}"
 TEMP_DIR="${TWINKLE_TEMP_DIR:-/dashscope/caches/application/ray_logs}"
 LOG_FILE="$TWINKLE_WORK_DIR/run.log"
 TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:9000/api/v1/healthz}"
+TWINKLE_DEEP_HEALTH_URL="${TWINKLE_DEEP_HEALTH_URL:-http://127.0.0.1:9000/api/v1/twinkle/healthz/deep}"
 TWINKLE_WATCHDOG_INTERVAL_SECONDS="${TWINKLE_WATCHDOG_INTERVAL_SECONDS:-10}"
 TWINKLE_WATCHDOG_FAILURE_THRESHOLD="${TWINKLE_WATCHDOG_FAILURE_THRESHOLD:-3}"
 TWINKLE_RAY_GRACE_SECONDS="${TWINKLE_RAY_GRACE_SECONDS:-30}"
 TWINKLE_HEALTH_GRACE_SECONDS="${TWINKLE_HEALTH_GRACE_SECONDS:-${TWINKLE_WATCHDOG_STARTUP_GRACE_SECONDS:-300}}"
+TWINKLE_DEEP_HEALTH_GRACE_SECONDS="${TWINKLE_DEEP_HEALTH_GRACE_SECONDS:-${TWINKLE_HEALTH_GRACE_SECONDS:-300}}"
 RESTART_BACKOFF_SECONDS="${TWINKLE_ENTRYPOINT_RESTART_BACKOFF_SECONDS:-10}"
 
 CHILD_PID=""
@@ -58,6 +60,7 @@ validate_entrypoint_config() {
     require_positive_int "TWINKLE_WATCHDOG_FAILURE_THRESHOLD" "$TWINKLE_WATCHDOG_FAILURE_THRESHOLD"
     require_non_negative_int "TWINKLE_RAY_GRACE_SECONDS" "$TWINKLE_RAY_GRACE_SECONDS"
     require_non_negative_int "TWINKLE_HEALTH_GRACE_SECONDS" "$TWINKLE_HEALTH_GRACE_SECONDS"
+    require_non_negative_int "TWINKLE_DEEP_HEALTH_GRACE_SECONDS" "$TWINKLE_DEEP_HEALTH_GRACE_SECONDS"
     require_non_negative_int "TWINKLE_ENTRYPOINT_RESTART_BACKOFF_SECONDS" "$RESTART_BACKOFF_SECONDS"
 
     require_command timeout
@@ -72,13 +75,14 @@ validate_entrypoint_config() {
 }
 
 check_http_health() {
+    local url="${1:-$TWINKLE_HEALTH_URL}"
     if command -v curl &> /dev/null; then
-        curl -fsS --max-time 10 "$TWINKLE_HEALTH_URL" >/dev/null
+        curl -fsS --max-time 10 "$url" >/dev/null
         return
     fi
 
     if command -v wget &> /dev/null; then
-        wget -q --spider --timeout=10 "$TWINKLE_HEALTH_URL"
+        wget -q --spider --timeout=10 "$url"
         return
     fi
 
@@ -86,7 +90,7 @@ check_http_health() {
     if ! command -v "$python_bin" &> /dev/null; then
         python_bin="python"
     fi
-    "$python_bin" - "$TWINKLE_HEALTH_URL" <<'PY'
+    "$python_bin" - "$url" <<'PY'
 import sys
 import urllib.request
 
@@ -102,6 +106,7 @@ PY
 print_watchdog_diagnostics() {
     print_warning "EntryPoint watchdog 诊断信息："
     echo "  - health url: $TWINKLE_HEALTH_URL"
+    echo "  - deep health url: $TWINKLE_DEEP_HEALTH_URL"
     echo "  - run.sh pid: ${CHILD_PID:-unset}"
     echo "  - Ray logs: $TEMP_DIR/session_latest/logs"
 
@@ -161,6 +166,9 @@ while true; do
         elif ! check_http_health; then
             WATCHDOG_FAILURE_REASON="http health check failed: $TWINKLE_HEALTH_URL"
             WATCHDOG_GRACE_SECONDS="$TWINKLE_HEALTH_GRACE_SECONDS"
+        elif ! check_http_health "$TWINKLE_DEEP_HEALTH_URL"; then
+            WATCHDOG_FAILURE_REASON="deep health check failed (model actors may be dead): $TWINKLE_DEEP_HEALTH_URL"
+            WATCHDOG_GRACE_SECONDS="$TWINKLE_DEEP_HEALTH_GRACE_SECONDS"
         fi
 
         if [ -z "$WATCHDOG_FAILURE_REASON" ]; then

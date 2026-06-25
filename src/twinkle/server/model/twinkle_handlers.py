@@ -62,6 +62,18 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     replica instance. It is wired in via Depends so it is resolved lazily at request time.
     """
 
+    @app.get('/healthz')
+    async def model_healthz(
+            request: Request,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict:
+        """Deep health probe: pings underlying model actors to verify liveness."""
+        result = self.check_model_health()
+        if not result['healthy']:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content=result)
+        return result
+
     async def run_task(coro):
         """Await a schedule_task_and_wait coroutine and surface any exception as a
         structured HTTP 500 response so the client receives the full traceback instead

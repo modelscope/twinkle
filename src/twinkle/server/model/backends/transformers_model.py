@@ -105,3 +105,8 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
+
+    @remote_function(collect='first', lazy_collect=False)
+    def ping(self) -> bool:
+        """Lightweight liveness probe for watchdog health checks."""
+        return True

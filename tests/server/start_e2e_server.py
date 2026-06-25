@@ -18,7 +18,7 @@ import requests
 RAY = "/mnt/nas2/anaconda3/envs/tinker_myl/bin/ray"
 PYTHON = "/mnt/nas2/anaconda3/envs/tinker_myl/bin/python"
 WORKDIR = "/mnt/nas2/yunlin.myl/twinkle"
-DEFAULT_CONFIG = "server_config_4b_e2e.yaml"
+DEFAULT_CONFIG = "tests/server/config/server_config_4b_e2e.yaml"
 RAY_TEMP_DIR = "/mnt/nas2/yunlin.myl/ray_logs"
 SERVER_LOG = os.path.join(WORKDIR, "server_e2e.log")
 
