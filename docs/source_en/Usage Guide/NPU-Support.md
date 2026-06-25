@@ -177,7 +177,7 @@ To use FLA (Flash Linear Attention) with Qwen3.5/3.6 on the transformers backend
 
 **MindSpeed Version and Code Adaptation**
 
-The currently validated MindSpeed version is `2.3.0_core_r0.12.1`. MindSpeed repository: [https://gitcode.com/Ascend/MindSpeed](https://gitcode.com/Ascend/MindSpeed)
+The currently validated MindSpeed version is `26.0.0_core_r0.12.1`. MindSpeed repository: [https://gitcode.com/Ascend/MindSpeed](https://gitcode.com/Ascend/MindSpeed)
 
 If using a higher MindSpeed version, note that the following import paths in `src/twinkle/kernel/chunk_gated_delta_rule.py` may need to be adjusted to match the actual code locations in MindSpeed:
 
