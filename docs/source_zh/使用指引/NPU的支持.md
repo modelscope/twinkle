@@ -190,6 +190,30 @@ from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom
 from mindspeed.lite.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 ```
 
+### 7. NPU Patch 环境变量配置
+
+Twinkle 在 NPU 环境下默认启用模型层补丁，可通过以下环境变量进行细粒度控制：
+
+| 环境变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `TWINKLE_NPU_PATCH` | 所有 NPU 优化的总开关 | `1`（启用） |
+| `TWINKLE_NPU_FUSED_OPS` | 启用融合算子（RMSNorm、RoPE、SwiGLU、SDPA） | `1`（启用） |
+| `TWINKLE_NPU_MOE_PATCH` | 启用 MoE Grouped MatMul | `1`（启用） |
+| `TWINKLE_NPU_FLA` | 启用 Qwen3.5 Flash Linear Attention；设为 `0` 强制回退到 torch 实现 | `1`（启用） |
+
+**使用示例**：
+
+```bash
+# 关闭所有 NPU 优化，回退到 Transformers 原生实现
+export TWINKLE_NPU_PATCH=0
+
+# 仅关闭 FLA，保留其他融合算子
+export TWINKLE_NPU_FLA=0
+
+# 仅关闭 MoE 补丁
+export TWINKLE_NPU_MOE_PATCH=0
+```
+
 ## 快速开始
 
 **重要提示**：以下示例均来自 `cookbook/` 目录，已在实际 NPU 环境中验证通过。建议直接运行 cookbook 中的脚本，而不是复制粘贴代码片段。
