@@ -1,4 +1,4 @@
-# Twinkle Server Configuration - E2E Test (4B model, FAIL_FAST=0)
+# Twinkle Server Configuration - E2E Test (4B model, Transformers backend)
 
 proxy_location: EveryNode
 
@@ -33,7 +33,7 @@ applications:
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      backend: megatron
+      backend: transformers
       model_id: "ms://Qwen/Qwen3.5-4B"
       max_length: 10240
       nproc_per_node: 2
@@ -47,11 +47,9 @@ applications:
       queue_config:
         rps_limit: 100
         tps_limit: 100000
-        max_input_tokens: 60000
       adapter_config:
         adapter_timeout: 30
         adapter_max_lifetime: 36000
-      max_loras: 5
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -62,7 +60,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
               TWINKLE_FAIL_FAST: "0"
 
   - name: sampler-Qwen3.5-4B
@@ -73,11 +71,10 @@ applications:
       nproc_per_node: 1
       sampler_type: vllm
       engine_args:
-        max_model_len: 16000
-        gpu_memory_utilization: 0.7
+        max_model_len: 4096
+        gpu_memory_utilization: 0.5
         enable_lora: true
         logprobs_mode: processed_logprobs
-        enable_tower_connector_lora: true
       device_group:
         name: sampler
         ranks: 1
@@ -98,7 +95,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
               TWINKLE_FAIL_FAST: "0"
 
   - name: processor
