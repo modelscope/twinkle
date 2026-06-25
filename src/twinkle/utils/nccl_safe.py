@@ -86,8 +86,9 @@ class SafeLossWrapper(Loss):
         try:
             return self._loss_instance(inputs, outputs, **kwargs)
         except Exception as e:
-            logger.warning(f'[nccl_safe] Loss computation skipped due to error: '
-                           f'{type(e).__name__}: {e}')
+            import traceback
+            logger.warning('[nccl_safe] Loss computation skipped due to error: '
+                           '%s: %s\n%s', type(e).__name__, e, traceback.format_exc())
             return _zero_loss(outputs)
 
 
@@ -308,8 +309,10 @@ def nccl_safe_megatron(func=None, *, tinker=False, forward_only=False):
             try:
                 return fn(self, *args, **kwargs)
             except Exception as e:
+                import traceback
                 logger.warning(f'[nccl_safe_megatron] Exception in Megatron method '
-                               f'{fn.__name__}: {type(e).__name__}: {e}')
+                               f'{fn.__name__}: {type(e).__name__}: {e}\n'
+                               f'{traceback.format_exc()}')
 
                 # Return safe fallback to prevent NCCL hang on other ranks
                 if tinker:

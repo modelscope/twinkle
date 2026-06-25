@@ -110,6 +110,19 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     @nccl_safe_megatron
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        # Normalize ragged ref_outputs logps into a regular 2D tensor.
+        # After HTTP + collect_tensor_dict, logps is a nested list grouped
+        # by microbatch with varying seq_lens across DP ranks.  Flatten to
+        # per-sample 1D lists and pad_and_stack — same as datum.py L84-88.
+        ref_outputs = kwargs.get('ref_outputs')
+        if isinstance(ref_outputs, dict) and 'logps' in ref_outputs:
+            logps = ref_outputs['logps']
+            if isinstance(logps, (list, tuple)) and logps and not isinstance(logps[0], torch.Tensor):
+                # Flatten [[mb0_sample0, mb0_sample1], [mb1_sample0, ...]] → [sample0, sample1, ...]
+                flat = [s for item in logps for s in (item if isinstance(item[0], (list, tuple)) else [item])]
+                from twinkle.utils import pad_and_stack_tensors
+                ref_outputs['logps'] = pad_and_stack_tensors(
+                    [torch.tensor(s, dtype=torch.float32) for s in flat], pad_value=0.0, concat=False)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 

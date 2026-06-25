@@ -204,7 +204,17 @@ class TwinkleCompatModelBase:
             # Non-last PP stages can legitimately produce no logits/logps.
             return None
         elif not (isinstance(value, list) and all(isinstance(item, torch.Tensor) for item in value)):
-            tensors = [torch.as_tensor(value, dtype=torch.float32)]
+            # Handle ragged list[list] (e.g. logps after to_cpu_safe_output
+            # converted variable-length Tensors to nested Python lists).
+            # Flatten microbatch grouping → per-sample 1D lists → pad_and_stack.
+            if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+                flat = [s for item in value for s in (item if isinstance(item[0], (list, tuple)) else [item])]
+                from twinkle.utils import pad_and_stack_tensors
+                tensors = [pad_and_stack_tensors(
+                    [torch.tensor(s, dtype=torch.float32) for s in flat],
+                    pad_value=0.0, concat=False)]
+            else:
+                tensors = [torch.as_tensor(value, dtype=torch.float32)]
 
         tensors = [tensor.detach().cpu() for tensor in tensors]
         if len(tensors) == len(seq_lens) and all(tensor.dim() <= 1 or tensor.shape[0] == 1 for tensor in tensors):
