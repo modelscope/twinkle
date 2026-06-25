@@ -191,6 +191,30 @@ from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom
 from mindspeed.lite.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 ```
 
+### 7. NPU Patch Environment Variable Configuration
+
+Twinkle enables model-layer patches by default in NPU environments. The following environment variables provide fine-grained control:
+
+| Environment Variable | Description | Default |
+| --- | --- | --- |
+| `TWINKLE_NPU_PATCH` | Master switch for all NPU optimizations | `1` (enabled) |
+| `TWINKLE_NPU_FUSED_OPS` | Enable fused operators (RMSNorm, RoPE, SwiGLU, SDPA) | `1` (enabled) |
+| `TWINKLE_NPU_MOE_PATCH` | Enable MoE Grouped MatMul | `1` (enabled) |
+| `TWINKLE_NPU_FLA` | Enable Qwen3.5 Flash Linear Attention; set to `0` to force torch fallback | `1` (enabled) |
+
+**Usage examples**:
+
+```bash
+# Disable all NPU optimizations and fall back to native Transformers
+export TWINKLE_NPU_PATCH=0
+
+# Disable FLA only while keeping other fused operators
+export TWINKLE_NPU_FLA=0
+
+# Disable MoE patch only
+export TWINKLE_NPU_MOE_PATCH=0
+```
+
 ## Quick Start
 
 **Important Notice**: The following examples are from the `cookbook/` directory and have been verified in actual NPU environments. It is recommended to run scripts directly from the cookbook rather than copying and pasting code snippets.
