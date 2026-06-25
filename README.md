@@ -129,7 +129,7 @@ our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
 | Hardware Environment | Notes                                                            |
 | -------------------- | ---------------------------------------------------------------- |
 | Nvidia GPUs          | ✅ Support for BF16/Flash-Attn may be incomplete in earlier GPUs |
-| Ascend NPU           | ✅ Some operators may not be supported                           |
+| Ascend NPU           | ✅ A2 and A3 do not support FP8                            |
 | PPU                  | ✅                                                               |
 | CPU                  | Supports partial components like dataset, dataloader             |
 
