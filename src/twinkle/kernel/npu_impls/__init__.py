@@ -7,10 +7,12 @@ here is meant to be instantiated directly.
 """
 from .rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
 from .rotary import npu_apply_multimodal_rotary_pos_emb, npu_apply_rotary_pos_emb
+from .swiglu import npu_swiglu_forward
 
 __all__ = [
     'NpuRMSNorm',
     'npu_gated_rms_norm_forward',
     'npu_apply_rotary_pos_emb',
     'npu_apply_multimodal_rotary_pos_emb',
+    'npu_swiglu_forward',
 ]
