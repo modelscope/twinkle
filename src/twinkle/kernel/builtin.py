@@ -85,7 +85,12 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
 
 
 def _install_sdpa(impl) -> None:
-    """One-shot install of SDPA attention forward (global modeling_utils dict)."""
+    """One-shot install of SDPA attention forward (global modeling_utils dict).
+
+    ``AttentionInterface._global_mapping`` is a private transformers attribute;
+    guard against its removal so an upstream change can't take down the rest
+    of ``npu_builtin()``.
+    """
     try:
         from transformers.modeling_utils import (
             ALL_ATTENTION_FUNCTIONS,
@@ -93,7 +98,10 @@ def _install_sdpa(impl) -> None:
         )
     except ImportError:
         return
-    AttentionInterface._global_mapping['sdpa'] = impl
+    try:
+        AttentionInterface._global_mapping['sdpa'] = impl
+    except AttributeError:
+        logger.warning('[NPU] [SDPA] AttentionInterface._global_mapping unavailable; skipping')
     ALL_ATTENTION_FUNCTIONS['sdpa'] = impl
 
 

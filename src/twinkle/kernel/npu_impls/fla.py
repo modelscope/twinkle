@@ -48,11 +48,10 @@ def apply_qwen3_5_fla(model=None) -> int:
     #    a FLA fast path whose kernel is missing -> runtime failure on NPU.
     try:
         from twinkle.kernel.chunk_gated_delta_rule import chunk_gated_delta_rule as mindspeed_fla
+        from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
     except ImportError as exc:
         logger.warning('[NPU] [FLA] MindSpeed unavailable: %s', exc)
         return 0
-
-    from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
 
     # 2. Only now can we safely claim FLA is available: flip the global flags
     #    and install the kernel path on Qwen3.5 modeling modules.
