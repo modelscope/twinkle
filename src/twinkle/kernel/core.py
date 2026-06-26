@@ -87,3 +87,29 @@ def _replace_attr(dotted_path: str, impl) -> None:
         raise ValueError(f"Expected 'pkg.module.attr', got: {dotted_path!r}")
     module = importlib.import_module(module_path)
     setattr(module, attr, impl)
+
+
+def _load_hub_ref(ref: HubRef):
+    """Lazy-load a Hub kernel layer via the optional ``kernels`` package."""
+    try:
+        from kernels import get_kernel
+    except ImportError as e:
+        raise ImportError(
+            'Loading a Hub kernel requires the `kernels` package. '
+            'Install it with `pip install kernels`.'
+        ) from e
+
+    kernel = get_kernel(
+        ref.repo_id,
+        revision=ref.revision,
+        version=ref.version,
+        backend=ref.backend,
+        trust_remote_code=ref.trust_remote_code,
+    )
+    layers = getattr(kernel, 'layers', None)
+    if layers is None:
+        raise ValueError(f'Hub repo {ref.repo_id!r} does not define any layers.')
+    impl = getattr(layers, ref.layer_name, None)
+    if impl is None:
+        raise ValueError(f'Layer {ref.layer_name!r} not found in {ref.repo_id!r}.')
+    return impl
