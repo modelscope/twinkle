@@ -104,15 +104,9 @@ def test_sft_twinkle():
             losses.append(loss)
             log(f'[step {step + 1}] loss={loss:.4f} ({elapsed:.1f}s)')
 
-    # For Megatron backend, calculate_metric(is_training=True) has a known server-side bug
-    # that always returns loss=0 (test_full_cycle_e2e.py also reproduces this).
-    # Loss verification for Megatron is done via test_sft_tinker (logprobs-based).
-    if backend == 'megatron':
-        log('[sft_twinkle] Megatron: calculate_metric server bug (loss=0), training completed OK')
-        log('[sft_twinkle] Loss decrease verified via test_sft_tinker (logprobs-based)')
-    else:
-        assert len(losses) >= 4, f'Expected at least 4 logged losses, got {len(losses)}'
-        assert_loss_decreases(losses, 'sft_twinkle')
+    # Assertions — both backends should report real loss via calculate_metric
+    assert len(losses) >= 4, f'Expected at least 4 logged losses, got {len(losses)}'
+    assert_loss_decreases(losses, 'sft_twinkle')
     log(f'test_sft_twinkle PASSED (backend={backend})')
 
 

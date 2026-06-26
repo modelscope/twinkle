@@ -74,7 +74,7 @@ def create_sft_dataset(data_slice=range(100)):
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=data_slice))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=256)
     dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
-    dataset.encode(batched=True, load_from_cache_file=False)
+    dataset.encode(batched=True)
     return dataset
 
 

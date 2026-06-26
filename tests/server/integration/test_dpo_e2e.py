@@ -146,17 +146,14 @@ def test_dpo_twinkle():
     assert step == DPO_TRAIN_STEPS, f'Expected {DPO_TRAIN_STEPS} steps, completed {step}'
 
     # Verify DPO loss decreases
-    backend = get_backend()
-    if len(losses) >= 3 and not all(l == 0.0 for l in losses):
+    if len(losses) >= 3:
         log(f'DPO losses: {["{:.4f}".format(l) for l in losses]}')
         assert losses[-1] < losses[0], (
             f'[dpo_twinkle] DPO loss did NOT decrease: first={losses[0]:.4f} last={losses[-1]:.4f}')
         log(f'[dpo_twinkle] Loss decreased: {losses[0]:.4f} -> {losses[-1]:.4f}')
-    elif backend == 'megatron':
-        log('[dpo_twinkle] Megatron: loss reports 0 (known behavior), verifying training completed OK')
 
     # Verify reward margins increase (DPO learns to prefer chosen)
-    if len(reward_margins) >= 3 and not all(abs(r) < 1e-6 for r in reward_margins):
+    if len(reward_margins) >= 3:
         log(f'Reward margins: {["{:.4f}".format(r) for r in reward_margins]}')
         assert reward_margins[-1] > reward_margins[0], (
             f'[dpo_twinkle] Reward margins did NOT increase: first={reward_margins[0]:.4f} last={reward_margins[-1]:.4f}')
@@ -269,16 +266,14 @@ def test_dpo_tinker():
     assert step == DPO_TRAIN_STEPS, f'Expected {DPO_TRAIN_STEPS} steps, completed {step}'
 
     # Verify DPO loss decreases
-    if len(losses) >= 3 and not all(l == 0.0 for l in losses):
+    if len(losses) >= 3:
         log(f'DPO losses: {["{:.4f}".format(l) for l in losses]}')
         assert losses[-1] < losses[0], (
             f'[dpo_tinker] DPO loss did NOT decrease: first={losses[0]:.4f} last={losses[-1]:.4f}')
         log(f'[dpo_tinker] Loss decreased: {losses[0]:.4f} -> {losses[-1]:.4f}')
-    elif backend == 'megatron':
-        log('[dpo_tinker] Megatron: loss reports 0 (known behavior), verifying training completed OK')
 
     # Verify reward margins increase
-    if len(reward_margins) >= 3 and not all(abs(r) < 1e-6 for r in reward_margins):
+    if len(reward_margins) >= 3:
         log(f'Reward margins: {["{:.4f}".format(r) for r in reward_margins]}')
         assert reward_margins[-1] > reward_margins[0], (
             f'[dpo_tinker] Reward margins did NOT increase: first={reward_margins[0]:.4f} last={reward_margins[-1]:.4f}')

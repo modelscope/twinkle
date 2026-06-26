@@ -386,11 +386,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
-                # safe_loss returned zero loss (num_tokens=0): use output_tensor
-                # to rebuild graph connectivity so backward triggers ALL gradient
-                # buckets, preventing DP AllReduce asymmetry in PP mode.
-                if output_tensor.requires_grad:
-                    losses = (output_tensor.flatten()[:1] * 0).sum()
+                # num_tokens=0 covers two cases:
+                # 1. Normal mean-reduction loss (e.g. CrossEntropyLoss reduction='mean')
+                #    → losses already contains the correct mean loss, just set counts=1.
+                # 2. safe_loss error degradation → losses is a graph-connected zero.
+                # Both cases need counts=1 so reduce_loss divides correctly.
+                # Do NOT overwrite losses here; case 1 would lose the real loss value.
                 counts = torch.tensor(1, device=losses.device)
             return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
