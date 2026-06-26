@@ -108,13 +108,6 @@ def train():
     
     for adapter_name in ADAPTER_NAMES:
         model.add_adapter_to_model(adapter_name, ep_lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-        model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name=adapter_name)
-        model.set_lr_scheduler(
-            scheduler_cls='CosineWarmupScheduler',
-            num_warmup_steps=5,
-            num_training_steps=len(dataloader),
-            adapter_name=adapter_name,
-        )
 
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
@@ -136,6 +129,17 @@ def train():
 
     # After LoRA init, before forward (LoRA active): perform EP + FSDP broadcast & sharding.
     model._lazy_wrap_model()
+
+    # Must call set_optimizer() after EP + FSDP sharding, otherwise optimizer may
+    # capture stale parameter references and fail to update the actual LoRA weights.
+    for adapter_name in ADAPTER_NAMES:
+        model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name=adapter_name)
+        model.set_lr_scheduler(
+            scheduler_cls='CosineWarmupScheduler',
+            num_warmup_steps=5,
+            num_training_steps=len(dataloader),
+            adapter_name=adapter_name,
+        )
     
     for batch_idx, batch in enumerate(dataloader):
         if callable(batch):
