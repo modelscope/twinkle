@@ -36,6 +36,7 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
+from twinkle.utils.nccl_safe import _is_fail_fast
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
@@ -385,14 +386,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
-                # Later will gather this value, so it becomes:
-                # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
-                # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps )
-                #       = gradient_accumulation_steps * world_size
-                # Then, grad will divided by this value:
-                # 1. SUM loss: (global_sum_grad) / (global_num_tokens) = global_sum_grad/global_num_tokens
-                # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
-                #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
+                # safe_loss returned zero loss (num_tokens=0): use output_tensor
+                # to rebuild graph connectivity so backward triggers ALL gradient
+                # buckets, preventing DP AllReduce asymmetry in PP mode.
+                if output_tensor.requires_grad:
+                    losses = (output_tensor.flatten()[:1] * 0).sum()
                 counts = torch.tensor(1, device=losses.device)
             return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
@@ -415,44 +413,59 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             embeddings = None
             _loss_instance = loss_instance
             is_last_pp = mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage)
-            if task == 'embedding':
-                # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
-                if is_last_pp:
-                    embeddings = output_tensor
-            elif labels is not None and is_last_pp:
-                _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
-                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
-                _packed = batch.get('packed_seq_params')
-                cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
-                if _loss_require_logps:
-                    loss_mask = (labels != -100).bool()
-                    masked_labels = labels.clone()
-                    masked_labels[~loss_mask] = 0
-                    output_tensor.div_(temperature)
-                    if _loss_require_entropy:
-                        logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
-                    else:
-                        logps = selective_log_softmax(output_tensor, masked_labels)
-                    # Reconstruct full-length tensors from CP-split shards
-                    logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
+            try:
+                if task == 'embedding':
+                    # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
+                    if is_last_pp:
+                        embeddings = output_tensor
+                elif labels is not None and is_last_pp:
+                    _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
+                    _loss_require_entropy = (
+                        hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
+                    _packed = batch.get('packed_seq_params')
+                    cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                    if _loss_require_logps:
+                        loss_mask = (labels != -100).bool()
+                        masked_labels = labels.clone()
+                        masked_labels[~loss_mask] = 0
+                        output_tensor.div_(temperature)
+                        if _loss_require_entropy:
+                            logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
+                        else:
+                            logps = selective_log_softmax(output_tensor, masked_labels)
+                        # Reconstruct full-length tensors from CP-split shards
+                        logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
+                        if entropies is not None:
+                            entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                    batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
+                    if 'position_ids' in batch:
+                        pos = batch['position_ids']
+                        if pos.dim() == 3:
+                            pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                        batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
+                    # Unpack packed sequences into per-sequence batch format
+                    _outputs = {'logps': logps}
                     if entropies is not None:
-                        entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
-                batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
-                if 'position_ids' in batch:
-                    pos = batch['position_ids']
-                    if pos.dim() == 3:
-                        pos = pos[0]  # [2/3, 1, seq] → [1, seq]
-                    batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
-                # Unpack packed sequences into per-sequence batch format
-                _outputs = {'logps': logps}
-                if entropies is not None:
-                    _outputs['entropies'] = entropies
-                if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
-                    _outputs['logits'] = output_tensor
-                batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
-                logps = _outputs['logps']
-                entropies = _outputs.get('entropies', None)
-                unpacked_logits = _outputs.get('logits', None)
+                        _outputs['entropies'] = entropies
+                    if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                        _outputs['logits'] = output_tensor
+                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                    logps = _outputs['logps']
+                    entropies = _outputs.get('entropies', None)
+                    unpacked_logits = _outputs.get('logits', None)
+            except Exception as e:
+                # Data processing error (e.g. unpack_packed_sequences dimension mismatch).
+                # Must catch here inside the scheduler to prevent exception escaping
+                # and breaking PP P2P communication → NCCL hang.
+                if _is_fail_fast():
+                    raise
+                logger.warning('[nccl_safe] forward_step_func data processing error: '
+                               '%s: %s',
+                               type(e).__name__, e)
+                logps = None
+                unpacked_logits = None
+                entropies = None
+                embeddings = None
             return output_tensor, partial(
                 post_loss_function,
                 inputs=batch,

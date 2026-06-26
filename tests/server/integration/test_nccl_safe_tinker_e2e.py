@@ -184,7 +184,7 @@ def test_4_no_advantages(tc):
 
 def test_5_consecutive_bad(tc):
     for i in range(5):
-        datums = [make_datum(seq_len=64, completion_len=32, bad_logprobs_len=3+i) for _ in range(2)]
+        datums = [make_datum(seq_len=64, completion_len=32, bad_logprobs_len=3+i) for _ in range(4)]
         _, _, elapsed = run_forward_backward(tc, datums, f'TEST-5-{i+1}')
         if elapsed >= TIMEOUT:
             return False
@@ -345,7 +345,7 @@ def test_17_single_datum(tc):
     return True
 
 def test_18_save_after_error(tc):
-    bad = [make_datum(seq_len=64, completion_len=32, bad_logprobs_len=2) for _ in range(2)]
+    bad = [make_datum(seq_len=64, completion_len=32, bad_logprobs_len=2) for _ in range(4)]
     _, _, elapsed = run_forward_backward(tc, bad, 'TEST-18-ERR')
     if elapsed >= TIMEOUT:
         return False

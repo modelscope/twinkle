@@ -257,8 +257,8 @@ class MegatronStrategy:
         grad_count = (count // cp_size).clamp(min=1) if cp_size > 1 else count
         return local_loss, grad_count, {
             'loss': local_loss.detach(),
-            'logits': logits.detach(),
-            'logps': logps.detach(),
+            'logits': logits.detach() if logits is not None else None,
+            'logps': logps.detach() if logps is not None else None,
             'num_tokens': count
         }
 

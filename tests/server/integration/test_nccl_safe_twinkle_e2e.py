@@ -103,6 +103,7 @@ def make_input_features(
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': [1] * seq_len,
+            'position_ids': list(range(seq_len)),
         })
 
         if bad_old_logps_len is not None:
@@ -212,7 +213,7 @@ def test_6_all_labels_masked(m):
 
 def test_7_consecutive_bad(m):
     for i in range(5):
-        inputs, old_logps, adv = make_input_features(batch_size=2, bad_old_logps_len=i+1)
+        inputs, old_logps, adv = make_input_features(batch_size=4, bad_old_logps_len=i+1)
         _, _, elapsed = run_forward_backward(m, inputs, old_logps, adv, f'TEST-7-{i+1}')
         if elapsed >= TIMEOUT:
             return False
@@ -241,15 +242,15 @@ def test_9_final_health(m):
     return True
 
 def test_10_gradient_accumulation_error(m):
-    inputs, lp, adv = make_input_features(batch_size=2)
+    inputs, lp, adv = make_input_features(batch_size=4)
     ok, _, elapsed = run_forward_backward(m, inputs, lp, adv, 'TEST-10-GA1')
     if not ok or elapsed >= TIMEOUT:
         return False
-    bad_in, bad_lp, bad_adv = make_input_features(batch_size=2, bad_old_logps_len=3)
+    bad_in, bad_lp, bad_adv = make_input_features(batch_size=4, bad_old_logps_len=3)
     _, _, elapsed = run_forward_backward(m, bad_in, bad_lp, bad_adv, 'TEST-10-GA2-BAD')
     if elapsed >= TIMEOUT:
         return False
-    inputs, lp, adv = make_input_features(batch_size=2)
+    inputs, lp, adv = make_input_features(batch_size=4)
     ok, _, elapsed = run_forward_backward(m, inputs, lp, adv, 'TEST-10-GA3')
     if not ok or elapsed >= TIMEOUT:
         return False
