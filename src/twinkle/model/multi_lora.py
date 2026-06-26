@@ -482,10 +482,10 @@ class MultiLora:
         module_device = getattr(module, 'device', None)
         if module_device is None:
             module_device = next(module.parameters())[1].device
-        low_cpu_mem_usage = module_device.type == "meta"
+        low_cpu_mem_usage = module_device.type == 'meta'
 
         for i in range(self.max_loras):
-            config = kwargs.get("lora_config", None)
+            config = kwargs.get('lora_config', None)
             if config is None:
                 config = LoraConfig(
                     r=self.max_r,
@@ -500,7 +500,8 @@ class MultiLora:
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config, low_cpu_mem_usage=low_cpu_mem_usage)
                 else:
-                    _peft_model: PeftModel = get_peft_model(_module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
+                    _peft_model: PeftModel = get_peft_model(
+                        _module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
                     _module.active_adapters = _peft_model.active_adapters
                     _module = _peft_model
 
@@ -524,7 +525,8 @@ class MultiLora:
 
                         from .megatron import MegatronModel
                         _config.target_modules = MegatronModel.get_target_modules(_module, target_modules)
-                    _module = get_peft_model(_module, _config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
+                    _module = get_peft_model(
+                        _module, _config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
                 for name, submodule in _module.named_modules():
                     if isinstance(submodule, LoraLayer):

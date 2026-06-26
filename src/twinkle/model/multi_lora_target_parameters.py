@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import math
+import torch
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Iterable, Iterator
-
-import torch
 from peft import LoraConfig
 from torch import nn
+from typing import Iterable, Iterator
 
 
 class LoraParameterProxy(nn.Module):
@@ -20,7 +19,7 @@ class LoraParameterProxy(nn.Module):
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
         delta_weight = self.LoraWrapper.get_delta_weight(self.slot_name)
         mix_weight = weight + delta_weight
-        return mix_weight 
+        return mix_weight
 
 
 @dataclass
@@ -51,7 +50,7 @@ class TargetParameterLoraWrapper(nn.Module):
             self.out_features = parameter.shape[-2] if self.did_swap_in_out_features else parameter.shape[-1]
         else:
             self.out_features, self.in_features = parameter.shape[0], parameter.shape[1]
-    
+
         self.max_loras = max_loras
         self.max_r = max_r
         self.active_adapter: str | None = None
@@ -72,7 +71,7 @@ class TargetParameterLoraWrapper(nn.Module):
     def num_experts(self) -> int:
         # Check if the module has EP sharding info (for tensor experts)
         if hasattr(self.record.module, '_ep_local_end') and hasattr(self.record.module, '_ep_local_start'):
-            return self.record.module._ep_local_end - self.record.module._ep_local_start    # 在wrap_model的ep切分后会设置
+            return self.record.module._ep_local_end - self.record.module._ep_local_start  # 在wrap_model的ep切分后会设置
         # Check if the module has EP sharding info (for ModuleList experts)
         if hasattr(self.record.module, '_ep_experts_per_rank'):
             return self.record.module._ep_experts_per_rank
@@ -85,31 +84,29 @@ class TargetParameterLoraWrapper(nn.Module):
         if parameter.ndim not in (2, 3):
             raise ValueError(
                 f'target parameter {self.record.key} has {parameter.ndim} dimensions; only 2D and 3D are supported')
-        
+
         # Note: reset_slot requires the tensor to be created on a physical device, not on a meta device.
         device = parameter.device
         if device.type == 'meta':
-            device = "cpu"
+            device = 'cpu'
         for index in range(self.max_loras):
             slot_name = f'lora_{index}'
             self.lora_A[slot_name] = nn.Parameter(
                 torch.empty(
                     self.num_experts,
-                    self.max_r,        
-                    self.in_features, 
+                    self.max_r,
+                    self.in_features,
                     device=device,
                     dtype=parameter.dtype,
-                )
-            )
+                ))
             self.lora_B[slot_name] = nn.Parameter(
                 torch.empty(
-                    self.num_experts,  
+                    self.num_experts,
                     self.out_features,
                     self.max_r,
                     device=device,
                     dtype=parameter.dtype,
-                )
-            )
+                ))
             self.r[slot_name] = self.max_r
             self.scaling[slot_name] = 1.0
             self.reset_slot(slot_name)
@@ -186,7 +183,7 @@ class TargetParameterLoraWrapper(nn.Module):
         param_name = self.record.parameter_name
         already_parametrized = nn.utils.parametrize.is_parametrized(module, param_name)
         if not already_parametrized:
-            # LoRA weights change after EP + FSDP sharding, so they must be computed dynamically and cannot be pre-fixed.
+            # LoRA weights change after EP + FSDP sharding, so they must be computed dynamically and not be pre-fixed.
             # delta_weight = self.get_delta_weight(slot_name) # lora_weight = B @ A * scaling
             requires_grad_before = self.base_parameter.requires_grad
             nn.utils.parametrize.register_parametrization(
@@ -234,16 +231,14 @@ class TargetParameterLoraWrapper(nn.Module):
         with torch.no_grad():
             self.lora_A[slot_name].zero_()
             self.lora_B[slot_name].zero_()
-            self.lora_A[slot_name][:state_dict[key_a].shape[0], :].copy_(
-                state_dict[key_a].to(
-                    device=self.lora_A[slot_name].device,
-                    dtype=self.lora_A[slot_name].dtype,
-                ))
-            self.lora_B[slot_name][:, :state_dict[key_b].shape[1]].copy_(
-                state_dict[key_b].to(
-                    device=self.lora_B[slot_name].device,
-                    dtype=self.lora_B[slot_name].dtype,
-                ))
+            self.lora_A[slot_name][:state_dict[key_a].shape[0], :].copy_(state_dict[key_a].to(
+                device=self.lora_A[slot_name].device,
+                dtype=self.lora_A[slot_name].dtype,
+            ))
+            self.lora_B[slot_name][:, :state_dict[key_b].shape[1]].copy_(state_dict[key_b].to(
+                device=self.lora_B[slot_name].device,
+                dtype=self.lora_B[slot_name].dtype,
+            ))
         return {key_a, key_b}
 
 

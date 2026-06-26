@@ -113,7 +113,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         return super()._lazy_wrap_model()
-    
+
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
             raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')

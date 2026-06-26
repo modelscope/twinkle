@@ -105,7 +105,7 @@ def train():
         },
         lora_config=lora_cfg,
     )
-    
+
     for adapter_name in ADAPTER_NAMES:
         model.add_adapter_to_model(adapter_name, ep_lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
 
@@ -141,7 +141,7 @@ def train():
             num_training_steps=len(dataloader),
             adapter_name=adapter_name,
         )
-    
+
     for adapter_name in ADAPTER_NAMES:
         for batch_idx, batch in enumerate(dataloader):
             if callable(batch):

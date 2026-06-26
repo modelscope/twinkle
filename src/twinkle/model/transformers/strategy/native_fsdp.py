@@ -730,8 +730,8 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
 
     # Parametrization renames MoE layer parameters. full_sd stores the original
     # weights, so we need to align the naming to match the expected keys.
-    if "parametrizations" in param_name:
-        param_name = param_name.replace(".parametrizations", "").replace(".original", "")
+    if 'parametrizations' in param_name:
+        param_name = param_name.replace('.parametrizations', '').replace('.original', '')
     candidates = _source_key_candidates(param_name)
     for candidate in candidates:
         if candidate in source_state:
