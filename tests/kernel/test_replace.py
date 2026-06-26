@@ -52,3 +52,23 @@ def test_replace_attr_sets_module_attribute():
         assert mod.target_fn is new_fn
     finally:
         sys.modules.pop(mod_name, None)
+
+
+def test_replace_attr_supports_class_attribute():
+    import sys
+    import types
+
+    mod_name = 'tests.kernel._tmp_class_attr'
+    mod = types.ModuleType(mod_name)
+
+    class Foo:
+        def forward(self, x):
+            return x
+    mod.Foo = Foo
+    sys.modules[mod_name] = mod
+    try:
+        new_forward = lambda self, x: x + 7  # noqa: E731
+        _replace_attr(f'{mod_name}.Foo.forward', new_forward)
+        assert Foo.forward is new_forward
+    finally:
+        sys.modules.pop(mod_name, None)

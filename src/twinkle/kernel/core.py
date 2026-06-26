@@ -81,12 +81,40 @@ def _replace_class(model: nn.Module, target_cls: type, impl_cls: type) -> None:
 
 
 def _replace_attr(dotted_path: str, impl) -> None:
-    """``setattr`` ``impl`` onto the module identified by the dotted path's prefix."""
-    module_path, _, attr = dotted_path.rpartition('.')
-    if not module_path or not attr:
-        raise ValueError(f"Expected 'pkg.module.attr', got: {dotted_path!r}")
-    module = importlib.import_module(module_path)
-    setattr(module, attr, impl)
+    """``setattr`` ``impl`` onto the attribute identified by the dotted path.
+
+    Supports two forms:
+      - ``pkg.mod.attr``                 (set module attribute)
+      - ``pkg.mod.ClassName.attr``       (set class attribute / method)
+
+    The split is found by walking the prefix from the longest importable
+    module backwards until ``importlib.import_module`` succeeds.
+    """
+    parts = dotted_path.split('.')
+    if len(parts) < 2:
+        raise ValueError(f"Expected at least 'pkg.attr', got: {dotted_path!r}")
+
+    # Find the longest prefix that imports as a module.
+    last_err: ImportError | None = None
+    module = None
+    module_depth = 0
+    for i in range(len(parts) - 1, 0, -1):
+        candidate = '.'.join(parts[:i])
+        try:
+            module = importlib.import_module(candidate)
+            module_depth = i
+            break
+        except ImportError as e:
+            last_err = e
+            continue
+    if module is None:
+        raise ImportError(f'Could not import any prefix of {dotted_path!r}') from last_err
+
+    # Walk remaining attributes; the last one is the target.
+    obj = module
+    for attr in parts[module_depth:-1]:
+        obj = getattr(obj, attr)
+    setattr(obj, parts[-1], impl)
 
 
 def _load_hub_ref(ref: HubRef):
