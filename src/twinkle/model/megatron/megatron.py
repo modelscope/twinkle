@@ -386,12 +386,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
-                # num_tokens=0 covers two cases:
-                # 1. Normal mean-reduction loss (e.g. CrossEntropyLoss reduction='mean')
-                #    → losses already contains the correct mean loss, just set counts=1.
-                # 2. safe_loss error degradation → losses is a graph-connected zero.
-                # Both cases need counts=1 so reduce_loss divides correctly.
-                # Do NOT overwrite losses here; case 1 would lose the real loss value.
+                # Later will gather this value, so it becomes:
+                # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
+                # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps )
+                #       = gradient_accumulation_steps * world_size
+                # Then, grad will divided by this value:
+                # 1. SUM loss: (global_sum_grad) / (global_num_tokens) = global_sum_grad/global_num_tokens
+                # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
+                #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
             return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
