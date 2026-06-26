@@ -43,7 +43,7 @@ class TargetParameterLoraWrapper(nn.Module):
         self.record = record
         # Unsharded original target parameter (pre-sharding snapshot)
         parameter = getattr(self.record.module, self.record.parameter_name)
-        self.original_parameter = parameter.clone()
+        self.original_parameter_ndim = parameter.ndim
         # Cache invariant attributes that won't change after initialization
         self.did_swap_in_out_features = parameter.ndim == 3 and not getattr(self.record.module, 'is_transposed', False)
         if parameter.ndim == 3:
@@ -119,7 +119,12 @@ class TargetParameterLoraWrapper(nn.Module):
             nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))
             self._initial_lora_A[slot_name] = self.lora_A[slot_name].detach().clone().cpu()
         else:
-            initial = self._initial_lora_A[slot_name].to(
+            initial = self._initial_lora_A[slot_name]
+            if hasattr(self.record.module, '_ep_local_start') and hasattr(self.record.module, '_ep_local_end'):
+                start = self.record.module._ep_local_start
+                end = self.record.module._ep_local_end
+                initial = initial[start:end]
+            initial = initial.to(
                 device=self.lora_A[slot_name].device,
                 dtype=self.lora_A[slot_name].dtype,
             )
@@ -164,8 +169,8 @@ class TargetParameterLoraWrapper(nn.Module):
             weight_B = self.lora_B[slot_name][:num_experts, :, :r]
 
         # Don't call base_parameter during LoRA injection (infinite recursion risk)
-        if self.original_parameter.ndim == 2:
-            return (weight_B @ weight_A) * self.scaling[slot_name]
+        if self.original_parameter_ndim == 2:
+            return (weight_B[0] @ weight_A[0]) * self.scaling[slot_name]
 
         if self.did_swap_in_out_features:
             return torch.einsum('e o r, e r i -> e o i', weight_B, weight_A) * self.scaling[slot_name]
