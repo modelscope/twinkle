@@ -1,7 +1,17 @@
+import importlib.machinery
+import sys
+import types
+
 import torch
 import torch.nn as nn
 
 import pytest
+
+
+def _fake_module(name: str):
+    module = types.ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+    return module
 
 
 def test_npu_builtin_returns_dict():
@@ -48,13 +58,33 @@ def test_npu_builtin_skips_missing_modeling_modules():
     assert isinstance(bundle, dict)
 
 
-def test_npu_builtin_does_not_overwrite_global_sdpa_on_non_npu_host():
+def test_npu_builtin_does_not_overwrite_global_sdpa_on_non_npu_host(monkeypatch):
     """Calling npu_builtin() on a CUDA/CPU host must not contaminate the
     global HF SDPA registry. The NPU impl inverts boolean masks, which is
     wrong for non-NPU execution."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from twinkle.kernel.builtin import npu_builtin
+    from twinkle.utils.device_mesh import Platform
 
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cuda'))
     original = ALL_ATTENTION_FUNCTIONS.get('sdpa')
     npu_builtin()
     assert ALL_ATTENTION_FUNCTIONS.get('sdpa') is original
+
+
+def test_npu_builtin_skips_side_effects_on_non_npu_platform(monkeypatch):
+    from twinkle.kernel import builtin
+    from twinkle.kernel.npu_impls import fla
+    from twinkle.utils.device_mesh import Platform
+
+    installs = []
+    fla_calls = []
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cuda'))
+    monkeypatch.setitem(sys.modules, 'torch_npu', _fake_module('torch_npu'))
+    monkeypatch.setattr(builtin, '_install_sdpa', lambda impl: installs.append(impl))
+    monkeypatch.setattr(fla, 'apply_qwen3_5_fla', lambda model: fla_calls.append(model))
+
+    builtin.npu_builtin(nn.Linear(1, 1))
+
+    assert installs == []
+    assert fla_calls == []

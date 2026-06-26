@@ -49,15 +49,36 @@ def test_kernelize_string_key_calls_setattr():
         sys.modules.pop(mod_name, None)
 
 
-def test_kernelize_device_dict_match():
-    parent = nn.Sequential(_SrcLayer())  # cpu params
+def test_kernelize_device_dict_match(monkeypatch):
+    from twinkle.utils.device_mesh import Platform
+
+    parent = nn.Sequential(_SrcLayer())
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
+
     kernelize(parent, {_SrcLayer: {'cpu': _DstLayer, 'npu': nn.Identity}})
+
     assert type(parent[0]) is _DstLayer
 
 
-def test_kernelize_device_dict_miss_skips_silently():
-    parent = nn.Sequential(_SrcLayer())  # cpu params
+def test_kernelize_uses_platform_device_prefix(monkeypatch):
+    from twinkle.utils.device_mesh import Platform
+
+    parent = nn.Sequential(_SrcLayer())  # params may still be CPU before FSDP placement
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'npu'))
+
     kernelize(parent, {_SrcLayer: {'npu': _DstLayer}})
+
+    assert type(parent[0]) is _DstLayer
+
+
+def test_kernelize_device_dict_miss_skips_silently(monkeypatch):
+    from twinkle.utils.device_mesh import Platform
+
+    parent = nn.Sequential(_SrcLayer())
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
+
+    kernelize(parent, {_SrcLayer: {'npu': _DstLayer}})
+
     assert type(parent[0]) is _SrcLayer
 
 
