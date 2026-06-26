@@ -82,7 +82,7 @@ check_http_health() {
     fi
 
     if command -v wget &> /dev/null; then
-        wget -q --spider --timeout=10 "$url"
+        wget -q -O /dev/null --timeout=10 "$url"
         return
     fi
 

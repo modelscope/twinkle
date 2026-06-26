@@ -241,10 +241,10 @@ def _force_zero_backward(model, og, adapter_name, kwargs):
         # Fallback: use first model parameter to maintain graph connectivity.
         # Do NOT detach() the parameter -- the zero loss must remain connected
         # to the model's autograd graph so FSDP ReduceScatter hooks fire.
+        # Use lazy iteration to avoid materializing the full parameter list.
         try:
-            params = [p for p in _iter_model_params(model) if p.requires_grad]
-            if params:
-                param = params[0]
+            param = next((p for p in _iter_model_params(model) if p.requires_grad), None)
+            if param is not None:
                 zero_loss = (param.flatten()[0] * 0).sum()
             else:
                 zero_loss = torch.zeros((), device='cuda', requires_grad=True)
