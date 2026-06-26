@@ -54,8 +54,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         for model in self.supported_models:
             model_name = model.model_name
             try:
-                resp = await self.proxy.proxy_request(
-                    request, 'healthz', model_name, 'model')
+                resp = await self.proxy.proxy_request(request, 'healthz', model_name, 'model')
                 healthy = (resp.status_code == 200)
                 if not healthy:
                     all_healthy = False

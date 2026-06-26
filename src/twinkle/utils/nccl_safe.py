@@ -88,7 +88,8 @@ class SafeLossWrapper(Loss):
         except Exception as e:
             import traceback
             logger.warning('[nccl_safe] Loss computation skipped due to error: '
-                           '%s: %s\n%s', type(e).__name__, e, traceback.format_exc())
+                           '%s: %s\n%s',
+                           type(e).__name__, e, traceback.format_exc())
             return _zero_loss(outputs)
 
 

@@ -121,8 +121,9 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
                 # Flatten [[mb0_sample0, mb0_sample1], [mb1_sample0, ...]] → [sample0, sample1, ...]
                 flat = [s for item in logps for s in (item if isinstance(item[0], (list, tuple)) else [item])]
                 from twinkle.utils import pad_and_stack_tensors
-                ref_outputs['logps'] = pad_and_stack_tensors(
-                    [torch.tensor(s, dtype=torch.float32) for s in flat], pad_value=0.0, concat=False)
+                ref_outputs['logps'] = pad_and_stack_tensors([torch.tensor(s, dtype=torch.float32) for s in flat],
+                                                             pad_value=0.0,
+                                                             concat=False)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 

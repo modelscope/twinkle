@@ -210,9 +210,11 @@ class TwinkleCompatModelBase:
             if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
                 flat = [s for item in value for s in (item if isinstance(item[0], (list, tuple)) else [item])]
                 from twinkle.utils import pad_and_stack_tensors
-                tensors = [pad_and_stack_tensors(
-                    [torch.tensor(s, dtype=torch.float32) for s in flat],
-                    pad_value=0.0, concat=False)]
+                tensors = [
+                    pad_and_stack_tensors([torch.tensor(s, dtype=torch.float32) for s in flat],
+                                          pad_value=0.0,
+                                          concat=False)
+                ]
             else:
                 tensors = [torch.as_tensor(value, dtype=torch.float32)]
 
