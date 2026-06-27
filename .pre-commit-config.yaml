@@ -3,42 +3,42 @@ repos:
     rev: 7.3.0
     hooks:
       - id: flake8
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/|tests/)
 
   - repo: https://github.com/PyCQA/isort
     rev: 7.0.0
     hooks:
       - id: isort
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/|tests/)
 
   - repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
       - id: yapf
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/|tests/)
 
   - repo: https://github.com/asottile/pyupgrade
     rev: v3.19.1
     hooks:
       - id: pyupgrade
         args: [--py38-plus]
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/|tests/)
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: check-yaml
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: end-of-file-fixer
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: requirements-txt-fixer
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: double-quote-string-fixer
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: check-merge-conflict
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: mixed-line-ending
         args: ["--fix=lf"]
-        exclude: ^(client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/|tests/)

@@ -5,6 +5,7 @@ from .cross_entropy import CrossEntropyLoss
 from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
+from .infonce import InfonceLoss
 from .mse import MSELoss
 
 torch_loss_mapping = {
@@ -25,4 +26,6 @@ torch_loss_mapping = {
     'simpo': SimPOLoss,
     'cpo': CPOLoss,
     'orpo': ORPOLoss,
+    # Embedding / contrastive losses
+    'infonce': InfonceLoss,
 }

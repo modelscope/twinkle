@@ -36,7 +36,7 @@ from twinkle.model.base import TwinkleModel
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
-from twinkle.patch import Patch, apply_patch
+from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
@@ -45,6 +45,22 @@ from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
+
+
+def _resolve_task_context(model, task):
+    """Return a context manager that applies the right per-forward Patch for ``task``.
+
+    'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
+    'embedding' swaps lm_head for identity + installs a feature-extraction hook so
+    downstream pooling can run inside
+    ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    """
+    if task in (None, 'causal_lm'):
+        return contextlib.nullcontext()
+    if task == 'embedding':
+        from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
+        return apply_context(model, TransformersEmbeddingPatch())
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
 
 
 @dataclass
@@ -106,6 +122,8 @@ class OptimizerGroup(BaseOptimizerGroup):
         self._ensure_dp_group()
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            forward_kwargs = copy(status.forward_kwargs)
+            forward_kwargs.pop('gradient_accumulation_steps', None)
             for metric in status.metrics:
                 metric.accumulate(
                     status.inputs,
@@ -115,7 +133,7 @@ class OptimizerGroup(BaseOptimizerGroup):
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     grad_norm=self._last_grad_norm,
                     loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
-                    **status.forward_kwargs)
+                    **forward_kwargs)
 
 
 _default_adapter_name = ''
@@ -380,6 +398,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
         return_logits = kwargs.pop('return_logits', False)
+        task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -397,6 +416,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_instance = optimizer_config.loss_instance
         loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
         loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
+        loss_require_logps = getattr(loss_instance, 'require_logps', True)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -407,9 +427,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
-        outputs = self.model(**inputs)
+        with _resolve_task_context(self.model, task):
+            outputs = self.model(**inputs)
         inputs['labels'] = labels
-        if labels is not None:
+        if labels is not None and loss_require_logps:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
@@ -424,8 +445,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
+        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
+        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
@@ -451,6 +472,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         return_logits = kwargs.pop('return_logits', False)
+        task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -470,6 +492,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_instance = optimizer_config.loss_instance
             loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
             loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
+            loss_require_logps = getattr(loss_instance, 'require_logps', True)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -480,13 +503,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
-            if disable_lora and isinstance(unwrapped_model, PeftModel):
-                with unwrapped_model.disable_adapter():
-                    outputs = self.model(**inputs)
-            else:
+            lora_ctx = (
+                unwrapped_model.disable_adapter()
+                if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
+            with _resolve_task_context(self.model, task), lora_ctx:
                 outputs = self.model(**inputs)
             inputs['labels'] = labels
-            if labels is not None:
+            if labels is not None and loss_require_logps:
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
@@ -501,8 +524,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
-            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
-            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
+            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
+            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
@@ -582,7 +605,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             scaler = optimizer_config.scaler
 
         optimizer_config.cur_step += 1
-        should_sync = optimizer_config.do_grad_sync()
+        should_sync = optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
@@ -917,7 +940,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if isinstance(model, PeftModel):
             if Platform.is_master():
                 model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                save_file(processed_state_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
         else:
             model.save_pretrained(
                 checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
@@ -1156,7 +1180,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
 
-    @remote_function(collect='first')
+    @remote_function(collect='first', lazy_collect=False)
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 

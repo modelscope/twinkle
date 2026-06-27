@@ -13,6 +13,7 @@ from twinkle.model.megatron import MultiLoraMegatronModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
+from twinkle.utils.nccl_safe import nccl_safe_megatron
 
 
 @remote_class(execute='all')
@@ -23,7 +24,8 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     """
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
-    def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+    @nccl_safe_megatron(tinker=True)
+    def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass."""
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name=adapter_name)
@@ -43,7 +45,8 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         return [results, loss]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    def tinker_forward_only(self, *, inputs: List[types.Datum], adapter_name: str = None, **kwargs):
+    @nccl_safe_megatron(tinker=True)
+    def tinker_forward_only(self, *, inputs: list[types.Datum], adapter_name: str = None, **kwargs):
         """Forward pass without gradient computation."""
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
@@ -84,7 +87,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         token = kwargs.pop('token', None)
         if not token:
             raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+        from twinkle.server.checkpoint import create_checkpoint_manager
         checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
         if resolved.is_twinkle_path:
@@ -97,14 +100,34 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+    @nccl_safe_megatron(forward_only=True)
+    def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         **kwargs):
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @nccl_safe_megatron
+    def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        # Normalize ragged ref_outputs logps into a regular 2D tensor.
+        # After HTTP + collect_tensor_dict, logps is a nested list grouped
+        # by microbatch with varying seq_lens across DP ranks.  Flatten to
+        # per-sample 1D lists and pad_and_stack — same as datum.py L84-88.
+        ref_outputs = kwargs.get('ref_outputs')
+        if isinstance(ref_outputs, dict) and 'logps' in ref_outputs:
+            logps = ref_outputs['logps']
+            if isinstance(logps, (list, tuple)) and logps and not isinstance(logps[0], torch.Tensor):
+                # Flatten [[mb0_sample0, mb0_sample1], [mb1_sample0, ...]] → [sample0, sample1, ...]
+                flat = [s for item in logps for s in (item if isinstance(item[0], (list, tuple)) else [item])]
+                from twinkle.utils import pad_and_stack_tensors
+                ref_outputs['logps'] = pad_and_stack_tensors([torch.tensor(s, dtype=torch.float32) for s in flat],
+                                                             pad_value=0.0,
+                                                             concat=False)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
+
+    @remote_function(collect='first', lazy_collect=False)
+    def ping(self) -> bool:
+        """Lightweight liveness probe for watchdog health checks."""
+        return True

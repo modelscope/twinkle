@@ -14,13 +14,16 @@ import traceback
 from collections import deque
 from typing import TYPE_CHECKING, Any, Deque
 
+from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
+from twinkle.server.telemetry.tracing import traced_operation
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
-    from twinkle.server.utils.metrics import TaskMetrics
-    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.server.state import ServerState
+    from twinkle.server.telemetry.middleware import TaskMetrics
 
 logger = get_logger()
 
@@ -39,7 +42,7 @@ class ComputeWorker:
 
     def __init__(
         self,
-        state: ServerStateProxy,
+        state: ServerState,
         config: TaskQueueConfig,
         task_metrics: TaskMetrics | None,
         deployment_name: str,
@@ -134,10 +137,7 @@ class ComputeWorker:
             task.request_id,
             TaskStatus.FAILED.value,
             task.model_id,
-            result={
-                'error': error,
-                'category': 'Server'
-            },
+            result=task_error_payload(error),
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
         )
@@ -198,14 +198,27 @@ class ComputeWorker:
         exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
+        # One span per queued task execution, tagged `<deployment>.<task_type>`
+        # (e.g. `model.forward`, `sampler.sample`).
+        queue_attrs = {
+            TOKEN_ID: task.token,
+            MODEL_ID: task.model_id,
+            'twinkle.task_type': task_type,
+            'twinkle.deployment': self._deployment_name or 'unknown',
+            'twinkle.queue_key': queue_key,
+        }
+        handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
+        handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
         try:
-            coro = task.coro_factory()
-            logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
-                         f'type={task_type}, queue_key={queue_key}')
-            if self._config.execution_timeout > 0:
-                result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
-            else:
-                result = await coro
+            with traced_operation('task_queue.execute', attrs=queue_attrs):
+                logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
+                             f'type={task_type}, queue_key={queue_key}')
+                with traced_operation(handler_span_name, attrs=handler_attrs):
+                    coro = task.coro_factory()
+                    if self._config.execution_timeout > 0:
+                        result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
+                    else:
+                        result = await coro
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             await self._state.store_future_status(

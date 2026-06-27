@@ -1,43 +1,26 @@
-FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.1-1.35.0
+# ---------- Stage 0: grab pre-built binaries ----------
+FROM redis:7.4.9 AS redis
+FROM grafana/otel-lgtm:0.28.0 AS lgtm
+FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
 
-# Install miniconda with Python 3.12
-RUN curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
-    bash Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda && \
-    rm Miniconda3-latest-Linux-x86_64.sh
-ENV PATH="/opt/conda/bin:${PATH}"
-RUN conda create -n twinkle python=3.12 -y --override-channels -c conda-forge
-ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
+# Put the real CUDA runtime ahead of package-private stubs, then keep the forward-compat
+# driver shim and pip cuDNN ahead of apt cuDNN.
+ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
-ENV SETUPTOOLS_USE_DISTUTILS=local
-
-# Install base packages
-RUN pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
-
-# Install vllm
-RUN pip install --upgrade vllm --no-cache-dir
-
-# Install transformer_engine and megatron_core
-RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \
-    CUDNN_PATH=$SITE_PACKAGES/nvidia/cudnn \
-    CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
-    pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
-
-RUN pip install megatron_core mcore_bridge --no-cache-dir
-
-# Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
-ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
-RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    MAX_JOBS=8 \
-    FLASH_ATTENTION_FORCE_BUILD=TRUE \
-    pip install flash-attn --no-build-isolation --no-cache-dir
-
-RUN pip install flash-linear-attention -U --no-cache-dir
-
-# Install numpy
-RUN pip install numpy==2.2 --no-cache-dir
-
-# Install tinker, ray, and other deps
-RUN pip install --no-cache-dir tinker==0.16.1 "ray[serve]" transformers peft<=0.18 accelerate -U
+# Only twinkle-specific deps; everything else (torch, vllm, TE, flash-attn, megatron-core, mcore-bridge, transformers, peft, accelerate) ships in the base.
+RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
+    pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
+    pip install --no-cache-dir \
+        tinker==0.16.1 \
+        "ray[serve]" && \
+    pip install --no-cache-dir --no-deps \
+        flash-linear-attention \
+        apache-tvm-ffi==0.1.9 \
+        tilelang==0.1.9 && \
+    ln -sf /usr/local/cuda-13.0/targets/x86_64-linux/lib/libcudart.so \
+        /usr/local/lib/python3.12/site-packages/tilelang/lib/libcudart_stub.so && \
+    python -c "import ctypes, os; stub_path = '/usr/local/lib/python3.12/site-packages/tilelang/lib/libcudart_stub.so'; lib = ctypes.CDLL(stub_path); getattr(lib, 'cudaDeviceReset'); print(f'tilelang cudart path: {os.path.realpath(stub_path)}')" && \
+    rm -rf /root/.cache /tmp/*
 
 # Clone and install twinkle, checkout to latest v-tag
 RUN git clone https://github.com/modelscope/twinkle.git
@@ -47,5 +30,14 @@ RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --
     echo "Checking out: $LATEST_RELEASE" && \
     git checkout --track "$LATEST_RELEASE"
 
-# Install twinkle itself
-RUN pip install -e . --no-build-isolation
+# Install twinkle itself (with server extras: redis + otel + telemetry)
+RUN pip install -e ".[server]" --no-build-isolation
+
+# ---------- Redis server ----------
+COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
+COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
+
+# ---------- Observability: Grafana LGTM stack ----------
+COPY --from=lgtm /otel-lgtm /otel-lgtm
+COPY cookbook/observability/grafana/dashboards/twinkle-overview.json \
+     /otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json

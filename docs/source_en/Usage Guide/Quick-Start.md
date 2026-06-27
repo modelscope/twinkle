@@ -490,9 +490,7 @@ For production environments, you can start more nodes and deploy more replicas t
 
 Next, start the server:
 ```shell
-
-cd cookbook/client/twinkle/transformer
-python server.py
+twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
 ```
 
 The server will start three services: a sampler cluster, a model cluster, and a utility cluster.

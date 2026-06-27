@@ -177,7 +177,7 @@ class ResourceManager:
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
         for group in groups:
-            if group.device_type != 'CPU':
+            if (group.device_type or '').upper() != 'CPU':
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []

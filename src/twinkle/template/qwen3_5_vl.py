@@ -7,8 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
-from twinkle.template.base import ImageInput, VideoInput
-from twinkle.template.qwen import QwenTemplate
+from twinkle.template.base import ImageInput, Template, VideoInput
 from twinkle.template.utils import get_inputs_embeds_hf
 
 _ROPE_INDEX_CACHE: Dict[str, Callable] = {}
@@ -31,7 +30,7 @@ def _build_rope_index_func(config) -> Callable:
 
 
 @remote_class()
-class Qwen3_5Template(QwenTemplate):
+class Qwen3_5Template(Template):
     """
     Processor for Qwen VL series.
 
@@ -44,8 +43,15 @@ class Qwen3_5Template(QwenTemplate):
         # Fix upstream Qwen3 chat_template parse bugs (orphan </think> handling).
         # Deferred import to avoid cycles; idempotent across Ray actor re-init.
         from twinkle.patch import apply_patch
-        from twinkle.patch.qwen3_chat_template import Qwen3ChatTemplate
+        from twinkle.patch.qwen3_chat_template import Qwen3AllowToolTailTemplate, Qwen3ChatTemplate
         apply_patch(self.tokenizer, Qwen3ChatTemplate)
+        # Allow ScoreFilter to render multi-turn agent prefixes ending in `tool`.
+        apply_patch(self.tokenizer, Qwen3AllowToolTailTemplate)
+        # Qwen3VLProcessor carries its own chat_template; _apply_chat_template
+        # routes through self.processor, so the patch must be applied there too.
+        if self.processor is not self.tokenizer:
+            apply_patch(self.processor, Qwen3ChatTemplate)
+            apply_patch(self.processor, Qwen3AllowToolTailTemplate)
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()

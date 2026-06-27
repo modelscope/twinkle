@@ -13,7 +13,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.server.state import ServerState
 
 from twinkle.utils.logger import get_logger
 
@@ -38,7 +38,7 @@ class SessionResourceMixin:
     """
 
     # Type hint for state attribute that inheriting classes must provide
-    state: ServerStateProxy
+    state: ServerState
 
     # Resource type name for logging (override in subclass)
     _resource_type: str = 'resource'

@@ -47,6 +47,12 @@ class BaseOptimizerGroup:
     _device_mesh: DeviceMesh = None
     _last_grad_norm: float = 0.0
 
+    def __setattr__(self, name, value):
+        if name == 'loss_instance' and value is not None:
+            from twinkle.utils.nccl_safe import safe_loss
+            value = safe_loss(value)
+        super().__setattr__(name, value)
+
     def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps

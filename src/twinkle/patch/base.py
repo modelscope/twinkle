@@ -9,3 +9,6 @@ class Patch:
 
     def __call__(self, module: Union['torch.nn.Module', List['torch.nn.Module'], Any], *args, **kwargs):
         ...
+
+    def unpatch(self, module: Union['torch.nn.Module', List['torch.nn.Module'], Any], *args, **kwargs):
+        raise NotImplementedError()

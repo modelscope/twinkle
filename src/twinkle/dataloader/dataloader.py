@@ -134,6 +134,7 @@ class DataLoader:
                 _iter._dataset_fetcher.drop_last,
                 self.batch_size,
                 self.device_mesh,
+                min_batch_size=self.min_batch_size,
                 max_retries=self.max_retries)
         return self._tracking_iter(_iter)
 

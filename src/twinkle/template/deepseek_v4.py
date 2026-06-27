@@ -110,7 +110,7 @@ class DeepseekV4Template(Template):
         model_id: str,
         use_chat_template: bool = True,
         max_length: Optional[int] = 8192,
-        truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
+        truncation_strategy: Literal['raise', 'left', 'right', 'split', 'delete'] = 'raise',
         default_system: Optional[str] = None,
         enable_thinking: bool = True,
         **kwargs,

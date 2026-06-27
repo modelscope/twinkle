@@ -109,6 +109,11 @@ dataset.map('SelfCognitionProcessor',
 
 # Encode dataset into tokens usable by the model
 dataset.encode(batched=True)
+# For large datasets, use num_proc to enable multi-process parallelism:
+# dataset.encode(batched=True, num_proc=8)
+# When using twinkle_client.dataset, encode calls the remote server over HTTP
+# with a default 600s timeout; raise it via the timeout argument if needed:
+# dataset.encode(batched=True, num_proc=8, timeout=3600)
 
 # Create DataLoader
 dataloader = DataLoader(dataset=dataset, batch_size=4)

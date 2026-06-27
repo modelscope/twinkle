@@ -54,7 +54,7 @@ pip install -e .
 ### 使用docker镜像：
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
 ```
 
 如果你需要使用Twinkle的Client，可以使用我们的一键安装脚本：
@@ -123,7 +123,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 | 硬件环境 | 备注                                                            |
 | -------- | --------------------------------------------------------------- |
 | Nvidia GPU | ✅ 早期 GPU 对 BF16/Flash-Attn 的支持可能不完整 |
-| 昇腾 NPU   | ✅ 部分算子可能不支持                              |
+| 昇腾 NPU   | ✅ 由于硬件限制A2、A3暂不支持FP8                              |
 | PPU        | ✅                                                               |
 | CPU        | 支持部分组件如 dataset、dataloader             |
 

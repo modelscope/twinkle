@@ -9,6 +9,24 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 9000            # Port number for the server
 
+# Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4317
+
+# Persistence configuration for ServerState (sessions, models, futures, ...).
+# Top-level placement makes the launcher propagate this to every Ray worker
+# via env vars, so the configured backend is used regardless of which
+# deployment initializes the ServerState actor first.
+#   mode: memory | file | redis
+#     memory: requires an initialized Ray runtime (the launcher handles this
+#             automatically; standalone scripts must call ray.init() first)
+#   file_path: required for `file` mode
+#   redis_url / key_prefix: required for `redis` mode
+persistence:
+  mode: redis
+  redis_url: redis://localhost:6380
+
 # Applications: each entry defines a service component deployed on the server
 applications:
 
@@ -20,6 +38,8 @@ applications:
     args:
       server_config:
         per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
+      supported_models:
+        - Qwen/Qwen3.6-27B
 
     deployments:
       - name: TinkerCompatServer
@@ -34,11 +54,12 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
   #    Config: TP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, ~37GB for KV cache + LoRA
-  - name: sampler-Qwen3.6-35B-A3B
+  - name: sampler-Qwen3.6-27B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.6-27B
     import_path: sampler
     args:
@@ -46,7 +67,7 @@ applications:
       nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
-        max_model_len: 65536           # Maximum sequence length the engine supports
+        max_model_len: 32768           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.75   # 80% utilization, ~64GB/GPU, leaves buffer for safety
         enable_lora: true             # Allow loading LoRA adapters during inference
         max_loras: 5                  # Max allowed loras working on vLLM at the same time
@@ -64,7 +85,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
-        max_input_tokens: 65536
+        max_input_tokens: 32768
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -77,16 +98,17 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "0"
 
   # 2. Model Service - Hosts the base model for training.
   #    Config: PP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, comfortable for LoRA training
-  - name: models-Qwen3.6-35B-A3B
+  - name: models-Qwen3.6-27B
     route_prefix: /api/v1/model/Qwen/Qwen3.6-27B
     import_path: model
     args:
-      use_megatron: true                          # Use Megatron-LM backend
-      model_id: "ms://Qwen/Qwen3.6-27B" # ModelScope model identifier
-      max_length: 65536                           # model max length
+      backend: megatron                          # Use Megatron-LM backend
+      model_id: "ms://Qwen/Qwen3.6-27B"          # ModelScope model identifier
+      max_length: 32768                           # model max length
       max_loras: 3                                # model max loras
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
@@ -101,7 +123,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
-        max_input_tokens: 65536
+        max_input_tokens: 32768
       adapter_config:
         adapter_timeout: 120                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
@@ -117,6 +139,7 @@ applications:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
+              TWINKLE_FAIL_FAST: "0"
 
   # 4. Processor Service
   - name: processor
@@ -139,3 +162,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"

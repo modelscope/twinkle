@@ -11,18 +11,19 @@ from __future__ import annotations
 import asyncio
 import torch
 import traceback
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pathlib import Path
 from peft import LoraConfig
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
-from twinkle.server.utils.checkpoint_base import _resolve_client_save_dir, validate_user_path
+from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
+                                       validate_user_path)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object
@@ -47,10 +48,11 @@ def _parse_inputs(inputs: Any):
 
 
 def _get_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Build the per-request adapter name from the request_id prefix."""
+    """Build a stable per-session adapter name, falling back to request_id for older clients."""
     if adapter_name is None or adapter_name == '':
         return None
-    return request.state.request_id + '-' + adapter_name
+    owner_id = get_session_id_from_request(request) or request.state.request_id
+    return owner_id + '-' + adapter_name
 
 
 def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
@@ -59,6 +61,18 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     self_fn is a zero-argument callable that returns the current ModelManagement
     replica instance. It is wired in via Depends so it is resolved lazily at request time.
     """
+
+    @app.get('/healthz')
+    async def model_healthz(
+            request: Request,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict:
+        """Deep health probe: pings underlying model actors to verify liveness."""
+        result = self.check_model_health()
+        if not result['healthy']:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content=result)
+        return result
 
     async def run_task(coro):
         """Await a schedule_task_and_wait coroutine and surface any exception as a
@@ -104,7 +118,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward',
             ))
 
@@ -202,7 +216,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward_backward',
             ))
 

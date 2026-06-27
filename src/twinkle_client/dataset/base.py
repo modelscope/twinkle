@@ -9,7 +9,7 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
-from typing import Any, Callable, Dict, Type, Union
+from typing import Any, Callable, Dict, Optional, Type, Union
 from twinkle_client.http import http_post
 from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta
@@ -20,7 +20,7 @@ from twinkle.template import Template
 class Dataset(object):
     """Client wrapper for Dataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta, **kwargs):
+    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
         from twinkle_client.http import get_base_url
 
         self.server_url = f'{get_base_url()}/processor/twinkle'
@@ -50,7 +50,7 @@ class Dataset(object):
         return response.json()["result"]
     
 
-    def encode(self, add_generation_prompt: bool = False, **kwargs):
+    def encode(self, add_generation_prompt: bool = False, timeout: Optional[int] = 600, **kwargs):
         response = http_post(
             url=f'{self.server_url}/call',
             json_data={
@@ -58,7 +58,8 @@ class Dataset(object):
                 'function': 'encode',
                 **{'add_generation_prompt': add_generation_prompt},
                 **kwargs
-            }
+            },
+            timeout=timeout
         )
         response.raise_for_status()
         return response.json()["result"]
@@ -140,6 +141,33 @@ class Dataset(object):
                 'processor_id': self.processor_id,
                 'function': 'mix_dataset',
                 **{'interleave': interleave},
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def save_as(self, output_path: str, format: Optional[str] = None, batch_size: int = 1000, mode: str = 'immediate', **kwargs):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'save_as',
+                **{'output_path': output_path, 'format': format, 'batch_size': batch_size, 'mode': mode},
+                **kwargs
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def flush_save(self):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'flush_save',
+                **{},
             }
         )
         response.raise_for_status()

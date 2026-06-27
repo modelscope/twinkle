@@ -7,29 +7,57 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
-from typing import Any, Dict, Optional
+from typing import Any
 
-import twinkle
-from twinkle import DeviceGroup, DeviceMesh
+from twinkle import DeviceGroup
+from twinkle.server.common.router import StickyLoraRequestRouter
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.utils import wrap_builder_with_device_group_env
+from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
-from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request, verify_request_token
+from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-from ..common.router import StickyLoraRequestRouter
-from ..utils import wrap_builder_with_device_group_env
 from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 
 logger = get_logger()
 
 
-class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
+def _make_mock_model(kw: dict[str, Any]) -> Any:
+    from .backends.mock_model import TwinkleCompatMockModel
+
+    return TwinkleCompatMockModel(**kw)
+
+
+def _make_transformers_model(kw: dict[str, Any]) -> Any:
+    from .backends.transformers_model import TwinkleCompatTransformersModel
+
+    return TwinkleCompatTransformersModel(**kw)
+
+
+def _make_megatron_model(kw: dict[str, Any]) -> Any:
+    from .backends.megatron_model import TwinkleCompatMegatronModel
+
+    return TwinkleCompatMegatronModel(**kw)
+
+
+# Single validate-then-dispatch selector for the model backend.
+MODEL_SELECTOR = BackendSelector(
+    'backend',
+    {
+        'mock': _make_mock_model,
+        'transformers': _make_transformers_model,
+        'megatron': _make_megatron_model,
+    },
+)
+
+
+class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     """Unified model management service.
 
     Handles:
@@ -45,47 +73,49 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  nproc_per_node: int,
                  device_group: dict[str, Any],
                  device_mesh: dict[str, Any],
-                 use_megatron: bool = False,
+                 backend: str,
                  adapter_config: dict[str, Any] | None = None,
-                 queue_config: dict[str, Any] | None = None,
+                 queue_config: TaskQueueConfig | None = None,
                  **kwargs):
+        self.backend = backend
         self.device_group = DeviceGroup(**device_group)
-        twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
-        if 'mesh_dim_names' in device_mesh:
-            self.device_mesh = DeviceMesh(**device_mesh)
-        else:
-            self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
-        self.use_megatron = use_megatron
+        self.device_mesh = init_twinkle_runtime(
+            is_mock=(backend == 'mock'),
+            nproc_per_node=nproc_per_node,
+            device_group=self.device_group,
+            device_mesh_dict=device_mesh,
+        )
         self.replica_id = serve.get_replica_context().replica_id.unique_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
 
-        # Choose model backend
-        if use_megatron:
-            from ..model.backends.megatron_model import TwinkleCompatMegatronModel
+        ctor_kwargs: dict[str, Any] = {
+            'model_id': model_id,
+            'remote_group': self.device_group.name,
+            'instance_id': self.replica_id,
+            **kwargs,
+        }
+        if self.device_mesh is not None:
+            ctor_kwargs['device_mesh'] = self.device_mesh
+        self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
 
-            self.model = TwinkleCompatMegatronModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=self.replica_id,
-                **kwargs)
-        else:
-            from ..model.backends.transformers_model import TwinkleCompatTransformersModel
-            self.model = TwinkleCompatTransformersModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=self.replica_id,
-                **kwargs)
-
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
         self._replica_registered = False
 
         # Initialize mixins
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Model')
+        self._init_task_queue(queue_config, deployment_name='Model')
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
+
+    @property
+    def data_world_size(self) -> int:
+        """Effective data-parallel world size.
+
+        Returns the real ``device_mesh.data_world_size`` for distributed
+        backends; falls back to 1 on the ``mock`` backend where
+        ``device_mesh`` is None.
+        """
+        return self.device_mesh.data_world_size if self.device_mesh is not None else 1
 
     async def _ensure_replica_registered(self):
         """Lazily register replica on first async request."""
@@ -106,6 +136,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
         await self._ensure_replica_registered()
+        await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
         return token
 
@@ -115,6 +146,21 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
             await self.state.unregister_replica(self.replica_id)
         except Exception:
             pass
+
+    def check_model_health(self) -> dict:
+        """Probe model actors liveness via a lightweight ping.
+
+        Returns a dict with 'healthy' (bool) and 'detail' (str).
+        If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
+        will raise RayActorError, signalling the watchdog to restart.
+        """
+        try:
+            result = self.model.ping()
+            if result is True:
+                return {'healthy': True, 'detail': 'model actors alive'}
+            return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
+        except Exception as e:
+            return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
 
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):
@@ -133,9 +179,9 @@ def build_model_app(model_id: str,
                     device_group: dict[str, Any],
                     device_mesh: dict[str, Any],
                     deploy_options: dict[str, Any],
-                    use_megatron: bool = False,
+                    backend: str,
                     adapter_config: dict[str, Any] | None = None,
-                    queue_config: dict[str, Any] | None = None,
+                    queue_config: TaskQueueConfig | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -147,7 +193,9 @@ def build_model_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for tensor parallelism
         deploy_options: Ray Serve deployment options
-        use_megatron: Whether to use Megatron backend (vs Transformers)
+        backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``.
+            Validated up front; bad values raise :class:`ConfigError` before
+            any side effect.
         adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration (rate limiting, etc.)
         **kwargs: Additional model initialization arguments
@@ -155,43 +203,32 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
+    # Fail fast on bad backend values at builder time (the launcher imports
+    # this builder at startup, so the error surfaces before deployment).
+    backend = MODEL_SELECTOR.validate(backend)
 
-    # Build the FastAPI app and register all routes BEFORE serve.ingress so that
-    # the frozen app contains the complete route table (visible to ProxyActor).
-    def get_self() -> ModelManagement:
-        return serve.get_replica_context().servable_object
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. The Model passes its ``shutdown()``
+    # teardown via ``on_shutdown`` and its sticky-LoRA router via
+    # ``request_router_config``.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_tinker_routes(app, get_self)
+        _register_twinkle_routes(app, get_self)
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        try:
-            await get_self()._ensure_replica_registered()
-        except Exception as e:
-            logger.warning(f'Failed to register replica at startup: {e}')
-        yield
-        try:
-            await get_self().shutdown()
-        except Exception:
-            pass
+    async def _on_shutdown(servable: Any) -> None:
+        await servable.shutdown()
 
-    app = FastAPI(lifespan=lifespan)
+    app = build_deployment_app('Model', register_routes, on_shutdown=_on_shutdown, attach_replica_id_header=True)
 
-    @app.middleware('http')
-    async def verify_token(request: Request, call_next):
-        return await verify_request_token(request=request, call_next=call_next)
-
-    app.middleware('http')(create_metrics_middleware('Model'))
-
-    _register_tinker_routes(app, get_self)
-    _register_twinkle_routes(app, get_self)
-
-    ModelManagementWithIngress = serve.ingress(app)(ModelManagement)
-    DeploymentClass = serve.deployment(
-        name='ModelManagement',
+    return bind_deployment(
+        app,
+        ModelManagement,
+        deploy_options,
+        deployment_name='ModelManagement',
         request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
-    )(
-        ModelManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh,
-                                                          use_megatron, adapter_config, queue_config, **kwargs)
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config),
+        bind_kwargs=kwargs,
+    )
 
 
 build_model_app = wrap_builder_with_device_group_env(build_model_app)

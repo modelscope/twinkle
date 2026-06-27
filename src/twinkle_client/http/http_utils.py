@@ -1,6 +1,7 @@
 import requests
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from .headers import build_routing_headers
 from .utils import get_api_key, get_base_url, get_request_id, get_session_id
 
 
@@ -14,12 +15,7 @@ def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[
     Returns:
         Dictionary of headers
     """
-    headers = {
-        'X-Ray-Serve-Request-Id': get_request_id(),
-        'Serve-Multiplexed-Model-Id': get_request_id(),  # For model multiplexing
-        'Authorization': 'Bearer ' + get_api_key(),
-        'Twinkle-Authorization': 'Bearer ' + get_api_key(),  # For server compatibility
-    }
+    headers = build_routing_headers(get_request_id(), 'Bearer ' + get_api_key())
 
     if session_id := get_session_id():
         headers['X-Twinkle-Session-Id'] = session_id
@@ -124,7 +120,7 @@ def http_post(
     json_data: Optional[Dict[str, Any]] = {},
     data: Optional[Any] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 600,
+    timeout: Optional[int] = 600,
 ) -> requests.Response:
     """
     Send HTTP POST request with required headers.
@@ -134,7 +130,7 @@ def http_post(
         json_data: JSON data to send in request body
         data: Form data or raw data to send in request body
         additional_headers: Additional headers to include
-        timeout: Request timeout in seconds
+        timeout: Request timeout in seconds; None disables the timeout.
 
     Returns:
         requests.Response object

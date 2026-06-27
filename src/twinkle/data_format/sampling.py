@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from twinkle.data_format import InputFeature
 
-StopReason = Literal['length', 'stop']
+StopReason = Literal['length', 'stop', 'abort', 'error']
 
 
 @dataclass

@@ -253,10 +253,12 @@ class MegatronStrategy:
 
     def reduce_loss(self, local_loss, local_count, logits, logps):
         count = local_count.clamp(min=1).to(torch.int64)
-        return local_loss, count, {
+        cp_size = self.device_mesh.cp_world_size or 1
+        grad_count = (count // cp_size).clamp(min=1) if cp_size > 1 else count
+        return local_loss, grad_count, {
             'loss': local_loss.detach(),
-            'logits': logits.detach(),
-            'logps': logps.detach(),
+            'logits': logits.detach() if logits is not None else None,
+            'logps': logps.detach() if logps is not None else None,
             'num_tokens': count
         }
 

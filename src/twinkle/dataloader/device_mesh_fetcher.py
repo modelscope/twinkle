@@ -77,9 +77,8 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
         else:
             data = next(self.dataset_iter)
 
+        if self.min_batch_size is not None and len(data) < self.min_batch_size:
+            raise StopIteration
         if self.device_mesh:
-            if len(data) < self.min_batch_size:
-                raise StopIteration
-            else:
-                data = data[self.device_mesh.get_slice(len(data))]
+            data = data[self.device_mesh.get_slice(len(data))]
         return self.collate_fn(data)

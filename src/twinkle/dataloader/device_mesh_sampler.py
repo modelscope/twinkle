@@ -34,13 +34,12 @@ class DeviceMeshSampler(BatchSampler):
                 batch = batch[self.skip_samples - skipped:]
                 skipped = self.skip_samples
 
+            if self.min_batch_size is not None and len(batch) < self.min_batch_size:
+                return
             if not self.device_mesh:
                 yield batch
             else:
-                if len(batch) < self.min_batch_size:
-                    return
-                else:
-                    yield batch[self.device_mesh.get_slice(len(batch))]
+                yield batch[self.device_mesh.get_slice(len(batch))]
 
     def __len__(self):
         return len(self.original_sampler)

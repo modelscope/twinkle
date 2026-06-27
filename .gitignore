@@ -32,6 +32,7 @@ wheels/
 /temp
 MANIFEST
 .locks/
+.temp/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -131,8 +132,7 @@ replace.sh
 result.png
 result.jpg
 result.mp4
-output/
-outputs/
+output*
 wandb/
 *.out
 benchmarks/
@@ -146,6 +146,8 @@ images
 /custom/
 megatron_output/
 .qoder
+.kiro/
+.claude/
 
 # Pytorch
 *.pth

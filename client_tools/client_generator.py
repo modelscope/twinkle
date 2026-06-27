@@ -231,8 +231,15 @@ def generate_processors():
         """Generate client wrapper class code."""
 
         def build_imports() -> Tuple[List[str], str]:
-            # Include both method signatures and __init__ signature for import detection
-            signatures = [sig for _, sig in methods]
+            # Include both method signatures and __init__ signature for import detection.
+            # Use the timeout-injected signature for ``encode`` so the ``Optional``
+            # import introduced by ``_inject_timeout`` is detected.
+            signatures = []
+            for name, sig in methods:
+                if name == 'encode' and class_name in ('Dataset', 'LazyDataset'):
+                    signatures.append(_inject_timeout(sig))
+                else:
+                    signatures.append(sig)
             if init_signature:
                 signatures.append(init_signature)
 
@@ -261,15 +268,31 @@ def generate_processors():
             lines.append('')
             return lines, inheritance
 
+        def _inject_timeout(signature: str) -> str:
+            """Insert `timeout: Optional[int] = 600` before any **kwargs in the signature."""
+            if 'timeout' in signature:
+                return signature
+            if ', **' in signature:
+                pre, post = signature.rsplit(', **', 1)
+                return f'{pre}, timeout: Optional[int] = 600, **{post}'
+            if signature.startswith('**'):
+                return f'timeout: Optional[int] = 600, {signature}'
+            if signature:
+                return f'{signature}, timeout: Optional[int] = 600'
+            return 'timeout: Optional[int] = 600'
+
         def build_method(name: str, signature: str) -> str:
             param_names = parse_params_from_signature(signature)
             kwargs_dict = '{' + ', '.join(f"'{p}': {p}" for p in param_names) + '}' if param_names else '{}'
-            sig_part = f', {signature}' if signature else ''
+            wants_timeout = name == 'encode' and class_name in ('Dataset', 'LazyDataset')
+            effective_sig = _inject_timeout(signature) if wants_timeout else signature
+            sig_part = f', {effective_sig}' if effective_sig else ''
             if 'kwargs' in sig_part:
                 extra_args = '\n                **kwargs'
             else:
                 extra_args = ''
             ret = 'self' if name == '__iter__' else 'response.json()["result"]'
+            timeout_kwarg = ',\n            timeout=timeout' if wants_timeout else ''
 
             code = f'''
     def {name}(self{sig_part}):
@@ -279,7 +302,7 @@ def generate_processors():
                 'processor_id': self.processor_id,
                 'function': '{name}',
                 **{kwargs_dict},{extra_args}
-            }}
+            }}{timeout_kwarg}
         )
         response.raise_for_status()
         return {ret}
@@ -466,9 +489,9 @@ class MultiLoraTransformersModel:
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
-        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
@@ -760,13 +783,15 @@ def generate_samplers():
 
     sampler_code = AUTO_GEN_WARNING + '''from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
-from twinkle.sampler.base import Sampler
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 
 
-class vLLMSampler(Sampler):
+# Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
+# that base pulls ``twinkle.sampler.__init__`` → ``VLLMEngine`` → torch + zmq,
+# which the mock / CPU-only client environments don't have.
+class vLLMSampler:
     """Client wrapper for Sampler that calls server HTTP endpoints.
 
     This client manages sampling operations and adapter synchronization with the sampler server.
@@ -781,6 +806,7 @@ class vLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',

@@ -8,15 +8,16 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 from __future__ import annotations
 
 import traceback
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from peft import LoraConfig
 from tinker import types
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement
 
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
@@ -139,7 +140,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             token=token,
             input_tokens=input_tokens,
             batch_size=batch_size,
-            data_world_size=self.device_mesh.data_world_size,
+            data_world_size=self.data_world_size,
             task_type='forward',
         )
 
@@ -178,13 +179,15 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         datum_list = body.forward_backward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
         batch_size = len(datum_list)
+        loss_fn = body.forward_backward_input.loss_fn
         return await self.schedule_task(
             _do_forward_backward,
             model_id=body.model_id,
             token=token,
             input_tokens=input_tokens,
             batch_size=batch_size,
-            data_world_size=self.device_mesh.data_world_size,
+            data_world_size=self.data_world_size,
+            batch_size_multiple=2 if loss_fn == 'importance_sampling' else None,
             task_type='forward_backward',
         )
 
@@ -269,7 +272,15 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if metadata.get('base_model'):
                     payload['base_model'] = metadata['base_model']
                 sampling_session_id = await self.state.create_sampling_session(payload)
-                return types.SaveWeightsForSamplerResponseInternal(path=None, sampling_session_id=sampling_session_id)
+                # Tinker SDK distinguishes two modes by whether sampling_session_seq_id is set:
+                # 1. save_weights_for_sampler(name): expects path != None
+                # 2. save_weights_and_get_sampling_client(): expects path == None, sampling_session_id != None
+                if body.sampling_session_seq_id is not None:
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=None, sampling_session_id=sampling_session_id)
+                else:
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=tinker_path, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())
                 return types.RequestFailedResponse(

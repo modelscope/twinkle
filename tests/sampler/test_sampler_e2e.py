@@ -30,6 +30,9 @@ os.environ.setdefault('TRUST_REMOTE_CODE', '1')
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen2.5-0.5B')
 MAX_MODEL_LEN = int(os.environ.get('TWINKLE_MAX_MODEL_LEN', '512'))
 
+pytestmark = pytest.mark.skip(
+    reason='Heavy vLLM/Transformers e2e sampler test (model download + GPU); not viable on dual-V100 CI, run manually.')
+
 
 def _skip_slow_if_requested():
     """Skip immediately if slow tests are disabled (avoids long hangs)."""

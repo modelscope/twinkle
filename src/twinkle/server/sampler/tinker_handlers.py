@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import os
 import traceback
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from tinker import types
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
 
 from twinkle.data_format import SamplingParams
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
@@ -68,8 +69,8 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                     checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
                     adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
-                # Validate adapter URI
-                if not adapter_uri or not os.path.exists(adapter_uri):
+                # Base-model sampling is valid when no model_path was provided.
+                if adapter_uri and not os.path.exists(adapter_uri):
                     return types.RequestFailedResponse(
                         error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
                         category=types.RequestErrorCategory.User,
@@ -94,14 +95,18 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 tinker_sequences = []
                 for response in responses:
-                    # Convert twinkle SampleResponse to tinker types
+                    # twinkle logprobs are ``List[List[Tuple[int, float]]]``
+                    # (top-k per position); tinker wants ``List[float]``
+                    # (chosen-token logprob per position).
                     for seq in response.sequences:
                         logprobs = None
                         if seq.logprobs is not None:
-                            if any(lp is None for lp in seq.logprobs):
-                                logprobs = None
-                            else:
-                                logprobs = list(seq.logprobs)
+                            try:
+                                flattened = [float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list]
+                            except (IndexError, TypeError):
+                                flattened = []
+                            if flattened and len(flattened) == len(seq.logprobs):
+                                logprobs = flattened
                         tinker_sequences.append(
                             types.SampledSequence(
                                 stop_reason=seq.stop_reason,

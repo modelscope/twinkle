@@ -1,10 +1,10 @@
 import os
+import pytest
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import types
-import unittest
 
 try:
     import requests
@@ -32,34 +32,34 @@ def _reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x[..., :d]) * x[..., d:]
 
 
-class TestFunctionKernel(unittest.TestCase):
+class TestFunctionKernel:
 
-    def setUp(self):
+    def setup_method(self):
         if not is_kernels_available():
-            self.skipTest('kernels package not available in this environment.')
+            pytest.skip('kernels package not available in this environment.')
         get_global_function_registry()._clear()
 
-    def tearDown(self):
+    def teardown_method(self):
         get_global_function_registry()._clear()
 
     def test_flattened_build_replaces_function(self):
         if os.environ.get('TWINKLE_SKIP_SLOW_TESTS') == '1':
-            self.skipTest('TWINKLE_SKIP_SLOW_TESTS=1')
+            pytest.skip('TWINKLE_SKIP_SLOW_TESTS=1')
         if not torch.cuda.is_available():
-            self.skipTest('CUDA not available in this environment.')
+            pytest.skip('CUDA not available in this environment.')
         try:
             import urllib.request
             urllib.request.urlopen('https://huggingface.co', timeout=5)
         except Exception as e:
-            self.skipTest(f'HuggingFace unreachable: {e}')
+            pytest.skip(f'HuggingFace unreachable: {e}')
         try:
             from kernels import has_kernel
             from kernels._versions import select_revision_or_version
             from kernels.utils import get_kernel
         except Exception:
-            self.skipTest('kernels package missing has_kernel.')
+            pytest.skip('kernels package missing has_kernel.')
         if not has_kernel('kernels-test/flattened-build'):
-            self.skipTest('kernels-test/flattened-build not available.')
+            pytest.skip('kernels-test/flattened-build not available.')
         try:
             revision = select_revision_or_version(
                 'kernels-test/flattened-build',
@@ -68,7 +68,7 @@ class TestFunctionKernel(unittest.TestCase):
             )
             get_kernel('kernels-test/flattened-build', revision=revision)
         except Exception as exc:
-            self.skipTest(f'kernels-test/flattened-build cannot be loaded in this env: {exc}')
+            pytest.skip(f'kernels-test/flattened-build cannot be loaded in this env: {exc}')
 
         _ensure_test_packages()
         module_name = 'tests.kernel._tmp_flattened_build_module'
@@ -98,27 +98,27 @@ class TestFunctionKernel(unittest.TestCase):
                 )
             except TypeError as e:
                 if 'select_revision_or_version' in str(e) or 'takes 1 positional argument' in str(e):
-                    self.skipTest(f'kernels API incompatible: {e}')
+                    pytest.skip(f'kernels API incompatible: {e}')
                 raise
             except Exception as e:
                 if requests and isinstance(e, (requests.exceptions.SSLError, requests.exceptions.RequestException)):
-                    self.skipTest(f'Network/HuggingFace unreachable: {e}')
+                    pytest.skip(f'Network/HuggingFace unreachable: {e}')
                 if 'SSLError' in type(e).__name__ or 'MaxRetryError' in str(e):
-                    self.skipTest(f'Network/HuggingFace unreachable: {e}')
+                    pytest.skip(f'Network/HuggingFace unreachable: {e}')
                 raise
 
-            self.assertEqual(applied, [f'{module_name}.silu_and_mul'])
-            self.assertIsNot(temp_module.silu_and_mul, original)
+            assert applied == [f'{module_name}.silu_and_mul']
+            assert temp_module.silu_and_mul is not original
 
             x = torch.randn(4, 16, device='cuda', dtype=torch.float16)
             y_kernel = temp_module.silu_and_mul(x)
             y_ref = _reference_silu_and_mul(x)
-            self.assertTrue(torch.allclose(y_kernel, y_ref, atol=1e-3, rtol=1e-3))
+            assert torch.allclose(y_kernel, y_ref, atol=1e-3, rtol=1e-3)
         except Exception as e:
             if requests and isinstance(e, (requests.exceptions.SSLError, requests.exceptions.RequestException)):
-                self.skipTest(f'Network/HuggingFace unreachable: {e}')
+                pytest.skip(f'Network/HuggingFace unreachable: {e}')
             if 'SSLError' in type(e).__name__ or 'MaxRetryError' in str(e):
-                self.skipTest(f'Network/HuggingFace unreachable: {e}')
+                pytest.skip(f'Network/HuggingFace unreachable: {e}')
             raise
         finally:
             sys.modules.pop(module_name, None)
@@ -150,8 +150,8 @@ class TestFunctionKernel(unittest.TestCase):
                 mode='inference',
             )
 
-            self.assertEqual(applied, [])
-            self.assertIs(temp_module.silu_and_mul, original)
+            assert applied == []
+            assert temp_module.silu_and_mul is original
         finally:
             sys.modules.pop(module_name, None)
 
@@ -182,8 +182,8 @@ class TestFunctionKernel(unittest.TestCase):
                 mode='train',
             )
 
-            self.assertEqual(applied, [])
-            self.assertIs(temp_module.silu_and_mul, original)
+            assert applied == []
+            assert temp_module.silu_and_mul is original
         finally:
             sys.modules.pop(module_name, None)
 
@@ -208,7 +208,7 @@ class TestFunctionKernel(unittest.TestCase):
                 mode='inference',
             )
 
-            with self.assertRaises(ValueError):
+            with pytest.raises(ValueError):
                 apply_function_kernel(
                     target_module=module_name,
                     device='cpu',
@@ -256,10 +256,10 @@ class TestFunctionKernel(unittest.TestCase):
                 mode='inference',
             )
 
-            self.assertEqual(applied, [f'{module_name}.add'])
-            self.assertIsNot(temp_module.add, original)
+            assert applied == [f'{module_name}.add']
+            assert temp_module.add is not original
             x = torch.tensor([1.0])
             y = torch.tensor([2.0])
-            self.assertTrue(torch.allclose(temp_module.add(x, y), x + y + 2))
+            assert torch.allclose(temp_module.add(x, y), x + y + 2)
         finally:
             sys.modules.pop(module_name, None)

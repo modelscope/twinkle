@@ -1,5 +1,5 @@
 install_twinkle_with_kernels() {
-    pip install ".[kernels]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[kernels]"
+    pip install ".[kernels,test,tinker]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[kernels,test,tinker]"
 }
 
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
@@ -26,14 +26,23 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip uninstall autoawq -y
     pip uninstall lmdeploy -y
     pip uninstall tensorflow -y
-    pip install kernels -U
+    # Pin kernels<0.15 to avoid transformers' hub_kernels.py LayerRepository
+    # crash (huggingface/transformers#46291).
+    pip install 'kernels<0.15'
     pip install ray==2.48
     pip install optimum
 
     # test with install
     install_twinkle_with_kernels
+    # pyproject caps peft<=0.19.0, but 0.19.0 still does an unconditional
+    # `from transformers import HybridCache` at peft_model.py:37 which
+    # crashes on transformers v5. 0.19.1 dropped that top-level import.
+    pip install --upgrade 'peft>=0.19.1'
 else
     install_twinkle_with_kernels
+    # Same kernels pin and peft bump for the release-image branch.
+    pip install 'kernels<0.15'
+    pip install --upgrade 'peft>=0.19.1'
     echo "Running case in release image, run case directly!"
 fi
 # remove torch_extensions folder to avoid ci hang.

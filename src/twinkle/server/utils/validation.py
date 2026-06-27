@@ -3,6 +3,10 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from typing import Any
 
+from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
+
+_OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
+
 
 async def verify_request_token(request: Request, call_next):
     """
@@ -11,7 +15,8 @@ async def verify_request_token(request: Request, call_next):
     This middleware:
     1. Extracts the Bearer token from Authorization header
     2. Validates the token
-    3. Extracts X-Ray-Serve-Request-Id for sticky sessions (skipped for healthz endpoint)
+    3. Extracts x-request-id for sticky sessions (skipped for healthz
+       and OpenAI-compat endpoints)
     4. Stores token and request_id in request.state for later use
 
     Args:
@@ -21,21 +26,22 @@ async def verify_request_token(request: Request, call_next):
     Returns:
         JSONResponse with error if validation fails, otherwise the response from call_next
     """
-    authorization = request.headers.get('Twinkle-Authorization')
+    authorization = (request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH))
     token = authorization[7:] if authorization and authorization.startswith('Bearer ') else authorization
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
-    # Skip X-Ray-Serve-Request-Id check for healthz endpoint (path ends with /healthz)
-    if not request.url.path.endswith('/healthz'):
-        request_id = request.headers.get('X-Ray-Serve-Request-Id')
+    path = request.url.path
+    skip_sticky = ('/healthz' in path or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES))
+
+    if not skip_sticky:
+        request_id = request.headers.get(H_REQUEST_ID)
         if not request_id:
             return JSONResponse(
-                status_code=400,
-                content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
+                status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header, required for sticky session'})
         request.state.request_id = request_id
     else:
-        request.state.request_id = ''
+        request.state.request_id = request.headers.get(H_REQUEST_ID, '')
     request.state.token = token
     request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
     response = await call_next(request)

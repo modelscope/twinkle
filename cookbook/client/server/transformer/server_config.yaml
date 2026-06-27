@@ -9,6 +9,24 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 8000            # Port number for the server
 
+# Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
+telemetry:
+  enabled: false
+  otlp_endpoint: http://localhost:4317
+
+# Persistence configuration for ServerState (sessions, models, futures, ...).
+# Top-level placement makes the launcher propagate this to every Ray worker
+# via env vars, so the configured backend is used regardless of which
+# deployment initializes the ServerState actor first.
+#   mode: memory | file | redis
+#     memory: requires an initialized Ray runtime (the launcher handles this
+#             automatically; standalone scripts must call ray.init() first)
+#   file_path: required for `file` mode
+#   redis_url / key_prefix: required for `redis` mode
+persistence:
+  mode: file
+  file_path: /tmp/twinkle_state.json
+
 # Applications: each entry defines a service component deployed on the server
 applications:
 
@@ -31,14 +49,16 @@ applications:
           target_ongoing_requests: 128   # Target concurrent requests per replica
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"
 
-  # 2. Model Service (commented out) - Would host the base model for training.
-  #    Uncomment and configure if you need a training model worker.
+  # 2. Model Service - Hosts the base model for training.
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      use_megatron: false                          # Use HuggingFace Transformers backend
+      backend: transformers                        # Model backend: transformers | megatron
       model_id: "ms://Qwen/Qwen3.5-4B"    # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 1                            # Number of GPU processes per node
@@ -64,7 +84,8 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -73,7 +94,7 @@ applications:
     import_path: sampler
     args:
       model_id: "ms://Qwen/Qwen3.5-4B"   # ModelScope model identifier
-      nproc_per_node: 2               # Number of GPU processes per node
+      nproc_per_node: 1               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 4096           # Maximum sequence length the engine supports
@@ -100,7 +121,8 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 4. Processor Service
   - name: processor
@@ -123,3 +145,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"

@@ -16,6 +16,7 @@ from twinkle.model import MultiLoraTransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
+from twinkle.utils.nccl_safe import nccl_safe
 
 
 @remote_class()
@@ -32,7 +33,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    def tinker_forward_only(self, *, inputs: List[types.Datum], adapter_name: str = None, **kwargs):
+    def tinker_forward_only(self, *, inputs: list[types.Datum], adapter_name: str = None, **kwargs):
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
@@ -40,7 +41,8 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+    @nccl_safe(tinker=True)
+    def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
@@ -79,7 +81,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         token = kwargs.pop('token', None)
         if not token:
             raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+        from twinkle.server.checkpoint import create_checkpoint_manager
         checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
         if resolved.is_twinkle_path:
@@ -92,14 +94,19 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+    def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         **kwargs):
+    @nccl_safe
+    def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
+
+    @remote_function(collect='first', lazy_collect=False)
+    def ping(self) -> bool:
+        """Lightweight liveness probe for watchdog health checks."""
+        return True

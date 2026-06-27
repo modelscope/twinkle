@@ -51,7 +51,7 @@ sft_weight = 1.0
 max_length = 2048
 lora_rank = 8
 system_prompt = 'You are a helpful assistant.'
-use_swanlab = True
+use_swanlab = False
 
 
 # ---------------------------------------------------------------------------

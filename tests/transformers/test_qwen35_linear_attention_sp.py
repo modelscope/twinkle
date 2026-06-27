@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import os
+import pytest
 import socket
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
-import unittest
 from datetime import timedelta
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
 from transformers.utils.import_utils import is_flash_linear_attention_available
@@ -15,19 +14,25 @@ from types import MethodType, SimpleNamespace
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
 from twinkle.model.transformers.strategy.sequence_parallel.linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
-from twinkle.model.transformers.strategy.sequence_parallel.utils import get_cu_seqlens_from_position_ids
 from twinkle.utils import DeviceMesh, selective_log_softmax
 
 try:
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as hf_qwen35
 
     _HAS_QWEN35 = True
 except Exception:
     Qwen3_5ForCausalLM = None
     Qwen3_5TextConfig = None
-    hf_qwen35 = None
     _HAS_QWEN35 = False
+
+try:
+    from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
+
+    _HAS_QWEN35_MOE = True
+except Exception:
+    Qwen3_5MoeForCausalLM = None
+    Qwen3_5MoeTextConfig = None
+    _HAS_QWEN35_MOE = False
 
 if is_flash_linear_attention_available():
     from fla.modules.convolution import causal_conv1d as _FLA_CAUSAL_CONV1D_FN
@@ -36,13 +41,16 @@ else:
     _FLA_CAUSAL_CONV1D_FN = None
     _FLA_CHUNK_GATED_DELTA_RULE = None
 
+pytestmark = pytest.mark.skip(
+    reason='Heavy Qwen3.5 SP linear-attention test (FLA + multi-GPU); not viable on dual-V100 CI, run manually.')
+
 WORLD_SIZE = 2
 LOGITS_RTOL = 5e-3
 LOGITS_ATOL = 5e-3
 LOSS_ATOL = 5e-3
 GRAD_RTOL = 5e-3
 GRAD_ATOL = 2e-3
-_HAS_FLA_PREFILL = bool(_HAS_QWEN35 and _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None)
+_HAS_FLA_PREFILL = bool(_FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None)
 
 
 def _hf_compatible_fla_causal_conv1d_fn(x, weight, bias=None, activation=None, seq_idx=None):
@@ -59,7 +67,7 @@ def _hf_compatible_fla_causal_conv1d_fn(x, weight, bias=None, activation=None, s
     return mixed_qkv.transpose(1, 2).contiguous()
 
 
-def _force_fla_causal_conv(model: Qwen3_5ForCausalLM) -> Qwen3_5ForCausalLM:
+def _force_fla_causal_conv(model: torch.nn.Module) -> torch.nn.Module:
     for layer in model.model.layers:
         linear_attn = getattr(layer, 'linear_attn', None)
         if linear_attn is not None:
@@ -68,26 +76,26 @@ def _force_fla_causal_conv(model: Qwen3_5ForCausalLM) -> Qwen3_5ForCausalLM:
     return model
 
 
-def _force_packed_linear_attention(model: Qwen3_5ForCausalLM, position_ids: torch.Tensor) -> Qwen3_5ForCausalLM:
-    packed_cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
+def _force_packed_linear_attention(model: torch.nn.Module, position_ids: torch.Tensor) -> torch.nn.Module:
 
-    def _make_packed_forward(cu_seqlens: torch.Tensor):
+    def _make_packed_forward(real_position_ids: torch.Tensor):
 
         def _packed_forward(mod, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
             packed_ctx = SimpleNamespace(
                 world_size=1,
                 sp_world_size=1,
+                real_position_ids=real_position_ids.to(device=hidden_states.device),
                 extra_kwargs={
-                    'is_packed': True,
-                    'cu_seq_lens_q': cu_seqlens.to(dtype=torch.int32, device=hidden_states.device),
+                    'padding_free': True,
                 })
+            packed_ctx._extract_real_position_ids = lambda ids: ids
+            packed_ctx.pad = lambda tensor, padding_value=-1, position_ids=None: tensor
             return Qwen3_5GatedDeltaNetUlyssesPatch._run_forward(
                 mod,
                 hidden_states,
                 cache_params=cache_params,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
-                cu_seq_lens_q=packed_ctx.extra_kwargs['cu_seq_lens_q'],
                 sequence_parallel_context=packed_ctx,
             )
 
@@ -96,7 +104,7 @@ def _force_packed_linear_attention(model: Qwen3_5ForCausalLM, position_ids: torc
     for layer in model.model.layers:
         linear_attn = getattr(layer, 'linear_attn', None)
         if linear_attn is not None:
-            linear_attn.forward = MethodType(_make_packed_forward(packed_cu_seqlens), linear_attn)
+            linear_attn.forward = MethodType(_make_packed_forward(position_ids), linear_attn)
     return model
 
 
@@ -146,13 +154,13 @@ def _model_dtype() -> torch.dtype:
 def _build_tiny_qwen35(device: torch.device,
                        *,
                        attn_implementation: str = 'sdpa',
-                       layer_types: list[str] | None = None) -> Qwen3_5ForCausalLM:
+                       layer_types: list[str] | None = None,
+                       model_kind: str = 'dense') -> torch.nn.Module:
     if layer_types is None:
         layer_types = ['linear_attention', 'linear_attention']
-    config = Qwen3_5TextConfig(
+    common_config_kwargs = dict(
         vocab_size=128,
         hidden_size=64,
-        intermediate_size=256,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=4,
@@ -169,15 +177,33 @@ def _build_tiny_qwen35(device: torch.device,
         attention_dropout=0.0,
         use_cache=False,
     )
-    config._attn_implementation = attn_implementation
-    model = Qwen3_5ForCausalLM(config)
+    if model_kind == 'dense':
+        config = Qwen3_5TextConfig(
+            intermediate_size=256,
+            **common_config_kwargs,
+        )
+        config._attn_implementation = attn_implementation
+        model = Qwen3_5ForCausalLM(config)
+    elif model_kind == 'moe':
+        config = Qwen3_5MoeTextConfig(
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_experts=4,
+            num_experts_per_tok=2,
+            output_router_logits=False,
+            **common_config_kwargs,
+        )
+        config._attn_implementation = attn_implementation
+        model = Qwen3_5MoeForCausalLM(config)
+    else:
+        raise ValueError(f'Unknown Qwen3.5 test model kind: {model_kind}')
     model = _force_fla_causal_conv(model)
     model.to(device=device, dtype=_model_dtype())
     model.eval()
     return model
 
 
-def _make_strategy(model: Qwen3_5ForCausalLM, world_size: int) -> SequenceParallelStrategy:
+def _make_strategy(model: torch.nn.Module, world_size: int) -> SequenceParallelStrategy:
     strategy = SequenceParallelStrategy(
         device_mesh=DeviceMesh.from_sizes(
             world_size=world_size,
@@ -234,7 +260,7 @@ def _make_packed_train_batch(device: torch.device):
     return input_ids, attention_mask, position_ids, labels
 
 
-def _get_qkv_weight(model: Qwen3_5ForCausalLM) -> torch.nn.Parameter:
+def _get_qkv_weight(model: torch.nn.Module) -> torch.nn.Parameter:
     for layer in model.model.layers:
         linear_attn = getattr(layer, 'linear_attn', None)
         if linear_attn is not None:
@@ -261,7 +287,7 @@ def _compute_training_path_loss(
     return result['loss'], num_tokens
 
 
-def _average_qkv_grad_over_group(model: Qwen3_5ForCausalLM, group: dist.ProcessGroup | None) -> torch.Tensor:
+def _average_qkv_grad_over_group(model: torch.nn.Module, group: dist.ProcessGroup | None) -> torch.Tensor:
     grad = _get_qkv_weight(model).grad
     if grad is None:
         raise AssertionError('No qkv gradient collected from Qwen3.5 linear attention layer.')
@@ -280,12 +306,18 @@ def _run_prefill_alignment_worker(rank: int,
                                   port: int,
                                   attn_implementation: str = 'sdpa',
                                   layer_types: list[str] | None = None,
-                                  packed: bool = False):
+                                  packed: bool = False,
+                                  model_kind: str = 'dense'):
     device = _init_dist(rank, world_size, port)
     try:
         _set_determinism(1234)
 
-        baseline_model = _build_tiny_qwen35(device, attn_implementation=attn_implementation, layer_types=layer_types)
+        baseline_model = _build_tiny_qwen35(
+            device,
+            attn_implementation=attn_implementation,
+            layer_types=layer_types,
+            model_kind=model_kind,
+        )
         sp_model = copy.deepcopy(baseline_model)
         input_ids, attention_mask, position_ids, labels = (
             _make_packed_train_batch(device) if packed else _make_train_batch(device))
@@ -309,6 +341,7 @@ def _run_prefill_alignment_worker(rank: int,
             'input_ids': input_ids,
             'position_ids': position_ids,
             'labels': labels,
+            'padding_free': packed,
         })
         local_labels = processed_inputs['labels']
         sp_outputs = sp_model(
@@ -344,10 +377,12 @@ def _run_prefill_alignment_worker(rank: int,
             dist.destroy_process_group()
 
 
-@unittest.skipUnless(_HAS_QWEN35, 'transformers Qwen3.5 is not available in this environment')
-@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= WORLD_SIZE, 'requires 2 CUDA devices')
-@unittest.skipUnless(_HAS_FLA_PREFILL, 'requires flash-linear-attention kernels for Qwen3.5 SP linear attention tests')
-class TestQwen35LinearAttentionSP(unittest.TestCase):
+@pytest.mark.skipif(not _HAS_QWEN35, reason='transformers Qwen3.5 is not available in this environment')
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= WORLD_SIZE), reason='requires 2 CUDA devices')
+@pytest.mark.skipif(
+    not _HAS_FLA_PREFILL, reason='requires flash-linear-attention kernels for Qwen3.5 SP linear attention tests')
+class TestQwen35LinearAttentionSP:
 
     def test_qwen35_linear_attention_prefill_logits_and_qkv_grad_alignment(self):
         port = _find_free_port()
@@ -367,7 +402,27 @@ class TestQwen35LinearAttentionSP(unittest.TestCase):
             join=True,
         )
 
-    @unittest.skipUnless(is_flash_attn_available(), 'requires flash_attention_2 support in transformers')
+    @pytest.mark.skipif(not _HAS_QWEN35_MOE, reason='transformers Qwen3.5-MoE is not available in this environment')
+    def test_qwen35_moe_linear_attention_prefill_logits_and_qkv_grad_alignment(self):
+        port = _find_free_port()
+        mp.spawn(
+            _run_prefill_alignment_worker,
+            args=(WORLD_SIZE, port, 'sdpa', ['linear_attention', 'linear_attention'], False, 'moe'),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
+    @pytest.mark.skipif(not _HAS_QWEN35_MOE, reason='transformers Qwen3.5-MoE is not available in this environment')
+    def test_qwen35_moe_mixed_attention_prefill_logits_and_qkv_grad_alignment(self):
+        port = _find_free_port()
+        mp.spawn(
+            _run_prefill_alignment_worker,
+            args=(WORLD_SIZE, port, 'sdpa', ['full_attention', 'linear_attention'], False, 'moe'),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
+    @pytest.mark.skipif(not is_flash_attn_available(), reason='requires flash_attention_2 support in transformers')
     def test_qwen35_linear_attention_prefill_logits_and_qkv_grad_alignment_fa2(self):
         port = _find_free_port()
         mp.spawn(
@@ -377,7 +432,7 @@ class TestQwen35LinearAttentionSP(unittest.TestCase):
             join=True,
         )
 
-    @unittest.skipUnless(is_flash_attn_available(), 'requires flash_attention_2 support in transformers')
+    @pytest.mark.skipif(not is_flash_attn_available(), reason='requires flash_attention_2 support in transformers')
     def test_qwen35_mixed_attention_prefill_logits_and_qkv_grad_alignment_fa2(self):
         port = _find_free_port()
         mp.spawn(
@@ -387,7 +442,7 @@ class TestQwen35LinearAttentionSP(unittest.TestCase):
             join=True,
         )
 
-    @unittest.skipUnless(is_flash_attn_available(), 'requires flash_attention_2 support in transformers')
+    @pytest.mark.skipif(not is_flash_attn_available(), reason='requires flash_attention_2 support in transformers')
     def test_qwen35_linear_attention_packed_prefill_logits_and_qkv_grad_alignment(self):
         port = _find_free_port()
         mp.spawn(
@@ -399,4 +454,4 @@ class TestQwen35LinearAttentionSP(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    pytest.main([__file__])
