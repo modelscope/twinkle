@@ -15,6 +15,7 @@ from torch import nn
 from transformers.utils import is_torch_npu_available
 
 from twinkle import get_logger
+from .causal_conv1d import npu_causal_conv1d_fn
 
 logger = get_logger()
 
@@ -554,6 +555,7 @@ def _patch_qwen3_5_fla(model=None) -> None:
             logger.warning('[NPU] [FLA] Model does not support named_modules, skipping instance patch')
             return
         patched_instances = 0
+        patched_causal = 0
         for _name, _module in model.named_modules():
             if hasattr(_module, 'chunk_gated_delta_rule') and callable(getattr(_module, 'chunk_gated_delta_rule')):
                 if _module.chunk_gated_delta_rule is mindspeed_fla:
@@ -569,13 +571,32 @@ def _patch_qwen3_5_fla(model=None) -> None:
                     type(_module).__name__,
                 )
 
+            if hasattr(_module, 'causal_conv1d_fn'):
+                current = getattr(_module, 'causal_conv1d_fn')
+
+                if current is npu_causal_conv1d_fn:
+                    continue
+                _module.causal_conv1d_fn = npu_causal_conv1d_fn
+                patched_causal += 1
+                logger.debug(
+                    '[NPU] [FLA] Replaced %s(%s).causal_conv1d_fn (was %s) -> MindSpeed',
+                    _name,
+                    type(_module).__name__,
+                    current,
+                )
+
         if patched_instances > 0:
             logger.info(
                 '[NPU] [FLA] Patched %d linear attention instance(s)',
                 patched_instances,
             )
+        if patched_causal > 0:
+            logger.info(
+                '[NPU] [FLA] Patched %d causal_conv1d instance(s)',
+                patched_causal,
+            )
         else:
-            logger.info('[NPU] [FLA] No linear attention instances found in model')
+            logger.info('[NPU] [FLA] No causal_conv1d_fn instances found in model')
 
 
 # =============================================================================
@@ -916,6 +937,7 @@ def apply_npu_patch(model=None) -> None:
       - SwiGLU fused kernel
       - SDPA Attention compatibility fixes
       - Flash Linear Attention (FLA) for Qwen3.5
+      - Causal Conv1D Triton kernel for linear attention
 
     When ``model`` is **not** provided, the GMM patch is **skipped** by default
     (EP cannot be detected without a model instance).

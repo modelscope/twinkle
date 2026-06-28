@@ -165,7 +165,7 @@ def main():
         if step % SYNC_INTERVAL == 0:
             logger.info(f'Step {step}: Saving weights for sampler...')
 
-            sampling_client = (training_client.save_weights_and_get_sampling_client(name=f'GSM8K-step-{step}'))
+            sampling_client = training_client.save_weights_and_get_sampling_client()
             logger.info(f'Step {step}: Sampling client ready')
 
         if sampling_client is None:

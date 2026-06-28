@@ -1,17 +1,10 @@
-# E2E test config: model + sampler + processor all enabled.
-# Used only by full_cycle_e2e.py (client) + server_e2e.py (server boot).
-# Mirror of server_config.yaml with the sampler block uncommented and a
-# smaller persistence path so the e2e run doesn't clobber the demo state.
+# Twinkle Server Configuration - E2E Test (4B model, Megatron DP=2 PP=2, FAIL_FAST=1)
 
 proxy_location: EveryNode
 
 http_options:
   host: 0.0.0.0
-  port: 8000
-
-persistence:
-  mode: file
-  file_path: /tmp/twinkle_state_e2e.json
+  port: 9000
 
 applications:
 
@@ -20,7 +13,7 @@ applications:
     import_path: server
     args:
       server_config:
-        per_token_model_limit: 3
+        per_token_model_limit: 20
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
@@ -32,27 +25,32 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"
 
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      backend: transformers
+      backend: megatron
       model_id: "ms://Qwen/Qwen3.5-4B"
       max_length: 10240
-      nproc_per_node: 1
+      nproc_per_node: 4
       device_group:
         name: model
-        ranks: 1
+        ranks: 4
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 1
+        dp_size: 2
+        pp_size: 2
       queue_config:
         rps_limit: 100
         tps_limit: 100000
       adapter_config:
-        adapter_timeout: 60
+        adapter_timeout: 30
+        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -64,6 +62,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
 
   - name: sampler-Qwen3.5-4B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
@@ -98,6 +97,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
 
   - name: processor
     route_prefix: /api/v1/processor
@@ -105,7 +105,7 @@ applications:
     args:
       ncpu_proc_per_node: 2
       device_group:
-        name: processor
+        name: model
         ranks: 2
         device_type: CPU
       device_mesh:
@@ -119,3 +119,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"

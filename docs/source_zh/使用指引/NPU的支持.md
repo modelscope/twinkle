@@ -158,6 +158,61 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ```bash
 python -c "import mindspeed.megatron_adaptor; from twinkle.model.megatron._mindspeed_runtime import ensure_mindspeed_adaptor_patched; ensure_mindspeed_adaptor_patched(); print('✓ Megatron backend imports are ready')"
 ```
+### 6. Qwen3.5/3.6 FLA 与 Triton-Ascend 版本配套
+
+**FLA 开启条件**
+
+Qwen3.5/3.6 在 transformers 后端使用 FLA（Flash Linear Attention）时，需要满足以下条件：
+
+- 安装 `triton-ascend`
+- `mindspeed` 版本为 `26.0.0_core_r0.12.1`
+
+**Triton-Ascend 版本与 CANN 配套**
+
+| triton-ascend | CANN | 额外依赖 |
+| --- | --- | --- |
+| 3.2.0 | 8.5.x | 不需要安装 `triton` |
+| 3.2.1 | 9.0.0 | 需要安装 `triton` |
+
+**MindSpeed 版本与代码适配**
+
+当前验证的 MindSpeed 版本为 `26.0.0_core_r0.12.1`。MindSpeed 代码仓地址：[https://gitcode.com/Ascend/MindSpeed](https://gitcode.com/Ascend/MindSpeed)
+
+如使用更高版本 MindSpeed，需注意 `src/twinkle/kernel/chunk_gated_delta_rule.py` 中的以下导入路径可能需要对应 MindSpeed 实际代码位置进行修改：
+
+```python
+from mindspeed.lite.ops.triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from mindspeed.lite.ops.triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
+from mindspeed.lite.ops.triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from mindspeed.lite.ops.triton.cumsum import chunk_local_cumsum
+from mindspeed.lite.ops.triton.solve_tril import solve_tril
+from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from mindspeed.lite.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+```
+
+### 7. NPU Patch 环境变量配置
+
+Twinkle 在 NPU 环境下默认启用模型层补丁，可通过以下环境变量进行细粒度控制：
+
+| 环境变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `TWINKLE_NPU_PATCH` | 所有 NPU 优化的总开关 | `1`（启用） |
+| `TWINKLE_NPU_FUSED_OPS` | 启用融合算子（RMSNorm、RoPE、SwiGLU、SDPA） | `1`（启用） |
+| `TWINKLE_NPU_MOE_PATCH` | 启用 MoE Grouped MatMul | `1`（启用） |
+| `TWINKLE_NPU_FLA` | 启用 Qwen3.5 Flash Linear Attention；设为 `0` 强制回退到 torch 实现 | `1`（启用） |
+
+**使用示例**：
+
+```bash
+# 关闭所有 NPU 优化，回退到 Transformers 原生实现
+export TWINKLE_NPU_PATCH=0
+
+# 仅关闭 FLA，保留其他融合算子
+export TWINKLE_NPU_FLA=0
+
+# 仅关闭 MoE 补丁
+export TWINKLE_NPU_MOE_PATCH=0
+```
 
 ## 快速开始
 

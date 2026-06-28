@@ -159,6 +159,62 @@ First run a minimal import check to make sure the current environment can resolv
 python -c "import mindspeed.megatron_adaptor; from twinkle.model.megatron._mindspeed_runtime import ensure_mindspeed_adaptor_patched; ensure_mindspeed_adaptor_patched(); print('✓ Megatron backend imports are ready')"
 ```
 
+### 6. Qwen3.5/3.6 FLA and Triton-Ascend Version Compatibility
+
+**FLA Enablement Conditions**
+
+To use FLA (Flash Linear Attention) with Qwen3.5/3.6 on the transformers backend, the following conditions must be met:
+
+- Install `triton-ascend`
+- `mindspeed` version `26.0.0_core_r0.12.1`
+
+**Triton-Ascend Version and CANN Compatibility**
+
+| triton-ascend | CANN | Additional Dependencies |
+| --- | --- | --- |
+| 3.2.0 | 8.5.x | Do not install `triton` |
+| 3.2.1 | 9.0.0 | `triton` must be installed |
+
+**MindSpeed Version and Code Adaptation**
+
+The currently validated MindSpeed version is `26.0.0_core_r0.12.1`. MindSpeed repository: [https://gitcode.com/Ascend/MindSpeed](https://gitcode.com/Ascend/MindSpeed)
+
+If using a higher MindSpeed version, note that the following import paths in `src/twinkle/kernel/chunk_gated_delta_rule.py` may need to be adjusted to match the actual code locations in MindSpeed:
+
+```python
+from mindspeed.lite.ops.triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from mindspeed.lite.ops.triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
+from mindspeed.lite.ops.triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from mindspeed.lite.ops.triton.cumsum import chunk_local_cumsum
+from mindspeed.lite.ops.triton.solve_tril import solve_tril
+from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from mindspeed.lite.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+```
+
+### 7. NPU Patch Environment Variable Configuration
+
+Twinkle enables model-layer patches by default in NPU environments. The following environment variables provide fine-grained control:
+
+| Environment Variable | Description | Default |
+| --- | --- | --- |
+| `TWINKLE_NPU_PATCH` | Master switch for all NPU optimizations | `1` (enabled) |
+| `TWINKLE_NPU_FUSED_OPS` | Enable fused operators (RMSNorm, RoPE, SwiGLU, SDPA) | `1` (enabled) |
+| `TWINKLE_NPU_MOE_PATCH` | Enable MoE Grouped MatMul | `1` (enabled) |
+| `TWINKLE_NPU_FLA` | Enable Qwen3.5 Flash Linear Attention; set to `0` to force torch fallback | `1` (enabled) |
+
+**Usage examples**:
+
+```bash
+# Disable all NPU optimizations and fall back to native Transformers
+export TWINKLE_NPU_PATCH=0
+
+# Disable FLA only while keeping other fused operators
+export TWINKLE_NPU_FLA=0
+
+# Disable MoE patch only
+export TWINKLE_NPU_MOE_PATCH=0
+```
+
 ## Quick Start
 
 **Important Notice**: The following examples are from the `cookbook/` directory and have been verified in actual NPU environments. It is recommended to run scripts directly from the cookbook rather than copying and pasting code snippets.
