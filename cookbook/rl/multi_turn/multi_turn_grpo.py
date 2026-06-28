@@ -71,8 +71,7 @@ LORA_RANK = args.lora.lora_r or 16
 MAX_TURNS = int(os.environ.get('MAX_TURNS', '6'))
 
 # Environment configuration
-# ENV_CLS: import path to the environment class (no server needed)
-ENV_CLS = os.environ.get('ENV_CLS', 'blackjack_env:BlackjackEnv')
+ENV_GAME = os.environ.get('ENV_GAME', 'blackjack')
 # ENV_REMOTE: set to '1' to deploy envs on a dedicated CPU DeviceGroup
 ENV_REMOTE = os.environ.get('ENV_REMOTE', '0') == '1'
 # ENV_NUM_WORKERS: number of CPU workers for distributed EnvPool (default 1)
@@ -141,7 +140,6 @@ def prepare_trajectories(
     n_trajectories: int,
     tool_schema: List[Dict],
     system_prompt: str,
-    action_mapper=None,
 ) -> Tuple[List[Dict[str, Any]], List[ToolManager], List[List[EnvTool]]]:
     """Reset environments via EnvPool and build initial trajectories.
 
@@ -155,17 +153,11 @@ def prepare_trajectories(
         n_trajectories: Total number of trajectories to create.
         tool_schema: Tool definitions for the environment.
         system_prompt: System prompt for the agent.
-        action_mapper: Optional callable to transform actions.
 
     Returns:
         Tuple of (trajectories, tool_managers, env_tools_list).
     """
-    # Get per-trajectory adapters from the pool
-    adapters = env_pool.get_adapters(
-        n=n_trajectories,
-        tool_schema=tool_schema,
-        action_mapper=action_mapper,
-    )
+    adapters = env_pool.get_adapters(n=n_trajectories)
 
     trajectories = []
     tool_managers = []
@@ -284,20 +276,25 @@ def main():
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     # ========== EnvPool: environment instances managed by Twinkle ==========
+    # OpenEnv embedded mode: Ray workers replace the HTTP server process pool.
+    # Equivalent to: OPENSPIEL_GAME=blackjack python -m envs.openspiel_env.server.app
+    # but fully managed by Ray — no manual server startup needed.
     env_pool_kwargs = dict(
-        env_cls=ENV_CLS,
         pool_size=pool_size,
+        env_kwargs={
+            'env_name': 'openspiel_env',
+            'env_kwargs': {'game_name': ENV_GAME},
+            'action_mapper': blackjack_action_mapper,
+        },
     )
     if ENV_REMOTE:
-        # Deploy on dedicated CPU DeviceGroup with ENV_NUM_WORKERS workers
         env_mesh = DeviceMesh.from_sizes(world_size=ENV_NUM_WORKERS, dp_size=ENV_NUM_WORKERS)
         env_pool_kwargs['remote_group'] = 'env'
         env_pool_kwargs['device_mesh'] = env_mesh
-    # else: runs locally in driver (zero RPC overhead)
 
     env_pool = EnvPool(**env_pool_kwargs)
-    logger.info(f'EnvPool created: env_cls={ENV_CLS}, pool_size={pool_size}, '
-                f'remote={ENV_REMOTE}')
+    logger.info(f'EnvPool created: game={ENV_GAME}, '
+                f'pool_size={pool_size}, remote={ENV_REMOTE}')
 
     # Local template for MultiTurnRollout bridge computation
     rollout_template = Qwen3_5Template(MODEL_ID, max_length=8192, enable_thinking=False)
@@ -323,7 +320,6 @@ def main():
 
     optim_step = 0
     logger.info('Starting multi-turn GRPO training with EnvPool')
-    logger.info(f'ENV_CLS={ENV_CLS}, MAX_TURNS={MAX_TURNS}, NUM_GENERATIONS={NUM_GENERATIONS}')
     logger.info(get_device_placement())
 
     while optim_step < MAX_STEPS:
@@ -340,7 +336,6 @@ def main():
             n_trajectories=n_traj,
             tool_schema=TOOL_SCHEMA,
             system_prompt=SYSTEM_PROMPT,
-            action_mapper=blackjack_action_mapper,
         )
 
         # 2. Sync model weights to sampler
