@@ -9,7 +9,7 @@ import os
 from typing import Any, Callable
 
 from twinkle.utils.logger import get_logger
-from twinkle_client.tui.connection import LocalConnection
+from twinkle_client.auto.connection import LocalConnection
 
 logger = get_logger()
 
@@ -157,7 +157,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         'type': 'function',
         'function': {
             'name': 'select_run',
-            'description': 'Switch the TUI to monitor a different training run. Updates metrics panel and status bar.',
+            'description': 'Switch to monitor a different training run. Updates connection context.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -276,46 +276,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'zoom_metrics',
-            'description': 'Adjust the metrics chart view. Zoom into specific step ranges or reset to show all.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'action': {
-                        'type': 'string',
-                        'enum': ['zoom', 'reset'],
-                        'description': '"zoom" to set range, "reset" to show all.',
-                    },
-                    'x_start': {'type': 'integer', 'description': 'Start step for x-axis.'},
-                    'x_end': {'type': 'integer', 'description': 'End step for x-axis.'},
-                    'y_min': {'type': 'number', 'description': 'Min value for y-axis.'},
-                    'y_max': {'type': 'number', 'description': 'Max value for y-axis.'},
-                },
-                'required': ['action'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'select_metrics',
-            'description': 'Choose which metric keys to display on the chart. The chart shows at most 4 metrics at once. Use this when the user asks to see specific metrics (e.g. "show reward-related metrics"). Pass an empty keys array to list all available metrics without changing the selection.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'keys': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': 'Metric key names to display. Match against available keys (supports partial: pick keys containing the keyword). Pass [] to query available keys only.',
-                    },
-                },
-                'required': ['keys'],
-            },
-        },
-    },
+
     {
         'type': 'function',
         'function': {
@@ -344,8 +305,6 @@ class ToolExecutor:
 
     def __init__(self, connection: LocalConnection):
         self.connection = connection
-        self.metrics_callback: Callable | None = None
-        self.select_metrics_callback: Callable[[list[str]], dict] | None = None
         self.on_run_selected: Callable[[str], None] | None = None
         self._server_url: str | None = None  # Set after successful start_server
 
@@ -1093,29 +1052,6 @@ class ToolExecutor:
             }
             for m in models
         ]
-
-    # ── Metrics chart ──
-
-    async def _tool_zoom_metrics(
-        self,
-        action: str,
-        x_start: int | None = None,
-        x_end: int | None = None,
-        y_min: float | None = None,
-        y_max: float | None = None,
-    ) -> dict:
-        if self.metrics_callback:
-            if action == 'reset':
-                self.metrics_callback('reset')
-            else:
-                self.metrics_callback('zoom', x_start=x_start, x_end=x_end, y_min=y_min, y_max=y_max)
-        return {'action': action, 'status': 'applied'}
-
-    async def _tool_select_metrics(self, keys: list[str]) -> dict:
-        """Select which metrics to display on the chart."""
-        if self.select_metrics_callback:
-            return self.select_metrics_callback(keys)
-        return {'error': 'Metrics panel not available'}
 
     # ── Cluster info ──
 

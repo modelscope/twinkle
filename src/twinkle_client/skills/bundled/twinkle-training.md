@@ -419,7 +419,7 @@ metric = model.calculate_metric(is_training=True)
 ### 10. TrainingRuntime (Observability)
 
 ```python
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 rt = TrainingRuntime()  # auto-reads TWINKLE_RUN_ID env var (set by TUI launcher)
 # IMPORTANT: call rt.start() BEFORE model.add_adapter_to_model() so TUI can show logs immediately.
@@ -489,7 +489,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 MAX_STEPS = 50
@@ -568,7 +568,7 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.metric import CompletionRewardMetric
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.sampler import vLLMSampler
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 4
@@ -676,7 +676,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 DPO_BETA = 0.1
@@ -759,7 +759,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import Preprocessor
 from twinkle.data_format import Trajectory, Message
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 

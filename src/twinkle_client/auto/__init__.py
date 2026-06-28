@@ -1,29 +1,24 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
-"""Twinkle TUI - Terminal User Interface for training control."""
+"""Twinkle Auto - Minimal chat interface for ML training control."""
 
 import logging
 from pathlib import Path
 
 from twinkle.utils.logger import get_logger
 
-# ── Log file: ./tui.log (current working directory) ──
-_LOG_FILE = Path.cwd() / 'tui.log'
+# ── Log file: ./auto.log (current working directory) ──
+_LOG_FILE = Path.cwd() / 'auto.log'
 
 
 def _configure_logging(verbose: bool = False) -> None:
-    """Configure file-only logging for TUI.
+    """Configure file-only logging for auto.
 
-    All logs are written to ./tui.log in the current working directory.
-    NO console output — avoids corrupting Textual's alt-screen buffer.
-    The file is rotated at 5MB with 3 backups.
+    All logs go to ./auto.log, not stdout (avoids mixing with chat output).
     """
     from logging.handlers import RotatingFileHandler
 
     handler = RotatingFileHandler(
-        _LOG_FILE,
-        maxBytes=5 * 1024 * 1024,  # 5MB
-        backupCount=3,
-        encoding='utf-8',
+        _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8',
     )
     handler.setFormatter(logging.Formatter(
         '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -31,28 +26,19 @@ def _configure_logging(verbose: bool = False) -> None:
     ))
 
     level = logging.DEBUG if verbose else logging.INFO
-
-    # Get the 'twinkle' logger (same one returned by get_logger())
     twinkle_logger = logging.getLogger('twinkle')
     twinkle_logger.setLevel(level)
     twinkle_logger.propagate = False
-
-    # Remove any existing handlers (especially StreamHandlers that print to terminal)
     twinkle_logger.handlers.clear()
-
-    # Only attach the file handler — no terminal output
     twinkle_logger.addHandler(handler)
 
-    # Mark as initialized so get_logger() won't re-add a StreamHandler
     from twinkle.utils.logger import init_loggers
     init_loggers[twinkle_logger.name] = True
-
-    # Also capture warnings from third-party libs
     logging.captureWarnings(True)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Programmatic entry point for ``twinkle-tui``.
+    """Programmatic entry point for ``twinkle-auto``.
 
     Mirrors the pattern of ``twinkle.server.cli:main`` — runs the Typer app
     in standalone mode and converts SystemExit to a plain return code.
@@ -64,19 +50,19 @@ def main(argv: list[str] | None = None) -> int:
     app = typer.Typer(
         add_completion=False,
         no_args_is_help=False,
-        help='Twinkle TUI — ML Training Control via Natural Language.',
+        help='Twinkle Auto — ML Training Control via Natural Language.',
     )
 
     def _version_callback(value: bool) -> None:
         if value:
-            typer.echo(f'twinkle-tui {__version__}')
+            typer.echo(f'twinkle-auto {__version__}')
             raise typer.Exit()
 
     @app.command()
     def launch(
         run_id: str | None = typer.Option(
             None, '--run-id', '-r',
-            envvar='TWINKLE_TUI_RUN_ID',
+            envvar='TWINKLE_AUTO_RUN_ID',
             help='Attach to an existing training run by ID.',
         ),
         llm_base_url: str = typer.Option(
@@ -96,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         verbose: bool = typer.Option(
             False, '--verbose', '-v',
-            envvar='TWINKLE_TUI_VERBOSE',
+            envvar='TWINKLE_AUTO_VERBOSE',
             help='Enable verbose (DEBUG) logging.',
         ),
         version: bool = typer.Option(
@@ -105,23 +91,23 @@ def main(argv: list[str] | None = None) -> int:
             help='Show version and exit.',
         ),
     ) -> None:
-        """Launch the Twinkle TUI."""
+        """Launch Twinkle Auto."""
         _configure_logging(verbose=verbose)
         logger = get_logger()
         logger.info(
-            f'TUI starting — model={llm_model}, base_url={llm_base_url}, '
+            f'Auto starting — model={llm_model}, base_url={llm_base_url}, '
             f'run_id={run_id}, log_file={_LOG_FILE}'
         )
 
-        from twinkle_client.tui.app import TwinkleTUI
+        from twinkle_client.auto.app import TwinkleAuto
 
-        tui = TwinkleTUI(
+        auto = TwinkleAuto(
             run_id=run_id,
             llm_base_url=llm_base_url,
             llm_model=llm_model,
             llm_api_key=llm_api_key,
         )
-        tui.run()
+        auto.run()
 
     try:
         app(args=argv, standalone_mode=True)

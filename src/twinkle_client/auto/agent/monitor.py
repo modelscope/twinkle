@@ -24,7 +24,7 @@ from typing import Any, Callable
 from openai import AsyncOpenAI
 
 from twinkle.utils.logger import get_logger
-from twinkle_client.tui.connection import LocalConnection
+from twinkle_client.auto.connection import LocalConnection
 
 logger = get_logger()
 

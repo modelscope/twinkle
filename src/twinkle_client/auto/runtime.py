@@ -1,9 +1,9 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
-"""Training runtime utilities for TUI integration.
+"""Training runtime utilities for auto-research integration.
 
 This module provides helpers that training scripts import to:
 1. Write structured metrics to metrics.jsonl
-2. Print log messages to stdout (captured as output.log by TUI launcher)
+2. Print log messages to stdout (captured as output.log by launcher)
 3. Manage run lifecycle (start/end)
 4. Register SIGTERM handler for graceful shutdown with checkpoint
 
@@ -12,7 +12,7 @@ equivalent to "pause" (server retains all optimizer/model state in GPU memory).
 Restarting the script with the same adapter_name seamlessly continues training.
 
 Usage in training scripts:
-    from twinkle_client.tui.runtime import TrainingRuntime
+    from twinkle_client.auto.runtime import TrainingRuntime
 
     rt = TrainingRuntime(run_id='my-grpo-run')
     rt.start(model_id='Qwen/Qwen3.5-4B', config={...})
@@ -46,11 +46,11 @@ DEFAULT_BASE_DIR = Path.home() / '.cache' / 'twinkle'
 
 
 class TrainingRuntime:
-    """Runtime helper for training scripts to integrate with TUI.
+    """Runtime helper for training scripts to integrate with auto-research.
 
     Manages:
     - Writing metrics.jsonl (structured step data)
-    - Printing logs to stdout (captured by TUI launcher as output.log)
+    - Printing logs to stdout (captured by launcher as output.log)
     - Run metadata (meta.json)
     - SIGTERM graceful shutdown with checkpoint saving
     """
@@ -61,7 +61,7 @@ class TrainingRuntime:
         Args:
             run_id: Unique identifier for this training run.
                 If None, reads from TWINKLE_RUN_ID environment variable
-                (automatically set by TUI launcher).
+                (automatically set by launcher).
             base_dir: Base directory for run data. Defaults to ~/.cache/twinkle/
         """
         self.base_dir = Path(base_dir) if base_dir else DEFAULT_BASE_DIR
@@ -173,7 +173,7 @@ class TrainingRuntime:
                 self._last_progress_save = now
 
     def log(self, message: str) -> None:
-        """Print a log message to stdout (captured as output.log by TUI).
+        """Print a log message to stdout (captured as output.log by launcher).
 
         Args:
             message: Human-readable log message.
@@ -253,7 +253,7 @@ class TrainingRuntime:
     ) -> None:
         """Register SIGTERM handler for graceful shutdown with checkpoint.
 
-        When SIGTERM is received (e.g., from TUI stop command), the handler will:
+        When SIGTERM is received (e.g., from stop command), the handler will:
         1. Save model checkpoint (LoRA weights + optimizer state)
         2. Save dataloader position (consumed_train_samples) for exact resume
         3. Log the checkpoint path

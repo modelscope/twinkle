@@ -22,7 +22,7 @@ dependencies = [
 
 [project.scripts]
 twinkle-server = "twinkle.server.cli:main"
-twinkle-tui = "twinkle_client.tui:main"
+twinkle-auto = "twinkle_client.auto:main"
 
 [project.optional-dependencies]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]

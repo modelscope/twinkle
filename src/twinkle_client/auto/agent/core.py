@@ -10,9 +10,9 @@ from typing import Any, Callable
 
 from openai import AsyncOpenAI
 
-from twinkle_client.tui.agent.prompts import SYSTEM_PROMPT
-from twinkle_client.tui.agent.tools import TOOL_SCHEMAS, ToolExecutor
-from twinkle_client.tui.connection import LocalConnection
+from twinkle_client.auto.agent.prompts import SYSTEM_PROMPT
+from twinkle_client.auto.agent.tools import TOOL_SCHEMAS, ToolExecutor
+from twinkle_client.auto.connection import LocalConnection
 
 logger = get_logger()
 
@@ -177,14 +177,6 @@ class AgentLoop:
         content = ''.join(content_parts)
         tool_calls = [tool_calls_map[i] for i in sorted(tool_calls_map)] if tool_calls_map else []
         return content, tool_calls
-
-    def set_metrics_callback(self, callback: Callable) -> None:
-        """Set the callback for metrics zoom control."""
-        self._tool_executor.metrics_callback = callback
-
-    def set_select_metrics_callback(self, callback: Callable[[list[str]], dict]) -> None:
-        """Set the callback for selecting which metrics to display."""
-        self._tool_executor.select_metrics_callback = callback
 
     def set_run_selected_callback(self, callback: Callable[[str], None]) -> None:
         """Set the callback invoked when the agent switches to a different run."""

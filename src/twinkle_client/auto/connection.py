@@ -1,5 +1,5 @@
 # Copyright (c) Twinkle Contributors. All rights reserved.
-"""Local file-based connection layer for TUI.
+"""Local file-based connection layer for auto-research.
 
 Reads metrics from JSONL and raw logs from output.log.
 
@@ -11,7 +11,7 @@ process. The server retains all model/optimizer state in GPU memory.
 
 File layout under run_dir (~/.cache/twinkle/{run_id}/):
     metrics.jsonl  — one JSON object per line, written after each step
-    output.log     — combined stdout+stderr (raw text, read by TUI log panel)
+    output.log     — combined stdout+stderr (raw text, read by log viewer)
     meta.json      — run metadata (model_id, config, status, pid)
     train.py       — current active training script
     train_v{N}.py  — archived previous versions
@@ -36,7 +36,7 @@ DEFAULT_BASE_DIR = Path.home() / '.cache' / 'twinkle'
 
 
 class LocalConnection:
-    """File-based connection between TUI and training process.
+    """File-based connection between auto-research agent and training process.
 
     All monitoring happens through the local filesystem:
     - Metrics and logs are read from JSONL files (tail-style incremental)
