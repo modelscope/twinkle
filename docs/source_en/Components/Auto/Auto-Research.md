@@ -1,34 +1,24 @@
-# Auto-Research (TUI)
+# Auto-Research
 
-Twinkle TUI is a terminal-based intelligent training assistant that lets you **control, monitor, and debug ML training through natural language**. It combines a chat-driven AI agent with real-time metrics visualization, log streaming, and an automated health monitor that can detect and fix training failures autonomously.
+Twinkle Auto is a terminal-based intelligent training assistant that lets you **control, monitor, and debug ML training through natural language**. It combines a chat-driven AI agent with an automated health monitor that can detect and fix training failures autonomously.
 
 ## Architecture Overview
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ TwinkleTUI (Textual App)                                 │
-│ ┌──────────────────────────────────────────────────────┐ │
-│ │ StatusBar: state / run_id / model / step / progress  │ │
-│ ├──────────────────────┬───────────────────────────────┤ │
-│ │ MetricsPanel         │ LogPanel                      │ │
-│ │ (ASCII chart)        │ (scrolling logs)              │ │
-│ ├──────────────────────┤                               │ │
-│ │ ChatPanel            │                               │ │
-│ │ (user <-> agent)     │                               │ │
-│ └──────────────────────┴───────────────────────────────┘ │
+│ TwinkleAuto (asyncio chat loop)                          │
 │                                                          │
-│ Background Services:                                     │
+│ Components:                                              │
 │   AgentLoop  ─── LLM tool-calling loop                   │
 │   TrainingMonitor ─── periodic health check & auto-fix   │
-│   MetricsPoller ─── incremental metrics reading          │
-│   LogsPoller ─── incremental log tailing                 │
-│   SkillsLoader ─── async plugin loading                  │
+│   LocalConnection ─── file-system based communication   │
+│   SkillManager ─── async plugin loading                 │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ## Installation & Launch
 
-TUI is part of the `twinkle-client` package:
+Auto is part of the `twinkle-client` package:
 
 ```bash
 pip install twinkle-client
@@ -38,49 +28,41 @@ pip install twinkle-client
 
 ```bash
 # Basic launch (uses default local Ollama endpoint)
-twinkle-tui
+twinkle-auto
 
 # Specify LLM backend
-twinkle-tui --llm-base-url http://localhost:11434/v1 --llm-model qwen3.5
+twinkle-auto --llm-base-url http://localhost:11434/v1 --llm-model qwen3.5
 
 # Attach to an existing training run
-twinkle-tui --run-id my-grpo-run
+twinkle-auto --run-id my-grpo-run
 
 # Use a remote API (e.g., OpenAI-compatible)
-twinkle-tui --llm-base-url https://api.example.com/v1 --llm-api-key sk-xxx --llm-model gpt-4o
+twinkle-auto --llm-base-url https://api.example.com/v1 --llm-api-key sk-xxx --llm-model gpt-4o
 
 # Enable debug logging
-twinkle-tui --verbose
+twinkle-auto --verbose
 ```
 
 Or run as a Python module:
 
 ```bash
-python -m twinkle_client.tui
+python -m twinkle_client.auto
 ```
 
 ### CLI Options
 
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
-| `--run-id`, `-r` | `TWINKLE_TUI_RUN_ID` | None | Attach to an existing training run |
+| `--run-id`, `-r` | `TWINKLE_AUTO_RUN_ID` | None | Attach to an existing training run |
 | `--llm-base-url` | `TWINKLE_LLM_BASE_URL` | `http://localhost:11434/v1` | LLM API base URL |
 | `--llm-model` | `TWINKLE_LLM_MODEL` | `qwen3.5` | LLM model name |
 | `--llm-api-key` | `TWINKLE_LLM_API_KEY` | `not-needed` | LLM API key |
-| `--verbose`, `-v` | `TWINKLE_TUI_VERBOSE` | `False` | Enable DEBUG logging |
+| `--verbose`, `-v` | `TWINKLE_AUTO_VERBOSE` | `False` | Enable DEBUG logging |
 | `--version`, `-V` | — | — | Show version and exit |
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `q` | Quit |
-| `Ctrl+P` | Toggle metrics panel |
-| `Ctrl+L` | Clear logs |
 
 ## Chat Agent
 
-The core of TUI is an **LLM-powered tool-calling agent** (`AgentLoop`) that processes natural language commands through an OpenAI-compatible API. The agent maintains conversation history with automatic pruning (last 50 messages) and supports up to 10 tool-calling rounds per interaction.
+The core of Auto is an **LLM-powered tool-calling agent** (`AgentLoop`) that processes natural language commands through an OpenAI-compatible API. The agent maintains conversation history with automatic pruning (last 50 messages) and supports up to 10 tool-calling rounds per interaction.
 
 ### What You Can Say
 
@@ -144,10 +126,10 @@ Multi-model topology is supported: 1 training model + N sampler/teacher models.
 
 ### Skills System
 
-TUI supports extensible skill plugins loaded from three sources:
+Auto supports extensible skill plugins loaded from three sources:
 
 1. **Bundled skills** — shipped inside `twinkle_client/skills/bundled/`
-2. **User-local skills** — `~/.cache/twinkle/tui/skills/local/`
+2. **User-local skills** — `~/.cache/twinkle/auto/skills/local/`
 3. **Community skills** — fetched from ModelScope (best-effort, 10s timeout)
 
 Skills are loaded asynchronously after startup and injected into the agent's system prompt. The agent is usable immediately even before skills finish loading.
@@ -191,7 +173,7 @@ Safety guardrails:
 
 ## File-Based Connection
 
-TUI communicates with training processes through the local filesystem:
+Auto communicates with training processes through the local filesystem:
 
 ```
 ~/.cache/twinkle/{run_id}/
@@ -213,10 +195,10 @@ In Server Mode, the Twinkle Server retains all model/optimizer state in GPU memo
 
 ## TrainingRuntime (Script Integration)
 
-Training scripts use `TrainingRuntime` to integrate with TUI:
+Training scripts use `TrainingRuntime` to integrate with Auto:
 
 ```python
-from twinkle_client.tui.runtime import TrainingRuntime
+from twinkle_client.auto.runtime import TrainingRuntime
 
 rt = TrainingRuntime(run_id='my-grpo-run')
 rt.start(model_id='Qwen/Qwen3.5-4B', config={'lr': 1e-5})
@@ -264,50 +246,10 @@ When `register_graceful_shutdown()` is called, a SIGTERM handler is installed th
 3. Logs the checkpoint path
 4. Marks training as `stopped` and exits
 
-## UI Panels
-
-### StatusBar
-
-Displays current training state at the top of the screen:
-
-- Training state icon (🚀 Training / ⏸ Paused / ✅ Done / ❌ Error)
-- Run ID
-- Model name
-- Current step
-- Progress bar with percentage
-
-### MetricsPanel
-
-Real-time ASCII chart rendered with `plotext`:
-
-- Plots up to 4 metrics simultaneously
-- Supports zoom (by step range and y-axis range)
-- Auto-selects first 3 available metrics if no selection
-- Hint bar shows hidden metrics that can be switched via agent
-- Retains up to 2000 data points
-
-### LogPanel
-
-Scrolling log viewer:
-
-- Strips ANSI escape sequences for clean display
-- Hard-wraps long lines to prevent overflow
-- Handles `\r` carriage returns from progress bars
-- Retains last 500 lines
-
-### ChatPanel
-
-Interactive chat interface:
-
-- User input with streaming agent responses
-- Throttled token flushing (80ms) for smooth display
-- Stream reset on tool-call detection
-- Supports Rich markup formatting
-
 ## Logging
 
-All TUI logs are written to `./tui.log` (current working directory):
+All logs are written to `./auto.log` (current working directory):
 
 - Rotated at 5MB with 3 backups
-- **No console output** — avoids corrupting Textual's alt-screen buffer
+- **No console output** — all output goes to the log file
 - Use `--verbose` for DEBUG level logging

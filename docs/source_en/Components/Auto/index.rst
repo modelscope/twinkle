@@ -1,4 +1,4 @@
-TUI
+Auto
 ===============
 .. toctree::
    :maxdepth: 1

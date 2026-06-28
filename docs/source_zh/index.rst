@@ -44,7 +44,7 @@ Twinkle DOCUMENTATION
    组件/CLI/index.rst
    组件/通知器/index.rst
    组件/Agentic/index.rst
-   组件/TUI/index.rst
+   组件/Auto/index.rst
 
 Indices and tables
 ==================

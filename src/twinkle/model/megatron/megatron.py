@@ -420,7 +420,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     embeddings = output_tensor
             elif labels is not None and is_last_pp:
                 _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
-                _loss_require_entropy = getattr(_loss_instance, 'require_entropy', True)
+                _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)
                 _packed = batch.get('packed_seq_params')
                 cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                 if _loss_require_logps:

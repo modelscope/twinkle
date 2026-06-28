@@ -1,6 +1,6 @@
 # SkillProvider 技能系统
 
-技能系统允许 Twinkle 的 TUI 智能体从外部来源（Git 仓库、API、本地文件）动态加载专业知识，并注入到 LLM 的系统提示词中。
+技能系统允许 Twinkle Auto 智能体从外部来源（Git 仓库、API、本地文件）动态加载专业知识，并注入到 LLM 的系统提示词中。
 
 ## 架构
 
@@ -68,4 +68,4 @@ prompt_section = manager.format_for_prompt()
 
 ## 缓存目录
 
-默认缓存在 `~/.cache/twinkle/tui/skills/<provider_name>/`。可通过向 Provider 构造函数传入 `cache_dir` 参数覆盖。
+默认缓存在 `~/.cache/twinkle/auto/skills/<provider_name>/`。可通过向 Provider 构造函数传入 `cache_dir` 参数覆盖。

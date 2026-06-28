@@ -1,6 +1,6 @@
 # SkillProvider
 
-The skill system allows Twinkle's TUI agent to dynamically load specialized knowledge from external sources (Git repos, APIs, local files) and inject them into the LLM's system prompt.
+The skill system allows Twinkle Auto's agent to dynamically load specialized knowledge from external sources (Git repos, APIs, local files) and inject them into the LLM's system prompt.
 
 ## Architecture
 
@@ -68,4 +68,4 @@ prompt_section = manager.format_for_prompt()
 
 ## Cache Directory
 
-By default, skills are cached at `~/.cache/twinkle/tui/skills/<provider_name>/`. Override by passing `cache_dir` to the provider constructor.
+By default, skills are cached at `~/.cache/twinkle/auto/skills/<provider_name>/`. Override by passing `cache_dir` to the provider constructor.

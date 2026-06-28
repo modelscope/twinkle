@@ -44,7 +44,7 @@ Twinkle DOCUMENTATION
    Components/CLI/index.rst
    Components/Notifier/index.rst
    Components/Agentic/index.rst
-   Components/TUI/index.rst
+   Components/Auto/index.rst
 
 Indices and tables
 ==================

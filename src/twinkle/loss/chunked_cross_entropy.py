@@ -26,7 +26,8 @@ def _get_chunked_ce_func():
 
         @staticmethod
         def forward(ctx, logits, labels, chunk_size, ignore_index, reduction, dft):
-            ctx.save_for_backward(logits, labels)
+            ctx.save_for_backward(labels)
+            ctx._logits = logits
             ctx.chunk_size = chunk_size
             ctx.ignore_index = ignore_index
             ctx.reduction = reduction
@@ -58,7 +59,9 @@ def _get_chunked_ce_func():
 
         @staticmethod
         def backward(ctx, grad_output):
-            logits, labels = ctx.saved_tensors
+            labels, = ctx.saved_tensors
+            logits = ctx._logits
+            ctx._logits = None
             chunk_size = ctx.chunk_size
             ignore_index = ctx.ignore_index
             reduction = ctx.reduction
@@ -69,9 +72,9 @@ def _get_chunked_ce_func():
             else:
                 scale = grad_output
 
-            grad_logits = torch.empty_like(logits)
             n = logits.shape[0]
-
+            # Write gradients in-place into logits to avoid allocating a
+            # second [N, V] tensor (halves peak backward memory).
             for start in range(0, n, chunk_size):
                 end = min(start + chunk_size, n)
                 logits_chunk = logits[start:end].detach().requires_grad_(True)
@@ -85,10 +88,10 @@ def _get_chunked_ce_func():
                     loss_chunk = (per_token * mask).sum()
 
                 grad_chunk = torch.autograd.grad(loss_chunk, logits_chunk, retain_graph=False)[0]
-                grad_logits[start:end] = grad_chunk * scale
+                logits.data[start:end] = grad_chunk * scale
 
             # logits, labels, chunk_size, ignore_index, reduction, dft
-            return grad_logits, None, None, None, None, None
+            return logits, None, None, None, None, None
 
     _CHUNKED_CE_FUNC = _ChunkedCrossEntropyFunc
     return _CHUNKED_CE_FUNC
