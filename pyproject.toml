@@ -48,8 +48,8 @@ server = [
   "opentelemetry-instrumentation-logging",
 ]
 test = [
-  "hypothesis>=6.0", 
-  "pytest", 
+  "hypothesis>=6.0",
+  "pytest",
   "pytest-asyncio"
 ]
 docs = [

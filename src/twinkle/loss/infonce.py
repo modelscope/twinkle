@@ -109,10 +109,9 @@ class InfonceLoss(Loss):
         **kwargs,
     ):
         if mask_fake_negative and fake_neg_margin <= 0:
-            raise ValueError(
-                f'fake_neg_margin must be > 0 when mask_fake_negative=True, got {fake_neg_margin}. '
-                'A non-positive margin would mask out the positive itself or every above-positive '
-                'logit indiscriminately, collapsing the contrastive signal.')
+            raise ValueError(f'fake_neg_margin must be > 0 when mask_fake_negative=True, got {fake_neg_margin}. '
+                             'A non-positive margin would mask out the positive itself or every above-positive '
+                             'logit indiscriminately, collapsing the contrastive signal.')
         self.temperature = temperature
         self.use_batch = use_batch
         self.hard_negatives = hard_negatives
@@ -149,7 +148,7 @@ class InfonceLoss(Loss):
 
         def _pad_gather(tensor: torch.Tensor):
             if tensor.shape[0] < max_n:
-                pad_shape = (max_n - tensor.shape[0],) + tuple(tensor.shape[1:])
+                pad_shape = (max_n - tensor.shape[0], ) + tuple(tensor.shape[1:])
                 padded = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=0)
             else:
                 padded = tensor

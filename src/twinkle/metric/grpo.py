@@ -258,10 +258,9 @@ class GRPOMetric(Metric):
                 merged = torch.cat(label_tensors, dim=0)
                 inputs_list = [{'labels': merged}]
             else:
-                logger.warning(
-                    f'GRPOMetric: logps is a single tensor but inputs_list has '
-                    f'{len(inputs_list)} mb with mismatched seq_lens={sorted(seq_lens)}. '
-                    f'Only mb[0] will be accumulated; check the model forward path.')
+                logger.warning(f'GRPOMetric: logps is a single tensor but inputs_list has '
+                               f'{len(inputs_list)} mb with mismatched seq_lens={sorted(seq_lens)}. '
+                               f'Only mb[0] will be accumulated; check the model forward path.')
 
         flat_old: Optional[List] = None
         if old_logps is not None and isinstance(old_logps, (list, tuple)):
@@ -298,10 +297,9 @@ class GRPOMetric(Metric):
                     if mb_idx == 0:
                         # Warn once per accumulate call (not per mb) to avoid log spam.
                         old_shape = tuple(old_logps.shape) if _torch.is_tensor(old_logps) else 'unknown'
-                        logger.warning(
-                            f'GRPOMetric: old_logps shape {old_shape} does not match '
-                            f'logps_mb shape {tuple(logps_mb.shape)}; ratio/kl metrics will '
-                            f'be skipped for this step.')
+                        logger.warning(f'GRPOMetric: old_logps shape {old_shape} does not match '
+                                       f'logps_mb shape {tuple(logps_mb.shape)}; ratio/kl metrics will '
+                                       f'be skipped for this step.')
                     old_slice = None
             else:
                 old_slice = None

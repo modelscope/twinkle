@@ -6,8 +6,9 @@ Reference:
     "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
     (https://arxiv.org/abs/2305.18290)
 """
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import math
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 from twinkle.utils.torch_utils import selective_log_softmax
@@ -135,9 +136,8 @@ class DPOLoss(PreferenceLossBase):
         if loss_type not in ('sigmoid', 'hinge', 'ipo', 'kto_pair'):
             raise ValueError(f'Unknown loss_type: {loss_type}')
         if label_smoothing > 0 and loss_type != 'sigmoid':
-            raise ValueError(
-                f'label_smoothing > 0 is only defined for loss_type="sigmoid", '
-                f'got loss_type="{loss_type}". Set label_smoothing=0.0 or switch to sigmoid.')
+            raise ValueError(f'label_smoothing > 0 is only defined for loss_type="sigmoid", '
+                             f'got loss_type="{loss_type}". Set label_smoothing=0.0 or switch to sigmoid.')
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.loss_type = loss_type

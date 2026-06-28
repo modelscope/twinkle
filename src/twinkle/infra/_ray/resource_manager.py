@@ -102,10 +102,10 @@ class ResourceManager:
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
-            assert cpu_nnodes <= len(self.cpu_nodes), (
-                f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
-                f'available CPU nodes: {len(self.cpu_nodes)}, ensure your ray cluster '
-                f'has enough nodes with sufficient CPU resources.')
+            assert cpu_nnodes <= len(
+                self.cpu_nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
+                                  f'available CPU nodes: {len(self.cpu_nodes)}, ensure your ray cluster '
+                                  f'has enough nodes with sufficient CPU resources.')
             for i in range(cpu_nnodes):
                 node = self.cpu_nodes[i]
                 node_cpu = int(node['Resources']['CPU'])

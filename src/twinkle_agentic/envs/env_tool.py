@@ -3,14 +3,15 @@
 from typing import Any, Dict, List, Optional
 
 from twinkle.data_format.message import Tool as ToolInfo
-
 from .base import Env, StepResult
 
 
 class EnvTool:
     """Wraps an Env as a Tool for ToolManager."""
 
-    def __init__(self, env: Env, tool_name: str = 'env_action',
+    def __init__(self,
+                 env: Env,
+                 tool_name: str = 'env_action',
                  description: str = 'Execute an action in the environment.',
                  parameters: Optional[Dict[str, Any]] = None):
         self._env = env
@@ -52,10 +53,14 @@ class EnvTool:
         tools = []
         for info in tool_infos:
             fn = info.get('function', {}) if isinstance(info, dict) else {}
-            tools.append(cls(
-                env=env,
-                tool_name=fn.get('name', 'env_action'),
-                description=fn.get('description', ''),
-                parameters=fn.get('parameters', {'type': 'object', 'properties': {}}),
-            ))
+            tools.append(
+                cls(
+                    env=env,
+                    tool_name=fn.get('name', 'env_action'),
+                    description=fn.get('description', ''),
+                    parameters=fn.get('parameters', {
+                        'type': 'object',
+                        'properties': {}
+                    }),
+                ))
         return tools

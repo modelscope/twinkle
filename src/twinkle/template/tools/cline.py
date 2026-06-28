@@ -149,6 +149,6 @@ class ClineParser(ToolCallParser):
         out.append(text[last:])
         return ''.join(out).rstrip()
 
-    def extract_tool_result(self, text: str) -> Optional[str]:
+    def extract_tool_result(self, text: str) -> str | None:
         m = _RESULT_RE.match(text or '')
         return text[m.end():] if m else None

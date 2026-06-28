@@ -262,9 +262,8 @@ class MultiTurnRollout(Rollout):
     def _resolve_tool_managers(arg, n: int) -> List[ToolManager]:
         """Broadcast a single ``ToolManager`` or validate a per-trajectory list."""
         if arg is None:
-            raise ValueError(
-                'tool_manager is required but was not provided. '
-                'Pass it at construction time or as a per-call kwarg.')
+            raise ValueError('tool_manager is required but was not provided. '
+                             'Pass it at construction time or as a per-call kwarg.')
         if isinstance(arg, list):
             if len(arg) != n:
                 raise ValueError(f'per-call tool_manager list length ({len(arg)}) does '

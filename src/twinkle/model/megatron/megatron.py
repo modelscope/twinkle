@@ -1115,7 +1115,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 f.write(str(iteration))
 
         logger.info(f'Saved mcore optimizer state at iteration {iteration} '
-                                         f'to {checkpoint_dir}')
+                    f'to {checkpoint_dir}')
 
     def _load_mcore_optimizer(
         self,
@@ -1216,7 +1216,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             dist.barrier()
 
         logger.info(f'Resumed from mcore checkpoint at iteration {iteration} '
-                                         f'from {checkpoint_dir}')
+                    f'from {checkpoint_dir}')
 
     @staticmethod
     def _read_iteration(tracker_path: str) -> int:

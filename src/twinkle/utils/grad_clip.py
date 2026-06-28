@@ -78,7 +78,7 @@ def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
 # ---------------------------------------------------------------------------
 
 
-def _normalize_grads(parameters: List[torch.nn.Parameter], num_tokens: int) -> List[torch.Tensor]:
+def _normalize_grads(parameters: list[torch.nn.Parameter], num_tokens: int) -> list[torch.Tensor]:
     """Divide every non-None gradient by *num_tokens* in-place and return the grad list."""
     if num_tokens <= 0:
         num_tokens = 1
@@ -97,8 +97,8 @@ def _normalize_grads(parameters: List[torch.nn.Parameter], num_tokens: int) -> L
 
 
 def _standard_clip_grad_norm(
-    parameters: List[torch.nn.Parameter],
-    grads: List[torch.Tensor],
+    parameters: list[torch.nn.Parameter],
+    grads: list[torch.Tensor],
     max_grad_norm: float,
     norm_type: float,
     group,
@@ -107,10 +107,7 @@ def _standard_clip_grad_norm(
     import torch
 
     topology = _detect_grad_topology(grads)
-    can_use_builtin = (
-        not topology.has_mixed_mesh
-        and (topology.all_dtensor or (topology.all_local and group is None))
-    )
+    can_use_builtin = (not topology.has_mixed_mesh and (topology.all_dtensor or (topology.all_local and group is None)))
 
     if can_use_builtin:
         # PyTorch built-in handles DTensor reduce via mesh ops and works for
@@ -142,11 +139,11 @@ class _GradTopology:
         self.has_mixed_mesh = has_mixed_mesh
 
 
-def _detect_grad_topology(grads: List[torch.Tensor]) -> _GradTopology:
+def _detect_grad_topology(grads: list[torch.Tensor]) -> _GradTopology:
     """Classify gradients as pure-DTensor, pure-local, or mixed."""
     has_dtensor = False
     has_local = False
-    mesh_keys: Set = set()
+    mesh_keys: set = set()
 
     for grad in grads:
         if hasattr(grad, 'to_local'):
@@ -170,7 +167,7 @@ def _detect_grad_topology(grads: List[torch.Tensor]) -> _GradTopology:
     )
 
 
-def _resolve_reduce_device(grads: List[torch.Tensor]):
+def _resolve_reduce_device(grads: list[torch.Tensor]):
     """Pick the device to host the all-reduce scalar (prefer accelerator)."""
     import torch
     import torch.distributed as dist
@@ -187,7 +184,7 @@ def _resolve_reduce_device(grads: List[torch.Tensor]):
 
 
 def _compute_total_norm(
-    grads: List[torch.Tensor],
+    grads: list[torch.Tensor],
     norm_type: float,
     device,
     group,
@@ -224,7 +221,7 @@ def _compute_total_norm(
     return float(total_tensor.item())
 
 
-def _apply_clip(grads: List[torch.Tensor], max_grad_norm: float, total_norm: float) -> None:
+def _apply_clip(grads: list[torch.Tensor], max_grad_norm: float, total_norm: float) -> None:
     """Scale gradients in-place if total_norm exceeds max_grad_norm."""
     clip_coef = max_grad_norm / (total_norm + 1e-6)
     if clip_coef < 1.0:
@@ -271,7 +268,7 @@ def _ep_aware_clip_grad_norm(
         if math.isinf(norm_type):
             total_norm = torch.maximum(non_ep_val, ep_val)
         else:
-            total_norm = (non_ep_val + ep_val) ** (1.0 / norm_type)
+            total_norm = (non_ep_val + ep_val)**(1.0 / norm_type)
 
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm, foreach=True)
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm, foreach=True)
@@ -308,7 +305,7 @@ def _local_norm_stat(params, norm_type: float):
     return _local_p_norm_stat(grads_local, norm_type, default_device)
 
 
-def _collect_local_grads(params) -> Tuple[List, 'torch.device']:
+def _collect_local_grads(params) -> tuple[list, torch.device]:
     """Extract local fp32 grad tensors and determine the compute device."""
     import torch
     from torch.distributed._tensor import DTensor
@@ -329,7 +326,7 @@ def _collect_local_grads(params) -> Tuple[List, 'torch.device']:
     return grads_local, default_device
 
 
-def _local_inf_norm(grads_local: List, device) -> 'torch.Tensor':
+def _local_inf_norm(grads_local: list, device) -> torch.Tensor:
     """Compute local max-abs norm."""
     import torch
     val = torch.tensor(0.0, device=device, dtype=torch.float32)
@@ -340,7 +337,7 @@ def _local_inf_norm(grads_local: List, device) -> 'torch.Tensor':
     return val
 
 
-def _local_p_norm_stat(grads_local: List, norm_type: float, device) -> 'torch.Tensor':
+def _local_p_norm_stat(grads_local: list, norm_type: float, device) -> torch.Tensor:
     """Compute sum of p-th powers of per-grad norms (foreach-accelerated)."""
     import torch
 
@@ -352,11 +349,8 @@ def _local_p_norm_stat(grads_local: List, norm_type: float, device) -> 'torch.Te
 
     # Try vectorized foreach path (private PyTorch util, may be absent in future).
     try:
-        from torch.utils._foreach_utils import (
-            _device_has_foreach_support,
-            _group_tensors_by_device_and_dtype,
-            _has_foreach_support,
-        )
+        from torch.utils._foreach_utils import (_device_has_foreach_support, _group_tensors_by_device_and_dtype,
+                                                _has_foreach_support)
     except ImportError:
         return _local_p_norm_stat_scalar(non_empty, p, val)
 
@@ -374,7 +368,7 @@ def _local_p_norm_stat(grads_local: List, norm_type: float, device) -> 'torch.Te
     return val
 
 
-def _local_p_norm_stat_scalar(grads: List, p: float, val) -> 'torch.Tensor':
+def _local_p_norm_stat_scalar(grads: list, p: float, val) -> torch.Tensor:
     """Scalar fallback for p-norm stat when foreach utilities are unavailable."""
     import torch
     device = val.device

@@ -15,15 +15,14 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function
 from twinkle.utils import get_logger
-
 from .base import Env, StepResult
 
 logger = get_logger()
 
-
 # ==========================================================================
 # Utilities
 # ==========================================================================
+
 
 def _import_env_class(path: str):
     """Import a class from 'module:ClassName' or 'module.ClassName'."""
@@ -32,18 +31,14 @@ def _import_env_class(path: str):
     elif '.' in path:
         module_path, class_name = path.rsplit('.', 1)
     else:
-        raise ValueError(
-            f"env_cls must be 'module.ClassName' or 'module:ClassName', got {path!r}"
-        )
+        raise ValueError(f"env_cls must be 'module.ClassName' or 'module:ClassName', got {path!r}")
     try:
         module = importlib.import_module(module_path)
     except ModuleNotFoundError as e:
         missing = getattr(e, 'name', None) or ''
         if missing == module_path or missing == module_path.split('.')[0]:
-            raise ModuleNotFoundError(
-                f"Cannot import module {module_path!r}. "
-                f"Make sure it is installed or on PYTHONPATH."
-            ) from e
+            raise ModuleNotFoundError(f"Cannot import module {module_path!r}. "
+                                      f"Make sure it is installed or on PYTHONPATH.") from e
         raise
     cls = getattr(module, class_name, None)
     if cls is None:
@@ -114,18 +109,17 @@ def _collect_batch(results, device_mesh=None):
 # OpenEnv: embedded adapter (replaces HTTP server)
 # ==========================================================================
 
+
 def _discover_openenv_classes(env_name: str):
     """Auto-discover Environment and Action classes from an OpenEnv package."""
     import pkgutil
     try:
         pkg = importlib.import_module(env_name)
     except ModuleNotFoundError:
-        raise ModuleNotFoundError(
-            f"Cannot import '{env_name}'. Install the environment package:\n"
-            f"  pip install openenv-{env_name.replace('_', '-')}\n"
-            f"Or from source:\n"
-            f"  pip install -e /path/to/OpenEnv/envs/{env_name}"
-        )
+        raise ModuleNotFoundError(f"Cannot import '{env_name}'. Install the environment package:\n"
+                                  f"  pip install openenv-{env_name.replace('_', '-')}\n"
+                                  f"Or from source:\n"
+                                  f"  pip install -e /path/to/OpenEnv/envs/{env_name}")
 
     action_cls = None
     for name in getattr(pkg, '__all__', dir(pkg)):
@@ -138,18 +132,14 @@ def _discover_openenv_classes(env_name: str):
     try:
         server_pkg = importlib.import_module(f'{env_name}.server')
     except ImportError:
-        raise ImportError(
-            f"Cannot import '{env_name}.server'. "
-            f"Make sure the package is correctly installed."
-        )
+        raise ImportError(f"Cannot import '{env_name}.server'. "
+                          f"Make sure the package is correctly installed.")
     for _importer, modname, _ispkg in pkgutil.iter_modules(server_pkg.__path__):
         if modname.endswith('_environment') or modname.endswith('_env'):
             mod = importlib.import_module(f'{env_name}.server.{modname}')
             for attr_name in dir(mod):
                 obj = getattr(mod, attr_name)
-                if (isinstance(obj, type)
-                        and attr_name.endswith('Environment')
-                        and attr_name != 'Environment'
+                if (isinstance(obj, type) and attr_name.endswith('Environment') and attr_name != 'Environment'
                         and attr_name != 'MCPEnvironment'):
                     env_cls = obj
                     break
@@ -157,10 +147,8 @@ def _discover_openenv_classes(env_name: str):
                 break
 
     if env_cls is None:
-        raise ImportError(
-            f"Cannot discover Environment class in '{env_name}.server'. "
-            f"Expected a '*Environment' class in a '*_environment.py' module."
-        )
+        raise ImportError(f"Cannot discover Environment class in '{env_name}.server'. "
+                          f"Expected a '*Environment' class in a '*_environment.py' module.")
     return env_cls, action_cls
 
 
@@ -174,13 +162,10 @@ class OpenEnv(Env):
         result = env.step('play', {'action': 'hit'})
     """
 
-    def __init__(self, env_name=None, env_cls=None, env_kwargs=None,
-                 action_cls=None, action_mapper=None, **kwargs):
+    def __init__(self, env_name=None, env_cls=None, env_kwargs=None, action_cls=None, action_mapper=None, **kwargs):
         if env_cls is None and env_name is None:
-            raise ValueError(
-                "Either 'env_name' or 'env_cls' is required. "
-                "Example: OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'})"
-            )
+            raise ValueError("Either 'env_name' or 'env_cls' is required. "
+                             "Example: OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'})")
         if env_name and env_cls is None:
             resolved_cls, discovered_action_cls = _discover_openenv_classes(env_name)
             if action_cls is None:
@@ -225,6 +210,7 @@ class OpenEnv(Env):
 # EnvPool: distributed environment pool (OpenEnv-specific)
 # ==========================================================================
 
+
 @remote_class(execute='all')
 class EnvPool:
     """Distributed pool of OpenEnv instances managed as a Twinkle remote_class.
@@ -232,9 +218,11 @@ class EnvPool:
     Environments are sharded across workers. Each worker manages pool_size // num_workers slots.
     """
 
-    def __init__(self, pool_size: int = 32,
+    def __init__(self,
+                 pool_size: int = 32,
                  device_mesh: Optional[DeviceMesh] = None,
-                 env_kwargs: Optional[Dict[str, Any]] = None, **kwargs):
+                 env_kwargs: Optional[Dict[str, Any]] = None,
+                 **kwargs):
         self._pool_size = pool_size
         self._env_kwargs = env_kwargs or {}
 
@@ -246,9 +234,7 @@ class EnvPool:
         local_size = self._end - self._start
 
         self._episode_rewards: List[float] = [0.0] * local_size
-        self._envs: List[OpenEnv] = [
-            OpenEnv(**self._env_kwargs) for _ in range(local_size)
-        ]
+        self._envs: List[OpenEnv] = [OpenEnv(**self._env_kwargs) for _ in range(local_size)]
         logger.info(f'EnvPool initialized: pool_size={pool_size}, '
                     f'shard=[{self._start}, {self._end}), rank={rank}/{world_size}')
 
@@ -332,6 +318,7 @@ class EnvPool:
 # ==========================================================================
 # EnvPoolAdapter: wraps a single pool slot as standard Env
 # ==========================================================================
+
 
 class EnvPoolAdapter(Env):
     """Wraps a single slot in an EnvPool as a standard Env."""

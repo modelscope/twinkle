@@ -107,8 +107,7 @@ class InputProcessor:
                 # so tensor ops like labels != ignore_index or .to(device) would fail without this.
                 if isinstance(value, np.ndarray):
                     value = torch.from_numpy(value)
-                elif isinstance(value, list) and len(value) > 0 and isinstance(
-                        value[0], (int, float, np.number)):
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                     value = torch.tensor(value)
                 elif key == 'position_ids' and not isinstance(value, torch.Tensor):
                     if value is None:
@@ -798,5 +797,6 @@ class InputProcessor:
         if self.device_mesh.cp_world_size <= 1:
             return tensor
         from megatron.core import parallel_state as mpu
+
         from twinkle.utils.torch_utils import gather_cp_load_balanced
         return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)

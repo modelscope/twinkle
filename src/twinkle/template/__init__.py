@@ -2,4 +2,4 @@
 from .base import Template
 from .deepseek_v4 import DeepseekV4Template
 from .qwen3_5_vl import Qwen3_5Template
-from .tools import ToolCallParser, ToolCallRegistry, ClineParser, HermesQwenParser, ReActParser, VCPParser
+from .tools import ClineParser, HermesQwenParser, ReActParser, ToolCallParser, ToolCallRegistry, VCPParser

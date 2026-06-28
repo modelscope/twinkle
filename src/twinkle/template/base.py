@@ -299,11 +299,10 @@ class Template:
         # Split strategy
         if strategy == 'split':
             if self.is_mm:
-                raise ValueError(
-                    "truncation_strategy='split' is unsafe for multimodal templates: "
-                    'splitting input_ids across chunks breaks alignment with image tokens, '
-                    'and multimodal fields (pixel_values, image_grid_thw, ...) are not partitioned. '
-                    "Use 'left' / 'right' / 'delete' / 'raise' instead.")
+                raise ValueError("truncation_strategy='split' is unsafe for multimodal templates: "
+                                 'splitting input_ids across chunks breaks alignment with image tokens, '
+                                 'and multimodal fields (pixel_values, image_grid_thw, ...) are not partitioned. '
+                                 "Use 'left' / 'right' / 'delete' / 'raise' instead.")
             results = []
             for start in range(0, len(input_feature['input_ids']), self.max_length):
                 end = min(start + self.max_length, len(input_feature['input_ids']))
@@ -828,10 +827,18 @@ class Template:
         kwargs = to_device(self._post_encode(model, old_kwargs), device)
         for k, v in old_kwargs.items():
             if k in {
-                    'input_ids', 'attention_mask', 'labels', 'position_ids', 'output_hidden_states', 'logits_to_keep',
-                    'max_length_q', 'max_length_k',
-                    'cu_seq_lens_q', 'cu_seq_lens_k',
-                    'cu_seqlens_q', 'cu_seqlens_kv',
+                    'input_ids',
+                    'attention_mask',
+                    'labels',
+                    'position_ids',
+                    'output_hidden_states',
+                    'logits_to_keep',
+                    'max_length_q',
+                    'max_length_k',
+                    'cu_seq_lens_q',
+                    'cu_seq_lens_k',
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
                     'packed_seq_params',
             } and k not in kwargs:
                 kwargs[k] = v

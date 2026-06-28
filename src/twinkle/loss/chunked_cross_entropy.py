@@ -45,8 +45,9 @@ def _get_chunked_ce_func():
                 labels_chunk = labels[start:end]
                 mask = (labels_chunk != ignore_index).float()
 
-                logps = F.log_softmax(logits_chunk, dim=-1).gather(
-                    -1, labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+                logps = F.log_softmax(
+                    logits_chunk, dim=-1).gather(-1,
+                                                 labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
                 per_token = -logps * logps.exp() if dft else -logps
 
                 total_loss = total_loss + (per_token * mask).sum()
@@ -82,8 +83,9 @@ def _get_chunked_ce_func():
                 mask = (labels_chunk != ignore_index).float()
 
                 with torch.enable_grad():
-                    logps = F.log_softmax(logits_chunk, dim=-1).gather(
-                        -1, labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+                    logps = F.log_softmax(
+                        logits_chunk, dim=-1).gather(-1,
+                                                     labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
                     per_token = -logps * logps.exp() if dft else -logps
                     loss_chunk = (per_token * mask).sum()
 
@@ -118,12 +120,7 @@ class ChunkedCrossEntropyLoss(Loss):
     # where someone explicitly hands us pre-computed logps.
     require_logps = False
 
-    def __init__(self,
-                 chunk_size: int,
-                 ignore_index: int = -100,
-                 reduction: str = 'mean',
-                 dft: bool = False,
-                 **kwargs):
+    def __init__(self, chunk_size: int, ignore_index: int = -100, reduction: str = 'mean', dft: bool = False, **kwargs):
         super().__init__()
         assert chunk_size > 0, 'chunk_size must be positive'
         assert reduction in ('mean', 'sum'), f"reduction must be 'mean' or 'sum', got {reduction!r}"

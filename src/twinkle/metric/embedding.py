@@ -60,7 +60,7 @@ class EmbeddingMetric(Metric):
 
             def _pad_gather(tensor: 'torch.Tensor') -> 'List[torch.Tensor]':
                 if tensor.shape[0] < max_n:
-                    pad_shape = (max_n - tensor.shape[0],) + tuple(tensor.shape[1:])
+                    pad_shape = (max_n - tensor.shape[0], ) + tuple(tensor.shape[1:])
                     padded = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=0)
                 else:
                     padded = tensor

@@ -598,7 +598,7 @@ def train():
 
     condenser_sampler._ray_get_timeout = SAMPLER_TIMEOUT
     _sampler_epoch = 0
-    
+
     def _rebuild_sampler():
         """Kill stuck actors and recreate the vLLM sampler from scratch."""
         nonlocal condenser_sampler, _sampler_epoch

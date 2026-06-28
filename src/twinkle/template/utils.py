@@ -18,9 +18,8 @@ def _coerce_ids_to_list(ids: Any) -> List[int]:
     if isinstance(ids, torch.Tensor):
         while ids.dim() > 1:
             if ids.shape[0] != 1:
-                raise ValueError(
-                    '_coerce_ids_to_list expects a single-sample tensor (leading dims of size 1); '
-                    f'got shape {tuple(ids.shape)}. Pass one trajectory at a time.')
+                raise ValueError('_coerce_ids_to_list expects a single-sample tensor (leading dims of size 1); '
+                                 f'got shape {tuple(ids.shape)}. Pass one trajectory at a time.')
             ids = ids[0]
         return ids.tolist()
     return ids
@@ -98,9 +97,8 @@ def _transfer_single_message(
                 # More placeholders than provided media entries: stop scanning so the extra
                 # placeholder text is preserved verbatim instead of being silently consumed
                 # (which would make user-supplied media references vanish without warning).
-                logger.warning(
-                    f'placeholder {placeholder!r} appears more times than provided '
-                    f'{media_type} entries ({len(media_list)}); extra occurrences are kept as literal text.')
+                logger.warning(f'placeholder {placeholder!r} appears more times than provided '
+                               f'{media_type} entries ({len(media_list)}); extra occurrences are kept as literal text.')
                 break
             url = media_list[media_idx]
             placeholders.append((pos, len(placeholder), media_type, url))
@@ -348,12 +346,10 @@ class TokenizeByPlaceHolder:
                 if isinstance(msg['content'], str):
                     msg['content'] = placeholder
                 else:
-                    text_items = [c for c in msg['content']
-                                  if isinstance(c, dict) and c.get('type') == 'text']
+                    text_items = [c for c in msg['content'] if isinstance(c, dict) and c.get('type') == 'text']
                     if len(text_items) != 1:
-                        raise ValueError(
-                            'TokenizeByPlaceHolder requires exactly one text item in assistant '
-                            f'content, got {len(text_items)} (content={msg["content"]!r}).')
+                        raise ValueError('TokenizeByPlaceHolder requires exactly one text item in assistant '
+                                         f'content, got {len(text_items)} (content={msg["content"]!r}).')
                     text_items[0]['text'] = placeholder
                 assistant_count += 1
             _dummy_messages.append(msg)

@@ -34,8 +34,10 @@ class AccelerateStrategy:
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
         fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
-        kwargs_handlers = [InitProcessGroupKwargs(
-            timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))))]
+        kwargs_handlers = [
+            InitProcessGroupKwargs(
+                timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))))
+        ]
         if ddp_config is not None:
             from accelerate import DistributedDataParallelKwargs
             ddp_config = DistributedDataParallelKwargs(**ddp_config)
