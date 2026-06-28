@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
     --lr 1e-4 \
     --gradient-accumulation-steps 2 \
     --train-samples 500 \
+    --scheduler-cls CosineWarmupScheduler \
     --log-interval 10 \
     --model-name twinkle模型 \
     --model-author twinkle团队 \

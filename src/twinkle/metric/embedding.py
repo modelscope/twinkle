@@ -54,7 +54,7 @@ class EmbeddingMetric(Metric):
                 f'sentences/labels dim-0 mismatch: {sentences.shape[0]} vs {labels.shape[0]}')
             local_n = torch.tensor([sentences.shape[0]], device=sentences.device, dtype=torch.long)
             sizes = [torch.empty_like(local_n) for _ in range(world_size)]
-            dist.all_gather(sizes, local_n)
+            dist.all_gather(sizes, local_n, group=self.process_group)
             sizes_int = [int(s.item()) for s in sizes]
             max_n = max(sizes_int)
 
@@ -65,7 +65,7 @@ class EmbeddingMetric(Metric):
                 else:
                     padded = tensor
                 buffers = [torch.empty_like(padded) for _ in range(world_size)]
-                dist.all_gather(buffers, padded.contiguous())
+                dist.all_gather(buffers, padded.contiguous(), group=self.process_group)
                 return buffers
 
             sent_buffers = _pad_gather(sentences)

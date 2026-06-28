@@ -78,6 +78,7 @@ class SafeLossWrapper(Loss):
         self.require_logps = getattr(loss_instance, 'require_logps', True)
         self.require_entropy = getattr(loss_instance, 'require_entropy', False)
         self.require_logits = getattr(loss_instance, 'require_logits', False)
+        self.reduction = getattr(loss_instance, 'reduction', 'mean')
         self._nccl_safe_wrapped = True
 
     def __call__(self, inputs, outputs, **kwargs):

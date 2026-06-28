@@ -96,7 +96,7 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
                                           'under vocab tensor parallelism (TP>1).')
             # clone to avoid modifying the original logits
             return _vocab_parallel_selective_log_softmax(logits.clone(), index)
-    except (ImportError, AssertionError, OSError, RuntimeError):
+    except (ImportError, AssertionError, OSError):
         pass
 
     if logits.dtype in [torch.float32, torch.float64]:

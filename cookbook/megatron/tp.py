@@ -14,7 +14,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 logger = get_logger()
 args = CLI.from_args()
 
-device_mesh = DeviceMesh.from_sizes(dp_size=args.infra.dp_size, tp_size=args.infra.tp_size, pp_size=args.infra.pp_size)
+device_mesh = DeviceMesh.from_sizes(dp_size=args.infra.dp_size, tp_size=args.infra.tp_size, pp_size=args.infra.pp_size, cp_size=args.infra.cp_size)
 twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 

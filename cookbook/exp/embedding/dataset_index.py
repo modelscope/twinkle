@@ -704,7 +704,7 @@ def get_dataset(total: Optional[int] = None,
         ],
         dropped_log_path=dropped_log or '',
     )
-    dataset.map(qp, num_proc=32, load_from_cache_file=load_from_cache_file)
+    dataset.map(qp, batched=True, num_proc=32, load_from_cache_file=load_from_cache_file)
     return dataset
 
 
