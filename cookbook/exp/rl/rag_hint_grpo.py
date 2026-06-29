@@ -34,6 +34,7 @@ from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.loss import InfonceLoss
 from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
@@ -52,8 +53,8 @@ MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 # GPU layout: 1 condenser + 1 embedding + 4 rollout + 2 train = 8
 CONDENSER_GPUS = int(os.environ.get('CONDENSER_GPUS', 1))
 EMB_GPUS = int(os.environ.get('EMB_GPUS', 1))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 2))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 NUM_GPUS = CONDENSER_GPUS + EMB_GPUS + SAMPLER_GPUS + MODEL_GPUS
 
 # Training hyperparams
@@ -63,7 +64,7 @@ LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 5000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 1))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 100))
 
@@ -495,7 +496,7 @@ def main():
                     device_type='GPU'),
     ]
 
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, fsdp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, tp_size=SAMPLER_GPUS)
     emb_mesh = DeviceMesh.from_sizes(world_size=EMB_GPUS, dp_size=EMB_GPUS)
     condenser_mesh = DeviceMesh.from_sizes(world_size=CONDENSER_GPUS, dp_size=CONDENSER_GPUS)
@@ -530,6 +531,7 @@ def main():
     emb_model = TransformersModel(
         model_id=EMBED_MODEL_ID, device_mesh=emb_mesh, remote_group='emb_model')
     emb_model.set_processor(InputProcessor)
+    emb_model.set_loss(InfonceLoss, temperature=0.03, use_batch=True)
     emb_template = Qwen3_5Template(
         model_id=EMBED_MODEL_ID, max_length=EMBED_MAX_LENGTH,
         truncation_strategy='delete', enable_thinking=False)
@@ -590,6 +592,15 @@ def main():
     # -- Prefetch: overlap RAG data preparation with training --
     prefetch_pool = ThreadPoolExecutor(max_workers=1)
 
+    def _extract_text(content) -> str:
+        """Extract plain text from content (str or list-of-parts format)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return ''.join(
+                p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+        return str(content) if content else ''
+
     def prepare_rag_batch(batch):
         """Embed → retrieve → condense → build prompts. Runs in background thread."""
         problems = []
@@ -599,7 +610,7 @@ def main():
             prob = ''
             for m in msgs:
                 if m.get('role') == 'user':
-                    prob = m.get('content', '')
+                    prob = _extract_text(m.get('content', ''))
                     break
             problems.append(prob)
             ud = item.get('user_data', [])
