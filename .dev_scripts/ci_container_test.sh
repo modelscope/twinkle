@@ -1,5 +1,5 @@
 install_twinkle_with_kernels() {
-    pip install ".[kernels,test,tinker]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[kernels,test,tinker]"
+    pip install ".[test,client,server]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[test,client,server]"
 }
 
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
@@ -28,6 +28,9 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip uninstall tensorflow -y
     # Pin kernels<0.15 to avoid transformers' hub_kernels.py LayerRepository
     # crash (huggingface/transformers#46291).
+    # Also pin huggingface_hub<0.31 to avoid strict dataclass validator
+    # rejecting PEP 604 union types (str | None) used in kernels.
+    pip install 'huggingface_hub<0.31'
     pip install 'kernels<0.15'
     pip install ray==2.48
     pip install optimum
@@ -41,6 +44,7 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
 else
     install_twinkle_with_kernels
     # Same kernels pin and peft bump for the release-image branch.
+    pip install 'huggingface_hub<0.31'
     pip install 'kernels<0.15'
     pip install --upgrade 'peft>=0.19.1'
     echo "Running case in release image, run case directly!"
