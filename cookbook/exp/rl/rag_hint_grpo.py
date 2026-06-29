@@ -16,6 +16,7 @@ Pipeline per step:
 Launch:
     python cookbook/exp/rl/rag_hint_grpo.py
 """
+import json
 import os
 import re
 import random
@@ -88,6 +89,13 @@ CONDENSE_MAX_TOKENS = 8192
 # Dataset
 AOPS_DATASET_ID = os.environ.get('AOPS_DATASET_ID', 'AI-MO/aops')
 AOPS_SEED = int(os.environ.get('AOPS_SEED', 100))
+
+# Decontamination & RAG fallback
+DECONTAM_THRESHOLD = float(os.environ.get('DECONTAM_THRESHOLD', 0.20))
+RAG_FALLBACK_SIM = float(os.environ.get('RAG_FALLBACK_SIM', 0.60))
+
+# Output / diagnostics
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './outputs/rag_hint_grpo')
 
 # Forced analysis prefix appended at the start of assistant response
 ANALYSIS_PREFIX = (
@@ -175,6 +183,30 @@ def _api_condense_single(api_client: OpenAIClient, messages: List[Dict]) -> Opti
 # ============================================================================
 # Embedding & Retrieval
 # ============================================================================
+def _normalize_for_ngram(text: str) -> str:
+    """Normalize text for n-gram comparison: strip LaTeX markup, lowercase."""
+    text = text.lower()
+    text = re.sub(r'\$+', '', text)
+    text = re.sub(r'\\[a-z]+\{([^}]*)\}', r'\1', text)
+    text = re.sub(r'\\[a-z]+', ' ', text)
+    text = re.sub(r'[{}\\^_$]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _ngram_jaccard(text_a: str, text_b: str, n: int = 13) -> float:
+    """13-gram character-level Jaccard similarity for decontamination."""
+    a = _normalize_for_ngram(text_a)
+    b = _normalize_for_ngram(text_b)
+    if len(a) < n or len(b) < n:
+        return 0.0
+    grams_a = set(a[i:i + n] for i in range(len(a) - n + 1))
+    grams_b = set(b[i:i + n] for i in range(len(b) - n + 1))
+    if not grams_a or not grams_b:
+        return 0.0
+    return len(grams_a & grams_b) / len(grams_a | grams_b)
+
+
 def _wrap_anchor(text: str) -> List[Dict[str, str]]:
     return [
         {'role': 'user', 'content': text},
@@ -202,29 +234,47 @@ def get_embeddings(model: TransformersModel, template: Qwen3_5Template,
     return emb[:n] if pad_n else emb
 
 
-def retrieve_topk(tbl, query_vecs: np.ndarray, sim_threshold: float
-                  ) -> List[List[Dict[str, str]]]:
-    """Retrieve top-K thinking_raw per query. Returns empty list if none above threshold."""
+def retrieve_topk(tbl, query_vecs: np.ndarray, problems: List[str],
+                  sim_threshold: float
+                  ) -> List[List[Dict[str, Any]]]:
+    """Retrieve top-K thinking_raw per query with decontamination and length filter.
+
+    Returns per-query list of dicts with keys: query, thinking, sim.
+    """
     results = []
-    for vec in query_vecs:
+    decontam_skipped = 0
+    for qi, vec in enumerate(query_vecs):
         hits = (
             tbl.search(vec.astype(np.float32).tolist())
             .metric('dot')
-            .limit(TOP_K + 10)
+            .limit(TOP_K + 50)
             .select(['query_raw', 'thinking_raw', '_distance'])
             .to_list()
         )
         matched = []
+        problem_text = problems[qi] if problems else ''
         for h in hits:
+            if len(matched) >= TOP_K:
+                break
             sim = 1.0 - h.get('_distance', 0.0)
             if sim < sim_threshold:
                 continue
+            q = h.get('query_raw', '')
             t = h.get('thinking_raw', '')
-            if t:
-                matched.append({'query': h.get('query_raw', ''), 'thinking': t, 'sim': sim})
-                if len(matched) >= TOP_K:
-                    break
+            if not t:
+                continue
+            # Decontamination: skip if retrieved problem is too similar to current
+            if DECONTAM_THRESHOLD > 0 and problem_text and q:
+                if _ngram_jaccard(problem_text, q) > DECONTAM_THRESHOLD:
+                    decontam_skipped += 1
+                    continue
+            # Drop traces exceeding max length (don't truncate — they'll be condensed poorly)
+            if len(t) > MAX_TRACE_LEN * 4:
+                continue
+            matched.append({'query': q, 'thinking': t, 'sim': sim})
         results.append(matched)
+    if decontam_skipped > 0:
+        logger.info(f'[decontam] skipped {decontam_skipped} leaked retrievals')
     return results
 
 
@@ -460,7 +510,8 @@ def main():
     model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor, padding_free=True)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID,
+                       enable_thinking=True, max_length=65536)
 
     # -- Rollout sampler --
     sampler = vLLMSampler(
@@ -472,7 +523,8 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID,
+                         enable_thinking=True, max_length=65536)
 
     # -- Embedding model --
     emb_model = TransformersModel(
@@ -536,7 +588,6 @@ def main():
     logger.info(get_device_placement())
 
     # -- Prefetch: overlap RAG data preparation with training --
-    from concurrent.futures import ThreadPoolExecutor
     prefetch_pool = ThreadPoolExecutor(max_workers=1)
 
     def prepare_rag_batch(batch):
@@ -561,7 +612,7 @@ def main():
 
         # Embed & retrieve
         query_vecs = get_embeddings(emb_model, emb_template, problems, EMB_GPUS)
-        retrieved = retrieve_topk(tbl, query_vecs, SIM_THRESHOLD)
+        retrieved = retrieve_topk(tbl, query_vecs, problems, SIM_THRESHOLD)
 
         # Condense (batch local vLLM + API fallback)
         condensed_examples: List[List[Dict[str, str]]] = [[] for _ in range(len(problems))]
@@ -615,11 +666,16 @@ def main():
                     condensed_examples[idx].append(
                         {'query': ret['query'], 'thinking': ret['thinking'][:MAX_TRACE_LEN]})
 
-        # Build prompts
+        # Build prompts with rag_fallback_sim check
         rag_prompts = []
+        rag_debug_records = []
         for i, prob in enumerate(problems):
             examples = condensed_examples[i]
-            if examples:
+            rets = retrieved[i]
+            best_sim = max((r['sim'] for r in rets), default=0.0)
+            use_rag = bool(examples) and best_sim >= RAG_FALLBACK_SIM
+
+            if use_rag:
                 parts = [SYSTEM_WITH_RAG_HEADER]
                 for eidx, ex in enumerate(examples, 1):
                     parts.append(EXAMPLE_TEMPLATE.format(
@@ -636,13 +692,33 @@ def main():
                     {'role': 'user', 'content': prob},
                 ],
                 'user_data': [('ground_truth', ground_truths[i])],
-                'assistant_prefix': ANALYSIS_PREFIX if examples else '',
+                'assistant_prefix': ANALYSIS_PREFIX if use_rag else '',
             }
             rag_prompts.append(prompt_feature)
 
-        return rag_prompts
+            # Diagnostic record
+            debug_rec = {
+                'problem': prob[:200],
+                'ground_truth': ground_truths[i],
+                'best_sim': round(best_sim, 4),
+                'num_retrieved': len(rets),
+                'num_condensed': len(examples),
+                'use_rag': use_rag,
+            }
+            if rets:
+                debug_rec['top_retrieved_query'] = rets[0]['query'][:200]
+            if examples:
+                debug_rec['condensed_len'] = len(examples[0].get('thinking', ''))
+            rag_debug_records.append(debug_rec)
+
+        return rag_prompts, rag_debug_records
 
     # Submit first batch prefetch
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    rag_log_path = os.path.join(OUTPUT_DIR, 'rag_diagnostics.jsonl')
+    rag_log_f = open(rag_log_path, 'a', encoding='utf-8')
+    logger.info(f'[rag] diagnostics → {rag_log_path}')
+
     batch_iter = iter(dataloader)
     pending_future = None
     try:
@@ -651,86 +727,105 @@ def main():
     except StopIteration:
         pass
 
-    while pending_future is not None:
-        if optim_step >= MAX_STEPS:
-            break
-
-        metrics.reset()
-        rag_prompts = pending_future.result()
-
-        # Submit next batch prefetch (overlaps with rollout + training)
-        pending_future = None
-        try:
-            next_batch = next(batch_iter)
-            pending_future = prefetch_pool.submit(prepare_rag_batch, next_batch)
-        except StopIteration:
-            pass
-
-        # ---- Expand for NUM_GENERATIONS and sample ----
-        expand_prompts = []
-        for prompt in rag_prompts:
-            expand_prompts.extend([prompt] * NUM_GENERATIONS)
-
-        ckpt_manager.sync_weights(merge_and_sync=False)
-        sampler.reset_prefix_cache()
-
-        sample_responses = sampler.sample(expand_prompts, sampling_params)
-
-        # ---- Collect rollouts ----
-        all_input_data: List[Dict[str, Any]] = []
-        all_old_logps: List[List[float]] = []
-        all_completion_lengths: List[int] = []
-
-        for sample_response in sample_responses:
-            for sequence in sample_response.sequences:
-                all_input_data.append(sequence.new_input_feature)
-                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
-                all_completion_lengths.append(len(sequence.tokens))
-
-        # ---- Rewards ----
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(all_input_data)
-
-        metrics.accumulate(
-            completion_lengths=all_completion_lengths,
-            rewards={
-                'total': total_rewards,
-                'format': format_rewards,
-                'accuracy': accuracy_rewards,
-            },
-        )
-
-        # ---- GRPO advantage ----
-        advantages = advantage_fn(
-            total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-        # ---- Mini-batch training ----
-        total_completions = len(all_input_data)
-        for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
-            mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
-            mb_inputs = all_input_data[mb_start:mb_end]
-            mb_old_logps = all_old_logps[mb_start:mb_end]
-            mb_advantages = advantages[mb_start:mb_end]
-
-            model.forward_backward(
-                inputs=mb_inputs,
-                old_logps=mb_old_logps,
-                advantages=mb_advantages,
-                micro_batch_size=MICRO_BATCH_SIZE,
-            )
-            model.clip_grad_and_step()
-            optim_step += 1
-
+    try:
+        while pending_future is not None:
             if optim_step >= MAX_STEPS:
                 break
-            if optim_step % SAVE_STEPS == 0:
-                model.save(f'rag-hint-grpo-checkpoint-{optim_step}')
 
-        log_dict = metrics.calculate()
-        log_dict.update(model.calculate_metric(is_training=True))
-        metrics.reset()
-        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
+            metrics.reset()
+            rag_prompts, rag_debug_records = pending_future.result()
 
-    prefetch_pool.shutdown(wait=False)
+            # Write RAG diagnostics
+            for rec in rag_debug_records:
+                rec['step'] = optim_step
+                rag_log_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            rag_log_f.flush()
+
+            # Submit next batch prefetch (overlaps with rollout + training)
+            pending_future = None
+            try:
+                next_batch = next(batch_iter)
+                pending_future = prefetch_pool.submit(prepare_rag_batch, next_batch)
+            except StopIteration:
+                pass
+
+            # ---- Expand for NUM_GENERATIONS and sample ----
+            expand_prompts = []
+            for prompt in rag_prompts:
+                expand_prompts.extend([prompt] * NUM_GENERATIONS)
+
+            ckpt_manager.sync_weights(merge_and_sync=False)
+            sampler.reset_prefix_cache()
+
+            sample_responses = sampler.sample(expand_prompts, sampling_params)
+
+            # ---- Collect rollouts ----
+            all_input_data: List[Dict[str, Any]] = []
+            all_old_logps: List[List[float]] = []
+            all_completion_lengths: List[int] = []
+
+            for sample_response in sample_responses:
+                for sequence in sample_response.sequences:
+                    all_input_data.append(sequence.new_input_feature)
+                    all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                    all_completion_lengths.append(len(sequence.tokens))
+
+            # ---- Rewards ----
+            total_rewards, format_rewards, accuracy_rewards = compute_rewards(all_input_data)
+
+            # Per-step reward summary to diagnostics
+            n_correct = sum(1 for a in accuracy_rewards if a > 0)
+            rag_log_f.write(json.dumps({
+                'step': optim_step, 'type': 'reward_summary',
+                'n_samples': len(accuracy_rewards),
+                'accuracy': n_correct / len(accuracy_rewards) if accuracy_rewards else 0,
+                'mean_reward': sum(total_rewards) / len(total_rewards) if total_rewards else 0,
+            }, ensure_ascii=False) + '\n')
+            rag_log_f.flush()
+
+            metrics.accumulate(
+                completion_lengths=all_completion_lengths,
+                rewards={
+                    'total': total_rewards,
+                    'format': format_rewards,
+                    'accuracy': accuracy_rewards,
+                },
+            )
+
+            # ---- GRPO advantage ----
+            advantages = advantage_fn(
+                total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+
+            # ---- Mini-batch training ----
+            total_completions = len(all_input_data)
+            for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
+                mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
+                mb_inputs = all_input_data[mb_start:mb_end]
+                mb_old_logps = all_old_logps[mb_start:mb_end]
+                mb_advantages = advantages[mb_start:mb_end]
+
+                model.forward_backward(
+                    inputs=mb_inputs,
+                    old_logps=mb_old_logps,
+                    advantages=mb_advantages,
+                    micro_batch_size=MICRO_BATCH_SIZE,
+                )
+                model.clip_grad_and_step()
+                optim_step += 1
+
+                if optim_step >= MAX_STEPS:
+                    break
+                if optim_step % SAVE_STEPS == 0:
+                    model.save(f'rag-hint-grpo-checkpoint-{optim_step}')
+
+            log_dict = metrics.calculate()
+            log_dict.update(model.calculate_metric(is_training=True))
+            metrics.reset()
+            logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
+    finally:
+        prefetch_pool.shutdown(wait=False)
+        rag_log_f.close()
+
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('rag-hint-grpo-final')
 
