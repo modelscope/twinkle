@@ -13,9 +13,8 @@ in by merging:
 from __future__ import annotations
 
 import importlib
-from typing import Any
-
 import torch.nn as nn
+from typing import Any
 
 from twinkle import get_logger
 from twinkle.utils.device_mesh import Platform
@@ -34,15 +33,9 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     """Return the NPU builtin mapping; optionally apply per-instance FLA."""
     from .npu_impls.attention import npu_sdpa_attention_forward
     from .npu_impls.fla import apply_qwen3_5_fla
-    from .npu_impls.moe import (
-        npu_packed_moe_experts_forward,
-        npu_qwen3_5_moe_sparse_block_forward,
-    )
+    from .npu_impls.moe import npu_packed_moe_experts_forward, npu_qwen3_5_moe_sparse_block_forward
     from .npu_impls.rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
-    from .npu_impls.rotary import (
-        npu_apply_multimodal_rotary_pos_emb,
-        npu_apply_rotary_pos_emb,
-    )
+    from .npu_impls.rotary import npu_apply_multimodal_rotary_pos_emb, npu_apply_rotary_pos_emb
     from .npu_impls.swiglu import npu_swiglu_forward
 
     bundle: dict[Any, dict[str, Any]] = {}
@@ -60,20 +53,34 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     _add_qwen2_entries(bundle, NpuRMSNorm, npu_apply_rotary_pos_emb, npu_swiglu_forward)
     _add_qwen3_entries(bundle, NpuRMSNorm, npu_apply_rotary_pos_emb, npu_swiglu_forward)
     _add_qwen3_moe_entries(
-        bundle, NpuRMSNorm, npu_apply_rotary_pos_emb, npu_swiglu_forward,
-        npu_packed_moe_experts_forward, npu_qwen3_5_moe_sparse_block_forward,
+        bundle,
+        NpuRMSNorm,
+        npu_apply_rotary_pos_emb,
+        npu_swiglu_forward,
+        npu_packed_moe_experts_forward,
+        npu_qwen3_5_moe_sparse_block_forward,
     )
     _add_qwen2_5_vl_entries(
-        bundle, NpuRMSNorm, npu_apply_rotary_pos_emb, npu_swiglu_forward,
+        bundle,
+        NpuRMSNorm,
+        npu_apply_rotary_pos_emb,
+        npu_swiglu_forward,
         npu_apply_multimodal_rotary_pos_emb,
     )
     _add_qwen3_5_entries(
-        bundle, NpuRMSNorm, npu_gated_rms_norm_forward, npu_apply_rotary_pos_emb,
+        bundle,
+        NpuRMSNorm,
+        npu_gated_rms_norm_forward,
+        npu_apply_rotary_pos_emb,
         npu_swiglu_forward,
     )
     _add_qwen3_5_moe_entries(
-        bundle, NpuRMSNorm, npu_gated_rms_norm_forward, npu_apply_rotary_pos_emb,
-        npu_swiglu_forward, npu_packed_moe_experts_forward,
+        bundle,
+        NpuRMSNorm,
+        npu_gated_rms_norm_forward,
+        npu_apply_rotary_pos_emb,
+        npu_swiglu_forward,
+        npu_packed_moe_experts_forward,
         npu_qwen3_5_moe_sparse_block_forward,
     )
 
@@ -92,10 +99,7 @@ def _install_sdpa(impl) -> None:
     of ``npu_builtin()``.
     """
     try:
-        from transformers.modeling_utils import (
-            ALL_ATTENTION_FUNCTIONS,
-            AttentionInterface,
-        )
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
     except ImportError:
         return
     try:
@@ -106,6 +110,7 @@ def _install_sdpa(impl) -> None:
 
 
 # ---- helpers that conditionally add entries based on module availability ----
+
 
 def _add_class_if_present(bundle, module_path, class_name, impl_cls):
     mod = _import_optional(module_path)
@@ -192,8 +197,7 @@ def _add_qwen3_5_entries(bundle, rms_cls, gated_rms_fn, rope_fn, swiglu_fn):
     _add_attr_if_present(bundle, base, 'Qwen3_5GatedRMSNorm.forward', gated_rms_fn)
 
 
-def _add_qwen3_5_moe_entries(bundle, rms_cls, gated_rms_fn, rope_fn, swiglu_fn,
-                             experts_fn, sparse_fn):
+def _add_qwen3_5_moe_entries(bundle, rms_cls, gated_rms_fn, rope_fn, swiglu_fn, experts_fn, sparse_fn):
     base = 'transformers.models.qwen3_5_moe.modeling_qwen3_5_moe'
     if _import_optional(base) is None:
         return

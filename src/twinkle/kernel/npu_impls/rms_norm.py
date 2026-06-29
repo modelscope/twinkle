@@ -7,7 +7,6 @@ attributes already present on the original instance.
 from __future__ import annotations
 
 import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,9 +49,7 @@ class NpuRMSNorm(nn.Module):
 
 # Resolved once at import: matches the legacy "patch-time, process-wide" invariant.
 # Mid-process env mutation will not retroactively change behavior.
-_FORCE_FP32 = os.environ.get('TWINKLE_NPU_GATED_RMSNorm_FP32', '0').lower() in (
-    '1', 'true', 'on', 'yes'
-)
+_FORCE_FP32 = os.environ.get('TWINKLE_NPU_GATED_RMSNorm_FP32', '0').lower() in ('1', 'true', 'on', 'yes')
 
 
 def npu_gated_rms_norm_forward(self, hidden_states, gate=None):

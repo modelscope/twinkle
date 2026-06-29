@@ -47,8 +47,8 @@ def apply_qwen3_5_fla(model=None) -> int:
     #    fail to install the kernel, HF transformers would route Qwen3.5 onto
     #    a FLA fast path whose kernel is missing -> runtime failure on NPU.
     try:
-        from twinkle.kernel.chunk_gated_delta_rule import chunk_gated_delta_rule as mindspeed_fla
         from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
+        from twinkle.kernel.chunk_gated_delta_rule import chunk_gated_delta_rule as mindspeed_fla
     except ImportError as exc:
         logger.warning('[NPU] [FLA] MindSpeed unavailable: %s', exc)
         return 0
@@ -88,8 +88,7 @@ def apply_qwen3_5_fla(model=None) -> int:
 
     patched_instances = 0
     for _name, _module in root.named_modules():
-        if hasattr(_module, 'chunk_gated_delta_rule') and callable(
-                getattr(_module, 'chunk_gated_delta_rule')):
+        if hasattr(_module, 'chunk_gated_delta_rule') and callable(getattr(_module, 'chunk_gated_delta_rule')):
             if _module.chunk_gated_delta_rule is not mindspeed_fla:
                 _module.chunk_gated_delta_rule = mindspeed_fla
                 _module._twinkle_npu_patched = True

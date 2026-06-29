@@ -6,10 +6,9 @@ Public API: ``kernelize``, ``hub`` (re-exported from ``twinkle.kernel``).
 from __future__ import annotations
 
 import importlib
+import torch.nn as nn
 from dataclasses import dataclass
 from typing import Any
-
-import torch.nn as nn
 
 from twinkle.utils.device_mesh import Platform
 
@@ -47,7 +46,6 @@ def hub(
         raise ValueError(f"Hub ref must be 'repo_id:LayerName', got: {ref!r}")
     repo_id, layer_name = ref.rsplit(':', 1)
     return HubRef(repo_id, layer_name, revision, version, backend, trust_remote_code)
-
 
 
 def _resolve_value(value: Any, device: str) -> Any | None:
@@ -116,10 +114,8 @@ def _load_hub_ref(ref: HubRef):
     try:
         from kernels import get_kernel
     except ImportError as e:
-        raise ImportError(
-            'Loading a Hub kernel requires the `kernels` package. '
-            'Install it with `pip install kernels`.'
-        ) from e
+        raise ImportError('Loading a Hub kernel requires the `kernels` package. '
+                          'Install it with `pip install kernels`.') from e
 
     kernel = get_kernel(
         ref.repo_id,

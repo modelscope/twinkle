@@ -15,8 +15,12 @@ class GmmFunction(torch.autograd.Function):
         group_list = group_list.to(torch.int64)
         ctx.save_for_backward(x, group_list, weight_ekn)
         outputs = torch_npu.npu_grouped_matmul(
-            [x], [weight_ekn], group_list=group_list,
-            group_type=0, split_item=2, group_list_type=1,
+            [x],
+            [weight_ekn],
+            group_list=group_list,
+            group_type=0,
+            split_item=2,
+            group_list_type=1,
         )
         return outputs[0]
 
@@ -25,14 +29,22 @@ class GmmFunction(torch.autograd.Function):
         import torch_npu
         x, group_list, weight_ekn = ctx.saved_tensors
         grad_input = torch_npu.npu_grouped_matmul(
-            [grad_output], [weight_ekn.transpose(-2, -1).contiguous()],
-            bias=None, group_list=group_list,
-            group_type=0, split_item=2, group_list_type=1,
+            [grad_output],
+            [weight_ekn.transpose(-2, -1).contiguous()],
+            bias=None,
+            group_list=group_list,
+            group_type=0,
+            split_item=2,
+            group_list_type=1,
         )[0]
         grad_weight = torch_npu.npu_grouped_matmul(
-            [x.transpose(0, 1)], [grad_output],
-            bias=None, group_list=group_list,
-            group_type=2, split_item=3, group_list_type=1,
+            [x.transpose(0, 1)],
+            [grad_output],
+            bias=None,
+            group_list=group_list,
+            group_type=2,
+            split_item=3,
+            group_list_type=1,
         )[0]
         return grad_input, None, grad_weight.contiguous()
 
@@ -67,20 +79,16 @@ def _normalize_packed_expert_weights(module, input_dtype, hidden_dim):
 
 def _get_cached_expert_weights(self, target_dtype, hidden_dim):
     requires_grad = (
-        getattr(self.gate_up_proj, 'requires_grad', False)
-        or getattr(self.down_proj, 'requires_grad', False)
-    )
+        getattr(self.gate_up_proj, 'requires_grad', False) or getattr(self.down_proj, 'requires_grad', False))
     cache_attr = '_npu_expert_cache'
     if not requires_grad and hasattr(self, cache_attr):
         cached_dtype, cached_gv, cached_dv, cached = getattr(self, cache_attr)
-        if (cached_dtype == target_dtype
-                and cached_gv == self.gate_up_proj._version
+        if (cached_dtype == target_dtype and cached_gv == self.gate_up_proj._version
                 and cached_dv == self.down_proj._version):
             return cached
     weights = _normalize_packed_expert_weights(self, target_dtype, hidden_dim)
     if not requires_grad:
-        setattr(self, cache_attr,
-                (target_dtype, self.gate_up_proj._version, self.down_proj._version, weights))
+        setattr(self, cache_attr, (target_dtype, self.gate_up_proj._version, self.down_proj._version, weights))
     return weights
 
 

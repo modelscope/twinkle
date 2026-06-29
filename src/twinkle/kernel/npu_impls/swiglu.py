@@ -16,5 +16,4 @@ def npu_swiglu_forward(self, hidden_state):
         torch_npu.npu_swiglu(
             torch.cat((self.gate_proj(hidden_state), self.up_proj(hidden_state)), dim=-1),
             dim=-1,
-        )
-    )
+        ))
