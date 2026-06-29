@@ -430,7 +430,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         with _resolve_task_context(self.model, task):
             outputs = self.model(**inputs)
         inputs['labels'] = labels
-        if labels is not None and loss_require_logps:
+        if task != 'embedding' and labels is not None and loss_require_logps:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
@@ -509,7 +509,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             with _resolve_task_context(self.model, task), lora_ctx:
                 outputs = self.model(**inputs)
             inputs['labels'] = labels
-            if labels is not None and loss_require_logps:
+            if task != 'embedding' and labels is not None and loss_require_logps:
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
