@@ -26,12 +26,6 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip uninstall autoawq -y
     pip uninstall lmdeploy -y
     pip uninstall tensorflow -y
-    # Pin kernels<0.15 to avoid transformers' hub_kernels.py LayerRepository
-    # crash (huggingface/transformers#46291).
-    # Also pin huggingface_hub<0.31 to avoid strict dataclass validator
-    # rejecting PEP 604 union types (str | None) used in kernels.
-    pip install 'huggingface_hub<0.31'
-    pip install 'kernels<0.15'
     pip install ray==2.48
     pip install optimum
 
@@ -41,12 +35,18 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     # `from transformers import HybridCache` at peft_model.py:37 which
     # crashes on transformers v5. 0.19.1 dropped that top-level import.
     pip install --upgrade 'peft>=0.19.1'
+    # Pin huggingface_hub AFTER main install to prevent transitive upgrade.
+    # kernels<0.15 uses str | None (PEP 604) which newer huggingface_hub's
+    # strict dataclass validator rejects (huggingface/transformers#46291).
+    pip install 'huggingface_hub<0.31'
+    pip install 'kernels<0.15'
 else
     install_twinkle_with_kernels
     # Same kernels pin and peft bump for the release-image branch.
+    pip install --upgrade 'peft>=0.19.1'
+    # Pin huggingface_hub AFTER main install (same reason as debug branch).
     pip install 'huggingface_hub<0.31'
     pip install 'kernels<0.15'
-    pip install --upgrade 'peft>=0.19.1'
     echo "Running case in release image, run case directly!"
 fi
 # remove torch_extensions folder to avoid ci hang.
