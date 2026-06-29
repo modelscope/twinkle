@@ -221,15 +221,15 @@ class TestTokenSoupFilterPipeline:
     def test_drops_soupy_assistant(self):
         f = TokenSoupFilter()
         rows = [_row('clean response'), _row('aaaaaaaaaaaaaaaaaaaaaaaaaaaaa')]
-        out = f(rows)
-        assert len(out) == 1
-        assert out[0]['messages'][1]['content'] == 'clean response'
+        kept, dropped = f(rows)
+        assert len(kept) == 1
+        assert kept[0]['messages'][1]['content'] == 'clean response'
 
     def test_keeps_row_without_assistant(self):
         f = TokenSoupFilter()
         rows = [{'messages': [{'role': 'user', 'content': 'q'}]}]
-        out = f(rows)
-        assert len(out) == 1
+        kept, dropped = f(rows)
+        assert len(kept) == 1
 
     def test_any_assistant_soupy_drops_row(self):
         f = TokenSoupFilter()
@@ -253,29 +253,32 @@ class TestTokenSoupFilterPipeline:
                 },
             ]
         }]
-        out = f(rows)
-        assert out == []
+        kept, dropped = f(rows)
+        assert kept == []
 
     def test_strips_whitespace_before_check(self):
         # Leading/trailing whitespace shouldn't bypass detection.
         f = TokenSoupFilter()
         rows = [_row('   ' + 'a' * 30 + '   ')]
-        assert f(rows) == []
+        kept, dropped = f(rows)
+        assert kept == []
 
     def test_threshold_overrides_propagated(self):
         # With a stricter ratio, even small amounts of \ufffd trip it.
         f = TokenSoupFilter(replacement_char_ratio=0.0)
         rows = [_row('hello\ufffdworld')]
-        assert f(rows) == []
+        kept, dropped = f(rows)
+        assert kept == []
 
     def test_empty_rows(self):
-        assert TokenSoupFilter()([]) == []
+        kept, dropped = TokenSoupFilter()([])
+        assert kept == []
 
     def test_messages_missing(self):
         f = TokenSoupFilter()
         rows = [{'id': 'no-msgs'}]
-        out = f(rows)
-        assert len(out) == 1
+        kept, dropped = f(rows)
+        assert len(kept) == 1
 
 
 if __name__ == '__main__':

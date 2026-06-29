@@ -194,6 +194,7 @@ class TestKernelizeModel:
         """Test returns original model when kernels disabled."""
         with patch('twinkle.kernel.layer.is_kernels_enabled', return_value=False):
             mock_model = Mock()
+            mock_model.parameters = Mock(return_value=iter([]))
             result = kernelize_model(mock_model)
             assert result == mock_model
 
@@ -201,6 +202,7 @@ class TestKernelizeModel:
     def test_kernelize_without_kernels_available(self, mock_available):
         """Test returns original model when kernels unavailable."""
         mock_model = Mock()
+        mock_model.parameters = Mock(return_value=iter([]))
         result = kernelize_model(mock_model)
         assert result == mock_model
 
@@ -305,6 +307,8 @@ class TestModeSupport:
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
     def test_register_with_mode_fallback(self, mock_available):
         """Test fallback mode mapping when mode is None."""
+        if not is_kernels_available():
+            pytest.skip('kernels package not available')
         from kernels import Mode
 
         from twinkle.kernel.layer import _to_hf_mode, register_layer_kernel
@@ -328,6 +332,8 @@ class TestModeSupport:
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
     def test_register_multiple_modes(self, mock_available):
         """Test registering multiple modes for the same layer."""
+        if not is_kernels_available():
+            pytest.skip('kernels package not available')
         registry = get_global_layer_registry()
 
         class MockRepo:

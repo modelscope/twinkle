@@ -237,6 +237,9 @@ class Template:
         def _extract_reasoning_content(messages: list[Message]) -> List[Message]:
             result = []
             for message in messages:
+                if not isinstance(message, dict):
+                    result.append(message)
+                    continue
                 message = message.copy()
                 if message.get('role') == 'assistant':
                     content = message.get('content', '')
