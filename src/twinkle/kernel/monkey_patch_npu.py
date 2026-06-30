@@ -923,6 +923,39 @@ def _discover_and_patch_unknown_models() -> int:
 
 
 # =============================================================================
+# Section 5b: DeepSeek-V4 NPU Sparse Attention / Lightning Indexer
+# =============================================================================
+
+
+def _apply_deepseek_v4_npu_patch(model=None) -> None:
+    sas_enabled = _is_env_enabled('TWINKLE_NPU_DSV4_SAS', default=False)
+    li_enabled = _is_env_enabled('TWINKLE_NPU_DSV4_LI', default=False)
+
+    if not sas_enabled and not li_enabled:
+        return
+
+    if sas_enabled and li_enabled:
+        raise ValueError(
+            '[NPU] [DSV4] TWINKLE_NPU_DSV4_SAS and TWINKLE_NPU_DSV4_LI cannot be enabled simultaneously. '
+            'Please enable only one.'
+        )
+
+    if model is not None:
+        config = getattr(model, 'hf_config', getattr(model, 'config', None))
+        archs = getattr(config, 'architectures', None) if config else None
+        if archs and 'DeepseekV4ForCausalLM' not in archs:
+            return
+
+    from .deepseek_v4_npu import apply_deepseek_v4_npu_patch
+    apply_deepseek_v4_npu_patch(model, sas_enabled=sas_enabled, li_enabled=li_enabled)
+
+    if sas_enabled:
+        logger.info('[NPU] [DSV4] SAS patch applied')
+    if li_enabled:
+        logger.info('[NPU] [DSV4] Lightning Indexer patch applied')
+
+
+# =============================================================================
 # Section 6: Public API
 # =============================================================================
 
@@ -957,6 +990,8 @@ def apply_npu_patch(model=None) -> None:
         When ``0``: disable the patch regardless.
       - ``TWINKLE_NPU_FLA``: FLA switch (``1``/``0``)
       - ``TWINKLE_NPU_GATED_RMSNorm_FP32``: force FP32 in Gated RMSNorm (``1``/``0``)
+      - ``TWINKLE_NPU_DSV4_SAS``: DeepSeek-V4 NPU Sparse Attention (``1``/``0``)
+      - ``TWINKLE_NPU_DSV4_LI``: DeepSeek-V4 NPU Lightning Indexer (``1``/``0``).
 
     Args:
         model: Optional model instance. If not provided, GMM patch is skipped.
@@ -980,6 +1015,8 @@ def apply_npu_patch(model=None) -> None:
     _apply_hf_moe_grouped_mm_patch(model)
 
     _apply_all_fused_ops(model)
+
+    _apply_deepseek_v4_npu_patch(model)
 
     _NPU_PATCH_APPLIED = True
     logger.info('[NPU] All patches applied successfully')
