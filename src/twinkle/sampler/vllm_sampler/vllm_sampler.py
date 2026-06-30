@@ -252,29 +252,23 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         for seq in response.sequences:
             if logprobs_only:
                 new_input_feature = _convert_ndarray_to_list(feat)
-                routed_experts = None
                 if seq.routed_experts is not None:
-                    routed_experts = _convert_ndarray_to_list(seq.routed_experts)
-                    new_input_feature['routed_experts'] = routed_experts
+                    new_input_feature['routed_experts'] = _convert_ndarray_to_list(seq.routed_experts)
                 sampled_seq = SampledSequence(
                     tokens=[],
                     stop_reason=seq.stop_reason,
                     new_input_feature=new_input_feature,
-                    routed_experts=routed_experts,
                 )
             else:
                 new_input_feature = _convert_ndarray_to_list(self.template.concat_input_feature(feat, seq.tokens))
-                routed_experts = None
                 if seq.routed_experts is not None:
-                    routed_experts = _convert_ndarray_to_list(seq.routed_experts)
-                    new_input_feature['routed_experts'] = routed_experts
+                    new_input_feature['routed_experts'] = _convert_ndarray_to_list(seq.routed_experts)
                 sampled_seq = SampledSequence(
                     stop_reason=seq.stop_reason,
                     tokens=seq.tokens,
                     logprobs=seq.logprobs,
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
-                    routed_experts=routed_experts,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(
