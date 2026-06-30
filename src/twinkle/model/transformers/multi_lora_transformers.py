@@ -32,6 +32,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
+            lora_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             max_loras: int = 5,
@@ -49,6 +50,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
+        self.lora_config = lora_config or {}
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
@@ -65,7 +67,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
+        elif self._should_init_empty_pretrained_model_on_this_rank():
+            self.model = self._init_empty_model_from_config(model_cls, **kwargs)
         else:
+            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
@@ -76,7 +81,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
-        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
+        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -108,6 +113,22 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         return super()._lazy_wrap_model()
+
+    def _maybe_apply_expert_parallel(self):
+        if self._memory_efficient_init:
+            raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')
+        return super()._maybe_apply_expert_parallel()
+
+    def _ensure_target_parameter_lora_installed(self, config: LoraConfig) -> None:
+        target_parameters = getattr(config, 'target_parameters', None)
+        if not target_parameters:
+            return
+        if self._model_wrapped:
+            raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
+        if getattr(self, '_enable_expert_parallel', False):
+            self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=True)
+            # self._maybe_apply_expert_parallel()   # 各rank广播之前不能对moe层进行分片, 没有实际权重时不能分片
+        self.multi_adapter.patch_target_parameters(self.model, target_parameters)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -201,6 +222,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             config_or_dir, str
         ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
         assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
+        config_or_dir = self.strategy.prepare_adapter_config(
+            config_or_dir,
+            enable_ep=getattr(self, '_enable_expert_parallel', False),
+        )
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
@@ -213,6 +238,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+        self._ensure_target_parameter_lora_installed(config_or_dir)
         self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
 
     @remote_function()
@@ -304,4 +330,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
-            return super()._get_trainable_parameters(real_adapter_name)
+            params = super()._get_trainable_parameters(real_adapter_name)
+            # Note: experts have registered LoraWrapper as a submodule, so its internal LoRA parameters
+            # are already captured automatically. Duplicating parameter capture here will cause
+            # optimizer errors due to duplicate keys.
+            # params.update(self.multi_adapter.get_target_parameter_trainable_parameters(adapter_name))
+            return params

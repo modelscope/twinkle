@@ -873,7 +873,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
+        # parameters to be missed by the optimizer.
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
