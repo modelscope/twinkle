@@ -23,8 +23,8 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 1))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 1))
-NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS * 2  # Two teacher samplers need separate GPU resources
-
+SHARED_TEACHER_GPUS = bool(os.environ.get('SHARED_TEACHER_GPUS', False))
+NUM_GPUS = MODEL_GPUS + (SAMPLER_GPUS if SHARED_TEACHER_GPUS else SAMPLER_GPUS * 2)
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 10))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))
@@ -264,10 +264,13 @@ def train():
 
         teacher_inputs = []
         for item in batch:
-            # Decode student tokens to text
+            # Decode student tokens back to text, then re-encode with teacher tokenizer
             text = student_tokenizer.decode(item['input_ids'], skip_special_tokens=False)
-            # Create Trajectory for teacher to encode with its tokenizer
-            teacher_inputs.append({'messages': [{'role': 'user', 'content': text}]})
+            teacher_encoded = teacher_tokenizer.encode(text, add_special_tokens=False)
+            teacher_inputs.append({
+                'input_ids': teacher_encoded,
+                'labels': item.get('labels', [-100] * len(teacher_encoded)),
+            })
 
         # 2. Teachers compute top-k logprobs on the full sequences
         # max_tokens=0: don't generate new content, just compute logits on input

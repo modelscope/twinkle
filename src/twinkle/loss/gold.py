@@ -71,10 +71,9 @@ class GOLDLoss(Loss):
 
         # If we have topk format but not full logits, convert topk to logits
         if teacher_logits is None and teacher_topk_logprobs is not None and teacher_topk_indices is not None:
-            # Get vocabulary size from student logits
-            vocab_size = student_logits.size(-1)
+            # Get vocabulary size from teacher tokenizer if available, otherwise fallback to student
+            vocab_size = len(self.teacher_tokenizer) if self.teacher_tokenizer is not None else student_logits.size(-1)
             batch_size, seq_len, topk = teacher_topk_logprobs.shape
-
             # Create full logits tensor initialized with very negative values
             teacher_logits = torch.full(
                 (batch_size, seq_len, vocab_size),
@@ -226,15 +225,6 @@ class GOLDLoss(Loss):
             # 转换为概率
             student_probs = F.softmax(student_ans_logits / self.student_temperature, dim=-1)
             teacher_probs = F.softmax(teacher_ans_logits / self.teacher_temperature, dim=-1)
-
-            def decode_tokens(tokenizer, token_ids):
-                pieces = []
-                prev = ""
-                for k in range(len(token_ids)):
-                    cur = tokenizer.decode(token_ids[:k + 1], skip_special_tokens=False)
-                    pieces.append(cur[len(prev):])
-                    prev = cur
-                return pieces
 
             # 获取token IDs用于对齐
 

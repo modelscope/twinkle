@@ -174,9 +174,9 @@ class CTKDLoss(Loss):
             # Load from cache
             cached_data = _PROJECTION_MATRIX_CACHE[cache_key]
             self.projection_matrices = cached_data['projection_matrices']
-            self.projection_student_indices_list = cached_data['projection_student_indices_list']
-            self.projection_teacher_indices_list = cached_data['projection_teacher_indices_list']
-            self.projection_values_list = cached_data['projection_values_list']
+            self.projection_student_indices_list = [t.to(self.device) if self.device is not None else t.clone() for t in cached_data['projection_student_indices_list']]
+            self.projection_teacher_indices_list = [t.to(self.device) if self.device is not None else t.clone() for t in cached_data['projection_teacher_indices_list']]
+            self.projection_values_list = [t.to(self.device) if self.device is not None else t.clone() for t in cached_data['projection_values_list']]
         else:
             # Build projection matrices
             self.projection_matrices = []
@@ -206,8 +206,8 @@ class CTKDLoss(Loss):
         """Generate a unique cache key based on tokenizer configurations."""
         # Create a hashable representation of the tokenizer configurations
         config_data = {
-            'student_vocab': self.student_tokenizer.vocab,
-            'teacher_vocabs': [tokenizer.vocab for tokenizer in self.teacher_tokenizer_group],
+            'student_vocab': self.student_tokenizer.get_vocab(),
+            'teacher_vocabs': [tokenizer.get_vocab() for tokenizer in self.teacher_tokenizer_group],
             'max_length': self.max_length,
             'beta': self.beta,
             'gamma': self.gamma,

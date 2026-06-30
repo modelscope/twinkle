@@ -223,13 +223,21 @@ def train():
     for batch in dataloader:
         if optim_step >= MAX_STEPS:
             break
+        # 在 Ray 模式下，batch 是一个可调用对象，需要调用它来获取实际数据
+        if callable(batch):
+            batch = batch()
 
         # 1. Teacher computes logits on the full sequences
         # max_tokens=0: don't generate new content, just compute logits on input
         # Use prompt_logprobs to get teacher logprobs for distillation
 
+        teacher_inputs = []
+        for item in batch:
+            text = student_tokenizer.decode(item['input_ids'], skip_special_tokens=False)
+            teacher_inputs.append({'messages': [{'role': 'user', 'content': text}]})
+
         teacher_response = teacher_sampler.sample(
-            batch,
+            teacher_inputs,
             SamplingParams(max_tokens=0, temperature=1.0, prompt_logprobs=64),
         )
 
@@ -269,7 +277,7 @@ def train():
 
         # 4. Student forward + GOLD backward
         student_model.forward_backward(
-            inputs=input_data,
+            inputs=batch,
             adapter_name=ADAPTER_NAME,
             return_logits=True,
             **teacher_output,
