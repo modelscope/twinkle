@@ -697,13 +697,13 @@ def main():
         DeviceGroup(name='emb_model', ranks=list(range(emb_start, sampler_start)),
                     device_type='GPU'),
         DeviceGroup(name='sampler', ranks=list(range(sampler_start, model_start)),
-                    device_type='GPU', gpus_per_worker=SAMPLER_GPUS),
+                    device_type='GPU'),
         DeviceGroup(name='model', ranks=list(range(model_start, NUM_GPUS)),
                     device_type='GPU'),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, fsdp_size=MODEL_GPUS, ulysses_size=2)
-    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, tp_size=SAMPLER_GPUS)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     emb_mesh = DeviceMesh.from_sizes(world_size=EMB_GPUS, dp_size=EMB_GPUS)
     condenser_mesh = DeviceMesh.from_sizes(world_size=CONDENSER_GPUS, dp_size=CONDENSER_GPUS)
 

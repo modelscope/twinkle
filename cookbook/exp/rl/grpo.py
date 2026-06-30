@@ -440,13 +440,13 @@ def main():
 
     device_groups = [
         DeviceGroup(name='sampler', ranks=list(range(sampler_start, model_start)),
-                    device_type='GPU', gpus_per_worker=SAMPLER_GPUS),
+                    device_type='GPU'),
         DeviceGroup(name='model', ranks=list(range(model_start, NUM_GPUS)),
                     device_type='GPU'),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, fsdp_size=MODEL_GPUS, ulysses_size=2)
-    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, tp_size=SAMPLER_GPUS)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
 
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS,
                        groups=device_groups, lazy_collect=False)
