@@ -1,7 +1,7 @@
 '''Ascend NPU implementation of chunk_gated_delta_rule for Flash Linear Attention (FLA).
 This module provides a drop-in replacement for fla.ops.gated_delta_rule.chunk_gated_delta_rule,
 redirecting the underlying Triton kernels to MindSpeed's NPU-compatible counterparts.
-It is consumed by twinkle.kernel.monkey_patch_npu to enable the fast linear-attention
+It is consumed by twinkle.kernel.npu_impls.fla to enable the fast linear-attention
 path of Qwen3.5 on Ascend hardware.'''
 
 import torch
