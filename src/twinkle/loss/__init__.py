@@ -7,6 +7,8 @@ from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .infonce import InfonceLoss
 from .mse import MSELoss
+from .gold import GOLDLoss
+from .ctkd import CTKDLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -28,4 +30,6 @@ torch_loss_mapping = {
     'orpo': ORPOLoss,
     # Embedding / contrastive losses
     'infonce': InfonceLoss,
+    'gold': GOLDLoss,
+    'ctkd': CTKDLoss,
 }
