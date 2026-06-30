@@ -9,12 +9,14 @@ TEST_DATA_DIR = Path(__file__).parent / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 
 
-def create_multimodal_messages(example):
-    text = example.get('text', '')
-    if not text:
-        text = str(example.get('question', example.get('title', '')))
-
-    return {'messages': [{'role': 'user', 'content': f'<image>\n{text}'}, {'role': 'assistant', 'content': 'Response'}]}
+def create_multimodal_messages(examples):
+    """Batched map function: receives dict of lists, returns dict of lists."""
+    texts = examples.get('text', None) or examples.get('question', None) or examples.get('title', [])
+    messages_batch = []
+    for text in texts:
+        text = text or ''
+        messages_batch.append([{'role': 'user', 'content': f'<image>\n{text}'}, {'role': 'assistant', 'content': 'Response'}])
+    return {'messages': messages_batch}
 
 
 class TestMultimodalDataset:
@@ -87,17 +89,18 @@ class TestMultimodalDataset:
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
-        def create_multi_image_messages(example):
-            text = example.get('text', '')
-            return {
-                'messages': [{
+        def create_multi_image_messages(examples):
+            messages_batch = []
+            for text in examples.get('text', []):
+                text = text or ''
+                messages_batch.append([{
                     'role': 'user',
                     'content': f'<image>\n{text}\n<image>'
                 }, {
                     'role': 'assistant',
                     'content': 'Response'
-                }]
-            }
+                }])
+            return {'messages': messages_batch}
 
         dataset.map(create_multi_image_messages)
 
@@ -110,17 +113,18 @@ class TestMultimodalDataset:
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
-        def create_video_messages(example):
-            text = example.get('text', '')
-            return {
-                'messages': [{
+        def create_video_messages(examples):
+            messages_batch = []
+            for text in examples.get('text', []):
+                text = text or ''
+                messages_batch.append([{
                     'role': 'user',
                     'content': f'<video>\n{text}'
                 }, {
                     'role': 'assistant',
                     'content': 'Response'
-                }]
-            }
+                }])
+            return {'messages': messages_batch}
 
         dataset.map(create_video_messages)
 
@@ -133,17 +137,18 @@ class TestMultimodalDataset:
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
-        def create_audio_messages(example):
-            text = example.get('text', '')
-            return {
-                'messages': [{
+        def create_audio_messages(examples):
+            messages_batch = []
+            for text in examples.get('text', []):
+                text = text or ''
+                messages_batch.append([{
                     'role': 'user',
                     'content': f'<audio>\n{text}'
                 }, {
                     'role': 'assistant',
                     'content': 'Response'
-                }]
-            }
+                }])
+            return {'messages': messages_batch}
 
         dataset.map(create_audio_messages)
 

@@ -54,6 +54,8 @@ def to_kernels_mode(mode: ModeType) -> Any:
 
 
 def validate_mode(mode: str) -> None:
+    if not is_kernels_available():
+        return
     from kernels.layer.mode import Mode
     mode = to_kernels_mode(mode)
 

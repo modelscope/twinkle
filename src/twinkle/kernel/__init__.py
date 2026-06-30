@@ -104,7 +104,7 @@ def _is_npu_device(model=None) -> bool:
             param_device = next(model.parameters()).device
             if param_device.type == 'npu':
                 return True
-        except StopIteration:
+        except (StopIteration, TypeError):
             pass
 
     # Priority 2: Fallback to global NPU availability
