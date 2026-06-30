@@ -25,9 +25,10 @@ torchrun --nnodes=$NNODES --node_rank=${NODE_RANK:?"NODE_RANK must be set"} \
   ep_fsdp2_lora_deepseek_v4.py \
     --model-id ms://deepseek-ai/DeepSeek-V4-Flash-bf16 \
     --dataset-id ms://swift/self-cognition \
-    --dp-size 4 \
-    --ep-size 2 \
-    --batch-size 4 \
+    --fsdp-size $NNODES*$NPROC_PER_NODE \
+    --dp-size 1 \
+    --ep-size $NNODES*$NPROC_PER_NODE \
+    --batch-size 64 \
     --gradient-accumulation-steps 4 \
     --output-dir ./output_dsv4_multinode \
     --enable-ep 1 \

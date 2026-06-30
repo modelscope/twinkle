@@ -31,24 +31,13 @@ device_mesh = DeviceMesh.from_sizes(
 twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 
-def _build_lora_config(enable_ep: bool):
-    if enable_ep:
-        return LoraConfig(
-            r=args.lora.lora_r,
-            lora_alpha=args.lora.lora_alpha,
-            target_modules='all-linear',
-            exclude_modules=['o_a_proj'],
-            target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'],
-        )
-    # Expert weights are bare nn.Parameters. PEFT trains them through
-    # target_parameters/ParamWrapper, which dynamically parametrizes weights
-    # during forward. That is not stable with plain FSDP2, so non-EP mode uses
-    # regular module LoRA and does not train expert parameters.
+def _build_lora_config():
     return LoraConfig(
         r=args.lora.lora_r,
         lora_alpha=args.lora.lora_alpha,
         exclude_modules=['o_a_proj'],
         target_modules='all-linear',
+        target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'],
     )
 
 
@@ -91,7 +80,7 @@ def train():
             }
         },
     )
-    lora_cfg = _build_lora_config(ENABLE_EP)
+    lora_cfg = _build_lora_config()
     model.add_adapter_to_model(args.lora.adapter_name, lora_cfg,
                                gradient_accumulation_steps=args.training.gradient_accumulation_steps)
     model.set_optimizer(args.optimizer.optimizer_cls, lr=args.optimizer.learning_rate, foreach=False)
