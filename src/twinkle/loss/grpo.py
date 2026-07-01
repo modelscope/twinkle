@@ -76,8 +76,8 @@ class GRPOLoss(Loss):
         """
         import torch
         log_ratio = per_token_logps - per_token_old_logps
-        # Clamp for numerical stability
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+        # Clamp for numerical stability (±5 bounds ratio to [exp(-5), exp(5)] ≈ [0.007, 148])
+        log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
         return log_ratio
 
     def _compute_per_token_loss(
@@ -87,9 +87,16 @@ class GRPOLoss(Loss):
         per_token_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
         """
-        Compute per-token loss with PPO clipping.
+        Compute per-token loss with PPO double-sided clipping.
 
-        Override this method in subclasses for different loss formulations.
+        Standard PPO clip is one-sided: it only bounds the loss when
+        advantage > 0 and ratio > 1+eps.  When advantage < 0 and ratio > 1+eps
+        (policy moved AWAY from the old action on its own), the loss is
+        unbounded upward, causing gradient explosions.
+
+        This implementation clips the ratio from BOTH sides regardless of
+        advantage sign, bounding the per-token loss to at most
+        (1+eps_high) * |advantage|.
 
         Args:
             ratio: [batch, seq_len] importance sampling ratio
@@ -103,7 +110,14 @@ class GRPOLoss(Loss):
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
-        return -torch.min(loss1, loss2)
+        # Double-sided clip: use max for positive advantage, min for negative.
+        # Equivalent to: always take the MORE conservative (smaller magnitude) loss.
+        per_token_loss = torch.where(
+            advantages >= 0,
+            -torch.min(loss1, loss2),  # positive adv: standard PPO clip
+            -torch.max(loss1, loss2),  # negative adv: clip the OTHER side
+        )
+        return per_token_loss
 
     def _aggregate_loss(
         self,
@@ -327,7 +341,7 @@ class GSPOLoss(GRPOLoss):
         """Sequence-level importance sampling: use mean log ratio."""
         import torch
         log_ratio = per_token_logps - per_token_old_logps
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+        log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
         seq_level_log_weights = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
         return seq_level_log_weights
 

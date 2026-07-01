@@ -64,10 +64,11 @@ LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 5000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 8))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 100))
-ADV_CLIP = float(os.environ.get('ADV_CLIP', 2.0))
+ADV_CLIP = float(os.environ.get('ADV_CLIP', 1.0))
+LOSS_SPIKE_THRESHOLD = float(os.environ.get('LOSS_SPIKE_THRESHOLD', 10.0))
 
 # RAG config
 DB_PATH = os.environ.get('DB_PATH', './output.oldemb/thinking_rag/lance.db')
@@ -100,13 +101,7 @@ RAG_FALLBACK_SIM = float(os.environ.get('RAG_FALLBACK_SIM', 0.60))
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './outputs/rag_hint_grpo')
 
 # Forced analysis prefix appended at the start of assistant response
-ANALYSIS_PREFIX = (
-    "Let me think step by step. First, I will analyze the example above: "
-    "identify which steps and concepts are CORRECT and APPLICABLE to this problem, "
-    "and explicitly discard any reasoning that is WRONG, IRRELEVANT, or based on "
-    "assumptions that do not hold here. Then I will solve the problem using only "
-    "the validated useful parts:\n\n"
-)
+ANALYSIS_PREFIX = ''
 
 # ============================================================================
 # Condenser prompt (strategy-level extraction)
@@ -141,9 +136,15 @@ COMPRESS_USER = (
 SYSTEM_WITH_RAG_HEADER = (
     'You are an expert competition mathematician. '
     'Below are condensed reasoning examples from similar problems. '
-    'Analyze them critically — identify which steps/concepts are applicable '
-    'and which may not apply. Then solve the actual problem step by step. '
-    'Put your final answer inside \\boxed{}. '
+    'Before solving the problem, you MUST first output a <hint> ... </hint> block '
+    'that critically analyzes the provided examples:\n'
+    '- Identify which steps, formulas, and concepts are CORRECT and APPLICABLE '
+    'to the current problem.\n'
+    '- Identify which parts are WRONG, IRRELEVANT, MISLEADING, or based on '
+    'assumptions that do NOT hold for this problem.\n'
+    '- Conclude with a one-line verdict: "Useful: ..." and "Discard: ..."\n\n'
+    'After the </hint> block, solve the actual problem step by step using ONLY '
+    'the validated useful parts. Put your final answer inside \\boxed{}. '
     'For multiple-choice questions, put the option LETTER (A/B/C/D/E) inside \\boxed{}.\n\n'
 )
 
@@ -675,19 +676,36 @@ class AoPSAccuracyReward(Reward):
 
 
 class FormatReward(Reward):
-    """Reward for having \\boxed{} in the output."""
+    """Reward for having \\boxed{} and <hint>...</hint> analysis in the output."""
+
+    _HINT_OPEN_RE = re.compile(r'<hint>')
+    _HINT_CLOSE_RE = re.compile(r'</hint>')
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for traj in trajectories:
             messages = traj.get('messages', [])
             completion = ''
+            sys_content = ''
+            for msg in messages:
+                if msg.get('role') == 'system':
+                    sys_content = msg.get('content', '')
             for msg in reversed(messages):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
             has_boxed = '\\boxed{' in completion
-            rewards.append(0.5 if has_boxed else 0.0)
+            # Only check hint tags for RAG prompts (system contains examples)
+            is_rag = 'condensed reasoning examples from similar problems' in sys_content
+            if is_rag:
+                has_hint_open = bool(self._HINT_OPEN_RE.search(completion))
+                has_hint_close = bool(self._HINT_CLOSE_RE.search(completion))
+                has_hint = has_hint_open and has_hint_close
+                # 0.3 for boxed + 0.2 for hint analysis = 0.5 max
+                reward = (0.3 if has_boxed else 0.0) + (0.2 if has_hint else 0.0)
+            else:
+                reward = 0.5 if has_boxed else 0.0
+            rewards.append(reward)
         return rewards
 
 
@@ -1021,35 +1039,31 @@ def main():
                         idx=eidx,
                         example_query=ex['query'],
                         example_thinking=ex['thinking']))
-                sys_content = ''.join(parts)
+                rag_sys_content = ''.join(parts)
+
+                # RAG group (only RAG, no paired NoRAG)
+                rag_prompts.append({
+                    'messages': [
+                        {'role': 'system', 'content': rag_sys_content},
+                        {'role': 'user', 'content': prob},
+                    ],
+                    'user_data': [('ground_truth', ground_truths[i])],
+                    'assistant_prefix': ANALYSIS_PREFIX,
+                })
+                rag_debug_records.append({
+                    'problem': prob[:200],
+                    'ground_truth': ground_truths[i],
+                    'best_sim': round(best_sim, 4),
+                    'num_raw_retrieved': raw_retrieved_counts[i],
+                    'num_retrieved': len(rets),
+                    'num_condensed': len(examples),
+                    'use_rag': True,
+                    'top_retrieved_query': rets[0]['query'][:200] if rets else '',
+                    'condensed_len': len(examples[0].get('thinking', '')) if examples else 0,
+                })
             else:
-                sys_content = SYSTEM_DIRECT
-
-            prompt_feature = {
-                'messages': [
-                    {'role': 'system', 'content': sys_content},
-                    {'role': 'user', 'content': prob},
-                ],
-                'user_data': [('ground_truth', ground_truths[i])],
-                'assistant_prefix': ANALYSIS_PREFIX if use_rag else '',
-            }
-            rag_prompts.append(prompt_feature)
-
-            # Diagnostic record
-            debug_rec = {
-                'problem': prob[:200],
-                'ground_truth': ground_truths[i],
-                'best_sim': round(best_sim, 4),
-                'num_raw_retrieved': raw_retrieved_counts[i],
-                'num_retrieved': len(rets),
-                'num_condensed': len(examples),
-                'use_rag': use_rag,
-            }
-            if rets:
-                debug_rec['top_retrieved_query'] = rets[0]['query'][:200]
-            if examples:
-                debug_rec['condensed_len'] = len(examples[0].get('thinking', ''))
-            rag_debug_records.append(debug_rec)
+                # No hint found — skip this query entirely
+                continue
 
         return rag_prompts, rag_debug_records
 
@@ -1199,14 +1213,15 @@ def main():
             # Skip groups where accuracy is too low (<0.1) or too high (>0.9)
             # to avoid gradient dominated by gibberish/format noise or no learning signal.
             filtered_inputs, filtered_old_logps, filtered_advantages = [], [], []
-            for g in range(BATCH_SIZE):
+            actual_num_groups = len(all_input_data) // NUM_GENERATIONS
+            for g in range(actual_num_groups):
                 g_start = g * NUM_GENERATIONS
                 g_end = g_start + NUM_GENERATIONS
                 grp_adv = advantages[g_start:g_end]
                 if all(abs(a) < 1e-8 for a in grp_adv):
                     continue
                 grp_acc_rate = sum(accuracy_rewards[g_start:g_end]) / NUM_GENERATIONS
-                if grp_acc_rate < 0.1 or grp_acc_rate > 0.9:
+                if grp_acc_rate < 0.2 or grp_acc_rate > 0.8:
                     continue
                 filtered_inputs.extend(all_input_data[g_start:g_end])
                 filtered_old_logps.extend(all_old_logps[g_start:g_end])
@@ -1229,7 +1244,7 @@ def main():
                 mb_old_logps = filtered_old_logps[mb_start:mb_end]
                 mb_advantages = filtered_advantages[mb_start:mb_end]
 
-                model.forward_backward(
+                outputs = model.forward_backward(
                     inputs=mb_inputs,
                     old_logps=mb_old_logps,
                     ref_logps=mb_old_logps,
@@ -1238,8 +1253,26 @@ def main():
                 accum_count += 1
 
                 if accum_count % grad_accum_steps == 0:
-                    model.clip_grad_and_step()
-                    optim_step += 1
+                    # Loss spike skip: discard explosive gradients
+                    skip_step = False
+                    try:
+                        loss_val = outputs.get('loss', None)
+                        if loss_val is not None:
+                            if hasattr(loss_val, 'item'):
+                                loss_val = loss_val.item()
+                            if loss_val > LOSS_SPIKE_THRESHOLD:
+                                skip_step = True
+                                logger.warning(
+                                    f'[Step {optim_step}] Loss spike: {loss_val:.4f} > '
+                                    f'{LOSS_SPIKE_THRESHOLD}, skipping update')
+                    except Exception:
+                        pass
+
+                    if skip_step:
+                        model.zero_grad()
+                    else:
+                        model.clip_grad_and_step()
+                        optim_step += 1
 
                     if optim_step >= MAX_STEPS:
                         break
@@ -1248,8 +1281,25 @@ def main():
 
             # Flush remaining accumulated gradients (incomplete window at tail)
             if accum_count % grad_accum_steps != 0:
-                model.clip_grad_and_step()
-                optim_step += 1
+                skip_step = False
+                try:
+                    loss_val = outputs.get('loss', None)
+                    if loss_val is not None:
+                        if hasattr(loss_val, 'item'):
+                            loss_val = loss_val.item()
+                        if loss_val > LOSS_SPIKE_THRESHOLD:
+                            skip_step = True
+                            logger.warning(
+                                f'[Step {optim_step}] Loss spike (tail): {loss_val:.4f} > '
+                                f'{LOSS_SPIKE_THRESHOLD}, skipping update')
+                except Exception:
+                    pass
+
+                if skip_step:
+                    model.zero_grad()
+                else:
+                    model.clip_grad_and_step()
+                    optim_step += 1
 
             log_dict = metrics.calculate()
             log_dict.update(model.calculate_metric(is_training=True))
