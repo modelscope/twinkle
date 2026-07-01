@@ -63,9 +63,9 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for _, block in find_moe_blocks_with_names(model):
+    for block_name, block in find_moe_blocks_with_names(model):
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
-        patch_forward(block, ep_group, ep_world_size, cfg)
+        patch_forward(block, ep_group, ep_world_size, cfg, block_name)
         specs.append(spec)
 
     return specs
@@ -160,6 +160,7 @@ def patch_forward(
     ep_group: dist.ProcessGroup,
     ep_world_size: int,
     cfg: ExpertParallelConfig,
+    block_name: str,
 ) -> None:
     """Replace the MoE block forward with EP-aware communication flow.
 
@@ -222,12 +223,17 @@ def patch_forward(
         else:
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
+        # R2 / R3 routing replay: pass block-level replay state
+        from .router_replay import get_replay_state
+        replay_state = get_replay_state(block_name)
+
         router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
             hidden_states=hidden_states_2d,
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
-            norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            norm_topk_prob=_get_norm_topk_prob(block),
+            replay_state=replay_state,
             **kwargs,
         )
         # Keep routing weights in activation dtype before unpermute weighting.
@@ -400,6 +406,15 @@ def _get_top_k(block: nn.Module) -> int | None:
                 return int(value)
     return None
 
+def _get_norm_topk_prob(block: nn.Module) -> bool:
+    # fix: get norm_topk_prob from gate
+    gate = _get_gate(block)
+    if gate is not None and hasattr(gate, 'norm_topk_prob'):
+        value = getattr(gate, 'norm_topk_prob')
+        if value is not None:
+            return bool(value)
+    # default retrun True
+    return True
 
 def _get_router_dtype(router_dtype: str, default_dtype: torch.dtype) -> torch.dtype:
     if router_dtype == 'fp32':
@@ -419,13 +434,32 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
         shared = getattr(block, 'shared_experts', None)
     if shared is None:
         return None
-    return _run_module_with_casting(shared, hidden_states_2d)
+    shared_output = _run_module_with_casting(shared, hidden_states_2d)
+    # fix: add shared_expert_gate for Qwen3_5Moe
+    shared_gate = getattr(block, 'shared_expert_gate', None)
+    if shared_gate is not None:
+        shared_output = F.sigmoid(shared_gate(hidden_states_2d)) * shared_output
+    return shared_output
 
 
 def _is_moe_experts(experts: Any) -> bool:
-    if isinstance(experts, nn.ModuleList):
+    unwrapped = experts
+    # Look through PEFT / LoRA wrappers that may wrap the experts module
+    # or its parameters (e.g. LoraLayer, ParamWrapper).
+    while True:
+        previous = unwrapped
+        if hasattr(unwrapped, 'base_layer'):
+            unwrapped = unwrapped.base_layer
+        elif hasattr(unwrapped, 'module'):
+            unwrapped = unwrapped.module
+        elif hasattr(unwrapped, '_fsdp_wrapped_module'):
+            unwrapped = unwrapped._fsdp_wrapped_module
+        if unwrapped is previous:
+            break
+
+    if isinstance(unwrapped, nn.ModuleList):
         return True
-    if hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'):
+    if hasattr(unwrapped, 'gate_up_proj') and hasattr(unwrapped, 'down_proj'):
         return True
     return False
 
@@ -507,21 +541,48 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
+    replay_state: Any = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_kwargs = {}
     if 'input_ids' in kwargs and _module_forward_accepts_kwarg(gate, 'input_ids'):
         gate_kwargs['input_ids'] = kwargs['input_ids']
     gate_out = gate(hidden_states, **gate_kwargs)
+
+    # Resolve router_logits once — needed by both REPLAY and normal paths.
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
-        router_logits, routing_weights, selected_experts = gate_out[:3]
+        router_logits = gate_out[0]
+    else:
+        router_logits = gate_out
+
+    # Lazy import to avoid circular dependency with router_replay.py
+    from .router_replay import RouterReplayAction
+
+    # --- REPLAY_FORWARD: use injected selected_experts ---
+    if (replay_state is not None
+            and replay_state.action != RouterReplayAction.RECORD
+            and replay_state.target_indices is not None):
+        selected_experts = replay_state.target_indices
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+        routing_weights = routing_weights.gather(-1, selected_experts)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         return router_logits, routing_weights, selected_experts
 
-    router_logits = gate_out
-    routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    if norm_topk_prob:
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    # --- Normal path: compute routing_weights and selected_experts ---
+    if isinstance(gate_out, tuple) and len(gate_out) >= 3:
+        _, routing_weights, selected_experts = gate_out[:3]
+    else:
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+    # --- RECORD: save selected_experts after computing them ---
+    if (replay_state is not None
+            and replay_state.action == RouterReplayAction.RECORD):
+        replay_state.recorded_indices = selected_experts.detach().clone()
+
     return router_logits, routing_weights, selected_experts
 
 

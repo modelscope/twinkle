@@ -27,6 +27,7 @@ class ModelOutput(TypedDict, total=False):
     logps: Optional[OutputType]
     num_tokens: Optional[OutputType]
     embeddings: Optional[OutputType]
+    routed_experts: Optional[OutputType]
 
 
 class LossOutput(TypedDict, total=False):
