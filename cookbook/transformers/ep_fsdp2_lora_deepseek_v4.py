@@ -58,7 +58,8 @@ def train():
         text_config.use_cache = False
 
     dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id))
-    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
+                         max_length=args.template.max_length)
     dataset.map(SelfCognitionProcessor(
         args.extra.get('model_name', 'twinkle'),
         args.extra.get('model_author', 'ModelScope'),
@@ -71,7 +72,7 @@ def train():
         config=config,
         device_mesh=device_mesh,
         strategy='native_fsdp',
-        memory_efficient_init=args.model.memory_efficient_init,
+        memory_efficient_init=True,
         fsdp_config={
             'expert_parallel': {
                 'enabled': ENABLE_EP,

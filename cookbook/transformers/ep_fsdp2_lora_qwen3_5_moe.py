@@ -60,9 +60,11 @@ def train():
 
     dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id))
     try:
-        dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+        dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
+                             max_length=args.template.max_length)
     except ValueError:
-        dataset.set_template('Qwen3_5Template', model_id=args.model.model_id)
+        dataset.set_template('Qwen3_5Template', model_id=args.model.model_id,
+                             max_length=args.template.max_length)
     dataset.map(SelfCognitionProcessor(
         args.extra.get('model_name', 'twinkle'),
         args.extra.get('model_author', 'ModelScope'),
