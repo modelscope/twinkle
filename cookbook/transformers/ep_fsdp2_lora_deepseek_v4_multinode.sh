@@ -25,7 +25,7 @@ GRAD_ACCUM_STEPS=4
 torchrun --nnodes=$NNODES --node_rank=${NODE_RANK:?"NODE_RANK must be set"} \
   --nproc_per_node=$NPROC_PER_NODE \
   --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-  cookbook\transformers\ep_fsdp2_lora_deepseek_v4.py \
+  cookbook/transformers/ep_fsdp2_lora_deepseek_v4.py \
     --model-id ms://deepseek-ai/DeepSeek-V4-Flash-bf16 \
     --dataset-id ms://swift/self-cognition \
     --template-cls DeepseekV4Template \
