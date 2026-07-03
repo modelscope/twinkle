@@ -19,8 +19,8 @@ from pathlib import Path
 
 # Make the local ``src`` importable when running the script directly.
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(_PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+if str(_PROJECT_ROOT / 'src') not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / 'src'))
 
 import torch
 import torch.nn as nn
@@ -38,7 +38,7 @@ def _assert(cond: bool, msg: str) -> None:
 
 def _describe(obj) -> str:
     """Best-effort name for a callable (plain function or kernels ``Func``)."""
-    qn = getattr(obj, "__qualname__", None)
+    qn = getattr(obj, '__qualname__', None)
     if qn:
         return qn
     return f"<{type(obj).__module__}.{type(obj).__name__}>"
@@ -48,7 +48,7 @@ class FusedQwen3MLP(Qwen3MLP):
     """Pretend fused kernel: same gated MLP + a constant +1.0 bias."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print("[patched] FusedQwen3MLP.forward called")
+        print('[patched] FusedQwen3MLP.forward called')
         return super().forward(x) + 1.0
 
 
@@ -67,9 +67,9 @@ def _build_mlp() -> Qwen3MLP:
 # Demo 1: Class replacement
 # --------------------------------------------------------------------------- #
 def demo_class_replacement() -> None:
-    print("=" * 60)
-    print("Demo 1: class replacement (replace transformers Qwen3MLP)")
-    print("=" * 60)
+    print('=' * 60)
+    print('Demo 1: class replacement (replace transformers Qwen3MLP)')
+    print('=' * 60)
 
     mlp = _build_mlp()
     x = torch.randn(1, 4, mlp.config.hidden_size)
@@ -85,36 +85,36 @@ def demo_class_replacement() -> None:
     print(f"After kernelize:  type = {type(mlp).__name__}")
     print(f"  output[0,0,:3] = {out_after[0, 0, :3].tolist()}")
 
-    _assert(type(mlp) is FusedQwen3MLP, "mlp should be FusedQwen3MLP after kernelize")
+    _assert(type(mlp) is FusedQwen3MLP, 'mlp should be FusedQwen3MLP after kernelize')
     # Params (gate_proj/up_proj/down_proj) are preserved on the instance, so the
     # only difference is the +1.0 added by the fused forward.
     _assert(
         torch.allclose(out_after, out_before + 1.0),
-        "FusedQwen3MLP should add +1.0 to the original output",
+        'FusedQwen3MLP should add +1.0 to the original output',
     )
-    print("✓ Class replacement passed\n")
+    print('✓ Class replacement passed\n')
 
 
 # --------------------------------------------------------------------------- #
 # Demo 2: Attribute replacement (patch transformers qwen3 apply_rotary_pos_emb)
 # --------------------------------------------------------------------------- #
-_QWEN3_MOD_PATH = "transformers.models.qwen3.modeling_qwen3"
-_ROPE_ATTR = "apply_rotary_pos_emb"
+_QWEN3_MOD_PATH = 'transformers.models.qwen3.modeling_qwen3'
+_ROPE_ATTR = 'apply_rotary_pos_emb'
 
 
 def demo_attr_replacement() -> None:
-    print("=" * 60)
-    print("Demo 2: attribute replacement (two forms)")
-    print("=" * 60)
+    print('=' * 60)
+    print('Demo 2: attribute replacement (two forms)')
+    print('=' * 60)
 
     import importlib
 
     mod = importlib.import_module(_QWEN3_MOD_PATH)
 
     # ---- Form A: module attribute (pkg.mod.attr) -------------------------- #
-    print("-" * 60)
-    print("Form A: replace module-level function `apply_rotary_pos_emb`")
-    print("-" * 60)
+    print('-' * 60)
+    print('Form A: replace module-level function `apply_rotary_pos_emb`')
+    print('-' * 60)
 
     original_rope = getattr(mod, _ROPE_ATTR)
 
@@ -136,21 +136,20 @@ def demo_attr_replacement() -> None:
 
         patched_fn = getattr(mod, _ROPE_ATTR)
         print(f"After kernelize:  {_describe(patched_fn)}")
-        _assert(patched_fn is fused_apply_rotary_pos_emb, "module attr should be the fused fn")
+        _assert(patched_fn is fused_apply_rotary_pos_emb, 'module attr should be the fused fn')
         q_out_after, k_out_after = patched_fn(q, k, cos, sin)
         _assert(
-            torch.allclose(q_out_after, q_out_before)
-            and torch.allclose(k_out_after, k_out_before),
-            "wrapped RoPE should preserve the original output",
+            torch.allclose(q_out_after, q_out_before) and torch.allclose(k_out_after, k_out_before),
+            'wrapped RoPE should preserve the original output',
         )
-        print("✓ Form A (module attribute) passed\n")
+        print('✓ Form A (module attribute) passed\n')
     finally:
         setattr(mod, _ROPE_ATTR, original_rope)
 
     # ---- Form B: class attribute / method (pkg.mod.ClassName.attr) ------- #
-    print("-" * 60)
-    print("Form B: replace class method `Qwen3MLP.forward`")
-    print("-" * 60)
+    print('-' * 60)
+    print('Form B: replace class method `Qwen3MLP.forward`')
+    print('-' * 60)
 
     original_forward = Qwen3MLP.forward
 
@@ -169,17 +168,17 @@ def demo_attr_replacement() -> None:
 
         patched_forward = Qwen3MLP.forward
         print(f"After kernelize:  {_describe(patched_forward)}")
-        _assert(patched_forward is fused_forward, "class method should be the fused fn")
+        _assert(patched_forward is fused_forward, 'class method should be the fused fn')
 
         out_after = mlp(x)
         print(f"  output[0,0,:3] = {out_after[0, 0, :3].tolist()}")
         _assert(
             torch.allclose(out_after, out_before + 1.0),
-            "fused forward should add +1.0 to the original output",
+            'fused forward should add +1.0 to the original output',
         )
-        print("✓ Form B (class method) passed\n")
+        print('✓ Form B (class method) passed\n')
     finally:
-        setattr(Qwen3MLP, "forward", original_forward)
+        setattr(Qwen3MLP, 'forward', original_forward)
 
 
 # --------------------------------------------------------------------------- #
@@ -192,8 +191,8 @@ def demo_attr_replacement() -> None:
 # on CPU. This demo verifies the parts that DO work on CPU: the kernel is
 # downloaded lazily via ``_load_hub_ref`` and the target module's class is
 # swapped to the Hub-loaded class. Running the fused forward requires CUDA.
-_HUB_REPO = "kernels-community/activation"
-_HUB_LAYER = "SiluAndMul"
+_HUB_REPO = 'kernels-community/activation'
+_HUB_LAYER = 'SiluAndMul'
 
 
 class LocalSiluAndMul(nn.Module):
@@ -205,14 +204,14 @@ class LocalSiluAndMul(nn.Module):
 
 
 def demo_hub_replacement() -> None:
-    print("=" * 60)
-    print("Demo 3: Hub replacement (real HF Hub kernel: kernels-community/activation)")
-    print("=" * 60)
+    print('=' * 60)
+    print('Demo 3: Hub replacement (real HF Hub kernel: kernels-community/activation)')
+    print('=' * 60)
 
     try:
         from kernels import get_kernel  # noqa: F401
     except ImportError:
-        print("Skipped: `kernels` package not installed (pip install kernels)")
+        print('Skipped: `kernels` package not installed (pip install kernels)')
         return
 
     model = nn.Sequential(LocalSiluAndMul())
@@ -235,26 +234,26 @@ def demo_hub_replacement() -> None:
     print(f"After kernelize:  type = {hub_cls.__name__}")
     print(f"  module = {hub_cls.__module__}")
 
-    _assert(hub_cls.__name__ == _HUB_LAYER, "should be the Hub SiluAndMul class")
+    _assert(hub_cls.__name__ == _HUB_LAYER, 'should be the Hub SiluAndMul class')
     _assert(
-        "activation" in hub_cls.__module__,
-        "loaded class should come from the Hub activation kernel package",
+        'activation' in hub_cls.__module__,
+        'loaded class should come from the Hub activation kernel package',
     )
     # The Hub forward is CUDA-only, so we do not execute it on CPU.
-    print("(Hub kernel forward is CUDA-only; verified download + class swap on CPU)")
-    print("✓ Hub replacement passed\n")
+    print('(Hub kernel forward is CUDA-only; verified download + class swap on CPU)')
+    print('✓ Hub replacement passed\n')
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    print("Running kernelize end-to-end demos on CPU...\n")
+    print('Running kernelize end-to-end demos on CPU...\n')
     demo_class_replacement()
     demo_attr_replacement()
     demo_hub_replacement()
-    print("All demos passed.")
+    print('All demos passed.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
