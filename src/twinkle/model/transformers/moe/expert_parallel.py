@@ -430,7 +430,12 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
         shared = getattr(block, 'shared_experts', None)
     if shared is None:
         return None
-    return _run_module_with_casting(shared, hidden_states_2d)
+    shared_out = _run_module_with_casting(shared, hidden_states_2d)
+    shared_gate = getattr(block, 'shared_expert_gate', None)
+    if shared_gate is None:
+        return shared_out
+    gate_out = _run_module_with_casting(shared_gate, hidden_states_2d)
+    return torch.sigmoid(gate_out) * shared_out
 
 
 def _is_moe_experts(experts: Any) -> bool:
