@@ -54,10 +54,11 @@ LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 5000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 8))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 100))
-ADV_CLIP = float(os.environ.get('ADV_CLIP', 2.0))
+ADV_CLIP = float(os.environ.get('ADV_CLIP', 1.0))
+LOSS_SPIKE_THRESHOLD = float(os.environ.get('LOSS_SPIKE_THRESHOLD', 10.0))
 
 # Dataset
 AOPS_DATASET_ID = os.environ.get('AOPS_DATASET_ID', 'AI-MO/aops')
@@ -550,7 +551,7 @@ def main():
     # -- Diagnostics --
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     diag_path = os.path.join(OUTPUT_DIR, 'diagnostics.jsonl')
-    diag_f = open(diag_path, 'a', encoding='utf-8')
+    diag_f = open(diag_path, 'w', encoding='utf-8')
     logger.info(f'[diag] diagnostics → {diag_path}')
 
     def _content_to_str(content):
@@ -693,7 +694,7 @@ def main():
             if all(abs(a) < 1e-8 for a in grp_adv):
                 continue
             grp_acc_rate = sum(accuracy_rewards[g_start:g_end]) / NUM_GENERATIONS
-            if grp_acc_rate < 0.1 or grp_acc_rate > 0.9:
+            if grp_acc_rate < 0.2 or grp_acc_rate > 0.8:
                 continue
             filtered_inputs.extend(all_input_data[g_start:g_end])
             filtered_old_logps.extend(all_old_logps[g_start:g_end])
@@ -716,7 +717,7 @@ def main():
             mb_old_logps = filtered_old_logps[mb_start:mb_end]
             mb_advantages = filtered_advantages[mb_start:mb_end]
 
-            model.forward_backward(
+            outputs = model.forward_backward(
                 inputs=mb_inputs,
                 old_logps=mb_old_logps,
                 ref_logps=mb_old_logps,
@@ -725,8 +726,25 @@ def main():
             accum_count += 1
 
             if accum_count % grad_accum_steps == 0:
-                model.clip_grad_and_step()
-                optim_step += 1
+                skip_step = False
+                try:
+                    loss_val = outputs.get('loss', None)
+                    if loss_val is not None:
+                        if hasattr(loss_val, 'item'):
+                            loss_val = loss_val.item()
+                        if loss_val > LOSS_SPIKE_THRESHOLD:
+                            skip_step = True
+                            logger.warning(
+                                f'[Step {optim_step}] Loss spike: {loss_val:.4f} > '
+                                f'{LOSS_SPIKE_THRESHOLD}, skipping update')
+                except Exception:
+                    pass
+
+                if skip_step:
+                    model.zero_grad()
+                else:
+                    model.clip_grad_and_step()
+                    optim_step += 1
 
                 if optim_step >= MAX_STEPS:
                     break
@@ -735,8 +753,25 @@ def main():
 
         # Flush remaining accumulated gradients (incomplete window at tail)
         if accum_count % grad_accum_steps != 0:
-            model.clip_grad_and_step()
-            optim_step += 1
+            skip_step = False
+            try:
+                loss_val = outputs.get('loss', None)
+                if loss_val is not None:
+                    if hasattr(loss_val, 'item'):
+                        loss_val = loss_val.item()
+                    if loss_val > LOSS_SPIKE_THRESHOLD:
+                        skip_step = True
+                        logger.warning(
+                            f'[Step {optim_step}] Loss spike (tail): {loss_val:.4f} > '
+                            f'{LOSS_SPIKE_THRESHOLD}, skipping update')
+            except Exception:
+                pass
+
+            if skip_step:
+                model.zero_grad()
+            else:
+                model.clip_grad_and_step()
+                optim_step += 1
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))

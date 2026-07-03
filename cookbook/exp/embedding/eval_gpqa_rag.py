@@ -5,6 +5,11 @@ Two modes:
   - ``rag``:    Retrieve top-k thinking traces from LanceDB as 1-shot
                 examples, then solve (8 GPUs: DP=4 embedding + TP=4 vLLM).
 
+Optional ``--hint`` flag (rag mode only):
+  After retrieval (+ optional condensing), call an API model to pre-analyze
+  which methods from the traces are applicable, then inject the analysis as
+  a system-prompt "preanalysis" instead of raw traces.
+
 Only problems with ``metadata.boxed == True`` are used (auto-gradable via
 ``\\boxed{...}`` extraction).  A random subset is sampled for efficiency.
 
@@ -14,6 +19,12 @@ Launch examples:
 
     # RAG-augmented (8 GPUs)
     python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag
+
+    # RAG + API hint analysis (recommended)
+    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --hint
+
+    # RAG + condense + hint (full pipeline)
+    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --condense --hint
 
     # Smaller sample for quick test
     python cookbook/exp/embedding/eval_gpqa_rag.py --mode direct --n 100
@@ -62,6 +73,47 @@ CONDENSE_API_CONCURRENCY = int(os.environ.get('API_CONCURRENCY', 32))
 CONDENSE_API_MIN_INTERVAL = float(os.environ.get('API_MIN_INTERVAL', 0.1))
 CONDENSE_TEMPERATURE = 0.2
 CONDENSE_MAX_TOKENS = 8192
+
+# -- Hint analysis config ------------------------------------------------------
+HINT_ANALYSIS_MAX_TOKENS = int(os.environ.get('HINT_ANALYSIS_MAX_TOKENS', 400))
+HINT_ANALYSIS_TEMPERATURE = 0.3
+
+HINT_ANALYSIS_SYSTEM = (
+    'You are a mathematical methodology analyst. '
+    'Given a target problem and a condensed reasoning trace from a SIMILAR (but different) problem, '
+    'analyze which methods, formulas, and techniques from the trace are APPLICABLE to the target problem '
+    'and which are IRRELEVANT or MISLEADING.\n\n'
+    'Output format (strict):\n'
+    '- Useful: [list specific methods/formulas/techniques that transfer to the target]\n'
+    '- Discard: [list parts that are irrelevant or would mislead]\n'
+    '- Key insight: [one sentence on how to apply the useful parts]\n\n'
+    'Rules:\n'
+    '1. Be concise — at most 200 words total.\n'
+    '2. Focus ONLY on transferable methodology, never solve the target problem.\n'
+    '3. Never output the answer to either problem.\n'
+    '4. If the trace is entirely irrelevant, say "Useful: None. Discard: All."'
+)
+
+HINT_ANALYSIS_USER = (
+    '## Target Problem\n{query}\n\n'
+    '## Condensed Trace (from similar problem)\n{thinking}'
+)
+
+_PREANALYSIS_BEFORE = (
+    'You are an expert competition mathematician.\n\n'
+    'A methodology analysis from a similar problem:\n\n'
+)
+_PREANALYSIS_AFTER = (
+    '\n\n'
+    'This is from a related but different problem — '
+    'some techniques may transfer, others may not. '
+    'Solve the given problem step by step and put your final answer inside \\boxed{}.'
+)
+
+
+def build_preanalysis_system(hint_analysis: str) -> str:
+    """Build system prompt with pre-analyzed hint."""
+    return _PREANALYSIS_BEFORE + hint_analysis + _PREANALYSIS_AFTER
 
 # ---------------------------------------------------------------------------
 # Config
@@ -142,6 +194,7 @@ _api_last_refill = [time.monotonic()]
 
 def _api_throttle():
     _api_semaphore.acquire()
+    wait = 0.0
     try:
         with _api_bucket_lock:
             now = time.monotonic()
@@ -154,9 +207,10 @@ def _api_throttle():
             else:
                 wait = (1.0 - _api_tokens[0]) * CONDENSE_API_MIN_INTERVAL
                 _api_tokens[0] = 0.0
-                time.sleep(wait)
     finally:
         _api_semaphore.release()
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _api_condense_single(api_client: OpenAIClient, messages: List[Dict]) -> Optional[str]:
@@ -175,6 +229,140 @@ def _api_condense_single(api_client: OpenAIClient, messages: List[Dict]) -> Opti
     if m:
         content = m.group(1).strip()
     return content
+
+
+def _api_hint_analysis_batch(
+    api_client: OpenAIClient,
+    problems: List[str],
+    condensed_examples: List[List[Dict[str, str]]],
+) -> List[Optional[str]]:
+    """Call API to pre-analyze RAG relevance for each problem."""
+    _MAX_HINT_INPUT = 4000
+    results: List[Optional[str]] = [None] * len(problems)
+    tasks = []
+    for i, prob in enumerate(problems):
+        if not condensed_examples[i]:
+            continue
+        traces = [ex.get('thinking', '') for ex in condensed_examples[i]]
+        merged_thinking = '\n---\n'.join(traces)
+        if len(merged_thinking) > _MAX_HINT_INPUT:
+            merged_thinking = merged_thinking[:_MAX_HINT_INPUT] + '\n[...truncated]'
+        user_msg = HINT_ANALYSIS_USER.format(query=prob, thinking=merged_thinking)
+        msgs = [
+            {'role': 'system', 'content': HINT_ANALYSIS_SYSTEM},
+            {'role': 'user', 'content': user_msg},
+        ]
+        tasks.append((i, msgs))
+
+    if not tasks:
+        return results
+
+    def _call_one(idx, msgs):
+        _api_throttle()
+        try:
+            trajectory = {'messages': msgs}
+            sp = TwinkleSamplingParams(
+                temperature=HINT_ANALYSIS_TEMPERATURE,
+                max_tokens=HINT_ANALYSIS_MAX_TOKENS)
+            reply = api_client(trajectory, sp, extra_body={'enable_thinking': False})
+            content = (reply.get('content') or '').strip()
+            return idx, content if content else None
+        except Exception as exc:
+            logger.warning(f'[hint-analysis] error for idx={idx}: {exc}')
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=min(len(tasks), CONDENSE_API_CONCURRENCY)) as pool:
+        futs = [pool.submit(_call_one, idx, msgs) for idx, msgs in tasks]
+        for fut in as_completed(futs):
+            idx, analysis = fut.result()
+            results[idx] = analysis
+
+    n_success = sum(1 for r in results if r)
+    logger.info(f'[hint-analysis] completed {n_success}/{len(tasks)} analyses')
+    return results
+
+
+# ---------------------------------------------------------------------------
+# LLM-based decontamination
+# ---------------------------------------------------------------------------
+
+_DECONTAM_JUDGE_PROMPT = (
+    'We are building a RAG-augmented math training system. Problem A is the test '
+    'question; Problem B was retrieved from a knowledge base.\n'
+    'Answer YES only if A and B are essentially the SAME specific problem — '
+    'i.e. solving B directly gives you A\'s answer (just different wording/notation/'
+    'format/negation).\n'
+    'Answer NO if they merely share the same method/topic but have different '
+    'specific values, equations, or geometric configurations — learning B\'s '
+    'approach still requires independent work to solve A.\n'
+    'Problem A: {prob_a}\n'
+    'Problem B: {prob_b}\n'
+    'Answer only YES or NO.'
+)
+
+
+def _llm_judge_same_problem(
+    api_client: OpenAIClient, pairs: List[tuple],
+) -> List[bool]:
+    """Batch LLM judge: are (problem_a, problem_b) the same problem?
+
+    Returns list of bools (True = same problem = should filter).
+    """
+    if not pairs or not api_client:
+        return [False] * len(pairs)
+
+    results = [False] * len(pairs)
+
+    def _judge_one(idx, pa, pb):
+        prompt = _DECONTAM_JUDGE_PROMPT.format(prob_a=pa, prob_b=pb)
+        msgs = [{'role': 'user', 'content': prompt}]
+        _api_throttle()
+        try:
+            trajectory = {'messages': msgs}
+            sp = TwinkleSamplingParams(temperature=0.1, max_tokens=8)
+            reply = api_client(trajectory, sp, extra_body={'enable_thinking': False})
+            answer = (reply.get('content') or '').strip().upper()
+            return idx, 'YES' in answer
+        except Exception:
+            return idx, False
+
+    with ThreadPoolExecutor(max_workers=min(len(pairs), CONDENSE_API_CONCURRENCY)) as pool:
+        futs = [pool.submit(_judge_one, i, pa, pb) for i, (pa, pb) in enumerate(pairs)]
+        for fut in as_completed(futs):
+            idx, is_same = fut.result()
+            results[idx] = is_same
+    return results
+
+
+def _llm_decontaminate(
+    api_client: OpenAIClient,
+    problems: List[str],
+    all_examples: List[List[Dict[str, str]]],
+) -> List[List[Dict[str, str]]]:
+    """Apply LLM-based decontamination: remove retrievals judged as same problem."""
+    judge_pairs = []  # (qi, ret_idx, prob_a, prob_b)
+    for qi, exs in enumerate(all_examples):
+        for ri, ex in enumerate(exs):
+            judge_pairs.append((qi, ri, problems[qi], ex.get('query', '')))
+
+    if not judge_pairs:
+        return all_examples
+
+    pairs_input = [(pa, pb) for _, _, pa, pb in judge_pairs]
+    verdicts = _llm_judge_same_problem(api_client, pairs_input)
+    to_remove = set()
+    for vi, (qi, ri, _, _) in enumerate(judge_pairs):
+        if verdicts[vi]:
+            to_remove.add((qi, ri))
+
+    if to_remove:
+        logger.info(f'[decontam-llm] filtered {len(to_remove)} same-problem retrievals')
+        for qi in range(len(all_examples)):
+            all_examples[qi] = [
+                ex for ri, ex in enumerate(all_examples[qi])
+                if (qi, ri) not in to_remove
+            ]
+    return all_examples
 
 
 def condense_traces(
@@ -391,15 +579,43 @@ def _try_numeric_equal(a: str, b: str) -> bool:
     return False
 
 
+# MCQ reference pattern: \text{(D) }49, \textbf{(C)}12, (B) 21, etc.
+_MCQ_REF_RE = re.compile(
+    r'^\\(?:textbf|text|mathrm|mathbf)\{\(?([A-E])\)?\s*\}\s*(.+)$'
+    r'|^\(?([A-E])\)\s+(.+)$'
+)
+
+
 def answers_match(predicted: str, reference: str) -> bool:
-    """Check if two math answers are equivalent."""
+    """Check if two math answers are equivalent.
+
+    Supports bidirectional MCQ matching: if reference contains both a letter
+    and a value (e.g. '\\text{(D) }49'), predicted can match either the letter
+    or the value.
+    """
     if not predicted or not reference:
         return False
     norm_p = normalize_answer(predicted)
     norm_r = normalize_answer(reference)
     if norm_p == norm_r:
         return True
-    return _try_numeric_equal(norm_p, norm_r)
+    if _try_numeric_equal(norm_p, norm_r):
+        return True
+    # Bidirectional MCQ matching: reference has letter+value compound format
+    ref_stripped = reference.strip()
+    mcq_m = _MCQ_REF_RE.match(ref_stripped)
+    if mcq_m:
+        ref_letter = mcq_m.group(1) or mcq_m.group(3)  # from either branch
+        ref_value = (mcq_m.group(2) or mcq_m.group(4) or '').strip()
+        # predicted is the letter
+        if norm_p == ref_letter:
+            return True
+        # predicted is the numeric value
+        if ref_value:
+            norm_rv = normalize_answer(ref_value)
+            if norm_p == norm_rv or _try_numeric_equal(norm_p, norm_rv):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +678,16 @@ def build_direct_prompt(problem: str) -> Dict[str, Any]:
     return {
         'messages': [
             {'role': 'system', 'content': DIRECT_SYSTEM},
+            {'role': 'user', 'content': problem},
+        ]
+    }
+
+
+def build_hint_prompt(problem: str, hint_analysis: str) -> Dict[str, Any]:
+    """Build prompt with pre-analyzed hint in system, problem as user."""
+    return {
+        'messages': [
+            {'role': 'system', 'content': build_preanalysis_system(hint_analysis)},
             {'role': 'user', 'content': problem},
         ]
     }
@@ -553,11 +779,15 @@ def retrieve_examples(tbl, query_vecs: np.ndarray, top_k: int,
                       decontam_threshold: float = 0.0,
                       ) -> List[List[Dict[str, str]]]:
     thinking_field = 'thinking_raw' if use_thinking_raw else 'cot_compressed'
-    # Fetch extra candidates when decontamination is active
     fetch_limit = top_k + 50 if decontam_threshold > 0 else top_k
-    all_examples: List[List[Dict[str, str]]] = []
+    n_queries = len(query_vecs)
+    all_examples: List[List[Dict[str, str]]] = [None] * n_queries
     decontam_skipped = 0
-    for qi, vec in enumerate(query_vecs):
+    _decontam_lock = threading.Lock()
+
+    def _search_one(qi: int):
+        nonlocal decontam_skipped
+        vec = query_vecs[qi]
         results = (
             tbl.search(vec.astype(np.float32).tolist())
             .metric('dot')
@@ -567,6 +797,7 @@ def retrieve_examples(tbl, query_vecs: np.ndarray, top_k: int,
         )
         problem_text = problems[qi] if problems else ''
         examples = []
+        local_skipped = 0
         for r in results:
             if len(examples) >= top_k:
                 break
@@ -577,15 +808,21 @@ def retrieve_examples(tbl, query_vecs: np.ndarray, top_k: int,
             t = r.get(thinking_field, '')
             if not t:
                 continue
-            # 13-gram decontamination: skip if retrieved query overlaps with problem
             if decontam_threshold > 0 and problem_text and q:
                 ng_sim = _ngram_jaccard(problem_text, q)
                 if ng_sim > decontam_threshold:
-                    decontam_skipped += 1
+                    local_skipped += 1
                     continue
             examples.append({'query': q, 'thinking': t, '_sim': round(sim, 4),
                              '_raw_trace_len': len(t)})
-        all_examples.append(examples)
+        all_examples[qi] = examples
+        if local_skipped:
+            with _decontam_lock:
+                decontam_skipped += local_skipped
+
+    with ThreadPoolExecutor(max_workers=min(n_queries, 16)) as pool:
+        list(pool.map(_search_one, range(n_queries)))
+
     if decontam_skipped > 0:
         logger.info(f'[decontam] skipped {decontam_skipped} leaked retrievals '
                     f'(13-gram Jaccard > {decontam_threshold})')
@@ -600,20 +837,31 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--mode', choices=['direct', 'rag'], default='direct')
-    p.add_argument('--n', type=int, default=500,
-                   help='Number of problems to sample (0 = all boxed).')
-    p.add_argument('--db-path', default='./output/thinking_rag/lance.db')
+    p.add_argument('--n', type=int, default=0,
+                   help='Pool size: sample this many problems (0 = all boxed). '
+                        'In RAG mode with --target-eval, set this to 0 for max coverage.')
+    p.add_argument('--target-eval', type=int, default=200,
+                   help='Stop after this many problems are successfully evaluated '
+                        '(RAG mode: problems that have valid traces after decontam; '
+                        'direct mode: ignored, evaluates all filtered problems).')
+    p.add_argument('--db-path', default='./output.oldemb/thinking_rag/lance.db')
     p.add_argument('--table', default='thinking_traces')
     p.add_argument('--top-k', type=int, default=3)
     p.add_argument('--use-cot-compressed', action='store_true',
                    help='Use pre-compressed cot_compressed field instead of thinking_raw.')
-    p.add_argument('--sim-threshold', type=float, default=0.75)
-    p.add_argument('--rag-fallback-sim', type=float, default=0.70,
-                   help='Fallback to direct prompt when best retrieval similarity '
-                        'is below this threshold (avoids weak-trace loops).')
+    p.add_argument('--sim-threshold', type=float, default=0.80,
+                   help='Minimum cosine similarity for retrieved traces. '
+                        'Traces below this are discarded at retrieval time.')
     p.add_argument('--decontam-threshold', type=float, default=0.20,
                    help='13-gram Jaccard threshold for leak detection. '
                         'Retrieved traces above this are skipped (0=disabled).')
+    p.add_argument('--llm-decontam', action='store_true', default=True,
+                   help='LLM-based decontamination (default ON): API judges whether '
+                        'retrieved problem is the same as the test problem. '
+                        'Applied after 13-gram decontam, before condensing. '
+                        'Use --no-llm-decontam to disable.')
+    p.add_argument('--no-llm-decontam', dest='llm_decontam', action='store_false',
+                   help='Disable LLM-based decontamination.')
     p.add_argument('--max-trace-len', type=int, default=12000)
     p.add_argument('--condense', action='store_true',
                    help='Enable condenser re-compression on retrieved traces.')
@@ -621,11 +869,25 @@ def main():
                    help='Max chars of condensed trace (fallback truncation).')
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--hint', action='store_true', default=True,
+                   help='Enable API hint analysis on retrieved traces (default ON). '
+                        'In rag mode: retrieve → condense → API hint analysis → preanalysis system prompt. '
+                        'In direct mode: ignored (no traces to analyze).')
+    p.add_argument('--no-hint', dest='hint', action='store_false',
+                   help='Disable API hint analysis; inject condensed trace directly.')
+    p.add_argument('--problem-ids-file', default='./output/thinking_rag/aops_rag_problem_ids.json',
+                   help='File listing problem indices evaluated by RAG mode. '
+                        'RAG mode writes this file; direct mode reads it to '
+                        'evaluate the same subset (use --no-filter to disable).')
+    p.add_argument('--no-filter', action='store_true',
+                   help='In direct mode, evaluate ALL sampled problems '
+                        'instead of filtering to RAG subset.')
     p.add_argument('--output', default=None)
     args = p.parse_args()
 
     if args.output is None:
-        args.output = f'./output/thinking_rag/aops_{args.mode}_results.jsonl'
+        suffix = f'{args.mode}_hint' if (args.hint and args.mode == 'rag') else args.mode
+        args.output = f'./output/thinking_rag/aops_{suffix}_results.jsonl'
 
     if args.condense and args.use_cot_compressed:
         logger.warning('--condense requires thinking_raw, ignoring --use-cot-compressed')
@@ -634,6 +896,27 @@ def main():
     records = load_aops(n=args.n, seed=args.seed)
 
     is_rag = (args.mode == 'rag')
+
+    # Direct mode: filter to same problems RAG evaluated (controlled comparison)
+    original_indices = list(range(len(records)))  # track original indices
+    if not is_rag and not args.no_filter:
+        if os.path.exists(args.problem_ids_file):
+            with open(args.problem_ids_file) as f:
+                content = f.read().strip()
+            if content.startswith('['):
+                valid_indices = set(json.loads(content))
+            else:
+                valid_indices = set(int(line) for line in content.splitlines() if line.strip())
+            filtered = [(i, r) for i, r in enumerate(records) if i in valid_indices]
+            original_indices = [i for i, _ in filtered]
+            records = [r for _, r in filtered]
+            sys.stderr.write(
+                f'[direct] filtered to {len(records)} problems '
+                f'from {args.problem_ids_file}\n')
+        else:
+            sys.stderr.write(
+                f'[direct] WARNING: {args.problem_ids_file} not found, '
+                f'running all {len(records)} problems\n')
 
     condenser_gpus = int(os.environ.get('EVAL_CONDENSER_GPUS', 0)) if args.condense else 0
 
@@ -739,84 +1022,186 @@ def main():
                 top_p=0.5, num_samples=1)
             sys.stderr.write(f'[condense] local vLLM ready (model={CONDENSE_MODEL_ID})\n')
 
+    # -- Hint analysis API client (reuses condenser API config) -----------------
+    hint_api_client = None
+    if args.hint and is_rag:
+        if condenser_api_client is not None:
+            hint_api_client = condenser_api_client
+        else:
+            hint_api_client = OpenAIClient(
+                model=CONDENSE_API_MODEL, api_key=CONDENSE_API_KEY,
+                base_url=CONDENSE_BASE_URL)
+        sys.stderr.write(f'[hint] API hint analysis enabled (model={CONDENSE_API_MODEL})\n')
+
+    # -- LLM decontam API client ---------------------------------------------------
+    decontam_api_client = None
+    if args.llm_decontam and is_rag:
+        if hint_api_client is not None:
+            decontam_api_client = hint_api_client
+        elif condenser_api_client is not None:
+            decontam_api_client = condenser_api_client
+        else:
+            decontam_api_client = OpenAIClient(
+                model=CONDENSE_API_MODEL, api_key=CONDENSE_API_KEY,
+                base_url=CONDENSE_BASE_URL)
+        sys.stderr.write(f'[decontam-llm] LLM decontamination enabled (model={CONDENSE_API_MODEL})\n')
+
     correct_count = 0
     total_count = 0
+    skipped_indices: List[int] = []  # problems skipped by RAG (no valid trace)
+    evaluated_indices: List[int] = []  # problems actually evaluated
     debug_records: List[Dict[str, Any]] = []
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     out_f = open(args.output, 'w', encoding='utf-8')
 
-    for batch_start in range(0, len(records), args.batch_size):
+    # Open problem-ids files for incremental writing (RAG mode only)
+    ids_f = None
+    skip_f = None
+    if is_rag:
+        os.makedirs(os.path.dirname(args.problem_ids_file) or '.', exist_ok=True)
+        ids_f = open(args.problem_ids_file, 'w', encoding='utf-8')
+        skip_path = args.problem_ids_file.replace('.json', '_skipped.json')
+        skip_f = open(skip_path, 'w', encoding='utf-8')
+
+    # -- RAG batch preparation (embed + retrieve + decontam + condense + hint) --
+    def _prepare_rag_batch(batch_start: int):
+        """Prepare a RAG batch: returns (prompts, batch, all_examples,
+        hint_analyses, kept_global_indices, batch_skipped_indices) or None."""
         batch_end = min(batch_start + args.batch_size, len(records))
         batch = records[batch_start:batch_end]
+        problems = [r['problem'] for r in batch]
 
-        if is_rag:
-            problems = [r['problem'] for r in batch]
-            query_vecs = get_embeddings(emb_model, emb_template, problems,
-                                        EMB_GPUS)
-            use_raw = not args.use_cot_compressed
-            all_examples = retrieve_examples(tbl, query_vecs, args.top_k,
-                                             use_raw,
-                                             args.sim_threshold,
-                                             problems=problems,
-                                             decontam_threshold=args.decontam_threshold)
-            # Strip structural markers from cot_compressed field
-            if args.use_cot_compressed:
-                for exs in all_examples:
-                    for ex in exs:
-                        ex['thinking'] = _strip_condenser_markers(ex['thinking'])
+        query_vecs = get_embeddings(emb_model, emb_template, problems, EMB_GPUS)
+        use_raw = not args.use_cot_compressed
+        all_examples = retrieve_examples(tbl, query_vecs, args.top_k,
+                                         use_raw, args.sim_threshold,
+                                         problems=problems,
+                                         decontam_threshold=args.decontam_threshold)
+        if args.use_cot_compressed:
+            for exs in all_examples:
+                for ex in exs:
+                    ex['thinking'] = _strip_condenser_markers(ex['thinking'])
 
-            # Condenser re-compression
-            if args.condense and condenser_api_client:
-                all_examples = condense_traces(
-                    all_examples, problems, condenser_api_client,
-                    condenser_sampler=condenser_sampler_obj,
-                    compress_params=condenser_params,
-                    special_tokens=condenser_special_tokens,
-                    max_output_len=args.condense_max_len)
+        if args.llm_decontam and decontam_api_client:
+            all_examples = _llm_decontaminate(
+                decontam_api_client, problems, all_examples)
 
-            prompts = []
-            for r, examples in zip(batch, all_examples):
-                if not examples:
-                    prompts.append(build_direct_prompt(r['problem']))
-                else:
-                    # Drop traces exceeding max_trace_len instead of truncating
-                    filtered = [{'query': ex['query'], 'thinking': ex['thinking']}
-                                for ex in examples
-                                if len(ex['thinking']) <= args.max_trace_len]
-                    # Fallback to direct if best similarity is too low
-                    best_sim = max(ex.get('_sim', 0.0) for ex in examples)
-                    if filtered and best_sim >= args.rag_fallback_sim:
-                        prompts.append(build_rag_prompt(r['problem'], filtered))
-                    else:
-                        prompts.append(build_direct_prompt(r['problem']))
-        else:
-            prompts = [build_direct_prompt(r['problem']) for r in batch]
+        if args.condense and condenser_api_client:
+            all_examples = condense_traces(
+                all_examples, problems, condenser_api_client,
+                condenser_sampler=condenser_sampler_obj,
+                compress_params=condenser_params,
+                special_tokens=condenser_special_tokens,
+                max_output_len=args.condense_max_len)
 
-        responses = sampler.sample(prompts, gen_params)
+        hint_analyses = None
+        if args.hint and hint_api_client:
+            hint_analyses = _api_hint_analysis_batch(
+                hint_api_client, problems, all_examples)
 
-        for i, (rec, resp) in enumerate(zip(batch, responses)):
-            seq = resp.sequences[0] if resp and resp.sequences else None
-            raw_output = ''
-            if seq is not None:
-                raw_output = seq.decoded or ''
-                raw_output = re.sub(r'<\|[^|]+\|>', '', raw_output).rstrip()
+        keep_mask = []
+        for pi, (r, examples) in enumerate(zip(batch, all_examples)):
+            if not examples:
+                keep_mask.append(False)
+            elif hint_analyses and hint_analyses[pi]:
+                keep_mask.append(True)
+            else:
+                usable = [ex for ex in examples
+                          if len(ex['thinking']) <= args.max_trace_len]
+                keep_mask.append(bool(usable))
 
-            predicted = extract_boxed(raw_output)
-            is_correct = answers_match(predicted, rec['reference_answer'])
-            if is_correct:
-                correct_count += 1
-            total_count += 1
+        batch_skipped = []
+        for pi, keep in enumerate(keep_mask):
+            if not keep:
+                batch_skipped.append(batch_start + pi)
 
-            debug_rec = {
-                'idx': batch_start + i,
-                'reference_answer': rec['reference_answer'],
-                'predicted': predicted,
-                'is_correct': is_correct,
-                'problem': rec['problem'],
-                'model_output': raw_output,
-            }
-            if is_rag:
+        kept_batch = []
+        kept_examples = []
+        kept_hints = []
+        kept_global_indices = []
+        for pi, keep in enumerate(keep_mask):
+            if keep:
+                kept_batch.append(batch[pi])
+                kept_examples.append(all_examples[pi])
+                kept_hints.append(hint_analyses[pi] if hint_analyses else None)
+                kept_global_indices.append(batch_start + pi)
+
+        if not kept_batch:
+            return None, None, None, None, None, batch_skipped
+
+        prompts = []
+        for pi, (r, examples) in enumerate(zip(kept_batch, kept_examples)):
+            if kept_hints[pi]:
+                prompts.append(build_hint_prompt(r['problem'], kept_hints[pi]))
+            else:
+                filtered = [{'query': ex['query'], 'thinking': ex['thinking']}
+                            for ex in examples
+                            if len(ex['thinking']) <= args.max_trace_len]
+                prompts.append(build_rag_prompt(r['problem'], filtered))
+
+        return prompts, kept_batch, kept_examples, kept_hints, kept_global_indices, batch_skipped
+
+    target_reached = False
+    batch_starts = list(range(0, len(records), args.batch_size))
+
+    if is_rag:
+        # Pipeline: prefetch next batch while current batch generates
+        from concurrent.futures import Future
+        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+        # Prepare first batch synchronously
+        cur_result = _prepare_rag_batch(batch_starts[0])
+
+        for bi, batch_start in enumerate(batch_starts):
+            if target_reached:
+                break
+            prompts, batch, all_examples, hint_analyses, kept_global_indices, batch_skipped = cur_result
+            skipped_indices.extend(batch_skipped or [])
+            if skip_f and batch_skipped:
+                for sid in batch_skipped:
+                    skip_f.write(f'{sid}\n')
+                skip_f.flush()
+
+            # Submit next batch preparation in background
+            next_future: Optional[Future] = None
+            if bi + 1 < len(batch_starts) and not target_reached:
+                next_future = prefetch_pool.submit(_prepare_rag_batch, batch_starts[bi + 1])
+
+            if prompts is None:
+                # Entire batch skipped
+                cur_result = next_future.result() if next_future else None
+                continue
+
+            # Generate (runs on gen GPU while next batch prepares on emb GPU + API)
+            responses = sampler.sample(prompts, gen_params)
+
+            for i, (rec, resp) in enumerate(zip(batch, responses)):
+                seq = resp.sequences[0] if resp and resp.sequences else None
+                raw_output = ''
+                if seq is not None:
+                    raw_output = seq.decoded or ''
+                    raw_output = re.sub(r'<\|[^|]+\|>', '', raw_output).rstrip()
+
+                predicted = extract_boxed(raw_output)
+                is_correct = answers_match(predicted, rec['reference_answer'])
+                if is_correct:
+                    correct_count += 1
+                total_count += 1
+
+                global_idx = kept_global_indices[i]
+                evaluated_indices.append(global_idx)
+                if ids_f:
+                    ids_f.write(f'{global_idx}\n')
+                    ids_f.flush()
+
+                debug_rec = {
+                    'idx': global_idx,
+                    'reference_answer': rec['reference_answer'],
+                    'predicted': predicted,
+                    'is_correct': is_correct,
+                    'problem': rec['problem'],
+                    'model_output': raw_output,
+                }
                 debug_rec['num_traces'] = len(all_examples[i])
                 if all_examples[i]:
                     ex0 = all_examples[i][0]
@@ -826,24 +1211,89 @@ def main():
                     debug_rec['condensed_trace'] = ex0['thinking']
                     debug_rec['condensed_trace_len'] = len(ex0['thinking'])
                     debug_rec['condense_source'] = ex0.get('_condense_source', '')
-            debug_records.append(debug_rec)
-            out_f.write(json.dumps(debug_rec, ensure_ascii=False) + '\n')
-            out_f.flush()
+                if hint_analyses and hint_analyses[i]:
+                    debug_rec['hint_analysis'] = hint_analyses[i]
+                debug_records.append(debug_rec)
+                out_f.write(json.dumps(debug_rec, ensure_ascii=False) + '\n')
+                out_f.flush()
 
-        acc = correct_count / total_count if total_count else 0
-        sys.stderr.write(
-            f'  [{batch_end}/{len(records)}] '
-            f'acc={acc:.4f} ({correct_count}/{total_count})\n')
+            acc = correct_count / total_count if total_count else 0
+            sys.stderr.write(
+                f'  [{total_count}/{args.target_eval}] '
+                f'acc={acc:.4f} ({correct_count}/{total_count})\n')
+
+            if args.target_eval > 0 and total_count >= args.target_eval:
+                target_reached = True
+
+            # Collect prefetched result for next iteration (skip if done)
+            if not target_reached and next_future:
+                cur_result = next_future.result()
+            else:
+                cur_result = None
+
+        prefetch_pool.shutdown(wait=True)
+    else:
+        # Direct mode: no pipeline needed, just batch generate
+        for batch_start in batch_starts:
+            batch_end = min(batch_start + args.batch_size, len(records))
+            batch = records[batch_start:batch_end]
+            prompts = [build_direct_prompt(r['problem']) for r in batch]
+
+            responses = sampler.sample(prompts, gen_params)
+
+            for i, (rec, resp) in enumerate(zip(batch, responses)):
+                seq = resp.sequences[0] if resp and resp.sequences else None
+                raw_output = ''
+                if seq is not None:
+                    raw_output = seq.decoded or ''
+                    raw_output = re.sub(r'<\|[^|]+\|>', '', raw_output).rstrip()
+
+                predicted = extract_boxed(raw_output)
+                is_correct = answers_match(predicted, rec['reference_answer'])
+                if is_correct:
+                    correct_count += 1
+                total_count += 1
+
+                global_idx = original_indices[batch_start + i]
+                evaluated_indices.append(global_idx)
+
+                debug_rec = {
+                    'idx': global_idx,
+                    'reference_answer': rec['reference_answer'],
+                    'predicted': predicted,
+                    'is_correct': is_correct,
+                    'problem': rec['problem'],
+                    'model_output': raw_output,
+                }
+                debug_records.append(debug_rec)
+                out_f.write(json.dumps(debug_rec, ensure_ascii=False) + '\n')
+                out_f.flush()
+
+            acc = correct_count / total_count if total_count else 0
+            sys.stderr.write(
+                f'  [{total_count}/{len(records)}] '
+                f'acc={acc:.4f} ({correct_count}/{total_count})\n')
 
     overall_acc = correct_count / total_count if total_count else 0
     print(f'\n{"=" * 60}')
     print(f'AoPS Math — mode={args.mode}, model={GEN_MODEL_ID}')
     print(f'  n={total_count}, seed={args.seed}')
+    if is_rag:
+        print(f'  evaluated={len(evaluated_indices)}, skipped={len(skipped_indices)}')
     print(f'{"=" * 60}')
     print(f'Overall accuracy: {overall_acc:.4f}  ({correct_count}/{total_count})')
 
     out_f.close()
     print(f'\n[output] {len(debug_records)} records saved to {args.output}')
+
+    if ids_f:
+        ids_f.close()
+        print(f'[output] problem IDs ({len(evaluated_indices)}) saved to {args.problem_ids_file}')
+    if skip_f:
+        skip_f.close()
+        if skipped_indices:
+            print(f'[output] skipped IDs ({len(skipped_indices)}) saved to '
+                  f'{args.problem_ids_file.replace(".json", "_skipped.json")}')
 
 
 if __name__ == '__main__':

@@ -103,6 +103,13 @@ OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './outputs/rag_hint_grpo')
 # Forced analysis prefix appended at the start of assistant response
 ANALYSIS_PREFIX = ''
 
+# Fixed opening inside <hint> block — model must produce this EXACT prefix
+HINT_REQUIRED_PREFIX = "Let's analyze the RAG example step by step."
+
+# Hint analysis config (API pre-analysis)
+HINT_ANALYSIS_MAX_TOKENS = int(os.environ.get('HINT_ANALYSIS_MAX_TOKENS', 400))
+HINT_ANALYSIS_TEMPERATURE = 0.3
+
 # ============================================================================
 # Condenser prompt (strategy-level extraction)
 # ============================================================================
@@ -135,17 +142,69 @@ COMPRESS_USER = (
 # ============================================================================
 SYSTEM_WITH_RAG_HEADER = (
     'You are an expert competition mathematician. '
-    'Below are condensed reasoning examples from similar problems. '
-    'Before solving the problem, you MUST first output a <hint> ... </hint> block '
-    'that critically analyzes the provided examples:\n'
-    '- Identify which steps, formulas, and concepts are CORRECT and APPLICABLE '
-    'to the current problem.\n'
+    'Below are condensed reasoning examples from similar problems.\n\n'
+    '## Output Format (STRICT)\n'
+    'Your response MUST begin with a <hint> block as the VERY FIRST content. '
+    'Do NOT output any text before <hint>.\n\n'
+    'The <hint> block MUST start with EXACTLY this sentence (copy verbatim):\n'
+    '"Let\'s analyze the RAG example step by step."\n\n'
+    'Then continue your analysis:\n'
+    '- Walk through each example\'s methodology and identify which steps, '
+    'formulas, and concepts are CORRECT and APPLICABLE to the current problem.\n'
     '- Identify which parts are WRONG, IRRELEVANT, MISLEADING, or based on '
     'assumptions that do NOT hold for this problem.\n'
-    '- Conclude with a one-line verdict: "Useful: ..." and "Discard: ..."\n\n'
+    '- End with a one-line verdict: "Useful: ..." and "Discard: ..."\n\n'
+    'Example format:\n'
+    '<hint>\n'
+    "Let's analyze the RAG example step by step.\n"
+    '- Example 1: The ansatz f(x)=x^n is APPLICABLE because ... However, '
+    'the uniqueness argument via continuity is UNNECESSARY for this problem.\n'
+    '- Useful: power function ansatz, linear combination check.\n'
+    '- Discard: continuity assumption, specific numeric result.\n'
+    '</hint>\n\n'
     'After the </hint> block, solve the actual problem step by step using ONLY '
     'the validated useful parts. Put your final answer inside \\boxed{}. '
     'For multiple-choice questions, put the option LETTER (A/B/C/D/E) inside \\boxed{}.\n\n'
+)
+
+# System prompt for pre-analyzed RAG (hint analysis done by API, model just solves)
+_PREANALYSIS_BEFORE = (
+    'You are an expert competition mathematician.\n\n'
+    '## RAG Analysis (pre-computed)\n'
+)
+_PREANALYSIS_AFTER = (
+    '\n\n## Instructions\n'
+    'Use the useful methods/formulas identified above to solve the problem. '
+    'Ignore anything marked as irrelevant. '
+    'Solve step by step and put your final answer inside \\boxed{}. '
+    'For multiple-choice questions, put the option LETTER (A/B/C/D/E) inside \\boxed{}.'
+)
+
+
+def build_preanalysis_system(hint_analysis: str) -> str:
+    """Build system prompt with pre-analyzed hint. Uses concatenation to avoid .format() issues with math braces."""
+    return _PREANALYSIS_BEFORE + hint_analysis + _PREANALYSIS_AFTER
+
+# API prompt for hint analysis generation
+HINT_ANALYSIS_SYSTEM = (
+    'You are a mathematical methodology analyst. '
+    'Given a target problem and a condensed reasoning trace from a SIMILAR (but different) problem, '
+    'analyze which methods, formulas, and techniques from the trace are APPLICABLE to the target problem '
+    'and which are IRRELEVANT or MISLEADING.\n\n'
+    'Output format (strict):\n'
+    '- Useful: [list specific methods/formulas/techniques that transfer to the target]\n'
+    '- Discard: [list parts that are irrelevant or would mislead]\n'
+    '- Key insight: [one sentence on how to apply the useful parts]\n\n'
+    'Rules:\n'
+    '1. Be concise — at most 200 words total.\n'
+    '2. Focus ONLY on transferable methodology, never solve the target problem.\n'
+    '3. Never output the answer to either problem.\n'
+    '4. If the trace is entirely irrelevant, say "Useful: None. Discard: All."'
+)
+
+HINT_ANALYSIS_USER = (
+    '## Target Problem\n{query}\n\n'
+    '## Condensed Trace (from similar problem)\n{thinking}'
 )
 
 EXAMPLE_TEMPLATE = (
@@ -183,6 +242,59 @@ def _api_condense_single(api_client: OpenAIClient, messages: List[Dict]) -> Opti
         return None
     finally:
         _api_semaphore.release()
+
+
+def _api_hint_analysis_batch(
+    api_client: OpenAIClient,
+    problems: List[str],
+    condensed_examples: List[List[Dict[str, str]]],
+) -> List[Optional[str]]:
+    """Call API to pre-analyze RAG relevance for each problem. ~300 tokens per call."""
+    results: List[Optional[str]] = [None] * len(problems)
+    tasks = []  # (idx, messages)
+    for i, prob in enumerate(problems):
+        if not condensed_examples[i]:
+            continue
+        # Merge all condensed traces into one block
+        traces = []
+        for ex in condensed_examples[i]:
+            traces.append(ex.get('thinking', ''))
+        merged_thinking = '\n---\n'.join(traces)
+        user_msg = HINT_ANALYSIS_USER.format(query=prob, thinking=merged_thinking)
+        msgs = [
+            {'role': 'system', 'content': HINT_ANALYSIS_SYSTEM},
+            {'role': 'user', 'content': user_msg},
+        ]
+        tasks.append((i, msgs))
+
+    if not tasks:
+        return results
+
+    def _call_one(idx, msgs):
+        _api_semaphore.acquire()
+        try:
+            trajectory = {'messages': msgs}
+            sp = SamplingParams(
+                temperature=HINT_ANALYSIS_TEMPERATURE,
+                max_tokens=HINT_ANALYSIS_MAX_TOKENS)
+            reply = api_client(trajectory, sp, extra_body={'enable_thinking': False})
+            content = (reply.get('content') or '').strip()
+            return idx, content if content else None
+        except Exception as exc:
+            logger.warning(f'[hint-analysis] error for idx={idx}: {exc}')
+            return idx, None
+        finally:
+            _api_semaphore.release()
+
+    with ThreadPoolExecutor(max_workers=min(len(tasks), CONDENSE_API_CONCURRENCY)) as pool:
+        futs = [pool.submit(_call_one, idx, msgs) for idx, msgs in tasks]
+        for fut in as_completed(futs):
+            idx, analysis = fut.result()
+            results[idx] = analysis
+
+    n_success = sum(1 for r in results if r)
+    logger.info(f'[hint-analysis] completed {n_success}/{len(tasks)} analyses')
+    return results
 
 
 # ============================================================================
@@ -678,8 +790,29 @@ class AoPSAccuracyReward(Reward):
 class FormatReward(Reward):
     """Reward for having \\boxed{} and <hint>...</hint> analysis in the output."""
 
-    _HINT_OPEN_RE = re.compile(r'<hint>')
-    _HINT_CLOSE_RE = re.compile(r'</hint>')
+    _HINT_RE = re.compile(r'<hint>(.*?)</hint>', re.DOTALL)
+    _THINK_RE = re.compile(r'^.*?</think>', re.DOTALL)
+    _MIN_HINT_LEN = 30  # minimum chars for a substantive hint
+    _MAX_HINT_LEN = 4096  # hints longer than this are likely thinking dumps
+
+    @staticmethod
+    def _to_text(content) -> str:
+        """Convert content (str or list-of-blocks) to plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return ''.join(
+                b.get('text', '') if isinstance(b, dict) else str(b)
+                for b in content)
+        return str(content) if content else ''
+
+    @classmethod
+    def _visible_response(cls, text: str) -> str:
+        """Strip <think>...</think> block to get the visible response."""
+        think_end = text.find('</think>')
+        if think_end >= 0:
+            return text[think_end + len('</think>'):]
+        return text
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
@@ -689,20 +822,33 @@ class FormatReward(Reward):
             sys_content = ''
             for msg in messages:
                 if msg.get('role') == 'system':
-                    sys_content = msg.get('content', '')
+                    sys_content = self._to_text(msg.get('content', ''))
             for msg in reversed(messages):
                 if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
+                    completion = self._to_text(msg.get('content', ''))
                     break
             has_boxed = '\\boxed{' in completion
             # Only check hint tags for RAG prompts (system contains examples)
             is_rag = 'condensed reasoning examples from similar problems' in sys_content
             if is_rag:
-                has_hint_open = bool(self._HINT_OPEN_RE.search(completion))
-                has_hint_close = bool(self._HINT_CLOSE_RE.search(completion))
-                has_hint = has_hint_open and has_hint_close
-                # 0.3 for boxed + 0.2 for hint analysis = 0.5 max
-                reward = (0.3 if has_boxed else 0.0) + (0.2 if has_hint else 0.0)
+                # Check hint in VISIBLE response only (after </think>)
+                visible = self._visible_response(completion)
+                hint_match = self._HINT_RE.search(visible)
+                has_good_hint = False
+                if hint_match:
+                    hint_text = hint_match.group(1).strip()
+                    hint_pos = hint_match.start()
+                    # Hint must be near the start of visible output
+                    at_beginning = hint_pos < max(len(visible) * 0.05, 200)
+                    is_substantive = len(hint_text) >= self._MIN_HINT_LEN
+                    # Reject hints that are too long (model dumping thinking)
+                    not_dump = len(hint_text) <= self._MAX_HINT_LEN
+                    # Must start with the required prefix
+                    has_prefix = hint_text.startswith(HINT_REQUIRED_PREFIX)
+                    has_good_hint = (at_beginning and is_substantive
+                                     and not_dump and has_prefix)
+                # 0.3 for boxed + 0.2 for good hint = 0.5 max
+                reward = (0.3 if has_boxed else 0.0) + (0.2 if has_good_hint else 0.0)
             else:
                 reward = 0.5 if has_boxed else 0.0
             rewards.append(reward)
@@ -1023,6 +1169,11 @@ def main():
                     condensed_examples[idx].append(
                         {'query': ret['query'], 'thinking': ret['thinking'][:MAX_TRACE_LEN]})
 
+        # API hint analysis: pre-compute RAG relevance verdict
+        hint_analyses = [None] * len(problems)
+        if api_client:
+            hint_analyses = _api_hint_analysis_batch(api_client, problems, condensed_examples)
+
         # Build prompts with rag_fallback_sim check
         rag_prompts = []
         rag_debug_records = []
@@ -1033,13 +1184,18 @@ def main():
             use_rag = bool(examples) and best_sim >= RAG_FALLBACK_SIM
 
             if use_rag:
-                parts = [SYSTEM_WITH_RAG_HEADER]
-                for eidx, ex in enumerate(examples, 1):
-                    parts.append(EXAMPLE_TEMPLATE.format(
-                        idx=eidx,
-                        example_query=ex['query'],
-                        example_thinking=ex['thinking']))
-                rag_sys_content = ''.join(parts)
+                # If API hint analysis succeeded, use pre-analyzed prompt (no <hint> needed)
+                if hint_analyses[i]:
+                    rag_sys_content = build_preanalysis_system(hint_analyses[i])
+                else:
+                    # Fallback: old-style prompt with self-analysis requirement
+                    parts = [SYSTEM_WITH_RAG_HEADER]
+                    for eidx, ex in enumerate(examples, 1):
+                        parts.append(EXAMPLE_TEMPLATE.format(
+                            idx=eidx,
+                            example_query=ex['query'],
+                            example_thinking=ex['thinking']))
+                    rag_sys_content = ''.join(parts)
 
                 # RAG group (only RAG, no paired NoRAG)
                 rag_prompts.append({
@@ -1058,6 +1214,8 @@ def main():
                     'num_retrieved': len(rets),
                     'num_condensed': len(examples),
                     'use_rag': True,
+                    'has_preanalysis': hint_analyses[i] is not None,
+                    'preanalysis_len': len(hint_analyses[i]) if hint_analyses[i] else 0,
                     'top_retrieved_query': rets[0]['query'][:200] if rets else '',
                     'condensed_len': len(examples[0].get('thinking', '')) if examples else 0,
                 })
@@ -1070,7 +1228,7 @@ def main():
     # Submit first batch prefetch
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rag_log_path = os.path.join(OUTPUT_DIR, 'rag_diagnostics.jsonl')
-    rag_log_f = open(rag_log_path, 'a', encoding='utf-8')
+    rag_log_f = open(rag_log_path, 'w', encoding='utf-8')
     logger.info(f'[rag] diagnostics → {rag_log_path}')
 
     batch_iter = iter(dataloader)
@@ -1107,6 +1265,10 @@ def main():
             expand_prompts = []
             for prompt in rag_prompts:
                 expand_prompts.extend([prompt] * NUM_GENERATIONS)
+
+            if not expand_prompts:
+                logger.warning(f'[Step {optim_step}] empty prompt list after RAG processing, skip')
+                continue
 
             ckpt_manager.sync_weights(merge_and_sync=False)
             sampler.reset_prefix_cache()
@@ -1182,7 +1344,8 @@ def main():
                 user_data = traj.get('user_data') or []
                 gt = next((v for k, v in user_data if k == 'ground_truth'), '')
                 problem_idx = ridx // NUM_GENERATIONS
-                use_rag = 'condensed reasoning examples from similar problems' in sys_text
+                use_rag = ('condensed reasoning examples from similar problems' in sys_text
+                           or 'RAG Analysis (pre-computed)' in sys_text)
                 # Per-problem group accuracy (all generations for same problem)
                 grp_start = problem_idx * NUM_GENERATIONS
                 grp_end = grp_start + NUM_GENERATIONS
