@@ -1,42 +1,41 @@
-"""AoPS math competition evaluation: direct vs RAG-augmented with Qwen3.5-4B.
+"""Math evaluation: direct vs RAG-augmented with Qwen3.5-4B.
 
-Two modes:
+Datasets (``--dataset``):
+  - ``math`` (default): MATH (Hendrycks), stratified by difficulty (Level 1-5)
+                        so RAG gain can be plotted against difficulty.
+  - ``aops``:           AoPS competition problems (metadata.boxed only).
+
+Modes (``--mode``):
   - ``direct``: The model solves problems directly (4 GPUs, TP=4).
-  - ``rag``:    Retrieve top-k thinking traces from LanceDB as 1-shot
-                examples, then solve (8 GPUs: DP=4 embedding + TP=4 vLLM).
+  - ``rag`` (default): Retrieve top-k thinking traces from LanceDB, condense
+                them (API qwen3.7-max), inject as 1-shot examples, then solve
+                (8 GPUs: DP=4 embedding + TP=4 vLLM).
+
+Defaults implement **raw RAG on MATH**: ``--dataset math --mode rag --condense``
+with hint filtering OFF. The API condenser needs ``COMPRESS_API_KEY`` (or a
+local condenser via ``EVAL_CONDENSER_GPUS``); otherwise pass ``--no-condense``.
 
 Optional ``--hint`` flag (rag mode only):
-  After retrieval (+ optional condensing), call an API model to pre-analyze
-  which methods from the traces are applicable, then inject the analysis as
-  a system-prompt "preanalysis" instead of raw traces.
+  After retrieval + condensing, call an API model to filter and refine the
+  traces — keeping only applicable methods — then inject the refined trace.
 
-Only problems with ``metadata.boxed == True`` are used (auto-gradable via
-``\\boxed{...}`` extraction).  A random subset is sampled for efficiency.
+Reference answers are the ``\\boxed{...}`` content of each solution.
 
 Launch examples:
-    # Direct (4 GPUs, default 500 problems)
+    # Default: raw RAG on MATH, stratified 100/level (needs COMPRESS_API_KEY)
+    COMPRESS_API_KEY=sk-... python cookbook/exp/embedding/eval_gpqa_rag.py
+
+    # Paired direct baseline on the same MATH subset
     python cookbook/exp/embedding/eval_gpqa_rag.py --mode direct
 
-    # RAG-augmented (8 GPUs)
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag
+    # Raw RAG without condenser (inject raw retrieved traces)
+    python cookbook/exp/embedding/eval_gpqa_rag.py --no-condense
 
-    # RAG + API hint analysis (recommended)
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --hint
+    # Add hint filtering back on top of condensing
+    COMPRESS_API_KEY=sk-... python cookbook/exp/embedding/eval_gpqa_rag.py --hint
 
-    # RAG + condense + hint (full pipeline)
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --condense --hint
-
-    # Smaller sample for quick test
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode direct --n 100
-
-    # RAG with condenser (retrieves thinking_raw, compresses with local 4B / API)
-    EVAL_CONDENSER_GPUS=2 python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --condense
-
-    # RAG without condenser (uses thinking_raw by default, truncated to max-trace-len)
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag
-
-    # RAG with pre-compressed field (opt-in, not recommended for reader LM)
-    python cookbook/exp/embedding/eval_gpqa_rag.py --mode rag --use-cot-compressed
+    # Fall back to the old AoPS dataset
+    python cookbook/exp/embedding/eval_gpqa_rag.py --dataset aops
 """
 import argparse
 import json
@@ -75,45 +74,30 @@ CONDENSE_TEMPERATURE = 0.2
 CONDENSE_MAX_TOKENS = 8192
 
 # -- Hint analysis config ------------------------------------------------------
-HINT_ANALYSIS_MAX_TOKENS = int(os.environ.get('HINT_ANALYSIS_MAX_TOKENS', 400))
-HINT_ANALYSIS_TEMPERATURE = 0.3
+HINT_ANALYSIS_MAX_TOKENS = int(os.environ.get('HINT_ANALYSIS_MAX_TOKENS', 2000))
+HINT_ANALYSIS_TEMPERATURE = 0.2
 
 HINT_ANALYSIS_SYSTEM = (
-    'You are a mathematical methodology analyst. '
-    'Given a target problem and a condensed reasoning trace from a SIMILAR (but different) problem, '
-    'analyze which methods, formulas, and techniques from the trace are APPLICABLE to the target problem '
-    'and which are IRRELEVANT or MISLEADING.\n\n'
-    'Output format (strict):\n'
-    '- Useful: [list specific methods/formulas/techniques that transfer to the target]\n'
-    '- Discard: [list parts that are irrelevant or would mislead]\n'
-    '- Key insight: [one sentence on how to apply the useful parts]\n\n'
+    'You are a mathematical reasoning trace filter. '
+    'Given a target problem and reasoning traces retrieved from SIMILAR (but different) problems, '
+    'your task is to FILTER and REFINE the traces into a clean reference.\n\n'
     'Rules:\n'
-    '1. Be concise — at most 200 words total.\n'
-    '2. Focus ONLY on transferable methodology, never solve the target problem.\n'
-    '3. Never output the answer to either problem.\n'
-    '4. If the trace is entirely irrelevant, say "Useful: None. Discard: All."'
+    '1. KEEP: solution steps, methods, formulas, techniques, and key insights '
+    'that are directly applicable to solving the target problem.\n'
+    '2. REMOVE: problem-specific numeric calculations that do not transfer, '
+    'dead-end explorations, irrelevant approaches, verbose restatements, '
+    'and any content that would mislead the solver on the target problem.\n'
+    '3. Output the refined trace directly as actionable solution steps. '
+    'Preserve the original mathematical expressions and step structure.\n'
+    '4. Do NOT solve the target problem. Do NOT add your own solutions or commentary.\n'
+    '5. Do NOT output the answer to either problem.\n'
+    '6. If the traces are entirely irrelevant, output exactly: "No applicable methods."'
 )
 
 HINT_ANALYSIS_USER = (
     '## Target Problem\n{query}\n\n'
-    '## Condensed Trace (from similar problem)\n{thinking}'
+    '## Retrieved Reasoning Traces\n{thinking}'
 )
-
-_PREANALYSIS_BEFORE = (
-    'You are an expert competition mathematician.\n\n'
-    'A methodology analysis from a similar problem:\n\n'
-)
-_PREANALYSIS_AFTER = (
-    '\n\n'
-    'This is from a related but different problem — '
-    'some techniques may transfer, others may not. '
-    'Solve the given problem step by step and put your final answer inside \\boxed{}.'
-)
-
-
-def build_preanalysis_system(hint_analysis: str) -> str:
-    """Build system prompt with pre-analyzed hint."""
-    return _PREANALYSIS_BEFORE + hint_analysis + _PREANALYSIS_AFTER
 
 # ---------------------------------------------------------------------------
 # Config
@@ -134,6 +118,7 @@ GEN_TEMPERATURE = float(os.environ.get('GEN_TEMPERATURE', 0.6))
 GEN_TOP_P = float(os.environ.get('GEN_TOP_P', 0.95))
 
 AOPS_DATASET_ID = os.environ.get('AOPS_DATASET_ID', 'AI-MO/aops')
+MATH_DATA_DIR = os.environ.get('MATH_DATA_DIR', './output/math_data/MATH')
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +222,7 @@ def _api_hint_analysis_batch(
     condensed_examples: List[List[Dict[str, str]]],
 ) -> List[Optional[str]]:
     """Call API to pre-analyze RAG relevance for each problem."""
-    _MAX_HINT_INPUT = 4000
+    _MAX_HINT_INPUT = 8000
     results: List[Optional[str]] = [None] * len(problems)
     tasks = []
     for i, prob in enumerate(problems):
@@ -266,7 +251,10 @@ def _api_hint_analysis_batch(
                 max_tokens=HINT_ANALYSIS_MAX_TOKENS)
             reply = api_client(trajectory, sp, extra_body={'enable_thinking': False})
             content = (reply.get('content') or '').strip()
-            return idx, content if content else None
+            # Treat "No applicable methods." as empty (will trigger fallback)
+            if not content or content == 'No applicable methods.':
+                return idx, None
+            return idx, content
         except Exception as exc:
             logger.warning(f'[hint-analysis] error for idx={idx}: {exc}')
             return idx, None
@@ -373,6 +361,7 @@ def condense_traces(
     compress_params=None,
     special_tokens: set = None,
     max_output_len: int = 2000,
+    dp_size: int = 1,
 ) -> List[List[Dict[str, str]]]:
     """Compress retrieved thinking traces with query-aware condenser.
 
@@ -404,11 +393,23 @@ def condense_traces(
 
     if condenser_sampler is not None and compress_params is not None:
         sampler_inputs = [{'messages': p} for p in prompts]
+        # The local vLLM sampler runs data-parallel across ``dp_size`` workers
+        # and requires at least one item per worker (it errors with
+        # "Batch too small for N workers" otherwise). Pad the batch up to a
+        # multiple of dp_size by repeating the last item, run, then keep only
+        # the first ``n_real`` responses and drop the padding.
+        n_real = len(sampler_inputs)
+        pad_size = 0
+        if dp_size > 1 and n_real > 0 and n_real % dp_size != 0:
+            pad_size = dp_size - (n_real % dp_size)
+            sampler_inputs = sampler_inputs + [sampler_inputs[-1]] * pad_size
         try:
             responses = condenser_sampler.sample(sampler_inputs, compress_params)
         except Exception as exc:
             logger.warning(f'[condense] sampler error: {exc}')
             responses = [None] * len(sampler_inputs)
+        if pad_size:
+            responses = responses[:n_real]
         for ri, resp in enumerate(responses):
             seq = resp.sequences[0] if resp and resp.sequences else None
             text = ''
@@ -509,8 +510,8 @@ def normalize_answer(ans: str) -> str:
     if not ans:
         return ''
     s = ans.strip()
-    # MCQ: extract bare letter from \textbf{(D)}, \text{(A)}, (B), etc.
-    m = re.match(r'^\\?(?:textbf|text|mathrm|mathbf)?\{?\(?([A-E])\)?\}?$', s)
+    # MCQ: extract bare letter from \textbf{(D)}, \text{(A)}, \mathbb{A}, (B), etc.
+    m = re.match(r'^\\?(?:textbf|text|mathrm|mathbf|mathbb)?\{?\(?([A-E])\)?\}?$', s)
     if m:
         return m.group(1)
     s = s.replace(' ', '')
@@ -579,19 +580,40 @@ def _try_numeric_equal(a: str, b: str) -> bool:
     return False
 
 
-# MCQ reference pattern: \text{(D) }49, \textbf{(C)}12, (B) 21, etc.
+# MCQ compound pattern: \text{(D) }49, \textbf{(C)}12, (B) 21, etc.
 _MCQ_REF_RE = re.compile(
     r'^\\(?:textbf|text|mathrm|mathbf)\{\(?([A-E])\)?\s*\}\s*(.+)$'
     r'|^\(?([A-E])\)\s+(.+)$'
 )
 
 
+def _split_mcq(ans: str):
+    """Split an MCQ answer into (letter, value) components.
+
+    Handles compound forms (``\\text{(D) }49``, ``(B) 21``) as well as a
+    bare letter (``D`` -> letter only) and a bare value (``21`` -> value only).
+    Returns ``(letter_or_None, value_or_None)``.
+    """
+    s = ans.strip()
+    m = _MCQ_REF_RE.match(s)
+    if m:
+        letter = m.group(1) or m.group(3)
+        value = (m.group(2) or m.group(4) or '').strip()
+        return letter, (value or None)
+    # Bare single letter (with optional \text/\textbf/\mathbb wrapper or parens).
+    # \mathbb{A} appears as a dirty reference label for option A in some rows.
+    bl = re.match(r'^\\?(?:textbf|text|mathrm|mathbf|mathbb)?\{?\(?([A-E])\)?\}?$', s)
+    if bl:
+        return bl.group(1), None
+    return None, s or None
+
+
 def answers_match(predicted: str, reference: str) -> bool:
     """Check if two math answers are equivalent.
 
-    Supports bidirectional MCQ matching: if reference contains both a letter
-    and a value (e.g. '\\text{(D) }49'), predicted can match either the letter
-    or the value.
+    Supports bidirectional MCQ matching: either side may be a bare option
+    letter, a bare value, or a compound ``(letter) value`` form. The answer is
+    considered correct if the letters match, or if the values match.
     """
     if not predicted or not reference:
         return False
@@ -601,20 +623,29 @@ def answers_match(predicted: str, reference: str) -> bool:
         return True
     if _try_numeric_equal(norm_p, norm_r):
         return True
-    # Bidirectional MCQ matching: reference has letter+value compound format
-    ref_stripped = reference.strip()
-    mcq_m = _MCQ_REF_RE.match(ref_stripped)
-    if mcq_m:
-        ref_letter = mcq_m.group(1) or mcq_m.group(3)  # from either branch
-        ref_value = (mcq_m.group(2) or mcq_m.group(4) or '').strip()
-        # predicted is the letter
-        if norm_p == ref_letter:
+
+    # Symmetric MCQ matching: decompose both sides into (letter, value).
+    p_letter, p_value = _split_mcq(predicted)
+    r_letter, r_value = _split_mcq(reference)
+
+    # Match on the option letter (only meaningful if both sides carry a letter).
+    if p_letter and r_letter and p_letter == r_letter:
+        return True
+
+    # If both sides are letter-only (a bare option letter with no value), the
+    # letters are the only signal; differing letters mean a mismatch. Do NOT
+    # fall through to value comparison, which would spuriously match dirty
+    # labels like \mathbb{A} vs \mathbb{B}.
+    if (p_letter and p_value is None) and (r_letter and r_value is None):
+        return False
+
+    # Match on the value part (compare whichever value each side exposes; fall
+    # back to the raw normalized string when a side has no separate value).
+    p_val = normalize_answer(p_value) if p_value else norm_p
+    r_val = normalize_answer(r_value) if r_value else norm_r
+    if p_val and r_val:
+        if p_val == r_val or _try_numeric_equal(p_val, r_val):
             return True
-        # predicted is the numeric value
-        if ref_value:
-            norm_rv = normalize_answer(ref_value)
-            if norm_p == norm_rv or _try_numeric_equal(norm_p, norm_rv):
-                return True
     return False
 
 
@@ -649,6 +680,74 @@ def load_aops(n: int, seed: int = 42) -> List[Dict[str, Any]]:
     return boxed
 
 
+def load_math(n: int, seed: int = 42, split: str = 'test',
+              per_level: int = 0) -> List[Dict[str, Any]]:
+    """Load the MATH (Hendrycks) dataset from local extracted JSON files.
+
+    Each problem's reference answer is the ``\\boxed{}`` content of its
+    ``solution`` (MATH solutions always end in a boxed answer).
+
+    Sampling is *stratified by level* so every difficulty (Level 1-5) is
+    represented equally — required to measure how RAG gain varies with
+    difficulty. ``per_level`` (if >0) fixes the count per level; otherwise
+    ``n`` is split evenly across the 5 levels. When both are 0, all problems
+    are returned. The final list is shuffled with ``seed`` so index order is
+    stable/comparable across direct vs rag runs.
+    """
+    import glob
+    root = os.path.join(MATH_DATA_DIR, split)
+    files = glob.glob(os.path.join(root, '*', '*.json'))
+    if not files:
+        raise FileNotFoundError(
+            f'[math] no problems found under {root!r}; set MATH_DATA_DIR or '
+            f'extract MATH.zip there')
+
+    by_level: Dict[str, List[Dict[str, Any]]] = {}
+    n_no_box = 0
+    for fp in files:
+        try:
+            with open(fp, 'r', encoding='utf-8') as fin:
+                row = json.load(fin)
+        except Exception:
+            continue
+        ref = extract_boxed(row.get('solution', ''))
+        if not ref:
+            n_no_box += 1
+            continue
+        level = row.get('level', 'Unknown')
+        by_level.setdefault(level, []).append({
+            'problem': row['problem'],
+            'solution': row['solution'],
+            'reference_answer': ref,
+            'level': level,
+            'type': row.get('type', ''),
+        })
+
+    total = sum(len(v) for v in by_level.values())
+    sys.stderr.write(
+        f'[math] {total} problems with boxed answers across '
+        f'{len(by_level)} levels (skipped {n_no_box} without boxed)\n')
+
+    levels = sorted(by_level.keys())
+    rng = random.Random(seed)
+
+    # Decide how many per level.
+    if per_level <= 0 and n > 0:
+        per_level = max(1, n // max(1, len(levels)))
+
+    sampled: List[Dict[str, Any]] = []
+    for lv in levels:
+        pool = by_level[lv]
+        rng.shuffle(pool)
+        take = pool if per_level <= 0 else pool[:per_level]
+        sampled.extend(take)
+        sys.stderr.write(f'[math]   {lv}: took {len(take)}/{len(pool)}\n')
+
+    rng.shuffle(sampled)
+    sys.stderr.write(f'[math] total sampled: {len(sampled)}\n')
+    return sampled
+
+
 # ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
@@ -673,24 +772,54 @@ RAG_FOLLOWUP = (
     'Solve the problem step by step and put your final answer in \\boxed{}.'
 )
 
+HINT_FOLLOWUP = (
+    'The above are applicable solution approaches extracted from similar problems. '
+    'You may use any applicable techniques from them, or ignore them '
+    'if you find a better approach. '
+    'Solve the problem step by step and put your final answer in \\boxed{}.'
+)
+
+# Reminder appended to the final user turn. Without this, the reasoning model
+# can loop indefinitely on multiple-choice problems, oscillating between boxing
+# the option letter and boxing the value (e.g. "I'll box B. I'll box 21. ...")
+# and never terminating. Boxing BOTH the letter and value removes the ambiguity
+# (the grader accepts either), so the model has no format decision to agonize over.
+MCQ_INSTRUCTION = (
+    '\n\nNote: If the problem is multiple-choice (it lists options such as '
+    '(A), (B), (C), ...), put BOTH the option letter and its value in the box, '
+    'e.g. \\boxed{(B) 21}. Otherwise, box the value directly. Decide the answer '
+    'format once and do not deliberate over which form to box.'
+)
+
 
 def build_direct_prompt(problem: str) -> Dict[str, Any]:
     return {
         'messages': [
             {'role': 'system', 'content': DIRECT_SYSTEM},
-            {'role': 'user', 'content': problem},
+            {'role': 'user', 'content': problem + MCQ_INSTRUCTION},
         ]
     }
 
 
 def build_hint_prompt(problem: str, hint_analysis: str) -> Dict[str, Any]:
-    """Build prompt with pre-analyzed hint in system, problem as user."""
-    return {
-        'messages': [
-            {'role': 'system', 'content': build_preanalysis_system(hint_analysis)},
-            {'role': 'user', 'content': problem},
-        ]
-    }
+    """Build prompt with pre-analyzed hint in a multi-turn conversation.
+
+    Mirrors ``build_rag_prompt``: the hint is presented as an assistant
+    "extracted approaches" turn (instead of being buried in the system
+    prompt), followed by a user instruction that provides a clear closing
+    directive to solve the problem and box the answer. Keeping the final
+    solve/box instruction in a dedicated user turn (rather than in the
+    system prompt) helps the reasoning model terminate cleanly.
+    """
+    messages: List[Dict[str, str]] = [
+        {'role': 'system', 'content': DIRECT_SYSTEM},
+        {'role': 'user', 'content': problem},
+        {'role': 'assistant',
+         'content': ('Here are applicable solution approaches extracted from '
+                     f'similar problems:\n\n{hint_analysis}')},
+        {'role': 'user', 'content': HINT_FOLLOWUP + MCQ_INSTRUCTION},
+    ]
+    return {'messages': messages}
 
 
 def build_rag_prompt(problem: str,
@@ -710,7 +839,7 @@ def build_rag_prompt(problem: str,
     trace_text = '\n\n'.join(trace_parts)
     messages.append({'role': 'assistant',
                      'content': f'I found relevant reasoning traces from the knowledge base!\n\n{trace_text}'})
-    messages.append({'role': 'user', 'content': RAG_FOLLOWUP})
+    messages.append({'role': 'user', 'content': RAG_FOLLOWUP + MCQ_INSTRUCTION})
     return {'messages': messages}
 
 
@@ -836,20 +965,31 @@ def retrieve_examples(tbl, query_vecs: np.ndarray, top_k: int,
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--mode', choices=['direct', 'rag'], default='direct')
+    p.add_argument('--mode', choices=['direct', 'rag'], default='rag')
+    p.add_argument('--dataset', choices=['aops', 'math'], default='math',
+                   help='Evaluation dataset. "math" = MATH (Hendrycks), '
+                        'stratified by level for a difficulty-vs-gain curve.')
+    p.add_argument('--math-split', default='test',
+                   help='MATH split to load (test/train).')
+    p.add_argument('--per-level', type=int, default=100,
+                   help='MATH only: problems per difficulty level (default 100 '
+                        '-> 500 total across Level 1-5). If 0, --n is split '
+                        'evenly across the 5 levels.')
     p.add_argument('--n', type=int, default=0,
                    help='Pool size: sample this many problems (0 = all boxed). '
                         'In RAG mode with --target-eval, set this to 0 for max coverage.')
-    p.add_argument('--target-eval', type=int, default=200,
+    p.add_argument('--target-eval', type=int, default=0,
                    help='Stop after this many problems are successfully evaluated '
-                        '(RAG mode: problems that have valid traces after decontam; '
-                        'direct mode: ignored, evaluates all filtered problems).')
+                        '(0 = no limit, evaluate the entire sampled set — the '
+                        'default, so all 500 stratified MATH problems are run). '
+                        'RAG mode: counts problems with valid traces after '
+                        'decontam; direct mode: ignored, evaluates all filtered.')
     p.add_argument('--db-path', default='./output.oldemb/thinking_rag/lance.db')
     p.add_argument('--table', default='thinking_traces')
-    p.add_argument('--top-k', type=int, default=3)
+    p.add_argument('--top-k', type=int, default=1)
     p.add_argument('--use-cot-compressed', action='store_true',
                    help='Use pre-compressed cot_compressed field instead of thinking_raw.')
-    p.add_argument('--sim-threshold', type=float, default=0.80,
+    p.add_argument('--sim-threshold', type=float, default=0.75,
                    help='Minimum cosine similarity for retrieved traces. '
                         'Traces below this are discarded at retrieval time.')
     p.add_argument('--decontam-threshold', type=float, default=0.20,
@@ -863,37 +1003,52 @@ def main():
     p.add_argument('--no-llm-decontam', dest='llm_decontam', action='store_false',
                    help='Disable LLM-based decontamination.')
     p.add_argument('--max-trace-len', type=int, default=12000)
-    p.add_argument('--condense', action='store_true',
-                   help='Enable condenser re-compression on retrieved traces.')
+    p.add_argument('--condense', action='store_true', default=True,
+                   help='Enable condenser re-compression on retrieved traces '
+                        '(default ON). Use --no-condense to inject raw traces.')
+    p.add_argument('--no-condense', dest='condense', action='store_false',
+                   help='Disable condenser; inject raw retrieved traces.')
     p.add_argument('--condense-max-len', type=int, default=2000,
                    help='Max chars of condensed trace (fallback truncation).')
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--hint', action='store_true', default=True,
-                   help='Enable API hint analysis on retrieved traces (default ON). '
-                        'In rag mode: retrieve → condense → API hint analysis → preanalysis system prompt. '
-                        'In direct mode: ignored (no traces to analyze).')
+    p.add_argument('--hint', action='store_true', default=False,
+                   help='Enable API hint filtering on retrieved traces (default OFF; '
+                        'raw RAG injects the condensed trace directly). '
+                        'In rag mode: retrieve → condense → API filters trace → refined system prompt. '
+                        'In direct mode: ignored (no traces to filter).')
     p.add_argument('--no-hint', dest='hint', action='store_false',
-                   help='Disable API hint analysis; inject condensed trace directly.')
-    p.add_argument('--problem-ids-file', default='./output/thinking_rag/aops_rag_problem_ids.json',
+                   help='Disable API hint filtering; inject condensed trace directly.')
+    p.add_argument('--problem-ids-file', default=None,
                    help='File listing problem indices evaluated by RAG mode. '
                         'RAG mode writes this file; direct mode reads it to '
-                        'evaluate the same subset (use --no-filter to disable).')
+                        'evaluate the same subset (use --no-filter to disable). '
+                        'Defaults to a dataset-specific path.')
     p.add_argument('--no-filter', action='store_true',
                    help='In direct mode, evaluate ALL sampled problems '
                         'instead of filtering to RAG subset.')
     p.add_argument('--output', default=None)
     args = p.parse_args()
 
+    # Dataset-specific default paths (keeps aops and math runs from colliding).
+    if args.problem_ids_file is None:
+        args.problem_ids_file = (
+            f'./output/thinking_rag/{args.dataset}_rag_problem_ids.json')
+
     if args.output is None:
         suffix = f'{args.mode}_hint' if (args.hint and args.mode == 'rag') else args.mode
-        args.output = f'./output/thinking_rag/aops_{suffix}_results.jsonl'
+        args.output = (
+            f'./output/thinking_rag/{args.dataset}_{suffix}_results.jsonl')
 
     if args.condense and args.use_cot_compressed:
         logger.warning('--condense requires thinking_raw, ignoring --use-cot-compressed')
         args.use_cot_compressed = False
 
-    records = load_aops(n=args.n, seed=args.seed)
+    if args.dataset == 'math':
+        records = load_math(n=args.n, seed=args.seed, split=args.math_split,
+                            per_level=args.per_level)
+    else:
+        records = load_aops(n=args.n, seed=args.seed)
 
     is_rag = (args.mode == 'rag')
 
@@ -919,6 +1074,18 @@ def main():
                 f'running all {len(records)} problems\n')
 
     condenser_gpus = int(os.environ.get('EVAL_CONDENSER_GPUS', 0)) if args.condense else 0
+
+    # Raw RAG relies on the API condenser (qwen3.7-max). Fail fast with a clear
+    # message if it's enabled without an API key and without a local condenser.
+    if is_rag and args.condense and not CONDENSE_API_KEY and condenser_gpus == 0:
+        sys.stderr.write(
+            '[condense] ERROR: --condense is ON but COMPRESS_API_KEY is unset '
+            'and no local condenser (EVAL_CONDENSER_GPUS=0).\n'
+            '  Fix one of:\n'
+            '    - export COMPRESS_API_KEY=sk-...            (use API condenser)\n'
+            '    - EVAL_CONDENSER_GPUS=2 python ...          (use local vLLM condenser)\n'
+            '    - pass --no-condense                        (inject raw traces)\n')
+        sys.exit(1)
 
     if is_rag:
         num_gpus = EMB_GPUS + GEN_GPUS + condenser_gpus
@@ -1093,7 +1260,8 @@ def main():
                 condenser_sampler=condenser_sampler_obj,
                 compress_params=condenser_params,
                 special_tokens=condenser_special_tokens,
-                max_output_len=args.condense_max_len)
+                max_output_len=args.condense_max_len,
+                dp_size=condenser_gpus)
 
         hint_analyses = None
         if args.hint and hint_api_client:
@@ -1202,6 +1370,10 @@ def main():
                     'problem': rec['problem'],
                     'model_output': raw_output,
                 }
+                if rec.get('level'):
+                    debug_rec['level'] = rec['level']
+                if rec.get('type'):
+                    debug_rec['type'] = rec['type']
                 debug_rec['num_traces'] = len(all_examples[i])
                 if all_examples[i]:
                     ex0 = all_examples[i][0]
@@ -1265,6 +1437,10 @@ def main():
                     'problem': rec['problem'],
                     'model_output': raw_output,
                 }
+                if rec.get('level'):
+                    debug_rec['level'] = rec['level']
+                if rec.get('type'):
+                    debug_rec['type'] = rec['type']
                 debug_records.append(debug_rec)
                 out_f.write(json.dumps(debug_rec, ensure_ascii=False) + '\n')
                 out_f.flush()
@@ -1276,12 +1452,26 @@ def main():
 
     overall_acc = correct_count / total_count if total_count else 0
     print(f'\n{"=" * 60}')
-    print(f'AoPS Math — mode={args.mode}, model={GEN_MODEL_ID}')
+    print(f'{args.dataset.upper()} — mode={args.mode}, model={GEN_MODEL_ID}')
     print(f'  n={total_count}, seed={args.seed}')
     if is_rag:
         print(f'  evaluated={len(evaluated_indices)}, skipped={len(skipped_indices)}')
     print(f'{"=" * 60}')
     print(f'Overall accuracy: {overall_acc:.4f}  ({correct_count}/{total_count})')
+
+    # Per-level breakdown (MATH: the difficulty-vs-gain curve we care about).
+    if any(r.get('level') for r in debug_records):
+        from collections import defaultdict
+        per = defaultdict(lambda: [0, 0])  # level -> [correct, total]
+        for r in debug_records:
+            lv = r.get('level', 'Unknown')
+            per[lv][1] += 1
+            if r['is_correct']:
+                per[lv][0] += 1
+        print(f'\nPer-level accuracy:')
+        for lv in sorted(per.keys()):
+            c, t = per[lv]
+            print(f'  {lv:>10}: {c/t:.4f}  ({c}/{t})')
 
     out_f.close()
     print(f'\n[output] {len(debug_records)} records saved to {args.output}')
