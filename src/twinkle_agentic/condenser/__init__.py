@@ -1,5 +1,4 @@
 from .base import Condenser
-from .keyword import KeywordCondenser
-from .model import ModelCondenser
+from .facts import FactsCondenser
 
-__all__ = ['Condenser', 'KeywordCondenser', 'ModelCondenser']
+__all__ = ['Condenser', 'FactsCondenser']
