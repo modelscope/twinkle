@@ -397,7 +397,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         unwrapped = self.strategy.unwrap_model(self.model)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            assert routed_experts is not None, f'routed_experts must be not None'
+            assert routed_experts is not None, 'routed_experts must be not None'
             set_router_replay_data(routed_experts, unwrapped)
 
         def cleanup():
@@ -687,7 +687,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             no_sync_ctx = self.model.no_sync()
 
         router_replay_action = kwargs.pop('router_replay_action', None)
-        rr_cleanup = lambda: None
+        rr_cleanup = None
         if router_replay_action is not None:
             from .moe.router_replay import RouterReplayAction
             rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
@@ -697,7 +697,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
-        rr_cleanup()
+
+        if rr_cleanup is not None:
+            rr_cleanup()
 
         optimizer_config.train_status.loss_value = None
 
