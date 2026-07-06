@@ -1412,7 +1412,40 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
-        return PeftModel.get_nb_trainable_parameters(model)
+        # PEFT default uses param.numel(). For DTensors that returns the logical
+        # (global) shape, which is correct for plain FSDP sharding. With EP,
+        # `_shard_tensor_experts` slices the nn.Parameter to 1/ep_size BEFORE
+        # FSDP wraps it, so the DTensor's logical shape is already post-EP and
+        # everything under an `_ep_patched` module's `experts` subtree (raw
+        # expert tensors + any PEFT LoRA stacked on them) is undercounted by
+        # ep_size. Compensate here.
+        strategy = getattr(self, 'strategy', None)
+        ep_mesh = getattr(strategy, 'ep_fsdp_device_mesh', None) if strategy is not None else None
+        ep_size = ep_mesh['ep'].size() if ep_mesh is not None else 1
+
+        ep_param_ids: set = set()
+        if ep_size > 1:
+            for module in model.modules():
+                if not getattr(module, '_ep_patched', False):
+                    continue
+                experts = getattr(module, 'experts', None)
+                if experts is None:
+                    continue
+                for p in experts.parameters():
+                    ep_param_ids.add(id(p))
+
+        trainable = 0
+        total = 0
+        for _, p in model.named_parameters():
+            n = p.numel()
+            if n == 0 and hasattr(p, 'ds_numel'):
+                n = p.ds_numel
+            if id(p) in ep_param_ids:
+                n *= ep_size
+            total += n
+            if p.requires_grad:
+                trainable += n
+        return trainable, total
 
     def _get_trainable_parameters_example(self, adapter_name, model):
         trainable_param_names = []

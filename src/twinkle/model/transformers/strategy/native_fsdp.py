@@ -79,11 +79,6 @@ class NativeFSDPStrategy:
                 raise ValueError('PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
             if float(getattr(config_or_dir, 'lora_dropout', 0.0)) > 0.0:
                 raise ValueError('PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
-            return config_or_dir
-
-        config_or_dir.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
-        logger.info('EP+LoRA auto-filled target_parameters with '
-                    "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
         return config_or_dir
 
     def set_rank0_pre_ep_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
