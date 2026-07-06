@@ -10,7 +10,10 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Any
 
+from twinkle import get_logger
 from twinkle.utils.device_mesh import Platform
+
+logger = get_logger()
 
 
 @dataclass(frozen=True)
@@ -157,8 +160,12 @@ def kernelize(model: nn.Module, mapping: dict) -> nn.Module:
             impl = _load_hub_ref(impl)
         if isinstance(key, type) and issubclass(key, nn.Module):
             _replace_class(model, key, impl)
+            logger.info(f'[kernelize] Replaced {key.__module__}.{key.__qualname__} '
+                        f'with {impl.__module__}.{impl.__qualname__}')
         elif isinstance(key, str):
             _replace_attr(key, impl)
+            impl_repr = getattr(impl, '__qualname__', repr(impl))
+            logger.info(f'[kernelize] Replaced {key!r} with {impl_repr}')
         else:
             raise TypeError(f'Unsupported mapping key: {key!r}')
     return model
