@@ -43,12 +43,14 @@ class TestLocalDatasetLoading:
 
     def test_load_local_lance(self):
         """Test loading local Lance file"""
+        pytest.importorskip('lance')
         lance_path = str(TEST_DATA_DIR / '1.lance')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=lance_path))
         assert len(dataset) == 2
 
     def test_load_local_lance_dir(self):
         """Test loading local Lance dir"""
+        pytest.importorskip('lance')
         lance_path = str(TEST_DATA_DIR / 'lance')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=lance_path))
         assert len(dataset) == 2

@@ -17,9 +17,14 @@ TEST_DATA_DIR = Path(__file__).parent / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 
 
-def convert_to_messages(example):
-    text = example.get('text', '') or str(example.get('question', example.get('title', '')))
-    return {'messages': [Message(role='user', content=text), Message(role='assistant', content='Response')]}
+def convert_to_messages(examples):
+    """Batched map function: receives dict of lists, returns dict of lists."""
+    texts = examples.get('text', None) or examples.get('question', None) or examples.get('title', [])
+    messages_batch = []
+    for text in texts:
+        text = text or ''
+        messages_batch.append([Message(role='user', content=str(text)), Message(role='assistant', content='Response')])
+    return {'messages': messages_batch}
 
 
 @pytest.mark.skipif(not HAS_BINPACKING, reason='binpacking not installed')

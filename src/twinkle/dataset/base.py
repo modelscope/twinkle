@@ -331,12 +331,13 @@ class Dataset(TorchDataset):
                 dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
             if not any(dataset_types):
                 dsets = list(self.datasets.values())
-                # Align features
+                # Align features: only cast when columns match but types differ
                 ref_features = dsets[0].features
                 aligned = []
                 for ds in dsets:
                     if ds.features != ref_features:
-                        ds = ds.cast(ref_features)
+                        if sorted(ds.features.keys()) == sorted(ref_features.keys()):
+                            ds = ds.cast(ref_features)
                     aligned.append(ds)
             else:
                 aligned = list(self.datasets.values())
