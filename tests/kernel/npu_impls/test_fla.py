@@ -27,7 +27,7 @@ def test_fla_does_not_flip_flag_when_mindspeed_missing(monkeypatch):
     import sys
     import types
 
-    import transformers.utils as tu
+    import transformers.utils.import_utils as tui
 
     monkeypatch.setenv('TWINKLE_NPU_FLA', '1')
     # Fake torch_npu as importable (with a real __spec__ so find_spec doesn't trip)
@@ -42,14 +42,14 @@ def test_fla_does_not_flip_flag_when_mindspeed_missing(monkeypatch):
     # Force the MindSpeed-backed module import to fail
     monkeypatch.setitem(sys.modules, 'twinkle.kernel.chunk_gated_delta_rule', None)
 
-    original_flag = tu.is_flash_linear_attention_available
+    original_flag = tui.is_flash_linear_attention_available
     try:
         from twinkle.kernel.npu_impls.fla import apply_qwen3_5_fla
         assert apply_qwen3_5_fla(None) == 0
-        assert tu.is_flash_linear_attention_available is original_flag, (
+        assert tui.is_flash_linear_attention_available is original_flag, (
             'is_flash_linear_attention_available was flipped to True while the '
             'MindSpeed kernel is unavailable — this would break Qwen3.5 at runtime.'
         )
     finally:
         # Defensive cleanup in case the buggy path ran.
-        tu.is_flash_linear_attention_available = original_flag
+        tui.is_flash_linear_attention_available = original_flag
