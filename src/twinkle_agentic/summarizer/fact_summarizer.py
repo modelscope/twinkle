@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from twinkle_agentic.condenser.base import Condenser
+from twinkle_agentic.summarizer.base import Summarizer
 
 if TYPE_CHECKING:
     from twinkle.data_format import SamplingParams  # noqa: F401
@@ -57,7 +57,7 @@ Never exceed the ceiling.
 {text}"""
 
 
-class FactsCondenser(Condenser):
+class FactSummarizer(Summarizer):
 
     def __init__(
         self,

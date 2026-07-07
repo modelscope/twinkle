@@ -22,8 +22,8 @@ HARD CEILING: {budget} chars. If core facts fit in far fewer chars, output fewer
 {text}"""
 
 
-class Condenser:
-    """Base condenser with progressive distillation via llm_backup.
+class Summarizer:
+    """Base summarizer with progressive distillation via llm_backup.
 
     Subclasses customize compression behavior by providing their own
     ``system_prompt``, ``user_prompt_template``, and ``lora_path``.
@@ -40,12 +40,12 @@ class Condenser:
         compression_ratio: Target compression factor (> 1).
         model_path: Model identifier.
         sampling_params: Default sampling params.
-        system_prompt: System prompt for this condenser type.
+        system_prompt: System prompt for this summarizer type.
         user_prompt_template: User prompt template. Must contain
             ``{budget}`` and ``{text}``. May contain ``{query}``.
         min_budget_chars: Floor for the character budget in the prompt.
         template: Optional :class:`Template` for special token stripping.
-        lora_path: LoRA adapter path specific to this condenser type.
+        lora_path: LoRA adapter path specific to this summarizer type.
             Each subclass can use a different LoRA for its task.
     """
 
@@ -168,9 +168,9 @@ class Condenser:
 
     @staticmethod
     def _postprocess(raw: str, original: str, special_tokens: tuple[str, ...]) -> str | None:
-        text = Condenser._strip_special_tokens(
-            Condenser._strip_code_fences(raw), special_tokens).strip()
-        if not text or not Condenser._has_alnum(text):
+        text = Summarizer._strip_special_tokens(
+            Summarizer._strip_code_fences(raw), special_tokens).strip()
+        if not text or not Summarizer._has_alnum(text):
             return None
         if len(text) >= len(original):
             return None
@@ -186,7 +186,7 @@ class Condenser:
     @staticmethod
     def _strip_code_fences(text: str) -> str:
         stripped = text.strip()
-        m = Condenser._CODE_FENCE_RE.match(stripped)
+        m = Summarizer._CODE_FENCE_RE.match(stripped)
         return m.group(1) if m else text
 
     @staticmethod
