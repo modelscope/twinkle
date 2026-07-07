@@ -87,6 +87,38 @@ def test_kernelize_rejects_unknown_key_type():
         kernelize(nn.Linear(1, 1), {42: _DstLayer})
 
 
+def test_kernelize_no_mapping_on_npu_uses_npu_builtin(monkeypatch):
+    """kernelize(model) with no mapping auto-detects NPU and applies npu_builtin."""
+    from twinkle.utils.device_mesh import Platform
+    import twinkle.kernel.builtin as builtin
+
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'npu'))
+    monkeypatch.setattr(builtin, 'npu_builtin', lambda model=None: {_SrcLayer: _DstLayer})
+
+    parent = nn.Sequential(_SrcLayer())
+    out = kernelize(parent)
+    assert out is parent
+    assert type(parent[0]) is _DstLayer
+
+
+def test_kernelize_no_mapping_on_non_npu_is_noop(monkeypatch):
+    """kernelize(model) with no mapping on a non-NPU device must not touch the
+    model and must not invoke npu_builtin (avoiding its side effects)."""
+    from twinkle.utils.device_mesh import Platform
+    import twinkle.kernel.builtin as builtin
+
+    called = []
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cuda'))
+    monkeypatch.setattr(builtin, 'npu_builtin',
+                        lambda model=None: called.append(model) or {_SrcLayer: _DstLayer})
+
+    parent = nn.Sequential(_SrcLayer())
+    out = kernelize(parent)
+    assert out is parent
+    assert type(parent[0]) is _SrcLayer
+    assert called == []
+
+
 def test_kernelize_loads_hub_ref(monkeypatch):
     # Stand in for HF kernels: patch _load_hub_ref to return _DstLayer
     from twinkle.kernel import core as _core

@@ -133,7 +133,7 @@ def _load_hub_ref(ref: HubRef):
     return impl
 
 
-def kernelize(model: nn.Module, mapping: dict) -> nn.Module:
+def kernelize(model: nn.Module, mapping: dict | None = None) -> nn.Module:
     """Apply ``mapping`` to ``model`` and return it (modified in place).
 
     Keys:
@@ -147,11 +147,26 @@ def kernelize(model: nn.Module, mapping: dict) -> nn.Module:
         Twinkle platform device prefix; non-matching devices skip.
       - ``HubRef``: lazy-resolved via the optional ``kernels`` package.
       - anything else: used directly as the impl.
+
+    If ``mapping`` is ``None`` it is auto-detected from the current platform
+    via ``Platform.device_prefix()``: on NPU the built-in ``npu_builtin(model)``
+    bundle is applied (including its side effects); on any other platform this
+    is a no-op and the model is returned unchanged.
     """
+    device = Platform.device_prefix()
+
+    if mapping is None:
+        if device == 'npu':
+            from .builtin import npu_builtin
+            mapping = npu_builtin(model)
+        else:
+            logger.debug(f'[kernelize] No mapping provided and device {device!r} '
+                         f'has no built-in bundle; returning model unchanged')
+            return model
+
     if not mapping:
         return model
 
-    device = Platform.device_prefix()
     for key, value in mapping.items():
         impl = _resolve_value(value, device)
         if impl is None:

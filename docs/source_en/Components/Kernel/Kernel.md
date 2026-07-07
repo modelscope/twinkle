@@ -8,7 +8,7 @@ The public surface is exactly three symbols:
 
 | Symbol | Purpose |
 | --- | --- |
-| `kernelize(model, mapping)` | Apply ``mapping`` to ``model`` (in place) and return it |
+| `kernelize(model, mapping=None)` | Apply ``mapping`` to ``model`` (in place) and return it. If ``mapping`` is omitted, it is auto-detected from the current platform (see below) |
 | `npu_builtin(model=None)` | Return the Ascend NPU built-in mapping (composes with user mappings) |
 | `hub(ref, *, revision=None, version=None, backend=None, trust_remote_code=False)` | Build a ``HubRef`` for use as a mapping value; the actual Hub download is deferred to ``kernelize`` |
 
@@ -28,9 +28,21 @@ The public surface is exactly three symbols:
 
 Device is inferred from `next(model.parameters()).device.type` (falling back to buffers, then `'cpu'`).
 
+## Auto-detection (mapping omitted)
+
+When `mapping` is `None`, `kernelize` auto-detects the current platform via `Platform.device_prefix()` and applies the matching built-in bundle. Platforms without a built-in bundle are a safe no-op (the model is returned unchanged).
+
 ## Examples
 
-### Enable the full NPU built-in bundle
+### Enable the built-in bundle for the current platform
+
+```python
+from twinkle.kernel import kernelize
+
+model = kernelize(model)  # auto-detects the platform and applies its built-in bundle
+```
+
+The explicit form is still supported:
 
 ```python
 import torch

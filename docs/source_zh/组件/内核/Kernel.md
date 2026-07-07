@@ -6,7 +6,7 @@
 
 | 符号 | 作用 |
 | --- | --- |
-| `kernelize(model, mapping)` | 在 `model` 上应用 `mapping`，原地修改后返回 |
+| `kernelize(model, mapping=None)` | 在 `model` 上应用 `mapping`，原地修改后返回。省略 `mapping` 时按当前平台自动检测（见下文） |
 | `npu_builtin(model=None)` | 返回 Ascend NPU 内置替换的 mapping dict（可与用户 mapping 自由组合） |
 | `hub(ref, *, revision=None, version=None, backend=None, trust_remote_code=False)` | 构造一个 `HubRef`，用作 mapping value；真实下载推迟到 `kernelize` 执行 |
 
@@ -26,9 +26,21 @@
 
 device 从 `next(model.parameters()).device.type` 推断（无参数则用 buffers，再无则为 `'cpu'`）。
 
+## 自动检测（省略 mapping）
+
+当 `mapping` 为 `None` 时，`kernelize` 通过 `Platform.device_prefix()` 自动检测当前平台，并应用对应平台的内置 bundle。没有内置 bundle 的平台为安全空操作，原样返回 model。
+
 ## 场景示例
 
-### 启用全部 NPU 内置优化
+### 启用当前平台的内置优化
+
+```python
+from twinkle.kernel import kernelize
+
+model = kernelize(model)  # 自动检测当前平台并应用其内置 bundle
+```
+
+显式写法依然支持：
 
 ```python
 import torch
