@@ -219,10 +219,17 @@ class TargetParameterLoraWrapper(nn.Module):
 
     def get_state_dict(self, slot_name: str) -> dict[str, torch.Tensor]:
         r = self.r[slot_name]
-        rank_width = r * self.num_experts
+        num_experts = self.num_experts
+        # Slice to actual rank first, then flatten expert and rank dimensions
+        lora_A = self.lora_A[slot_name][:num_experts, :r, :].detach().clone()
+        lora_B = self.lora_B[slot_name][:num_experts, :, :r].detach().clone()
+        # Flatten: [num_experts, r, in_features] -> [num_experts*r, in_features]
+        lora_A_flat = lora_A.reshape(num_experts * r, -1)
+        # Flatten: [num_experts, out_features, r] -> [out_features, num_experts*r]
+        lora_B_flat = lora_B.transpose(0, 1).reshape(-1, num_experts * r)
         return {
-            f'{self.peft_key_prefix}.lora_A.weight': self.lora_A[slot_name][:rank_width, :].detach().clone(),
-            f'{self.peft_key_prefix}.lora_B.weight': self.lora_B[slot_name][:, :rank_width].detach().clone(),
+            f'{self.peft_key_prefix}.lora_A.weight': lora_A_flat,
+            f'{self.peft_key_prefix}.lora_B.weight': lora_B_flat,
         }
 
     def set_state_dict(self, slot_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
@@ -233,17 +240,24 @@ class TargetParameterLoraWrapper(nn.Module):
         if key_a not in state_dict or key_b not in state_dict:
             raise KeyError(f'Missing target-parameter LoRA pair for {self.peft_key_prefix}')
 
+        r = self.r[slot_name]
+        num_experts = self.num_experts
+
         with torch.no_grad():
             self.lora_A[slot_name].zero_()
             self.lora_B[slot_name].zero_()
-            self.lora_A[slot_name][:state_dict[key_a].shape[0], :].copy_(state_dict[key_a].to(
+            # Reshape: [num_experts*r, in_features] -> [num_experts, r, in_features]
+            lora_A_reshaped = state_dict[key_a].reshape(num_experts, r, -1).to(
                 device=self.lora_A[slot_name].device,
                 dtype=self.lora_A[slot_name].dtype,
-            ))
-            self.lora_B[slot_name][:, :state_dict[key_b].shape[1]].copy_(state_dict[key_b].to(
+            )
+            self.lora_A[slot_name][:num_experts, :r, :].copy_(lora_A_reshaped)
+            # Reshape: [out_features, num_experts*r] -> [out_features, num_experts, r] -> [num_experts, out_features, r]
+            lora_B_reshaped = state_dict[key_b].reshape(-1, num_experts, r).transpose(0, 1).to(
                 device=self.lora_B[slot_name].device,
                 dtype=self.lora_B[slot_name].dtype,
-            ))
+            )
+            self.lora_B[slot_name][:num_experts, :, :r].copy_(lora_B_reshaped)
         return {key_a, key_b}
 
 
