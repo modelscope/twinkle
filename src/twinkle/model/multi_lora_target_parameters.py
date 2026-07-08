@@ -65,7 +65,12 @@ class TargetParameterLoraWrapper(nn.Module):
 
     @property
     def base_parameter(self) -> nn.Parameter:
-        return getattr(self.record.module, self.record.parameter_name)
+        module = self.record.module
+        param_name = self.record.parameter_name
+        if hasattr(module, 'parametrizations'):
+            if hasattr(module.parametrizations, param_name):
+                return module.parametrizations[param_name].original
+        return getattr(module, param_name)
 
     @property
     def num_experts(self) -> int:
