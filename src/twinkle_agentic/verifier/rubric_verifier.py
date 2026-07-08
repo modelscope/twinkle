@@ -160,6 +160,7 @@ class RubricVerifier(Verifier):
         margin_threshold: float = 0.25,
         max_votes: int = 5,
         gate: bool = True,
+        fixed_rubric: Optional[List['RubricItem']] = None,
     ):
         if max_rubrics < min_rubrics:
             raise ValueError('max_rubrics must be >= min_rubrics')
@@ -184,6 +185,9 @@ class RubricVerifier(Verifier):
         self.margin_threshold = float(margin_threshold)
         self.max_votes = int(max_votes)
         self.gate = bool(gate)
+        # When provided, skip stage-1 rubric generation and score against these
+        # fixed criteria (e.g. a safety rubric — AUDIT D8).
+        self.fixed_rubric: Optional[List['RubricItem']] = list(fixed_rubric) if fixed_rubric else None
 
     # ------------------------------------------------------------------
     # public entry points
@@ -192,20 +196,39 @@ class RubricVerifier(Verifier):
         return self.score_detail(trajectory, **kwargs).level
 
     def score_detail(self, trajectory: dict, *, query: Optional[str] = None,
-                     sampling_params: Any = None) -> ScoreDetail:
+                     sampling_params: Any = None,
+                     extra_context: Optional[str] = None) -> ScoreDetail:
         query = query or self._infer_query(trajectory)
         segment_text = self._render_segment(trajectory)
+        # D7c: fold an objective finding into the scored transcript so the judge
+        # re-scores WITH the hard evidence in view (objective corrects subjective).
+        if extra_context:
+            segment_text = f'{segment_text}\n\n[OBJECTIVE EVIDENCE]\n{extra_context}'
 
         # --- code-level hard verification (free, un-hackable) ---
         hard_pass_rate, has_hard = self._code_hard_checks(trajectory)
 
-        # --- stage 1: rubric generation (distilled) ---
-        raw_rubric = self._gen_rubric(
-            trajectory=self._gen_trajectory(query, segment_text),
-            sampling_params=self._gen_sampling_params(sampling_params),
-            query=query,
-        )
-        rubric = self._parse_rubric(raw_rubric)
+        # No LLM (no student sampler AND no teacher API): skip both LLM stages and
+        # fall back to the deterministic code signal, instead of letting the
+        # llm_backup teacher path raise a missing-credentials error.
+        if not self._llm_available():
+            scalar = hard_pass_rate if has_hard else 0.0
+            return ScoreDetail(
+                level=self._to_level(scalar), scalar=scalar, llm_scalar=0.0,
+                hard_pass_rate=hard_pass_rate if has_hard else 1.0,
+                gated=False, n_votes=0, rubric=[],
+            )
+
+        # --- stage 1: rubric (fixed if configured, else distilled generation) ---
+        if self.fixed_rubric is not None:
+            rubric = list(self.fixed_rubric)
+        else:
+            raw_rubric = self._gen_rubric(
+                trajectory=self._gen_trajectory(query, segment_text),
+                sampling_params=self._gen_sampling_params(sampling_params),
+                query=query,
+            )
+            rubric = self._parse_rubric(raw_rubric)
         if not rubric:
             # No usable rubric: fall back to the code signal alone.
             scalar = hard_pass_rate if has_hard else 0.0
@@ -381,6 +404,20 @@ class RubricVerifier(Verifier):
     # ------------------------------------------------------------------
     # LLM sampling plumbing (mirrors Summarizer)
     # ------------------------------------------------------------------
+    def _llm_available(self) -> bool:
+        """True if a student sampler exists or a teacher API is configured.
+
+        Mirrors the env vars ``llm_backup`` uses for its teacher; when neither a
+        student nor a teacher is present we must not attempt an LLM call (it would
+        raise a missing-credentials error inside the llm_backup teacher path).
+        """
+        if self.sampler is not None:
+            return True
+        import os
+        return bool(os.environ.get('LLM_BACKUP_API_KEY')
+                    or os.environ.get('OPENAI_API_KEY')
+                    or os.environ.get('LLM_BACKUP_BASE_URL'))
+
     def _sample_text(self, trajectory, sampling_params, lora_path) -> str:
         if self.sampler is None:
             return ''

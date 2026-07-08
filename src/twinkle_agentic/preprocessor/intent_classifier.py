@@ -13,14 +13,10 @@ logger = get_logger()
 # Reasoning block regex covers both <think> and <thinking> forms.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>(.*?)</think(?:ing)?>', re.DOTALL | re.IGNORECASE)
 
-# ── Intent categories ─────────────────────────────────────────────────────────
-INTENT_TOOL_CALL = 'tool_call'
-INTENT_CODE = 'code'
-INTENT_MATH = 'math'
-INTENT_COMPLEX_LOGIC = 'complex_logic'
-INTENT_REASONING = 'reasoning'
-INTENT_USER_DISSATISFACTION = 'user_dissatisfaction'
-INTENT_OTHER = 'other'
+# ── Intent categories (canonical vocabulary lives in intents.py; re-exported) ──
+from .intents import (INTENT_CODE, INTENT_COMPLEX_LOGIC,  # noqa: F401,E402
+                      INTENT_MATH, INTENT_OTHER, INTENT_REASONING,
+                      INTENT_TOOL_CALL, INTENT_USER_DISSATISFACTION)
 
 # ── Heuristic patterns ────────────────────────────────────────────────────────
 _CODE_BLOCK_RE = re.compile(r'```[\s\S]{10,}?```')
@@ -337,6 +333,10 @@ class IntentClassifier(Preprocessor):
     Pure-heuristic, no LLM. Each intent is a pluggable :class:`IntentDetector`;
     pass ``detectors=[...]`` to extend or override.
 
+    R3: this is an *annotator* — by default it never drops rows
+    (``drop_no_key_rounds=False``); rows with no detected key round are simply
+    tagged ``INTENT_OTHER``. Set ``drop_no_key_rounds=True`` to also filter.
+
     Annotates per row::
 
         row['intent']                            # primary intent string
@@ -344,20 +344,21 @@ class IntentClassifier(Preprocessor):
                              ('intents', dict[str, str])] # per-round intent
     """
 
+    # R4: default to the detectors with a live downstream consumer. The heavier
+    # heuristics (ComplexLogic / Reasoning / UserDissatisfaction) are kept as
+    # importable classes but dropped from the default set — their outputs had no
+    # active consumer. Pass ``detectors=[...]`` to re-enable them.
     DEFAULT_DETECTORS: List[IntentDetector] = [
         ToolCallDetector(),
         CodeDetector(),
         MathDetector(),
-        ComplexLogicDetector(),
-        ReasoningDetector(),
-        UserDissatisfactionDetector(),
     ]
 
     def __init__(
         self,
         detectors: Optional[List[IntentDetector]] = None,
         intent_field: str = 'intent',
-        drop_no_key_rounds: bool = True,
+        drop_no_key_rounds: bool = False,
     ) -> None:
         super().__init__()
         self._intent_field = intent_field

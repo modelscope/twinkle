@@ -99,10 +99,16 @@ def _get_teacher_api():
         if _teacher_api is not None:
             return _teacher_api
         from twinkle_agentic.protocol.openai import OpenAI
+        # Bound per-request latency: without a timeout a single hung request blocks
+        # the calling worker for the SDK default (~600s) x retries. Overridable via
+        # env for slow/large-prompt endpoints.
+        timeout = float(os.environ.get('LLM_BACKUP_TIMEOUT', '120'))
+        max_retries = int(os.environ.get('LLM_BACKUP_MAX_RETRIES', '2'))
         _teacher_api = OpenAI(
-            model=os.environ.get('LLM_BACKUP_MODEL', 'gpt-4o'),
+            model=os.environ.get('LLM_BACKUP_MODEL', 'qwen3.7-max'),
             api_key=os.environ.get('LLM_BACKUP_API_KEY'),
             base_url=os.environ.get('LLM_BACKUP_BASE_URL'),
+            client_kwargs={'timeout': timeout, 'max_retries': max_retries},
         )
         return _teacher_api
 

@@ -1,3 +1,7 @@
+from .aggregation import (RoundScore, SegmentScore, TrajectoryScore,
+                          aggregate_hard_over_rounds, aggregate_trajectory,
+                          fuse_segment, scalar_to_level,
+                          split_segment_into_rounds)
 from .base import Verifier
 from .domain_checks import (check_answer_match, check_code_parses,
                             check_instruction_constraints, check_not_degenerate,
@@ -13,4 +17,7 @@ __all__ = [
     'check_output_format', 'check_numeric_equiv', 'check_answer_match',
     'check_code_parses', 'check_instruction_constraints', 'check_not_degenerate',
     'default_checks_for',
+    'RoundScore', 'SegmentScore', 'TrajectoryScore',
+    'split_segment_into_rounds', 'aggregate_hard_over_rounds', 'fuse_segment',
+    'aggregate_trajectory', 'scalar_to_level',
 ]

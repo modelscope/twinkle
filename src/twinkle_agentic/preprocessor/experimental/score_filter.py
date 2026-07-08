@@ -31,7 +31,7 @@ from twinkle.preprocessor import Preprocessor
 from twinkle.template import Template
 from twinkle.utils import get_logger
 from .llm_backend import LLMBackend
-from .utils import _chr_min_distinct, _ifd_family_metrics, _lp_to_jsonable, _pad_batch, _to_int_list
+from ..utils import _chr_min_distinct, _ifd_family_metrics, _lp_to_jsonable, _pad_batch, _to_int_list
 
 logger = get_logger()
 

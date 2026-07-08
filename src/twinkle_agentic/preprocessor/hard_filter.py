@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import cjk_ratio, msg_content_text, msg_has_media
+from .utils import cjk_ratio, is_agent_row, msg_content_text, msg_has_media, normalize_tool_calls
 
 # ── Language detection ────────────────────────────────────────────────────────
 
@@ -82,14 +82,8 @@ _LATIN_SIMPLE_REGEXES = (_EN_GREETING_RE, _EN_SIMPLE_RE)
 
 
 def _has_tool_calls(msg: Dict[str, Any]) -> bool:
-    """Truthy ``tool_calls`` excluding the empty-array sentinels '' / '[]' / []."""
-    tc = msg.get('tool_calls')
-    if not tc:
-        return False
-    if isinstance(tc, str):
-        s = tc.strip()
-        return bool(s) and s != '[]'
-    return bool(tc)
+    """True iff the message carries real tool calls (unified via normalize_tool_calls)."""
+    return normalize_tool_calls(msg) is not None
 
 
 def _is_simple_query(text: str, min_user_chars: int, min_user_chars_cjk: int) -> bool:
@@ -129,6 +123,7 @@ class HardFilter(Preprocessor):
         max_chars_per_round: Optional[int] = None,
         max_total_chars: Optional[int] = None,
         max_rounds: Optional[int] = None,
+        agent_max_rounds: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._min_user_chars = min_user_chars
@@ -142,6 +137,13 @@ class HardFilter(Preprocessor):
         self._max_chars_per_round = max_chars_per_round
         self._max_total_chars = max_total_chars
         self._max_rounds = max_rounds
+        # Agent trajectories legitimately run many tool-calling rounds and are the
+        # highest-value distillation data, so the plain ``max_rounds`` cap (meant
+        # for shallow chit-chat) must not clip them. They get their own, far higher
+        # ceiling that still catches pathological runaway loops. ``None`` disables
+        # the cap for agent rows entirely; if unset it defaults to a wide multiple
+        # of ``max_rounds``.
+        self._agent_max_rounds = agent_max_rounds
 
     def _drop_reason(self, row: Dict[str, Any], messages: List[Any]) -> Optional[str]:
         """Apply rules in order; return first matching drop_reason, or None to keep."""
@@ -194,9 +196,19 @@ class HardFilter(Preprocessor):
             if total > self._max_total_chars:
                 return 'total_too_long'
 
-        # Rule 7: max rounds (user-assistant pairs).
-        if self._max_rounds and len(asst_msgs) > self._max_rounds:
-            return 'too_many_rounds'
+        # Rule 7: max rounds (user-assistant pairs). Count complete pairs, not raw
+        # assistant turns — an agent turn may emit several assistant messages
+        # (tool_call + follow-up) that are one logical round. Agent traces use a
+        # separate, higher ceiling (or none) so long tool-calling loops survive.
+        if self._max_rounds:
+            rounds = min(len(user_msgs), len(asst_msgs))
+            if is_agent_row(messages):
+                cap = (self._agent_max_rounds if self._agent_max_rounds is not None
+                       else self._max_rounds * 10)
+            else:
+                cap = self._max_rounds
+            if cap is not None and rounds > cap:
+                return 'too_many_rounds'
 
         return None
 
