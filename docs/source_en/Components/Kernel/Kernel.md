@@ -1,308 +1,151 @@
-# Twinkle Kernel Module
+# Twinkle Kernel
 
-The Twinkle Kernel Module provides two kernel replacement paths for accelerating models during training and inference:
+`twinkle.kernel` exposes a mapping-driven kernel replacement API. Replacing one
+implementation with another collapses to a single `kernelize(model, mapping)`
+call.
 
-* **Layer-level kernelize**
-  Replace entire `nn.Module` implementations with optimized kernels.
-* **Function-level kernelize**
-  Monkey-patch specific functions inside a Python module.
+The public surface is exactly three symbols:
 
-These two approaches can be used independently or together via a unified registration and application entry point.
+| Symbol | Purpose |
+| --- | --- |
+| `kernelize(model, mapping=None)` | Apply ``mapping`` to ``model`` (in place) and return it. If ``mapping`` is omitted, it is auto-detected from the current platform (see below) |
+| `npu_builtin(model=None)` | Return the Ascend NPU built-in mapping (composes with user mappings) |
+| `hub(ref, *, revision=None, version=None, backend=None, trust_remote_code=False)` | Build a ``HubRef`` for use as a mapping value; the actual Hub download is deferred to ``kernelize`` |
 
----
+## Mapping semantics
 
-## Overview: Two Kernelization Paths
+`mapping` keys describe the target to replace:
 
-| Path           | Granularity          | Typical Use Cases                |
-| -------------- | -------------------- | -------------------------------- |
-| Layer-level    | Whole `nn.Module`    | Linear / Conv / MLP / Attention  |
-| Function-level | Individual functions | Hot paths, math ops, activations |
+- `type[nn.Module]` subclass — replace **every** instance whose exact type matches (`m.__class__ = impl`; subclasses are **not** touched)
+- `str` of the form `'pkg.sub.attr'` or `'pkg.sub.ClassName.attr'` — `setattr(target, attr, impl)`
 
----
+`mapping` values describe the replacement:
 
-## Layer-Level Kernel Replacement
+- `type[nn.Module]` subclass — used as the impl class. The class' `__init__` is **never** invoked; its forward must work against the attributes the original instance already has
+- `Callable` — assigned with `setattr`
+- `dict[str, V]` — device → impl dispatch. Device is inferred from the model; entries without a matching key are **silently skipped**
+- `HubRef` — built via `hub(...)`; resolved lazily
 
-### When to Use
+Device is inferred from `next(model.parameters()).device.type` (falling back to buffers, then `'cpu'`).
 
-* You have a complete kernel implementation for a layer
-* You want model-wide replacement of specific `nn.Module` types
-* Suitable for both training and inference
+## Auto-detection (mapping omitted)
 
----
+When `mapping` is `None`, `kernelize` auto-detects the current platform via `Platform.device_prefix()` and applies the matching built-in bundle. Platforms without a built-in bundle are a safe no-op (the model is returned unchanged).
 
-### Example 1: Local Kernel Repo
+## Examples
 
-Use this when:
-
-* Kernel implementations live in a local repository
-* You want to replace layers in HuggingFace or custom models
+### Enable the built-in bundle for the current platform
 
 ```python
-from twinkle.kernel import (
-    kernelize_model,
-    register_layer_kernel,
-    register_external_layer,
-)
-from transformers import Qwen2Config, Qwen2ForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+from twinkle.kernel import kernelize
 
-# 1) Register the layer kernel from a local repo
-register_layer_kernel(
-    kernel_name="MyAwesomeMLP",
-    repo_path="/path/to/local/repo",
-    package_name="my_kernels",
-    layer_name="Qwen2MLPTrainingKernel",
-    device="cuda",
-    mode="train",
-)
-
-# 2) Bind external layer to kernel name
-register_external_layer(Qwen2MLP, "MyAwesomeMLP")
-
-# 3) Build the model and apply kernelization
-config = Qwen2Config(
-    hidden_size=128,
-    num_hidden_layers=1,
-    num_attention_heads=4,
-    num_key_value_heads=4,
-    intermediate_size=256,
-    use_cache=False,
-)
-model = Qwen2ForCausalLM(config)
-model = kernelize_model(model, mode="train", device="cuda", use_fallback=True)
+model = kernelize(model)  # auto-detects the platform and applies its built-in bundle
 ```
 
----
-
-### Example 2: Hub Kernel Repo
-
-Use this when:
-
-* The kernel is hosted on a Hub
+The explicit form is still supported:
 
 ```python
 import torch
-import torch.nn as nn
-from twinkle.kernel import (
-    kernelize_model,
-    register_layer_kernel,
-    register_external_layer,
-)
+from twinkle.kernel import kernelize, npu_builtin
 
-# 1) Define the custom layer
-class SiluAndMul(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return nn.functional.silu(x1) * x2
-
-# 2) Register the Hub kernel and bind the layer
-register_layer_kernel(
-    kernel_name="SiluAndMulKernel",
-    repo_id="kernels-community/activation",
-    layer_name="SiluAndMul",
-    device="cuda",
-    mode="train",
-)
-register_external_layer(SiluAndMul, "SiluAndMulKernel")
-
-# 3) Apply to a model
-class SimpleModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.activation = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.activation(x)
-
-model = SimpleModel()
-model = kernelize_model(model, mode="train", device="cuda", use_fallback=True)
+if torch.npu.is_available():
+    model = kernelize(model, npu_builtin(model))
 ```
 
----
-
-## Local Kernel Repo (Minimal)
-
-A local kernel repository is a regular Python package.
-At minimum, it only needs a `layers.py` file for layer-level kernels.
-
-```text
-# Repo layout:
-my_kernels/                  # Local kernel repository (Python package)
-├── __init__.py              # Package entry
-└── layers.py                # Layer-level kernel implementations
-
-```
+### Custom class replacement
 
 ```python
-# my_kernels/__init__.py
-from . import layers
-__all__ = ["layers"]
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+from twinkle.kernel import kernelize
 
-# my_kernels/layers.py
-import torch
-import torch.nn as nn
-
-class Qwen2MLPTrainingKernel(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        return self.down_proj(self.act_fn(gate) * up)
+model = kernelize(model, {Qwen2RMSNorm: MyRMSNorm})
 ```
 
----
-
-## Function-Level Kernel Replacement
-
-### When to Use
-
-* You only need to accelerate a small number of hot functions
-* Replacing the entire layer is unnecessary or impractical
-* Common for math ops, activations, or utility functions
-
----
-
-### Example 1: Batch Registration (Simple Case)
+### Built-in + custom override
 
 ```python
-from twinkle.kernel import register_kernels, kernelize_model
+from twinkle.kernel import kernelize, npu_builtin
 
-# 1) Register function kernels
-config = {
-    "functions": {
-        "add": {
-            "target_module": "my_pkg.math_ops",
-            "func_impl": lambda x, y: x + y + 1,
-            "device": "cuda",
-            "mode": "inference",
-        },
-    },
+model = kernelize(model, {**npu_builtin(model), Qwen2RMSNorm: MyRMSNorm})
+```
+
+Plain dict merge — later keys override earlier ones.
+
+### Hub kernel (HF Hub format)
+
+```python
+from twinkle.kernel import kernelize, hub
+from my_pkg import SiluAndMul
+
+model = kernelize(model, {
+    SiluAndMul: hub('kernels-community/activation:SiluAndMul', version=1),
+})
+```
+
+Exactly one of `revision` / `version` must be passed. The `kernels` package is imported lazily; absence raises a clear "install kernels" error.
+
+### Function-level replacement
+
+```python
+from twinkle.kernel import kernelize
+from twinkle.kernel.npu_impls.rotary import npu_apply_rotary_pos_emb
+
+model = kernelize(model, {
+    'transformers.models.qwen2.modeling_qwen2.apply_rotary_pos_emb':
+        npu_apply_rotary_pos_emb,
+})
+```
+
+### Cross-device mapping (NPU enabled, CUDA skipped)
+
+```python
+from twinkle.kernel import kernelize
+
+model = kernelize(model, {
+    Qwen2RMSNorm: {'npu': NpuRMSNorm, 'cuda': CudaRMSNorm},
+})
+```
+
+Safe to run on CUDA — entries whose dict misses the current device just skip.
+
+## NPU built-in coverage
+
+`npu_builtin(model)` returns a dict that (as available transformers modules permit) covers:
+
+- RMSNorm class replacement for Qwen2 / Qwen3 / Qwen3-MoE / Qwen2.5-VL / Qwen3.5 / Qwen3.5-MoE families
+- `apply_rotary_pos_emb` function replacement (fused RoPE) for the same families
+- SwiGLU fused replacement for the MLP variants
+- `Experts.forward` and `SparseMoeBlock.forward` for Qwen3-MoE / Qwen3.5-MoE
+- GatedRMSNorm forward for Qwen3.5 / Qwen3.5-MoE
+- `apply_multimodal_rotary_pos_emb` for Qwen2.5-VL
+- Global SDPA replacement (one-shot side effect on `ALL_ATTENTION_FUNCTIONS['sdpa']`)
+- Qwen3.5 Flash Linear Attention enablement (one-shot side effect + per-instance traversal, triggered inside `npu_builtin(model)`)
+
+**Not included by default:** the NPU replacement for `transformers.integrations.moe._grouped_mm`. Without Expert Parallelism the contiguous-copy overhead is ~8x. Opt in explicitly when EP is enabled:
+
+```python
+from twinkle.kernel import kernelize, npu_builtin
+from twinkle.kernel.npu_impls.moe import npu_grouped_mm
+
+mapping = {
+    **npu_builtin(model),
+    'transformers.integrations.moe._grouped_mm': {'npu': npu_grouped_mm},
 }
-register_kernels(config)
-
-# 2) Apply (model can be None when only functions are used)
-kernelize_model(model=None, mode="inference", device="cuda", use_fallback=True)
+model = kernelize(model, mapping)
 ```
 
----
+## Environment variables
 
-### Example 2: Advanced Function Sources (Full Control)
+Only two remain:
 
-Use this when:
+- `TWINKLE_NPU_FLA` — Qwen3.5 FLA switch (default on; `0`/`false` to disable)
+- `TWINKLE_NPU_GATED_RMSNorm_FP32` — force FP32 in Gated RMSNorm forward (default off)
 
-* Use when different functions come from different sources (impl / repo / hub) or need compile/backward flags.
+The legacy `TWINKLE_NPU_PATCH` / `TWINKLE_NPU_FUSED_OPS` / `TWINKLE_NPU_GMM_PATCH` / `TWINKLE_USE_KERNELS` are gone — they're now "include the entry in the mapping or don't" decisions.
 
-```python
-from twinkle.kernel.function import (
-    register_function_kernel,
-    apply_function_kernel,
-)
-import torch.nn as nn
-from twinkle.kernel import kernelize_model
+## Caveats
 
-TARGET_MODULE = "my_pkg.math_ops"
-
-# 1) Direct implementation
-def fast_add(x, y):
-    return x + y + 1
-
-register_function_kernel(
-    func_name="add",
-    target_module=TARGET_MODULE,
-    func_impl=fast_add,
-    device="cuda",
-    mode="inference",
-)
-
-# 2) Repo object (FuncRepositoryProtocol)
-class MyFuncRepo:
-    def load(self):
-        return MyKernelFunc
-
-class MyKernelFunc(nn.Module):
-    def forward(self, x, y):
-        return x * y
-
-register_function_kernel(
-    func_name="mul",
-    target_module=TARGET_MODULE,
-    repo=MyFuncRepo(),
-    device="cuda",
-    mode="compile",
-)
-
-# 3) Hub repo
-register_function_kernel(
-    func_name="silu_and_mul",
-    target_module="my_pkg.activations",
-    repo_id="kernels-community/activation",
-    revision="main",  # or version="0.1.0"
-    device="cuda",
-    mode="inference",
-)
-
-# 4) Apply function kernels
-applied = apply_function_kernel(
-    target_module=TARGET_MODULE,
-    device="cuda",
-    mode="inference",
-    strict=False,
-)
-print("patched:", applied)
-
-# 5) Optional: unified entry via kernelize_model
-model = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
-kernelize_model(model=model, mode="inference", device="cuda", use_fallback=True)
-```
-
----
-
-## Unified Layer + Function Batch Registration
-
-### When to Use
-
-* Framework-level integration
-* A single configuration entry point is preferred
-* Managing both layer and function kernels together
-
-```python
-from twinkle.kernel import register_kernels, kernelize_model
-import torch.nn as nn
-
-# 1) Register layer + function kernels
-config = {
-    "layers": {
-        "linear": {
-            "repo_id": "kernels-community/linear",
-            "layer_name": "Linear",
-            "version": "0.1.0",
-            "device": "cuda",
-            "mode": "train",
-        },
-        "conv2d": {
-            "repo_path": "/path/to/local/repo",
-            "package_name": "my_kernels",
-            "layer_name": "Conv2d",
-            "device": "cuda",
-        },
-    },
-    "functions": {
-        "add": {
-            "target_module": "my_pkg.math_ops",
-            "func_impl": lambda x, y: x + y + 1,
-            "device": "cuda",
-            "mode": "inference",
-        },
-        "relu": {
-            "target_module": "my_pkg.activations",
-            "repo_id": "kernels-community/activation",
-            "revision": "main",
-            "device": "cuda",
-        },
-    },
-}
-register_kernels(config)
-
-# 2) Apply via kernelize_model
-model = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
-kernelize_model(model=model, mode="train", device="cuda", use_fallback=True)
-```
+- `m.__class__ = impl_cls` is Python class-replacement magic. The impl class **must** override only `forward` (and helpers); defining `__init__` is incompatible with the contract
+- Exact match: `type(m) is target_cls`. Subclasses of `target_cls` are not replaced — add them to the mapping yourself
+- `kernelize` is idempotent under repeated calls
+- There is no `unkernelize` — replacement is one-way
