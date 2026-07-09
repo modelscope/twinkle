@@ -32,10 +32,10 @@ logger = get_logger()
 args = CLI.from_args()
 
 # -- Config -------------------------------------------------------------------
-CONDENSE_MODEL_ID = args.extra.get('condense_model_id', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')
-EMB_MODEL_ID = args.extra.get('emb_model_id', 'ms://twinkle-kit/Qwen3.5-4B-QA-emb')
-SAMPLER_GPUS = args.infra.sampler_gpus or 1
-EMB_GPUS = int(args.extra.get('emb_gpus', 1))
+CONDENSE_MODEL_ID = os.environ.get('CONDENSE_MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')
+EMB_MODEL_ID = os.environ.get('EMB_MODEL', 'output/embedding_lora_transformers/step_8000')
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 1))
+EMB_GPUS = int(os.environ.get('EMB_GPUS', 1))
 EMB_MAX_LENGTH = 8192
 
 # -- Prompts (aligned with train_embedding_full_ddp.py) -----------------------

@@ -39,6 +39,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -163,7 +165,7 @@ logger = get_logger()
 
 EMBED_MODEL_ID = os.environ.get(
     'EMBED_MODEL_ID',
-    'output/embedding_lora_transformers/step_4000',
+    'output/embedding_full_transformers/last-checkpoint',
 )
 CONDENSE_MODEL_ID = os.environ.get('CONDENSE_MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')
 
@@ -185,30 +187,42 @@ EMBED_MAX_LENGTH = int(os.environ.get('EMBED_MAX_LENGTH', 8192))
 SIM_THRESHOLD = float(os.environ.get('SIM_THRESHOLD', 0.65))
 MIN_TEXT_CHARS = int(os.environ.get('MIN_TEXT_CHARS', 256))
 
+# Dataset mix caps (only used in 'both' mode). None = no cap.
+THINK_CAP: Optional[int] = int(os.environ.get('THINK_CAP', 400_000)) or None
+INDEX_CAP: Optional[int] = int(os.environ.get('INDEX_CAP', 400_000)) or None
+MIX_SHUFFLE_SEED = 100
+
+# Concurrency knobs for API fallback and prefetch pipeline.
+API_CONCURRENCY = int(os.environ.get('API_CONCURRENCY', 8))
+API_MIN_INTERVAL = float(os.environ.get('API_MIN_INTERVAL', 0.1))
+PREFETCH_WORKERS = int(os.environ.get('PREFETCH_WORKERS', 2))
+
 # Hard-templated hints: the condenser SFT prior maps `Skill` to the legacy
 # `Use when: / numbered steps / Output:` skeleton on long inputs; embedding the
 # exact 4-line body template + explicit negative constraints is the only way to
 # override it deterministically across query and cot sides.
 RAG_QUERY_HINT = (
-    'Summarize this query for retrieval. '
-    'The body of ## Summary MUST follow this EXACT 4-line template — '
-    'do NOT emit "Use when:", numbered procedure steps, or "Output:":\n'
-    'Topic: <specific pattern name — scope>\n'
-    'Problem: <what concrete problem is being asked>\n'
-    'Skill: <which specific method/technique/pattern is required to solve it>\n'
-    'Knowledge: <which domains/concepts/facts must be invoked>\n'
+    'Extract the abstract PROBLEM TYPE from this query. '
+    'IGNORE all specific numbers, values, variable names, and parameters — '
+    'focus ONLY on the CLASS of problem and the METHODOLOGY required. '
+    'The body of ## Summary MUST follow this EXACT 4-line template:\n'
+    'Topic: <problem class — mathematical/logical domain>\n'
+    'Problem: <what abstract TYPE of problem needs solving, no specific values>\n'
+    'Skill: <which general method/technique is required>\n'
+    'Knowledge: <which theoretical concepts/formulas must be invoked>\n'
     'Then emit the mandatory ## More section as usual. '
-    'Topic must name the specific pattern, never generic labels.')
+    'Topic must name the method class, never mention specific numbers.')
 RAG_THINKING_HINT = (
-    'Summarize this reasoning trace for retrieval. '
-    'The body of ## Summary MUST follow this EXACT 4-line template — '
-    'do NOT emit "Use when:", numbered procedure steps, or "Output:":\n'
-    'Topic: <specific pattern name — scope>\n'
-    'Problem: <what concrete problem this trace tackled>\n'
-    'Skill: <which specific method/technique/pattern was applied>\n'
-    'Knowledge: <which domains/concepts/facts were used>\n'
+    'Extract the abstract METHODOLOGY demonstrated in this solution. '
+    'IGNORE all specific numbers, values, and computed results — '
+    'focus ONLY on the general TECHNIQUE and key reasoning STEPS. '
+    'The body of ## Summary MUST follow this EXACT 4-line template:\n'
+    'Topic: <method/technique name — scope>\n'
+    'Problem: <what abstract type of problem this method solves>\n'
+    'Skill: <key steps of the methodology in abstract terms>\n'
+    'Knowledge: <theoretical basis and prerequisites>\n'
     'Then emit the mandatory ## More section as usual. '
-    'Topic must name the specific pattern, never generic labels.')
+    'Topic must name the method class, never mention specific numbers.')
 
 # OpenAI API fallback (used when vLLM truncates).
 COMPRESS_API_KEY = os.environ.get('COMPRESS_API_KEY', '')
@@ -419,23 +433,124 @@ def _api_compress(api: OpenAIClient, messages: List[Dict[str, str]]) -> Optional
     return _strip_outer_codefence(content)
 
 
+_api_throttle_lock = threading.Lock()
+_api_last_call = [0.0]
+
+
+def _api_throttle():
+    with _api_throttle_lock:
+        gap = time.monotonic() - _api_last_call[0]
+        if gap < API_MIN_INTERVAL:
+            time.sleep(API_MIN_INTERVAL - gap)
+        _api_last_call[0] = time.monotonic()
+
+
+def _api_compress_throttled(api: OpenAIClient, messages: List[Dict[str, str]]) -> Optional[str]:
+    """Rate-limited API compression call."""
+    _api_throttle()
+    return _api_compress(api, messages)
+
+
 def _resolve_compressed(sampler: vLLMSampler, api: Optional[OpenAIClient],
                         texts: List[str], query_hint: str) -> List[Optional[str]]:
-    """Run vLLM batch; replace truncations / skeleton-incomplete with API output."""
+    """Run vLLM batch; replace truncations / skeleton-incomplete with API output.
+
+    API fallback runs concurrently (up to API_CONCURRENCY workers) for speed.
+    """
     pairs = _vllm_compress(sampler, texts, query_hint)
-    results: List[Optional[str]] = []
-    for (text, stop), src_text in zip(pairs, texts):
+    results: List[Optional[str]] = [None] * len(texts)
+    fallback_indices: List[int] = []
+    for i, ((text, stop), src_text) in enumerate(zip(pairs, texts)):
         if stop != 'length' and not _is_truncated_compression(text):
-            results.append(text)
-            continue
-        if api is None:
-            results.append(None)
-            continue
-        api_text = _api_compress(api, _build_compress_messages(src_text, query_hint))
-        if api_text is None or _is_truncated_compression(api_text):
-            results.append(None)
+            results[i] = text
         else:
-            results.append(api_text)
+            fallback_indices.append(i)
+
+    if fallback_indices and api is not None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=API_CONCURRENCY) as pool:
+            futures = {}
+            for idx in fallback_indices:
+                msgs = _build_compress_messages(texts[idx], query_hint)
+                futures[pool.submit(_api_compress_throttled, api, msgs)] = idx
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                api_text = fut.result()
+                if api_text and not _is_truncated_compression(api_text):
+                    results[idx] = api_text
+
+    return results
+
+
+def _resolve_compressed_multi(sampler: vLLMSampler, api: Optional[OpenAIClient],
+                              texts: List[str], hints: List[str]) -> List[Optional[str]]:
+    """Like _resolve_compressed but each text has its own per-item hint.
+
+    Merges all texts into a SINGLE vLLM batch call (instead of one per hint),
+    dramatically reducing round-trip overhead when processing interleaved
+    query+cot pairs with different hint strings.
+
+    Args:
+        sampler: vLLM condenser sampler.
+        api: Optional OpenAI-compatible API client for fallback.
+        texts: List of raw texts to compress (may contain empty strings to skip).
+        hints: Per-text hint strings (same length as texts).
+
+    Returns:
+        List of compressed texts (None where compression failed entirely).
+    """
+    assert len(texts) == len(hints), f'texts({len(texts)}) != hints({len(hints)})'
+    if not texts:
+        return []
+
+    # Skip texts that would exceed the condenser's context window.
+    _max_input_chars = (CONDENSE_MAX_MODEL_LEN - CONDENSE_MAX_TOKENS) * 3
+    skip_mask = [len(t) > _max_input_chars for t in texts]
+
+    # Build prompts per-item (each text gets its own hint as the query parameter).
+    prompts = [{'messages': _build_compress_messages(t, h)}
+               for t, h, skip in zip(texts, hints, skip_mask) if not skip]
+    active_indices = [i for i, skip in enumerate(skip_mask) if not skip]
+    params = TwinkleSamplingParams(
+        max_tokens=CONDENSE_MAX_TOKENS,
+        temperature=COMPRESS_TEMPERATURE,
+        top_p=COMPRESS_TOP_P,
+        num_samples=1,
+    )
+
+    # Single vLLM batch call — the key throughput win.
+    responses = sampler.sample(prompts, params) if prompts else []
+
+    results: List[Optional[str]] = [None] * len(texts)
+    fallback_indices: List[int] = []
+    for resp_idx, orig_idx in enumerate(active_indices):
+        resp = responses[resp_idx]
+        seq = resp.sequences[0] if resp and resp.sequences else None
+        if seq is None:
+            fallback_indices.append(orig_idx)
+            continue
+        text = seq.decoded or ''
+        text = re.sub(r'<\|[^|]+\|>', '', text).rstrip()
+        text = _strip_outer_codefence(text)
+        if seq.stop_reason != 'length' and not _is_truncated_compression(text):
+            results[orig_idx] = text
+        else:
+            fallback_indices.append(orig_idx)
+
+    # Concurrent API fallback for failed items.
+    if fallback_indices and api is not None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=API_CONCURRENCY) as pool:
+            futures = {}
+            for idx in fallback_indices:
+                msgs = _build_compress_messages(texts[idx], hints[idx])
+                futures[pool.submit(_api_compress_throttled, api, msgs)] = idx
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                api_text = fut.result()
+                if api_text and not _is_truncated_compression(api_text):
+                    results[idx] = api_text
+
     return results
 
 
@@ -545,7 +660,7 @@ def _existing_ids(table) -> set:
 
 def _stream_corpus(total: Optional[int], load_from_cache_file: bool,
                    max_rows: int = 0) -> Iterator[Dict[str, Any]]:
-    ds = _GET_DATASET(total=total, load_from_cache_file=load_from_cache_file)
+    ds = _GET_DATASET(total=total or None, load_from_cache_file=load_from_cache_file)
     n_full = len(ds)
     cap = max_rows if (max_rows and max_rows < n_full) else n_full
     sys.stderr.write(f'[corpus] get_dataset: {n_full} rows'
@@ -602,32 +717,58 @@ def build_index(args: argparse.Namespace,
     # ---- Streaming loop -----------------------------------------------------
     n_seen = n_kept = n_dropped_short = n_dropped_compress = n_dropped_sim = 0
     n_dropped_dup = 0
-    pbar = tqdm(desc='index', unit='row', dynamic_ncols=True)
+    n_no_id = 0
+    n_no_query = 0
+    n_short_cot = 0
+    _diag_samples = 5  # print first N dropped rows for diagnosis
 
     batch: List[Dict[str, Any]] = []
 
-    def _flush(rows: List[Dict[str, Any]]) -> None:
-        nonlocal n_kept, n_dropped_compress, n_dropped_sim
+    def _compress_batch(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Phase 1: compress query+cot in a SINGLE merged vLLM call for throughput."""
         if not rows:
-            return
-        # Phase 1 — compress query (RAG_QUERY_HINT) and cot (RAG_THINKING_HINT).
-        # Short queries bypass condenser (passthrough) — matches training behaviour.
-        long_q_indices = [i for i, r in enumerate(rows) if len(r['query_raw']) >= MIN_TEXT_CHARS]
-        q_compressed: List[Optional[str]] = [None] * len(rows)
-        for i, r in enumerate(rows):
-            if len(r['query_raw']) < MIN_TEXT_CHARS:
-                q_compressed[i] = r['query_raw']
-        if long_q_indices:
-            long_results = _resolve_compressed(
-                sampler, api, [rows[i]['query_raw'] for i in long_q_indices], RAG_QUERY_HINT)
-            for idx, res in zip(long_q_indices, long_results):
-                q_compressed[idx] = res
-        c_compressed = _resolve_compressed(
-            sampler, api, [r['cot_raw'] for r in rows], RAG_THINKING_HINT)
+            return []
+        # Build a merged prompt list: interleave query and cot texts so the sampler
+        # processes both in one round-trip instead of two serial calls.
+        all_texts: List[str] = []
+        all_hints: List[str] = []
+        passthrough_map: Dict[int, str] = {}  # prompt_idx → raw text for short queries
+        for r in rows:
+            q_raw = r['query_raw']
+            if len(q_raw) < MIN_TEXT_CHARS:
+                passthrough_map[len(all_texts)] = q_raw
+                all_texts.append('')  # placeholder
+                all_hints.append(RAG_QUERY_HINT)
+            else:
+                all_texts.append(q_raw)
+                all_hints.append(RAG_QUERY_HINT)
+            all_texts.append(r['cot_raw'])
+            all_hints.append(RAG_THINKING_HINT)
+
+        # Split into passthrough vs sampler-needed
+        sampler_indices = [i for i in range(len(all_texts)) if i not in passthrough_map]
+        sampler_texts = [all_texts[i] for i in sampler_indices]
+        sampler_hints = [all_hints[i] for i in sampler_indices]
+
+        # Single merged vLLM call — group by hint to maximize prefix-sharing
+        # (both hints produce the same COMPRESS_SYSTEM, so batching is efficient).
+        sampler_results = _resolve_compressed_multi(
+            sampler, api, sampler_texts, sampler_hints)
+
+        # Reassemble full results
+        all_results: List[Optional[str]] = [None] * len(all_texts)
+        for idx, text in passthrough_map.items():
+            all_results[idx] = text
+        for pos, res in zip(sampler_indices, sampler_results):
+            all_results[pos] = res
+
+        # Pair up (query, cot) and filter
         kept_rows: List[Dict[str, Any]] = []
-        for r, q_cmp, c_cmp in zip(rows, q_compressed, c_compressed):
+        for i, r in enumerate(rows):
+            q_cmp = all_results[i * 2]
+            c_cmp = all_results[i * 2 + 1]
             if not q_cmp or not c_cmp:
-                n_dropped_compress += 1
+                nonlocal_counters['n_dropped_compress'] += 1
                 _log_miss(misses_path, misses_lock, {
                     'id': r['id'], 'source': r['source'], 'reason': 'compress_fail',
                     'query_raw_head': _short(r['query_raw'], 200),
@@ -637,15 +778,17 @@ def build_index(args: argparse.Namespace,
             r['query_compressed'] = q_cmp
             r['cot_compressed'] = c_cmp
             kept_rows.append(r)
+        return kept_rows
+
+    def _embed_and_insert(kept_rows: List[Dict[str, Any]]) -> None:
+        """Phase 2+3: embed compressed texts and insert into LanceDB."""
         if not kept_rows:
             return
-        # Phase 2 — encode anchor (compressed query) + positive (compressed cot).
         anchor_emb = get_embeddings(
             emb_model, emb_template, [r['query_compressed'] for r in kept_rows], role='anchor')
         positive_emb = get_embeddings(
             emb_model, emb_template, [r['cot_compressed'] for r in kept_rows], role='positive')
         sims = (anchor_emb * positive_emb).sum(axis=1).astype(np.float32)
-        # Phase 3 — sim filter + LanceDB insert.
         to_insert: List[Dict[str, Any]] = []
         for idx, (r, sim_val) in enumerate(zip(kept_rows, sims)):
             tag = 'KEEP' if sim_val >= SIM_THRESHOLD else 'DROP'
@@ -653,7 +796,7 @@ def build_index(args: argparse.Namespace,
                   f'q={_short(r["query_raw"], 60)!r} '
                   f'cot={_short(r["cot_raw"], 60)!r}', flush=True)
             if sim_val < SIM_THRESHOLD:
-                n_dropped_sim += 1
+                nonlocal_counters['n_dropped_sim'] += 1
                 _log_miss(misses_path, misses_lock, {
                     'id': r['id'], 'source': r['source'], 'reason': 'sim_low',
                     'sim': float(sim_val),
@@ -677,24 +820,60 @@ def build_index(args: argparse.Namespace,
             })
         if to_insert:
             tbl.add(to_insert)
-            n_kept += len(to_insert)
+            nonlocal_counters['n_kept'] += len(to_insert)
             indexed.update(r['id'] for r in to_insert)
 
+    def _process_batch(rows: List[Dict[str, Any]]) -> None:
+        """Full pipeline for one batch: compress → embed → insert."""
+        kept = _compress_batch(rows)
+        _embed_and_insert(kept)
+
+    # Mutable counters shared with nested functions (avoid nonlocal limitation).
+    nonlocal_counters = {
+        'n_kept': 0, 'n_dropped_compress': 0, 'n_dropped_sim': 0,
+    }
+
+    from concurrent.futures import ThreadPoolExecutor as _PrefetchPool
+    prefetch_pool = _PrefetchPool(max_workers=PREFETCH_WORKERS)
+
     try:
+        # Phase 1: Stream corpus, filter rows, collect batches (fast).
+        pending_futures = []
+        sys.stderr.write('[build] streaming corpus and submitting batches...\n')
+
         for row in _stream_corpus(total=args.total, load_from_cache_file=not args.no_cache,
                                   max_rows=args.max_rows):
             n_seen += 1
-            if args.limit and n_kept >= args.limit:
+            if args.limit and nonlocal_counters['n_kept'] >= args.limit:
                 break
             rid = row.get('id') or ''
             if not rid:
+                n_no_id += 1
+                if n_no_id <= _diag_samples:
+                    sys.stderr.write(f'[diag:no_id] row keys={list(row.keys())}\n')
                 continue
             if rid in indexed:
                 n_dropped_dup += 1
                 continue
             user_query, cot = _extract_query_cot(row)
-            if not user_query or len(cot) < MIN_TEXT_CHARS:
+            if not user_query:
+                n_no_query += 1
                 n_dropped_short += 1
+                if n_no_query <= _diag_samples:
+                    msgs = row.get('messages')
+                    sys.stderr.write(
+                        f'[diag:no_query] id={rid} source={row.get("source","?")} '
+                        f'msgs_type={type(msgs).__name__} '
+                        f'msgs_len={len(msgs) if isinstance(msgs, list) else "?"} '
+                        f'msg0_keys={list(msgs[0].keys()) if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict) else "?"}\n')
+                continue
+            if len(cot) < MIN_TEXT_CHARS:
+                n_short_cot += 1
+                n_dropped_short += 1
+                if n_short_cot <= _diag_samples:
+                    sys.stderr.write(
+                        f'[diag:short_cot] id={rid} source={row.get("source","?")} '
+                        f'cot_len={len(cot)} query_len={len(user_query)}\n')
                 continue
             batch.append({
                 'id': rid,
@@ -703,21 +882,45 @@ def build_index(args: argparse.Namespace,
                 'cot_raw': cot,
             })
             if len(batch) >= args.batch_size:
-                _flush(batch)
+                pending_futures.append(prefetch_pool.submit(_process_batch, list(batch)))
                 batch.clear()
-                pbar.set_postfix(kept=n_kept, sim_drop=n_dropped_sim,
-                                 cmp_drop=n_dropped_compress, refresh=False)
-            pbar.update(1)
+
+        # Flush remainder
         if batch:
-            _flush(batch)
+            pending_futures.append(prefetch_pool.submit(_process_batch, list(batch)))
             batch.clear()
+
+        n_batches = len(pending_futures)
+        n_valid = n_seen - n_no_id - n_dropped_dup - n_dropped_short
+        sys.stderr.write(
+            f'[build] stream done: seen={n_seen} valid={n_valid} '
+            f'batches={n_batches} (no_id={n_no_id} no_query={n_no_query} '
+            f'short_cot={n_short_cot} dup={n_dropped_dup})\n')
+
+        # Phase 2: Wait for all futures with real progress tracking.
+        pbar = tqdm(total=n_batches, desc='compress+embed', unit='batch',
+                    dynamic_ncols=True)
+        for fut in pending_futures:
+            fut.result()
+            n_kept = nonlocal_counters['n_kept']
+            n_dropped_sim = nonlocal_counters['n_dropped_sim']
+            n_dropped_compress = nonlocal_counters['n_dropped_compress']
+            pbar.set_postfix(kept=n_kept, sim_drop=n_dropped_sim,
+                             cmp_drop=n_dropped_compress, refresh=False)
+            pbar.update(1)
     finally:
         pbar.close()
+        prefetch_pool.shutdown(wait=True)
+
+    n_kept = nonlocal_counters['n_kept']
+    n_dropped_sim = nonlocal_counters['n_dropped_sim']
+    n_dropped_compress = nonlocal_counters['n_dropped_compress']
 
     sys.stderr.write(
-        f'[build] seen={n_seen} kept={n_kept} sim_drop={n_dropped_sim} '
-        f'cmp_drop={n_dropped_compress} short_drop={n_dropped_short} '
-        f'dup_skip={n_dropped_dup}\n')
+        f'[build] summary: seen={n_seen} kept={n_kept} '
+        f'dup={n_dropped_dup} no_id={n_no_id} no_query={n_no_query} '
+        f'short_cot={n_short_cot} compress_fail={n_dropped_compress} '
+        f'sim_drop={n_dropped_sim}\n')
 
     # ---- Build vector index for fast retrieval ------------------------------
     if n_kept >= 64 and not args.skip_index:
@@ -864,17 +1067,17 @@ def parse_args() -> argparse.Namespace:
                    help='LanceDB table name within --db-path.')
     p.add_argument('--total', type=int, default=0,
                    help='Total dataset rows to scale corpus to (0 = base sizes from the loader module).')
-    p.add_argument('--dataset-module', default='dataset_index',
-                   choices=['dataset_index', 'dataset_think'],
-                   help='Which loader to use: dataset_index (RAG profile) or '
-                        'dataset_think (training mix).')
+    p.add_argument('--dataset-module', default='both',
+                   choices=['dataset_index', 'dataset_think', 'both'],
+                   help='Which loader to use: dataset_index (RAG profile), '
+                        'dataset_think (training mix), or both (50/50 mix).')
     p.add_argument('--limit', type=int, default=0,
                    help='Stop building once this many rows are kept (0 = no cap).')
     p.add_argument('--max-rows', type=int, default=0,
                    help='Truncate corpus to this many rows AFTER get_dataset (0 = no cap). '
                         'Use this instead of --total to avoid invalidating the dataset cache.')
-    p.add_argument('--batch-size', type=int, default=64,
-                   help='Rows per condense+encode batch.')
+    p.add_argument('--batch-size', type=int, default=128,
+                   help='Rows per condense+encode batch (larger = better GPU util).')
     p.add_argument('--no-cache', action='store_true',
                    help='Disable load_from_cache_file in dataset_think.get_dataset.')
     p.add_argument('--overwrite', action='store_true',
@@ -901,6 +1104,27 @@ def main() -> None:
     if args.dataset_module == 'dataset_think':
         from dataset_think import get_dataset as _swap
         _GET_DATASET = _swap
+    elif args.dataset_module == 'both':
+        from dataset_think import get_dataset as _get_think
+        from datasets import concatenate_datasets
+
+        def _get_both(total=None, load_from_cache_file=True, **kw):
+            _total = total or None  # CLI default 0 means "no scaling" → None
+            ds_index = _default_get_dataset(total=_total, load_from_cache_file=load_from_cache_file)
+            ds_think = _get_think(total=_total, load_from_cache_file=load_from_cache_file)
+            if INDEX_CAP and len(ds_index.dataset) > INDEX_CAP:
+                ds_index.dataset = ds_index.dataset.select(range(INDEX_CAP))
+            if THINK_CAP and len(ds_think.dataset) > THINK_CAP:
+                ds_think.dataset = ds_think.dataset.select(range(THINK_CAP))
+            n_index = len(ds_index.dataset)
+            n_think = len(ds_think.dataset)
+            ds_index.dataset = concatenate_datasets(
+                [ds_index.dataset, ds_think.dataset]).shuffle(seed=MIX_SHUFFLE_SEED)
+            sys.stderr.write(f'[mix] index={n_index} + think={n_think} '
+                             f'→ total={len(ds_index.dataset)}\n')
+            return ds_index
+
+        _GET_DATASET = _get_both
     sys.stderr.write(f'[main] dataset loader: {args.dataset_module}\n')
 
     # Build/eval both depend on the same Twinkle stack — initialize once.
