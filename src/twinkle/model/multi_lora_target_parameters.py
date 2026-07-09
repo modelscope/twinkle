@@ -251,11 +251,9 @@ class TargetParameterLoraWrapper(nn.Module):
             # Validate shape
             expected_shape_a = (num_experts, r, self.lora_A[slot_name].shape[-1])
             if lora_A_3d.shape != expected_shape_a:
-                raise ValueError(
-                    f'Expected lora_A shape {expected_shape_a}, got {lora_A_3d.shape}'
-                )
+                raise ValueError(f'Expected lora_A shape {expected_shape_a}, got {lora_A_3d.shape}')
             self.lora_A[slot_name][:num_experts, :r, :].copy_(lora_A_3d)
-            
+
             # Directly use 3D tensor: [num_experts, out_features, r]
             lora_B_3d = state_dict[key_b].to(
                 device=self.lora_B[slot_name].device,
@@ -264,11 +262,9 @@ class TargetParameterLoraWrapper(nn.Module):
             # Validate shape
             expected_shape_b = (num_experts, self.lora_B[slot_name].shape[1], r)
             if lora_B_3d.shape != expected_shape_b:
-                raise ValueError(
-                    f'Expected lora_B shape {expected_shape_b}, got {lora_B_3d.shape}'
-                )
+                raise ValueError(f'Expected lora_B shape {expected_shape_b}, got {lora_B_3d.shape}')
             self.lora_B[slot_name][:num_experts, :, :r].copy_(lora_B_3d)
-        
+
         return {key_a, key_b}
 
 
