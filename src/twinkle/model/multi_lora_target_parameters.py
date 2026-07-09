@@ -220,16 +220,13 @@ class TargetParameterLoraWrapper(nn.Module):
     def get_state_dict(self, slot_name: str) -> dict[str, torch.Tensor]:
         r = self.r[slot_name]
         num_experts = self.num_experts
-        # Slice to actual rank first, then flatten expert and rank dimensions
+        # Slice to actual rank first, keep 3D shape: [num_experts, r, in_features]
         lora_A = self.lora_A[slot_name][:num_experts, :r, :].detach().clone()
+        # Keep 3D shape: [num_experts, out_features, r]
         lora_B = self.lora_B[slot_name][:num_experts, :, :r].detach().clone()
-        # Flatten: [num_experts, r, in_features] -> [num_experts*r, in_features]
-        lora_A_flat = lora_A.reshape(num_experts * r, -1)
-        # Flatten: [num_experts, out_features, r] -> [out_features, num_experts*r]
-        lora_B_flat = lora_B.transpose(0, 1).reshape(-1, num_experts * r)
         return {
-            f'{self.peft_key_prefix}.lora_A.weight': lora_A_flat,
-            f'{self.peft_key_prefix}.lora_B.weight': lora_B_flat,
+            f'{self.peft_key_prefix}.lora_A.weight': lora_A,
+            f'{self.peft_key_prefix}.lora_B.weight': lora_B,
         }
 
     def set_state_dict(self, slot_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
@@ -246,18 +243,32 @@ class TargetParameterLoraWrapper(nn.Module):
         with torch.no_grad():
             self.lora_A[slot_name].zero_()
             self.lora_B[slot_name].zero_()
-            # Reshape: [num_experts*r, in_features] -> [num_experts, r, in_features]
-            lora_A_reshaped = state_dict[key_a].reshape(num_experts, r, -1).to(
+            # Directly use 3D tensor: [num_experts, r, in_features]
+            lora_A_3d = state_dict[key_a].to(
                 device=self.lora_A[slot_name].device,
                 dtype=self.lora_A[slot_name].dtype,
             )
-            self.lora_A[slot_name][:num_experts, :r, :].copy_(lora_A_reshaped)
-            # Reshape: [out_features, num_experts*r] -> [out_features, num_experts, r] -> [num_experts, out_features, r]
-            lora_B_reshaped = state_dict[key_b].reshape(-1, num_experts, r).transpose(0, 1).to(
+            # Validate shape
+            expected_shape_a = (num_experts, r, self.lora_A[slot_name].shape[-1])
+            if lora_A_3d.shape != expected_shape_a:
+                raise ValueError(
+                    f'Expected lora_A shape {expected_shape_a}, got {lora_A_3d.shape}'
+                )
+            self.lora_A[slot_name][:num_experts, :r, :].copy_(lora_A_3d)
+            
+            # Directly use 3D tensor: [num_experts, out_features, r]
+            lora_B_3d = state_dict[key_b].to(
                 device=self.lora_B[slot_name].device,
                 dtype=self.lora_B[slot_name].dtype,
             )
-            self.lora_B[slot_name][:num_experts, :, :r].copy_(lora_B_reshaped)
+            # Validate shape
+            expected_shape_b = (num_experts, self.lora_B[slot_name].shape[1], r)
+            if lora_B_3d.shape != expected_shape_b:
+                raise ValueError(
+                    f'Expected lora_B shape {expected_shape_b}, got {lora_B_3d.shape}'
+                )
+            self.lora_B[slot_name][:num_experts, :, :r].copy_(lora_B_3d)
+        
         return {key_a, key_b}
 
 
