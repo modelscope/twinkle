@@ -52,6 +52,9 @@ class Qwen3_5Template(Template):
         if self.processor is not self.tokenizer:
             apply_patch(self.processor, Qwen3ChatTemplate)
             apply_patch(self.processor, Qwen3AllowToolTailTemplate)
+        # Patches above may alter chat_template behavior — re-probe assistant_masks
+        # support so `_template_support_assistant_tokens_mask` reflects the patched template.
+        self._test_support_assistant_tokens_mask()
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()

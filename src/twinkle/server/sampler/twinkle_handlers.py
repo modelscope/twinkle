@@ -25,6 +25,7 @@ import twinkle_client.types as types
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
+from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -49,10 +50,11 @@ def _serialize_input_feature(feature: dict) -> dict:
 
 
 def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Prefix the adapter name with the request ID for per-request isolation."""
+    """Build a stable per-session adapter name, falling back to request_id for older clients."""
     if adapter_name is None or adapter_name == '':
         return None
-    return request.state.request_id + '-' + adapter_name
+    owner_id = get_session_id_from_request(request) or request.state.request_id
+    return owner_id + '-' + adapter_name
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:

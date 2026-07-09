@@ -1,7 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
 from typing import List, Union
 
 from twinkle.data_format import InputFeature, ModelOutput
@@ -32,6 +29,9 @@ class EmbeddingMetric(Metric):
         self.grad_norm = 0.0
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
+        import torch
+        import torch.distributed as dist
+        import torch.nn.functional as F
         sentences = outputs.get('embeddings')
         if sentences is None:
             sentences = outputs.get('logits')
@@ -44,22 +44,34 @@ class EmbeddingMetric(Metric):
             inputs = [inputs]
         labels = torch.cat([inp['labels'].view(-1) for inp in inputs], dim=0)
 
-        # Gather embeddings and labels across DP for in-batch stats
+        # Gather embeddings and labels across DP for in-batch stats.
+        # NCCL ``all_gather`` requires every rank to send the same tensor size,
+        # but ``slice_dp`` dispatch (``divmod`` split) can leave per-rank dim-0
+        # uneven. Pad to the global max along dim-0, gather, then strip padding.
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             world_size = dist.get_world_size()
-            local_shape = sentences.new_tensor(sentences.shape, dtype=torch.long)
-            shapes = [torch.empty_like(local_shape) for _ in range(world_size)]
-            dist.all_gather(shapes, local_shape)
-            all_sentences = [sentences.new_empty(s.tolist()) for s in shapes]
-            dist.all_gather(all_sentences, sentences.contiguous())
-            sentences = torch.cat(all_sentences, dim=0)
+            assert sentences.shape[0] == labels.shape[0], (
+                f'sentences/labels dim-0 mismatch: {sentences.shape[0]} vs {labels.shape[0]}')
+            local_n = torch.tensor([sentences.shape[0]], device=sentences.device, dtype=torch.long)
+            sizes = [torch.empty_like(local_n) for _ in range(world_size)]
+            dist.all_gather(sizes, local_n, group=self.process_group)
+            sizes_int = [int(s.item()) for s in sizes]
+            max_n = max(sizes_int)
 
-            local_lshape = labels.new_tensor(labels.shape, dtype=torch.long)
-            lshapes = [torch.empty_like(local_lshape) for _ in range(world_size)]
-            dist.all_gather(lshapes, local_lshape)
-            all_labels = [labels.new_empty(s.tolist()) for s in lshapes]
-            dist.all_gather(all_labels, labels.contiguous())
-            labels = torch.cat(all_labels, dim=0)
+            def _pad_gather(tensor: 'torch.Tensor') -> 'List[torch.Tensor]':
+                if tensor.shape[0] < max_n:
+                    pad_shape = (max_n - tensor.shape[0], ) + tuple(tensor.shape[1:])
+                    padded = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=0)
+                else:
+                    padded = tensor
+                buffers = [torch.empty_like(padded) for _ in range(world_size)]
+                dist.all_gather(buffers, padded.contiguous(), group=self.process_group)
+                return buffers
+
+            sent_buffers = _pad_gather(sentences)
+            label_buffers = _pad_gather(labels)
+            sentences = torch.cat([sent_buffers[i][:sizes_int[i]] for i in range(world_size)], dim=0)
+            labels = torch.cat([label_buffers[i][:sizes_int[i]] for i in range(world_size)], dim=0)
 
         anchor_idx = torch.nonzero(labels, as_tuple=False).squeeze(-1)
         if anchor_idx.numel() == 0:

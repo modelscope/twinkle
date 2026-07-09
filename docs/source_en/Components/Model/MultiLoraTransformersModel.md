@@ -30,3 +30,48 @@ The reason for the existence of max_loras and max_r parameters is that Twinkle's
 Because of this, the user's r must be less than or equal to the max_r configuration. During actual training, only part of the lora's rank will be used in the calculation.
 
 MultiLoraTransformersModel supports the `@remote_class` annotation and supports device_mesh, which means it can run in Ray workers.
+
+## Tenant Lifecycle
+
+Under the hood, `MultiLoraTransformersModel` uses the `MultiLora` manager to handle tenant LoRA slots. The key APIs:
+
+### acquire_lora
+
+Claim an available LoRA slot for a tenant:
+
+```python
+adapter_name = model.multi_lora.acquire_lora('tenant_a', LoraConfig(r=16, lora_alpha=32))
+```
+
+- Raises `RuntimeError` if all slots are in use or `config.r > max_r`
+
+### release_lora
+
+Release a tenant's LoRA slot, resetting weights to initial state:
+
+```python
+model.multi_lora.release_lora('tenant_a')
+```
+
+### Context Manager
+
+Use `adapter()` for scoped activation:
+
+```python
+with model.multi_lora.adapter('tenant_a') as name:
+    output = model.forward(inputs)
+```
+
+### LoraTenant
+
+Each slot is tracked as a `LoraTenant` dataclass:
+
+```python
+@dataclass
+class LoraTenant:
+    index: int                    # Slot index (0..max_loras-1)
+    adapter_name: str             # Internal name (e.g. "lora_0")
+    config: LoraConfig            # Pre-allocated config (max_r)
+    tenant_adapter_name: str      # User-facing tenant name (None if free)
+    tenant_config: LoraConfig     # Tenant's actual config (None if free)
+```

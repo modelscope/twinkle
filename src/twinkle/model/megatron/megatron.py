@@ -36,6 +36,7 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
+from twinkle.utils.nccl_safe import _is_fail_fast
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
@@ -407,6 +408,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     output_tensor = model(**batch)
             else:
                 output_tensor = model(**batch)
+
             batch['labels'] = labels
             logps = None
             unpacked_logits = None
@@ -414,44 +416,58 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             embeddings = None
             _loss_instance = loss_instance
             is_last_pp = mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage)
-            if task == 'embedding':
-                # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
-                if is_last_pp:
-                    embeddings = output_tensor
-            elif labels is not None and is_last_pp:
-                _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
-                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
-                _packed = batch.get('packed_seq_params')
-                cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
-                if _loss_require_logps:
-                    loss_mask = (labels != -100).bool()
-                    masked_labels = labels.clone()
-                    masked_labels[~loss_mask] = 0
-                    output_tensor.div_(temperature)
-                    if _loss_require_entropy:
-                        logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
-                    else:
-                        logps = selective_log_softmax(output_tensor, masked_labels)
-                    # Reconstruct full-length tensors from CP-split shards
-                    logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
+            try:
+                if task == 'embedding':
+                    # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
+                    if is_last_pp:
+                        embeddings = output_tensor
+                elif labels is not None and is_last_pp:
+                    _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
+                    _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)
+                    _packed = batch.get('packed_seq_params')
+                    cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                    if _loss_require_logps:
+                        loss_mask = (labels != -100).bool()
+                        masked_labels = labels.clone()
+                        masked_labels[~loss_mask] = 0
+                        output_tensor.div_(temperature)
+                        if _loss_require_entropy:
+                            logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
+                        else:
+                            logps = selective_log_softmax(output_tensor, masked_labels)
+                        # Reconstruct full-length tensors from CP-split shards
+                        logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
+                        if entropies is not None:
+                            entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                    batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
+                    if 'position_ids' in batch:
+                        pos = batch['position_ids']
+                        if pos.dim() == 3:
+                            pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                        batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
+                    # Unpack packed sequences into per-sequence batch format
+                    _outputs = {'logps': logps}
                     if entropies is not None:
-                        entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
-                batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
-                if 'position_ids' in batch:
-                    pos = batch['position_ids']
-                    if pos.dim() == 3:
-                        pos = pos[0]  # [2/3, 1, seq] → [1, seq]
-                    batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
-                # Unpack packed sequences into per-sequence batch format
-                _outputs = {'logps': logps}
-                if entropies is not None:
-                    _outputs['entropies'] = entropies
-                if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
-                    _outputs['logits'] = output_tensor
-                batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
-                logps = _outputs['logps']
-                entropies = _outputs.get('entropies', None)
-                unpacked_logits = _outputs.get('logits', None)
+                        _outputs['entropies'] = entropies
+                    if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                        _outputs['logits'] = output_tensor
+                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                    logps = _outputs['logps']
+                    entropies = _outputs.get('entropies', None)
+                    unpacked_logits = _outputs.get('logits', None)
+            except Exception as e:
+                # Data processing error (e.g. unpack_packed_sequences dimension mismatch).
+                # Must catch here inside the scheduler to prevent exception escaping
+                # and breaking PP P2P communication → NCCL hang.
+                if _is_fail_fast():
+                    raise
+                logger.warning('[nccl_safe] forward_step_func data processing error: '
+                               '%s: %s',
+                               type(e).__name__, e)
+                logps = None
+                unpacked_logits = None
+                entropies = None
+                embeddings = None
             return output_tensor, partial(
                 post_loss_function,
                 inputs=batch,
@@ -600,7 +616,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         success, grad_norm, num_zeros = optimizer.step()
         # Store grad_norm for later retrieval
-        optimizer_config._last_grad_norm = grad_norm.detach().cpu().item() if grad_norm is not None else 0.0
+        if grad_norm is not None:
+            grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+        optimizer_config._last_grad_norm = float(grad_norm) if grad_norm is not None else 0.0
         optimizer_config._last_step_success = success
 
     def _is_model_ddp_wrapped(self) -> bool:
@@ -990,7 +1008,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'random_rng_state': random.getstate(),
             'np_rng_state': np.random.get_state(),
             'torch_rng_state': torch.get_rng_state(),
-            'cuda_rng_state': torch.cuda.get_rng_state(),
+            # Backend-agnostic device RNG (CUDA / NPU / MPS); key kept as
+            # 'cuda_rng_state' for backward compatibility with existing checkpoints.
+            'cuda_rng_state': Platform.get_device_rng_state(),
             'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
         }
         rng_state_list = [rng_state]
@@ -1112,8 +1132,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             with open(tracker_path, 'w') as f:
                 f.write(str(iteration))
 
-        logging.getLogger(__name__).info(f'Saved mcore optimizer state at iteration {iteration} '
-                                         f'to {checkpoint_dir}')
+        logger.info(f'Saved mcore optimizer state at iteration {iteration} '
+                    f'to {checkpoint_dir}')
 
     def _load_mcore_optimizer(
         self,
@@ -1139,7 +1159,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         )
         iteration = self._read_iteration(tracker_path)
         if iteration == 0:
-            logging.getLogger(__name__).warning(f'No checkpoint found in {checkpoint_dir}')
+            logger.warning(f'No checkpoint found in {checkpoint_dir}')
             return
 
         iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
@@ -1201,7 +1221,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             random.setstate(rng['random_rng_state'])
             np.random.set_state(rng['np_rng_state'])
             torch.set_rng_state(rng['torch_rng_state'])
-            torch.cuda.set_rng_state(rng['cuda_rng_state'])
+            # Backend-agnostic restore: tolerates ckpt produced on different backend
+            # (returns None) and avoids hard-coded torch.cuda which crashes on NPU.
+            Platform.set_device_rng_state(rng.get('cuda_rng_state'))
             tensor_parallel.get_cuda_rng_tracker().set_states(rng['rng_tracker_states'], )
 
         # Restore iteration counter.
@@ -1211,26 +1233,26 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if dist.is_initialized():
             dist.barrier()
 
-        logging.getLogger(__name__).info(f'Resumed from mcore checkpoint at iteration {iteration} '
-                                         f'from {checkpoint_dir}')
+        logger.info(f'Resumed from mcore checkpoint at iteration {iteration} '
+                    f'from {checkpoint_dir}')
 
     @staticmethod
     def _read_iteration(tracker_path: str) -> int:
-        if not os.path.exists(tracker_path):
-            return 0
-        with open(tracker_path) as f:
-            iteration = int(f.read().strip())
+        # All ranks must enter the all_reduce together; missing tracker on some
+        # ranks (e.g. NFS lag, partial mount) must NOT short-circuit, otherwise
+        # the remaining ranks hang at the collective. Treat missing as 0 and
+        # let MAX reduction recover the canonical iteration from any rank that
+        # successfully read the file.
+        iteration = 0
+        if os.path.exists(tracker_path):
+            with open(tracker_path) as f:
+                iteration = int(f.read().strip())
         if torch.distributed.is_initialized():
-            iters_cuda = torch.tensor(
-                [iteration],
-                dtype=torch.long,
-                device='cuda',
-            )
-            torch.distributed.all_reduce(
-                iters_cuda,
-                op=torch.distributed.ReduceOp.MAX,
-            )
-            iteration = iters_cuda[0].item()
+            # Use Platform.get_local_device() to stay backend-agnostic
+            # (CUDA / NPU / MPS); 'cuda' would crash on NPU.
+            iters_dev = torch.tensor([iteration], dtype=torch.long, device=Platform.get_local_device())
+            torch.distributed.all_reduce(iters_dev, op=torch.distributed.ReduceOp.MAX)
+            iteration = int(iters_dev[0].item())
         return iteration
 
     def _merge_lora_adapters(self, adapter_name: str = 'default'):
@@ -1256,7 +1278,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         For distributed training:
         - All PP ranks participate in export (each has different layers)
-        - Only DP rank 0 actually writes to disk
+        - Only global rank 0 actually writes shared config files
         - Uses barrier for synchronization
 
         For LoRA training:
@@ -1264,12 +1286,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         """
         # Check if this is LoRA training
         is_peft_format = (adapter_name != _default_adapter_name)
+        is_global_zero = (not dist.is_initialized()) or dist.get_rank() == 0
 
-        # Create output directory on rank 0 only
-        from megatron.core import parallel_state as mpu
-        dp_rank = mpu.get_data_parallel_rank() if mpu.is_initialized() else 0
-
-        if dp_rank == 0:
+        if is_global_zero:
             os.makedirs(output_dir, exist_ok=True)
 
         # Synchronize before saving
@@ -1281,8 +1300,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.strategy.bridge.save_weights(
             model, output_dir, peft_format=is_peft_format, adapter_name=adapter_name, converter=lora_converter)
 
-        # Save config on rank 0 only
-        if dp_rank == 0:
+        # Save config on global rank 0 only (avoid concurrent writers).
+        if is_global_zero:
             self.hf_config.save_pretrained(output_dir)
             if isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
@@ -1291,11 +1310,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 model[0].peft_config[adapter_name].save_pretrained(output_dir)
                 config.target_modules = target_modules
 
+        if dist.is_initialized():
+            dist.barrier()
+
     def _save_megatron_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in Megatron checkpoint format."""
+        is_global_zero = (not dist.is_initialized()) or dist.get_rank() == 0
         os.makedirs(output_dir, exist_ok=True)
-        from megatron.core import parallel_state as mpu
-        dp_rank = mpu.get_data_parallel_rank() if mpu.is_initialized() else 0
         state_dict = self._get_trainable_parameters(adapter_name)
         cpu_state_dict = {}
         for k, v in state_dict.items():
@@ -1311,12 +1332,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         rank = dist.get_rank() if dist.is_initialized() else 0
         checkpoint_path = os.path.join(output_dir, f'model_rank{rank}.pt')
         torch.save(cpu_state_dict, checkpoint_path)
-        # Save config on rank 0 only
+        # Save shared config on global rank 0 only (avoid concurrent writers).
         model = self.strategy.unwrap_model(self.model)
-        if dp_rank == 0:
+        if is_global_zero:
             self.hf_config.save_pretrained(output_dir)
             if isinstance(model[0], PeftModel):
                 model[0].peft_config[adapter_name].save_pretrained(output_dir)
+
+        # Finalize barrier: ensure all ranks finish writing model_rank*.pt
+        # before the caller proceeds (e.g. uploading / loading the ckpt).
+        if dist.is_initialized():
+            dist.barrier()
 
     def _save_tokenizer(self, output_dir: str, **kwargs):
         from twinkle.utils import is_last_rank

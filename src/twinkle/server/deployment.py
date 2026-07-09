@@ -18,16 +18,20 @@ used to repeat:
 
 The middleware ordering is the load-bearing invariant: FastAPI runs ``http``
 middleware in LIFO order, so the LAST registered is the OUTERMOST. The fixed
-registration sequence here — optional cleanup → ``verify_token`` → tracing →
-metrics — reproduces the per-builder execution order exactly
-(``metrics → tracing → verify_token → [cleanup] → handler``), with metrics as
-the outermost layer wrapping tracing.
+registration sequence here — optional cleanup → exception boundary →
+``verify_token`` → tracing → metrics → optional replica-id header — reproduces
+the per-builder execution order exactly
+(``[replica-id] → metrics → tracing → verify_token → exception boundary →
+[cleanup] → handler``), with metrics wrapping tracing and the replica-id header
+wrapping the full response path when enabled.
 """
 from __future__ import annotations
 
+import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
@@ -73,10 +77,14 @@ def build_deployment_app(
     2. [if ``attach_cleanup_middleware``] the gateway-only lazy-cleanup
        middleware (registered first ⇒ innermost), since the Gateway has no
        per-handler hook;
-    3. ``verify_token`` middleware;
-    4. ``create_tracing_middleware(component)``;
-    5. ``create_metrics_middleware(component)`` (registered last ⇒ outermost);
-    6. ``register_routes(app, get_servable)``.
+    3. ``catch_unhandled_exceptions`` middleware, inside auth/tracing/metrics
+       and outside cleanup/routes;
+    4. ``verify_token`` middleware;
+    5. ``create_tracing_middleware(component)``;
+    6. ``create_metrics_middleware(component)``;
+    7. [if ``attach_replica_id_header``] replica-id response header middleware
+       (registered last ⇒ outermost);
+    8. ``register_routes(app, get_servable)``.
 
     Args:
         component: ``'Gateway' | 'Model' | 'Sampler' | 'Processor'`` — used as
@@ -117,7 +125,8 @@ def build_deployment_app(
 
     # Registration order matters: FastAPI runs middleware LIFO, so the LAST
     # registered wraps the outermost layer. Register cleanup (if any) first so
-    # it stays innermost, then auth, then tracing, then metrics (outermost).
+    # it stays innermost, then the exception boundary, auth, tracing, metrics,
+    # and finally the optional replica-id header as the outermost layer.
     if attach_cleanup_middleware:
 
         @app.middleware('http')
@@ -128,6 +137,15 @@ def build_deployment_app(
             # worth surfacing.
             await get_servable()._ensure_state_cleanup_started()
             return await call_next(request)
+
+    @app.middleware('http')
+    async def catch_unhandled_exceptions(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            error = traceback.format_exc()
+            logger.error(error)
+            return JSONResponse(status_code=500, content={'detail': error})
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):

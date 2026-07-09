@@ -4,7 +4,6 @@
 Run on 8 GPUs:
     torchrun --nproc-per-node=8 cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py
 """
-import os
 from pathlib import Path
 
 from peft import LoraConfig
@@ -12,6 +11,7 @@ from transformers import AutoConfig
 
 import twinkle
 from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -20,79 +20,60 @@ from twinkle.utils.framework import Torch
 from twinkle.kernel import kernelize_model
 
 logger = get_logger()
+args = CLI.from_args()
 
-MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.6-35B-A3B')
-DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
-TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'Qwen3_5Template')
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
-GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '4'))
-LOG_INTERVAL = GRAD_ACCUM_STEPS
-LR = float(os.environ.get('LR', '1e-4'))
-MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
-LORA_R = int(os.environ.get('LORA_R', '8'))
-LORA_ALPHA = int(os.environ.get('LORA_ALPHA', '32'))
-ENABLE_EP = os.environ.get('ENABLE_EP', '1') == '1'
-OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
-RESUME_FROM_CHECKPOINT = os.environ.get('RESUME_FROM_CHECKPOINT') or None
-RESUME_ONLY_MODEL = os.environ.get('RESUME_ONLY_MODEL', '0') == '1'
-IGNORE_DATA_SKIP = os.environ.get('IGNORE_DATA_SKIP', '0') == '1'
-ADAPTER_NAME = os.environ.get('ADAPTER_NAME', 'default')
+ENABLE_EP = args.extra.get('enable_ep', True)
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=8,
-    dp_size=1,
-    ep_size=8,
+    fsdp_size=args.infra.fsdp_size,
+    dp_size=args.infra.dp_size,
+    ep_size=args.infra.ep_size,
     device_type=Platform.get_platform().device_prefix(),
 )
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 
-def _build_lora_config(enable_ep: bool):
-    if enable_ep:
-        return LoraConfig(
-            r=LORA_R,
-            lora_alpha=LORA_ALPHA,
-            target_modules='all-linear',
-            target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'],
-        )
-    # Expert weights are bare nn.Parameters. PEFT trains them through
-    # target_parameters/ParamWrapper, which dynamically parametrizes weights
-    # during forward. That is not stable with plain FSDP2, so non-EP mode uses
-    # regular module LoRA and does not train expert parameters.
+def _build_lora_config():
     return LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
+        r=args.lora.lora_r,
+        lora_alpha=args.lora.lora_alpha,
         target_modules='all-linear',
+        target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'],
     )
 
 
 def save_checkpoint(model: TransformersModel, checkpoint_name: str, dataloader: DataLoader):
     return model.save(
         name=checkpoint_name,
-        output_dir=OUTPUT_DIR,
-        adapter_name=ADAPTER_NAME,
-        save_optimizer=True,
+        output_dir=args.training.output_dir,
+        adapter_name=args.lora.adapter_name,
+        save_optimizer=args.checkpoint.save_optimizer,
         consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
 
 
 def train():
-    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(args.model.model_id, trust_remote_code=True)
     text_config = getattr(config, 'text_config', config)
     if hasattr(text_config, 'use_cache'):
         text_config.use_cache = False
 
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID))
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id))
     try:
-        dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)
+        dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
+                             max_length=args.template.max_length)
     except ValueError:
-        dataset.set_template('Qwen3_5Template', model_id=MODEL_ID)
-    dataset.map(SelfCognitionProcessor('twinkle', 'ModelScope'))
+        dataset.set_template('Qwen3_5Template', model_id=args.model.model_id,
+                             max_length=args.template.max_length)
+    dataset.map(SelfCognitionProcessor(
+        args.extra.get('model_name', 'twinkle'),
+        args.extra.get('model_author', 'ModelScope'),
+    ))
     dataset.encode(batched=True)
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, device_mesh=device_mesh)
+    dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size, device_mesh=device_mesh)
 
     model = TransformersModel(
-        model_id=MODEL_ID,
+        model_id=args.model.model_id,
         config=config,
         device_mesh=device_mesh,
         strategy='native_fsdp',
@@ -107,39 +88,42 @@ def train():
     # npu patch
     if Torch.is_npu_available():
         model = kernelize_model(model, mode='train', device='npu')
-    lora_cfg = _build_lora_config(ENABLE_EP)
-    model.add_adapter_to_model(ADAPTER_NAME, lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-    model.set_optimizer('AdamW', lr=LR, foreach=False)
+    lora_cfg = _build_lora_config()
+    model.add_adapter_to_model(args.lora.adapter_name, lora_cfg,
+                               gradient_accumulation_steps=args.training.gradient_accumulation_steps)
+    model.set_optimizer(args.optimizer.optimizer_cls, lr=args.optimizer.learning_rate, foreach=False)
     model.set_lr_scheduler(
-        scheduler_cls='CosineWarmupScheduler',
-        num_warmup_steps=5,
+        scheduler_cls=args.scheduler.scheduler_cls,
+        num_warmup_steps=args.scheduler.num_warmup_steps,
         num_training_steps=len(dataloader),
     )
 
-    if RESUME_FROM_CHECKPOINT:
-        checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
+    if args.training.resume_from_checkpoint:
+        checkpoint_path = Path(args.training.resume_from_checkpoint).expanduser().resolve()
         kwargs = {}
-        if ADAPTER_NAME:
-            kwargs['adapter_name'] = ADAPTER_NAME
+        if args.lora.adapter_name:
+            kwargs['adapter_name'] = args.lora.adapter_name
         progress = model.resume_from_checkpoint(
-            str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
-        if not IGNORE_DATA_SKIP:
+            str(checkpoint_path), resume_only_model=args.training.resume_only_model, **kwargs)
+        if not args.training.ignore_data_skip:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     logger.info(
-        f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}, '
-        f'enable_ep={ENABLE_EP}, output_dir={OUTPUT_DIR}')
+        f'Total steps: {len(dataloader)}, batch_size={args.training.batch_size}, '
+        f'grad_accum={args.training.gradient_accumulation_steps}, '
+        f'enable_ep={ENABLE_EP}, output_dir={args.training.output_dir}')
 
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
+    optimizer_group = model.optimizer_group[args.lora.adapter_name]
     for batch in dataloader:
         if callable(batch):
             batch = batch()
         model.forward_backward(inputs=batch)
-        model.clip_grad_and_step(max_grad_norm=MAX_GRAD_NORM, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
+        model.clip_grad_and_step(max_grad_norm=args.optimizer.max_grad_norm,
+                                gradient_accumulation_steps=args.training.gradient_accumulation_steps)
         cur_step = optimizer_group.cur_step
-        if cur_step > 0 and cur_step % LOG_INTERVAL == 0:
+        if cur_step > 0 and cur_step % args.training.log_interval == 0:
             metric = model.calculate_metric(is_training=True)
             if callable(metric):
                 metric = metric()

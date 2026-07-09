@@ -136,3 +136,24 @@ class Platform(ABC):
     def get_vllm_device_uuid(device_id: int = 0, platform=None) -> str:
         platform = Platform.get_platform(platform)
         return platform.get_vllm_device_uuid(device_id)
+
+    @staticmethod
+    def get_device_rng_state(platform: str = None):
+        """Return device-specific RNG state (e.g. CUDA / NPU / MPS).
+
+        Backend-agnostic replacement for hard-coded ``torch.cuda.get_rng_state()``.
+        Returns ``None`` when no accelerator is available, so callers can safely
+        skip persistence on CPU-only or unsupported devices.
+        """
+        return Platform.get_platform(platform).get_device_rng_state()
+
+    @staticmethod
+    def set_device_rng_state(state, *, platform: str = None) -> None:
+        """Restore device-specific RNG state.
+
+        No-op when ``state`` is ``None`` (e.g. checkpoint produced on a different
+        backend) or when the current platform has no accelerator available.
+        """
+        if state is None:
+            return
+        Platform.get_platform(platform).set_device_rng_state(state)

@@ -5,42 +5,26 @@ from tqdm import tqdm
 
 import twinkle
 from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
+args = CLI.from_args()
 
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-DATASET_ID = 'ms://swift/self-cognition'
-TEMPLATE_NAME = 'Qwen3_5Template'
-MODEL_NAME = 'twinkle大模型'
-MODEL_AUTHOR = 'ModelScope社区'
-DP_SIZE = 2
-TP_SIZE = 2
-PP_SIZE = 2
-BATCH_SIZE = 16
-LEARNING_RATE = 1e-4
-LOG_INTERVAL = 5
-EVAL_INTERVAL = 20
-EVAL_SAMPLES = 100
-TRAIN_SAMPLES = 1000
-
-OUTPUT_DIR = './output/megatron_tp'
-RESUME_FROM_CHECKPOINT = None
-RESUME_ONLY_MODEL = False
-IGNORE_DATA_SKIP = False
-ADAPTER_NAME = 'default'
-
-device_mesh = DeviceMesh.from_sizes(dp_size=DP_SIZE, tp_size=TP_SIZE, pp_size=PP_SIZE)
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+device_mesh = DeviceMesh.from_sizes(dp_size=args.infra.dp_size, tp_size=args.infra.tp_size, pp_size=args.infra.pp_size, cp_size=args.infra.cp_size)
+twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 
 def build_dataset(num_samples: int) -> Dataset:
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=range(num_samples)))
-    dataset.set_template(TEMPLATE_NAME, model_id=MODEL_ID)
-    dataset.map(SelfCognitionProcessor(MODEL_NAME, MODEL_AUTHOR))
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(num_samples)))
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.map(SelfCognitionProcessor(
+        args.extra.get('model_name', 'twinkle大模型'),
+        args.extra.get('model_author', 'ModelScope社区'),
+    ))
     dataset.encode()
     return dataset
 
@@ -48,42 +32,45 @@ def build_dataset(num_samples: int) -> Dataset:
 def save_checkpoint(model: MegatronModel, checkpoint_name: str, dataloader: DataLoader):
     model.save(
         checkpoint_name,
-        output_dir=OUTPUT_DIR,
-        adapter_name=ADAPTER_NAME,
-        save_optimizer=True,
+        output_dir=args.training.output_dir,
+        adapter_name=args.lora.adapter_name,
+        save_optimizer=args.checkpoint.save_optimizer,
         consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
 
 
 def evaluate(model):
-    dataloader = DataLoader(dataset=build_dataset(EVAL_SAMPLES), batch_size=BATCH_SIZE)
+    eval_samples = args.training.eval_samples or 100
+    dataloader = DataLoader(dataset=build_dataset(eval_samples), batch_size=args.training.batch_size)
     for batch in tqdm(dataloader):
         model.forward_only(inputs=batch)
     return model.calculate_metric(is_training=False)
 
 
 def train():
-    dataset = build_dataset(TRAIN_SAMPLES)
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
+    train_samples = args.training.train_samples or 1000
+    dataset = build_dataset(train_samples)
+    dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)
 
-    model = MegatronModel(model_id=MODEL_ID)
+    model = MegatronModel(model_id=args.model.model_id)
 
-    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
+    lora_config = LoraConfig(**args.get_lora_args())
 
     # Comment this to use full-parameter training
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config)
-    model.set_optimizer(optimizer_cls='default', lr=LEARNING_RATE)
-    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=5, lr_decay_steps=len(dataloader))
+    model.add_adapter_to_model(args.lora.adapter_name, lora_config)
+    model.set_optimizer(optimizer_cls='default', lr=args.optimizer.learning_rate)
+    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=args.scheduler.num_warmup_steps,
+                           lr_decay_steps=len(dataloader))
 
     start_step = 0
-    if RESUME_FROM_CHECKPOINT:
-        checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
+    if args.training.resume_from_checkpoint:
+        checkpoint_path = Path(args.training.resume_from_checkpoint).expanduser().resolve()
         kwargs = {}
-        if ADAPTER_NAME:
-            kwargs['adapter_name'] = ADAPTER_NAME
+        if args.lora.adapter_name:
+            kwargs['adapter_name'] = args.lora.adapter_name
         progress = model.resume_from_checkpoint(
-            str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
-        if not IGNORE_DATA_SKIP:
+            str(checkpoint_path), resume_only_model=args.training.resume_only_model, **kwargs)
+        if not args.training.ignore_data_skip:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
             start_step = progress['cur_step']
 
@@ -92,14 +79,15 @@ def train():
     logger.info(f'Total steps: {len(dataloader)}')
 
     best_loss = float('inf')
+    eval_interval = args.training.eval_interval or 20
 
     for step, batch in enumerate(dataloader, start=start_step):
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
-        if step % LOG_INTERVAL == 0:
+        if step % args.training.log_interval == 0:
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
-        if step > 0 and step % EVAL_INTERVAL == 0:
+        if step > 0 and step % eval_interval == 0:
             metrics = evaluate(model)
             logger.info(f'Eval metric: {metrics}')
             metrics['step'] = step

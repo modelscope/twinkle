@@ -16,6 +16,7 @@ from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from twinkle.server.telemetry.middleware import get_task_metrics
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
@@ -97,6 +98,7 @@ class TaskQueueMixin:
         input_tokens: int,
         batch_size: int | None = None,
         data_world_size: int | None = None,
+        batch_size_multiple: int | None = None,
     ) -> dict[str, Any] | None:
         """Run rate-limit and validation checks before queuing a task.
 
@@ -132,6 +134,22 @@ class TaskQueueMixin:
                     queue_state_reason=error_msg,
                 )
                 return {'request_id': request_id, 'model_id': model_id}
+            if batch_size_multiple is not None:
+                required_multiple = data_world_size * batch_size_multiple
+                if batch_size % required_multiple != 0:
+                    error_msg = (f'Batch size {batch_size} must be divisible by {required_multiple} '
+                                 f'so each data-parallel shard gets a multiple of '
+                                 f'{batch_size_multiple} examples')
+                    error_payload = {'error': error_msg, 'category': 'User'}
+                    await self.state.store_future_status(
+                        request_id,
+                        TaskStatus.FAILED.value,
+                        model_id,
+                        result=error_payload,
+                        queue_state=QueueState.UNKNOWN.value,
+                        queue_state_reason=error_msg,
+                    )
+                    return {'request_id': request_id, 'model_id': model_id}
 
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
@@ -159,6 +177,7 @@ class TaskQueueMixin:
         input_tokens: int = 0,
         batch_size: int | None = None,
         data_world_size: int | None = None,
+        batch_size_multiple: int | None = None,
         task_type: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a GPU compute task through the serial compute queue.
@@ -182,7 +201,7 @@ class TaskQueueMixin:
         request_id = f'req_{uuid.uuid4().hex}'
 
         preflight_result = await self._perform_preflight_checks(request_id, model_id, token, input_tokens, batch_size,
-                                                                data_world_size)
+                                                                data_world_size, batch_size_multiple)
         if preflight_result is not None:
             return preflight_result
 
@@ -229,6 +248,7 @@ class TaskQueueMixin:
         input_tokens: int = 0,
         batch_size: int | None = None,
         data_world_size: int | None = None,
+        batch_size_multiple: int | None = None,
         task_type: str | None = None,
     ) -> Any:
         """Schedule a compute task and block until it completes.
@@ -246,6 +266,7 @@ class TaskQueueMixin:
             input_tokens=input_tokens,
             batch_size=batch_size,
             data_world_size=data_world_size,
+            batch_size_multiple=batch_size_multiple,
             task_type=task_type,
         )
         request_id = future_ref.get('request_id')
@@ -309,7 +330,7 @@ class TaskQueueMixin:
                     queue_state=QueueState.ACTIVE.value)
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
             except Exception:
-                error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
+                error_payload = task_error_payload(traceback.format_exc())
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,

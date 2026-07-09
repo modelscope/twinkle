@@ -133,3 +133,24 @@ class NPU(Platform):
             visible = os.environ.get(Platform.visible_device_env())
             raw = f'{socket.gethostname()}:{visible}:{device_id}'
             return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+    @staticmethod
+    def get_device_rng_state():
+        import torch
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            return None
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            return torch.npu.get_rng_state()
+        return None
+
+    @staticmethod
+    def set_device_rng_state(state) -> None:
+        import torch
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            return
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.set_rng_state(state)

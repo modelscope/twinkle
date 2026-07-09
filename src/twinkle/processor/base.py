@@ -33,6 +33,7 @@ class InputProcessor:
         'inputs_embeds': 0.0,
         'attention_mask': 0,
         'labels': -100,
+        'completion_mask': 0,
         'loss_scale': 0.0,
         'position_ids': -1,
         'length': -1,
@@ -42,7 +43,6 @@ class InputProcessor:
         'video_grid_thw': 0,
         'input_features': 0.0,
         'feature_attention_mask': 0,
-        'mm_token_type_ids': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch
@@ -92,7 +92,7 @@ class InputProcessor:
             return inputs[0]
         else:
             for _input in inputs:
-                if 'position_ids' in _input and _input['position_ids'].dim() > 2:
+                if 'position_ids' in _input and _input['position_ids'] is not None and _input['position_ids'].dim() > 2:
                     # megatron needs 3, 1, N
                     _input['position_ids'] = _input['position_ids'][1:]
             return inputs
@@ -108,8 +108,11 @@ class InputProcessor:
                 # so tensor ops like labels != ignore_index or .to(device) would fail without this.
                 if isinstance(value, np.ndarray):
                     value = torch.from_numpy(value)
-                elif (isinstance(value, list) and isinstance(value[0],
-                                                             (int, float, np.number))) or key == 'position_ids':
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
+                    value = torch.tensor(value)
+                elif key == 'position_ids' and not isinstance(value, torch.Tensor):
+                    if value is None:
+                        continue
                     value = torch.tensor(value)
                 elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids'):
                     value = torch.tensor(value)
@@ -284,7 +287,9 @@ class InputProcessor:
                 return input_tensor
 
             if cp_size > 1:
-                position_ids_f = position_ids.flatten()
+                pos_for_cu = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 \
+                    else position_ids
+                position_ids_f = pos_for_cu.flatten()
                 indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
                 cu_seqlens = torch.cat([
                     indices_q[position_ids_f == 0],
@@ -354,17 +359,18 @@ class InputProcessor:
                     view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] //
                                   (2 * cp_size), *inputs.shape[dim + 1:])
                     val = val.view(view_shape)
-                    index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
-                                         pin_memory=True).cuda(non_blocking=True)
+                    index = torch.tensor(
+                        [cp_rank, (2 * cp_size - cp_rank - 1)],
+                        device=inputs.device,
+                        dtype=torch.long,
+                    )
                     val = val.index_select(dim, index)
                     view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
                     new_inputs.append(val.view(view_shape))
                 return torch.cat(new_inputs, dim=dim)
 
             if cp_size > 1:
-                if position_ids.shape[0] == 1:
-                    # mm input_ids will do split inside of the mcore_bridge
-                    input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
+                input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
                 position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=-1)
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
@@ -402,17 +408,18 @@ class InputProcessor:
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
 
-        from twinkle.patch import apply_patch
-        from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
-
-        apply_patch(
-            model,
-            GatedDeltaNetPaddingFreePatch,
-            hf_config=kwargs.get('hf_config'),
-            enable_sp=False,
-        )
         if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-            return inputs
+            from twinkle.patch import apply_patch
+            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+            apply_patch(
+                model,
+                GatedDeltaNetPaddingFreePatch,
+                hf_config=kwargs.get('hf_config'),
+                enable_sp=False,
+            )
+            if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
+                return inputs
 
         for _inp in inputs:
             position_ids = _inp.get('position_ids')
@@ -631,15 +638,27 @@ class InputProcessor:
             output = {}
             _keys = [
                 'input_ids',
-                'input_embeddings',
+                'inputs_embeds',
                 'attention_mask',
                 'position_ids',
                 'labels',
                 'completion_mask',
+                'cu_seq_lens_q',
+                'cu_seq_lens_k',
+                'cu_seqlens_q',
+                'cu_seqlens_kv',
+                'max_length_q',
+                'max_length_k',
+                'packed_seq_params',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
-                if key in _keys:
-                    output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]
+                if key not in _keys:
+                    continue
+                value = _input[key]
+                if isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
+                    output[key] = value
+                else:
+                    output[key] = np.array(value)
             results.append(InputFeature(**output))
         return results
 

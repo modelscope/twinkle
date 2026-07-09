@@ -106,6 +106,28 @@ _ALL_PATTERNS = (_EN_CORE, _EN_APOLOGY, _EN_POLICY, _EN_STANDALONE, _ZH_APOLOGY,
 # refusal-like phrasing doesn't get mistaken for a real user-facing refusal.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>.*?</think(?:ing)?>\s*', re.DOTALL | re.IGNORECASE)
 
+# ── Continuation exemption ────────────────────────────────────────────────────
+#
+# A genuine refusal is TERMINAL — the assistant stops helping. In agent / coding
+# traces the model very often states a local, technical inability and then
+# immediately pivots to an alternative action:
+#   "I can't write to E:\…. I'll need to use exec to create the directory…"
+#   "I can't read files outside the sandbox. Let me use exec to …"
+# These are NOT refusals of the user's request. If a pivot-to-action cue appears
+# anywhere in the scanned window, we exempt the row.
+_EN_CONTINUE = re.compile(
+    r"\b(let\s+me|let'?s|i'?ll|i\s+will|i'?m\s+going\s+to|i\s+need\s+to|i'?ll\s+need\s+to|"
+    r'instead|so\s+i(\'?ll|\s+will)?|so\s+let|try\s+(again|another)|as\s+an\s+alternative|'
+    r'alternatively|workaround|work\s+around|use\s+(exec|the\s+\w+\s+tool)|'
+    r'run\s+the|call\s+the|switch\s+to|fall\s+back)\b',
+    re.IGNORECASE | re.DOTALL,
+)
+_ZH_CONTINUE = re.compile(
+    r'(让我|我来|我先|我会|我将|我需要|改用|换用|换个|换成|试试|尝试|再试|退而|作为替代|'
+    r'替代方案|变通|绕过|所以我|因此我|接下来我|那我|改为|改成|使用工具|调用工具|执行命令)',
+    re.UNICODE | re.DOTALL,
+)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -116,31 +138,72 @@ def _text(content: Any) -> str:
     return content if isinstance(content, str) else ''
 
 
-def _is_refusal(text: str, check_window: int) -> bool:
-    """Return True if the text contains a self-referential refusal signal."""
-    window = text[:check_window]
-    return any(p.search(window) for p in _ALL_PATTERNS)
+# Patterns that signal a *soft* technical inability rather than a hard refusal of
+# the user's request. These are the ones prone to false positives on agents that
+# state a constraint and keep working, so they are subject to the continuation
+# exemption. The remaining patterns (apology-decline, policy/violation, AI-identity
+# refusal, standalone "I refuse to") are terminal and never exempted.
+_SOFT_INABILITY = frozenset({id(_EN_CORE), id(_ZH_SELF)})
+
+
+def _is_refusal(text: str, check_window: int = 600) -> bool:
+    """Return True if the text contains a self-referential refusal signal.
+
+    ``check_window <= 0`` scans the whole text (no truncation). A soft technical
+    inability ("I can't write to X") that is immediately followed by a pivot to an
+    alternative action ("let me use exec…") is exempted — that is an agent working
+    around a constraint, not refusing the user's request.
+    """
+    window = text if check_window <= 0 else text[:check_window]
+    pivots = None  # lazily computed only when a soft-inability pattern hits
+    for p in _ALL_PATTERNS:
+        if not p.search(window):
+            continue
+        if id(p) in _SOFT_INABILITY:
+            if pivots is None:
+                pivots = bool(_EN_CONTINUE.search(window) or _ZH_CONTINUE.search(window))
+            if pivots:
+                continue  # constraint-then-pivot: not a refusal
+        return True
+    return False
 
 
 # ── Preprocessor ─────────────────────────────────────────────────────────────
 
 
 class RefuseFilter(Preprocessor):
+    """Drop rows whose assistant reply is a self-referential refusal.
 
-    def __init__(self, check_window: int = 600) -> None:
+    Args:
+        check_window: chars scanned per assistant message (0 = whole message).
+        scan_all_assistants: scan every assistant turn, not just the first — a
+            multi-turn conversation may only refuse in a later turn.
+        scan_reasoning: also scan ``reasoning_content``/``thinking`` fields.
+            Default False: reasoning traces often rehearse refusal-like phrasing
+            that the model then overrides, so scanning them raises false positives.
+    """
+
+    def __init__(self, check_window: int = 600, *, scan_all_assistants: bool = True,
+                 scan_reasoning: bool = False) -> None:
         super().__init__()
         self._check_window = check_window
+        self._scan_all = bool(scan_all_assistants)
+        self._scan_reasoning = bool(scan_reasoning)
 
     def _is_refusal_row(self, row: Dict[str, Any]) -> bool:
         messages = row.get('messages') or []
-        first_asst = next(
-            (m for m in messages if isinstance(m, dict) and m.get('role') == 'assistant'),
-            None,
-        )
-        if first_asst is None:
-            return False
-        reply = _THINK_BLOCK_RE.sub('', _text(first_asst.get('content'))).strip()
-        return bool(reply) and _is_refusal(reply, self._check_window)
+        asst_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'assistant']
+        if not self._scan_all:
+            asst_msgs = asst_msgs[:1]
+        for m in asst_msgs:
+            reply = _THINK_BLOCK_RE.sub('', _text(m.get('content'))).strip()
+            if reply and _is_refusal(reply, self._check_window):
+                return True
+            if self._scan_reasoning:
+                reasoning = (m.get('reasoning_content') or m.get('thinking') or '').strip()
+                if reasoning and _is_refusal(reasoning, self._check_window):
+                    return True
+        return False
 
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)

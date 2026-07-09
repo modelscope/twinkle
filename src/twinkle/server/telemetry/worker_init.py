@@ -7,10 +7,11 @@ set by the launcher.
 """
 from __future__ import annotations
 
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from twinkle.utils import get_logger
+
+logger = get_logger()
 
 _worker_initialized = False
 

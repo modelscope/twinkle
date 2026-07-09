@@ -12,15 +12,15 @@ Launch:
     python cookbook/sample/emb_sample.py
     EMB_MODEL=./output/embedding_lora_transformers/step_16000 python cookbook/sample/emb_sample.py
 """
-import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
 from twinkle.loss import InfonceLoss
 from twinkle.model import TransformersModel
@@ -29,6 +29,7 @@ from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 
 logger = get_logger()
+args = CLI.from_args()
 
 # -- Config -------------------------------------------------------------------
 CONDENSE_MODEL_ID = os.environ.get('CONDENSE_MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')

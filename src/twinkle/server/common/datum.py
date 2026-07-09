@@ -82,7 +82,9 @@ def extract_rl_features_for_loss(datum: types.Datum | list[types.Datum]) -> dict
     if advantages:
         result['advantages'] = advantages
     if ref_logps_lists:
-        result['ref_outputs'] = {'logps': torch.stack([torch.tensor(r, dtype=torch.float32) for r in ref_logps_lists])}
+        from twinkle.utils import pad_and_stack_tensors
+        ref_logps_tensors = [torch.tensor(r, dtype=torch.float32) for r in ref_logps_lists]
+        result['ref_outputs'] = {'logps': pad_and_stack_tensors(ref_logps_tensors, pad_value=0.0, concat=False)}
     return result
 
 

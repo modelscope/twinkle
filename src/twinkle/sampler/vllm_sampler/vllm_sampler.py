@@ -1,24 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""vLLM-based sampler using VLLMEngine (AsyncLLM).
-
-Device Configuration:
-    vLLMSampler automatically detects the number of available GPUs from
-    CUDA_VISIBLE_DEVICES environment variable (set by twinkle's ResourceManager)
-    and configures vLLM's tensor_parallel_size accordingly.
-
-    To use tensor parallelism, configure DeviceGroup with gpus_per_worker > 1:
-
-        # DP2 with TP2 (4 GPUs total, 2 workers, each with 2 GPUs)
-        DeviceGroup(name='sampler', ranks=[0,1,2,3], gpus_per_worker=2)
-
-        # TP4 (4 GPUs, 1 worker with all 4 GPUs)
-        DeviceGroup(name='sampler', ranks=[0,1,2,3], gpus_per_worker=4)
-
-Data Flow:
-    When multiple vLLMSampler workers exist (DP > 1):
-    - Data is dispatched via dispatch='slice_dp' (each worker gets a slice)
-    - Results are collected via collect='flatten' (merged into single list)
-"""
 import asyncio
 import atexit
 import numpy as np

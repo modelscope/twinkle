@@ -21,7 +21,7 @@ Recognised blocks are extracted only on full-text :meth:`parse` (e.g. by
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .base import ToolCallParser
 
@@ -99,10 +99,6 @@ class ClineParser(ToolCallParser):
     open_marker = None
     close_marker = None
 
-    def matches_model(self, model_id: str) -> bool:
-        # Cline is an app-level prompt protocol, not bound to any model family.
-        return False
-
     def detect(self, text: str) -> bool:
         if not text or '<' not in text:
             return False
@@ -153,9 +149,6 @@ class ClineParser(ToolCallParser):
         out.append(text[last:])
         return ''.join(out).rstrip()
 
-    def detect_result(self, text: str) -> bool:
-        return bool(_RESULT_RE.match(text or ''))
-
-    def parse_result(self, text: str) -> str:
+    def extract_tool_result(self, text: str) -> str | None:
         m = _RESULT_RE.match(text or '')
-        return text[m.end():] if m else text
+        return text[m.end():] if m else None

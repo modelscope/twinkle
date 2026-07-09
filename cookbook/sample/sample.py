@@ -18,19 +18,19 @@ Usage:
     MODEL_ID=/path/to/model LORA_PATH=/path/to/adapter SAMPLER_GPUS=1 python sample.py
 """
 
-import os
 from typing import List, Dict, Any
 
 import twinkle
 from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
 from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
+args = CLI.from_args()
 
-MODEL_ID = os.environ.get('MODEL_ID', 'Qwen/Qwen3.5-4B')
-LORA_PATH = os.environ.get('LORA_PATH', '/path/to/lora')
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 1))
+SAMPLER_GPUS = args.infra.sampler_gpus or 1
+LORA_PATH = args.lora.lora_path or '/path/to/lora'
 
 
 def build_prompts() -> List[Dict[str, Any]]:
@@ -67,7 +67,7 @@ def main():
 
     # ── 2. Create vLLMSampler with LoRA enabled ────────────────────────
     sampler = vLLMSampler(
-        model_id=MODEL_ID,
+        model_id=args.model.model_id,
         engine_args={
             'gpu_memory_utilization': 0.7,
             'max_model_len': 4096,
@@ -79,7 +79,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=args.model.model_id)
     logger.info(get_device_placement())
 
     # ── 3. Configure sampling parameters ────────────────────────────────
@@ -92,7 +92,7 @@ def main():
 
     # ── 4. Run inference ────────────────────────────────────────────────
     prompts = build_prompts()
-    logger.info(f'Sampling {len(prompts)} prompts with model {MODEL_ID} ...')
+    logger.info(f'Sampling {len(prompts)} prompts with model {args.model.model_id} ...')
 
     responses = sampler.sample(prompts, sampling_params, adapter_path=LORA_PATH)
 

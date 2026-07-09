@@ -1,29 +1,38 @@
-import os
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
 from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-# Construct a device_mesh, tp=pp=ep=dp=2
-device_mesh = DeviceMesh.from_sizes(dp_size=2, tp_size=2, pp_size=2, ep_size=2, sequence_parallel=True)
-# use torchrun mode
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
-
 logger = get_logger()
+args = CLI.from_args()
+
+# Construct a device_mesh, tp=pp=ep=dp=2
+device_mesh = DeviceMesh.from_sizes(
+    dp_size=args.infra.dp_size, tp_size=args.infra.tp_size,
+    pp_size=args.infra.pp_size, ep_size=args.infra.ep_size,
+    sequence_parallel=args.infra.sequence_parallel,
+)
+# use torchrun mode
+twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 
 def eval(model):
-    # 100 Samples
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
-    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
-    dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
+    # Eval samples
+    eval_samples = args.training.eval_samples or 100
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(eval_samples)))
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.map(SelfCognitionProcessor(
+        args.extra.get('model_name', 'twinkle大模型'),
+        args.extra.get('model_author', 'ModelScope社区'),
+    ))
     dataset.encode()
-    dataloader = DataLoader(dataset=dataset, batch_size=16)
+    dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)
     for step, batch in tqdm(enumerate(dataloader)):
         model.forward_only(inputs=batch)
     metrics = model.calculate_metric(is_training=False)
@@ -31,44 +40,49 @@ def eval(model):
 
 
 def train():
-    # 1000 samples
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    # Training samples
+    train_samples = args.training.train_samples or 1000
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(train_samples)))
     # Set template to prepare encoding
-    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
     # Preprocess the dataset to standard format
-    dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
+    dataset.map(SelfCognitionProcessor(
+        args.extra.get('model_name', 'twinkle大模型'),
+        args.extra.get('model_author', 'ModelScope社区'),
+    ))
     # Encode dataset
     dataset.encode()
-    # Global batch size = 1, dp_size = 1
-    dataloader = DataLoader(dataset=dataset, batch_size=16)
+    # Global batch size
+    dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)
     # Use a MegatronModel
-    model = MegatronModel(model_id='ms://Qwen/Qwen3.5-35B-A3B')
+    model = MegatronModel(model_id=args.model.model_id)
 
-    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
+    lora_config = LoraConfig(**args.get_lora_args())
 
-    # Add a lora to model, with name `default`
+    # Add a lora to model, with name from args
     # Comment this to use full-parameter training
-    model.add_adapter_to_model('default', lora_config)
-    # Add Optimizer for lora `default`
-    model.set_optimizer(optimizer_cls='default', lr=1e-4)
-    # Add LRScheduler for lora `default`
-    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=5, lr_decay_steps=len(dataloader))
+    model.add_adapter_to_model(args.lora.adapter_name, lora_config)
+    # Add Optimizer
+    model.set_optimizer(optimizer_cls='default', lr=args.optimizer.learning_rate)
+    # Add LRScheduler
+    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=args.scheduler.num_warmup_steps,
+                           lr_decay_steps=len(dataloader))
     logger.info(get_device_placement())
     # Print the training config
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # lora: 23G * 8
+    eval_interval = args.training.eval_interval or 20
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
         # Step
         model.clip_grad_and_step()
-        if step % 5 == 0:
+        if step % args.training.log_interval == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
-        if step > 0 and step % 20 == 0:
+        if step > 0 and step % eval_interval == 0:
             metrics = eval(model)
             logger.info(f'Eval metric: {metrics}')
             metrics['step'] = step

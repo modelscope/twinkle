@@ -4,4 +4,3 @@ Task Processor
    :maxdepth: 1
 
    InputProcessor.md
-   GRPOProcessor.md

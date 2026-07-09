@@ -4,12 +4,25 @@ from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from twinkle.data_format import Message, Trajectory
-from twinkle.utils import to_device
+from twinkle.utils import get_logger, to_device
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
+logger = get_logger()
 _T = TypeVar('_T')
+
+
+def _coerce_ids_to_list(ids: Any) -> List[int]:
+    import torch
+    if isinstance(ids, torch.Tensor):
+        while ids.dim() > 1:
+            if ids.shape[0] != 1:
+                raise ValueError('_coerce_ids_to_list expects a single-sample tensor (leading dims of size 1); '
+                                 f'got shape {tuple(ids.shape)}. Pass one trajectory at a time.')
+            ids = ids[0]
+        return ids.tolist()
+    return ids
 
 
 def _convert_to_vlm_format(messages: List[Dict]) -> List[Dict]:
@@ -43,6 +56,7 @@ def _load_image(img: Any) -> Optional[Any]:
         if img.startswith(('http://', 'https://')):
             import requests
             resp = requests.get(img, timeout=30)
+            resp.raise_for_status()
             return Image.open(io.BytesIO(resp.content))
         else:
             return Image.open(img)
@@ -79,7 +93,14 @@ def _transfer_single_message(
         start = 0
         media_idx = 0
         while (pos := content.find(placeholder, start)) != -1:
-            url = media_list[media_idx] if media_idx < len(media_list) else None
+            if media_idx >= len(media_list):
+                # More placeholders than provided media entries: stop scanning so the extra
+                # placeholder text is preserved verbatim instead of being silently consumed
+                # (which would make user-supplied media references vanish without warning).
+                logger.warning(f'placeholder {placeholder!r} appears more times than provided '
+                               f'{media_type} entries ({len(media_list)}); extra occurrences are kept as literal text.')
+                break
+            url = media_list[media_idx]
             placeholders.append((pos, len(placeholder), media_type, url))
             media_idx += 1
             start = pos + len(placeholder)
@@ -212,14 +233,12 @@ class TokenizeByRound:
             Labels are -100 for non-assistant tokens, original token id for assistant content tokens.
             Assistant prefix tokens (e.g., '<|im_start|>assistant\n') are excluded from training.
         """
-        import torch
+        kwargs.pop('add_generation_prompt', None)
         messages = trajectory['messages']
 
         # Encode full trajectory
         encoded = encode_func(trajectory, **kwargs)
-        full_ids = encoded.pop('input_ids')
-        if isinstance(full_ids, torch.Tensor):
-            full_ids = full_ids.tolist()[0]
+        full_ids = _coerce_ids_to_list(encoded.pop('input_ids'))
 
         # Initialize labels: all -100 (not trained)
         labels = [-100] * len(full_ids)
@@ -237,17 +256,14 @@ class TokenizeByRound:
             # encode(messages[:i], add_generation_prompt=True) includes the prefix
             partial_trajectory = copy(trajectory)
             partial_trajectory['messages'] = list(messages[:i])
-            partial_ids = encode_func(partial_trajectory, add_generation_prompt=True, **kwargs)['input_ids']
-            if isinstance(partial_ids, torch.Tensor):
-                partial_ids = partial_ids.tolist()[0]
+            partial_ids = _coerce_ids_to_list(
+                encode_func(partial_trajectory, add_generation_prompt=True, **kwargs)['input_ids'])
             start_pos = len(partial_ids)
 
             # Get end position: encode(messages[:i+1]) includes full assistant turn
             partial_trajectory = copy(trajectory)
             partial_trajectory['messages'] = list(messages[:i + 1])
-            partial_ids = encode_func(partial_trajectory, **kwargs)['input_ids']
-            if isinstance(partial_ids, torch.Tensor):
-                partial_ids = partial_ids.tolist()[0]
+            partial_ids = _coerce_ids_to_list(encode_func(partial_trajectory, **kwargs)['input_ids'])
             end_pos = len(partial_ids)
 
             # Mark assistant CONTENT tokens as trainable (excluding prefix)
@@ -330,21 +346,20 @@ class TokenizeByPlaceHolder:
                 if isinstance(msg['content'], str):
                     msg['content'] = placeholder
                 else:
-                    msg['content'][0]['text'] = placeholder
+                    text_items = [c for c in msg['content'] if isinstance(c, dict) and c.get('type') == 'text']
+                    if len(text_items) != 1:
+                        raise ValueError('TokenizeByPlaceHolder requires exactly one text item in assistant '
+                                         f'content, got {len(text_items)} (content={msg["content"]!r}).')
+                    text_items[0]['text'] = placeholder
                 assistant_count += 1
             _dummy_messages.append(msg)
 
         encoded = encode_func(trajectory)
-        full_ids = encoded.pop('input_ids')
-        if isinstance(full_ids, torch.Tensor):
-            full_ids = full_ids.tolist()[0]
+        full_ids = _coerce_ids_to_list(encoded.pop('input_ids'))
 
         _dummy_trajectory = copy(trajectory)
         _dummy_trajectory['messages'] = _dummy_messages
-        template_ids = encode_func(_dummy_trajectory)
-        template_ids = template_ids['input_ids']
-        if isinstance(template_ids, torch.Tensor):
-            template_ids = template_ids.tolist()[0]
+        template_ids = _coerce_ids_to_list(encode_func(_dummy_trajectory)['input_ids'])
 
         extra_kwargs = {}
         if 'add_special_tokens' in inspect.signature(tokenizer.encode).parameters:
@@ -365,7 +380,8 @@ class TokenizeByPlaceHolder:
                 labels = TokenizeByPlaceHolder.build_labels(full_ids, template_parts)
             else:
                 raise e
-        if labels and labels[-1] == -100:
+        last_role = messages[-1]['role'] if messages else None
+        if last_role == 'assistant' and labels and labels[-1] == -100:
             end_idx = len(labels)
             start_idx = end_idx - 1
             while start_idx > 0 and labels[start_idx - 1] == -100:

@@ -1,12 +1,11 @@
 """Backend factory for creating StateBackend instances based on configuration."""
 from __future__ import annotations
 
-import logging
-
 from twinkle.server.config.persistence import PersistenceConfig
+from twinkle.utils import get_logger
 from .base import StateBackend
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def create_backend(config: PersistenceConfig | None = None) -> StateBackend:

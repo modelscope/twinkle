@@ -16,8 +16,9 @@ import logging
 from typing import Any
 
 from twinkle.server.config.telemetry import TelemetryConfig
+from twinkle.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 # Loggers belonging to the OTLP transport stack. Their own records must never
 # be routed back through the OTLP LoggingHandler: an exporter error logged

@@ -42,18 +42,6 @@ class GRPOLoss(Loss):
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
 
-    def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
-        """
-        Compute loss mask from labels.
-
-        Args:
-            labels: [batch, seq_len] target token ids, -100 for ignored positions
-
-        Returns:
-            mask: [batch, seq_len] float tensor, 1.0 for valid positions, 0.0 for ignored
-        """
-        return (labels != self.ignore_index).float()
-
     def _compute_log_importance_weights(
         self,
         per_token_logps: 'torch.Tensor',
@@ -179,10 +167,13 @@ class GRPOLoss(Loss):
                 return data  # Already aligned
             if data.dim() == 1:
                 data = data.unsqueeze(1)
-            if data.shape[1] == 1:  # Scalars
-                result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
-                result[mask] = data[mask.any(dim=1).nonzero(as_tuple=True)[0].repeat_interleave(mask.sum(dim=1)), 0]
-                return result
+            if data.shape[1] == 1:
+                assert data.shape[0] == batch_size, (
+                    f'scalar broadcast expects data.shape[0]==batch_size, '
+                    f'got data.shape={tuple(data.shape)} mask.shape={(batch_size, seq_len)}')
+                fill = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
+                expanded = data.expand(batch_size, seq_len)
+                return torch.where(mask, expanded, fill)
             data = [data[i] for i in range(batch_size)]  # To list
 
         # Handle list (scalars or sequences)
@@ -290,10 +281,12 @@ class GRPOLoss(Loss):
             )
 
         # GRPO loss is ill-defined without advantages (e.g. ref-logps-only forward,
-        # or eval/validation forwards). Return a zero loss so the forward still
-        # flows through cleanly and callers can harvest outputs['logps'] freely.
+        # or eval/validation forwards). Return a zero loss that still flows through
+        # autograd so DDP/FSDP do not see unused params, and callers can harvest
+        # outputs['logps'] freely.
         if advantages is None:
-            return LossOutput(loss=torch.zeros((), device=device, dtype=logps.dtype), num_tokens=0)
+            zero = logps.sum() * 0.0
+            return LossOutput(loss=zero, num_tokens=0)
 
         advantages = self._pad_and_align_to_batch(
             advantages,

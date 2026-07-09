@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
@@ -174,13 +174,27 @@ class APIMultiTurnRollout(Rollout):
             if not tool_calls:
                 stop_reason = _STOP_NO_TOOL
                 break
-            for tc in tool_calls:
-                response = tool_manager(tc)
-                messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tc.get('id'),
-                    'content': str(response),
-                })
+
+            # Skip tool execution at the last turn — results would never be
+            # consumed by a subsequent API call (consistent with multi_turn.py).
+            if turn >= self.max_turns:
+                truncated = True
+                stop_reason = _STOP_MAX_TURNS
+                break
+
+            try:
+                for tc in tool_calls:
+                    response = tool_manager(tc)
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc.get('id'),
+                        'content': str(response),
+                    })
+            except Exception as exc:
+                stop_reason = _STOP_API_ERROR
+                error = f'ToolExecution {type(exc).__name__}: {exc}'
+                truncated = True
+                break
         else:
             # Loop exited normally => max_turns reached.
             truncated = True

@@ -127,17 +127,7 @@ class DeepseekV4Template(Template):
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
-
-        self.pre_pipeline_names = [
-            '_add_default_system',
-            '_to_standard_reasoning_content',
-            '_build_standard_messages',
-        ]
-        self.post_pipeline_names = [
-            '_check_max_length',
-            '_add_attention_fields',
-            '_roll_labels',
-        ]
+        # pre_pipeline_names / post_pipeline_names inherit from Template (class-level).
 
     def parse(self, decoded: str) -> List[Dict[str, Any]]:
         text = decoded or ''
@@ -190,7 +180,17 @@ class DeepseekV4Template(Template):
             text = text[:start] + text[end:]
 
     def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
-        return self.parse(decoded)
+        """Prefer DeepSeek's DSML tool-call format; fall back to ToolCallRegistry parsers."""
+        text = decoded or ''
+        if DeepseekV4Template._TOOL_CALLS_START in text:
+            result = self.parse(text)
+            if result:
+                return result
+        return super().parse_tool_call(decoded)
 
     def clean_tool_call(self, decoded: str) -> str:
-        return self.clean(decoded)
+        """Prefer DeepSeek's DSML tool-call format; fall back to ToolCallRegistry parsers."""
+        text = decoded or ''
+        if DeepseekV4Template._TOOL_CALLS_START in text:
+            return self.clean(text)
+        return super().clean_tool_call(decoded)

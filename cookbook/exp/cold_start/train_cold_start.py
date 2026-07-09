@@ -13,11 +13,12 @@ from twinkle.dataset import Dataset, PackingDataset
 from twinkle.dataset.base import DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle_agentic.preprocessor import (
-    QualityPreprocessor, SamplerBackend,
+    QualityPreprocessor,
     IntentClassifier, HardFilter, RefuseFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
     SpecialCharsFilter, ModelFilter, DedupFilter,
     MessageNormalizer,
 )
+from twinkle_agentic.preprocessor.experimental import SamplerBackend  # noqa: F401
 
 logger = get_logger()
 

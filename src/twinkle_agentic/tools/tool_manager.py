@@ -45,7 +45,7 @@ class ToolManager:
                         f'got {type(tools).__name__}')
 
     def register(self, tool: Tool):
-        info = tool.tool_info()
+        info = tool.tool_info() if hasattr(tool, 'tool_info') else None
         name = _extract_name(info)
         if not name:
             raise ValueError(f'tool {type(tool).__name__} must expose a non-empty '

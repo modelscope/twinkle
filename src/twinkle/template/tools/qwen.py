@@ -16,9 +16,6 @@ class HermesQwenParser(ToolCallParser):
     _PARAMETER_RE = re.compile(r'<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>')
     _STRIP_RE = re.compile(r'<tool_call>[\s\S]*?(?:</tool_call>|\Z)')
 
-    def matches_model(self, model_id: str) -> bool:
-        return 'qwen' in model_id
-
     def detect(self, text: str) -> bool:
         return self.open_marker in text
 

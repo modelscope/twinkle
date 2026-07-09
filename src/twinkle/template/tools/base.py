@@ -10,14 +10,6 @@ class ToolCallParser(ABC):
     open_marker: Optional[str] = None
     close_marker: Optional[str] = None
 
-    def matches_model(self, model_id: str) -> bool:
-        """Return True if this parser is the canonical choice for ``model_id``.
-
-        Used for streaming where we must commit to a parser before any text
-        has arrived. Default False — parser is text-detection-only.
-        """
-        return False
-
     @abstractmethod
     def detect(self, text: str) -> bool:
         """Cheap pre-check: does ``text`` carry this format's markup?"""
@@ -30,13 +22,14 @@ class ToolCallParser(ABC):
     def clean(self, text: str) -> str:
         """Strip parser-specific markup; return plain content text."""
 
-    def detect_result(self, text: str) -> bool:
-        """Does ``text`` look like a tool-result message for this protocol?"""
-        return False
+    def extract_tool_result(self, text: str) -> Optional[str]:
+        """If ``text`` is a tool-result message of this protocol, return the
+        body with the protocol-specific prefix stripped; otherwise return ``None``.
 
-    def parse_result(self, text: str) -> str:
-        """Strip protocol-specific result prefix; return the raw tool output body."""
-        return text
+        Default returns ``None`` — only protocols carrying their own tool-result
+        framing (e.g. Cline) need to override this.
+        """
+        return None
 
 
 class ToolCallRegistry:
@@ -55,14 +48,6 @@ class ToolCallRegistry:
     @classmethod
     def parsers(cls) -> List[ToolCallParser]:
         return list(cls._parsers)
-
-    @classmethod
-    def select_for_model(cls, model_id: Optional[str]) -> Optional[ToolCallParser]:
-        mid = (model_id or '').lower()
-        for p in cls._parsers:
-            if p.matches_model(mid):
-                return p
-        return None
 
     @classmethod
     def detect_first(cls, text: str) -> Optional[ToolCallParser]:

@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
+        <a href="https://modelscope.github.io/twinkle-web/docs/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/zh/docs/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
 </p>
 
 ## ✨ What is Twinkle?
@@ -92,14 +92,14 @@ sh INSTALL_MEGATRON.sh
 | pp/tp/cp finetuning                  | megatron        | [Script](cookbook/megatron/tp.py)                      |
 | pp/tp/cp MoE finetuning              | megatron        | [Script](cookbook/megatron/tp_moe.py)                  |
 | Multimodal FSDP finetuning           | transformers    | [Script](cookbook/mm/fsdp2.py)                         |
-| GRPO RL training                     | megatron        | [Script](cookbook/rl/grpo.py)                          |
-| GRPO Multimodal RL training          | megatron        | [Script](cookbook/rl/grpo_mm.py)                       |
-| GRPO Math RL training                | megatron        | [Script](cookbook/rl/short_math_grpo.py)               |
-| DPO full-parameter training          | transformers    | [Script](cookbook/rl/dpo_full.py)                      |
-| DPO LoRA training                    | transformers    | [Script](cookbook/rl/dpo_lora.py)                      |
-| DPO multi-LoRA training              | transformers    | [Script](cookbook/rl/dpo_multi_lora.py)                |
-| GKD on-policy distillation           | megatron        | [Script](cookbook/rl/gkd_on_policy.py)                 |
-| GKD off-policy distillation          | megatron        | [Script](cookbook/rl/gkd_off_policy.py)                |
+| GRPO RL training                     | megatron        | [Script](cookbook/rl/grpo/grpo.py)                          |
+| GRPO Multimodal RL training          | megatron        | [Script](cookbook/rl/grpo/grpo_mm.py)                       |
+| GRPO Math RL training                | megatron        | [Script](cookbook/rl/grpo/short_math_grpo.py)               |
+| DPO full-parameter training          | transformers    | [Script](cookbook/rl/dpo/dpo_full.py)                      |
+| DPO LoRA training                    | transformers    | [Script](cookbook/rl/dpo/dpo_lora.py)                      |
+| DPO multi-LoRA training              | transformers    | [Script](cookbook/rl/dpo/dpo_multi_lora.py)                |
+| GKD on-policy distillation           | megatron        | [Script](cookbook/rl/gkd/gkd_on_policy.py)                 |
+| GKD off-policy distillation          | megatron        | [Script](cookbook/rl/gkd/gkd_off_policy.py)                |
 | Tinker client finetuning (self-host) | transformers    | [Script](cookbook/client/tinker/self_host)             |
 | Tinker client finetuning (ModelScope) | transformers   | [Script](cookbook/client/tinker/modelscope)            |
 | Twinkle client finetuning (self-host) | transformers   | [Script](cookbook/client/twinkle/self_host)            |
@@ -113,23 +113,23 @@ sh INSTALL_MEGATRON.sh
 - 🎉2026-04-27 Support the `padding_free` operation for sft/dpo/grpo/gkd, use `set_processor('InputProcessor', padding_free=True)` to train with it.
 - 🎉2026-04-22 The ModelScope service has been deployed to [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) with a new release 0.2.1.
 - 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) with a new release 0.2.0.
-- 🎉2026-03-28 Support DPO training with both Transformers and Megatron backends. See [dpo_full.py](cookbook/rl/dpo_full.py) and [dpo_lora.py](cookbook/rl/dpo_lora.py).
+- 🎉2026-03-28 Support DPO training with both Transformers and Megatron backends. See [dpo_full.py](cookbook/rl/dpo/dpo_full.py) and [dpo_lora.py](cookbook/rl/dpo/dpo_lora.py).
 - 🎉2026-03-24 Twinkle Web site is now live at https://modelscope.github.io/twinkle-web/
-- 🎉2026-03-19 Support GKD training, please refer to this [cookbook](cookbook/rl/gkd_on_policy.py).
+- 🎉2026-03-19 Support GKD training, please refer to this [cookbook](cookbook/rl/gkd/gkd_on_policy.py).
 - 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models.
 
 ## Training as a Service on ModelScope
 
 We are rolling out training service built atop Twinkle✨ on ModelScope. You may
 train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
-our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
+our [documentation](https://modelscope.github.io/twinkle-web/docs/usage-guide/train-as-a-service/).
 
 ## Supported Hardware
 
 | Hardware Environment | Notes                                                            |
 | -------------------- | ---------------------------------------------------------------- |
 | Nvidia GPUs          | ✅ Support for BF16/Flash-Attn may be incomplete in earlier GPUs |
-| Ascend NPU           | ✅ Some operators may not be supported                           |
+| Ascend NPU           | ✅ FP8 is not supported on A2 and A3 due to hardware limitations |
 | PPU                  | ✅                                                               |
 | CPU                  | Supports partial components like dataset, dataloader             |
 
@@ -177,7 +177,7 @@ supported on Twinkle✨ framework.
 ## Sample Code
 
 Below are some of the capabilities demonstrated in the example code. For a complete introduction to training capabilities,
-please refer to [Quick Start](docs/source_en/Usage%20Guide/Quick-Start.md) and [cookbook](cookbook).
+please refer to [Quick Start](https://modelscope.github.io/twinkle-web/docs/usage-guide/quick-start/) and [cookbook](cookbook).
 
 ### Train with Ray
 

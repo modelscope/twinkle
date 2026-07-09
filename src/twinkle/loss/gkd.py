@@ -41,6 +41,10 @@ class GKDLoss(Loss):
         chunk_size: int = 512,
         **kwargs,
     ):
+        if not (0.0 <= beta <= 1.0):
+            raise ValueError(f'beta must be in [0, 1], got {beta}')
+        if temperature <= 0:
+            raise ValueError(f'temperature must be > 0, got {temperature}')
         self.beta = beta
         self.temperature = temperature
         self.ignore_index = ignore_index
@@ -94,6 +98,7 @@ class GKDLoss(Loss):
             labels=labels,
             beta=self.beta,
             temperature=self.temperature,
+            ignore_index=self.ignore_index,
             chunk_size=self.chunk_size,
             topk=topk,
             teacher_topk_logprobs=teacher_topk_logprobs,
@@ -108,6 +113,7 @@ class GKDLoss(Loss):
         labels=None,
         beta: float = 0.5,
         temperature: float = 1.0,
+        ignore_index: int = -100,
         chunk_size: int = 512,
         topk: Optional[int] = None,
         teacher_topk_logprobs=None,
@@ -164,7 +170,7 @@ class GKDLoss(Loss):
 
         # ── Mask valid (response) tokens ──────────────────────────────────────
         if labels is not None:
-            mask = labels != -100  # ignore_index is always -100 per convention
+            mask = labels != ignore_index
             # Vocab-size mismatch (e.g. Qwen2.5-VL-3B vs 7B): pad the smaller side
             # so both distributions are defined over the same token set.
             stu_dim = student_logits.shape[-1]
@@ -178,12 +184,15 @@ class GKDLoss(Loss):
             student_logits = student_logits[mask]  # [num_valid, vocab/topk]
             teacher_logits = teacher_logits[mask]
             num_valid = mask.sum()
+            # ``[mask]`` already created fresh storage, so in-place divide is safe
+            # and avoids an extra [num_valid, V] allocation.
+            student_logits.div_(temperature)
+            teacher_logits.div_(temperature)
         else:
-            student_logits = student_logits.view(-1, student_logits.size(-1))
-            teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
+            # Keep logits, may be an infer scenario
+            student_logits = student_logits.reshape(-1, student_logits.size(-1)) / temperature
+            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1)) / temperature
             num_valid = student_logits.size(0)
-        student_logits.div_(temperature)
-        teacher_logits.div_(temperature)
 
         if num_valid == 0:
             return student_logits.new_zeros(())

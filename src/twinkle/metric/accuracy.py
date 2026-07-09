@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 from typing import List, Union
 
 from ..data_format import InputFeature, ModelOutput

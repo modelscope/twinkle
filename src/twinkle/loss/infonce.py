@@ -13,22 +13,11 @@ normalization, matching the convention used by ``DPOLoss``/``GRPOLoss``).
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-from enum import Enum
 from torch import nn
 from typing import Optional
 
 from twinkle.data_format import LossOutput
 from .base import Loss
-
-
-# Borrowed from sentence_transformers.
-class SiameseDistanceMetric(Enum):
-    """Distance metrics available to the pairwise contrastive losses."""
-
-    EUCLIDEAN = lambda x, y: F.pairwise_distance(x, y, p=2)  # noqa
-    MANHATTAN = lambda x, y: F.pairwise_distance(x, y, p=1)  # noqa
-    COSINE_DISTANCE = lambda x, y: 1 - F.cosine_similarity(x, y)  # noqa
 
 
 def _extract_sentences(outputs) -> torch.Tensor:
@@ -119,6 +108,10 @@ class InfonceLoss(Loss):
         process_group=None,
         **kwargs,
     ):
+        if mask_fake_negative and fake_neg_margin <= 0:
+            raise ValueError(f'fake_neg_margin must be > 0 when mask_fake_negative=True, got {fake_neg_margin}. '
+                             'A non-positive margin would mask out the positive itself or every above-positive '
+                             'logit indiscriminately, collapsing the contrastive signal.')
         self.temperature = temperature
         self.use_batch = use_batch
         self.hard_negatives = hard_negatives
@@ -129,7 +122,13 @@ class InfonceLoss(Loss):
         self.process_group = process_group
 
     def _gather_across_dp(self, sentences: torch.Tensor, labels: torch.Tensor):
-        """All-gather embeddings & labels across DP ranks; only local shard keeps grad."""
+        """All-gather embeddings & labels across DP ranks; only local shard keeps grad.
+
+        NCCL ``all_gather`` requires every rank to send the *same* tensor size. Under
+        ``slice_dp`` dispatch the per-rank batch is uneven (``divmod`` splits), so we
+        pad each rank to the global max along dim-0, do an equal-sized all_gather,
+        then strip padding back. Only the local shard retains gradients.
+        """
         if not (dist.is_available() and dist.is_initialized()):
             return sentences, labels
         world_size = dist.get_world_size(group=self.process_group)
@@ -137,24 +136,40 @@ class InfonceLoss(Loss):
             return sentences, labels
         rank = dist.get_rank(group=self.process_group)
 
-        # variable per-rank shapes require communicating shape first
-        local_shape = sentences.new_tensor(sentences.shape, dtype=torch.long)
-        shapes = [torch.empty_like(local_shape) for _ in range(world_size)]
-        dist.all_gather(shapes, local_shape, group=self.process_group)
-        all_sentences = [sentences.new_empty(shape.tolist()) for shape in shapes]
-        dist.all_gather(all_sentences, sentences.contiguous(), group=self.process_group)
+        # ``labels`` is a 1-D mask aligned to ``sentences`` along dim-0, so they
+        # share the same per-rank size. Gather sizes once and reuse for both.
+        assert sentences.shape[0] == labels.shape[0], (
+            f'sentences/labels dim-0 mismatch: {sentences.shape[0]} vs {labels.shape[0]}')
+        local_n = torch.tensor([sentences.shape[0]], device=sentences.device, dtype=torch.long)
+        sizes = [torch.empty_like(local_n) for _ in range(world_size)]
+        dist.all_gather(sizes, local_n, group=self.process_group)
+        sizes_int = [int(s.item()) for s in sizes]
+        max_n = max(sizes_int)
 
-        local_label_shape = labels.new_tensor(labels.shape, dtype=torch.long)
-        label_shapes = [torch.empty_like(local_label_shape) for _ in range(world_size)]
-        dist.all_gather(label_shapes, local_label_shape, group=self.process_group)
-        all_labels = [labels.new_empty(shape.tolist()) for shape in label_shapes]
-        dist.all_gather(all_labels, labels.contiguous(), group=self.process_group)
+        def _pad_gather(tensor: torch.Tensor):
+            if tensor.shape[0] < max_n:
+                pad_shape = (max_n - tensor.shape[0], ) + tuple(tensor.shape[1:])
+                padded = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=0)
+            else:
+                padded = tensor
+            buffers = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(buffers, padded.contiguous(), group=self.process_group)
+            return buffers
 
-        # keep the local shard differentiable; detach others
-        all_sentences[rank] = sentences
+        sent_buffers = _pad_gather(sentences)
+        label_buffers = _pad_gather(labels)
+
+        # Strip padding; keep local shard differentiable, detach others.
+        all_sentences = []
+        all_labels = []
         for idx in range(world_size):
-            if idx != rank:
-                all_sentences[idx] = all_sentences[idx].detach()
+            n = sizes_int[idx]
+            if idx == rank:
+                all_sentences.append(sentences)
+                all_labels.append(labels)
+            else:
+                all_sentences.append(sent_buffers[idx][:n].detach())
+                all_labels.append(label_buffers[idx][:n])
         return torch.cat(all_sentences, dim=0), torch.cat(all_labels, dim=0)
 
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:

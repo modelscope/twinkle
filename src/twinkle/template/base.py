@@ -32,6 +32,19 @@ class Template:
     video_placeholder: str = '<video>'
     audio_placeholder: str = '<audio>'
 
+    # Encode pipeline stages — class-level so deepcopy/dill fingerprints stay stable
+    # and subclasses can override at class scope rather than re-assigning per instance.
+    pre_pipeline_names: List[str] = [
+        '_add_default_system',
+        '_to_standard_reasoning_content',
+        '_build_standard_messages',
+    ]
+    post_pipeline_names: List[str] = [
+        '_check_max_length',
+        '_add_attention_fields',
+        '_roll_labels',
+    ]
+
     def __init__(self,
                  model_id: str,
                  use_chat_template: bool = True,
@@ -58,18 +71,6 @@ class Template:
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
-
-        self.pre_pipeline_names: List[str] = [
-            '_add_default_system',
-            '_to_standard_reasoning_content',
-            '_build_standard_messages',
-        ]
-
-        self.post_pipeline_names: List[str] = [
-            '_check_max_length',
-            '_add_attention_fields',
-            '_roll_labels',
-        ]
 
     def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
         """Parse tool calls from the assistant's decoded output.
@@ -161,9 +162,14 @@ class Template:
         """Preprocess a list of audio clips."""
         return [self.preprocess_audio(audio) for audio in audios]
 
-    def _invoke_pre_pipeline(self, trajectories: List[Trajectory]) -> List[Trajectory]:
+    def _invoke_pre_pipeline(self,
+                             trajectories: List[Trajectory],
+                             skip_stages: Optional[Set[str]] = None) -> List[Trajectory]:
+        skip_stages = skip_stages or set()
         current = trajectories
         for pipeline_name in self.pre_pipeline_names:
+            if pipeline_name in skip_stages:
+                continue
             pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
             next_batch = []
             for trajectory in current:
@@ -198,10 +204,14 @@ class Template:
             mm_token_type_ids = result['mm_token_type_ids']
             if not isinstance(mm_token_type_ids, torch.Tensor):
                 mm_token_type_ids = torch.as_tensor(mm_token_type_ids)
-            token_ids_shape = mm_token_type_ids.shape
-            device = mm_token_type_ids.device
-            padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
-            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=1)
+            # Pad along the last (sequence) dim — handles 1D [T] and 2D [1, T] (Qwen-VL) uniformly.
+            leading_shape = mm_token_type_ids.shape[:-1]
+            padded_tokens = torch.zeros(
+                (*leading_shape, len(new_tokens)),
+                dtype=mm_token_type_ids.dtype,
+                device=mm_token_type_ids.device,
+            )
+            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=-1)
         new_input_feature = self._invoke_post_pipeline([result])[0]
         result.update(new_input_feature)
         messages: List[Message] = result.get('messages')
@@ -227,6 +237,9 @@ class Template:
         def _extract_reasoning_content(messages: list[Message]) -> List[Message]:
             result = []
             for message in messages:
+                if not isinstance(message, dict):
+                    result.append(message)
+                    continue
                 message = message.copy()
                 if message.get('role') == 'assistant':
                     content = message.get('content', '')
@@ -288,6 +301,11 @@ class Template:
 
         # Split strategy
         if strategy == 'split':
+            if self.is_mm:
+                raise ValueError("truncation_strategy='split' is unsafe for multimodal templates: "
+                                 'splitting input_ids across chunks breaks alignment with image tokens, '
+                                 'and multimodal fields (pixel_values, image_grid_thw, ...) are not partitioned. '
+                                 "Use 'left' / 'right' / 'delete' / 'raise' instead.")
             results = []
             for start in range(0, len(input_feature['input_ids']), self.max_length):
                 end = min(start + self.max_length, len(input_feature['input_ids']))
@@ -584,7 +602,7 @@ class Template:
 
     @staticmethod
     def _get_train_indices(trajectory: Trajectory) -> Optional[Set[int]]:
-        """Extract key-round assistant indices from trajectory's packed ``user_data``."""
+        """You can pick any round for training, only set key_rounds in `user_data`"""
         kr = user_data_get(trajectory.get('user_data'), 'key_rounds')
         if isinstance(kr, list) and kr:
             return set(kr)
@@ -618,6 +636,12 @@ class Template:
                 if 'input_ids' in encoded:
                     input_ids = encoded.pop('input_ids')
                     assistant_masks = encoded.pop('assistant_masks')
+                    # _apply_chat_template returns batched tensors ([1, T]); strip the batch dim
+                    # so downstream `len(input_ids)` reflects sequence length, not 1.
+                    if hasattr(input_ids, 'squeeze'):
+                        input_ids = input_ids.squeeze(0)
+                    if hasattr(assistant_masks, 'squeeze'):
+                        assistant_masks = assistant_masks.squeeze(0)
                     labels = np.where(assistant_masks, input_ids, -100)
             else:
                 if kwargs.get('tokenize', True):
@@ -760,16 +784,8 @@ class Template:
         return output
 
     def format_trajectory(self, trajectory: Trajectory, add_default_system: bool = False) -> Trajectory:
-        current = [trajectory]
-        for pipeline_name in self.pre_pipeline_names:
-            if not add_default_system and pipeline_name == '_add_default_system':
-                continue
-            pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
-            next_batch = []
-            for traj in current:
-                next_batch.extend(pipeline(traj))
-            current = next_batch
-        return current[0]
+        skip = set() if add_default_system else {'_add_default_system'}
+        return self._invoke_pre_pipeline([trajectory], skip_stages=skip)[0]
 
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None
@@ -817,8 +833,19 @@ class Template:
         kwargs = to_device(self._post_encode(model, old_kwargs), device)
         for k, v in old_kwargs.items():
             if k in {
-                    'input_ids', 'attention_mask', 'labels', 'position_ids', 'output_hidden_states', 'logits_to_keep',
-                    'max_length_q', 'max_length_k', 'cu_seq_lens_q', 'cu_seq_lens_k'
+                    'input_ids',
+                    'attention_mask',
+                    'labels',
+                    'position_ids',
+                    'output_hidden_states',
+                    'logits_to_keep',
+                    'max_length_q',
+                    'max_length_k',
+                    'cu_seq_lens_q',
+                    'cu_seq_lens_k',
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
+                    'packed_seq_params',
             } and k not in kwargs:
                 kwargs[k] = v
         if 'inputs_embeds' in kwargs:

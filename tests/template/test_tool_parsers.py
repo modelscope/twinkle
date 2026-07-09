@@ -23,11 +23,6 @@ class TestHermesQwenParser:
         assert not self.p.detect('plain text')
         assert not self.p.detect('')
 
-    def test_matches_model(self):
-        assert self.p.matches_model('qwen2.5-7b')
-        assert self.p.matches_model('qwen3-32b')
-        assert not self.p.matches_model('llama-3.1-8b')
-
     def test_parse_json_variant(self):
         text = '<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>'
         out = self.p.parse(text)
@@ -104,10 +99,6 @@ class TestReActParser:
         assert self.p.open_marker is None
         assert self.p.close_marker is None
 
-    def test_does_not_match_qwen_model(self):
-        assert not self.p.matches_model('qwen2.5')
-        assert not self.p.matches_model('llama-3')
-
     def test_parse_single_action(self):
         text = 'Thought: search the web.\nAction: search[hello world]'
         out = self.p.parse(text)
@@ -171,11 +162,6 @@ class TestClineParser:
         # Outer tag varies per call — no fixed marker.
         assert self.p.open_marker is None
         assert self.p.close_marker is None
-
-    def test_does_not_match_any_model_by_default(self):
-        # Cline is an app-level prompt protocol, not a model-family format.
-        assert not self.p.matches_model('qwen2.5')
-        assert not self.p.matches_model('claude-3')
 
     def test_parse_single_arg(self):
         text = '<read_file><path>src/foo.py</path></read_file>'
@@ -253,14 +239,6 @@ class TestRegistryRoundRobin:
     def test_no_parser_for_plain_text(self):
         assert ToolCallRegistry.detect_first('just some plain text') is None
         assert ToolCallRegistry.detect_first('') is None
-
-    def test_select_for_qwen_picks_hermes(self):
-        parser = ToolCallRegistry.select_for_model('qwen2.5-7b')
-        assert parser is not None and parser.name == 'hermes_qwen'
-
-    def test_select_for_unknown_returns_none(self):
-        assert ToolCallRegistry.select_for_model('llama-3.1-8b') is None
-        assert ToolCallRegistry.select_for_model(None) is None
 
 
 if __name__ == '__main__':

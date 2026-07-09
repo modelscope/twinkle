@@ -6,6 +6,7 @@ Reference:
     "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
     (https://arxiv.org/abs/2305.18290)
 """
+import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from twinkle.data_format import LossOutput
@@ -132,6 +133,11 @@ class DPOLoss(PreferenceLossBase):
         **kwargs,
     ):
         super().__init__(ignore_index=ignore_index)
+        if loss_type not in ('sigmoid', 'hinge', 'ipo', 'kto_pair'):
+            raise ValueError(f'Unknown loss_type: {loss_type}')
+        if label_smoothing > 0 and loss_type != 'sigmoid':
+            raise ValueError(f'label_smoothing > 0 is only defined for loss_type="sigmoid", '
+                             f'got loss_type="{loss_type}". Set label_smoothing=0.0 or switch to sigmoid.')
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.loss_type = loss_type
@@ -217,6 +223,11 @@ class DPOLoss(PreferenceLossBase):
         if self.loss_type == 'sigmoid':
             # Standard DPO loss: -log(sigmoid(beta * margin))
             losses = -F.logsigmoid(logits)
+            # Apply label smoothing (only meaningful here: Bradley-Terry soft labels).
+            if self.label_smoothing > 0:
+                # Soft labels: (1 - eps) * loss_chosen + eps * loss_rejected
+                smooth_losses = -F.logsigmoid(-logits)  # Loss for flipped preference
+                losses = (1 - self.label_smoothing) * losses + self.label_smoothing * smooth_losses
         elif self.loss_type == 'hinge':
             # Hinge loss variant
             losses = torch.relu(1 - logits)
@@ -233,12 +244,6 @@ class DPOLoss(PreferenceLossBase):
             losses = chosen_losses + rejected_losses
         else:
             raise ValueError(f'Unknown loss_type: {self.loss_type}')
-
-        # Apply label smoothing if specified
-        if self.label_smoothing > 0:
-            # Soft labels: (1 - eps) * loss_chosen + eps * loss_rejected
-            smooth_losses = -F.logsigmoid(-logits)  # Loss for flipped preference
-            losses = (1 - self.label_smoothing) * losses + self.label_smoothing * smooth_losses
 
         return losses.mean()
 
@@ -321,7 +326,8 @@ class DPOLoss(PreferenceLossBase):
             reference_chosen_logps = torch.zeros_like(policy_chosen_logps)
             reference_rejected_logps = torch.zeros_like(policy_rejected_logps)
         else:
-            return LossOutput(loss=torch.tensor(0.0, device=chosen_logps.device), num_tokens=0)
+            zero = (policy_chosen_logps.sum() + policy_rejected_logps.sum()) * 0.0
+            return LossOutput(loss=zero, num_tokens=0)
 
         # Compute DPO loss
         dpo_loss = self._compute_dpo_loss(
@@ -535,11 +541,23 @@ class ORPOLoss(PreferenceLossBase):
 
         # Odds ratio: log(odds_chosen / odds_rejected)
         # log_odds = log(p/(1-p)) = log(p) - log(1-p)
-        # Compute entirely in log-space to avoid exp() underflow:
-        #   log(p)   = avg_logps  (already in log-space)
-        #   log(1-p) = log1p(-exp(avg_logps))  (numerically stable via log1p)
-        log_odds_chosen = chosen_avg_logps - torch.log1p(-torch.exp(chosen_avg_logps))
-        log_odds_rejected = rejected_avg_logps - torch.log1p(-torch.exp(rejected_avg_logps))
+        # Compute log(1-p) = log(1 - exp(avg_logp)) numerically stably:
+        #   - For x > -log(2):  log(-expm1(x))  (avoids log(0) when p → 1)
+        #   - For x ≤ -log(2): log1p(-exp(x))  (avoids cancellation when p → 0)
+        # ``avg_logp ∈ (-∞, 0]`` so the threshold partitions the safe regime.
+        log_two = math.log(2.0)
+
+        def _log1mexp(x: 'torch.Tensor') -> 'torch.Tensor':
+            # Clamp at a tiny negative to keep both branches well-defined when p≈1.
+            x_safe = torch.clamp(x, max=-1e-7)
+            return torch.where(
+                x_safe > -log_two,
+                torch.log(-torch.expm1(x_safe)),
+                torch.log1p(-torch.exp(x_safe)),
+            )
+
+        log_odds_chosen = chosen_avg_logps - _log1mexp(chosen_avg_logps)
+        log_odds_rejected = rejected_avg_logps - _log1mexp(rejected_avg_logps)
 
         # ORPO odds ratio loss
         odds_ratio = log_odds_chosen - log_odds_rejected

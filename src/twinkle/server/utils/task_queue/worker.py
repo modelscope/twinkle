@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Deque
 
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
@@ -136,10 +137,7 @@ class ComputeWorker:
             task.request_id,
             TaskStatus.FAILED.value,
             task.model_id,
-            result={
-                'error': error,
-                'category': 'Server'
-            },
+            result=task_error_payload(error),
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
         )

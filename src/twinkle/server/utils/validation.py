@@ -32,7 +32,7 @@ async def verify_request_token(request: Request, call_next):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
     path = request.url.path
-    skip_sticky = (path.endswith('/healthz') or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES))
+    skip_sticky = ('/healthz' in path or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES))
 
     if not skip_sticky:
         request_id = request.headers.get(H_REQUEST_ID)

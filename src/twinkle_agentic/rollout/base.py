@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List
 
 from twinkle.data_format import Trajectory
 

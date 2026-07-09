@@ -147,6 +147,21 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         except Exception:
             pass
 
+    def check_model_health(self) -> dict:
+        """Probe model actors liveness via a lightweight ping.
+
+        Returns a dict with 'healthy' (bool) and 'detail' (str).
+        If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
+        will raise RayActorError, signalling the watchdog to restart.
+        """
+        try:
+            result = self.model.ping()
+            if result is True:
+                return {'healthy': True, 'detail': 'model actors alive'}
+            return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
+        except Exception as e:
+            return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
+
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):
             self.clear_resource_state(adapter_name)

@@ -4,4 +4,3 @@
    :maxdepth: 1
 
    InputProcessor.md
-   GRPOProcessor.md

@@ -31,6 +31,7 @@ def consolidate_system_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
     misplaced = any(isinstance(m, dict) and m.get('role') == 'system' and i != 0 for i, m in enumerate(messages))
     if sys_count <= 1 and not misplaced:
         return messages
+    sys_msgs: List[Dict[str, Any]] = []
     sys_chunks: List[str] = []
     rest: List[Dict[str, Any]] = []
     template: Optional[Dict[str, Any]] = None
@@ -38,11 +39,24 @@ def consolidate_system_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
         if isinstance(m, dict) and m.get('role') == 'system':
             if template is None:
                 template = m
+            sys_msgs.append(m)
             text = msg_content_text(m).strip()
             if text:
                 sys_chunks.append(text)
         else:
             rest.append(m)
+    # A multimodal system message must not be flattened to a joined string — that
+    # would drop image/audio parts. Preserve list content by concatenating the
+    # original content parts instead.
+    if any(msg_has_media(m) for m in sys_msgs):
+        merged_parts: List[Any] = []
+        for m in sys_msgs:
+            content = m.get('content')
+            if isinstance(content, list):
+                merged_parts.extend(content)
+            elif isinstance(content, str) and content.strip():
+                merged_parts.append({'type': 'text', 'text': content})
+        return [dict(template, content=merged_parts)] + rest
     return [dict(template, content='\n\n'.join(sys_chunks))] + rest
 
 
@@ -327,6 +341,10 @@ class MessageSanityFilter(Preprocessor):
                     dropped.append(dict(row, drop_reason='no_assistant'))
                     continue
                 row = dict(row, messages=messages)
+                # Trimming can drop the trailing tool round, so re-derive is_agent
+                # on the trimmed messages — otherwise agent-only checks may run
+                # against a now non-agent (or vice-versa) conversation.
+                is_agent = is_agent_row(messages)
 
             reason = self._run_checks(messages, is_agent)
             if reason is None:

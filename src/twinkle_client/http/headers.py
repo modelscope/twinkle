@@ -13,6 +13,7 @@ environment.
 
 # -- request id --
 H_REQUEST_ID = 'x-request-id'
+H_REQUEST_ID_LEGACY = 'X-Ray-Serve-Request-Id'
 
 # -- multiplexed model id (sticky routing) --
 H_MULTIPLEX = 'serve_multiplexed_model_id'
@@ -22,7 +23,7 @@ H_MULTIPLEX_LEGACY = 'Serve-Multiplexed-Model-Id'
 H_AUTH = 'Authorization'
 H_AUTH_TWINKLE = 'Twinkle-Authorization'
 
-_ROUTING_HEADERS = (H_REQUEST_ID, H_MULTIPLEX, H_MULTIPLEX_LEGACY)
+_ROUTING_HEADERS = (H_REQUEST_ID, H_REQUEST_ID_LEGACY, H_MULTIPLEX, H_MULTIPLEX_LEGACY)
 _AUTH_HEADERS = (H_AUTH, H_AUTH_TWINKLE)
 
 

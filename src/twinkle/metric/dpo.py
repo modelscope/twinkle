@@ -132,6 +132,12 @@ class DPOMetric(Metric):
         if ref_outputs is not None:
             ref_logps = ref_outputs.get('logps')
             if ref_logps is not None:
+                if isinstance(ref_logps, list):
+                    if len(ref_logps) == 0:
+                        ref_logps = None
+                    else:
+                        ref_logps = pad_and_stack_tensors(ref_logps)
+            if ref_logps is not None:
                 # Align ref_logps to match labels shape (handles different seq lengths)
                 ref_logps = self._align_logps(ref_logps, labels.shape, labels.device, logps.dtype)
 

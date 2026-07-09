@@ -156,6 +156,8 @@ if __name__ == '__main__':
 
 In this training code, we constructed a dataset and loaded the Qwen/Qwen3.5-4B model, used LoRA with the all-linear approach, and completed one training run. In the logs, you can observe the process of loss gradually converging.
 
+> **Tip — Full-Parameter Training**: The example above uses LoRA for efficiency. To switch to full-parameter training, simply remove the `add_adapter_to_model` call (and the `from peft import LoraConfig` import). Everything else stays the same.
+
 ### torchrun
 
 Twinkle supports running training in torchrun mode. In this scenario, Ray-related dependencies do not need to be installed.
@@ -471,7 +473,7 @@ python train.py
 
 A major feature of Twinkle is support for multi-tenant mixed training. Specifically, multiple users can use a single base model for LoRA training, which can greatly reduce server-side deployment costs.
 
-Checkpoint resumption is also supported in client-server training. The recommended flow is to call `model.resume_from_checkpoint(resume_path)` to restore weights and optimizer state, then call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip consumed data. See [Twinkle-Client](./Server%20and%20Client/Twinkle-Client.md) and [self_cognition.py](../../../cookbook/client/twinkle/self_host/self_cognition.py).
+Checkpoint resumption is also supported in client-server training. The recommended flow is to call `model.resume_from_checkpoint(resume_path)` to restore weights and optimizer state, then call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip consumed data. See [Twinkle-Client](./Server%20and%20Client/Twinkle-Client.md) and [self_cognition.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_host/self_cognition.py).
 
 Suppose we start a service using eight GPUs. First, we need to start the Ray cluster:
 
@@ -492,6 +494,8 @@ Next, start the server:
 ```shell
 twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
 ```
+
+> For details on how to write `server_config.yaml`, see [Server Configuration](../Server%20and%20Client/Server.md).
 
 The server will start three services: a sampler cluster, a model cluster, and a utility cluster.
 

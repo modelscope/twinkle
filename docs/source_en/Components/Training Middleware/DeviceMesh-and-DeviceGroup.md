@@ -40,6 +40,24 @@ class DeviceMesh:
 
 It is recommended to use `from_sizes` to construct it.
 
+### Parameter Reference
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `world_size` | Total number of processes | 1 |
+| `dp_size` | Data parallel degree | 1 |
+| `fsdp_size` | Fully Sharded Data Parallel degree | None |
+| `tp_size` | Tensor parallel degree | None |
+| `pp_size` | Pipeline parallel degree | None |
+| `ulysses_size` | Ulysses sequence parallel degree | None |
+| `cp_size` | Context parallel degree | None |
+| `ep_size` | Expert parallel degree (for MoE models) | None |
+| `etp_size` | Expert tensor parallel degree | None |
+| `ep_fsdp_size` | FSDP degree within each EP group | None |
+| `vpp_size` | Virtual pipeline parallel degree | None |
+| `device_type` | Device type (`cuda`, `npu`, etc.) | `cuda` |
+| `sequence_parallel` | Enable Megatron-style sequence parallel | False |
+
 Let's give an example:
 
 ```python

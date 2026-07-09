@@ -1,4 +1,3 @@
-from twinkle.template.base import Template
 from twinkle.template.deepseek_v4 import DeepseekV4Template
 
 DSML_TOOL_CALL = ('Need data.\n\n'
@@ -44,8 +43,7 @@ def test_deepseek_v4_parse_tool_call_normalizes_block_prefix_whitespace():
 
 
 def test_template_dispatches_deepseek_tool_call_parser():
-    template = Template.__new__(Template)
-    template.model_id = 'deepseek-v4'
+    template = DeepseekV4Template.__new__(DeepseekV4Template)
 
     calls = template.parse_tool_call(DSML_TOOL_CALL)
 

@@ -39,15 +39,12 @@ class ResourceManager:
 
         for group in groups:
             ranks = group.ranks
-            device = device_type
-            if device == 'CPU':
-                # Only support totally how many processes needed
+            if (group.device_type or '').upper() == 'CPU':
                 assert isinstance(ranks, int), 'CPU group only supports integer ranks'
                 cpu_proc_count += ranks
                 continue
 
             if isinstance(ranks, int):
-                # turn to a list of int
                 ranks = list(range(last_rank + 1, last_rank + 1 + ranks))
             all_ranks.extend(ranks)
             group.ranks = ranks
@@ -68,14 +65,22 @@ class ResourceManager:
             self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
         self.nodes = []
+        self.cpu_nodes = []
         for node in ray.nodes():
-            # get available nodes
+            if not node.get('Alive', True):
+                continue
             resource = node['Resources']
-            node_device_num = int(resource.get(device_type, 0))
-            if device_type != 'CPU' and node_device_num >= nproc_per_node:
-                self.nodes.append(node)
-            if device_type == 'CPU' and int(node['Resources']['CPU']) // 4 >= ncpu_proc_per_node:
-                self.nodes.append(node)
+            if device_type != 'CPU':
+                node_device_num = int(resource.get(device_type, 0))
+                if node_device_num >= nproc_per_node:
+                    self.nodes.append(node)
+            else:
+                if int(resource.get('CPU', 0)) // 4 >= ncpu_proc_per_node:
+                    self.nodes.append(node)
+            # Independent CPU node pool: any alive node with enough CPU
+            node_cpu = int(resource.get('CPU', 0))
+            if node_cpu // 4 >= ncpu_proc_per_node:
+                self.cpu_nodes.append(node)
 
         assert self.nnodes <= len(
             self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
@@ -83,28 +88,26 @@ class ResourceManager:
         bundles = []
         cpu_bundles = []
 
-        for i in range(self.nnodes):
-            # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
-            node_idx = self.min_node_idx + i if device_type != 'CPU' else i
-            try:
-                node = self.nodes[node_idx]
-            except IndexError:
-                # node_idx may not be continuous
-                node = self.nodes[0]
-            node_cpu = int(node['Resources']['CPU'])
-            if device_type != 'CPU':
-                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)})  # create bundles
+        if device_type != 'CPU':
+            for i in range(self.nnodes):
+                # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
+                node_idx = self.min_node_idx + i
+                try:
+                    node = self.nodes[node_idx]
+                except IndexError:
+                    node = self.nodes[0]
+                node_cpu = int(node['Resources']['CPU'])
+                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)})
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
-            assert cpu_nnodes <= len(self.nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
-                                                   f'available: {len(self.nodes)}, ensure your ray cluster '
-                                                   f'has enough nodes, or '
-                                                   f'setting `twinkle.initialize(nproc_per_node=N(default 8), ...) '
-                                                   f'to reduce per node GPU usage.`')
+            assert cpu_nnodes <= len(
+                self.cpu_nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
+                                  f'available CPU nodes: {len(self.cpu_nodes)}, ensure your ray cluster '
+                                  f'has enough nodes with sufficient CPU resources.')
             for i in range(cpu_nnodes):
-                node = self.nodes[i]
+                node = self.cpu_nodes[i]
                 node_cpu = int(node['Resources']['CPU'])
                 # How many CPU processes will actually be placed on this node
                 # (last node may have fewer than ncpu_proc_per_node)
@@ -144,7 +147,7 @@ class ResourceManager:
 
         @ray.remote
         def get_visible_devices():
-            return os.environ.get(Platform.get_platform(group.device_type).visible_device_env())
+            return os.environ.get(Platform.get_platform(device_type).visible_device_env())
 
         if self.placement_groups:
             self.visible_devices = ray.get([
@@ -176,6 +179,7 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
+        global_cpu_proc_idx = 0
         for group in groups:
             if (group.device_type or '').upper() != 'CPU':
                 ranks = group.ranks
@@ -202,7 +206,7 @@ class ResourceManager:
                         for r in worker_ranks:
                             node_rank = r // nproc_per_node
                             node_ranks.append(node_rank)
-                            gpu_ranks = self.visible_devices[node_rank][r % nproc_per_node]
+                            gpu_ranks = self.visible_devices[node_rank - self.min_node_idx][r % nproc_per_node]
                             gpu_ranks_local.append(gpu_ranks)
 
                         if len(set(node_ranks)) > 1:
@@ -218,7 +222,7 @@ class ResourceManager:
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = self.visible_devices[node_rank][alloc_rank % nproc_per_node]
+                        gpu_rank = self.visible_devices[node_rank - self.min_node_idx][alloc_rank % nproc_per_node]
                         local_device_groups.append(
                             dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
 
@@ -232,7 +236,6 @@ class ResourceManager:
                 assert getattr(group, 'gpus_per_worker', 1) == 1
                 ranks = group.ranks
                 local_device_groups = []
-                global_cpu_proc_idx = 0
                 for _ in range(ranks):
                     local_device_groups.append(
                         dict(

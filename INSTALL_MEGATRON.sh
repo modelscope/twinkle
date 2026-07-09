@@ -5,6 +5,7 @@
 
 set -e  # Exit immediately on error
 export SETUPTOOLS_USE_DISTUTILS=local
+export UV_INDEX_URL=${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
 echo "=========================================="
 echo "Starting deep learning dependencies installation..."
 echo "=========================================="
@@ -53,15 +54,15 @@ TORCH_CUDA_ARCH_LIST=$(get_cuda_arch "$GPU_NAME")
 export TORCH_CUDA_ARCH_LIST
 echo "Using CUDA architecture: $TORCH_CUDA_ARCH_LIST"
 
+# Install vllm 0.21.x (latest 0.2x uses CUDA 12 toolchain, avoids CUDA 13 CUTLASS conflicts)
+echo ""
+echo "Installing vllm 0.21..."
+uv pip install "vllm>=0.21,<0.22"
+
 # Install latest base packages
 echo ""
 echo "Installing peft, accelerate, transformers, modelscope..."
-pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
-
-# Install latest vllm
-echo ""
-echo "Installing latest vllm..."
-pip install --upgrade vllm --no-cache-dir
+uv pip install --upgrade peft accelerate transformers "modelscope[framework]"
 
 # Get site-packages path and install transformer_engine and megatron_core
 echo ""
@@ -69,26 +70,30 @@ echo "Installing transformer_engine and megatron_core..."
 SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
 echo "Site-packages path: $SITE_PACKAGES"
 
-CUDNN_PATH=$SITE_PACKAGES/nvidia/cudnn \
-CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
-pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
+export CUDA_HOME=${SITE_PACKAGES}/nvidia/cu13
+export PATH=$CUDA_HOME/bin:$PATH
+export CPATH=$CUDA_HOME/include:$CPATH
+export LIBRARY_PATH=$CUDA_HOME/lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
+uv pip install transformer_engine_torch --no-build-isolation
 
-pip install megatron_core mcore_bridge --no-cache-dir
+uv pip install megatron_core mcore_bridge
 
-# Install flash-attention (force local build)
+# Install flash-attention
+# Prefer prebuilt wheel; fall back to source build only if needed.
 echo ""
-echo "Installing flash-attention (local build for $GPU_NAME)..."
-TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
-MAX_JOBS=8 \
-FLASH_ATTENTION_FORCE_BUILD=TRUE \
-pip install flash-attn --no-build-isolation --no-cache-dir
+echo "Installing flash-attention..."
+export TORCH_CUDA_ARCH_LIST
+export MAX_JOBS=8
+pip install flash-attn --no-cache-dir || \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn --no-build-isolation --no-cache-dir
 
-pip install flash-linear-attention -U --no-cache-dir
+uv pip install flash-linear-attention --upgrade
 
 # Install numpy
 echo ""
 echo "Installing numpy==2.2 and deep_gemm..."
-pip install numpy==2.2 --no-cache-dir
+uv pip install numpy==2.2
 
 # Verify installation
 echo ""

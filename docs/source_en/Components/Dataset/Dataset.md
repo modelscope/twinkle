@@ -148,6 +148,7 @@ dataset.encode()
 > 1. Dataset's `map`, `encode`, `filter`, and other methods all use the `map` method of `datasets`, so you can use the corresponding parameters in the kwargs of the corresponding methods
 > 2. The `load_from_cache_file` parameter defaults to False, because when this parameter is set to True, it can cause headaches when the dataset changes but training still uses the cache. If your dataset is large and updated infrequently, you can directly set it to True
 > 3. encode does not need to specify `DatasetMeta` because after preprocessing, all datasets have the same format
+> 4. `encode` tokenizes with a single process by default. For large datasets, enable multi-process parallelism via `num_proc`, e.g. `dataset.encode(num_proc=8)`
 
 6. Getting data
 

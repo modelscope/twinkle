@@ -30,3 +30,48 @@ class MultiLoraTransformersModel:
 正因如此，用户的r必须要小于等于max_r的配置，在实际训练时仅会使用lora的部分rank参与计算。
 
 MultiLoraTransformersModel支持`@remote_class`注解，并且支持device_mesh，这意味着它可以运行在ray的worker中。
+
+## 租户生命周期
+
+底层使用 `MultiLora` 管理器来处理租户 LoRA 槽位。关键 API：
+
+### acquire_lora
+
+为租户获取一个可用的 LoRA 槽位：
+
+```python
+adapter_name = model.multi_lora.acquire_lora('tenant_a', LoraConfig(r=16, lora_alpha=32))
+```
+
+- 如果所有槽位已被占用或 `config.r > max_r`，则抛出 `RuntimeError`
+
+### release_lora
+
+释放租户的 LoRA 槽位，权重重置为初始状态：
+
+```python
+model.multi_lora.release_lora('tenant_a')
+```
+
+### 上下文管理器
+
+使用 `adapter()` 进行作用域激活：
+
+```python
+with model.multi_lora.adapter('tenant_a') as name:
+    output = model.forward(inputs)
+```
+
+### LoraTenant
+
+每个槽位以 `LoraTenant` 数据类追踪：
+
+```python
+@dataclass
+class LoraTenant:
+    index: int                    # 槽位索引 (0..max_loras-1)
+    adapter_name: str             # 内部名称（如 "lora_0"）
+    config: LoraConfig            # 预分配配置（max_r）
+    tenant_adapter_name: str      # 面向用户的租户名（空闲时为 None）
+    tenant_config: LoraConfig     # 租户实际配置（空闲时为 None）
+```

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from typing import Dict, Optional
 
@@ -66,7 +67,7 @@ def notify_exception(notifier: Notifier, context: str, exc: BaseException, name:
     if not _try_claim_notify_slot(exc, context, name):
         try:
             setattr(exc, '_twinkle_notified', True)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa
             pass
         return
 

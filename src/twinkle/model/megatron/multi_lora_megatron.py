@@ -15,17 +15,20 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoConfig, PretrainedConfig
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
-from twinkle import DeviceMesh, remote_class, remote_function, requires, template, torch_util
+from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
+from twinkle.utils import get_logger
 from ..multi_lora import MultiLora
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
+
+logger = get_logger()
 
 
 @remote_class(execute='all')
@@ -221,8 +224,11 @@ class MultiLoraMegatronModel(MegatronModel):
             'np_rng_state': np.random.get_state(),
             'torch_rng_state': torch.get_rng_state(),
         }
-        if torch.cuda.is_available():
-            rng_state['cuda_rng_state'] = torch.cuda.get_rng_state()
+        # Backend-agnostic device RNG capture (CUDA / NPU / MPS). Key is kept as
+        # 'cuda_rng_state' for backward compatibility with existing checkpoints.
+        device_rng = Platform.get_device_rng_state()
+        if device_rng is not None:
+            rng_state['cuda_rng_state'] = device_rng
         rng_state['rng_tracker_states'] = tensor_parallel.get_cuda_rng_tracker().get_states()
         return rng_state
 
@@ -233,8 +239,10 @@ class MultiLoraMegatronModel(MegatronModel):
         random.setstate(rng_state['random_rng_state'])
         np.random.set_state(rng_state['np_rng_state'])
         torch.set_rng_state(rng_state['torch_rng_state'])
-        if 'cuda_rng_state' in rng_state and torch.cuda.is_available():
-            torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+        # Backend-agnostic device RNG restore: tolerates ckpt produced on different
+        # backend (key absent or None) and avoids hard-coded torch.cuda on NPU.
+        if 'cuda_rng_state' in rng_state:
+            Platform.set_device_rng_state(rng_state['cuda_rng_state'])
         tensor_parallel.get_cuda_rng_tracker().set_states(rng_state['rng_tracker_states'])
 
     def _save_multi_lora_optimizer(self, checkpoint_dir: str, optimizer_config, **kwargs):
@@ -251,19 +259,34 @@ class MultiLoraMegatronModel(MegatronModel):
 
         torch.save(state_dict, self._rank_local_optimizer_path(checkpoint_dir))
 
+        if dist.is_initialized():
+            dist.barrier()
+
     def _load_multi_lora_optimizer(self, checkpoint_dir: str, adapter_name: str = '', **kwargs):
         no_load_optim = kwargs.pop('no_load_optim', False)
-        no_load_rng = kwargs.pop('no_load_rng', False)
+        no_load_rng = kwargs.pop('no_load_rng', True)
         optimizer_config = self.optimizer_group.get(adapter_name)
         state_dict = torch.load(self._rank_local_optimizer_path(checkpoint_dir), map_location='cpu', weights_only=False)
 
         if not no_load_optim and optimizer_config is not None:
             if optimizer_config.optimizer is not None and 'optimizer' in state_dict:
                 optimizer_config.optimizer.load_state_dict(state_dict['optimizer'])
+                device = Platform.get_local_device()
+                for group_state in optimizer_config.optimizer.state.values():
+                    if not isinstance(group_state, dict):
+                        continue
+                    for k, v in group_state.items():
+                        if isinstance(v, torch.Tensor):
+                            group_state[k] = v.to(device)
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+        # RNG state is intentionally not restored in multi-tenant mode:
+        # restoring the global RNG would silently affect other active tenants'
+        # dropout / initialization behaviour.
         if not no_load_rng and 'rng_state' in state_dict:
-            self._load_local_training_rng_state(state_dict['rng_state'])
+            logger.warning('Skipping RNG state restoration in multi-tenant mode. '
+                           'Global RNG is shared across tenants; restoring it would '
+                           'affect other active adapters.')
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
@@ -354,6 +377,10 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(adapter_name)
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        if not os.path.isfile(trainer_state_path):
+            raise FileNotFoundError(f'trainer_state.json not found in {checkpoint_dir}. '
+                                    f'Ensure the checkpoint was saved with save_optimizer=True.')
+
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 

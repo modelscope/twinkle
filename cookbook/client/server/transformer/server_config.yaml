@@ -11,7 +11,7 @@ http_options:
 
 # Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
 telemetry:
-  enabled: true
+  enabled: false
   otlp_endpoint: http://localhost:4317
 
 # Persistence configuration for ServerState (sessions, models, futures, ...).
@@ -49,6 +49,9 @@ applications:
           target_ongoing_requests: 128   # Target concurrent requests per replica
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"
 
   # 2. Model Service - Hosts the base model for training.
   - name: models-Qwen3.5-4B
@@ -81,43 +84,45 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  # - name: sampler-Qwen3.5-4B
-  #   route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
-  #   import_path: sampler
-  #   args:
-  #     model_id: "ms://Qwen/Qwen3.5-4B"   # ModelScope model identifier
-  #     nproc_per_node: 2               # Number of GPU processes per node
-  #     sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
-  #     engine_args:                    # vLLM engine-specific settings
-  #       max_model_len: 4096           # Maximum sequence length the engine supports
-  #       gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
-  #       enable_lora: true             # Allow loading LoRA adapters during inference
-  #       logprobs_mode: processed_logprobs # Logprobs mode for sampling results
-  #     device_group:                   # Logical device group for the sampler
-  #       name: sampler
-  #       ranks: 1                    # Number of GPUs to use
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       dp_size: 1
-  #     queue_config:
-  #       rps_limit: 100                             # Max requests per second
-  #       tps_limit: 100000                           # Max tokens per second
-  #   deployments:
-  #     - name: SamplerManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
-  #         runtime_env:
-  #           env_vars:
-  #             TWINKLE_TRUST_REMOTE_CODE: "0"
+  - name: sampler-Qwen3.5-4B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen3.5-4B"   # ModelScope model identifier
+      nproc_per_node: 1               # Number of GPU processes per node
+      sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
+      engine_args:                    # vLLM engine-specific settings
+        max_model_len: 4096           # Maximum sequence length the engine supports
+        gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
+        enable_lora: true             # Allow loading LoRA adapters during inference
+        logprobs_mode: processed_logprobs # Logprobs mode for sampling results
+      device_group:                   # Logical device group for the sampler
+        name: sampler
+        ranks: 1                    # Number of GPUs to use
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 100000                           # Max tokens per second
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
 
   # 4. Processor Service
   - name: processor
@@ -140,3 +145,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"

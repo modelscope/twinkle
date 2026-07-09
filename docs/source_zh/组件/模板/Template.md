@@ -9,7 +9,7 @@ class Template:
                  model_id: str,
                  use_chat_template: bool = True,
                  max_length: Optional[int] = 8192,
-                 truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
+                 truncation_strategy: Literal['raise', 'left', 'right', 'split', 'delete'] = 'raise',
                  default_system: Optional[str] = None):
         ...
 
@@ -42,7 +42,9 @@ class Template:
   - raise: 抛出异常。一般用于非常精确的数据集场景
   - left: 移除左边的 token，使其符合 max_length
   - right: 移除右边的 token，使其符合 max_length
-  - default_system: 如果数据集没有 system，则使用默认 system
+  - split: 将超长样本切分为多个 max_length 的片段（不支持多模态、LazyDataset、IterablePackingDataset）
+  - delete: 直接丢弃超长样本
+- default_system: 如果数据集没有 system，则使用默认 system
 
 > Template 不支持使用函数来代替，因为其内部要支持的功能较多。如果需要编写新的 Template，请继承 `Template` 类。
 > 一般来说，纯文本模型使用 Template 基类就足够了，在基类中我们使用了 tokenizer.apply_chat_template 来编码模型，对一般的纯文本模型是通用的。

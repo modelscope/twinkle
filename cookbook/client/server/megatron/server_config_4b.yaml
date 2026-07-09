@@ -31,6 +31,9 @@ applications:
           target_ongoing_requests: 128   # Target concurrent requests per replica
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
@@ -68,6 +71,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_FAIL_FAST: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -105,6 +109,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_FAIL_FAST: "0"
 
   # 4. Processor Service
   - name: processor
@@ -127,3 +132,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"

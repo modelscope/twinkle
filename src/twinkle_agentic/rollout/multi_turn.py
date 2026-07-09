@@ -77,7 +77,7 @@ class MultiTurnRollout(Rollout):
         self,
         sampler,
         template: Template,
-        tool_manager: ToolManager,
+        tool_manager: Optional[ToolManager] = None,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
@@ -88,8 +88,6 @@ class MultiTurnRollout(Rollout):
         super().__init__()
         if template is None:
             raise ValueError('MultiTurnRollout requires a local Template instance')
-        if tool_manager is None:
-            raise ValueError('MultiTurnRollout requires a ToolManager')
         if max_turns < 1:
             raise ValueError(f'max_turns must be >= 1, got {max_turns}')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
@@ -112,7 +110,7 @@ class MultiTurnRollout(Rollout):
                              f'got {self.sampling_params.num_samples}')
         assert self.template.truncation_strategy != 'split', (
             "MultiTurnRollout does not support truncation_strategy='split'; "
-            'use left/right/raise on the template.')
+            'use left/right/delete/raise on the template.')
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
@@ -216,7 +214,13 @@ class MultiTurnRollout(Rollout):
             # outstanding tool turns. Done serially: bridge computation is
             # a cheap decode-diff-encode on python strings / token lists.
             for global_idx, tool_messages in pending_bridges:
-                pifs[global_idx] = self._extend_with_bridge(pifs[global_idx], tool_messages)
+                extended = self._extend_with_bridge(pifs[global_idx], tool_messages)
+                if extended is None:
+                    # Trajectory exceeded max_length, mark as done (deleted)
+                    truncated[global_idx] = True
+                    done[global_idx] = True
+                else:
+                    pifs[global_idx] = extended
 
         for i in range(n):
             if not all_logprobs[i]:
@@ -257,6 +261,9 @@ class MultiTurnRollout(Rollout):
     @staticmethod
     def _resolve_tool_managers(arg, n: int) -> List[ToolManager]:
         """Broadcast a single ``ToolManager`` or validate a per-trajectory list."""
+        if arg is None:
+            raise ValueError('tool_manager is required but was not provided. '
+                             'Pass it at construction time or as a per-call kwarg.')
         if isinstance(arg, list):
             if len(arg) != n:
                 raise ValueError(f'per-call tool_manager list length ({len(arg)}) does '
@@ -446,6 +453,9 @@ class MultiTurnRollout(Rollout):
             raise RuntimeError(f'Bridge text tokenised to empty id list: {bridge_text!r}')
 
         new_pif = self._append_bridge_tokens(pif, bridge_ids)
+        if new_pif is None:
+            # Trajectory exceeds max_length and strategy is 'delete'
+            return None
         new_pif['messages'] = messages_after
         return new_pif
 
@@ -491,11 +501,16 @@ class MultiTurnRollout(Rollout):
             mm = result['mm_token_type_ids']
             if not isinstance(mm, torch.Tensor):
                 mm = torch.as_tensor(mm)
-            pad = torch.zeros((mm.shape[0], len(bridge_ids)), dtype=mm.dtype, device=mm.device)
-            result['mm_token_type_ids'] = torch.cat([mm, pad], dim=1)
+            # Pad along the last (sequence) dim — handles 1D [T] and 2D [1, T] uniformly.
+            leading_shape = mm.shape[:-1]
+            pad = torch.zeros((*leading_shape, len(bridge_ids)), dtype=mm.dtype, device=mm.device)
+            result['mm_token_type_ids'] = torch.cat([mm, pad], dim=-1)
 
         # Replay the post pipeline: refresh attention_mask / position_ids /
         # length and re-roll labels back into output/shifted order.
-        refreshed = self.template._invoke_post_pipeline([result])[0]
-        result.update(refreshed)
+        refreshed_list = self.template._invoke_post_pipeline([result])
+        if not refreshed_list:
+            # truncation_strategy='delete': trajectory exceeds max_length
+            return None
+        result.update(refreshed_list[0])
         return _to_plain(result)

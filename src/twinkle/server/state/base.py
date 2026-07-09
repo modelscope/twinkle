@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-import logging
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -9,9 +8,10 @@ from pydantic import BaseModel
 from typing import Generic, TypeVar
 
 from twinkle.server.state.backend.base import StateBackend
+from twinkle.utils import get_logger
 
 T = TypeVar('T', bound=BaseModel)
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 class BaseManager(ABC, Generic[T]):

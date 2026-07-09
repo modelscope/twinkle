@@ -80,6 +80,52 @@ def _hash_short(s: str, salt: str = '') -> str:
     return hashlib.sha256((salt + s).encode('utf-8')).hexdigest()[:12]
 
 
+def _faker_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec('faker') is not None
+
+
+def _build_stub_nlp_engine(languages: Sequence[str]):
+    """A no-op presidio NlpEngine: emits empty NLP artifacts (spaCy-free).
+
+    Lets pattern (regex) recognizers run without loading any language model.
+    Built lazily so importing this module never requires presidio.
+    """
+    from presidio_analyzer.nlp_engine import NlpArtifacts, NlpEngine
+
+    class _StubNlp(NlpEngine):
+        def __init__(self, langs):
+            self._langs = list(langs)
+
+        def load(self):
+            pass
+
+        def is_loaded(self):
+            return True
+
+        def process_text(self, text, language):
+            return NlpArtifacts(entities=[], tokens=[], tokens_indices=[],
+                                lemmas=[], nlp_engine=self, language=language)
+
+        def process_batch(self, texts, language, **kwargs):
+            for t in texts:
+                yield t, self.process_text(t, language)
+
+        def is_stopword(self, word, language):
+            return False
+
+        def is_punct(self, word, language):
+            return False
+
+        def get_supported_entities(self):
+            return []
+
+        def get_supported_languages(self):
+            return list(self._langs)
+
+    return _StubNlp(languages)
+
+
 # ─── Faker dispatcher (per-instance, thread-safe) ───────────────────────────────
 
 
@@ -206,9 +252,9 @@ class PIIPresidioFilter(Preprocessor):
     # identifiers (phone/email/IDs/bank/cards) reliably indicate real PII. URL is also dropped—redacting
     # links in technical/instruction text changes semantics without privacy benefit.
     IGNORED_ENTITIES: Tuple[str, ...] = ('PERSON', 'LOCATION', 'ORGANIZATION', 'NRP', 'DATE_TIME', 'URL')
-    INSTALL_HINT = ('PIIPresidioFilter requires: pip install presidio-analyzer presidio-anonymizer '
-                    'faker spacy && python -m spacy download en_core_web_sm && '
-                    'python -m spacy download zh_core_web_sm')
+    INSTALL_HINT = ('PIIPresidioFilter requires: pip install presidio-analyzer presidio-anonymizer. '
+                    'For NER-backed entities and Faker replacement also: pip install faker spacy && '
+                    'python -m spacy download en_core_web_sm && python -m spacy download zh_core_web_sm')
 
     def __init__(
         self,
@@ -222,22 +268,37 @@ class PIIPresidioFilter(Preprocessor):
         persistent_consistency: bool = False,
         hash_salt: str = '',
         record_counts: bool = False,
+        regex_only: bool = True,
     ) -> None:
         super().__init__()
-        self._require_deps()
+        # In regex-only mode we act exclusively on pattern-based identifiers
+        # (email/phone/cards/IDs/bank), which are the only entities we keep anyway
+        # (see IGNORED_ENTITIES). This drops the heavy spaCy model load entirely.
+        self._regex_only = bool(regex_only)
+        self._require_deps(self._regex_only)
 
         self._languages: List[str] = list(languages)
         self._spacy_models = dict(self.DEFAULT_SPACY_MODELS)
         if spacy_models:
             self._spacy_models.update(spacy_models)
-        for lang in self._languages:
-            if lang not in self._spacy_models:
-                raise ValueError(f'No spaCy model configured for language {lang!r}')
+        if not self._regex_only:
+            for lang in self._languages:
+                if lang not in self._spacy_models:
+                    raise ValueError(f'No spaCy model configured for language {lang!r}')
 
         self._strategy = {k: Strategy.coerce(v) for k, v in self.DEFAULT_ENTITY_STRATEGY.items()}
         if entity_strategy:
             self._strategy.update({k.upper(): Strategy.coerce(v) for k, v in entity_strategy.items()})
         self._default_strategy = Strategy.coerce(default_strategy)
+
+        # Faker-backed REPLACE needs the optional 'faker' dep. If it is absent
+        # (common in regex-only deployments) transparently degrade REPLACE->MASK
+        # so PII is still scrubbed rather than crashing at scrub time.
+        if not _faker_available():
+            if self._default_strategy is Strategy.REPLACE:
+                self._default_strategy = Strategy.MASK
+            self._strategy = {k: (Strategy.MASK if v is Strategy.REPLACE else v)
+                              for k, v in self._strategy.items()}
 
         self._score_threshold = score_threshold
         self._roles = set(roles)
@@ -261,17 +322,21 @@ class PIIPresidioFilter(Preprocessor):
     # ── construction ────────────────────────────────────────────────────────
 
     @classmethod
-    def _require_deps(cls) -> None:
+    def _require_deps(cls, regex_only: bool = True) -> None:
         try:
-            import faker  # noqa: F401
             import presidio_analyzer  # noqa: F401
             import presidio_anonymizer  # noqa: F401
-            import spacy  # noqa: F401
+            if not regex_only:
+                import spacy  # noqa: F401
         except ImportError as e:
             raise ImportError(f'{e}. {cls.INSTALL_HINT}') from e
 
     def _build_analyzer(self):
         from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+
+        if self._regex_only:
+            return self._build_regex_analyzer(AnalyzerEngine, RecognizerRegistry)
+
         from presidio_analyzer.nlp_engine import NlpEngineProvider
 
         nlp_conf = {
@@ -289,6 +354,26 @@ class PIIPresidioFilter(Preprocessor):
                     nlp.disable_pipe(pipe)
         registry = RecognizerRegistry(supported_languages=self._languages)
         registry.load_predefined_recognizers(languages=self._languages, nlp_engine=nlp_engine)
+        for r in _build_cn_recognizers(self._languages):
+            registry.add_recognizer(r)
+        return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=self._languages)
+
+    def _build_regex_analyzer(self, AnalyzerEngine, RecognizerRegistry):
+        """spaCy-free analyzer: only pattern (regex) recognizers, stub NLP engine.
+
+        Presidio's predefined pattern recognizers (email, phone, credit card,
+        IBAN, IP, etc.) plus our CN identifier recognizers are all regex-based and
+        need no NLP artifacts, so we feed a no-op NlpEngine and load only those.
+        NER-driven entities (PERSON/LOCATION/...) are intentionally unavailable —
+        they are in IGNORED_ENTITIES anyway.
+        """
+        nlp_engine = _build_stub_nlp_engine(self._languages)
+        registry = RecognizerRegistry(supported_languages=self._languages)
+        registry.load_predefined_recognizers(languages=self._languages, nlp_engine=nlp_engine)
+        # Drop recognizers that depend on NLP artifacts (SpacyRecognizer et al.);
+        # keep only pure PatternRecognizers so analyze() never touches the stub NER.
+        from presidio_analyzer import PatternRecognizer
+        registry.recognizers = [r for r in registry.recognizers if isinstance(r, PatternRecognizer)]
         for r in _build_cn_recognizers(self._languages):
             registry.add_recognizer(r)
         return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=self._languages)

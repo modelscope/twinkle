@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import functools
-import logging
 import time
 
+from twinkle.utils import get_logger
 from .backend.base import ConcurrencyError, StateBackend
 from .base import BaseManager
 from .models import SessionRecord
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def _session_touch_transform(existing: dict | None, *, now: float) -> dict | None:

@@ -36,6 +36,44 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
     async def healthz(request: Request) -> types.HealthResponse:
         return types.HealthResponse(status='ok')
 
+    @app.get('/twinkle/healthz/deep')
+    async def healthz_deep(
+            request: Request,
+            self: GatewayServer = Depends(self_fn),
+    ) -> dict:
+        """Deep health check: verifies model actors are alive, not just the gateway.
+
+        Returns 503 if any model deployment's actors are unreachable (e.g. OOM/SIGSEGV).
+        The entrypoint watchdog should poll this endpoint to detect silent failures.
+        """
+        from fastapi.responses import JSONResponse
+
+        results = {}
+        all_healthy = True
+
+        for model in self.supported_models:
+            model_name = model.model_name
+            try:
+                resp = await self.proxy.proxy_request(request, 'healthz', model_name, 'model')
+                healthy = (resp.status_code == 200)
+                if not healthy:
+                    all_healthy = False
+                results[model_name] = {
+                    'healthy': healthy,
+                    'status_code': resp.status_code,
+                }
+            except Exception as e:
+                all_healthy = False
+                results[model_name] = {
+                    'healthy': False,
+                    'detail': str(e),
+                }
+
+        body = {'healthy': all_healthy, 'models': results}
+        if not all_healthy:
+            return JSONResponse(status_code=503, content=body)
+        return body
+
     @app.get('/twinkle/get_server_capabilities', response_model=types.GetServerCapabilitiesResponse)
     async def get_server_capabilities(
             request: Request,

@@ -8,4 +8,6 @@ Metrics
    Accuracy.md
    CompletionRewardMetric.md
    DPOMetric.md
+   GRPOMetric.md
+   EmbeddingMetric.md
    Building-Metrics.md

@@ -253,20 +253,19 @@ def _registered_http_middleware_names(app: FastAPI) -> list[str]:
 
 
 def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_replica_id: bool = False) -> None:
-    """Assert metrics is outermost, wrapping tracing, wrapping auth.
+    """Assert the scaffold middleware stack preserves the intended LIFO order.
 
     ``user_middleware`` is ordered OUTERMOST → INNERMOST (Starlette prepends
-    each new entry). So the expected sequence is metrics first, then tracing,
-    then ``verify_token``, with the Gateway-only cleanup middleware last as
-    the innermost layer (it has no per-handler hook elsewhere).
-
-    Model and Sampler add ``inject_replica_id`` after the scaffold stack, making
-    it the outermost middleware.
+    each new entry). Model and Sampler add ``inject_replica_id`` after the
+    scaffold stack, making it the outermost middleware when enabled.
     """
     names = _registered_http_middleware_names(app)
-    expected_prefix = ['metrics_middleware', 'tracing_middleware', 'verify_token']
-    expected = (expected_prefix + ['ensure_state_cleanup_started']) if expect_cleanup else expected_prefix
+    expected = []
     if expect_replica_id:
-        expected = ['inject_replica_id'] + expected
+        expected.append('inject_replica_id')
+    expected.extend(['metrics_middleware', 'tracing_middleware', 'verify_token'])
+    expected.append('catch_unhandled_exceptions')
+    if expect_cleanup:
+        expected.append('ensure_state_cleanup_started')
     assert names == expected, (f'middleware ordering mismatch — expected (outermost→innermost) '
                                f'{expected!r}, got {names!r}')

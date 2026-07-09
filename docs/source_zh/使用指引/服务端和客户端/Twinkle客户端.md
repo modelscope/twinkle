@@ -109,6 +109,11 @@ dataset.map('SelfCognitionProcessor',
 
 # 编码数据集为模型可用的 token
 dataset.encode(batched=True)
+# 数据量大时可用 num_proc 多进程加速：
+# dataset.encode(batched=True, num_proc=8)
+# 使用 twinkle_client.dataset 时，encode 是通过 HTTP 调用远端服务，
+# 默认 600 秒超时，可用 timeout 参数按需调大：
+# dataset.encode(batched=True, num_proc=8, timeout=3600)
 
 # 创建 DataLoader
 dataloader = DataLoader(dataset=dataset, batch_size=4)

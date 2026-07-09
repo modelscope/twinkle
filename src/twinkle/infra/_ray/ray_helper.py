@@ -161,7 +161,10 @@ class RayHelper:
         return ip, port
 
     @staticmethod
-    def do_get_and_collect_func(collect_func: Callable, method: Union[str, Callable], futures, device_mesh,
+    def do_get_and_collect_func(collect_func: Callable,
+                                method: Union[str, Callable],
+                                futures,
+                                device_mesh,
                                 timeout=None):
         """Return a callable to collect results in the workers."""
 
@@ -341,6 +344,9 @@ class RayHelper:
                 worker_name = key + '-' + str(rank)
                 env_vars = os.environ.copy()
                 env_vars.update({
+                    'WORLD_SIZE': str(world_size),
+                    'RANK': str(rank),
+                    'LOCAL_RANK': str(0),
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',

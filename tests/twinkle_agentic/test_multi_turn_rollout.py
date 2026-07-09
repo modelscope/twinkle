@@ -523,9 +523,14 @@ def test_rejects_none_template(sampler, tool_manager):
         MultiTurnRollout(sampler=sampler, template=None, tool_manager=tool_manager)
 
 
-def test_rejects_none_tool_manager(sampler, template):
-    with pytest.raises(ValueError, match='ToolManager'):
-        MultiTurnRollout(sampler=sampler, template=template, tool_manager=None)
+def test_none_tool_manager_accepted_at_construction(sampler, template):
+    """tool_manager=None is valid at construction; error deferred to call time."""
+    rollout = MultiTurnRollout(sampler=sampler, template=template, tool_manager=None)
+    assert rollout.tool_manager is None
+    # Calling without providing a tool_manager should raise
+    sampler.queue(_tool_call_text('search', {'q': 'x'}), stop_reason='stop')
+    with pytest.raises(ValueError, match='tool_manager is required'):
+        rollout([_user_traj('hello')])
 
 
 def test_rejects_bad_max_turns(sampler, template, tool_manager):
