@@ -25,6 +25,7 @@ class NpuRMSNorm(nn.Module):
     """
 
     def _twinkle_residual_param(self) -> bool:
+         """Lazily detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight)."""
         cached = getattr(self, '_twinkle_residual_cached', None)
         if cached is None:
             cached = not hasattr(self, 'variance_epsilon')
