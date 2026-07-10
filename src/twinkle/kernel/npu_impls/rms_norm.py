@@ -15,6 +15,10 @@ from twinkle import get_logger
 
 logger = get_logger()
 
+# Resolved once at import: matches the legacy "patch-time, process-wide" invariant.
+# Mid-process env mutation will not retroactively change behavior.
+_FORCE_FP32 = os.environ.get('TWINKLE_NPU_GATED_RMSNorm_FP32', '0').lower() in ('1', 'true', 'on', 'yes')
+
 
 class NpuRMSNorm(nn.Module):
     """Class-replacement impl for HF RMSNorm variants.
@@ -25,7 +29,7 @@ class NpuRMSNorm(nn.Module):
     """
 
     def _twinkle_residual_param(self) -> bool:
-         """Lazily detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight)."""
+        """Lazily detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight)."""
         cached = getattr(self, '_twinkle_residual_cached', None)
         if cached is None:
             cached = not hasattr(self, 'variance_epsilon')
@@ -40,24 +44,15 @@ class NpuRMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         import torch_npu
         input_dtype = hidden_states.dtype
+        target_dtype = torch.float32 if _FORCE_FP32 else input_dtype
         if _FORCE_FP32:
             hidden_states = hidden_states.to(torch.float32)
-            if self._twinkle_residual_param():
-                scale = (1.0 + self.weight).float()
-            else:
-                scale = self.weight.float()
+        if self._twinkle_residual_param():
+            scale = 1.0 + self.weight.to(target_dtype)
         else:
-            if self._twinkle_residual_param():
-                scale = (1.0 + self.weight).to(input_dtype)
-            else:
-                scale = self.weight.to(input_dtype)
+            scale = self.weight.to(target_dtype)
         out = torch_npu.npu_rms_norm(hidden_states, scale, epsilon=self._twinkle_eps())[0]
         return out.to(input_dtype) if _FORCE_FP32 else out
-
-
-# Resolved once at import: matches the legacy "patch-time, process-wide" invariant.
-# Mid-process env mutation will not retroactively change behavior.
-_FORCE_FP32 = os.environ.get('TWINKLE_NPU_GATED_RMSNorm_FP32', '0').lower() in ('1', 'true', 'on', 'yes')
 
 
 def npu_gated_rms_norm_forward(self, hidden_states, gate=None):
@@ -69,7 +64,7 @@ def npu_gated_rms_norm_forward(self, hidden_states, gate=None):
 
     if _FORCE_FP32:
         hidden_states = hidden_states.to(torch.float32)
-        weight = self.weight.float()
+        weight = self.weight.to(torch.float32)
         gate = gate.to(torch.float32) if gate is not None else None
     else:
         weight = self.weight
@@ -77,4 +72,4 @@ def npu_gated_rms_norm_forward(self, hidden_states, gate=None):
     hidden_states = torch_npu.npu_rms_norm(hidden_states, weight, epsilon=_eps)[0]
     if gate is not None:
         hidden_states = hidden_states * F.silu(gate)
-    return hidden_states.to(input_dtype)
+    return hidden_states.to(input_dtype) if _FORCE_FP32 else hidden_states
