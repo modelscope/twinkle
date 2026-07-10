@@ -25,17 +25,6 @@ class NpuRMSNorm(nn.Module):
     """
 
     def _twinkle_residual_param(self) -> bool:
-        """Detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight).
-
-        Detection is by attribute name, not weight values: Qwen3.5 RMSNorm uses
-        ``eps`` and residual parameterization (scale = 1 + weight); Qwen3 /
-        Qwen2 / Llama etc. use ``variance_epsilon`` and standard parameterization
-        (scale = weight).  The previous weight-value heuristic
-        (``abs(mean) < 0.3``) was unreliable: trained Qwen3 weights can have
-        small means, falsely triggering residual mode and inflating the scale
-        by ~90×, which corrupted the forward output and inflated the training
-        loss by ~1.9×.
-        """
         cached = getattr(self, '_twinkle_residual_cached', None)
         if cached is None:
             cached = not hasattr(self, 'variance_epsilon')
