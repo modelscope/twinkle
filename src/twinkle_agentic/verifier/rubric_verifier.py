@@ -26,9 +26,10 @@ breakdown for callers that want the raw signal (e.g. an RL reward).
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle_agentic.utils.llm_backup import llm_backup
 
@@ -55,6 +56,18 @@ a bad one. Each criterion:
 [Principle] for softer quality (reasoning soundness, sub-goal progress, no \
 redundant calls).
 
+Scope discipline (critical — avoid over-strict, mismatched rubrics):
+- This is ONE SEGMENT, possibly the MIDDLE of a longer task. Only write criteria \
+about behavior that is OBSERVABLE INSIDE THIS SEGMENT. Do NOT invent criteria \
+about a final deliverable, later steps, or task completion that this segment is \
+not expected to reach (e.g. "registers the component", "updates the entry point").
+- Infer the task type ONLY from what the segment actually does. Do NOT assume it \
+is an "implement a feature" task unless the segment clearly shows that. When the \
+segment only reads/inspects/answers, judge reading/answering quality, not delivery.
+- Reasoning shown inside <think>...</think> (or <thinking>) is internal scratch \
+work. Never write a criterion that penalizes the mere presence of such reasoning, \
+and do NOT let it count against "output only X" style constraints.
+
 Rules:
 - Output {min_n}-{max_n} criteria, as FEW as needed to cover the key axes.
 - Do NOT reference specific entities/values from THIS segment; keep criteria \
@@ -80,8 +93,17 @@ You are given a rubric (numbered criteria, each tagged [Hard Rule] or \
     <index>: PASS   or   <index>: FAIL
 
 Judge every criterion independently and literally. A [Hard Rule] fails unless \
-it is unambiguously satisfied. Output only the verdict lines, in order, then \
-stop. Do not add explanations."""
+it is unambiguously satisfied.
+
+Grading discipline:
+- Judge ONLY what is observable in THIS segment; if a criterion asks about a \
+step/deliverable this segment was not meant to reach, do not FAIL it for that \
+alone — grade it satisfied when the in-segment behavior is correct.
+- Content inside <think>...</think> (or <thinking>) is internal reasoning, not \
+user-facing output. For "output only X / no extra text" style criteria, ignore \
+such reasoning blocks; judge the actual response payload.
+
+Output only the verdict lines, in order, then stop. Do not add explanations."""
 
 _SCORE_USER = """\
 ## Task / query (context)
@@ -94,6 +116,55 @@ _SCORE_USER = """\
 {segment}
 
 Now output one PASS/FAIL line per criterion, in order."""
+
+
+# --- diagnostic mode: single call yields verdict + reason together ---------
+# Used to distil an "on-the-fly error checker" LoRA (DESIGN §11.6). Unlike the
+# terse scorer above, this asks for a COMPLETE verification chain over EVERY
+# criterion (both pass and fail) so the distilled LoRA learns to also emit
+# "checked, all good, continue" — not only to nitpick. Verdict and reason are
+# produced in ONE pass so they can never disagree.
+_DIAG_SYSTEM = """\
+You are a process error checker for one segment of an agent trajectory. You are \
+given a rubric (numbered criteria, each tagged [Hard Rule] or [Principle]) and \
+the segment. Walk through EVERY criterion in order and, for each, decide PASS or \
+FAIL and briefly justify it grounded in the segment.
+
+Output STRICT JSON (no prose outside it) with this shape:
+{
+  "items": [
+    {"index": 1, "verdict": "PASS", "reason": "<why, grounded in the segment>",
+     "fix": ""},
+    {"index": 2, "verdict": "FAIL", "reason": "<what is wrong and where>",
+     "fix": "<one concrete, actionable correction>"}
+  ],
+  "overall": "OK" | "ISSUES",
+  "summary": "<one sentence: 'no process errors, continue' OR the key issue(s)>"
+}
+
+Rules:
+- Judge every criterion independently and literally; a [Hard Rule] is FAIL \
+unless unambiguously satisfied.
+- Judge ONLY what is observable in THIS segment; do not FAIL a criterion merely \
+because a later step/deliverable it references is outside this segment's scope.
+- Content inside <think>...</think> (or <thinking>) is internal reasoning, not \
+user-facing output; ignore it for "output only X" style criteria.
+- For PASS items, leave "fix" as "". For FAIL items, "fix" must be a concrete \
+correction (e.g. add the missing argument, redo step k).
+- "overall" is "OK" only if NO criterion is FAIL.
+- Output only the JSON object."""
+
+_DIAG_USER = """\
+## Task / query (context)
+{query}
+
+## Rubric
+{rubric}
+
+## Segment
+{segment}
+
+Now output the diagnostic JSON object."""
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +191,33 @@ class ScoreDetail:
     n_votes: int                        # scoring passes actually spent
     rubric: List[RubricItem] = field(default_factory=list)
     per_item_pass_rate: List[float] = field(default_factory=list)
+
+
+@dataclass
+class DiagnosisItem:
+    """Per-criterion diagnostic verdict with its justification."""
+    index: int
+    verdict: bool                       # True == PASS
+    reason: str = ''
+    fix: str = ''                       # concrete correction, only for FAIL
+
+
+@dataclass
+class DiagnoseDetail:
+    """A complete verification chain over one segment (DESIGN §11.6).
+
+    Produced in a single LLM call so verdict and reason are always consistent.
+    Covers EVERY criterion (pass and fail) so a distilled checker learns to emit
+    "checked, no error, continue" as well as concrete fault localisation.
+    """
+    scalar: float                       # aggregated pointwise score in [0, 1]
+    overall_ok: bool                    # True == no criterion failed
+    summary: str                        # one-line human-readable conclusion
+    items: List[DiagnosisItem] = field(default_factory=list)
+    rubric: List[RubricItem] = field(default_factory=list)
+    raw: str = ''                       # raw model output (for SFT targets)
+    query: str = ''                     # task/query context (for SFT inputs)
+    segment_text: str = ''              # rendered segment (for SFT inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +259,17 @@ class RubricVerifier(Verifier):
         max_votes: int = 5,
         gate: bool = True,
         fixed_rubric: Optional[List['RubricItem']] = None,
+        base_rubric: Optional[List['RubricItem']] = None,
+        intent_rubrics: Optional[Dict[str, List['RubricItem']]] = None,
+        intent_base_rubrics: Optional[Dict[str, List['RubricItem']]] = None,
+        max_segment_chars: int = 14_000,
+        long_segment_chars: int = 8_000,
+        min_votes_long: int = 3,
+        long_margin_threshold: float = 0.18,
+        max_votes_long: int = 3,
+        min_votes_high: int = 3,
+        high_score_threshold: float = 0.85,
+        diag_max_tokens: int = 2048,
     ):
         if max_rubrics < min_rubrics:
             raise ValueError('max_rubrics must be >= min_rubrics')
@@ -185,9 +294,32 @@ class RubricVerifier(Verifier):
         self.margin_threshold = float(margin_threshold)
         self.max_votes = int(max_votes)
         self.gate = bool(gate)
+        self.max_segment_chars = int(max_segment_chars)
+        self.long_segment_chars = int(long_segment_chars)
+        self.min_votes_long = max(1, int(min_votes_long))
+        self.long_margin_threshold = float(long_margin_threshold)
+        self.max_votes_long = max(1, int(max_votes_long))
+        # High-confidence band: force at least this many votes when the first
+        # pass lands >= high_score_threshold, so 4/4-looking "level 4" segments
+        # are not decided by a single lucky sample (reduces high-band variance).
+        self.min_votes_high = max(1, int(min_votes_high))
+        self.high_score_threshold = float(high_score_threshold)
+        # Diagnosis emits a full per-criterion (verdict+reason+fix) JSON; it needs
+        # a far larger token budget than terse scoring or it truncates mid-JSON.
+        self.diag_max_tokens = max(256, int(diag_max_tokens))
         # When provided, skip stage-1 rubric generation and score against these
         # fixed criteria (e.g. a safety rubric — AUDIT D8).
         self.fixed_rubric: Optional[List['RubricItem']] = list(fixed_rubric) if fixed_rubric else None
+        # Skeleton criteria PREPENDED to every distilled rubric (half-fixed mode,
+        # DESIGN follow-up): stabilizes cross-segment comparability while still
+        # letting stage-1 add task-specific criteria. Ignored when fixed_rubric set.
+        self.base_rubric: Optional[List['RubricItem']] = list(base_rubric) if base_rubric else None
+        # Intent-aware routing: per-intent fully-fixed rubrics (highest priority)
+        # and per-intent half-fixed skeletons. Keys are intent strings (intents.py).
+        self.intent_rubrics: Optional[Dict[str, List['RubricItem']]] = (
+            {k: list(v) for k, v in intent_rubrics.items()} if intent_rubrics else None)
+        self.intent_base_rubrics: Optional[Dict[str, List['RubricItem']]] = (
+            {k: list(v) for k, v in intent_base_rubrics.items()} if intent_base_rubrics else None)
 
     # ------------------------------------------------------------------
     # public entry points
@@ -197,9 +329,10 @@ class RubricVerifier(Verifier):
 
     def score_detail(self, trajectory: dict, *, query: Optional[str] = None,
                      sampling_params: Any = None,
-                     extra_context: Optional[str] = None) -> ScoreDetail:
+                     extra_context: Optional[str] = None,
+                     intent: Optional[str] = None) -> ScoreDetail:
         query = query or self._infer_query(trajectory)
-        segment_text = self._render_segment(trajectory)
+        segment_text = self._trim_segment_for_llm(self._render_segment(trajectory))
         # D7c: fold an objective finding into the scored transcript so the judge
         # re-scores WITH the hard evidence in view (objective corrects subjective).
         if extra_context:
@@ -220,15 +353,7 @@ class RubricVerifier(Verifier):
             )
 
         # --- stage 1: rubric (fixed if configured, else distilled generation) ---
-        if self.fixed_rubric is not None:
-            rubric = list(self.fixed_rubric)
-        else:
-            raw_rubric = self._gen_rubric(
-                trajectory=self._gen_trajectory(query, segment_text),
-                sampling_params=self._gen_sampling_params(sampling_params),
-                query=query,
-            )
-            rubric = self._parse_rubric(raw_rubric)
+        rubric = self._build_rubric(query, segment_text, sampling_params, intent=intent)
         if not rubric:
             # No usable rubric: fall back to the code signal alone.
             scalar = hard_pass_rate if has_hard else 0.0
@@ -263,9 +388,116 @@ class RubricVerifier(Verifier):
             per_item_pass_rate=per_item_rate,
         )
 
+    def diagnose(self, trajectory: dict, *, query: Optional[str] = None,
+                 sampling_params: Any = None,
+                 intent: Optional[str] = None) -> DiagnoseDetail:
+        """Produce a COMPLETE verification chain over the segment (DESIGN §11.6).
+
+        Unlike :meth:`score_detail` (terse PASS/FAIL, tuned to be cheap), this
+        emits, in a SINGLE llm_backup-distilled call, a per-criterion verdict
+        *with* its reason and (on FAIL) a concrete fix, plus an overall verdict.
+        The single call keeps verdict and reason mutually consistent, and it
+        covers passing criteria too so a distilled checker learns to say
+        "checked, no error, continue" — not only to nitpick.
+
+        Every call flows through ``llm_backup``: the (student, teacher, match)
+        pairs it records are exactly the SFT corpus for the error-checker LoRA.
+        Store all of them (both OK and ISSUES segments); balancing is a
+        training-time sampling concern, not a collection-time one.
+        """
+        query = query or self._infer_query(trajectory)
+        segment_text = self._trim_segment_for_llm(self._render_segment(trajectory))
+
+        if not self._llm_available():
+            # No LLM: fall back to the deterministic code signal only.
+            hard_pass_rate, has_hard = self._code_hard_checks(trajectory)
+            scalar = hard_pass_rate if has_hard else 1.0
+            return DiagnoseDetail(
+                scalar=scalar, overall_ok=scalar >= 1.0,
+                summary='no LLM available; code-hard signal only',
+                items=[], rubric=[], raw='', query=query, segment_text=segment_text)
+
+        # Reuse the same rubric machinery as scoring (fixed / half-fixed / gen).
+        rubric = self._build_rubric(query, segment_text, sampling_params, intent=intent)
+        if not rubric:
+            hard_pass_rate, has_hard = self._code_hard_checks(trajectory)
+            scalar = hard_pass_rate if has_hard else 1.0
+            return DiagnoseDetail(
+                scalar=scalar, overall_ok=scalar >= 1.0,
+                summary='no usable rubric; code-hard signal only',
+                items=[], rubric=rubric, raw='', query=query, segment_text=segment_text)
+
+        rubric_block = self._render_rubric(rubric)
+        rubric_key = _short_hash(rubric_block)
+        raw = self._diagnose_once(
+            trajectory=self._diagnose_trajectory(query, rubric_block, segment_text),
+            sampling_params=self._diagnose_sampling_params(sampling_params, temperature=0.0),
+            query=query, rubric_key=rubric_key)
+
+        items, overall_ok, summary = self._parse_diagnosis(raw, len(rubric))
+        # Blend deterministic hard checks in as a gatekeeper floor, mirroring
+        # score_detail so the diagnostic scalar is comparable to the scoring one.
+        per_item_rate = [1.0 if it.verdict else 0.0 for it in items]
+        llm_scalar = self._aggregate(rubric, per_item_rate) if per_item_rate else 0.0
+        hard_pass_rate, has_hard = self._code_hard_checks(trajectory)
+        scalar = llm_scalar
+        if self.gate and has_hard and hard_pass_rate < 1.0:
+            scalar = min(llm_scalar, hard_pass_rate)
+        return DiagnoseDetail(
+            scalar=scalar, overall_ok=overall_ok, summary=summary,
+            items=items, rubric=rubric, raw=raw,
+            query=query, segment_text=segment_text)
+
     # ------------------------------------------------------------------
-    # stage 1: rubric generation (student, distilled via llm_backup)
+    # stage 1: rubric assembly (fixed | half-fixed skeleton + distilled | gen)
     # ------------------------------------------------------------------
+    def _build_rubric(self, query, segment_text, sampling_params,
+                      intent: Optional[str] = None) -> List[RubricItem]:
+        """Return the rubric to score against.
+
+        Selection order (intent-aware routing, DESIGN follow-up):
+        1. ``intent_rubrics[intent]`` set -> fully fixed for this intent (most
+           stable; template-like tasks such as tool_call / code / math).
+        2. ``fixed_rubric`` set           -> global fixed rubric, verbatim.
+        3. else                           -> distilled generation, optionally
+           PREPENDED with a fixed skeleton: ``intent_base_rubrics[intent]`` if
+           present, else the global ``base_rubric`` (half-fixed). Skeleton gives
+           cross-segment comparability; the generated tail adds task-specific
+           coverage. Duplicate criteria (same normalized text) drop, skeleton wins.
+        """
+        if intent and self.intent_rubrics and intent in self.intent_rubrics:
+            return list(self.intent_rubrics[intent])
+        if self.fixed_rubric is not None:
+            return list(self.fixed_rubric)
+
+        skeleton: Optional[List[RubricItem]] = None
+        if intent and self.intent_base_rubrics and intent in self.intent_base_rubrics:
+            skeleton = self.intent_base_rubrics[intent]
+        elif self.base_rubric:
+            skeleton = self.base_rubric
+
+        gen_min = self.min_rubrics
+        gen_max = self.max_rubrics
+        if skeleton:
+            # leave room for the skeleton so the total stays in the count window
+            gen_min = max(1, self.min_rubrics - len(skeleton))
+            gen_max = max(gen_min, self.max_rubrics - len(skeleton))
+        raw_rubric = self._gen_rubric(
+            trajectory=self._gen_trajectory(query, segment_text, gen_min, gen_max),
+            sampling_params=self._gen_sampling_params(sampling_params),
+            query=query)
+        generated = self._parse_rubric(raw_rubric)
+        if not skeleton:
+            return generated
+        merged = list(skeleton)
+        seen = {_norm_criterion(it.text) for it in merged}
+        for it in generated:
+            key = _norm_criterion(it.text)
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(it)
+        return merged
+
     @llm_backup(key_params=['query'], comparator=lambda a, b: _rubric_similar(a, b))
     def _gen_rubric(self, trajectory, sampling_params, query: str = None) -> str:
         return self._sample_text(trajectory, sampling_params, self.gen_lora_path)
@@ -282,12 +514,32 @@ class RubricVerifier(Verifier):
                     rubric_key: str = '') -> str:
         return self._sample_text(trajectory, sampling_params, self.score_lora_path)
 
+    # ------------------------------------------------------------------
+    # diagnostic pass (student, distilled via llm_backup) — DESIGN §11.6
+    # ------------------------------------------------------------------
+    # Distilled on the full (verdict + reason) chain. Consistency is checked on
+    # the per-criterion verdict vector (same idea as scoring), not on the free
+    # text of the reasons — two valid reasons for the same verdict should match.
+    @llm_backup(key_params=['query', 'rubric_key'],
+                comparator=lambda a, b: _diag_verdicts_close(a, b))
+    def _diagnose_once(self, trajectory, sampling_params, query: str = None,
+                       rubric_key: str = '') -> str:
+        return self._sample_text(trajectory, sampling_params, self.score_lora_path)
+
     def _score_with_voting(self, query, segment_text, rubric, sampling_params
                            ) -> Tuple[List[float], int]:
         n = len(rubric)
         rubric_block = self._render_rubric(rubric)
         rubric_key = _short_hash(rubric_block)
         score_traj = self._score_trajectory(query, rubric_block, segment_text)
+
+        margin_thr = self.margin_threshold
+        vote_cap = self.max_votes
+        min_votes = 1
+        if len(segment_text) >= self.long_segment_chars:
+            margin_thr = self.long_margin_threshold
+            min_votes = self.min_votes_long
+            vote_cap = min(vote_cap, self.max_votes_long)
 
         # First (cheap) pass.
         votes: List[List[bool]] = []
@@ -297,20 +549,36 @@ class RubricVerifier(Verifier):
             query=query, rubric_key=rubric_key)
         votes.append(self._parse_verdicts(first, n))
 
-        # Decide whether to escalate: uncertainty = closeness of pass-rate to 0.5.
+        # High-confidence band: a lone pass that looks like "all good" (>= the
+        # high threshold) still gets re-sampled, so top-band scores are not
+        # decided by one lucky draw. Raise the required vote depth accordingly.
         rate = self._vote_rates(votes)
-        if self._is_uncertain(rate) and self.max_votes > 1:
+        first_scalar = self._aggregate(rubric, rate)
+        if first_scalar >= self.high_score_threshold:
+            min_votes = max(min_votes, min(self.min_votes_high, vote_cap))
+
+        # Escalate when uncertain OR when the vote-depth floor is not yet met.
+        if vote_cap > 1 and (self._is_uncertain(rate, margin_thr) or len(votes) < min_votes):
             sp = self._score_sampling_params(sampling_params, temperature=0.7)
-            # Escalate up to max_votes; early-stop once verdicts stabilize.
-            while len(votes) < self.max_votes:
+            while len(votes) < vote_cap:
                 extra = self._score_once(
                     trajectory=score_traj, sampling_params=sp,
                     query=query, rubric_key=rubric_key)
                 votes.append(self._parse_verdicts(extra, n))
                 rate = self._vote_rates(votes)
-                if not self._is_uncertain(rate):
+                if len(votes) >= min_votes and not self._is_uncertain(rate, margin_thr):
                     break
         return rate, len(votes)
+
+    def _trim_segment_for_llm(self, text: str) -> str:
+        cap = self.max_segment_chars
+        if len(text) <= cap:
+            return text
+        head = cap // 2 - 96
+        tail = cap // 2 - 96
+        omitted = len(text) - head - tail
+        return (f'{text[:head]}\n\n[... {omitted} chars omitted for rubric scoring ...]\n\n'
+                f'{text[-tail:]}')
 
     # ------------------------------------------------------------------
     # code-level hard verification (no LLM)
@@ -371,13 +639,15 @@ class RubricVerifier(Verifier):
         level = int(round(scalar * (self.NUM_LEVELS - 1)))
         return min(self.NUM_LEVELS - 1, max(0, level))
 
-    def _is_uncertain(self, per_item_rate: Sequence[float]) -> bool:
+    def _is_uncertain(self, per_item_rate: Sequence[float],
+                      margin_threshold: Optional[float] = None) -> bool:
         """A segment is uncertain if any criterion sits near the 0.5 boundary."""
+        thr = self.margin_threshold if margin_threshold is None else margin_threshold
         if not per_item_rate:
             return False
         # distance of the aggregate margin from a confident 0/1 verdict
         for r in per_item_rate:
-            if abs(r - 0.5) * 2.0 < self.margin_threshold:
+            if abs(r - 0.5) * 2.0 < thr:
                 return True
         return False
 
@@ -413,7 +683,6 @@ class RubricVerifier(Verifier):
         """
         if self.sampler is not None:
             return True
-        import os
         return bool(os.environ.get('LLM_BACKUP_API_KEY')
                     or os.environ.get('OPENAI_API_KEY')
                     or os.environ.get('LLM_BACKUP_BASE_URL'))
@@ -433,9 +702,12 @@ class RubricVerifier(Verifier):
         seqs = getattr(resp, 'sequences', None) or []
         return (getattr(seqs[0], 'decoded', None) or '') if seqs else ''
 
-    def _gen_trajectory(self, query: str, segment_text: str) -> dict:
+    def _gen_trajectory(self, query: str, segment_text: str,
+                        min_n: Optional[int] = None, max_n: Optional[int] = None) -> dict:
         user = _fill(_GEN_USER, query=query, segment=segment_text)
-        system = _fill(_GEN_SYSTEM, min_n=self.min_rubrics, max_n=self.max_rubrics)
+        system = _fill(_GEN_SYSTEM,
+                       min_n=self.min_rubrics if min_n is None else min_n,
+                       max_n=self.max_rubrics if max_n is None else max_n)
         return {'messages': [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': user},
@@ -445,6 +717,13 @@ class RubricVerifier(Verifier):
         user = _fill(_SCORE_USER, query=query, rubric=rubric_block, segment=segment_text)
         return {'messages': [
             {'role': 'system', 'content': _SCORE_SYSTEM},
+            {'role': 'user', 'content': user},
+        ]}
+
+    def _diagnose_trajectory(self, query: str, rubric_block: str, segment_text: str) -> dict:
+        user = _fill(_DIAG_USER, query=query, rubric=rubric_block, segment=segment_text)
+        return {'messages': [
+            {'role': 'system', 'content': _DIAG_SYSTEM},
             {'role': 'user', 'content': user},
         ]}
 
@@ -461,6 +740,22 @@ class RubricVerifier(Verifier):
             return override
         from twinkle.data_format.sampling import SamplingParams
         return SamplingParams(temperature=temperature, max_tokens=256)
+
+    def _diagnose_sampling_params(self, override, *, temperature: float):
+        """Token budget for the diagnostic pass.
+
+        Scoring emits terse PASS/FAIL lines (256 tokens is plenty), but the
+        diagnosis emits a full JSON object with a per-criterion reason AND fix
+        for EVERY rubric item. With ~7 criteria that easily exceeds 256 tokens
+        and the JSON gets truncated mid-string (unparsable -> all-FAIL fallback,
+        useless as SFT data). Give it a much larger budget, scaled by rubric size
+        and overridable via ``RUBRIC_DIAG_MAX_TOKENS``.
+        """
+        if override is not None:
+            return override
+        from twinkle.data_format.sampling import SamplingParams
+        cap = int(os.environ.get('RUBRIC_DIAG_MAX_TOKENS', str(self.diag_max_tokens)))
+        return SamplingParams(temperature=temperature, max_tokens=cap)
 
     # ------------------------------------------------------------------
     # rendering / parsing helpers
@@ -545,6 +840,58 @@ class RubricVerifier(Verifier):
                 verdicts[idx] = m.group(2).lower() in ('pass', 'true', 'yes', '1')
         return verdicts
 
+    @classmethod
+    def _parse_diagnosis(cls, raw: str, n: int
+                         ) -> Tuple[List[DiagnosisItem], bool, str]:
+        """Parse the diagnostic JSON into (items, overall_ok, summary).
+
+        Robust to models that wrap JSON in code fences or add stray prose. Falls
+        back to the PASS/FAIL line parser when JSON is unrecoverable, so a
+        malformed diagnostic still yields usable verdicts (missing -> FAIL).
+        """
+        obj = _extract_json_obj(raw)
+        entries: List[dict] = []
+        if isinstance(obj, dict) and isinstance(obj.get('items'), list):
+            entries = [e for e in obj['items'] if isinstance(e, dict)]
+        if not entries:
+            # The full JSON did not parse (commonly a truncated response): salvage
+            # every COMPLETE ``{...}`` item object so partial diagnoses stay usable
+            # instead of degrading to an all-FAIL, reason-less vector.
+            entries = _salvage_diag_items(raw)
+
+        items: List[DiagnosisItem] = []
+        for i, entry in enumerate(entries):
+            try:
+                idx = int(entry.get('index', i + 1))
+            except (TypeError, ValueError):
+                idx = i + 1
+            verdict = str(entry.get('verdict', '')).strip().lower() in (
+                'pass', 'true', 'yes', '1', 'ok')
+            items.append(DiagnosisItem(
+                index=idx, verdict=verdict,
+                reason=str(entry.get('reason', '') or '').strip(),
+                fix=str(entry.get('fix', '') or '').strip()))
+        if not items:
+            # Last resort: the terse verdict-line parser (missing -> FAIL).
+            verdicts = cls._parse_verdicts(raw, n)
+            items = [DiagnosisItem(index=i + 1, verdict=v)
+                     for i, v in enumerate(verdicts)]
+
+        overall_ok = all(it.verdict for it in items) if items else False
+        summary = ''
+        if isinstance(obj, dict):
+            summary = str(obj.get('summary', '') or '').strip()
+            overall_raw = str(obj.get('overall', '') or '').strip().lower()
+            if overall_raw in ('ok', 'pass', 'good'):
+                # Trust an explicit OK only if no item contradicts it.
+                overall_ok = overall_ok and True
+            elif overall_raw in ('issues', 'issue', 'fail', 'bad'):
+                overall_ok = False
+        if not summary:
+            summary = ('no process errors, continue' if overall_ok
+                       else 'process issues found')
+        return items, overall_ok, summary
+
 
 # ---------------------------------------------------------------------------
 # module-level helpers (comparators etc.)
@@ -574,6 +921,15 @@ def _is_valid_json_args(args: Any) -> bool:
 def _short_hash(text: str) -> str:
     import hashlib
     return hashlib.md5((text or '').encode()).hexdigest()[:12]
+
+
+_NORM_RE = re.compile(r'[^a-z0-9]+')
+
+
+def _norm_criterion(text: str) -> str:
+    """Normalize criterion text for dedup (lowercase, alnum-only, first 12 words)."""
+    words = _NORM_RE.sub(' ', (text or '').lower()).split()
+    return ' '.join(words[:12])
 
 
 _TAG_ANY_RE = re.compile(r'\[\s*(hard\s*rule|principle)\s*\]', re.IGNORECASE)
@@ -618,6 +974,101 @@ def _verdicts_close(a: str, b: str, tol: float = 0.25) -> bool:
     """Comparator for rubric scoring: student/teacher agree when their overall
     PASS rate is within ``tol`` (binned agreement, not byte-identical text)."""
     ra, rb = _parse_rate(a), _parse_rate(b)
+    if ra is None or rb is None:
+        return (a or '').strip() == (b or '').strip()
+    return abs(ra - rb) <= tol
+
+
+def _salvage_diag_items(raw: str) -> List[dict]:
+    """Recover complete diagnosis item objects from a (possibly truncated) reply.
+
+    Scans for balanced ``{...}`` spans (string-aware, so braces inside a reason
+    like ``\\subsubsection*{...}`` don't corrupt the depth count) and json-parses
+    each object that carries a ``verdict`` key. A response cut off mid-stream
+    still yields every item emitted before the cut, so the diagnosis keeps its
+    reasons/fixes instead of collapsing to an all-FAIL, reason-less vector.
+    """
+    if not raw:
+        return []
+    out: List[dict] = []
+    stack: List[int] = []          # start index of each open brace, by depth
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(raw):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            stack.append(i)
+        elif ch == '}' and stack:
+            start = stack.pop()
+            frag = raw[start:i + 1]
+            # Only leaf-ish item objects carry a verdict; the outer envelope
+            # ({"items": [...]}) usually never closes when truncated anyway.
+            if '"verdict"' in frag and '"items"' not in frag:
+                try:
+                    obj = json.loads(frag)
+                    if isinstance(obj, dict):
+                        out.append(obj)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    return out
+
+
+def _extract_json_obj(raw: str) -> Optional[dict]:
+    """Best-effort extraction of the first JSON object from a model response.
+
+    Handles bare JSON, ```json fenced blocks, and JSON embedded in prose.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    # Strip a leading/trailing code fence if present.
+    if s.startswith('```'):
+        s = re.sub(r'^```[a-zA-Z]*\s*', '', s)
+        s = re.sub(r'\s*```$', '', s).strip()
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Fall back to the widest {...} span.
+    start = s.find('{')
+    end = s.rfind('}')
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(s[start:end + 1])
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+def _diag_rate(raw: str) -> Optional[float]:
+    """Overall PASS rate from a diagnostic JSON response (for the comparator)."""
+    obj = _extract_json_obj(raw)
+    if isinstance(obj, dict) and isinstance(obj.get('items'), list):
+        verdicts = [str(e.get('verdict', '')).strip().lower() in
+                    ('pass', 'true', 'yes', '1', 'ok')
+                    for e in obj['items'] if isinstance(e, dict)]
+        if verdicts:
+            return sum(1 for v in verdicts if v) / len(verdicts)
+    return _parse_rate(raw)
+
+
+def _diag_verdicts_close(a: str, b: str, tol: float = 0.25) -> bool:
+    """Comparator for the diagnostic pass: student/teacher agree when their
+    overall PASS rate is within ``tol``. Reasons are free text, so we match on
+    the verdict vector (two valid phrasings of the same verdict count as a
+    match), not on byte-identical explanations."""
+    ra, rb = _diag_rate(a), _diag_rate(b)
     if ra is None or rb is None:
         return (a or '').strip() == (b or '').strip()
     return abs(ra - rb) <= tol

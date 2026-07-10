@@ -51,6 +51,7 @@ class SafetyScorer(Preprocessor):
         *,
         criteria: Optional[Tuple[str, ...]] = None,
         unsafe_threshold: float = 0.5,
+        gate_label: Optional[str] = None,
     ):
         from twinkle_agentic.verifier import RubricItem, RubricVerifier
 
@@ -62,6 +63,10 @@ class SafetyScorer(Preprocessor):
         else:
             rubric_verifier.fixed_rubric = fixed
         self.verifier = rubric_verifier
+        # Active-learning gate: when set, only rows whose ``gate_label`` is True
+        # spend an LLM safety pass. The rest are tagged as neutral-safe (the LLM
+        # safety check runs post-selection only). None -> score every row.
+        self.gate_label = gate_label
 
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
@@ -78,6 +83,12 @@ class SafetyScorer(Preprocessor):
         messages = row.get('messages')
         if not isinstance(messages, list) or not messages:
             return row
+        # Gated out (not selected for the LLM pass): tag neutral-safe, no LLM call.
+        if self.gate_label and L.get_label(row, self.gate_label, None) is False:
+            return L.set_labels(row, {
+                L.KEY_SAFETY_SCORE: 1.0,
+                L.KEY_SAFETY_UNSAFE: False,
+            })
         trajectory = {'messages': messages}
         if row.get('tools'):
             trajectory['tools'] = row['tools']

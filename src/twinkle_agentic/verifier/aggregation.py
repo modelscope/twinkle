@@ -165,6 +165,8 @@ def fuse_segment(
         hard_agg: reducer for per-round hard scores ('gmean'|'mean'|'min'|...).
         fusion: how to combine hard_agg and rubric:
             'product'  -> hard_agg * rubric   (hard acts as a floor/gatekeeper)
+            'hard_soft_blend' -> product, but when hard is high blend rubric toward
+                a floor so all-pass tool segments are not one-shot vetoed
             'min'      -> min(hard_agg, rubric)
             'mean'     -> (hard_agg + rubric)/2
             'hard_only'-> ignore rubric entirely
@@ -218,6 +220,16 @@ def _rubric_scalar(result: Any) -> float:
 def _combine(hard: float, soft: float, fusion: str) -> float:
     if fusion == 'product':
         return hard * soft
+    if fusion == 'hard_soft_blend':
+        # When hard checks are strong (tool/format all pass), a harsh rubric on a
+        # long agent trace must not one-shot veto the segment (product → ~0.08).
+        if hard >= 0.9:
+            mix = 0.55 * soft + 0.45
+        elif hard >= 0.75:
+            mix = 0.75 * soft + 0.25
+        else:
+            mix = soft
+        return hard * mix
     if fusion == 'min':
         return min(hard, soft)
     if fusion == 'mean':

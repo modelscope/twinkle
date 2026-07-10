@@ -155,6 +155,7 @@ class DeadLoopFilter(Preprocessor):
         think_hesitation_density_threshold: float = 15.0,
         think_cascade_threshold: int = 20,
         think_repetition_threshold: float = 0.65,
+        agent_min_stuck_turns: int = 2,
     ) -> None:
         super().__init__()
         # Two threshold profiles: laxer inside <think> reasoning (free to ramble),
@@ -175,6 +176,7 @@ class DeadLoopFilter(Preprocessor):
             ngram_size=ngram_size,
             ngram_min_words=ngram_min_words,
         )
+        self._agent_min_stuck_turns = max(1, int(agent_min_stuck_turns))
 
     def _is_stuck(self, text: str, reasoning: str = '') -> bool:
         think_part, response_part = _split_think(text)
@@ -204,11 +206,14 @@ class DeadLoopFilter(Preprocessor):
             if not asst_msgs:
                 out.append(row)
                 continue
-            if any(
-                    self._is_stuck(
-                        msg_content_text(m).strip(),
-                        (m.get('reasoning_content') or m.get('thinking') or '').strip(),
-                    ) for m in asst_msgs):
+            stuck_turns = sum(
+                1 for m in asst_msgs
+                if self._is_stuck(
+                    msg_content_text(m).strip(),
+                    (m.get('reasoning_content') or m.get('thinking') or '').strip(),
+                ))
+            min_stuck = self._agent_min_stuck_turns if agent else 1
+            if stuck_turns >= min_stuck:
                 dropped.append(dict(row, drop_reason='dead_loop'))
             else:
                 out.append(row)

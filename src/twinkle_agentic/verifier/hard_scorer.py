@@ -272,13 +272,24 @@ def check_protocol_pairing(view: TrajectoryView) -> CheckResult:
 
 
 def check_no_repeated_calls(view: TrajectoryView) -> CheckResult:
-    """Penalize exact-duplicate (name, args) calls (dead-loop / redundancy)."""
+    """Penalize degenerate tool-call loops.
+
+    Two independent signals, worst one wins:
+    1. exact-duplicate ``(name, args)`` calls — classic redundant repetition;
+    2. single-tool domination — one tool name fired over and over (even with
+       *different* args), the "spin the same tool forever" failure that (1)
+       misses because the arguments differ each time. Only kicks in once there
+       are enough calls (``>= _SPIN_MIN_CALLS``) so a legitimate 3-4 step loop
+       of the same tool is not punished.
+    """
     calls = view.tool_calls
     if len(calls) < 2:
         return CheckResult('no_repeated_calls', 1.0, 1.0, critical=False,
                            n=len(calls), detail='fewer than 2 calls')
+
     seen: set = set()
     dupes = 0
+    name_counts: Dict[str, int] = {}
     for tc in calls:
         args = view.parsed_args(tc)
         key = (tc.name, json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(tc.raw_args))
@@ -286,9 +297,33 @@ def check_no_repeated_calls(view: TrajectoryView) -> CheckResult:
             dupes += 1
         else:
             seen.add(key)
-    score = 1.0 - dupes / len(calls)
+        name_counts[tc.name or ''] = name_counts.get(tc.name or '', 0) + 1
+    dup_score = 1.0 - dupes / len(calls)
+
+    # Single-tool domination: one tool fired over and over (a spin loop). This
+    # is only a *soft* signal — a legitimate agent may batch-read 8 files with
+    # the same tool — so it is deliberately lenient: it only triggers on long
+    # sequences that are almost entirely one tool, and it floors the penalty so
+    # a batch operation is nudged down, not zeroed. Real dead-loops (empty
+    # repeated spins) get further penalized by the rubric / final-answer checks.
+    _SPIN_MIN_CALLS = 8
+    _SPIN_TOLERATED_SHARE = 0.8
+    _SPIN_FLOOR = 0.4
+    spin_score = 1.0
+    top_name, top_n = max(name_counts.items(), key=lambda kv: kv[1])
+    top_share = top_n / len(calls)
+    if len(calls) >= _SPIN_MIN_CALLS and top_share > _SPIN_TOLERATED_SHARE:
+        # Linearly map (tolerated..1.0] share onto (1.0.._SPIN_FLOOR] score.
+        frac = (top_share - _SPIN_TOLERATED_SHARE) / (1.0 - _SPIN_TOLERATED_SHARE)
+        spin_score = max(_SPIN_FLOOR, 1.0 - (1.0 - _SPIN_FLOOR) * frac)
+
+    score = min(dup_score, spin_score)
+    detail = f'{dupes} duplicate calls'
+    if spin_score < dup_score:
+        detail = (f"tool '{top_name}' dominates {top_n}/{len(calls)} "
+                  f'calls ({top_share:.0%})')
     return CheckResult('no_repeated_calls', score, 1.0, critical=False,
-                       n=len(calls), detail=f'{dupes} duplicate calls')
+                       n=len(calls), detail=detail)
 
 
 def check_clean_termination(view: TrajectoryView) -> CheckResult:

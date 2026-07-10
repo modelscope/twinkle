@@ -27,6 +27,8 @@ scorer still produces useful per-round hard scores with zero LLM calls.
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
@@ -61,7 +63,7 @@ class TrajectoryScorer(Preprocessor):
         rubric_verifier: Optional[Any] = None,
         *,
         hard_agg: str = 'gmean',
-        fusion: str = 'product',
+        fusion: str = 'hard_soft_blend',
         hard_floor: float = 0.25,
         hard_ceil_skip: Optional[float] = None,
         traj_agg: str = 'mean',
@@ -69,6 +71,11 @@ class TrajectoryScorer(Preprocessor):
         write_round_detail: bool = False,
         calibrate: bool = True,
         disagree_margin: float = 0.34,
+        reconcile_max_messages: int = 80,
+        scorer_workers: Optional[int] = None,
+        intent_aware: bool = True,
+        rubric_gate_label: Optional[str] = L.KEY_SELECTED_FOR_RUBRIC,
+        persist_diagnosis: bool = False,
     ):
         # Lazy imports keep the module importable even if verifier/segment deps
         # are heavy; construction still fails loudly if the packages are absent.
@@ -78,6 +85,19 @@ class TrajectoryScorer(Preprocessor):
         self.segmenter = segmenter if segmenter is not None else TurnSegmenter('cluster')
         self.hard_scorer = hard_scorer if hard_scorer is not None else HardScorer()
         self.rubric_verifier = rubric_verifier
+        # Route each segment's rubric by its structural intent (tool_call/code/
+        # math) so the verifier can apply intent-keyed fixed/half-fixed rubrics.
+        self.intent_aware = bool(intent_aware)
+        self._intent_detectors = None
+        # Active-learning gate: when set, only rows whose ``rubric_gate_label`` is
+        # True spend an LLM rubric pass; the rest are scored hard-only. Leaving it
+        # None (or the label absent) preserves the "rubric every row" behavior.
+        self.rubric_gate_label = rubric_gate_label
+        # When True, rubric-scored segments also emit a full DiagnoseDetail
+        # (per-criterion verdict + reason + fix + raw teacher output). Persisted
+        # under KEY_RUBRIC_DIAGNOSIS as the SFT corpus for a distilled PRM/checker
+        # LoRA. Costs one extra teacher call per scored segment.
+        self.persist_diagnosis = bool(persist_diagnosis)
         self.hard_agg = hard_agg
         self.fusion = fusion
         self.hard_floor = float(hard_floor)
@@ -88,17 +108,26 @@ class TrajectoryScorer(Preprocessor):
         # D7c: self-evolving calibration (no human alignment).
         self.calibrate = bool(calibrate)
         self.disagree_margin = float(disagree_margin)
+        self.reconcile_max_messages = int(reconcile_max_messages)
+        if scorer_workers is None:
+            scorer_workers = int(os.environ.get('TRAJ_SCORER_WORKERS', '1'))
+        self.scorer_workers = max(1, int(scorer_workers))
+
+    def _score_row_safe(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return self._score_row(row)
+        except Exception as e:
+            logger.warning(f'[TrajectoryScorer] scoring failed, row left unscored: {e}')
+            return row
 
     # ------------------------------------------------------------------
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            try:
-                out.append(self._score_row(row))
-            except Exception as e:  # scoring must never break the pipeline
-                logger.warning(f'[TrajectoryScorer] scoring failed, row left unscored: {e}')
-                out.append(row)
+        if self.scorer_workers <= 1 or len(rows) <= 1:
+            out = [self._score_row_safe(row) for row in rows]
+        else:
+            with ThreadPoolExecutor(max_workers=self.scorer_workers) as pool:
+                out = list(pool.map(self._score_row_safe, rows))
         return out, []  # mapper: never drops
 
     # ------------------------------------------------------------------
@@ -119,12 +148,22 @@ class TrajectoryScorer(Preprocessor):
         if not segments:
             return row
 
+        # Active-learning gate: skip the LLM rubric for rows not pre-selected by
+        # ValueSelector (hard-only), so expensive labeling is spent on the top
+        # fraction only. Absent label -> treat as selected (backward compatible).
+        rubric_enabled = self.rubric_verifier is not None
+        if rubric_enabled and self.rubric_gate_label:
+            selected = L.get_label(row, self.rubric_gate_label, None)
+            if selected is False:
+                rubric_enabled = False
+
         query = self._infer_query(messages)
         all_round_scalars: List[float] = []
         all_round_gated: List[bool] = []
         segment_scalars: List[float] = []
         segment_confidence: List[float] = []
         segment_scores = []
+        diagnoses: List[Dict[str, Any]] = []
 
         for s_idx, segment in enumerate(segments):
             rounds = split_segment_into_rounds(segment)
@@ -140,7 +179,12 @@ class TrajectoryScorer(Preprocessor):
                 all_round_scalars.append(detail.scalar)
                 all_round_gated.append(detail.gated)
 
-            rubric_fn = self._make_rubric_fn(segment, query, round_scores)
+            seg_intent = None
+            if rubric_enabled:
+                seg_intent = self._segment_intent(segment) if self.intent_aware else None
+                rubric_fn = self._make_rubric_fn(segment, query, round_scores, seg_intent)
+            else:
+                rubric_fn = None
             seg_score = fuse_segment(
                 s_idx, round_scores, rubric_fn,
                 hard_agg=self.hard_agg, fusion=self.fusion,
@@ -151,6 +195,14 @@ class TrajectoryScorer(Preprocessor):
             segment_scores.append(seg_score)
             segment_scalars.append(seg_score.scalar)
             segment_confidence.append(self._segment_confidence(seg_score))
+
+            # Persist a full diagnostic chain for segments that actually reached
+            # the LLM (not hard-only / short-circuited) — the PRM/checker SFT data.
+            if (self.persist_diagnosis and rubric_enabled
+                    and not seg_score.short_circuited):
+                diag = self._diagnose_segment(segment, query, seg_intent, s_idx)
+                if diag is not None:
+                    diagnoses.append(diag)
 
         traj = aggregate_trajectory(
             segment_scores, how=self.traj_agg, weight_by_rounds=self.weight_by_rounds)
@@ -176,10 +228,77 @@ class TrajectoryScorer(Preprocessor):
                     for s in segment_scores
                 ],
             }
+        if self.persist_diagnosis and diagnoses:
+            labels[L.KEY_RUBRIC_DIAGNOSIS] = diagnoses
         return L.set_labels(row, labels)
 
+    def _diagnose_segment(self, segment: dict, query: str, intent, s_idx: int):
+        """Run the verifier's full diagnosis and pack it for persistence.
+
+        Emits everything a distilled PRM/checker LoRA needs: per-criterion
+        verdict + reason + fix, the overall verdict, the rubric text, and the
+        raw teacher output (SFT target) alongside the query + segment text
+        (SFT inputs). Never raises — diagnosis is best-effort enrichment.
+        """
+        rv = self.rubric_verifier
+        if rv is None or not hasattr(rv, 'diagnose'):
+            return None
+        try:
+            d = rv.diagnose(segment, query=query, intent=intent)
+        except Exception as e:
+            logger.warning(f'[TrajectoryScorer] diagnose failed (seg {s_idx}): {e}')
+            return None
+        if d is None:
+            return None
+        return {
+            'segment_index': s_idx,
+            'intent': intent,
+            'scalar': round(float(getattr(d, 'scalar', 0.0)), 6),
+            'overall_ok': bool(getattr(d, 'overall_ok', False)),
+            'summary': getattr(d, 'summary', '') or '',
+            'query': getattr(d, 'query', '') or query,
+            'segment_text': getattr(d, 'segment_text', '') or '',
+            'raw': getattr(d, 'raw', '') or '',
+            'rubric': [
+                {'text': it.text, 'is_hard': bool(getattr(it, 'is_hard', False))}
+                for it in (getattr(d, 'rubric', None) or [])
+            ],
+            'items': [
+                {
+                    'index': it.index,
+                    'verdict': bool(it.verdict),
+                    'reason': it.reason or '',
+                    'fix': it.fix or '',
+                }
+                for it in (getattr(d, 'items', None) or [])
+            ],
+        }
+
     # ------------------------------------------------------------------
-    def _make_rubric_fn(self, segment: dict, query: str, round_scores):
+    def _segment_intent(self, segment: dict):
+        """Classify a segment by structural intent (tool_call > code > math).
+
+        Reuses the lightweight, LLM-free detectors from IntentClassifier so the
+        segment's rubric can be routed to an intent-keyed fixed/half-fixed rubric.
+        Returns an intent string or ``None`` (no confident match -> generate).
+        """
+        if self._intent_detectors is None:
+            from .intent_classifier import (CodeDetector, MathDetector,
+                                            ToolCallDetector)
+            # Order matters: tool_call is the strongest structural signal.
+            self._intent_detectors = [ToolCallDetector(), CodeDetector(), MathDetector()]
+        messages = segment.get('messages') or []
+        if not isinstance(messages, list) or not messages:
+            return None
+        for det in self._intent_detectors:
+            try:
+                if det(messages):
+                    return det.intent
+            except Exception:
+                continue
+        return None
+
+    def _make_rubric_fn(self, segment: dict, query: str, round_scores, intent=None):
         """Return a zero-arg callable for the soft chain, or None if unavailable.
 
         ``fuse_segment`` only invokes this when the segment is NOT short-circuited,
@@ -198,13 +317,16 @@ class TrajectoryScorer(Preprocessor):
         hard_agg_val = aggregate_hard_over_rounds(round_scores, how=self.hard_agg)
 
         def _fn():
-            detail = rv.score_detail(segment, query=query)
-            if self.calibrate and detail is not None and getattr(detail, 'scalar', None) is not None:
+            detail = rv.score_detail(segment, query=query, intent=intent)
+            if (self.calibrate and detail is not None
+                    and getattr(detail, 'scalar', None) is not None
+                    and len(segment.get('messages') or []) <= self.reconcile_max_messages):
                 if abs(detail.scalar - hard_agg_val) >= self.disagree_margin:
                     evidence = (f'Deterministic tool/answer checks scored this '
                                 f'segment {hard_agg_val:.2f} out of 1.0. Reconcile '
                                 f'your assessment with this objective evidence.')
-                    revised = rv.score_detail(segment, query=query, extra_context=evidence)
+                    revised = rv.score_detail(segment, query=query,
+                                              extra_context=evidence, intent=intent)
                     if revised is not None:
                         detail = revised
             segment['_last_rubric'] = detail

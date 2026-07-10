@@ -56,6 +56,21 @@ KEY_PROVENANCE = 'provenance'
 # Free-form scoring metadata (short-circuit stats, per-check breakdown, etc.).
 KEY_SCORE_META = 'score_meta'
 
+# Active-learning pre-selection (ValueSelector): a cheap, LLM-free "how worth an
+# expensive rubric pass is this row" score in [0, 1], its per-component
+# breakdown, and the boolean gate the rubric stage reads to decide whether to
+# spend an LLM call on this row (top-fraction by value_score).
+KEY_VALUE_SCORE = 'value_score'
+KEY_VALUE_META = 'value_meta'
+KEY_SELECTED_FOR_RUBRIC = 'selected_for_rubric'
+
+# Persisted rubric diagnosis for rubric-scored rows: a per-segment verification
+# chain (rubric text + per-criterion verdict/reason/fix + raw model output +
+# query/segment_text). This is the SFT corpus for distilling a PRM / error-checker
+# LoRA — store it so training never has to re-run the (expensive) teacher.
+# Value: List[dict], one entry per rubric-scored segment (see TrajectoryScorer).
+KEY_RUBRIC_DIAGNOSIS = 'rubric_diagnosis'
+
 
 # ---------------------------------------------------------------------------
 # thin get / set helpers over the (key, pack_value) envelope

@@ -107,3 +107,8 @@ class LanguageFilter(Filter):
         if lang is None:
             return self.keep_undetected
         return lang.lower() in self.allowed
+
+    def drop_reason(self, row: Dict[str, Any]) -> str:
+        text = self._user_text(row)
+        lang = self._detect(text) if len(text) >= self.min_chars else None
+        return f'language_{lang or "undetected"}'

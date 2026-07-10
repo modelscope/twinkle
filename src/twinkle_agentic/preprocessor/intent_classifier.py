@@ -201,9 +201,24 @@ class _RegexDetector(IntentDetector):
     """Common scaffolding: scan messages, run ``_match`` on each text, pair to assistant."""
 
     role_filter: Optional[str] = None
+    # Whether ``<think>`` reasoning blocks are stripped before matching an
+    # assistant message. Content-signature detectors (code / math / logic) set
+    # this so scratch-pad markdown fences or LaTeX inside the model's private
+    # reasoning don't misclassify the task (e.g. a copywriting answer whose
+    # <think> happens to contain a ``` fence being tagged as ``code``). User
+    # messages are never stripped — a code/latex request there is a real signal.
+    strip_think_in_assistant: bool = False
 
     def _match(self, text: str) -> bool:
         return False
+
+    def _text_for_match(self, role: str, m: dict) -> str:
+        text = msg_content_text(m)
+        if self.strip_think_in_assistant and role == 'assistant' and text:
+            # Keep only the visible response (pre-think + post-think), drop the
+            # <think>...</think> scratch work that shouldn't define the task type.
+            text = _THINK_BLOCK_RE.sub(' ', text)
+        return text
 
     def __call__(self, messages):
         rounds = set()
@@ -217,7 +232,7 @@ class _RegexDetector(IntentDetector):
                 continue
             if self.role_filter and role != self.role_filter:
                 continue
-            text = msg_content_text(m)
+            text = self._text_for_match(role, m)
             if not text or not self._match(text):
                 continue
             asst_idx = _pair_assistant(messages, idx, role)
@@ -241,6 +256,7 @@ class ToolCallDetector(IntentDetector):
 
 class CodeDetector(_RegexDetector):
     intent = INTENT_CODE
+    strip_think_in_assistant = True
 
     def __init__(self, threshold: int = 3) -> None:
         self.threshold = threshold
@@ -254,6 +270,7 @@ class CodeDetector(_RegexDetector):
 
 class MathDetector(_RegexDetector):
     intent = INTENT_MATH
+    strip_think_in_assistant = True
 
     def __init__(self, threshold: int = 4) -> None:
         self.threshold = threshold
@@ -265,6 +282,7 @@ class MathDetector(_RegexDetector):
 class ComplexLogicDetector(_RegexDetector):
     intent = INTENT_COMPLEX_LOGIC
     role_filter = 'assistant'
+    strip_think_in_assistant = True
 
     def __init__(self, threshold: int = 6) -> None:
         self.threshold = threshold

@@ -42,10 +42,11 @@ class Preprocessor:
             return {k: [] for k in keys} if keys else {}
 
         columns: Dict[str, List[Any]] = {}
-        keys = keys or rows[0].keys()
+        row_keys = list(rows[0].keys())
+        out_keys = row_keys if not keys else list(dict.fromkeys(row_keys + [k for k in keys if k not in row_keys]))
 
-        for key in keys:
-            columns[key] = [row[key] for row in rows]
+        for key in out_keys:
+            columns[key] = [row.get(key) for row in rows]
 
         return columns
 
@@ -79,12 +80,19 @@ class Filter(Preprocessor):
     def keep(self, row: Dict[str, Any]) -> bool:
         raise NotImplementedError
 
+    def drop_reason(self, row: Dict[str, Any]) -> str:
+        """Short reason tag for dropped-row logs (override in subclasses)."""
+        return type(self).__name__
+
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         kept: List[Dict[str, Any]] = []
         dropped: List[Dict[str, Any]] = []
         for r in rows:
-            (kept if self.keep(r) else dropped).append(r)
+            if self.keep(r):
+                kept.append(r)
+            else:
+                dropped.append(dict(r, drop_reason=self.drop_reason(r)))
         return kept, dropped
 
 

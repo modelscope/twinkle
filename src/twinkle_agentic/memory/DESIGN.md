@@ -19,6 +19,12 @@
 
 **line B 的存在理由**：在线蒸馏有延迟（攒数据→训练→部署），空窗期 student 学不到新东西；memory 立刻起作用填这个空窗，等能力被训进权重后再从 memory 退休。
 
+> **line B 有两种载体（同为"不动 base 的外挂补充"，见 §11.6）**：
+> 1. **文本 memory**：检索注入 context —— 本文 §1~§9 讨论的主形态，适合**易变事实/实体/偏好**（一条即用即改，天然带"检不到就拒答"信号）。
+> 2. **参数化 memory（LoRA，base 冻结）**：把能力挂成可插拔 adapter —— 适合**可泛化的行为模式**（如"边生成边查错"），在已部署 vLLM 里边际显存/进程成本最低、可回滚（换 adapter ≈ 删一条 memory，而非重训 base）。
+>
+> 二者与 line A 的分界是"**动不动 base**"：line A 改 base 权重（有遗忘风险，故慎重、攒批离线做）；参数化 memory 虽然也是"权重形态"，但**base 全程冻结、只挂 LoRA**，本质仍是 line B（可插拔、可回滚、即挂即用）。参数化 memory 与文本 memory 的取舍见 Substrate Asymmetry（§11 反方证据）：参数化擅长行为/风格，文本检索擅长事实/拒答。
+
 **双线共用的唯一“质检车间”**：现有 `preprocessor + verifier`。它产出的 `traj_score / round_scores / confidence / intent / safety` 同时作为两条线的准入闸门，不重复造。
 
 ### 分工判据（什么进 A，什么进 B）
@@ -562,3 +568,178 @@ harness.mode = 'static'  # 固定路由表，永远兜底
 4. **进化被工程化为可回滚的发布流程**（static→shadow→canary→live），而非在线自由漂移——把 SEA 的“门控只能 select 已有行为”落成部署 mode。
 
 **一句话定位**：DuoMem 证明了双线值得做，UCOB/ATMem 证明了 memory-on/off 对照能归因，GovMem/MemDelta 证明了不归因会污染/被混淆，SEA 证明了进化要门控——**本设计是把这些已被各自验证的结论，收进一个共用 verifier/`llm_backup`/D7c 的单一自进化蒸馏闭环。**
+
+---
+
+## 11. skill/rubric → 参数化（LoRA）：双 LoRA 方案的文献支撑
+
+> 背景：讨论中提出过一个具体的 line A 实现形态 —— **① 把高分轨迹的 system skills 蒸成一个"技能 LoRA"，推理时先用它产出/注入 skill；② 把 rubric 评价能力蒸成另一个"评价 LoRA"，推理中每隔 N 个 token 用它检验，当过程奖励/memory 提示。** 这一节把 2026 上半年直接对应这三个子命题（skill→LoRA、rubric→LoRA、多 LoRA 推理时切换）的工作按 §10 的详尽风格补全，并标注每篇对方案的取舍启示。**结论先行：三个子命题都各有直接平行工作，MetaClaw 几乎是整套方案 + 本双线设计的镜像；但"评价要不要绕一圈做成 LoRA judge"和"过程监督要不要走 LoRA"这两处，有明确的反方证据，需先决策。**
+
+### 11.1 skill → LoRA（对应子命题 ①：技能 LoRA）
+
+这一类的**共同范式**高度一致：**离线用完整 skill 文本合成"技能引导"的示范 → 训一个 skill 专属 LoRA → 在线丢掉 skill 文本、动态挂 LoRA 激活行为**。动机都是：skill 文本每步注入 context 太贵、且长上下文里关键指令定位不到 / 遵守不了（小模型尤甚，ICL 一贯不如微调、且模型越小差距越大）。
+
+**Skill-to-LoRA (S2L)**（arXiv 2606.16769）—— **最贴近方案 ① 的朴素做法（一 skill 一 LoRA，不用 hypernetwork）**
+- 想解决的问题：agent skill 现在以 `SKILL.md`（人读的流程文档：workflow / 工具 / 资源 / 领域约定）分发，可读可复用，但**同一套可复用流程要在每步 runtime context 里反复注入**，费 token 又稀释注意力。
+- 怎么做（**离线合成 + 在线换挂**，behavior-centric）：不压缩文档本身，而是**建模"skill 文本诱导的行为改变"**。**离线**：把完整 `SKILL.md` 喂进去，让模型合成一批"skill 引导下的示范轨迹"（demonstrations），用这些示范 SFT 出一个**该 skill 专属的 LoRA**；**在线**：完全省略 `SKILL.md` 全文，按当前需要动态加载对应 LoRA 来"激活"这个技能行为。
+- 数据 / loss：标准 SFT（在合成的 skill-guided 示范上做 teacher-forcing 训 LoRA），无 RL。Qwen3.6-27B、SWE-Skills-Bench 21 个 skill 子集：比 no-skill +2.9 pp、比 Full-Text +5.2 pp，每步 token 比 Full-Text prompting −6.6%；18/21 个 skill 追平或超过 Full-Text、15/21 超过 no-skill。**关键对照实验：Wrong-LoRA（挂错 skill 的 LoRA）和 Shared-LoRA（所有 skill 共用一个 LoRA）都掉点** → 收益依赖 **skill-专属对齐**，不是"随便训个 LoRA 就行"。
+- 与我们的区别：这就是方案 ① 最省事的落法（不引入 hypernetwork，一 skill 一 LoRA、离线 SFT）。**它的对照实验直接给我们敲定了两条工程铁律**：(a) 技能 LoRA 必须按 skill 对齐、**不能把多 skill 或 query 糊进一个 LoRA**（呼应 §0 分工判据："query 是易变实体，训进权重会过拟合"）；(b) 挂错 LoRA 反而有害 → 上线要有"挂哪个 skill LoRA"的可靠路由（正好复用我们 meta harness / intent 标签）。差异：S2L 是**离线一次性**、skill 集固定；我们要它在自进化闭环里**持续产出新技能 LoRA**，且用主线 `traj_score` 当"哪些高分轨迹够格蒸成 skill LoRA"的门槛。
+
+**LatentSkill**（arXiv 2606.06087）—— **用 hypernetwork 把文本 skill 一次前向转成 LoRA**
+- 想解决的问题：同 S2L（per-step 注入 skill 费 context、且 skill 明文暴露），但更进一步想要"**不为每个 skill 单独训 LoRA**"。
+- 怎么做：训一个**预训练 hypernetwork**，输入文本 skill、输出即插即用的 LoRA adapter（把 skill 知识存进**权重空间**而非 context 空间）。保留了 LoRA 的模块化：可加载、可缩放（用 LoRA scaling 系数精确调强弱）、可组合（对齐时能在**参数空间做算术**叠加多个 skill）。
+- 数据 / loss：hypernetwork 预训练。ALFWorld seen/unseen +21.4 / +13.4 分、prefill token −64.1%；Search-QA EM +3.0、skill-token 开销 −72.2%。分析发现生成的 skill LoRA 形成**结构化语义几何**。
+- 与我们的区别：如果我们不想"一个 skill 训一个 LoRA"（S2L 的痛点是 skill 一多 LoRA 就爆炸），LatentSkill 的 hypernetwork 是升级路径 —— **一次前向即出新 skill 的 LoRA、零梯度更新、零 skill 专属数据采集**。但它更复杂、要预训练 hypernetwork，属于方案 ① 的"进阶版"，建议 S2L 跑通、验证 skill LoRA 确有增益后再考虑。它的"参数空间算术组合"对我们"把多条相关碎片 memory 合并升华"（§2 consolidation / B→A 晋升）是权重侧的对应工具。
+
+**ParametricSkills**（arXiv 2606.30015）—— **hypernetwork 同时参数化"skill 内容 + 利用方法"，含自进化/持续学习**
+- 想解决的问题：同上两条，外加一个更深的观察 —— **文本空间演化 skill（EvoSkill/SkillOpt 等改写 SKILL.md）和模型本身的学习是解耦的**，模型能力没被优化。
+- 怎么做（三阶段，hypernetwork 驱动）：(1) 建 **45.8k skill 库**（网爬 + 从真实 agent 轨迹总结，覆盖 13 领域），用 OpenCode 沙箱围绕这些 skill 合成单/多轮"skill 利用轨迹"；(2) **skill-重建预训练**：三个自监督目标让 hypernetwork 学会把 skill 编码成 LoRA —— **完整重建**（据全文生成能重建全文的 adapter）、**前缀补全**（只给前缀、要补出全文，学 skill 结构）、**段级 cloze 补全**（挖掉一个功能段、据前后文补，学"触发条件/执行步骤/失败处理"如何组织与互相支撑 → 强组合泛化 + 支持局部编辑）；(3) 在 skill-利用轨迹上**多轮 SFT** hypernetwork。
+- 数据 / loss：自监督重建 + 多轮 SFT（loss 都 backprop 到 hypernetwork）。6 个 SWE 子任务比 ICL +6.44 分（DeepSeek-V4-Flash 判）、BERTScore +1.17、F1 +5.53%；**注意 text-to-LoRA 基线 SHINE 反而打不过 in-context skill** → hypernetwork 训不好会退化。持续学习：把多条轨迹的经验**不断 merge 成一个全局 parametric skill**。
+- 与我们的区别：它把 §2「抽取器越来越专业」和 §3「B→A 晋升」在**权重侧**给出了一个具体形态 —— "文本演化 skill = 直接改进模型"。三个自监督目标（尤其**段级 cloze**）可直接借来当我们"技能 LoRA 抽取器"的预训练任务。但它同样是**离线训 hypernetwork**、且 SHINE 反例提醒**参数化 skill 不保证优于文本注入**，必须带对照验证（呼应 §4 影子对照）。
+
+### 11.2 rubric / 评价 → 参数化（对应子命题 ②：评价 LoRA）—— 两条岔路，务必先选
+
+**支线 A：把 rubric 打分能力做成一个轻量 LoRA judge（= 方案 ② 的原意）**
+
+**Plug-and-Play LLM Judges**（arXiv 2506.05748）—— **"rubric + 小 LoRA = 顶级裁判"的最强直接背书**
+- 想解决的问题：RLHF 的奖励模型训练是成本瓶颈（动辄几十亿参数 + 离线偏好微调阶段）。
+- 怎么做：**冻结的 instruction-tuned 7B + 一行 JSON rubric + rank-16 LoRA（只动 0.8% 参数）**，就当完整奖励模型用。消融：6 条 in-context 示范贡献了大部分零样本→少样本增益（+2pp），**LoRA 补上剩余差距**（尤其 safety / 对抗性 Chat-Hard 段）。
+- 数据 / loss：小 LoRA 微调 + prompt 工程。RewardBench 96.2%，超过 27B~70B 专用奖励网络；配它当在线 PPO 的 reward，7B actor 在 GSM-8K 拿 92% EM、超过 70B DPO 基线；LoRA judge 的解释与人类相似度 ≈9/10（零样本裁判仅 ≈5/10）。
+- 与我们的区别：**这是方案 ②「rubric→评价 LoRA」最硬的可行性背书** —— 极小 LoRA + 一条 rubric 就能把通用模型变成高质量、可解释、可调的裁判。直接支持我们把 `RubricVerifier`（现在调 dashscope teacher）蒸成本地评价 LoRA：既复用 `score_lora_path` 现成入口，又能治昨天"每段调远程 LLM 太慢"的痛（本地 LoRA 打分快几个数量级）。
+
+**支线 B：跳过 judge，把 rubric 直接蒸进 policy 的 token 级信号（更省，可能是更优解）**
+
+> ⚠️ 这两篇机制外壳都是"rubric-conditioned 的自己当 teacher、逐 token 蒸给 unconditioned 的自己"，但**要解决的痛点、对标的对手、卖点完全不同**，别当成一篇：**RCSD 的对手是 RL 的标量奖励**（卖点＝把标量 reward 升级成过程级 token 信用分配）；**RGSD 的对手是 rubric 训练里的那个 LLM verifier**（卖点＝把 verifier 从训练回路里彻底删掉）。下面各自只讲其独有点。
+
+**Rubric-Conditioned Self-Distillation / RCSD**（arXiv 2606.19327）—— **卖点：用 rubric 替代 RL 的"标量奖励"，做过程级信用分配**
+- 想解决的问题：针对的是**蒸馏与 RLVR 两种 post-training 各自的病**。蒸馏靠 CoT 标注（贵、可能有噪/不全/半错，**哪怕最终答案对，坏 rationale 也会干扰学习**）；RLVR 则把评价**压成一个标量 reward**，看不出"该改推理的哪一步"。它要的是一个**比标量更细的过程监督信号**。
+- 怎么做（**独有点＝两阶段 pipeline + 显式过程级信用分配**）：核心是"**不把单一参考 rationale 当唯一监督靶**"，而让 teacher 看 criterion 级 rubric、在 student 自采样轨迹上给 token 级指导。落地成**两阶段**：**阶段① 先训一个"生成 task-specific rubric"的模块**（给任务先产出该任务的评分条目），**阶段② 再用这些 rubric 训"rubric 引导的 reasoner"**。rubric 说明"强回答该满足什么" → 转成**过程级信用分配**，这是它明确对标 GRPO 的地方。
+- 数据 / loss：on-policy 自蒸馏（token 级）。科学推理套件上**比 GRPO +1.0、比 OPSD +0.9**（对手是 RL/在线自蒸馏方法，不是 verifier）。
+- 与我们的区别：它证明 **rubric 能当"过程级 reward"直接进 policy 训练**，比标量 GRPO 奖励细。对我们的启示落在**训练信号形态**上：如果 line A 想要比 `traj_score` 标量更细的过程监督，RCSD 的"rubric→token 级信用分配"是替代 GRPO 标量奖励的路子；它的**阶段① rubric 生成器**正对应我们 `RubricVerifier` 的 stage-1（可复用）。
+
+**Rubric-Guided Self-Distillation / RGSD**（arXiv 2606.12507）—— **卖点：verifier-free，把 LLM judge 从训练回路里删掉**
+- 想解决的问题：针对的是**现有 rubric 训练法都要挂一个 LLM verifier 给每条 rollout 打分**这件事本身 —— 带来三个后果：训练期 verifier 调用**开销大**、优化被**特定 verifier 的偏差**污染、且 rubric 反馈被 verifier 压成**稀疏的轨迹末端信号**（只有一个 end-of-trajectory 分）。它要的是**根本不调 verifier**。
+- 怎么做（**独有点＝极简、零 verifier、单 rollout**）：直接拿 rubric-conditioned base policy 当 teacher、unconditioned 当 student 逐 token 蒸 —— 关键在于它把这套做到了**训练回路里完全没有 LLM judge**、且**每 prompt 只需一条 on-policy rollout**（不用像 GRPO 那样一题多采样再让 judge 排序）。
+- 数据 / loss：**零 verifier 调用 + 单 rollout/prompt**。Qwen-2.5(3B/7B)、Qwen3-Thinking(4B/8B) 医学/科学域：rubric 满足度**与 judge-based GRPO 相当**（对手是"带 verifier 的 rubric 训练"）。独有消融：**raw rubric 比"自生成参考回答"是更强的 teacher 富化信号**；但**更强的 GRPO judge 在某些设置能反超 RGSD** → 它诚实地把自己定位为"**当 verifier 成本/可靠性是瓶颈时**"的互补方案，而非全面更优。
+- 与我们的区别：**这篇最该在决策前读透**。它直击我们现状——verifier 又贵又不稳（RuVerBench 警示 + dashscope 每段调用慢）时，**把 rubric 直接蒸进 policy 比"训一个评价 LoRA 再在线打分"更省更稳**。据此，方案 ② 有两条路：**A 训评价 LoRA judge（Plug-and-Play 背书，产物是可复用的独立评价分）** vs **B 走 RGSD/RCSD 把 rubric 直接蒸进主 policy（不产独立分、只喂 student）**。选 A 还是 B，取决于我们是否真需要一个"能被 memory 效用 / 在线 PRM 复用的独立评价分"——若需要就 A，若只为提升 student 就 B。
+
+### 11.3 多 LoRA 推理时切换 / 评价即一个 LoRA（对应子命题 ③：每 N token 用评价 LoRA 检验）
+
+**VideoMind — Chain-of-LoRA**（arXiv 2503.13444，**ICLR 2026**）—— **方案 ③"主生成 LoRA + 评价 LoRA 交替"的现成机制原型**
+- 想解决的问题：视频时序 grounding 推理要多种能力（定位、验证、回答），但为每种能力各开一个完整模型太重。
+- 怎么做（两个创新）：(1) **角色化 agent 工作流** —— planner 协调、grounder 时序定位、**verifier 评估候选**、answerer 回答；(2) **Chain-of-LoRA**：一个统一 base model + **多个 LoRA adapter**，推理时**无缝切换角色**（用哪个角色就挂哪个 LoRA），在"每角色一个完整模型"和"纯 prompt 切角色"之间取平衡。
+- 数据 / loss：各角色 LoRA 分别训。15 个 benchmark（Grounded VideoQA / 时序 grounding / 通用 VideoQA）验证有效，且利于 test-time scaling / 长视频。
+- 与我们的区别：**它的 verifier 就是链条里的一个 LoRA 角色，与主生成角色在同一 base 上按需热切** —— 这正是方案 ③ 想要的"生成 LoRA / 评价 LoRA 交替"的成熟原型，**强烈建议精读**它怎么做角色切换调度。⚠️ 但注意：Chain-of-LoRA 是**在"角色回合"边界切**（planner→grounder→verifier→answerer 各跑一段），**不是"每 N 个 token 打断主流插评价"**；后者需要在 decode 中途暂停、跑旁路评估、再续，当前我们 vLLM sampler 的 `sample`/`sample_stream` 没有这种中途插入钩子（一次前向也只能挂一个 LoRA），要自己写**交错解码调度器**——这是方案 ③ 真正的工程量所在。
+
+**MetaClaw: Just Talk**（arXiv 2603.17187，**有 code**）—— **几乎是整套方案 + 本双线设计的生产级镜像**
+- 想解决的问题：部署的 agent 是**静态**的，跟不上用户需求漂移；在 OpenClaw（20+ 渠道、杂负载）上，现有法要么只存原始轨迹不蒸馏、要么静态 skill 库、要么retrain 要停机。
+- 怎么做（**双互补机制**）：(1) **skill 驱动的快适应** —— LLM evolver 分析**失败轨迹**合成新 skill，**零停机立刻生效**（= 我们的 line B / 快记忆）；(2) **机会式策略优化** —— **云端 LoRA 微调 + RL-PRM（带过程奖励模型的 RL）** 做梯度更新（= 我们的 line A / 慢权重），由 **OMLS 调度器**在**用户空闲窗口**（监控系统空闲 + 日历）触发。两机制**互相喂**：更好的策略产更好轨迹给 skill 合成，更丰富的 skill 给策略优化更高质数据。用**版本机制**分离 support / query 数据**防污染**。proxy 架构、无需本地 GPU。
+- 数据 / loss：SFT/RL-PRM（LoRA）+ 无训练的 skill 合成。skill 快适应相对 +32%；全流程把 Kimi-K2.5 从 21.4%→40.6%、综合鲁棒性 +18.3%。
+- 与我们的区别：**这是与本设计 §0 双线 + §3 毕业 + §6 harness 最像的一篇，且是 OpenClaw 生产场景**。相同点几乎逐条对上：skill 快线 + LoRA/PRM 慢线、失败轨迹驱动 skill、空闲窗口触发训练、版本防污染。差异（也是我们的增量）：MetaClaw 的两机制是**并列互喂**，**没有显式的 B→A 晋升 / A→B 退休毕业梯度**，也**不做"失败是模型问题还是 memory 误导"的因果归因**（§4）；我们多了归因前置、毕业出口、和 static→shadow→canary→live 的可回滚门控。**它是本方案最好的对标基线与工程参考（有 code），建议直接研读其 OMLS 调度 + RL-PRM 实现。**
+
+### 11.4 ⚠️ 反方证据：过程监督 / TTT 未必要走 LoRA
+
+**SCATR: Simple Calibrated Test-Time Ranking**（arXiv 2604.16535）
+- 想解决的问题：Best-of-N 的效果全看打分函数；学出来的 PRM 强但**训练/推理都贵**，而基于 token logprob 的轻量置信度启发式又**明显偏弱**。
+- 怎么做：从**小校准集**学一个**轻量 scorer**，用的是 **base 模型的隐藏表示**（不是训 LoRA、不生成）。
+- 数据 / loss：轻量回归头。编码/数学基准上比置信度基线 +最高 9%；**相对在同样校准数据上做 LoRA 微调，用少 8000× 的可训练参数达到相当精度**，训练/推理延迟分别快 150×/1000×；和强 PRM 相当、部分设置数学 +7.8%/代码 +4.2% 且推理快 1000×。
+- 与我们的区别：**直接质疑方案 ③"评价/PRM 一定要做成 LoRA"** —— 一个读 base 隐藏层的轻量头，可能比评价 LoRA 更省几个数量级且更快。若方案 ② 的评价只用于"打个过程分排序/门控"（而非要它生成文字理由），**优先考虑 SCATR 式轻量头，而不是 LoRA**。
+
+**Surprisal-Guided Selection**（arXiv 2602.07670）
+- 想解决的问题：可验证、密集奖励任务（如 GPU kernel 优化，有确定性 evaluator）下，test-time 到底该"梯度自适应"还是"搜索"？
+- 怎么做 / 结论：KernelBench + GPT-OSS-120B(LoRA)：**Best-of-N 搜索（K=64 达 90% 成功）远胜 TTT 梯度自适应（最好 30.6%）**；TTT 会**过度锐化**、把多样性塌成平庸解，"等效 K < 1"（还不如单样本）。零成本妙招：**选 surprisal 最高（最不自信）的正确样本**比选最自信的 +30%。
+- 与我们的区别：提醒我们——**有确定性 verifier 时，算力花在"采样多样性 + 聪明选样"常比训 LoRA / 在线梯度自适应更值**。方案 ② / ③ 若目的是"提升生成质量"，先比一比"评价 LoRA + 干预" vs "多采样 + 评价选样"哪个划算，别默认前者。
+
+**VDS-TTT**（arXiv 2505.19475）—— **支持方案：verifier 选样 → 只训 LoRA**
+- 怎么做：learned verifier 给一批候选打分，**选高分伪标签**（置信度过阈值）配对成训练数据，**只微调 LoRA adapter** 做 test-time training。
+- 数据 / loss：verifier 驱动的自监督 SFT（仅 LoRA）。三 benchmark × 三 LLM，比 base 相对 +最高 32.29%、比"用 verifier 但不 TTT" +6.66%。
+- 与我们的区别：这是**"高分轨迹 → LoRA"这条主链的直接同构与背书**（verifier 打分选样 → 只训 LoRA），但它是**离线选样再训**、不是"推理中途干预"。我们 line A 的"用主线 `traj_score` 选高分轨迹蒸 LoRA"和它几乎一样，可当实现参考。
+
+**Beyond Perplexity（TTT memory 审计）**（arXiv 2607.00368）
+- 怎么做 / 结论：提出行为层评测框架，审计 TTT/memory 工作。发现一步 LoRA 更新能降 support/answer loss（跨 3 个 Qwen3 规模），但**自由 recall 仍为零** —— **proxy 指标改善 ≠ 部署行为改善**。
+- 与我们的区别：警示方案 ① 的技能 LoRA / 方案 ② 的评价能力，**别只看 loss 或 rubric 分下降就宣称有效**，要用**行为层对照**（带/不带、later recall / 下游动作）验证真收益（呼应 §4 影子对照、§10 DuoMem 的 CD 单独只 +1.4 的教训）。
+
+### 11.5 双 LoRA 方案落地建议（综合上面证据）
+
+| 子命题 | 直接背书 | 反方 / 风险 | 建议 |
+|---|---|---|---|
+| ① 技能 LoRA（skill→LoRA） | S2L / LatentSkill / ParametricSkills / VDS-TTT | Beyond-Perplexity（proxy≠行为）；DuoMem CD 单独仅 +1.4 | **先做 S2L 式（一 skill 一 LoRA、离线 SFT、主线 traj_score 选样）**；必须带**带/不带对照**验证增益；skill 一多再上 hypernetwork（LatentSkill） |
+| ② 评价 LoRA（rubric→judge） | Plug-and-Play Judge（rank-16 LoRA 顶 70B） | RGSD/RCSD：verifier 贵/不稳时**直接蒸进 policy 更优**；SCATR：轻量头比 LoRA 省 8000× | **先决策产物是不是"独立可复用的评价分"**：要 → 训评价 LoRA（复用 `score_lora_path`）；只为给 student dense 信号 → 走 RGSD 直蒸；只为排序/门控 → SCATR 轻量头 |
+| ③ 每 N token 在线 PRM | Chain-of-LoRA（多 LoRA 热切原型）；MetaClaw（生产 RL-PRM） | 一次前向只挂一个 LoRA、无中途插入钩子；Surprisal/SCATR：搜索选样常更值；TTT 过锐化 | **最后做**；第一版用 `prompt_logprobs` **旁路打分 + 只留痕不干预**；确认 PRM 分与主线 hard verifier 一致性够高再考虑写交错解码调度器 |
+
+**对标基线**：**MetaClaw（有 code、OpenClaw 生产、双线镜像）**是整套方案最该研读与对标的工作；**Chain-of-LoRA** 是子命题 ③ 的机制原型；**RGSD** 是子命题 ② 决策的关键对照。我们相对它们的增量仍是 §10.10 那四条（显式毕业梯度、失败前置归因、抽取器被下游效用反向蒸馏、可回滚发布门控）——双 LoRA 只是把 line A 的"权重"具体化成"技能 LoRA + 评价能力"，不改变整体闭环定位。
+
+### 11.6 定稿：查错 LoRA 作为参数化 memory —— 结论与实验方案
+
+> 本节是 §11 讨论收敛后的**决策记录 + 实验计划**。核心转变：把"评价 LoRA"从"给数据打分的 judge"重新定位成**不动 base 的参数化 memory（line B 第二载体），专门给 base 补一个"在线查错"能力**。技能 LoRA（LoRA-2）**本轮暂缓**（理由见末尾）。
+
+#### 11.6.1 定位（钉死的几条前提）
+
+1. **base 全程冻结，永不训。** 从根上杜绝知识遗忘——这是硬底线。所有能力增量都以**可插拔 LoRA**形式外挂，本质是 line B（参数化 memory），不是 line A。
+2. **LoRA-1 = 查错器（过程级 memory）。** 它不改 base 的知识，只给 base 补"边生成边发现自己踩了 rubric 里哪类错"的能力（如"公式第 k 步描述错""工具调用缺参数"）。发现错误后把**具体问题**注回 context，引导 base 改。
+3. **可回滚性 ≈ 删一条 memory。** 因为不动 base、LoRA 可插拔，一版 adapter 训坏了直接换/摘，撤销成本远低于"重训 base"——这消解了"权重侧犯错难撤"的顾虑（那顾虑只对"蒸进 base"成立）。
+4. **蒸馏数据 = 问题定位 + 打分（不是只给分）。** 要蒸出的是"**可定位、可操作的过程诊断**"能力，所以 teacher rubric 的产出必须到"哪一步/哪个 tool call/缺什么"这一粒度，而非单一 PASS/FAIL 标量（这是能否蒸出"查错"而非"打分习惯"的前提，对应 §10.7 原子化可验证条目 / 多角色 rubric）。
+
+#### 11.6.2 自进化引擎：超大模型 + 本地 LoRA 双端检测
+
+```
+超大模型(teacher rubric) ──检测出错误──┐
+                                        ├─► 分歧/teacher 独有的错误 = 本地能力缺口 = 训练信号 ─► 升级 LoRA-1
+本地查错 LoRA-1          ──检测出错误──┘                                                          │
+                                                                                                 ▼
+                          下一轮两端一起查 ──► 本地 LoRA-1 持续追平 teacher 的查错能力（追平后 teacher 少调、省成本）
+```
+
+- 与主线蒸馏同构：主线是"student 生成能力追平 teacher"，这里是"**本地 LoRA 的查错能力追平 teacher**"，同一套 `llm_backup` (teacher 对/本地错) 配对机制，被蒸对象换成"查错"这一角色。
+- **双端分歧同时是"该审上游"的探针**：本地 LoRA 与 teacher **系统性**分歧（成规律、非零星）时，要么本地没学到位（继续训），要么 **teacher/rubric 本身有系统性偏差**——后者是上游数据源/超大模型质量问题，**在上游治**（换更强 teacher、多角色 rubric 交叉、rubric 可靠性审计），不指望下游 LoRA 兜（呼应 §10.7"先坐实 verifier 再用它"）。
+
+#### 11.6.3 三阶段实验路径（每阶段是下阶段的 gate，早止损）
+
+**阶段 0（先做）：不引入任何 LoRA，纯 teacher LLM 在线查错，测"上限"。**
+- 数据集：**数学**（对错相对明确、查错信号干净，理想试验田）。
+- 机制：base 每隔 N 个 token **暂停** → 用 **teacher LLM（走 `llm_backup`）** 判当前生成有没有踩 rubric 错 → 有则把发现的问题注入 context → 继续生成。
+- 目的：**验证"在线过程级查错 + 注入 rubric"这个机制本身能否抬升数学解题上限**。用最强 teacher 代表能力天花板。
+- 性质：**纯可行性 gate，不训任何东西**。若最强 teacher 在线查错都提不了分，后面蒸 LoRA 更无意义 —— 先证信号有价值。
+- 工程：实验期"每 N token 暂停判断"**可用最粗暴实现**（停→跑一次 teacher 判断→拼 rubric→续），**不追性能**；生产化才需要专门的交错解码调度器（见待解决项）。
+- **已有实现**：`cookbook/exp/embedding/eval_dualline_math.py`（`--mode dualline`）。它复用 `eval_gpqa_rag.py` 的 MATH 分层加载 / 采样参数 / `answers_match` 判分，token 级分段生成：每 `--chunk-tokens` 暂停 → `RubricVerifier.diagnose()`（无 student sampler，走 llm_backup teacher）查错 → 命中且分数低于 `DUALLINE_CHECK_FLOOR` 则把 fix/原因作 `[Checker]` 注入续写。对照基线 `--mode baseline`（＝单遍生成，等同 `eval_gpqa_rag --mode direct`），同一 200 条子集直接比较 overall / 分层准确率与 checks/injections 计数。launch 配置：`dualline_math`。
+
+**阶段 1（阶段 0 证明有效后）：把 teacher 的查错能力蒸成 LoRA-1，替换在线 teacher 调用。**
+- 用阶段 0 收集的 (完整核验 CoT + 问题定位 + 打分) 数据蒸 LoRA-1（可复用 `score_lora_path` 入口）。**数据须正负配平**（成功段"无错、continue" + 失败段"定位/原因/建议"），构造约束见 11.6.6。
+- 目的：验证**本地低秩 LoRA 能否追平 teacher 查错**（＝待验证 b"学不学得动"）。实验要**把 rank × rubric 产出粒度当两个变量扫**（ParametricSkills 的 SHINE 退化反例说明：配置不对会打不过 in-context，学不学得动不是 0/1）。
+
+**阶段 2（远期）：LoRA-2 技能 + 召回**——本轮暂缓，见 11.6.5。
+
+#### 11.6.4 三条反驳 → 回应 → 限定（决策留痕）
+
+| 反驳 | 我们的回应 | 仍需守住的限定 |
+|---|---|---|
+| **① 廉价 query 路由只解决"该不该召回"，没解决"召回内容本身可能是错的"** | 不走"召回一条可能有错的 memory"，而是把"**查错能力**"蒸进 LoRA，让 base 内生地边做边纠错，**绕开召回可信度问题** | 前提：rubric 产出要到"**可定位错误**"粒度，否则只蒸出打分习惯、蒸不出查错 |
+| **③ 权重侧坏数据难撤 / 会不会被污染** | LoRA 对**单条随机坏数据**抗性强于 RAG（梯度统计稀释 + base 低秩先验；RAG 一条即直入 context 无稀释）；且不动 base、可插拔，撤销≈删 memory | 抗的是**单条噪声**，**不抗系统性偏差**——系统性错误会被梯度强化。故 §4 归因质量仍是地基；系统性偏差归上游治（11.6.2） |
+| **（Substrate Asymmetry）参数化 memory 在"该缺的要拒答"上惨败** | 承认：这是 LoRA "缺检不到信号"的固有短板，**不是污染问题** | **LoRA 只装可泛化行为/模式（如查错），易变事实仍留文本 memory**（§0 分工判据）；别用 LoRA 装事实 |
+
+#### 11.6.6 查错 LoRA 的训练数据构造（三条硬约束，钉死）
+
+> 复用现有 `RubricVerifier` 的 rubric + `llm_backup` 配对采集管线来攒数据，但现有 scoring prompt 刻意"只出 PASS/FAIL、不出解释"（省 token、便于 comparator 对齐），**直接拿来训会蒸出"打分习惯"而非"查错能力"**。故新增一个"诊断模式"产训练样本，须同时满足：
+
+1. **分数与原因必须一次调用同源产出（不可分两次采样拼）。** 若分数、原因来自两次独立采样，二者可能逻辑矛盾（判 FAIL 但原因说"没问题"），LoRA 学到错位映射。实现上：单次调用同时产 `per-criterion verdict + 每条 FAIL 的定位/原因/建议`，聚合分数由这批 verdict 算得，**原因与分数天然一致**。
+
+2. **正负样本都要产、且要均衡（不能只在低分/被 gate 段跑诊断）。** 只见"错的"会把 LoRA 训成"逢查必报错"的挑刺偏置——它在线运行时每 N token 都硬报一个错，注入噪声反拖垮 base。必须让它见过大量"**看完一段、逐条核验、全部 PASS、结论=本段无过程错、无需干预**"的样本，才有能力在线输出关键的"OK，继续"信号。故诊断要**按比例覆盖高分成功段**，与失败段配平。
+
+3. **CoT 要完整（核验过程，非只报结论）。** 正负两类样本的 target 都写成完整推理链：
+   - 成功段：`逐条核验 → 每条为何 PASS → 结论：无过程错误，continue`
+   - 失败段：`逐条核验 → 定位到第 k 条 FAIL → 错在哪 / 为什么 / 建议修法`
+   完整 CoT 才对齐 LoRA-1 在线"边看前缀边判断"的实际形态；只给"这里错了"的结论会让它学不到核验过程，泛化差（呼应 §11.4 Beyond-Perplexity："proxy 改善 ≠ 部署行为改善"）。
+
+> 落地路径（不改动服务打分/准入的现有 `RubricVerifier` 便宜路径）：新增诊断入口（`explain=True` 变体或独立 `_diagnose_once`，带 `@llm_backup` 自动落配对数据），schema：`input=[segment + rubric]`，`target=[完整核验 CoT + verdict + (FAIL 时) 定位/原因/建议]`。
+>
+> **采样策略（已定）**：
+> - **采集期全量存储、不做平衡、不设成本上限** —— 对每个 segment 都产完整诊断 CoT（正负都存），先把数据完整跑出来。正负配比、降采样等**留到训练采样阶段**再定，避免采集期过早丢信息。
+> - **注意训练/部署分布差**：离线诊断看的是"已完成的整段"，LoRA-1 在线看的是"生成中途的前缀"——离线攒数据能省掉阶段 0 的交错解码调度器工程，但**仍需一次"带/不带 LoRA-1 在线注入"的行为层对照**才算真验证（不能只看离线诊断准确率）。
+
+#### 11.6.5 待验证 / 待解决 / 暂缓
+
+- **待验证 a（已定方案）**：蒸 LoRA-1 时数据须含"问题定位 + 打分"，二者**一次调用同源产出**，且**正负样本都产、带完整核验 CoT**（详见 11.6.6 三条硬约束）。
+- **待验证 b**：低秩 LoRA 学不学得动查错 —— 阶段 1 跑实验，扫 rank × 信号粒度。
+- **待解决（生产化）**：vLLM **一次前向只挂一个 LoRA、无中途插入钩子**，"每 N token 暂停查错"生产化需自写**交错解码调度器**；实验阶段用粗暴实现绕过。
+- **待解决**：LoRA-1（旁路查错）与未来 LoRA-2（技能常驻）**同时在线的调度冲突**（单请求单 LoRA 限制）。
+- **暂缓：LoRA-2（优秀轨迹 skill 召回）** —— 本轮不做。理由：(1) 它**必须先训 LoRA 才能用，没有"纯 LLM 不训练"的验证捷径**，不适合当前"先用 LLM 测上限"的实验起点；(2) 训它需要**大量 trajectory** 作输入。两个已知前置问题记录备查：**P1 技能可能 per-user、跨用户不可迁移**（长期解＝只把 global 可泛化技能进 LoRA-2，用户专属留文本 memory，归 §0 分工；实验阶段忽略）；**P2 冷启动召回**（首个 query 可能是"你好"无信息量）——解法优先级：**A 延迟召回**（无信息量不召回，用 `intent`/信息量阈值判，"你好"本就不该召回）＞ B 滚动召回（每轮用累积上下文重判）＞ C 用 system/场景先验预挂。
