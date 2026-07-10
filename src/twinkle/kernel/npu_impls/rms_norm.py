@@ -25,10 +25,20 @@ class NpuRMSNorm(nn.Module):
     """
 
     def _twinkle_residual_param(self) -> bool:
-        """Lazily detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight)."""
+        """Detect residual parameterization (e.g. Qwen3.5: scale = 1 + weight).
+
+        Detection is by attribute name, not weight values: Qwen3.5 RMSNorm uses
+        ``eps`` and residual parameterization (scale = 1 + weight); Qwen3 /
+        Qwen2 / Llama etc. use ``variance_epsilon`` and standard parameterization
+        (scale = weight).  The previous weight-value heuristic
+        (``abs(mean) < 0.3``) was unreliable: trained Qwen3 weights can have
+        small means, falsely triggering residual mode and inflating the scale
+        by ~90×, which corrupted the forward output and inflated the training
+        loss by ~1.9×.
+        """
         cached = getattr(self, '_twinkle_residual_cached', None)
         if cached is None:
-            cached = abs(self.weight.data.mean().item()) < 0.3
+            cached = not hasattr(self, 'variance_epsilon')
             self._twinkle_residual_cached = cached
             if cached:
                 logger.debug('[NPU] NpuRMSNorm using residual parameterization (1.0 + weight)')
@@ -39,12 +49,20 @@ class NpuRMSNorm(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         import torch_npu
-        target_dtype = hidden_states.dtype
-        if self._twinkle_residual_param():
-            scale = (1.0 + self.weight).to(target_dtype)
+        input_dtype = hidden_states.dtype
+        if _FORCE_FP32:
+            hidden_states = hidden_states.to(torch.float32)
+            if self._twinkle_residual_param():
+                scale = (1.0 + self.weight).float()
+            else:
+                scale = self.weight.float()
         else:
-            scale = self.weight.to(target_dtype)
-        return torch_npu.npu_rms_norm(hidden_states, scale, epsilon=self._twinkle_eps())[0]
+            if self._twinkle_residual_param():
+                scale = (1.0 + self.weight).to(input_dtype)
+            else:
+                scale = self.weight.to(input_dtype)
+        out = torch_npu.npu_rms_norm(hidden_states, scale, epsilon=self._twinkle_eps())[0]
+        return out.to(input_dtype) if _FORCE_FP32 else out
 
 
 # Resolved once at import: matches the legacy "patch-time, process-wide" invariant.
