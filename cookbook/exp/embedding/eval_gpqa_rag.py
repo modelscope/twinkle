@@ -107,7 +107,7 @@ GEN_MODEL_ID = os.environ.get('GEN_MODEL_ID', 'Qwen/Qwen3.5-4B')
 EMBED_MODEL_ID = os.environ.get(
     'EMBED_MODEL_ID', 'output.oldemb/embedding_full_transformers/last-checkpoint')
 
-GEN_GPUS = int(os.environ.get('GEN_GPUS', 4))
+GEN_GPUS = int(os.environ.get('GEN_GPUS', 8))
 EMB_GPUS = int(os.environ.get('EMB_GPUS', 2))
 EMBED_MAX_LENGTH = int(os.environ.get('EMBED_MAX_LENGTH', 20000))
 
@@ -653,11 +653,51 @@ def answers_match(predicted: str, reference: str) -> bool:
 # Dataset loading
 # ---------------------------------------------------------------------------
 
+def _load_aops_from_modelscope():
+    """Download the AoPS repo natively from ModelScope and read its parquet.
+
+    Primary loader: ``dataset_snapshot_download`` pulls the dataset repo files
+    (parquet) straight from the ModelScope hub WITHOUT going through the
+    ``datasets``/HF-filesystem path used by ``MsDataset.load`` — that path is
+    broken on this modelscope build (``HfFileSystem.find() got multiple values
+    for 'maxdepth'``). We then read the local parquet with the ``datasets``
+    backend (reading local files does not trigger the HfFileSystem bug).
+    """
+    import glob
+
+    from datasets import Dataset as HFDataset
+    from modelscope.hub.snapshot_download import dataset_snapshot_download
+
+    local = dataset_snapshot_download(AOPS_DATASET_ID)
+    files = sorted(glob.glob(os.path.join(local, '**', '*.parquet'),
+                             recursive=True))
+    if not files:
+        # Older snapshots may materialize an arrow file instead of parquet.
+        files = sorted(glob.glob(os.path.join(local, '**', '*train*.arrow'),
+                                 recursive=True))
+        if files:
+            sys.stderr.write(f'[aops] modelscope snapshot arrow: {files[0]}\n')
+            return HFDataset.from_file(files[0])
+        return None
+    sys.stderr.write(f'[aops] modelscope snapshot parquet: {files[0]}\n')
+    return HFDataset.from_parquet(files if len(files) > 1 else files[0])
+
+
 def load_aops(n: int, seed: int = 42) -> List[Dict[str, Any]]:
-    """Load AoPS boxed problems, sample n, extract reference answers."""
-    from modelscope import MsDataset
-    ds = MsDataset.load(AOPS_DATASET_ID, split='train',
-                        download_mode='reuse_dataset_if_exists')
+    """Load AoPS boxed problems, sample n, extract reference answers.
+
+    Uses ModelScope as the data source (native repo snapshot download).
+    """
+    ds = None
+    try:
+        ds = _load_aops_from_modelscope()
+    except Exception as exc:
+        sys.stderr.write(f'[aops] modelscope snapshot download failed ({exc}); '
+                         f'trying MsDataset.load\n')
+    if ds is None:
+        from modelscope import MsDataset
+        ds = MsDataset.load(AOPS_DATASET_ID, split='train',
+                            download_mode='reuse_dataset_if_exists')
     boxed = []
     for row in ds:
         if not row['metadata'].get('boxed'):

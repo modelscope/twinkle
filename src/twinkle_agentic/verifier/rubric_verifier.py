@@ -151,6 +151,9 @@ because a later step/deliverable it references is outside this segment's scope.
 user-facing output; ignore it for "output only X" style criteria.
 - For PASS items, leave "fix" as "". For FAIL items, "fix" must be a concrete \
 correction (e.g. add the missing argument, redo step k).
+- Keep every "reason" and "fix" clear and concise — one short sentence each, \
+stating only the essential point; do not restate the criterion, quote the segment \
+at length, or add filler.
 - "overall" is "OK" only if NO criterion is FAIL.
 - Output only the JSON object."""
 
