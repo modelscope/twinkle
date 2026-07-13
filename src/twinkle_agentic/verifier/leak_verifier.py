@@ -62,6 +62,27 @@ checks that are not specific to this task's answer.
 
 Reply with exactly one word: LEAK or CLEAN."""
 
+# Answer-only variant: flags ONLY final-answer disclosure and explicitly PERMITS
+# revealing the method / approach / step plan. For skill-generation training, the
+# method IS the product we want, so the default prompt's "decisive intermediate
+# result" and "step-by-step plan that solves this task" clauses over-flag good
+# skills; this variant drops them.
+_JUDGE_SYSTEM_ANSWER_ONLY = """\
+You check whether a HINT that will be shown to someone solving a TASK reveals the 
+TASK's FINAL ANSWER.
+
+The hint may FREELY describe general methods, the solution approach, which 
+technique to apply, the steps to take, common pitfalls, or sanity checks — even 
+if that strongly points at how to solve THIS task. Revealing the METHOD or PLAN 
+is allowed and expected of a good hint.
+
+The hint LEAKS only if it reveals the FINAL ANSWER itself — the concrete final 
+value, expression, choice, label, or verbatim result the task asks for (or a 
+trivially equivalent restatement of it). Describing HOW to get there WITHOUT 
+stating the resulting final value does NOT leak.
+
+Reply with exactly one word: LEAK or CLEAN."""
+
 _JUDGE_USER = """\
 ## Task
 {query}
@@ -135,6 +156,8 @@ class LeakVerifier(Verifier):
         max_content_chars / max_query_chars: truncation caps for the judge input.
         uncertain_is_leak: if the judge reply is unparseable, treat it as a leak
             (default False: keep the hint, the conservative choice).
+        judge_system: optional custom judge system prompt that overrides the built-in
+            answer_only/legacy criteria (for task-specific leak policies).
     """
 
     def __init__(
@@ -147,6 +170,8 @@ class LeakVerifier(Verifier):
         max_content_chars: int = 4000,
         max_query_chars: int = 4000,
         uncertain_is_leak: bool = False,
+        answer_only: bool = False,
+        judge_system: Optional[str] = None,
     ):
         self.sampler = sampler
         self.model_path = model_path
@@ -155,6 +180,13 @@ class LeakVerifier(Verifier):
         self.max_content_chars = int(max_content_chars)
         self.max_query_chars = int(max_query_chars)
         self.uncertain_is_leak = bool(uncertain_is_leak)
+        # answer_only: flag ONLY final-answer disclosure, permit method/plan (see
+        # _JUDGE_SYSTEM_ANSWER_ONLY). Default keeps the strict legacy behaviour.
+        self.answer_only = bool(answer_only)
+        # judge_system: caller-supplied criterion that overrides both built-ins, for
+        # task-specific leak policies (e.g. permit method/plan but still flag concrete
+        # intermediate key results). None -> fall back to the answer_only/legacy pair.
+        self.judge_system = judge_system or None
 
     # ------------------------------------------------------------------
     # public entry points
@@ -240,8 +272,10 @@ class LeakVerifier(Verifier):
             query=self._trim(query, self.max_query_chars),
             reference_block=ref_block,
             hint=self._trim(content, self.max_content_chars))
+        system = self.judge_system or (
+            _JUDGE_SYSTEM_ANSWER_ONLY if self.answer_only else _JUDGE_SYSTEM)
         return {'messages': [
-            {'role': 'system', 'content': _JUDGE_SYSTEM},
+            {'role': 'system', 'content': system},
             {'role': 'user', 'content': user},
         ]}
 

@@ -265,18 +265,18 @@ def _skill_leaks(skill: str, gold: str) -> Tuple[bool, str]:
 # --- API leak judge: catches what the string filter cannot (MCQ letters, a
 #     derived key result, or a near-complete solution laid out as a "skill"). ---
 _LEAK_JUDGE_SYSTEM = (
-    'You are a strict grader deciding whether a "skill" hint LEAKS the solution to a '
-    'math problem. A skill should be a GENERAL, transferable reminder. It LEAKS if it '
-    'does ANY of: reveal the final answer (a number, expression, or multiple-choice '
-    'option); state a specific numeric/geometric result or key intermediate value of '
-    'THIS problem; or give a derivation that essentially solves THIS problem. It does '
-    'NOT leak if it only names general methods, common pitfalls, or checks. Reply with '
-    'exactly one word: LEAK or CLEAN.'
+    'You decide whether a "skill" hint LEAKS the FINAL ANSWER to a math problem. '
+    'A skill may freely name the general method, the right technique, the solution '
+    'approach, the steps to take, or common pitfalls — revealing the METHOD is '
+    'allowed and expected. It LEAKS only if it reveals the FINAL ANSWER itself: the '
+    'concrete final number, expression, or multiple-choice option the problem asks '
+    'for (or a trivially equivalent restatement). Describing HOW to solve it WITHOUT '
+    'stating the resulting final value does NOT leak. Reply with exactly one word: '
+    'LEAK or CLEAN.'
 )
 _LEAK_JUDGE_USER = (
     'Problem:\n{problem}\n\nGold answer: {gold}\n\nSkill hint to check:\n{skill}\n\n'
-    'Does the skill leak the answer or a full solution to THIS problem? Reply LEAK or '
-    'CLEAN.'
+    'Does the skill reveal the FINAL ANSWER to THIS problem? Reply LEAK or CLEAN.'
 )
 
 
@@ -339,13 +339,22 @@ def _pad_for_dp(prompts: List[Any], gen_dp: int) -> List[Any]:
 
 
 def _run_samples(sampler, prompts: List[Any], num_samples: int, max_tokens: int,
-                 gen_dp: int) -> List[List[Any]]:
-    """One batched sampler call; return per-prompt list of raw sampled sequences."""
+                 gen_dp: int, temperature: Optional[float] = None,
+                 top_p: Optional[float] = None,
+                 top_k: Optional[int] = None) -> List[List[Any]]:
+    """One batched sampler call; return per-prompt list of raw sampled sequences.
+
+    ``temperature``/``top_p``/``top_k`` default to the module's sampling config; pass
+    ``temperature=0.0`` for deterministic greedy decoding (SEAM-style executor scoring),
+    or a high ``temperature`` with ``top_k=-1`` for diverse multi-candidate sampling."""
     if not prompts:
         return []
     params = TwinkleSamplingParams(
-        max_tokens=max_tokens, temperature=GEN_TEMPERATURE, top_p=GEN_TOP_P,
-        num_samples=num_samples)
+        max_tokens=max_tokens,
+        temperature=GEN_TEMPERATURE if temperature is None else temperature,
+        top_p=GEN_TOP_P if top_p is None else top_p,
+        num_samples=num_samples,
+        **({} if top_k is None else {'top_k': top_k}))
     padded = _pad_for_dp(prompts, gen_dp)
     responses = sampler.sample(padded, params)[:len(prompts)]
     return [list(r.sequences) if (r and r.sequences) else [] for r in responses]

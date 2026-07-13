@@ -5,21 +5,26 @@
 
 set -euo pipefail
 
-export GEN_MODEL_ID=${GEN_MODEL_ID:-Qwen/Qwen3.5-4B}
-export MATH_DATA_DIR=${MATH_DATA_DIR:-./output/math_data/MATH}
+export GEN_MODEL_ID=${GEN_MODEL_ID:-Qwen/Qwen3-4B}
+# Local MATH copy (modelscope download cache). Override MATH_DATA_DIR if the
+# cache hash dir changes or the data lives elsewhere.
+export MATH_DATA_DIR=${MATH_DATA_DIR:-/mnt/workspace/.cache/modelscope/hub/datasets/downloads/extracted/0744cd2d347a7e8f85f7087d950b2ed38b626a5c808c5399e2d8a0923d42d013/MATH}
 export LLM_BACKUP_API_KEY=${LLM_BACKUP_API_KEY:?set LLM_BACKUP_API_KEY for the leak judge}
 export LLM_BACKUP_BASE_URL=${LLM_BACKUP_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
 export LLM_BACKUP_MODEL=${LLM_BACKUP_MODEL:-qwen3.7-max}
 
 python cookbook/exp/embedding/train_reflexion_skill_rft.py \
-  --n 2000 \
+  --n 5000 \
   --chunk-size 16 \
   --n-skills 8 \
-  --pass-k 8 \
-  --hard-baseline-max 0.25 \
-  --train-every 64 \
-  --train-batch 64 \
+  --view-b-frac 0.5 \
+  --skill-retries 2 \
+  --max-tokens 25000 \
+  --max-model-len 30000 \
   --sft-batch-size 8 \
-  --lr 1e-5 \
-  --max-train-rounds 200 \
+  --grpo-epsilon 0.2 \
+  --lr 6e-6 \
+  --max-train-rounds 1500 \
+  --save-rounds 25 \
+  --trend-every 10 \
   --output-dir ./output/reflexion_skill_rft
