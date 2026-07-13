@@ -560,12 +560,12 @@ class MultiLora:
             lora_tenant = self.loras[i]
             pattern = re.compile(rf'\.lora_(?:A|embedding_A)\.{re.escape(lora_tenant.adapter_name)}\.')
 
-        def _store_weights(_module):
-            for name, parameter in _module.named_parameters():
-                if self._is_target_parameter_lora_name(name):
-                    continue
-                if pattern.search(name):
-                    lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
+            def _store_weights(_module):
+                for name, parameter in _module.named_parameters():
+                    if self._is_target_parameter_lora_name(name):
+                        continue
+                    if pattern.search(name):
+                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
 
             if isinstance(self.module, list):
                 for _module in self.module:

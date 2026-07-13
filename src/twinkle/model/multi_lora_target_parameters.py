@@ -248,6 +248,11 @@ class TargetParameterLoraWrapper(nn.Module):
                 device=self.lora_A[slot_name].device,
                 dtype=self.lora_A[slot_name].dtype,
             )
+            if hasattr(self.record.module, '_ep_local_start') and hasattr(self.record.module, '_ep_local_end'):
+                start = self.record.module._ep_local_start
+                end = self.record.module._ep_local_end
+                if lora_A_3d.shape[0] > num_experts:
+                    lora_A_3d = lora_A_3d[start:end]
             # Validate shape
             expected_shape_a = (num_experts, r, self.lora_A[slot_name].shape[-1])
             if lora_A_3d.shape != expected_shape_a:
@@ -259,6 +264,11 @@ class TargetParameterLoraWrapper(nn.Module):
                 device=self.lora_B[slot_name].device,
                 dtype=self.lora_B[slot_name].dtype,
             )
+            if hasattr(self.record.module, '_ep_local_start') and hasattr(self.record.module, '_ep_local_end'):
+                start = self.record.module._ep_local_start
+                end = self.record.module._ep_local_end
+                if lora_B_3d.shape[0] > num_experts:
+                    lora_B_3d = lora_B_3d[start:end]
             # Validate shape
             expected_shape_b = (num_experts, self.lora_B[slot_name].shape[1], r)
             if lora_B_3d.shape != expected_shape_b:
