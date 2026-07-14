@@ -90,10 +90,11 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
         if exists('mindspeed>=0.12.1') and exists('flash-linear-attention'):
             apply_qwen3_5_fla(model)
         else:
-            logger.warning('[NPU] [FLA] mindspeed or flash-linear-attention is not installed, or mindspeed version smaller than 0.12.1; '
-                           'FLA patch for Qwen3.5 requires mindspeed and flash-linear-attention. '
-                           'Install them with: pip install flash-linear-attention and mindspeed from source code via https://gitcode.com/Ascend/MindSpeed.'
-                           'Other NPU patches will still apply.')
+            logger.warning(
+                '[NPU] [FLA] mindspeed or flash-linear-attention is not installed, or mindspeed version smaller than 0.12.1; '
+                'FLA patch for Qwen3.5 requires mindspeed and flash-linear-attention. '
+                'Install them with: pip install flash-linear-attention and mindspeed from source code via https://gitcode.com/Ascend/MindSpeed.'
+                'Other NPU patches will still apply.')
     return bundle
 
 
