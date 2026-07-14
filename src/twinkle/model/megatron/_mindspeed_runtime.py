@@ -35,8 +35,6 @@ def ensure_mindspeed_adaptor_patched() -> None:
     global _MINDSPEED_IMPORTED
     if not _is_npu() or _MINDSPEED_IMPORTED:
         return
-    from twinkle.utils.import_utils import requires
-    requires('mindspeed')
     import mindspeed.megatron_adaptor  # noqa: F401
     _MINDSPEED_IMPORTED = True
 
