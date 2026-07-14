@@ -400,6 +400,8 @@ def _ep_expert_state_dict_gather_dim(name: str) -> int:
     # [out, r * num_experts]. EP therefore owns a contiguous expert block on
     # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
     # parallelism, so the forward pass does not need an EP all-reduce.
+    if '_twinkle_lora_' in name:
+        return 0
     if 'lora_B' in name:
         return 1
     return 0

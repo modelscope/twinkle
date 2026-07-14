@@ -24,6 +24,7 @@ def test_ep_target_parameter_lora_gather_dim_matches_peft_flattening():
     assert _ep_expert_state_dict_gather_dim("model.layers.0.mlp.experts.base_layer.lora_A.weight") == 0
     assert _ep_expert_state_dict_gather_dim("model.layers.0.mlp.experts.lora_B.weight") == 1
     assert _ep_expert_state_dict_gather_dim("model.layers.0.mlp.experts.base_layer.lora_B.weight") == 1
+    assert _ep_expert_state_dict_gather_dim("model.layers.0.mlp.experts._twinkle_lora_gate_up_proj.lora_B.lora_0.weight") == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4, reason="Need 4 GPUs")
