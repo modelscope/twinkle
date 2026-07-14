@@ -160,3 +160,63 @@ def test_sample_stream_rejects_bad_max_tokens() -> None:
     inp = InputFeature(input_ids=[1])
     with pytest.raises(ValueError):
         list(s.sample_stream(inp, SamplingParams(max_tokens=0)))
+
+
+# ---------- Multi-turn contract knobs (task 8.6) -------------------------- #
+
+
+def test_default_new_input_feature_appends_sampled_tokens() -> None:
+    """Default behaviour now carries a non-empty new_input_feature that appends
+    the round's sampled tokens onto the input pif's input_ids."""
+    s = MockSampler('mid')
+    inp = InputFeature(input_ids=[1, 2, 3])
+    seq = s.sample(inp, SamplingParams(max_tokens=4))[0].sequences[0]
+    assert seq.new_input_feature is not None
+    assert 'input_ids' in seq.new_input_feature
+    assert seq.new_input_feature['input_ids'] == [1, 2, 3] + list(seq.tokens)
+    # Prior context stays non-trainable; sampled tokens are trainable (their ids).
+    assert seq.new_input_feature['labels'] == [-100, -100, -100] + list(seq.tokens)
+    assert seq.new_input_feature['length'] == 3 + len(seq.tokens)
+
+
+def test_default_backward_compatible_stop_reason_and_decoded() -> None:
+    """With no knobs configured, stop_reason stays 'length' and decoded None."""
+    s = MockSampler('mid')
+    inp = InputFeature(input_ids=[1])
+    seq = s.sample(inp, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert seq.stop_reason == 'length'
+    assert seq.decoded is None
+
+
+def test_configurable_stop_reason_via_ctor() -> None:
+    s = MockSampler('mid', stop_reason='stop')
+    inp = InputFeature(input_ids=[1])
+    seq = s.sample(inp, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert seq.stop_reason == 'stop'
+
+
+def test_stop_reason_per_call_kwarg_overrides_ctor() -> None:
+    s = MockSampler('mid', stop_reason='stop')
+    inp = InputFeature(input_ids=[1])
+    seq = s.sample(inp, SamplingParams(max_tokens=2), stop_reason='length')[0].sequences[0]
+    assert seq.stop_reason == 'length'
+
+
+def test_tool_call_text_injected_only_on_configured_turns() -> None:
+    """tool_call_text is emitted as decoded on turn 1 only (default), driving a
+    'sample -> tool -> next round -> terminate' loop."""
+    s = MockSampler('mid', stop_reason='stop', tool_call_text='<tool_call>x</tool_call>')
+    inp = InputFeature(input_ids=[1, 2])
+    # Round 1: tool call injected.
+    seq1 = s.sample(inp, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert seq1.decoded == '<tool_call>x</tool_call>'
+    # Round 2: no injection -> decoded None (loop can terminate on empty parse).
+    seq2 = s.sample(inp, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert seq2.decoded is None
+
+
+def test_tool_call_turns_multiple_rounds() -> None:
+    s = MockSampler('mid', stop_reason='stop', tool_call_text='TC', tool_call_turns=(1, 3))
+    inp = InputFeature(input_ids=[1])
+    decoded = [s.sample(inp, SamplingParams(max_tokens=1))[0].sequences[0].decoded for _ in range(3)]
+    assert decoded == ['TC', None, 'TC']
