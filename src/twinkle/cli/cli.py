@@ -193,6 +193,7 @@ class RLArgs:
     gkd_beta: float = 0.5
     gkd_temperature: float = 1.0
     gkd_topk: int = 64
+    router_replay_mode: Literal['disabled', 'R2', 'R3'] = 'disabled'
 
 
 @dataclass

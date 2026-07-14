@@ -312,11 +312,14 @@ class VLLMEngine(BaseSamplerEngine):
 
             stop_reason: StopReason = _map_finish_reason(output.finish_reason)
 
-            sequences.append(SampledSequence(
-                stop_reason=stop_reason,
-                tokens=token_ids,
-                logprobs=seq_logprobs,
-            ))
+            routed_experts = getattr(output, 'routed_experts', None)
+            sequences.append(
+                SampledSequence(
+                    stop_reason=stop_reason,
+                    tokens=token_ids,
+                    logprobs=seq_logprobs,
+                    routed_experts=routed_experts,
+                ))
 
         # Extract prompt logprobs if requested
         result_prompt_logprobs = None
