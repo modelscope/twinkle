@@ -384,7 +384,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns ``cleanup_fn``.
         Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
         """
-        if not self._router_replay_enabled:
+        if not getattr(self, '_router_replay_enabled', False):
             return lambda: None
 
         self._maybe_apply_router_replay()
