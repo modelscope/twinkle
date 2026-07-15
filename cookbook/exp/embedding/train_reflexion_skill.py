@@ -26,6 +26,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -398,6 +399,125 @@ def load_problems(dataset: str, n: int, seed: int, num_proc: int = 0) -> List[Di
     return out[:n] if (n and n < len(out)) else out
 
 
+# ---------------------------------------------------------------------------
+# Bag-of-words neighbour pairing (cross-problem rubric transfer, --xproblem-rubric)
+# ---------------------------------------------------------------------------
+# Common English + math-scaffolding words that carry no problem-type signal. Kept small
+# and deterministic on purpose (no external stopword list): what survives is the domain
+# vocabulary ('triangle', 'prime', 'polynomial', ...) that actually defines the type.
+_BOW_STOP = frozenset("""
+a an the of to in on at for and or but if is are be was were been being this that these those
+with without into onto from by as it its their his her our your my we you they he she them
+find compute determine calculate evaluate solve show prove given let suppose consider assume
+what which when where how many much value values number numbers expression form terms term
+such that then than so if only when each every all any some both one two three four five six
+seven eight nine ten first second third last non over under about above below between
+problem answer result equal equals sum difference product total following there here have has
+had do does did can could will would should may might must not no yes if then else
+""".split())
+
+_WORD_RE = re.compile(r'[a-z]+')
+
+
+def _stem(w: str) -> str:
+    """Crude suffix stripper so 'prime'/'primes', 'triangle'/'triangles' collapse to one
+    type token. Not linguistically correct -- just enough to merge the common plural/gerund
+    variants that otherwise split a type's vocabulary and starve the df filter."""
+    if len(w) > 4 and w.endswith('ies'):
+        return w[:-3] + 'y'                     # properties -> property
+    if len(w) > 4 and w.endswith('es') and w[-3] in 'sxzh':
+        return w[:-2]                           # boxes -> box (keep primes -> prime below)
+    for suf in ('ing', 'ed', 's'):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            return w[:-len(suf)]
+    return w
+
+
+def _tokenize(problem: str) -> List[str]:
+    """Deterministic bag-of-words tokens for type matching: lowercase alphabetic words
+    (numbers dropped -- they are instance detail, not type), minus generic stopwords, then
+    stemmed, so only domain terms remain. Latex control words (frac, sqrt, ...) survive."""
+    return [_stem(w) for w in _WORD_RE.findall((problem or '').lower())
+            if len(w) > 2 and w not in _BOW_STOP]
+
+
+class BagOfWordsIndex:
+    """TF-IDF cosine nearest-neighbour over problem statements. Sparse dict vectors +
+    an inverted index, so ``nearest`` scores only problems sharing a term (near-linear in
+    practice, no dense NxN). Deterministic; ties break on lower index for reproducibility."""
+
+    def __init__(self, problems: List[str], min_df: int = 2, max_df_frac: float = 0.5):
+        self._toks = [_tokenize(p) for p in problems]
+        n = len(self._toks)
+        df: Dict[str, int] = {}
+        for toks in self._toks:
+            for w in set(toks):
+                df[w] = df.get(w, 0) + 1
+        max_df = max(min_df, int(max_df_frac * n))
+        self._idf = {w: math.log((n + 1) / (c + 1)) + 1.0
+                     for w, c in df.items() if min_df <= c <= max_df}
+        self._vecs: List[Dict[str, float]] = [self._vectorize(t) for t in self._toks]
+        self._inverted: Dict[str, List[int]] = {}
+        for i, v in enumerate(self._vecs):
+            for w in v:
+                self._inverted.setdefault(w, []).append(i)
+
+    def _vectorize(self, toks: List[str]) -> Dict[str, float]:
+        tf: Dict[str, float] = {}
+        for w in toks:
+            if w in self._idf:
+                tf[w] = tf.get(w, 0.0) + 1.0
+        vec = {w: c * self._idf[w] for w, c in tf.items()}
+        norm = math.sqrt(sum(x * x for x in vec.values()))
+        return {w: x / norm for w, x in vec.items()} if norm > 0 else {}
+
+    def nearest(self, i: int) -> Tuple[int, float]:
+        """(index, cosine) of the most similar OTHER problem, or (-1, 0.0) if none."""
+        vi = self._vecs[i]
+        if not vi:
+            return -1, 0.0
+        scores: Dict[int, float] = {}
+        for w, xi in vi.items():
+            for j in self._inverted.get(w, ()):
+                if j != i:
+                    scores[j] = scores.get(j, 0.0) + xi * self._vecs[j].get(w, 0.0)
+        if not scores:
+            return -1, 0.0
+        best = max(scores.items(), key=lambda kv: (kv[1], -kv[0]))
+        return best[0], best[1]
+
+
+def build_neighbor_map(problems: List[str], cache: 'DiskCache') -> Dict[str, Tuple[str, float]]:
+    """{problem -> (nearest-neighbour problem, cosine similarity)}. Cached on disk keyed by
+    the whole problem set (order-independent), so a restart reloads instantly."""
+    key = DiskCache.key_for('bow_neighbors', *sorted(problems))
+    hit = cache.get(key)
+    if hit is not None:
+        return {q: (p, s) for q, (p, s) in hit.items()}  # json roundtrips tuples as lists
+    index = BagOfWordsIndex(problems)
+    out: Dict[str, Tuple[str, float]] = {}
+    for i, p in enumerate(problems):
+        j, sim = index.nearest(i)
+        if j >= 0:
+            out[p] = (problems[j], sim)
+    cache.put(key, {q: [p, s] for q, (p, s) in out.items()})
+    return out
+
+
+def select_paired_subset(records: List[Dict[str, Any]], n: int, seed: int
+                         ) -> List[Dict[str, Any]]:
+    """Keep the ``n`` problems with the strongest bag-of-words neighbour, so the training
+    pool is dense in same-type pairs (cross-problem rubric transfer needs a real analogue,
+    not a random other problem). n<=0 or n>=len keeps all (still shuffled)."""
+    index = BagOfWordsIndex([r['problem'] for r in records])
+    scored = [(index.nearest(i)[1], i) for i in range(len(records))]
+    scored.sort(key=lambda si: (-si[0], si[1]))
+    keep = [i for _, i in scored[:n]] if (0 < n < len(records)) else list(range(len(records)))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(keep)
+    return [records[i] for i in keep]
+
+
 _NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
 
 
@@ -455,7 +575,11 @@ def _load_records(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[
     eval_records = [dict(r) for r in records[:eval_n]]
     pool = records[eval_n:]
     train_n = args.n if args.n > 0 else len(pool)
-    train_records = [dict(r) for r in pool[:train_n]]
+    # Cross-problem rubric: keep the train_n problems with the strongest bag-of-words
+    # neighbour (dense same-type pairs), so a problem's rubric can transfer to its analogue.
+    # Otherwise keep the first train_n (already shuffled).
+    train_records = ([dict(r) for r in select_paired_subset(pool, train_n, args.seed)]
+                     if args.xproblem_rubric else [dict(r) for r in pool[:train_n]])
     if {r['problem'] for r in train_records} & {r['problem'] for r in eval_records}:
         raise ValueError('eval/train overlap detected')
     stats = {'raw_loaded': raw_n, 'numeric_dropped': dropped,
@@ -818,16 +942,50 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
             c['advantage'], c['grpo_adv'], c['kept'] = adv, adv, c['reward'] > mean_r
 
 
+def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
+                          neighbor_map: Dict[str, Tuple[str, float]], base_dp: int,
+                          args: argparse.Namespace, checker,
+                          base_cache: DiskCache, rubric_cache: DiskCache) -> None:
+    """Cross-problem rubric (--xproblem-rubric): for every view-A problem Q, replace its own
+    rubric with the rubric of its bag-of-words neighbour P (Q keeps being the solved/scored
+    problem). P is baselined + diagnosed here (both disk-cached) as a throwaway stub, then
+    P's findings are copied onto Q, along with the neighbour's text + similarity for audit.
+    A P that can't be diagnosed -> Q degrades to view B. This makes any answer leaked from
+    P's rubric useless for solving Q."""
+    targets = [r for r in chunk if r.get('_view') == 'A' and neighbor_map.get(r['problem'])]
+    if not targets:
+        return
+    stubs, by_problem = [], {}
+    for r in targets:
+        p, _ = neighbor_map[r['problem']]
+        if p not in by_problem:
+            stub = {'problem': p, 'reference_answer': '', '_view': 'A'}
+            by_problem[p] = stub
+            stubs.append(stub)
+    baseline_rollout(base_sampler, stubs, base_dp, args, base_cache)
+    diagnose_views(checker, stubs, args, rubric_cache)
+    for r in targets:
+        p, sim = neighbor_map[r['problem']]
+        r['_rubric_diag'] = by_problem[p].get('_rubric_diag', '')
+        r['_rubric_src'], r['_neighbor_sim'] = p, sim
+
+
 def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                   ci: int, base_dp: int, skill_dp: int, args: argparse.Namespace,
-                  checker, rubric_cache: DiskCache
+                  checker, rubric_cache: DiskCache, base_cache: DiskCache = None,
+                  neighbor_map: Optional[Dict[str, str]] = None
                   ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     """view assign -> rubric-check (view A) -> skill-gen -> leak-filter -> with-skill
-    greedy pass -> GRPO advantages. ``chunk`` arrives already baselined by draw_chunk."""
+    greedy pass -> GRPO advantages. ``chunk`` arrives already baselined by draw_chunk.
+    With --xproblem-rubric, view A gets its NEIGHBOUR's rubric (see apply_neighbor_rubric)."""
     hard = chunk
     for r in hard:
         r['_view'], r['_rubric_diag'] = _assign_view(r['problem'], args), ''
-    diagnose_views(checker, hard, args, rubric_cache)
+    if args.xproblem_rubric and neighbor_map:
+        apply_neighbor_rubric(base_sampler, hard, neighbor_map, base_dp, args, checker,
+                              base_cache, rubric_cache)
+    else:
+        diagnose_views(checker, hard, args, rubric_cache)
 
     # skill-gen (thinking ON), per-view prompt; re-sample problems with no clean candidate.
     flat: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -847,7 +1005,9 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                 block = _extract_skills_block(resp)
                 cand = {'skills': block or '', 'response': resp, 'parseable': bool(block),
                         'view': r['_view'], 'leaked': None, 'leak_reason': '',
-                        'leak_source': '', 'with_pass': None, 'reward': None, 'rolls': []}
+                        'leak_source': '', 'with_pass': None, 'reward': None, 'rolls': [],
+                        'skillgen_stop': getattr(s, 'stop_reason', None),
+                        'skillgen_tokens': len(getattr(s, 'tokens', None) or [])}
                 r['_cands'].append(cand)
                 if block:
                     flat.append((r, cand))
@@ -913,9 +1073,12 @@ def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
                          'gen_tokens': init['gen_tokens']},
         'baseline_pass': r['_baseline_pass'], 'is_hard': r['_hard'],
         'view': r.get('_view', ''), 'rubric_diag': r.get('_rubric_diag', ''),
+        # xproblem audit: which neighbour's rubric this problem borrowed, and how similar.
+        'rubric_src': r.get('_rubric_src', ''), 'neighbor_sim': r.get('_neighbor_sim'),
         'baseline_rolls': [_roll(x) for x in r['_baseline_rolls']],
         'candidates': [{
             'skills': c['skills'], 'response': c['response'], 'parseable': c['parseable'],
+            'skillgen_stop': c.get('skillgen_stop'), 'skillgen_tokens': c.get('skillgen_tokens'),
             'leaked': c['leaked'], 'leak_reason': c['leak_reason'], 'leak_source': c['leak_source'],
             'with_pass': c['with_pass'], 'reward': c.get('reward'), 'advantage': c.get('advantage'),
             'grpo_adv': c.get('grpo_adv'), 'kept': c.get('kept'),
@@ -924,44 +1087,97 @@ def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
     }
 
 
-def _view_stats(hard: List[Dict[str, Any]], view: str) -> Dict[str, Any]:
-    hv = [r for r in hard if r.get('_view') == view]
-    cands = [c for r in hv for c in r['_cands'] if c['parseable']]
+def _view_stats(problems: List[Dict[str, Any]], view: str) -> Dict[str, Any]:
+    pv = [r for r in problems if r.get('_view') == view]
+    cands = [c for r in pv for c in r['_cands'] if c['parseable']]
     clean = [c for c in cands if c['leaked'] is False]
-    adopted = sum(1 for r in hv
+    adopted = sum(1 for r in pv
                   if any(c['leaked'] is False and abs(c.get('advantage') or 0.0) > 1e-9
                          for c in r['_cands']))
-    return {'n_hard': len(hv), 'n_candidates_parseable': len(cands), 'n_clean': len(clean),
-            'n_adopted_problems': adopted, 'adoption_rate': (adopted / len(hv)) if hv else 0.0}
+    return {'n': len(pv), 'n_candidates_parseable': len(cands), 'n_clean': len(clean),
+            'n_adopted_problems': adopted, 'adoption_rate': (adopted / len(pv)) if pv else 0.0}
+
+
+def _mean(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _std(xs: List[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+
+
+def _signal_stats(problems: List[Dict[str, Any]]) -> Dict[str, float]:
+    """The heart of 'is there a learning signal': per problem, the scored candidates form a
+    GRPO group. A group with zero reward variance (all skills solve, or none do -- the
+    hard-problem dead zone) gives NO gradient. Tracks that fraction plus reward level and
+    within-group variance so a collapse (all-0 or all-1) is visible immediately."""
+    group_vars, all_rewards, zero_grad, groups = [], [], 0, 0
+    for r in problems:
+        rewards = [c['reward'] for c in r['_cands'] if c.get('reward') is not None]
+        if len(rewards) < 2:
+            continue
+        groups += 1
+        all_rewards.extend(rewards)
+        v = _std(rewards)
+        group_vars.append(v)
+        if v < 1e-9:  # every skill got the same reward -> GRPO skips this problem
+            zero_grad += 1
+    return {'n_groups': groups, 'zero_grad_frac': (zero_grad / groups) if groups else 0.0,
+            'reward_mean': _mean(all_rewards), 'reward_std': _std(all_rewards),
+            'group_reward_std_mean': _mean(group_vars)}
 
 
 def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespace) -> Dict[str, Any]:
-    hard = [r for r in chunk if r['_hard']]
     all_cands = [c for r in chunk for c in r['_cands']]
     cands = [c for c in all_cands if c['parseable']]
     scored = [c for c in cands if c['with_pass'] is not None]
+    clean = [c for c in cands if c['leaked'] is False]
     ws_rolls = [x for c in scored for x in c['rolls']]
-    fail_cands = [c for r in chunk if r['_failed'] for c in r['_cands']]
-    base_acc = (sum(r['_baseline_pass'] for r in hard) / len(hard)) if hard else 0.0
-    ws_acc = (sum(c['with_pass'] for c in scored) / len(scored)) if scored else 0.0
-    abs_adv = lambda cs: sum(abs(c.get('advantage') or 0.0) for c in cs)
-    total_abs = abs_adv(all_cands)
+    base_acc = (sum(r['_baseline_pass'] for r in chunk) / len(chunk)) if chunk else 0.0
+    ws_acc = _mean([c['with_pass'] for c in scored])
+    # base failure taxonomy (you asked whether skills fail because the base loops out of length)
+    classes = [_baseline_class(r) for r in chunk]
+    n_fail = sum(1 for c in classes if c != 'success')
+    skill_tokens = [c.get('skillgen_tokens') or 0 for c in cands]  # skill-gen response length
+    trunc = sum(1 for r in chunk for c in r['_cands']
+                for x in c['rolls'] if x['stop_reason'] == 'length')
     return {
         'record_type': 'summary', 'chunk': ci, 'n': len(chunk),
-        'n_failed_first_try': sum(1 for r in chunk if r['_failed']), 'n_hard': len(hard),
+        'n_failed_first_try': sum(1 for r in chunk if r['_failed']),
         'n_generated': len(all_cands), 'n_candidates_parseable': len(cands),
         'n_unparseable': len(all_cands) - len(cands),
-        'n_leaked': sum(1 for c in cands if c['leaked']),
-        'n_clean': sum(1 for c in cands if c['leaked'] is False),
+        'parse_rate': (len(cands) / len(all_cands)) if all_cands else 0.0,
+        'n_leaked': sum(1 for c in cands if c['leaked']), 'n_clean': len(clean),
+        'leak_rate': (sum(1 for c in cands if c['leaked']) / len(cands)) if cands else 0.0,
         'n_reward_pos': sum(1 for c in scored if c['reward']),
         'n_train_samples': sum(1 for c in all_cands if _is_trainable(c, args)),
-        'n_train_from_fail': sum(1 for c in fail_cands if _is_trainable(c, args)),
-        'abs_adv_from_fail_frac': (abs_adv(fail_cands) / total_abs) if total_abs > 0 else 0.0,
-        'avg_baseline_pass_on_hard': base_acc, 'avg_withskill_pass': ws_acc,
+        'signal': _signal_stats(chunk),
+        'fail_loop_frac': (sum(1 for c in classes if c == 'fail_loop') / n_fail) if n_fail else 0.0,
+        'fail_wrong_frac': (sum(1 for c in classes if c == 'fail_wrong') / n_fail) if n_fail else 0.0,
+        'skill_tokens_mean': _mean(skill_tokens),
+        'withskill_trunc_frac': (trunc / len(ws_rolls)) if ws_rolls else 0.0,
+        'avg_baseline_pass': base_acc, 'avg_withskill_pass': ws_acc,
         'avg_lift': ws_acc - base_acc,
-        'termination_rate_withskill': (sum(1 for x in ws_rolls if x['terminated']) / len(ws_rolls)) if ws_rolls else 0.0,
-        'view_A': _view_stats(hard, 'A'), 'view_B': _view_stats(hard, 'B'),
+        'termination_rate_withskill': _mean([1.0 if x['terminated'] else 0.0 for x in ws_rolls]),
+        'view_A': _view_stats(chunk, 'A'), 'view_B': _view_stats(chunk, 'B'),
+        **_xproblem_stats(chunk, args),
     }
+
+
+def _xproblem_stats(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Dict[str, Any]:
+    """Cross-problem pairing health: of the view-A problems, how many actually got a
+    neighbour's rubric (pair_rate) and how similar those neighbours were. Empty when off."""
+    if not args.xproblem_rubric:
+        return {}
+    view_a = [r for r in chunk if r.get('_view') == 'A']
+    paired = [r for r in view_a if r.get('_rubric_src')]
+    return {'xproblem': {
+        'n_view_a': len(view_a), 'n_paired': len(paired),
+        'pair_rate': (len(paired) / len(view_a)) if view_a else 0.0,
+        'neighbor_sim_mean': _mean([r.get('_neighbor_sim', 0.0) for r in paired])}}
 
 
 def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -976,7 +1192,9 @@ def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
                 out.append({
                     'problem': r['problem'], 'reference_answer': r['reference_answer'],
                     'view': r.get('_view', 'A'), 'diagnosis': r.get('_rubric_diag', ''),
+                    'rubric_src': r.get('_rubric_src', ''),
                     'response': c['response'], 'skills': c['skills'],
+                    'skillgen_stop': c.get('skillgen_stop'),
                     'advantage': c['advantage'], 'grpo_adv': c['grpo_adv'], 'kept': c['kept'],
                     'reward': c['reward'], 'with_pass': c['with_pass']})
     return out
@@ -1086,29 +1304,43 @@ def _trend_line(hist: List[Dict[str, float]], window: int, rounds_done: int) -> 
     return (f'[trend] first {window} vs last {window} | '
             f'adopt A {m(base,"aA"):.2f}->{m(rec,"aA"):.2f} B {m(base,"aB"):.2f}->{m(rec,"aB"):.2f} | '
             f'lift {m(base,"lift"):+.3f}->{m(rec,"lift"):+.3f} | '
+            f'0grad {m(base,"zero_grad"):.2f}->{m(rec,"zero_grad"):.2f} | '
             f'pos/chunk {m(base,"pos"):.1f}->{m(rec,"pos"):.1f} | rounds={rounds_done}')
 
 
 def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]]) -> Dict[str, float]:
-    """Flat swanlab dict = generation metrics + (when trained) the GRPO built-in metric.
-    acc/adopt/term only on chunks with hard problems, so idle chunks don't dip charts."""
+    """Flat swanlab dict. ``signal/*`` is the primary health group (is GRPO getting a
+    gradient at all); ``acc/*`` is the effect; the rest diagnose why. acc/adopt/skill are
+    only logged when the chunk produced a scored group, so idle chunks don't dip charts."""
+    sig = summary['signal']
     d: Dict[str, float] = {
-        'gen/n_hard': summary['n_hard'], 'gen/n_clean': summary['n_clean'],
-        'gen/n_leaked': summary['n_leaked'], 'gen/n_train_samples': summary['n_train_samples'],
-        'gen/n_reward_pos': summary['n_reward_pos'],
-        'gen/n_train_from_fail': summary['n_train_from_fail'],
-        'gen/abs_adv_from_fail_frac': summary['abs_adv_from_fail_frac'],
+        # --- signal: the FIRST thing to watch (no variance -> no learning) ---
+        'signal/zero_grad_frac': sig['zero_grad_frac'], 'signal/n_groups': sig['n_groups'],
+        'signal/reward_mean': sig['reward_mean'], 'signal/reward_std': sig['reward_std'],
+        'signal/group_reward_std_mean': sig['group_reward_std_mean'],
+        'signal/n_train_samples': summary['n_train_samples'],
+        'signal/n_reward_pos': summary['n_reward_pos'],
+        # --- skill format / leak health ---
+        'skill/parse_rate': summary['parse_rate'], 'skill/tokens_mean': summary['skill_tokens_mean'],
+        'leak/rate': summary['leak_rate'], 'leak/n': summary['n_leaked'],
+        # --- base failure taxonomy (loop-out-of-length vs plain wrong) ---
+        'fail/loop_frac': summary['fail_loop_frac'], 'fail/wrong_frac': summary['fail_wrong_frac'],
+        'fail/frac_first_try': (summary['n_failed_first_try'] / summary['n']) if summary['n'] else 0.0,
     }
     bal = summary.get('balance') or {}
     if bal.get('enabled'):
         d.update({'balance/n_drawn': bal['n_drawn'], 'balance/n_baseline_fresh': bal['n_baseline_fresh'],
                   'balance/selected_success_frac': bal['selected_success_frac']})
-    if summary['n_hard'] > 0:
-        d.update({'acc/baseline_pass': summary['avg_baseline_pass_on_hard'],
+    xp = summary.get('xproblem') or {}
+    if xp:
+        d.update({'xproblem/pair_rate': xp['pair_rate'], 'xproblem/neighbor_sim_mean': xp['neighbor_sim_mean']})
+    if sig['n_groups'] > 0:
+        d.update({'acc/baseline_pass': summary['avg_baseline_pass'],
                   'acc/withskill_pass': summary['avg_withskill_pass'], 'acc/lift': summary['avg_lift'],
                   'adopt/A': summary['view_A']['adoption_rate'],
                   'adopt/B': summary['view_B']['adoption_rate'],
-                  'term/withskill': summary['termination_rate_withskill']})
+                  'term/withskill': summary['termination_rate_withskill'],
+                  'term/withskill_trunc_frac': summary['withskill_trunc_frac']})
     if log:
         d['train/n_steps'] = log['n_steps']
         d['train/n_micro_batches'] = log['n_micro_batches']
@@ -1171,7 +1403,7 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--eval-size', type=int, default=128, help='Fixed holdout size (0 disables).')
-    p.add_argument('--eval-every', type=int, default=10, help='Run holdout eval every N chunks.')
+    p.add_argument('--eval-every', type=int, default=5, help='Run holdout eval every N chunks.')
     p.add_argument('--chunk-size', type=int, default=16)
     p.add_argument('--balance', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--balance-success-frac', type=float, default=0.4,
@@ -1180,6 +1412,11 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--balance-max-draws-mult', type=int, default=8)
     p.add_argument('--n-skills', type=int, default=8)
     p.add_argument('--view-b-frac', type=float, default=0.5)
+    p.add_argument('--xproblem-rubric', action=argparse.BooleanOptionalAction, default=True,
+                   help='View A uses its bag-of-words NEIGHBOUR problem\'s rubric (transfer '
+                        'test; kills answer leakage since the neighbour\'s answer differs). '
+                        'On (default); --no-xproblem-rubric = each problem uses its own rubric '
+                        '(may leak).')
     p.add_argument('--skill-retries', type=int, default=2)
     p.add_argument('--skill-gen-temperature', type=float, default=1.0)
     p.add_argument('--skill-gen-top-p', type=float, default=1.0)
@@ -1194,7 +1431,7 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--lr', type=float, default=6e-6)
     p.add_argument('--max-train-rounds', type=int, default=1500)
-    p.add_argument('--save-rounds', type=int, default=50)
+    p.add_argument('--save-rounds', type=int, default=200)
     p.add_argument('--trend-every', type=int, default=10)
     p.add_argument('--output-dir', default='./output/reflexion_skill_rft')
     p.add_argument('--cache-dir', default='', help='Baseline/rubric cache dir (default <output-dir>/cache).')
@@ -1254,6 +1491,12 @@ def main() -> None:
     base_cache = DiskCache(os.path.join(cache_dir, 'baseline.jsonl'), use_cache)
     eval_base_cache = DiskCache(os.path.join(cache_dir, 'eval_baseline.jsonl'), use_cache)
     rubric_cache = DiskCache(os.path.join(cache_dir, 'rubric.jsonl'), use_cache)
+    neighbor_map: Dict[str, str] = {}
+    if args.xproblem_rubric:
+        neighbor_cache = DiskCache(os.path.join(cache_dir, 'bow_neighbors.jsonl'), use_cache)
+        neighbor_map = build_neighbor_map([r['problem'] for r in records], neighbor_cache)
+        neighbor_cache.close()
+        sys.stderr.write(f'[rft] xproblem-rubric ON: {len(neighbor_map)} bag-of-words pairs\n')
 
     cfg = {'record_type': 'config', 'model': MODEL_ID, 'dataset': args.dataset,
            'n': len(records), 'eval_n': len(eval_records), 'seed': args.seed,
@@ -1265,6 +1508,7 @@ def main() -> None:
            'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct)',
            'advantage': 'group_relative', 'format_in_reward': args.format_in_reward, 'cache': use_cache,
            'rubric_check': 'fixed_math_5crit(viewA)' if checker else 'disabled',
+           'xproblem_rubric': args.xproblem_rubric,
            'grpo_epsilon': args.grpo_epsilon, 'lr': args.lr,
            'max_train_rounds': args.max_train_rounds, 'started': int(time.time())}
     sys.stderr.write(f'[rft] raw={data_stats["raw_loaded"]} numeric_drop={data_stats["numeric_dropped"]} '
@@ -1306,7 +1550,7 @@ def main() -> None:
                 pending = prefetch_pool.submit(_prefetch, peeked)
             full, summary, groups = process_chunk(
                 base_sampler, skill_sampler, chunk, gstep, base_dp, skill_dp,
-                args, checker, rubric_cache)
+                args, checker, rubric_cache, base_cache, neighbor_map)
             summary['balance'] = balance
 
             log = None
@@ -1329,18 +1573,22 @@ def main() -> None:
                 _write(data_f, v)
             data_f.flush()
 
-            sa, sb = summary['view_A'], summary['view_B']
+            sa, sb, sig = summary['view_A'], summary['view_B'], summary['signal']
             hist.append({'aA': sa['adoption_rate'], 'aB': sb['adoption_rate'],
-                         'lift': summary['avg_lift'], 'pos': summary['n_reward_pos']})
+                         'lift': summary['avg_lift'], 'pos': summary['n_reward_pos'],
+                         'zero_grad': sig['zero_grad_frac']})
             bal_str = (f'bal {balance["selected_fail"]}f/{balance["selected_success"]}s '
                        f'(drew {balance["n_drawn"]}/fresh {balance["n_baseline_fresh"]}'
                        + ('!' if balance.get('budget_hit') else '') + ') ') if balance.get('enabled') else ''
+            xp = summary.get('xproblem')
+            xp_str = f'pair={xp["pair_rate"]:.2f}@{xp["neighbor_sim_mean"]:.2f} ' if xp else ''
             sys.stderr.write(
-                f'[gen] e{pool.epoch} g{gstep}: {bal_str}hard={summary["n_hard"]} '
-                f'clean={summary["n_clean"]} train={summary["n_train_samples"]} '
-                f'acc={summary["avg_baseline_pass_on_hard"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
-                f'lift={summary["avg_lift"]:+.3f} '
-                f'A[{sa["n_hard"]}h {sa["adoption_rate"]:.2f}] B[{sb["n_hard"]}h {sb["adoption_rate"]:.2f}] '
+                f'[gen] e{pool.epoch} g{gstep}: {bal_str}n={summary["n"]} '
+                f'clean={summary["n_clean"]} leak={summary["leak_rate"]:.2f} train={summary["n_train_samples"]} '
+                f'0grad={sig["zero_grad_frac"]:.2f} R={sig["reward_mean"]:.2f}±{sig["reward_std"]:.2f} '
+                f'acc={summary["avg_baseline_pass"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
+                f'lift={summary["avg_lift"]:+.3f} {xp_str}'
+                f'A[{sa["n"]} {sa["adoption_rate"]:.2f}] B[{sb["n"]} {sb["adoption_rate"]:.2f}] '
                 f'rounds={rounds}\n')
             if use_swan:
                 swanlab.log(_swan_metrics(summary, log), step=gstep)

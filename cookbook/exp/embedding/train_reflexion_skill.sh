@@ -31,6 +31,7 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --chunk-size 16 \
   --n-skills 8 \
   --view-b-frac 0.5 \
+  --xproblem-rubric \
   --skill-retries 2 \
   --balance \
   --balance-success-frac 0.4 \
@@ -40,13 +41,13 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --skill-max-tokens 8192 \
   --max-model-len 30000 \
   --eval-size 128 \
-  --eval-every 10 \
+  --eval-every 5 \
   --sft-batch-size 8 \
   --grpo-epsilon 0.2 \
   --format-in-reward \
   --lr 6e-6 \
   --max-train-rounds 1500 \
-  --save-rounds 25 \
+  --save-rounds 200 \
   --trend-every 10 \
   --prefetch-baseline \
   --output-dir ./output/reflexion_skill \
