@@ -853,7 +853,7 @@ def build_direct_prompt(problem: str) -> Dict[str, Any]:
     return {
         'messages': [
             {'role': 'system', 'content': DIRECT_SYSTEM},
-            {'role': 'user', 'content': problem + MCQ_INSTRUCTION},
+            {'role': 'user', 'content': problem},
         ]
     }
 

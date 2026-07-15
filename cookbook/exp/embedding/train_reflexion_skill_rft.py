@@ -140,8 +140,8 @@ SKILL_GEN_SYSTEM = (
     'training scaffolding: study it together with the problem, identify the '
     'problem-visible features that make each useful flagged failure relevant, then '
     'rephrase those lessons as self-contained reusable skills. The goal is not to '
-    'continue from the check, cite it, or hide it silently; the goal is to turn it into '
-    'a problem-triggered reasoning pattern a query-only solver could reproduce later.\n\n'
+    'continue from the check, cite it, or hide it silently; the goal is to turn it to '
+    'a skill pattern which prevents the model falls into similar pitfalls in the future.\n\n'
     'Good skills name the observable trigger, the method worth reaching for, the '
     'pitfall to watch, and a quick verification habit. Prefer formulations like '
     '"When a configuration has ...", "Before setting up ...", or "Check whether ..." '
@@ -181,7 +181,8 @@ SKILL_GEN_USER_RUBRIC = (
     'Now output a self-contained skills bullet list. Each bullet should still be useful '
     'if the process check were removed: connect any useful flagged failure to '
     'problem-visible features, general methods, and quick checks rather than citing the '
-    'rubric or the earlier attempt.'
+    'rubric or the earlier attempt. \n\n'
+    'Note: **Do not solve the problem, only generate skills**. Now Begin:'
 )
 
 
@@ -193,8 +194,8 @@ def build_skillgen_prompt(problem: str, diagnosis: str) -> Dict[str, Any]:
     attempt. The one-shot demo is query-only; only the real turn carries the diagnosis."""
     return {'messages': [
         {'role': 'system', 'content': SKILL_GEN_SYSTEM},
-        {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=_EX_PROBLEM)},
-        {'role': 'assistant', 'content': _EX_SKILLS},
+        # {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=_EX_PROBLEM)},
+        # {'role': 'assistant', 'content': _EX_SKILLS},
         {'role': 'user',
          'content': SKILL_GEN_USER_RUBRIC.format(problem=problem, diagnosis=diagnosis)},
     ]}
@@ -267,8 +268,8 @@ def build_querygen_prompt(problem: str) -> Dict[str, Any]:
     attempt) — matching what is available at deployment (query only)."""
     return {'messages': [
         {'role': 'system', 'content': SKILL_GEN_SYSTEM_Q},
-        {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=_EX_PROBLEM)},
-        {'role': 'assistant', 'content': _EX_SKILLS},
+        # {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=_EX_PROBLEM)},
+        # {'role': 'assistant', 'content': _EX_SKILLS},
         {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=problem)},
     ]}
 
@@ -406,14 +407,14 @@ Rules:
 - For PASS items, leave "fix" as "".
 - For FAIL items, "reason", "fix", and "summary" must describe only the flawed
   step, theorem, arithmetic operation, case split, or verification habit.
-- NEVER state the correct final answer, corrected final expression, option letter,
+- NEVER try to solve the query or state the correct final answer, corrected final expression, option letter,
   graph/choice label, or any exact value that the answer should become.
 - NEVER write phrases like "the correct answer is", "which gives", "yielding",
   "should be <value>", "Option <letter>", or "Graph <letter>".
 - If a fix would require naming a corrected value, replace it with a method-level
   instruction such as "redo that computation carefully" or "apply the theorem with
   the correct quantities".
-- Keep every "reason" and "fix" clear and concise — one short sentence each.
+- Keep every "reason" and "fix" clear and concise.
 - "overall" is "OK" only if NO criterion is FAIL.
 - Output only the JSON object."""
 

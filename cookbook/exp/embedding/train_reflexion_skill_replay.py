@@ -52,6 +52,7 @@ def _load_chunks(path: str) -> List[List[Dict[str, Any]]]:
 
 
 def _init_model(args: argparse.Namespace, total_updates: int):
+    model = 'ms://Qwen/Qwen3-4B'
     train_mesh = rft.DeviceMesh.from_sizes(
         world_size=rft.TRAIN_GPUS, dp_size=rft.TRAIN_DP, fsdp_size=rft.TRAIN_FSDP)
     device_groups = [
@@ -59,11 +60,11 @@ def _init_model(args: argparse.Namespace, total_updates: int):
     ]
     rft.twinkle.initialize(mode='ray', nproc_per_node=rft.TRAIN_GPUS, groups=device_groups,
                            lazy_collect=False)
-    model = rft.TransformersModel(model_id=rft.GEN_MODEL_ID, device_mesh=train_mesh,
+    model = rft.TransformersModel(model_id=model, device_mesh=train_mesh,
                                   remote_group='train', ddp_config={'find_unused_parameters': False})
     from twinkle.patch.no_split_modules import NoSplitModulesPatch
     model.apply_patch(NoSplitModulesPatch({'Qwen3DecoderLayer'}))
-    model.set_template(rft.Template, model_id=rft.GEN_MODEL_ID,
+    model.set_template(rft.Template, model_id=model,
                        enable_thinking=True, max_length=args.max_model_len,
                        truncation_strategy='delete')
     model.set_processor(rft.InputProcessor, padding_free=False)

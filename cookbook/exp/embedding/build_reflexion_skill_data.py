@@ -6,78 +6,106 @@ inspection. This lets expensive rollout/scoring be run once, then reused for
 offline replay experiments.
 
 Launch:
-    python cookbook/exp/embedding/build_reflexion_skill_data.py --chunks 100
+    python cookbook/exp/embedding/build_reflexion_skill_data.py \
+        --total-problems 3200 --base-success-frac 0.3
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+
+from cookbook.exp.embedding.eval_gpqa_rag import load_aops, load_math
+from twinkle.sampler import vLLMSampler
+
+import twinkle
+from twinkle import DeviceGroup, DeviceMesh
 
 import train_reflexion_skill_rft as rft
 from twinkle_agentic.verifier import LeakVerifier
 
 
 def _build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--dataset', choices=('aops', 'math'), default='aops')
-    p.add_argument('--n', type=int, default=2000)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument('--eval-size', type=int, default=128)
-    p.add_argument('--chunks', type=int, default=100)
-    p.add_argument('--chunk-size', type=int, default=16)
-    p.add_argument('--balance', action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument('--balance-success-frac', type=float, default=0.4)
-    p.add_argument('--balance-loop-frac', type=float, default=0.5)
-    p.add_argument('--balance-max-draws-mult', type=int, default=8)
-    p.add_argument('--n-skills', type=int, default=8)
-    p.add_argument('--view-b-frac', type=float, default=0.5)
-    p.add_argument('--skill-retries', type=int, default=2)
-    p.add_argument('--skill-gen-temperature', type=float, default=1.0)
-    p.add_argument('--skill-gen-top-p', type=float, default=1.0)
-    p.add_argument('--skill-gen-top-k', type=int, default=-1)
-    p.add_argument('--max-model-len', type=int, default=16384)
-    p.add_argument('--max-tokens', type=int, default=8192)
-    p.add_argument('--skill-max-tokens', type=int, default=8192)
-    p.add_argument('--leak-workers', type=int, default=16)
-    p.add_argument('--rubric-workers', type=int, default=16)
-    p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--total-problems', type=int, default=3200,
+                   help='Final number of problems selected into generated chunks.')
+    p.add_argument('--base-success-frac', type=float, default=0.3,
+                   help='Target fraction of selected problems solved by the frozen base.')
     p.add_argument('--output-dir', default='./output/reflexion_skill_data')
     p.add_argument('--overwrite', action='store_true')
-    return p.parse_args()
+    p.add_argument('--seed', type=int, default=42)
+
+    advanced = p.add_argument_group('advanced knobs, usually leave unchanged')
+    advanced.add_argument('--dataset', choices=('aops', 'math'), default='aops')
+    advanced.add_argument('--n', type=int, default=0,
+                          help='Raw train-pool size; 0 derives it from --total-problems.')
+    advanced.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True)
+    advanced.add_argument('--eval-size', type=int, default=128)
+    advanced.add_argument('--chunk-size', type=int, default=16)
+    advanced.add_argument('--balance', action=argparse.BooleanOptionalAction, default=True)
+    advanced.add_argument('--balance-loop-frac', type=float, default=0.5)
+    advanced.add_argument('--balance-max-draws-mult', type=int, default=8)
+    advanced.add_argument('--n-skills', type=int, default=8)
+    advanced.add_argument('--view-b-frac', type=float, default=0.5)
+    advanced.add_argument('--skill-retries', type=int, default=2)
+    advanced.add_argument('--skill-gen-temperature', type=float, default=1.0)
+    advanced.add_argument('--skill-gen-top-p', type=float, default=1.0)
+    advanced.add_argument('--skill-gen-top-k', type=int, default=-1)
+    advanced.add_argument('--max-model-len', type=int, default=16384)
+    advanced.add_argument('--max-tokens', type=int, default=8192)
+    advanced.add_argument('--skill-max-tokens', type=int, default=8192)
+    advanced.add_argument('--leak-workers', type=int, default=16)
+    advanced.add_argument('--rubric-workers', type=int, default=16)
+    advanced.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
+    args = p.parse_args()
+    _resolve_args(args)
+    return args
+
+
+def _resolve_args(args: argparse.Namespace) -> None:
+    if args.total_problems <= 0:
+        raise ValueError('--total-problems must be positive')
+    if args.chunk_size <= 0:
+        raise ValueError('--chunk-size must be positive')
+    if not 0.0 <= args.base_success_frac <= 1.0:
+        raise ValueError('--base-success-frac must be in [0, 1]')
+    args.chunks = math.ceil(args.total_problems / args.chunk_size)
+    args.balance_success_frac = args.base_success_frac
+    if args.n <= 0:
+        args.n = max(args.total_problems + args.eval_size,
+                     math.ceil(args.total_problems * 1.5))
 
 
 def _init_samplers(args: argparse.Namespace):
-    skill_dp = rft.SKILL_SAMPLER_GPUS
-    base_dp = rft.BASE_SAMPLER_GPUS
-    total_gpus = skill_dp + base_dp
-    if total_gpus <= 0:
-        raise ValueError('SKILL_SAMPLER_GPUS + BASE_SAMPLER_GPUS must be positive')
+    model = 'ms://Qwen/Qwen3-4B'
     device_groups = [
-        rft.DeviceGroup(name='skill_sampler', ranks=list(range(0, skill_dp)), device_type='GPU'),
-        rft.DeviceGroup(name='base_sampler', ranks=list(range(skill_dp, total_gpus)), device_type='GPU'),
+        DeviceGroup(name='skill_sampler', ranks=list(range(0, 4)), device_type='GPU'),
+        DeviceGroup(name='base_sampler', ranks=list(range(4, 8)), device_type='GPU'),
     ]
-    rft.twinkle.initialize(mode='ray', nproc_per_node=total_gpus, groups=device_groups,
+    twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_groups,
                            lazy_collect=False)
-    skill_sampler = rft.vLLMSampler(
-        model_id=rft.GEN_MODEL_ID,
-        engine_args={'gpu_memory_utilization': rft.GEN_GPU_MEM,
+    skill_sampler = vLLMSampler(
+        model_id='Qwen/Qwen3-4B',
+        engine_args={'gpu_memory_utilization': 0.8,
                      'max_model_len': args.max_model_len, 'tensor_parallel_size': 1},
-        device_mesh=rft.DeviceMesh.from_sizes(world_size=skill_dp, dp_size=skill_dp),
+        device_mesh=DeviceMesh.from_sizes(world_size=4, dp_size=4),
         remote_group='skill_sampler')
-    skill_sampler.set_template(rft.Template, model_id=rft.GEN_MODEL_ID,
+    skill_sampler.set_template('Template', model_id=model,
                                enable_thinking=True, max_length=args.max_model_len)
-    base_sampler = rft.vLLMSampler(
-        model_id=rft.GEN_MODEL_ID,
-        engine_args={'gpu_memory_utilization': rft.GEN_GPU_MEM,
+    base_sampler = vLLMSampler(
+        model_id=model,
+        engine_args={'gpu_memory_utilization': 0.8,
                      'max_model_len': args.max_model_len, 'tensor_parallel_size': 1},
-        device_mesh=rft.DeviceMesh.from_sizes(world_size=base_dp, dp_size=base_dp),
+        device_mesh=DeviceMesh.from_sizes(world_size=4, dp_size=4),
         remote_group='base_sampler')
-    base_sampler.set_template(rft.Template, model_id=rft.GEN_MODEL_ID,
+    base_sampler.set_template('Template', model_id=model,
                               enable_thinking=True, max_length=args.max_model_len)
-    return base_sampler, skill_sampler, base_dp, skill_dp
+    return base_sampler, skill_sampler, 4, 4
 
 
 def _write_jsonl_row(handle, row: Dict[str, Any]) -> None:
@@ -106,12 +134,14 @@ def main() -> None:
     rubric_cache: Dict[str, str] = {}
 
     cfg = {
-        'record_type': 'config', 'mode': 'offline_data_build', 'model': rft.GEN_MODEL_ID,
+        'record_type': 'config', 'mode': 'offline_data_build', 'model': 'Qwen/Qwen3-4B',
         'dataset': args.dataset, 'n': len(records), 'eval_n': len(eval_records),
-        'seed': args.seed, 'numeric_only': args.numeric_only,
+        'total_problems': args.total_problems, 'seed': args.seed,
+        'numeric_only': args.numeric_only,
         'raw_loaded': data_stats['raw_loaded'], 'numeric_dropped': data_stats['numeric_dropped'],
         'chunks': args.chunks, 'chunk_size': args.chunk_size, 'n_skills': args.n_skills,
         'view_b_frac': args.view_b_frac, 'balance': args.balance,
+        'base_success_frac': args.base_success_frac,
         'balance_success_frac': args.balance_success_frac,
         'reward': 'greedy_binary(correct)', 'advantage': 'group_relative',
         'format_in_reward': args.format_in_reward, 'started': int(time.time()),
@@ -126,11 +156,20 @@ def main() -> None:
             _write_jsonl_row(eval_f, {'record_type': 'eval_holdout', **rec})
         eval_f.flush()
 
+        selected = 0
         for ci in range(args.chunks):
-            chunk, balance = rft._draw_chunk(pool, base_sampler, base_dp, args)
-            full, summary, groups = rft.process_chunk(
-                base_sampler, skill_sampler, leak, chunk, ci, base_dp, skill_dp,
-                args, checker, rubric_cache)
+            remaining = args.total_problems - selected
+            if remaining <= 0:
+                break
+            original_chunk_size = args.chunk_size
+            args.chunk_size = min(original_chunk_size, remaining)
+            try:
+                chunk, balance = rft._draw_chunk(pool, base_sampler, base_dp, args)
+                full, summary, groups = rft.process_chunk(
+                    base_sampler, skill_sampler, leak, chunk, ci, base_dp, skill_dp,
+                    args, checker, rubric_cache)
+            finally:
+                args.chunk_size = original_chunk_size
             summary['balance'] = balance
             for rec in full:
                 _write_jsonl_row(gen_f, rec)
@@ -140,8 +179,10 @@ def main() -> None:
                 _write_jsonl_row(data_f, {'chunk': ci, **row})
             data_f.flush()
             total_groups += len(groups)
+            selected += len(chunk)
             sys.stderr.write(
-                f'[build-rft-data] g{ci}: train={len(groups)} total={total_groups} '
+                f'[build-rft-data] g{ci}: problems={selected}/{args.total_problems} '
+                f'train={len(groups)} total={total_groups} '
                 f'acc={summary["avg_baseline_pass_on_hard"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
                 f'lift={summary["avg_lift"]:+.3f}\n')
 
