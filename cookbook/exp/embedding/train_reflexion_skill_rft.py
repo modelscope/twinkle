@@ -476,7 +476,8 @@ def _format_diagnosis(detail) -> str:
     return '\n'.join(lines)
 
 
-def _diagnose_views(checker, hard: List[Dict[str, Any]], args: argparse.Namespace) -> None:
+def _diagnose_views(checker, hard: List[Dict[str, Any]], args: argparse.Namespace,
+                    diag_cache: Optional[Dict[str, str]] = None) -> None:
     """Rubric-check every view-A problem's greedy attempt in parallel, stashing the
     formatted findings on ``r['_rubric_diag']`` (view B stays empty). A checker error
     or empty result degrades to no diagnosis (the plain view-A prompt)."""
@@ -485,21 +486,38 @@ def _diagnose_views(checker, hard: List[Dict[str, Any]], args: argparse.Namespac
     if not checker or not targets:
         return
 
-    def _run(r: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    def _cache_key(r: Dict[str, Any]) -> str:
+        init_text = r.get('_init', [{}])[0].get('text', '')
+        return hashlib.md5(f'{r["problem"]}\n{init_text}'.encode('utf-8')).hexdigest()
+
+    pending = []
+    for r in targets:
+        key = _cache_key(r)
+        if diag_cache is not None and key in diag_cache:
+            r['_rubric_diag'] = diag_cache[key]
+        else:
+            pending.append((r, key))
+    if not pending:
+        return
+
+    def _run(item: Tuple[Dict[str, Any], str]) -> Tuple[Dict[str, Any], str, str, bool]:
+        r, key = item
         seg = {'messages': [
             {'role': 'user', 'content': r['problem']},
             {'role': 'assistant', 'content': r['_init'][0]['text']},
         ]}
         try:
-            return r, _format_diagnosis(checker.diagnose(seg, query=r['problem']))
+            return r, key, _format_diagnosis(checker.diagnose(seg, query=r['problem'])), True
         except Exception as exc:  # teacher hiccup -> fall back to no-diagnosis prompt
             logger.warning(f'[rubric] diagnose error: {exc}')
-            return r, ''
+            return r, key, '', False
 
-    workers = max(1, min(args.rubric_workers, len(targets)))
+    workers = max(1, min(args.rubric_workers, len(pending)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for r, diag in ex.map(_run, targets):
+        for r, key, diag, ok in ex.map(_run, pending):
             r['_rubric_diag'] = diag
+            if ok and diag_cache is not None:
+                diag_cache[key] = diag
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +895,8 @@ def _draw_chunk(pool: _ProblemPool, base_sampler, base_dp: int, args: argparse.N
 
 def process_chunk(base_sampler, skill_sampler, leak: LeakVerifier,
                   chunk: List[Dict[str, Any]], ci: int, base_dp: int, skill_dp: int,
-                  args: argparse.Namespace, checker=None
+                  args: argparse.Namespace, checker=None,
+                  diag_cache: Optional[Dict[str, str]] = None
                   ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     """base-solve -> rubric-check (view A) -> skill-gen -> leak-filter -> with-skill pass
     -> GRPO advantages, for one chunk.
@@ -902,7 +921,7 @@ def process_chunk(base_sampler, skill_sampler, leak: LeakVerifier,
     for r in hard:
         r['_view'] = _assign_view(r['problem'], args)
         r['_rubric_diag'] = ''
-    _diagnose_views(checker, hard, args)
+    _diagnose_views(checker, hard, args, diag_cache)
 
     # --- Phase 3: skill-gen (thinking ON), per-view prompt; re-sample empties. ---
     flat: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -1000,17 +1019,15 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     return {'messages': full, 'user_data': {'key_rounds': [len(msgs)]}}
 
 
-def _train_chunk(skill_model, ckpt: CheckpointEngineManager,
+def _train_chunk(skill_model, ckpt: Optional[CheckpointEngineManager],
                  samples: List[Dict[str, Any]], args: argparse.Namespace) -> Dict[str, Any]:
-    """One on-policy GRPO update on THIS chunk's skill candidates, then sync weights.
+    """One on-policy GRPO optimizer update on THIS chunk's skill candidates, then sync weights.
 
     Sequential design (generate-one-chunk-train-one): the skills were sampled from the
     current policy and trained immediately, so ``old_logps`` is omitted and the GRPO
-    ratio is ~1 (no importance correction needed). Each per-sample ``advantage`` was set
-    in _assign_advantages (group-relative + optional SFT blend). Driver-side mini-batches
-    each take an optimizer step (matching short_math_grpo); the batch is padded to a
-    multiple of ``sft_batch_size`` (dp needs each mini-batch divisible) with advantage-0
-    copies that contribute zero gradient. ``sync_weights`` needs no lock (no overlap).
+    ratio is ~1. All driver-side mini-batches accumulate into one optimizer step so the
+    whole rollout chunk stays under the same pre-update policy. The batch is padded to a
+    multiple of ``sft_batch_size`` with advantage-0 copies that contribute zero gradient.
     """
     trajs = [_train_trajectory(rec) for rec in samples]
     advs = [float(rec['advantage']) for rec in samples]
@@ -1018,15 +1035,16 @@ def _train_chunk(skill_model, ckpt: CheckpointEngineManager,
     if rem:
         trajs += [trajs[-1]] * rem       # zero-advantage pads -> forward only, no gradient
         advs += [0.0] * rem
-    steps = 0
+    micro_batches = 0
     for i in range(0, len(trajs), args.sft_batch_size):
         skill_model.forward_backward(inputs=trajs[i:i + args.sft_batch_size],
                                      advantages=advs[i:i + args.sft_batch_size])
-        skill_model.clip_grad_and_step()
-        steps += 1
-    ckpt.sync_weights(merge_and_sync=True)
+        micro_batches += 1
+    skill_model.clip_grad_and_step()
+    if ckpt is not None:
+        ckpt.sync_weights(merge_and_sync=True)
     metric = skill_model.calculate_metric(is_training=True)
-    return {'n_samples': len(samples), 'n_steps': steps,
+    return {'n_samples': len(samples), 'n_steps': 1, 'n_micro_batches': micro_batches,
             'advantages': [float(rec['advantage']) for rec in samples],
             'metric': {k: (float(v) if _is_num(v) else v) for k, v in (metric or {}).items()}}
 
@@ -1116,8 +1134,8 @@ def _build_args() -> argparse.Namespace:
                         '(teacher-served; requires LLM_BACKUP_* env).')
     # -- online GRPO (one on-policy update per generated chunk) --
     p.add_argument('--sft-batch-size', type=int, default=8,
-                   help='Driver-side mini-batch per optimizer step; MUST be a multiple '
-                        'of the training dp size (sliced across dp ranks).')
+                   help='Driver-side micro-batch size before the chunk-level optimizer step; '
+                        'MUST be a multiple of the training dp size (sliced across dp ranks).')
     p.add_argument('--grpo-epsilon', type=float, default=0.2,
                    help='PPO clip epsilon for GRPOLoss (ratio~1 on-policy, so rarely binds).')
     p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True,
@@ -1222,6 +1240,8 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]],
         d.update({'passk/baseline_mean': m(0), 'passk/bestN_mean': m(1), 'passk/avgN_mean': m(2)})
     if log:
         d['train/n_steps'] = log['n_steps']
+        if 'n_micro_batches' in log:
+            d['train/n_micro_batches'] = log['n_micro_batches']
         d.update({f'train/{k}': v for k, v in _clean_metric(log.get('metric')).items()})
     return d
 
@@ -1268,7 +1288,8 @@ def _greedy_eval_metrics(recs: List[Dict[str, Any]], ci: int, rounds: int
 def _run_greedy_eval(base_sampler, skill_sampler,
                      eval_records: List[Dict[str, Any]], eval_cache: Dict[str, Dict[str, Any]],
                      ci: int, rounds: int, base_dp: int, skill_dp: int,
-                     args: argparse.Namespace, checker=None
+                     args: argparse.Namespace, checker=None,
+                     diag_cache: Optional[Dict[str, str]] = None
                      ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, float]]:
     """SEAM ``val-core/math/acc/mean@1`` analogue on the fixed holdout: ONE greedy skill per
     problem (T=0) injected into ONE greedy base solve (T=0), so acc is a single-sample
@@ -1279,7 +1300,7 @@ def _run_greedy_eval(base_sampler, skill_sampler,
     for r in eval_records:
         r['_view'] = _assign_view(r['problem'], args)
         r['_rubric_diag'] = ''
-    _diagnose_views(checker, eval_records, args)
+    _diagnose_views(checker, eval_records, args, diag_cache)
     sg_out = _run_samples(skill_sampler, [_view_prompt(r, args) for r in eval_records],
                           1, args.skill_max_tokens, skill_dp, temperature=0.0)
     skills = []
@@ -1334,9 +1355,8 @@ def main() -> None:
     if args.sft_batch_size % TRAIN_DP != 0:
         raise ValueError(f'--sft-batch-size ({args.sft_batch_size}) must be a multiple '
                          f'of the training dp size ({TRAIN_DP})')
-    # LR schedule is sized by an upper bound on optimizer steps (one pass over each
-    # trained chunk's candidates); the exact count varies, cosine just decays slower.
-    steps_per_round = max(1, (args.chunk_size * args.n_skills) // args.sft_batch_size)
+    # LR schedule now follows chunk-level optimizer updates, not driver micro-batches.
+    steps_per_round = 1
     records, eval_records, data_stats = _load_records(args)
     _validate_run_config(args, records)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1446,6 +1466,8 @@ def main() -> None:
     rounds = 0
     pool = _ProblemPool(records, args.seed)
     eval_cache: Dict[str, Dict[str, Any]] = {}
+    rubric_cache: Dict[str, str] = {}
+    eval_rubric_cache: Dict[str, str] = {}
     with open(gen_path, 'w', encoding='utf-8') as gen_f, \
             open(eval_path, 'w', encoding='utf-8') as eval_f, \
             open(data_path, 'w', encoding='utf-8') as data_f, \
@@ -1463,7 +1485,7 @@ def main() -> None:
             chunk, balance = _draw_chunk(pool, base_sampler, base_dp, args)
             full, summary, groups = process_chunk(
                 base_sampler, skill_sampler, leak, chunk, gstep, base_dp, skill_dp,
-                args, checker)
+                args, checker, rubric_cache)
             summary['balance'] = balance
 
             log = None
@@ -1515,7 +1537,7 @@ def main() -> None:
             if eval_records and (gstep + 1) % args.eval_every == 0:
                 eval_recs, eval_summary, eval_metrics = _run_greedy_eval(
                     base_sampler, skill_sampler, eval_records, eval_cache, gstep,
-                    rounds, base_dp, skill_dp, args, checker)
+                    rounds, base_dp, skill_dp, args, checker, eval_rubric_cache)
                 for rec in eval_recs:
                     eval_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
                 eval_f.write(json.dumps(eval_summary, ensure_ascii=False) + '\n')
