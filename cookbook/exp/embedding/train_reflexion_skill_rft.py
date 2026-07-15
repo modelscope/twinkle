@@ -56,7 +56,7 @@ from twinkle_agentic.verifier.rubric_verifier import RubricItem
 # Reuse the reference eval's dataset + grading + prompts + sampling config, and the
 # phase-0 pipeline's parsing / rollout / injection helpers (Find > Create).
 from eval_gpqa_rag import (GEN_GPU_MEM, GEN_MODEL_ID, build_direct_prompt,  # noqa: F401
-                           load_math)
+                           load_aops, load_math)
 from eval_reflexion_skill import (_EX_PROBLEM, _clean_text,  # noqa: F401
                                   _parse_seq, _run_samples, build_skill_solve_prompt)
 
@@ -136,16 +136,22 @@ SKILL_GEN_SYSTEM = (
     'You are a mathematics coach. You are shown a competition problem together with an '
     'automated process-check of an earlier solver attempt at it -- which solution '
     'criteria the attempt passed or failed, and suggested fixes for the failures. You '
-    'do NOT see the attempt itself, only this check. Use the flagged failures to see '
-    'where this KIND of problem tends to trip solvers up, then distil a few reusable '
-    'tips that would prevent those specific failures.\n\n'
+    'do NOT see the attempt itself, only this check. Treat the check as privileged '
+    'training scaffolding: study it together with the problem, identify the '
+    'problem-visible features that make each useful flagged failure relevant, then '
+    'rephrase those lessons as self-contained reusable skills. The goal is not to '
+    'continue from the check, cite it, or hide it silently; the goal is to turn it into '
+    'a problem-triggered reasoning pattern a query-only solver could reproduce later.\n\n'
+    'Good skills name the observable trigger, the method worth reaching for, the '
+    'pitfall to watch, and a quick verification habit. Prefer formulations like '
+    '"When a configuration has ...", "Before setting up ...", or "Check whether ..." '
+    'over references to the process-check, failed criteria, or the earlier attempt. '
     "These tips are advisory: they will be placed in a solver's system prompt as gentle "
-    'reminders before it works through a SIMILAR problem on its own. So keep them '
-    'general and transferable — the method worth reaching for, the pitfall to watch and '
-    'a quick check, and the discipline to settle on a final answer — rather than a '
-    'worked solution to this exact problem, and without stating its specific '
-    'intermediate values or its final answer. Think briefly first, then give your tips '
-    'as a markdown bullet list wrapped in <skills> and </skills>, like the example below.'
+    'reminders before it works through a SIMILAR problem on its own, without seeing '
+    'this process-check. So keep them general and transferable rather than a worked '
+    'solution to this exact problem, and do not state its specific intermediate values '
+    'or final answer. Think briefly first, then give your tips as a markdown bullet '
+    'list wrapped in <skills> and </skills>, like the example below.'
 )
 
 # One-shot demo of the recommended mix (method / pitfall+check / procedure /
@@ -172,7 +178,10 @@ SKILL_GEN_USER_RUBRIC = (
     'Process check of an earlier attempt (automated rubric verifier -- treat as '
     'evidence, not gospel; PASS/FAIL per criterion with suggested fixes for failures):\n'
     '{diagnosis}\n\n'
-    'Now output the skills bullet list.'
+    'Now output a self-contained skills bullet list. Each bullet should still be useful '
+    'if the process check were removed: connect any useful flagged failure to '
+    'problem-visible features, general methods, and quick checks rather than citing the '
+    'rubric or the earlier attempt.'
 )
 
 
@@ -371,6 +380,66 @@ Reply with exactly one word: LEAK or CLEAN."""
 # localisation instead of guessing. Teacher-only (sampler=None -> every diagnose()
 # hits llm_backup); mirrors eval_dualline_math's fixed math rubric.
 # ---------------------------------------------------------------------------
+_RFT_DIAG_SYSTEM = """\
+You are a process error checker for a math solution attempt. You are given a math
+problem, a rubric, and one attempted solution segment. Decide PASS or FAIL for each
+criterion and explain only the process error type.
+
+Output STRICT JSON (no prose outside it) with this shape:
+{
+  "items": [
+    {"index": 1, "verdict": "PASS", "reason": "<why the process satisfies it>",
+     "fix": ""},
+    {"index": 2, "verdict": "FAIL", "reason": "<what process step is wrong>",
+     "fix": "<method-level correction, without computing the corrected result>"}
+  ],
+  "overall": "OK" | "ISSUES",
+  "summary": "<one sentence naming the process issue, not the answer>"
+}
+
+Rules:
+- Judge every criterion independently and literally; a [Hard Rule] is FAIL unless
+  unambiguously satisfied.
+- Judge ONLY what is observable in THIS segment.
+- Content inside <think>...</think> (or <thinking>) is internal reasoning, not
+  user-facing output; ignore it for "output only X" style criteria.
+- For PASS items, leave "fix" as "".
+- For FAIL items, "reason", "fix", and "summary" must describe only the flawed
+  step, theorem, arithmetic operation, case split, or verification habit.
+- NEVER state the correct final answer, corrected final expression, option letter,
+  graph/choice label, or any exact value that the answer should become.
+- NEVER write phrases like "the correct answer is", "which gives", "yielding",
+  "should be <value>", "Option <letter>", or "Graph <letter>".
+- If a fix would require naming a corrected value, replace it with a method-level
+  instruction such as "redo that computation carefully" or "apply the theorem with
+  the correct quantities".
+- Keep every "reason" and "fix" clear and concise — one short sentence each.
+- "overall" is "OK" only if NO criterion is FAIL.
+- Output only the JSON object."""
+
+
+_RFT_DIAG_USER = """\
+## Task / query (context)
+{query}
+
+## Rubric
+{rubric}
+
+## Segment
+{segment}
+
+Now output the diagnostic JSON object."""
+
+
+class _RftRubricVerifier(RubricVerifier):
+    def _diagnose_trajectory(self, query: str, rubric_block: str, segment_text: str) -> dict:
+        user = _RFT_DIAG_USER.format(query=query, rubric=rubric_block, segment=segment_text)
+        return {'messages': [
+            {'role': 'system', 'content': _RFT_DIAG_SYSTEM},
+            {'role': 'user', 'content': user},
+        ]}
+
+
 _MATH_RUBRIC = [
     ('The reasoning contains no arithmetic or algebraic error', True),
     ('Each step follows logically from the previous ones', True),
@@ -385,7 +454,7 @@ def _build_rubric_checker() -> Optional['RubricVerifier']:
     if not (os.environ.get('LLM_BACKUP_API_KEY') or os.environ.get('LLM_BACKUP_BASE_URL')
             or os.environ.get('OPENAI_API_KEY')):
         return None
-    return RubricVerifier(
+    return _RftRubricVerifier(
         fixed_rubric=[RubricItem(t, is_hard=h) for t, h in _MATH_RUBRIC], gate=True)
 
 
@@ -525,6 +594,17 @@ def _view_stats(hard: List[Dict[str, Any]], view: str) -> Dict[str, Any]:
     }
 
 
+def _is_trainable(c: Dict[str, Any], args: argparse.Namespace) -> bool:
+    """A candidate reaches the GRPO update iff its advantage is non-zero. With
+    --format-in-reward every candidate carries a reward (unparseable/leaked score 0),
+    so non-zero advantage is the only gate; otherwise it must also be clean and scored.
+    Single source of truth for both the summary counts and ``_group_records``."""
+    adv_nz = abs(c.get('advantage') or 0.0) > 1e-9
+    if args.format_in_reward:
+        return adv_nz
+    return c['leaked'] is False and c.get('with_pass') is not None and adv_nz
+
+
 def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespace) -> Dict[str, Any]:
     """Per-chunk aggregates — watch these across chunks to see if the RFT'd skill
     model produces better skills over time (yield, leak rate, lift, termination)."""
@@ -536,10 +616,15 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
     ws_rolls = [x for c in scored for x in c['rolls']]
     # With --format-in-reward, unparseable/leaked candidates also carry a (0) reward and are
     # trained, so count trainables over ALL candidates; else only clean scored ones.
-    train_cands = ([c for c in all_cands if abs(c.get('advantage') or 0.0) > 1e-9] if args.format_in_reward
-                   else [c for c in scored if c['leaked'] is False and abs(c.get('advantage') or 0.0) > 1e-9])
+    train_cands = [c for c in all_cands if _is_trainable(c, args)]
     base_acc = (sum(r['_baseline_pass'] for r in hard) / len(hard)) if hard else 0.0
     ws_acc = (sum(c['with_pass'] for c in scored) / len(scored)) if scored else 0.0
+    # -- signal-source monitor: how much of the GRPO signal comes from base-FAIL problems
+    # (the offensive "rescue a failure" signal we want) vs base-success (defensive "don't
+    # break an easy one"). abs_adv_from_fail_frac ~0.1 was the diagnosed failure mode. --
+    fail_cands = [c for r in chunk if r['_failed'] for c in r['_cands']]
+    abs_adv = lambda cs: sum(abs(c.get('advantage') or 0.0) for c in cs)
+    total_abs = abs_adv(all_cands)
     return {
         'record_type': 'summary', 'chunk': ci, 'n': len(chunk),
         'n_failed_first_try': len(failed), 'n_hard': len(hard),
@@ -550,6 +635,8 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
         'n_clean': sum(1 for c in cands if c['leaked'] is False),
         'n_reward_pos': sum(1 for c in scored if c['reward']),
         'n_train_samples': len(train_cands),
+        'n_train_from_fail': sum(1 for c in fail_cands if _is_trainable(c, args)),
+        'abs_adv_from_fail_frac': (abs_adv(fail_cands) / total_abs) if total_abs > 0 else 0.0,
         'avg_baseline_pass_on_hard': base_acc,
         'avg_withskill_pass': ws_acc,
         'avg_lift': ws_acc - base_acc,
@@ -570,10 +657,7 @@ def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
             continue
         view = r.get('_view', 'A')
         for c in r['_cands']:
-            adv_nz = abs(c.get('advantage') or 0.0) > 1e-9
-            trainable = adv_nz if args.format_in_reward else (
-                c['leaked'] is False and c['with_pass'] is not None and adv_nz)
-            if trainable:
+            if _is_trainable(c, args):
                 out.append({
                     'problem': r['problem'], 'reference_answer': r['reference_answer'],
                     'view': view,
@@ -583,6 +667,212 @@ def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
                     'reward': c['reward'], 'with_pass': c['with_pass'],
                 })
     return out
+
+
+def _apply_baseline(r: Dict[str, Any], roll: Dict[str, Any]) -> None:
+    """Write a (cached or fresh) greedy baseline roll onto a problem and RESET the per-chunk
+    working state, so a problem reused in a later chunk never carries prior skill candidates."""
+    r['_baseline_rolls'], r['_cands'] = [roll], []
+    r['_init'] = [roll]
+    r['_failed'] = not roll['correct']
+    r['_baseline_pass'] = 1.0 if roll['correct'] else 0.0
+    r['_hard'] = True                                   # process EVERY selected problem; group variance selects
+
+
+def _baseline_rollout(base_sampler, problems: List[Dict[str, Any]], base_dp: int,
+                      args: argparse.Namespace, cache: Dict[str, Dict[str, Any]]) -> int:
+    """Phase 1: base solves each problem GREEDILY once (T=0, M=1), keyed-cached by problem
+    text across chunks. The base sampler is FROZEN and decoding is greedy, so a problem's
+    baseline never changes over the run -- a cache hit is exact and skips the sampler.
+    Returns the number of FRESH sampler rollouts (cache misses) for efficiency reporting."""
+    todo = [r for r in problems if r['problem'] not in cache]
+    if todo:
+        base_out = _run_samples(base_sampler, [build_direct_prompt(r['problem']) for r in todo],
+                                1, args.max_tokens, base_dp, temperature=0.0)
+        for r, seqs in zip(todo, base_out):
+            cache[r['problem']] = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
+    for r in problems:
+        _apply_baseline(r, cache[r['problem']])
+    return len(todo)
+
+
+def _baseline_class(r: Dict[str, Any]) -> str:
+    """Bucket a baselined problem by its greedy outcome: ``success`` (base solved it),
+    ``fail_loop`` (ran the length budget out / never terminated -- the mode skills rescue
+    best), or ``fail_wrong`` (terminated cleanly but the answer is wrong)."""
+    roll = r['_init'][0]
+    if roll['correct']:
+        return 'success'
+    if roll['stop_reason'] == 'length' or not roll['terminated']:
+        return 'fail_loop'
+    return 'fail_wrong'
+
+
+_NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
+
+
+def _norm_num_text(num: str) -> str:
+    try:
+        f = float(num)
+        return str(int(f)) if f == int(f) else str(f)
+    except Exception:
+        return str(num).strip()
+
+
+def _numeric_value(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip().strip('$').strip()
+    s = s.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac')
+    s = re.sub(r'\\!|\\,|\\;|\\ |\\left|\\right|\s', '', s)
+    m = re.fullmatch(r'\\frac\{(-?\d+)\}\{(-?\d+)\}', s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return _norm_num_text(str(a / b)) if b else None
+    m = re.fullmatch(r'(-?\d+)/(-?\d+)', s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return _norm_num_text(str(a / b)) if b else None
+    if _NUM_RE.fullmatch(s):
+        return _norm_num_text(s)
+    return None
+
+
+def _numeric_only_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    out = []
+    dropped = 0
+    for r in records:
+        ref = _numeric_value(r.get('reference_answer'))
+        if ref is None:
+            dropped += 1
+            continue
+        rr = dict(r)
+        rr['reference_answer'] = ref
+        out.append(rr)
+    return out, dropped
+
+
+def _load_records(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+    need_split = args.eval_size > 0
+    load_n = 0 if (args.numeric_only or need_split) else args.n
+    records = (load_aops(n=load_n, seed=args.seed) if args.dataset == 'aops'
+               else load_math(n=load_n, seed=args.seed))
+    raw_n = len(records)
+    dropped = 0
+    if args.numeric_only:
+        records, dropped = _numeric_only_records(records)
+    rng = np.random.RandomState(args.seed)
+    rng.shuffle(records)
+    eval_n = min(args.eval_size, len(records)) if args.eval_size > 0 else 0
+    eval_records = [dict(r) for r in records[:eval_n]]
+    train_pool = records[eval_n:]
+    train_n = args.n if args.n > 0 else len(train_pool)
+    train_records = [dict(r) for r in train_pool[:train_n]]
+    overlap = {r['problem'] for r in train_records} & {r['problem'] for r in eval_records}
+    if overlap:
+        raise ValueError(f'fixed eval/train overlap detected: {len(overlap)} duplicated problems')
+    stats = {'raw_loaded': raw_n, 'numeric_dropped': dropped,
+             'train_records': len(train_records), 'eval_records': len(eval_records)}
+    return train_records, eval_records, stats
+
+
+class _ProblemPool:
+    """Cyclic draw source over the loaded problems. Each full pass reshuffles with
+    ``seed + epoch`` and bumps ``epoch`` (matching the old per-epoch reshuffle); the
+    initial pass keeps the loader's shuffled order. Draws never run out."""
+
+    def __init__(self, records: List[Dict[str, Any]], seed: int):
+        self._records = list(records)
+        self._seed = seed
+        self._cursor = 0
+        self.epoch = 0
+        self.baseline_cache: Dict[str, Dict[str, Any]] = {}  # problem text -> frozen greedy roll
+
+    def draw(self, k: int) -> List[Dict[str, Any]]:
+        """Return ``k`` DISTINCT problems (unique within this call, so one chunk never
+        processes the same problem twice even when the cursor wraps mid-draw). ``k`` is
+        always << pool size, so this terminates."""
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        while len(out) < k:
+            if self._cursor >= len(self._records):
+                self.epoch += 1
+                np.random.RandomState(self._seed + self.epoch).shuffle(self._records)
+                self._cursor = 0
+            r = self._records[self._cursor]
+            self._cursor += 1
+            if id(r) not in seen:
+                seen.add(id(r))
+                out.append(r)
+        return out
+
+
+def _select_balanced(buckets: Dict[str, List[Dict[str, Any]]], n_success: int,
+                     n_fail: int, n_fail_loop: int) -> List[Dict[str, Any]]:
+    """Pick the chunk from the baselined buckets: ``n_fail`` base-fails (split toward
+    ``n_fail_loop`` loop-fails, best-effort) + ``n_success`` base-successes. If a bucket
+    is too thin to hit ``chunk_size`` the shortfall is topped up from leftovers (the
+    ratio then drifts, which the caller logs)."""
+    loop, wrong, succ = buckets['fail_loop'], buckets['fail_wrong'], buckets['success']
+    take_loop = min(n_fail_loop, len(loop))
+    take_wrong = min(n_fail - take_loop, len(wrong))
+    take_loop = min(n_fail - take_wrong, len(loop))   # give loop the remainder if wrong is short
+    sel = loop[:take_loop] + wrong[:take_wrong] + succ[:n_success]
+    target = n_success + n_fail
+    if len(sel) < target:
+        used = {id(x) for x in sel}
+        leftover = [x for b in (loop, wrong, succ) for x in b if id(x) not in used]
+        sel += leftover[:target - len(sel)]
+    return sel
+
+
+def _draw_chunk(pool: _ProblemPool, base_sampler, base_dp: int, args: argparse.Namespace
+                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Draw one training chunk, running baseline rollout (Phase 1) on every drawn problem.
+
+    With ``--balance`` off, draw ``chunk_size`` problems and return them. With it on, keep
+    drawing+baselining in ``chunk_size`` batches, bucketing by ``_baseline_class``, until the
+    target base fail:success mix is reachable or the draw budget is hit; then select a
+    balanced subset. Returns ``(chunk, stats)`` where stats records the realised mix."""
+    if not args.balance:
+        chunk = pool.draw(args.chunk_size)
+        n_fresh = _baseline_rollout(base_sampler, chunk, base_dp, args, pool.baseline_cache)
+        return chunk, {'enabled': False, 'n_drawn': len(chunk), 'n_baseline_fresh': n_fresh}
+
+    n_success = max(0, min(args.chunk_size, round(args.chunk_size * args.balance_success_frac)))
+    n_fail = args.chunk_size - n_success
+    n_fail_loop = round(n_fail * args.balance_loop_frac)
+    buckets: Dict[str, List[Dict[str, Any]]] = {'success': [], 'fail_loop': [], 'fail_wrong': []}
+    budget = args.chunk_size * args.balance_max_draws_mult
+    n_drawn, n_fresh = 0, 0
+    seen: set = set()  # dedupe across batches: the pool can re-serve a problem after a wrap
+    while n_drawn < budget:
+        if (len(buckets['success']) >= n_success
+                and len(buckets['fail_loop']) + len(buckets['fail_wrong']) >= n_fail):
+            break  # enough of both classes buffered to satisfy the target split
+        batch = pool.draw(args.chunk_size)
+        n_fresh += _baseline_rollout(base_sampler, batch, base_dp, args, pool.baseline_cache)
+        n_drawn += len(batch)
+        for r in batch:
+            if id(r) in seen:
+                continue
+            seen.add(id(r))
+            buckets[_baseline_class(r)].append(r)
+
+    target_reached = (len(buckets['success']) >= n_success
+                      and len(buckets['fail_loop']) + len(buckets['fail_wrong']) >= n_fail)
+    chunk = _select_balanced(buckets, n_success, n_fail, n_fail_loop)
+    sel_success = sum(1 for r in chunk if not r['_failed'])
+    stats = {
+        'enabled': True, 'n_drawn': n_drawn, 'n_baseline_fresh': n_fresh, 'n_selected': len(chunk),
+        'target_success': n_success, 'target_fail': n_fail, 'target_fail_loop': n_fail_loop,
+        'selected_success': sel_success, 'selected_fail': len(chunk) - sel_success,
+        'selected_fail_loop': sum(1 for r in chunk if _baseline_class(r) == 'fail_loop'),
+        'selected_fail_wrong': sum(1 for r in chunk if _baseline_class(r) == 'fail_wrong'),
+        'selected_success_frac': (sel_success / len(chunk)) if chunk else 0.0,
+        'budget_hit': not target_reached,   # stopped short of the target mix, not by choice
+    }
+    return chunk, stats
 
 
 def process_chunk(base_sampler, skill_sampler, leak: LeakVerifier,
@@ -595,22 +885,15 @@ def process_chunk(base_sampler, skill_sampler, leak: LeakVerifier,
     Sequential (generate-one-chunk-train-one): generation and the trainer's weight
     sync never overlap, so no lock is needed. ``base_sampler`` is frozen (never
     synced); ``skill_sampler`` is synced by the trainer between chunks.
+
+    ``chunk`` arrives ALREADY baselined by ``_draw_chunk`` (Phase 1 ran during the
+    balanced draw), so every problem carries ``_init``/``_failed``/``_baseline_pass``/
+    ``_hard``/``_cands`` -- Phase 1 is not repeated here.
     """
-    # --- Phase 1: base solves each problem GREEDILY once (T=0, M=1) -- this produces the
-    # view-A attempt and records whether the base already gets it (reporting only). EVERY
-    # problem is processed (no difficulty gate, SEAM-style): the group-relative advantage
-    # (Phase 6) gives zero gradient to any problem whose skills all score alike (base-easy
-    # -> all solve, or hopeless -> all fail), so GRPO's own group variance selects the
-    # informative problems. Termination is NOT part of the reward (monitored only). ---
-    base_out = _run_samples(base_sampler, [build_direct_prompt(r['problem']) for r in chunk],
-                            1, args.max_tokens, base_dp, temperature=0.0)
-    for r, seqs in zip(chunk, base_out):
-        roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
-        r['_baseline_rolls'], r['_cands'] = [roll], []
-        r['_init'] = [roll]                             # the greedy attempt (metric + view A)
-        r['_failed'] = not roll['correct']
-        r['_baseline_pass'] = 1.0 if roll['correct'] else 0.0   # base accuracy (reporting only, NOT in reward)
-        r['_hard'] = True                               # process EVERY problem; group variance selects
+    # Phase 1 (base greedy solve) ran in _draw_chunk so the balancer could classify by
+    # outcome; every selected problem is processed (no difficulty gate, SEAM-style): the
+    # group-relative advantage (Phase 6) gives zero gradient to any problem whose skills
+    # all score alike, so GRPO's own group variance selects the informative problems.
     hard = chunk
 
     # --- Phase 2: assign each problem's view, then rubric-check the view-A attempts so
@@ -762,10 +1045,43 @@ def _is_num(v: Any) -> bool:
 def _build_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--n', type=int, default=2000, help='MATH problems to stream.')
+    p.add_argument('--dataset', choices=('aops', 'math'), default='aops',
+                   help='Problem source. aops (AI-MO competition problems) is much '
+                        'harder than MATH, so the base fails more often -> more offensive '
+                        'training signal after balanced sampling.')
+    p.add_argument('--n', type=int, default=2000,
+                   help='Problems to load into the draw pool (cycled/reshuffled across '
+                        'epochs; with --balance many more baseline rollouts than this '
+                        'may run, but the pool size is fixed here).')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True,
+                   help='Keep only answers that collapse to one integer/decimal/fraction, '
+                        'matching SEAM numeric reward and avoiding non-scalar grading noise.')
+    p.add_argument('--eval-size', type=int, default=128,
+                   help='Fixed holdout problems, sampled before the train pool after all '
+                        'filters; set 0 to disable fixed eval.')
+    p.add_argument('--eval-every', type=int, default=10,
+                   help='Run fixed holdout eval every N generation chunks when --eval-size > 0.')
     p.add_argument('--chunk-size', type=int, default=16,
                    help='Problems per generation chunk (all sampler calls batched).')
+    # -- online baseline-balanced sampling (draw+baseline until the chunk hits the
+    #    target base fail:success mix, so the offensive signal is not starved) --
+    p.add_argument('--balance', action=argparse.BooleanOptionalAction, default=True,
+                   help='Keep drawing+baselining problems until the chunk matches the '
+                        'target base fail:success composition, then select a balanced '
+                        'subset. --no-balance draws chunk_size problems directly.')
+    p.add_argument('--balance-success-frac', type=float, default=0.4,
+                   help='Target fraction of the chunk that the base solves (base-success). '
+                        '0.4 => 3:2 fail:success; 0.2 => 4:1. The remainder are base-fail.')
+    p.add_argument('--balance-loop-frac', type=float, default=0.5,
+                   help='Within the base-fail portion, SOFT target fraction of loop-fails '
+                        '(ran out of length / never terminated) vs non-loop wrong answers. '
+                        'Best-effort only: the fail count is filled from whichever bucket '
+                        'is available so a thin bucket never starves the chunk.')
+    p.add_argument('--balance-max-draws-mult', type=int, default=8,
+                   help='Draw budget per chunk as a multiple of chunk_size; once this many '
+                        'problems have been baselined the chunk is assembled from whatever '
+                        'the buckets hold (ratio may drift; the actual mix is logged).')
     p.add_argument('--n-skills', type=int, default=8,
                    help='Candidate skills generated per hard problem.')
     p.add_argument('--view-b-frac', type=float, default=0.5,
@@ -882,7 +1198,16 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]],
         'gen/n_hard': summary['n_hard'], 'gen/n_clean': summary['n_clean'],
         'gen/n_leaked': summary['n_leaked'], 'gen/n_train_samples': summary['n_train_samples'],
         'gen/n_reward_pos': summary['n_reward_pos'],
+        'gen/n_train_from_fail': summary['n_train_from_fail'],
+        'gen/abs_adv_from_fail_frac': summary['abs_adv_from_fail_frac'],
     }
+    bal = summary.get('balance') or {}
+    if bal.get('enabled'):
+        d.update({'balance/n_drawn': bal['n_drawn'],
+                  'balance/n_baseline_fresh': bal['n_baseline_fresh'],
+                  'balance/selected_success_frac': bal['selected_success_frac'],
+                  'balance/selected_fail_loop': bal['selected_fail_loop'],
+                  'balance/selected_fail_wrong': bal['selected_fail_wrong']})
     if summary['n_hard'] > 0:
         d.update({
             'acc/baseline_pass': summary['avg_baseline_pass_on_hard'],
@@ -901,6 +1226,109 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]],
     return d
 
 
+def _prefix_metrics(metrics: Dict[str, float], prefix: str) -> Dict[str, float]:
+    return {f'{prefix}/{k}': v for k, v in metrics.items()}
+
+
+def _greedy_eval_metrics(recs: List[Dict[str, Any]], ci: int, rounds: int
+                         ) -> Tuple[Dict[str, Any], Dict[str, float]]:
+    """Aggregate the greedy holdout into SEAM ``mean@1`` metrics: overall + per-view acc,
+    the frozen-baseline acc, and their lift -- all single-sample-per-problem means (no
+    candidate averaging, no pass@k), so acc is directly comparable to SEAM's
+    ``val-core/math/acc/mean@1`` (correctness only; format/leak not gated)."""
+    def acc(rs: List[Dict[str, Any]]) -> float:
+        return sum(1 for x in rs if x['withskill_correct']) / len(rs) if rs else 0.0
+    def bacc(rs: List[Dict[str, Any]]) -> float:
+        return sum(x['baseline_pass'] for x in rs) / len(rs) if rs else 0.0
+    A = [x for x in recs if x['view'] == 'A']
+    B = [x for x in recs if x['view'] == 'B']
+    ws, base = acc(recs), bacc(recs)
+    summary = {
+        'record_type': 'eval_summary', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
+        'n': len(recs), 'n_A': len(A), 'n_B': len(B),
+        'acc_mean1': ws, 'baseline_acc_mean1': base, 'lift_mean1': ws - base,
+        'acc_A_mean1': acc(A), 'acc_B_mean1': acc(B),
+        'format_mean1': (sum(1 for x in recs if x['skill_parseable']) / len(recs)) if recs else 0.0,
+        'term_mean1': (sum(1 for x in recs if x['withskill_terminated']) / len(recs)) if recs else 0.0,
+    }
+    metrics = {
+        'core/math/acc/mean@1': ws,
+        'core/math/baseline_acc/mean@1': base,
+        'core/math/lift/mean@1': ws - base,
+        'core/math/format/mean@1': summary['format_mean1'],
+        'core/math/term/mean@1': summary['term_mean1'],
+    }
+    if A:
+        metrics['core/math/acc_A/mean@1'] = summary['acc_A_mean1']
+    if B:
+        metrics['core/math/acc_B/mean@1'] = summary['acc_B_mean1']
+    return summary, metrics
+
+
+def _run_greedy_eval(base_sampler, skill_sampler,
+                     eval_records: List[Dict[str, Any]], eval_cache: Dict[str, Dict[str, Any]],
+                     ci: int, rounds: int, base_dp: int, skill_dp: int,
+                     args: argparse.Namespace, checker=None
+                     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, float]]:
+    """SEAM ``val-core/math/acc/mean@1`` analogue on the fixed holdout: ONE greedy skill per
+    problem (T=0) injected into ONE greedy base solve (T=0), so acc is a single-sample
+    pass@1 per problem averaged over problems. Each problem keeps its assigned view; view A
+    still gets the rubric process-check, view B stays query-only -- the mixed A/B acc is the
+    deployment number. No leak filter: like SEAM's val, acc scores correctness alone."""
+    _baseline_rollout(base_sampler, eval_records, base_dp, args, eval_cache)  # frozen greedy baseline
+    for r in eval_records:
+        r['_view'] = _assign_view(r['problem'], args)
+        r['_rubric_diag'] = ''
+    _diagnose_views(checker, eval_records, args)
+    sg_out = _run_samples(skill_sampler, [_view_prompt(r, args) for r in eval_records],
+                          1, args.skill_max_tokens, skill_dp, temperature=0.0)
+    skills = []
+    for seqs in sg_out:
+        resp = _clean_text(getattr(seqs[0], 'decoded', '') or '') if seqs else ''
+        skills.append((_extract_skills_block(resp) or '', resp))
+    ws_out = _run_samples(base_sampler,
+                          [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _) in zip(eval_records, skills)],
+                          1, args.max_tokens, base_dp, temperature=0.0)
+    recs = []
+    for r, (sk, sresp), seqs in zip(eval_records, skills, ws_out):
+        roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
+        recs.append({
+            'record_type': 'eval_problem', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
+            'problem': r['problem'], 'reference_answer': r['reference_answer'],
+            'view': r['_view'], 'rubric_diag': r.get('_rubric_diag', ''),
+            'baseline_pass': r['_baseline_pass'],
+            'skill': sk, 'skill_parseable': bool(sk), 'skill_response': sresp,
+            'withskill_pred': roll['pred'], 'withskill_correct': roll['correct'],
+            'withskill_terminated': roll['terminated'], 'withskill_stop_reason': roll['stop_reason'],
+            'withskill_text': roll['text'],
+        })
+    summary, metrics = _greedy_eval_metrics(recs, ci, rounds)
+    return recs, summary, metrics
+
+
+def _validate_run_config(args: argparse.Namespace, records: List[Dict[str, Any]]) -> None:
+    """Fail fast on configs that would SILENTLY hang the online sampler: _ProblemPool.draw(k)
+    dedups within a call, so it never returns unless the pool holds >= chunk_size problems;
+    a zero draw budget or chunk size yields empty chunks that never advance ``rounds``."""
+    if not records:
+        raise ValueError(f'loaded 0 {args.dataset} problems; check the dataset source')
+    if args.chunk_size < 1:
+        raise ValueError(f'--chunk-size must be >= 1 (got {args.chunk_size})')
+    if args.eval_size < 0:
+        raise ValueError(f'--eval-size must be >= 0 (got {args.eval_size})')
+    if args.eval_size > 0 and args.eval_every < 1:
+        raise ValueError(f'--eval-every must be >= 1 when eval is enabled (got {args.eval_every})')
+    if len(records) < args.chunk_size:
+        raise ValueError(f'--chunk-size ({args.chunk_size}) exceeds loaded problems '
+                         f'({len(records)}); raise --n or lower --chunk-size')
+    if args.balance_max_draws_mult < 1:
+        raise ValueError(f'--balance-max-draws-mult must be >= 1 (got {args.balance_max_draws_mult})')
+    if not 0.0 <= args.balance_success_frac <= 1.0:
+        raise ValueError(f'--balance-success-frac must be in [0, 1] (got {args.balance_success_frac})')
+    if not 0.0 <= args.balance_loop_frac <= 1.0:
+        raise ValueError(f'--balance-loop-frac must be in [0, 1] (got {args.balance_loop_frac})')
+
+
 def main() -> None:
     args = _build_args()
     if args.sft_batch_size % TRAIN_DP != 0:
@@ -909,10 +1337,12 @@ def main() -> None:
     # LR schedule is sized by an upper bound on optimizer steps (one pass over each
     # trained chunk's candidates); the exact count varies, cosine just decays slower.
     steps_per_round = max(1, (args.chunk_size * args.n_skills) // args.sft_batch_size)
-    records = load_math(n=args.n, seed=args.seed)
+    records, eval_records, data_stats = _load_records(args)
+    _validate_run_config(args, records)
     os.makedirs(args.output_dir, exist_ok=True)
     data_path = os.path.join(args.output_dir, 'skill_dataset.jsonl')
     gen_path = os.path.join(args.output_dir, 'gen_records.jsonl')
+    eval_path = os.path.join(args.output_dir, 'eval_records.jsonl')
     train_log_path = os.path.join(args.output_dir, 'train_log.jsonl')
 
     if not (os.environ.get('LLM_BACKUP_API_KEY') or os.environ.get('OPENAI_API_KEY')):
@@ -923,8 +1353,14 @@ def main() -> None:
     if use_swan:
         swanlab.init(project=args.swanlab_project,
                      experiment_name=(args.swanlab_exp or None),
-                     config={'model': GEN_MODEL_ID, 'n': len(records),
+                     config={'model': GEN_MODEL_ID, 'dataset': args.dataset,
+                             'n': len(records), 'eval_n': len(eval_records),
+                             'raw_loaded': data_stats['raw_loaded'],
+                             'numeric_only': args.numeric_only,
+                             'numeric_dropped': data_stats['numeric_dropped'],
                              'n_skills': args.n_skills, 'view_b_frac': args.view_b_frac,
+                             'balance': args.balance,
+                             'balance_success_frac': args.balance_success_frac,
                              'skill_gen_temp': args.skill_gen_temperature,
                              'grpo_epsilon': args.grpo_epsilon, 'lr': args.lr})
 
@@ -948,7 +1384,7 @@ def main() -> None:
     skill_model.set_template(Template, model_id=GEN_MODEL_ID,
                              enable_thinking=True, max_length=args.max_model_len,
                              truncation_strategy='delete')
-    skill_model.set_processor(InputProcessor, padding_free=True)
+    skill_model.set_processor(InputProcessor, padding_free=False)
     skill_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon)
     skill_model.set_optimizer('AdamW', lr=args.lr)
     skill_model.set_lr_scheduler('CosineWarmupScheduler', num_warmup_steps=10,
@@ -981,16 +1417,24 @@ def main() -> None:
         sys.stderr.write('[rft] no LLM backup env -> view-A rubric process-check DISABLED '
                          '(skill-gen diagnoses from the attempt alone)\n')
 
-    sys.stderr.write(f'[rft] {len(records)} MATH problems; train_gpus={TRAIN_GPUS} '
-                     f'skill_dp={skill_dp} base_dp={base_dp}\n')
+    sys.stderr.write(f'[rft] raw={data_stats["raw_loaded"]} numeric_drop={data_stats["numeric_dropped"]} '
+                     f'train={len(records)} eval={len(eval_records)} {args.dataset} problems; '
+                     f'train_gpus={TRAIN_GPUS} skill_dp={skill_dp} base_dp={base_dp}\n')
 
     # -- Sequential: generate one chunk, train on it, sync -> exact on-policy GRPO.
     # Generation dominates wall-clock, so not overlapping training costs little, and
     # it removes all producer/consumer concurrency (no thread, no lock). --
-    n_chunks = (len(records) + args.chunk_size - 1) // args.chunk_size
-    cfg = {'record_type': 'config', 'model': GEN_MODEL_ID, 'dataset': 'math',
-           'n': len(records), 'seed': args.seed, 'n_skills': args.n_skills,
+    cfg = {'record_type': 'config', 'model': GEN_MODEL_ID, 'dataset': args.dataset,
+           'n': len(records), 'eval_n': len(eval_records), 'seed': args.seed,
+           'numeric_only': args.numeric_only,
+           'raw_loaded': data_stats['raw_loaded'],
+           'numeric_dropped': data_stats['numeric_dropped'],
+           'eval_every': args.eval_every,
+           'n_skills': args.n_skills,
            'view_b_frac': args.view_b_frac, 'skill_retries': args.skill_retries,
+           'balance': args.balance, 'balance_success_frac': args.balance_success_frac,
+           'balance_loop_frac': args.balance_loop_frac,
+           'balance_max_draws_mult': args.balance_max_draws_mult,
            'skill_gen_temp': args.skill_gen_temperature,
            'skill_gen_top_p': args.skill_gen_top_p, 'skill_gen_top_k': args.skill_gen_top_k,
            'reward': 'greedy_binary(correct)', 'advantage': 'group_relative',
@@ -1000,76 +1444,100 @@ def main() -> None:
            'max_train_rounds': args.max_train_rounds, 'started': int(time.time())}
     hist: List[Dict[str, float]] = []
     rounds = 0
+    pool = _ProblemPool(records, args.seed)
+    eval_cache: Dict[str, Dict[str, Any]] = {}
     with open(gen_path, 'w', encoding='utf-8') as gen_f, \
+            open(eval_path, 'w', encoding='utf-8') as eval_f, \
             open(data_path, 'w', encoding='utf-8') as data_f, \
             open(train_log_path, 'w', encoding='utf-8') as tlog:
-        for f in (gen_f, data_f, tlog):
+        for f in (gen_f, eval_f, data_f, tlog):
             f.write(json.dumps(cfg, ensure_ascii=False) + '\n')
             f.flush()
-        gstep, epoch = 0, 0
-        # Multiple epochs over the SAME problem set: each pass reshuffles and RE-GENERATES
-        # rollouts with the current (improved) policy, so every chunk stays on-policy (no
-        # importance correction needed) -- the online analogue of SEAM's fixed-data epochs.
-        while rounds < args.max_train_rounds and n_chunks > 0:
-            if epoch > 0:
-                np.random.RandomState(args.seed + epoch).shuffle(records)
-            for ci in range(n_chunks):
-                if rounds >= args.max_train_rounds:
-                    break
-                chunk = records[ci * args.chunk_size:(ci + 1) * args.chunk_size]
-                full, summary, groups = process_chunk(
-                    base_sampler, skill_sampler, leak, chunk, gstep, base_dp, skill_dp,
-                    args, checker)
+        gstep = 0
+        # Each chunk is drawn fresh from the pool (which reshuffles + bumps epoch on every
+        # full pass) and RE-GENERATED with the current (improved) policy, so every chunk
+        # stays on-policy (no importance correction) -- the online analogue of SEAM's
+        # fixed-data epochs. With --balance, _draw_chunk keeps drawing+baselining until the
+        # base fail:success mix hits the target before this chunk is trained on.
+        while rounds < args.max_train_rounds:
+            chunk, balance = _draw_chunk(pool, base_sampler, base_dp, args)
+            full, summary, groups = process_chunk(
+                base_sampler, skill_sampler, leak, chunk, gstep, base_dp, skill_dp,
+                args, checker)
+            summary['balance'] = balance
 
-                log = None
-                if groups:  # on-policy GRPO update on this chunk, then weights sync
-                    log = _train_chunk(skill_model, ckpt, groups, args)
-                    rounds += 1
-                    log.update({'record_type': 'train_round', 'round': rounds,
-                                'chunk': gstep, 'epoch': epoch, 'ts': int(time.time())})
-                    tlog.write(json.dumps(log, ensure_ascii=False) + '\n')
-                    tlog.flush()
-                    if rounds % args.save_rounds == 0:
-                        skill_model.save(f'skill-rft-{rounds}', output_dir=args.output_dir)
+            log = None
+            if groups:  # on-policy GRPO update on this chunk, then weights sync
+                log = _train_chunk(skill_model, ckpt, groups, args)
+                rounds += 1
+                log.update({'record_type': 'train_round', 'round': rounds,
+                            'chunk': gstep, 'epoch': pool.epoch, 'ts': int(time.time())})
+                tlog.write(json.dumps(log, ensure_ascii=False) + '\n')
+                tlog.flush()
+                if rounds % args.save_rounds == 0:
+                    skill_model.save(f'skill-rft-{rounds}', output_dir=args.output_dir)
 
-                summary['rounds_done'], summary['epoch'] = rounds, epoch
-                for rec in full:
-                    gen_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-                gen_f.write(json.dumps(summary, ensure_ascii=False) + '\n')
-                gen_f.flush()
-                for v in groups:
-                    data_f.write(json.dumps(v, ensure_ascii=False) + '\n')
-                data_f.flush()
+            summary['rounds_done'], summary['epoch'] = rounds, pool.epoch
+            for rec in full:
+                gen_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            gen_f.write(json.dumps(summary, ensure_ascii=False) + '\n')
+            gen_f.flush()
+            for v in groups:
+                data_f.write(json.dumps(v, ensure_ascii=False) + '\n')
+            data_f.flush()
 
-                sa, sb = summary['view_A'], summary['view_B']
-                hist.append({'aA': sa['adoption_rate'], 'aB': sb['adoption_rate'],
-                             'lift': summary['avg_lift'], 'pos': summary['n_reward_pos']})
-                sys.stderr.write(
-                    f'[gen] e{epoch} chunk {ci+1}/{n_chunks} (g{gstep}): hard={summary["n_hard"]} '
-                    f'clean={summary["n_clean"]} train={summary["n_train_samples"]} '
-                    f'acc={summary["avg_baseline_pass_on_hard"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
-                    f'lift={summary["avg_lift"]:+.3f} '
-                    f'A[{sa["n_hard"]}h {sa["adoption_rate"]:.2f}] '
-                    f'B[{sb["n_hard"]}h {sb["adoption_rate"]:.2f}] '
-                    f'rounds={rounds}'
-                    + (f' metric={log.get("metric")}' if log else '') + '\n')
-                # -- per-query passk (base vs best/avg of N skills) + swanlab metrics --
-                rows = _query_rows(full)
-                for base_p, best_p, avg_p, nsc, prob in rows:
-                    logger.info(f'[q] g{gstep} base={base_p:.2f} bestN={best_p:.2f} avgN={avg_p:.2f} '
-                                f'n={nsc} | {prob[:70].replace(chr(10), " ")}')
+            sa, sb = summary['view_A'], summary['view_B']
+            hist.append({'aA': sa['adoption_rate'], 'aB': sb['adoption_rate'],
+                         'lift': summary['avg_lift'], 'pos': summary['n_reward_pos']})
+            bal_str = (f'bal {balance["selected_fail"]}f/{balance["selected_success"]}s '
+                       f'(loop {balance["selected_fail_loop"]} drew {balance["n_drawn"]}/'
+                       f'fresh {balance["n_baseline_fresh"]}'
+                       + ('!' if balance.get('budget_hit') else '') + ') '
+                       ) if balance.get('enabled') else ''
+            sys.stderr.write(
+                f'[gen] e{pool.epoch} g{gstep}: {bal_str}hard={summary["n_hard"]} '
+                f'clean={summary["n_clean"]} train={summary["n_train_samples"]} '
+                f'(fail {summary["n_train_from_fail"]} adv%{summary["abs_adv_from_fail_frac"]:.2f}) '
+                f'acc={summary["avg_baseline_pass_on_hard"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
+                f'lift={summary["avg_lift"]:+.3f} '
+                f'A[{sa["n_hard"]}h {sa["adoption_rate"]:.2f}] '
+                f'B[{sb["n_hard"]}h {sb["adoption_rate"]:.2f}] '
+                f'rounds={rounds}'
+                + (f' metric={log.get("metric")}' if log else '') + '\n')
+            # -- per-query passk (base vs best/avg of N skills) + swanlab metrics --
+            rows = _query_rows(full)
+            for base_p, best_p, avg_p, nsc, prob in rows:
+                logger.info(f'[q] g{gstep} base={base_p:.2f} bestN={best_p:.2f} avgN={avg_p:.2f} '
+                            f'n={nsc} | {prob[:70].replace(chr(10), " ")}')
+            if use_swan:
+                swanlab.log(_swan_metrics(summary, log, rows), step=gstep)
+
+            if eval_records and (gstep + 1) % args.eval_every == 0:
+                eval_recs, eval_summary, eval_metrics = _run_greedy_eval(
+                    base_sampler, skill_sampler, eval_records, eval_cache, gstep,
+                    rounds, base_dp, skill_dp, args, checker)
+                for rec in eval_recs:
+                    eval_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                eval_f.write(json.dumps(eval_summary, ensure_ascii=False) + '\n')
+                eval_f.flush()
                 if use_swan:
-                    swanlab.log(_swan_metrics(summary, log, rows), step=gstep)
+                    swanlab.log(_prefix_metrics(eval_metrics, 'eval'), step=gstep)
+                sys.stderr.write(
+                    f'[eval] g{gstep}: n={eval_summary["n"]} mean@1 '
+                    f'acc={eval_summary["baseline_acc_mean1"]:.3f}->{eval_summary["acc_mean1"]:.3f} '
+                    f'lift={eval_summary["lift_mean1"]:+.3f} '
+                    f'A[{eval_summary["n_A"]} {eval_summary["acc_A_mean1"]:.3f}] '
+                    f'B[{eval_summary["n_B"]} {eval_summary["acc_B_mean1"]:.3f}] '
+                    f'fmt={eval_summary["format_mean1"]:.2f} rounds={rounds}\n')
 
-                if (gstep + 1) % args.trend_every == 0:
-                    tl = _trend_line(hist, args.trend_every, rounds)
-                    if tl:
-                        sys.stderr.write(tl + '\n')
-                gstep += 1
-            epoch += 1
+            if (gstep + 1) % args.trend_every == 0:
+                tl = _trend_line(hist, args.trend_every, rounds)
+                if tl:
+                    sys.stderr.write(tl + '\n')
+            gstep += 1
 
     skill_model.save('skill-rft-final', output_dir=args.output_dir)
-    sys.stderr.write(f'[rft] done: {rounds} train rounds over {gstep} chunks / {epoch} epochs; '
+    sys.stderr.write(f'[rft] done: {rounds} train rounds over {gstep} chunks / {pool.epoch} epochs; '
                      f'data -> {data_path}\n')
 
 

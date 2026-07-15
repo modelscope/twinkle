@@ -14,11 +14,16 @@ export LLM_BACKUP_BASE_URL=${LLM_BACKUP_BASE_URL:-https://dashscope.aliyuncs.com
 export LLM_BACKUP_MODEL=${LLM_BACKUP_MODEL:-qwen3.7-max}
 
 python cookbook/exp/embedding/train_reflexion_skill_rft.py \
+  --dataset aops \
   --n 5000 \
   --chunk-size 16 \
   --n-skills 8 \
   --view-b-frac 0.5 \
   --skill-retries 2 \
+  --balance \
+  --balance-success-frac 0.4 \
+  --balance-loop-frac 0.5 \
+  --balance-max-draws-mult 8 \
   --max-tokens 25000 \
   --max-model-len 30000 \
   --sft-batch-size 8 \

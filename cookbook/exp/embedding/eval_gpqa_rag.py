@@ -509,29 +509,28 @@ def normalize_answer(ans: str) -> str:
     """Normalize a math answer string for comparison."""
     if not ans:
         return ''
-    s = ans.strip()
-    # MCQ: extract bare letter from \textbf{(D)}, \text{(A)}, \mathbb{A}, (B), etc.
+    s = str(ans).strip()
     m = re.match(r'^\\?(?:textbf|text|mathrm|mathbf|mathbb)?\{?\(?([A-E])\)?\}?$', s)
     if m:
         return m.group(1)
-    s = s.replace(' ', '')
-    s = s.replace(r'\,', '')
-    s = s.replace(r'\;', '')
-    s = s.replace(r'\!', '')
-    s = s.replace(r'\text', '')
-    s = s.replace(r'\mathrm', '')
+    s = s.strip('$').strip()
+    s = s.replace('−', '-')
+    s = re.sub(r'\\(?:text|mathrm|mathbf|textbf|operatorname)\{([^}]*)\}', r'\1', s)
     s = s.replace(r'\displaystyle', '')
-    s = re.sub(r'\\(?:left|right)[.()\[\]|]', '', s)
+    s = re.sub(r'\\(?:left|right)[.()\[\]{}|]', '', s)
     s = s.replace(r'\dfrac', r'\frac')
     s = s.replace(r'\tfrac', r'\frac')
-    s = s.strip('$').strip()
-    # Strip unit-like brace suffixes: {cm}, {m}, {kg}, etc.
+    s = s.replace(r'\,', '').replace(r'\;', '').replace(r'\!', '')
+    s = re.sub(r'\\(?:quad|qquad|\s)', '', s)
+    s = re.sub(r'\s+', '', s)
+    s = re.sub(r'\\sqrt([0-9A-Za-z])', r'\\sqrt{\1}', s)
+    s = re.sub(r'\\frac\{([^{}]+)\}([^{}\\])', r'\\frac{\1}{\2}', s)
+    s = re.sub(r'\\frac([^{\\])([^{\\])', r'\\frac{\1}{\2}', s)
     s = re.sub(r'\{[a-zA-Z]+\}$', '', s)
-    # Normalize degree: ^\circ, ^{\circ}, ° → deg
-    s = re.sub(r'\^\\circ|\^\{\\circ\}|°', 'deg', s)
-    # Canonicalize \frac{a}{b} → (a)/(b)
+    s = re.sub(r'\^\\circ|\^\{\\circ\}|°|\\circ', 'deg', s)
+    s = s.replace(r'\minus{}', '-').replace(r'\minus', '-')
+
     def _frac_to_slash(m):
-        # Handle nested braces in numerator/denominator
         text = m.group(0)
         pos = text.index('{') + 1
         depth, num_start = 1, pos
@@ -540,7 +539,7 @@ def normalize_answer(ans: str) -> str:
             elif text[pos] == '}': depth -= 1
             pos += 1
         numer = text[num_start:pos - 1]
-        pos += 1  # skip '{'
+        pos += 1
         den_start = pos
         depth = 1
         while depth > 0:
@@ -549,9 +548,8 @@ def normalize_answer(ans: str) -> str:
             pos += 1
         denom = text[den_start:pos - 1]
         return f'({numer})/({denom})'
+
     s = re.sub(r'\\frac\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', _frac_to_slash, s)
-    # Also handle bare a/b → (a)/(b) for consistent comparison
-    # Only simple integer/variable fractions: 17/5 → (17)/(5)
     s = re.sub(r'(?<!\w)(\d+)/(\d+)(?!\w)', r'(\1)/(\2)', s)
     return s
 
@@ -564,8 +562,8 @@ def _try_numeric_equal(a: str, b: str) -> bool:
         return abs(va - vb) < 1e-9 * max(1, abs(va), abs(vb))
     except (ValueError, ZeroDivisionError):
         pass
-    # Try evaluating simple fraction expressions like (17)/(5)
     frac_re = re.compile(r'^\(([^)]+)\)/\(([^)]+)\)$')
+
     def _eval_frac(s):
         m = frac_re.match(s)
         if m:
@@ -574,79 +572,98 @@ def _try_numeric_equal(a: str, b: str) -> bool:
             except (ValueError, ZeroDivisionError):
                 pass
         return None
+
     va, vb = _eval_frac(a), _eval_frac(b)
     if va is not None and vb is not None:
         return abs(va - vb) < 1e-9 * max(1, abs(va), abs(vb))
     return False
 
 
-# MCQ compound pattern: \text{(D) }49, \textbf{(C)}12, (B) 21, etc.
 _MCQ_REF_RE = re.compile(
     r'^\\(?:textbf|text|mathrm|mathbf)\{\(?([A-E])\)?\s*\}\s*(.+)$'
     r'|^\(?([A-E])\)\s+(.+)$'
 )
+_VAR_PREFIX_RE = re.compile(r'^(?:[A-Za-z](?:\([^)]*\))?|\([^)]*\))\s*=\s*(.+)$', re.DOTALL)
 
 
 def _split_mcq(ans: str):
-    """Split an MCQ answer into (letter, value) components.
-
-    Handles compound forms (``\\text{(D) }49``, ``(B) 21``) as well as a
-    bare letter (``D`` -> letter only) and a bare value (``21`` -> value only).
-    Returns ``(letter_or_None, value_or_None)``.
-    """
+    """Split an MCQ answer into (letter, value) components."""
     s = ans.strip()
     m = _MCQ_REF_RE.match(s)
     if m:
         letter = m.group(1) or m.group(3)
         value = (m.group(2) or m.group(4) or '').strip()
         return letter, (value or None)
-    # Bare single letter (with optional \text/\textbf/\mathbb wrapper or parens).
-    # \mathbb{A} appears as a dirty reference label for option A in some rows.
     bl = re.match(r'^\\?(?:textbf|text|mathrm|mathbf|mathbb)?\{?\(?([A-E])\)?\}?$', s)
     if bl:
         return bl.group(1), None
     return None, s or None
 
 
-def answers_match(predicted: str, reference: str) -> bool:
-    """Check if two math answers are equivalent.
+def _strip_var_prefix(ans: str) -> str:
+    m = _VAR_PREFIX_RE.match((ans or '').strip())
+    return m.group(1).strip() if m else (ans or '')
 
-    Supports bidirectional MCQ matching: either side may be a bare option
-    letter, a bare value, or a compound ``(letter) value`` form. The answer is
-    considered correct if the letters match, or if the values match.
-    """
+
+def _normalize_tuple(ans: str) -> str:
+    return re.sub(r'[\s()\[\]{}\\]', '', ans or '')
+
+
+def _math_verify_equal(predicted: str, reference: str) -> bool:
+    try:
+        from math_verify import parse, verify
+        gold = parse(r'\boxed{' + reference + '}', parsing_timeout=1)
+        pred = parse(r'\boxed{' + predicted + '}', parsing_timeout=1)
+        return bool(gold and pred and verify(gold, pred, timeout_seconds=1))
+    except Exception:
+        return False
+
+
+def answers_match(predicted: str, reference: str) -> bool:
+    """Check if two math answers are equivalent."""
     if not predicted or not reference:
         return False
     norm_p = normalize_answer(predicted)
     norm_r = normalize_answer(reference)
-    if norm_p == norm_r:
+    if norm_p == norm_r or norm_p.lower() == norm_r.lower():
         return True
     if _try_numeric_equal(norm_p, norm_r):
         return True
 
-    # Symmetric MCQ matching: decompose both sides into (letter, value).
+    stripped_p = normalize_answer(_strip_var_prefix(predicted))
+    stripped_r = normalize_answer(_strip_var_prefix(reference))
+    if stripped_p and stripped_r:
+        if stripped_p == stripped_r or stripped_p.lower() == stripped_r.lower():
+            return True
+        if _try_numeric_equal(stripped_p, stripped_r):
+            return True
+
     p_letter, p_value = _split_mcq(predicted)
     r_letter, r_value = _split_mcq(reference)
-
-    # Match on the option letter (only meaningful if both sides carry a letter).
     if p_letter and r_letter and p_letter == r_letter:
         return True
-
-    # If both sides are letter-only (a bare option letter with no value), the
-    # letters are the only signal; differing letters mean a mismatch. Do NOT
-    # fall through to value comparison, which would spuriously match dirty
-    # labels like \mathbb{A} vs \mathbb{B}.
     if (p_letter and p_value is None) and (r_letter and r_value is None):
         return False
 
-    # Match on the value part (compare whichever value each side exposes; fall
-    # back to the raw normalized string when a side has no separate value).
     p_val = normalize_answer(p_value) if p_value else norm_p
     r_val = normalize_answer(r_value) if r_value else norm_r
     if p_val and r_val:
-        if p_val == r_val or _try_numeric_equal(p_val, r_val):
+        if p_val == r_val or p_val.lower() == r_val.lower() or _try_numeric_equal(p_val, r_val):
             return True
-    return False
+
+    for left, right in ((norm_p, norm_r), (stripped_p, stripped_r)):
+        tuple_l, tuple_r = _normalize_tuple(left), _normalize_tuple(right)
+        if ',' in tuple_l and tuple_l == tuple_r:
+            return True
+
+    if '=' in norm_r and '=' not in norm_p:
+        if any(part and (part == norm_p or _try_numeric_equal(part, norm_p)) for part in norm_r.split('=')):
+            return True
+    if '=' in norm_p and '=' not in norm_r:
+        if any(part and (part == norm_r or _try_numeric_equal(part, norm_r)) for part in norm_p.split('=')):
+            return True
+
+    return _math_verify_equal(stripped_p or norm_p, stripped_r or norm_r)
 
 
 # ---------------------------------------------------------------------------
