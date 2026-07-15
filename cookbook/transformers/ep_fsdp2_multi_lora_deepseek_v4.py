@@ -93,7 +93,7 @@ def train():
         config=config,
         device_mesh=device_mesh,
         strategy='native_fsdp',
-        memory_efficient_init=True,
+        memory_efficient_init=False,
         max_loras=MAX_LORAS,
         max_r=MAX_R,
         fsdp_config={
@@ -122,8 +122,8 @@ def train():
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 
     logger.info(get_device_placement())
-    for adapter_name in ADAPTER_NAMES:
-        logger.info(model.get_train_configs(adapter_name=adapter_name))
+    # for adapter_name in ADAPTER_NAMES:
+    #     logger.info(model.get_train_configs(adapter_name=adapter_name))
     logger.info(
         f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}, '
         f'enable_ep={ENABLE_EP}, adapters={ADAPTER_NAMES}, output_dir={OUTPUT_DIR}')

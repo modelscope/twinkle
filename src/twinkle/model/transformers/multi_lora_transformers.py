@@ -48,6 +48,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
+        self._router_replay_applied = False
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         self.lora_config = lora_config
