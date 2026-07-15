@@ -50,7 +50,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
-        self.lora_config = lora_config or {}
+        self.lora_config = lora_config
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
