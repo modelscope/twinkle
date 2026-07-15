@@ -444,10 +444,17 @@ def _tokenize(problem: str) -> List[str]:
 class BagOfWordsIndex:
     """TF-IDF cosine nearest-neighbour over problem statements. Sparse dict vectors +
     an inverted index, so ``nearest`` scores only problems sharing a term (near-linear in
-    practice, no dense NxN). Deterministic; ties break on lower index for reproducibility."""
+    practice, no dense NxN). Deterministic; ties break on lower index for reproducibility.
 
-    def __init__(self, problems: List[str], min_df: int = 2, max_df_frac: float = 0.5):
+    Answer-aware: ``nearest`` skips the same index, near-verbatim duplicates (cosine
+    >= ``sim_max``) and -- crucially for anti-leak -- any candidate whose answer equals the
+    query's, so a neighbour rubric can never hand over the query's own answer."""
+
+    def __init__(self, problems: List[str], answers: Optional[List[str]] = None,
+                 min_df: int = 2, max_df_frac: float = 0.5):
         self._toks = [_tokenize(p) for p in problems]
+        self._ans = [(_numeric_value(a) or (str(a).strip() if a else '')) for a in answers] \
+            if answers is not None else [''] * len(problems)
         n = len(self._toks)
         df: Dict[str, int] = {}
         for toks in self._toks:
@@ -471,51 +478,47 @@ class BagOfWordsIndex:
         norm = math.sqrt(sum(x * x for x in vec.values()))
         return {w: x / norm for w, x in vec.items()} if norm > 0 else {}
 
-    def nearest(self, i: int) -> Tuple[int, float]:
-        """(index, cosine) of the most similar OTHER problem, or (-1, 0.0) if none."""
+    def nearest(self, i: int, sim_max: float = 0.98) -> Tuple[int, float]:
+        """(index, cosine) of the most similar *distinct* problem: not i, not a duplicate
+        (cosine < ``sim_max``) and not the same answer. (-1, 0.0) if none qualifies."""
         vi = self._vecs[i]
         if not vi:
             return -1, 0.0
+        ai = self._ans[i]
         scores: Dict[int, float] = {}
         for w, xi in vi.items():
             for j in self._inverted.get(w, ()):
                 if j != i:
                     scores[j] = scores.get(j, 0.0) + xi * self._vecs[j].get(w, 0.0)
-        if not scores:
-            return -1, 0.0
-        best = max(scores.items(), key=lambda kv: (kv[1], -kv[0]))
-        return best[0], best[1]
+        best_j, best_s = -1, 0.0
+        for j, s in scores.items():
+            if s >= sim_max or (ai and self._ans[j] == ai):
+                continue
+            if s > best_s or (s == best_s and (best_j < 0 or j < best_j)):
+                best_j, best_s = j, s
+        return best_j, best_s
 
 
-def build_neighbor_map(problems: List[str], cache: 'DiskCache') -> Dict[str, Tuple[str, float]]:
-    """{problem -> (nearest-neighbour problem, cosine similarity)}. Cached on disk keyed by
-    the whole problem set (order-independent), so a restart reloads instantly."""
-    key = DiskCache.key_for('bow_neighbors', *sorted(problems))
-    hit = cache.get(key)
-    if hit is not None:
-        return {q: (p, s) for q, (p, s) in hit.items()}  # json roundtrips tuples as lists
-    index = BagOfWordsIndex(problems)
-    out: Dict[str, Tuple[str, float]] = {}
-    for i, p in enumerate(problems):
-        j, sim = index.nearest(i)
-        if j >= 0:
-            out[p] = (problems[j], sim)
-    cache.put(key, {q: [p, s] for q, (p, s) in out.items()})
-    return out
+def build_pairs(records: List[Dict[str, Any]], n: int, seed: int, sim_max: float = 0.98
+                ) -> Tuple[List[Dict[str, Any]], Dict[str, Tuple[str, float]]]:
+    """Single-pass cross-problem pairing over the whole pool (one index build).
 
-
-def select_paired_subset(records: List[Dict[str, Any]], n: int, seed: int
-                         ) -> List[Dict[str, Any]]:
-    """Keep the ``n`` problems with the strongest bag-of-words neighbour, so the training
-    pool is dense in same-type pairs (cross-problem rubric transfer needs a real analogue,
-    not a random other problem). n<=0 or n>=len keeps all (still shuffled)."""
-    index = BagOfWordsIndex([r['problem'] for r in records])
-    scored = [(index.nearest(i)[1], i) for i in range(len(records))]
-    scored.sort(key=lambda si: (-si[0], si[1]))
-    keep = [i for _, i in scored[:n]] if (0 < n < len(records)) else list(range(len(records)))
+    Returns ``(subset, neighbour_map)`` where ``subset`` is the ``n`` problems with the
+    strongest qualifying neighbour (dense same-type pairs; n<=0/n>=len keeps all, shuffled)
+    and ``neighbour_map[q] = (p, cosine)`` gives each kept problem its analogue P. P is drawn
+    from the *full* pool (richer analogues) but never a duplicate or same-answer problem, so
+    P's rubric can transfer method without ever leaking Q's answer."""
+    index = BagOfWordsIndex([r['problem'] for r in records],
+                            [str(r.get('reference_answer', '')) for r in records])
+    nbr = [index.nearest(i, sim_max) for i in range(len(records))]
+    order = sorted(range(len(records)), key=lambda i: (-nbr[i][1], i))
+    keep = order[:n] if (0 < n < len(records)) else list(range(len(records)))
     rng = np.random.RandomState(seed)
     rng.shuffle(keep)
-    return [records[i] for i in keep]
+    subset = [records[i] for i in keep]
+    neighbour_map = {records[i]['problem']: (records[nbr[i][0]]['problem'], nbr[i][1])
+                     for i in keep if nbr[i][0] >= 0}
+    return subset, neighbour_map
 
 
 _NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
@@ -559,8 +562,13 @@ def _answer_leaked(skill: str, reference: str) -> bool:
     return False
 
 
-def _load_records(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
-    """Load, numeric-filter, shuffle, then split a fixed eval holdout off the front."""
+def _load_records(args: argparse.Namespace
+                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                             Dict[str, Tuple[str, float]], Dict[str, str], Dict[str, int]]:
+    """Load, numeric-filter, shuffle, split a fixed eval holdout, and (when --xproblem-rubric)
+    select a same-type-dense train subset with its neighbour map -- all in one pass.
+    Also returns ``pool_answers`` (every candidate neighbour P's true answer) so P's baseline
+    can be graded/cached correctly even when P is not itself a training problem."""
     # Load all when filtering or splitting (else the eval holdout could starve train).
     load_n = 0 if (args.numeric_only or args.eval_size > 0) else args.n
     records = load_problems(args.dataset, load_n, args.seed)
@@ -575,16 +583,20 @@ def _load_records(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[
     eval_records = [dict(r) for r in records[:eval_n]]
     pool = records[eval_n:]
     train_n = args.n if args.n > 0 else len(pool)
-    # Cross-problem rubric: keep the train_n problems with the strongest bag-of-words
-    # neighbour (dense same-type pairs), so a problem's rubric can transfer to its analogue.
-    # Otherwise keep the first train_n (already shuffled).
-    train_records = ([dict(r) for r in select_paired_subset(pool, train_n, args.seed)]
-                     if args.xproblem_rubric else [dict(r) for r in pool[:train_n]])
+    # Cross-problem rubric: pick the train_n problems with the strongest qualifying neighbour
+    # (dense same-type pairs) and build {Q -> (P, sim)} in one index pass. Otherwise keep the
+    # first train_n (already shuffled) with no neighbours.
+    if args.xproblem_rubric:
+        subset, neighbor_map = build_pairs(pool, train_n, args.seed)
+        train_records = [dict(r) for r in subset]
+        pool_answers = {r['problem']: str(r.get('reference_answer', '')) for r in pool}
+    else:
+        train_records, neighbor_map, pool_answers = [dict(r) for r in pool[:train_n]], {}, {}
     if {r['problem'] for r in train_records} & {r['problem'] for r in eval_records}:
         raise ValueError('eval/train overlap detected')
     stats = {'raw_loaded': raw_n, 'numeric_dropped': dropped,
              'train_records': len(train_records), 'eval_records': len(eval_records)}
-    return train_records, eval_records, stats
+    return train_records, eval_records, neighbor_map, pool_answers, stats
 
 
 # ===========================================================================
@@ -943,15 +955,17 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
 
 
 def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
-                          neighbor_map: Dict[str, Tuple[str, float]], base_dp: int,
+                          neighbor_map: Dict[str, Tuple[str, float]],
+                          pool_answers: Dict[str, str], base_dp: int,
                           args: argparse.Namespace, checker,
                           base_cache: DiskCache, rubric_cache: DiskCache) -> None:
     """Cross-problem rubric (--xproblem-rubric): for every view-A problem Q, replace its own
     rubric with the rubric of its bag-of-words neighbour P (Q keeps being the solved/scored
-    problem). P is baselined + diagnosed here (both disk-cached) as a throwaway stub, then
-    P's findings are copied onto Q, along with the neighbour's text + similarity for audit.
-    A P that can't be diagnosed -> Q degrades to view B. This makes any answer leaked from
-    P's rubric useless for solving Q."""
+    problem). P is baselined + diagnosed here (both disk-cached) as a stub carrying P's REAL
+    answer, so P's baseline grades correctly and legitimately shares the baseline cache with
+    P-as-training-problem. P's findings are copied onto Q with the neighbour text + similarity
+    for audit. A P that can't be diagnosed -> Q degrades to view B. Since P's answer differs
+    from Q's (guaranteed at pairing time), any answer P's rubric leaks is useless for Q."""
     targets = [r for r in chunk if r.get('_view') == 'A' and neighbor_map.get(r['problem'])]
     if not targets:
         return
@@ -959,7 +973,7 @@ def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
     for r in targets:
         p, _ = neighbor_map[r['problem']]
         if p not in by_problem:
-            stub = {'problem': p, 'reference_answer': '', '_view': 'A'}
+            stub = {'problem': p, 'reference_answer': pool_answers.get(p, ''), '_view': 'A'}
             by_problem[p] = stub
             stubs.append(stub)
     baseline_rollout(base_sampler, stubs, base_dp, args, base_cache)
@@ -973,7 +987,8 @@ def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
 def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                   ci: int, base_dp: int, skill_dp: int, args: argparse.Namespace,
                   checker, rubric_cache: DiskCache, base_cache: DiskCache = None,
-                  neighbor_map: Optional[Dict[str, str]] = None
+                  neighbor_map: Optional[Dict[str, Tuple[str, float]]] = None,
+                  pool_answers: Optional[Dict[str, str]] = None
                   ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     """view assign -> rubric-check (view A) -> skill-gen -> leak-filter -> with-skill
     greedy pass -> GRPO advantages. ``chunk`` arrives already baselined by draw_chunk.
@@ -982,8 +997,8 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
     for r in hard:
         r['_view'], r['_rubric_diag'] = _assign_view(r['problem'], args), ''
     if args.xproblem_rubric and neighbor_map:
-        apply_neighbor_rubric(base_sampler, hard, neighbor_map, base_dp, args, checker,
-                              base_cache, rubric_cache)
+        apply_neighbor_rubric(base_sampler, hard, neighbor_map, pool_answers or {}, base_dp,
+                              args, checker, base_cache, rubric_cache)
     else:
         diagnose_views(checker, hard, args, rubric_cache)
 
@@ -1456,7 +1471,7 @@ def _write(handle, row: Dict[str, Any]) -> None:
 
 def main() -> None:
     args = _build_args()
-    records, eval_records, data_stats = _load_records(args)
+    records, eval_records, neighbor_map, pool_answers, data_stats = _load_records(args)
     if len(records) < args.chunk_size:
         raise ValueError(f'--chunk-size ({args.chunk_size}) exceeds loaded ({len(records)}); raise --n')
 
@@ -1491,11 +1506,7 @@ def main() -> None:
     base_cache = DiskCache(os.path.join(cache_dir, 'baseline.jsonl'), use_cache)
     eval_base_cache = DiskCache(os.path.join(cache_dir, 'eval_baseline.jsonl'), use_cache)
     rubric_cache = DiskCache(os.path.join(cache_dir, 'rubric.jsonl'), use_cache)
-    neighbor_map: Dict[str, str] = {}
     if args.xproblem_rubric:
-        neighbor_cache = DiskCache(os.path.join(cache_dir, 'bow_neighbors.jsonl'), use_cache)
-        neighbor_map = build_neighbor_map([r['problem'] for r in records], neighbor_cache)
-        neighbor_cache.close()
         sys.stderr.write(f'[rft] xproblem-rubric ON: {len(neighbor_map)} bag-of-words pairs\n')
 
     cfg = {'record_type': 'config', 'model': MODEL_ID, 'dataset': args.dataset,
@@ -1550,7 +1561,7 @@ def main() -> None:
                 pending = prefetch_pool.submit(_prefetch, peeked)
             full, summary, groups = process_chunk(
                 base_sampler, skill_sampler, chunk, gstep, base_dp, skill_dp,
-                args, checker, rubric_cache, base_cache, neighbor_map)
+                args, checker, rubric_cache, base_cache, neighbor_map, pool_answers)
             summary['balance'] = balance
 
             log = None
