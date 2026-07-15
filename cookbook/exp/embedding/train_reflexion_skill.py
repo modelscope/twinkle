@@ -1032,15 +1032,15 @@ def _train_chunk(skill_model, ckpt: CheckpointEngineManager, samples: List[Dict[
 # ===========================================================================
 def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, Any]],
                     ci: int, rounds: int, base_dp: int, skill_dp: int, args: argparse.Namespace,
-                    checker, base_cache: DiskCache, rubric_cache: DiskCache
+                    base_cache: DiskCache
                     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, float]]:
     """SEAM ``val-core/math/acc/mean@1`` on the fixed holdout: ONE greedy skill (T=0) per
-    problem into ONE greedy base solve (T=0). Each problem keeps its view; no leak filter
-    (acc scores correctness alone). Baseline + rubric reuse the disk caches."""
+    problem into ONE greedy base solve (T=0). Eval ALWAYS uses view B (query-only, the
+    deployment form: no rubric, since rubric needs an online teacher unavailable at deploy);
+    no leak filter (acc scores correctness alone). Baseline reuses the disk cache."""
     baseline_rollout(base_sampler, eval_records, base_dp, args, base_cache)
     for r in eval_records:
-        r['_view'], r['_rubric_diag'] = _assign_view(r['problem'], args), ''
-    diagnose_views(checker, eval_records, args, rubric_cache)
+        r['_view'], r['_rubric_diag'] = 'B', ''
     sg_out = _run_samples(skill_sampler, [_view_prompt(r) for r in eval_records],
                           1, args.skill_max_tokens, skill_dp, temperature=0.0)
     skills = [(_extract_skills_block(_clean_text(getattr(seqs[0], 'decoded', '') or '')) or '',
@@ -1062,23 +1062,17 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
             'withskill_stop_reason': roll['stop_reason'], 'withskill_text': roll['text'],
         })
     acc = lambda rs: sum(1 for x in rs if x['withskill_correct']) / len(rs) if rs else 0.0
-    A = [x for x in recs if x['view'] == 'A']
-    B = [x for x in recs if x['view'] == 'B']
-    ws = acc(recs)
+    ws = acc(recs)  # all view B (deployment form)
     base = sum(x['baseline_pass'] for x in recs) / len(recs) if recs else 0.0
     fmt = (sum(1 for x in recs if x['skill_parseable']) / len(recs)) if recs else 0.0
     term = (sum(1 for x in recs if x['withskill_terminated']) / len(recs)) if recs else 0.0
     summary = {'record_type': 'eval_summary', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
-               'n': len(recs), 'n_A': len(A), 'n_B': len(B), 'acc_mean1': ws,
+               'n': len(recs), 'view': 'B', 'acc_mean1': ws,
                'baseline_acc_mean1': base, 'lift_mean1': ws - base,
-               'acc_A_mean1': acc(A), 'acc_B_mean1': acc(B), 'format_mean1': fmt, 'term_mean1': term}
+               'format_mean1': fmt, 'term_mean1': term}
     metrics = {'core/math/acc/mean@1': ws, 'core/math/baseline_acc/mean@1': base,
                'core/math/lift/mean@1': ws - base, 'core/math/format/mean@1': fmt,
                'core/math/term/mean@1': term}
-    if A:
-        metrics['core/math/acc_A/mean@1'] = acc(A)
-    if B:
-        metrics['core/math/acc_B/mean@1'] = acc(B)
     return recs, summary, metrics
 
 
@@ -1354,7 +1348,7 @@ def main() -> None:
             if eval_records and (gstep + 1) % args.eval_every == 0:
                 eval_recs, eval_summary, eval_metrics = run_greedy_eval(
                     base_sampler, skill_sampler, eval_records, gstep, rounds, base_dp, skill_dp,
-                    args, checker, eval_base_cache, rubric_cache)
+                    args, eval_base_cache)
                 for rec in eval_recs:
                     _write(eval_f, rec)
                 _write(eval_f, eval_summary)
@@ -1362,11 +1356,9 @@ def main() -> None:
                 if use_swan:
                     swanlab.log({f'eval/{k}': v for k, v in eval_metrics.items()}, step=gstep)
                 sys.stderr.write(
-                    f'[eval] g{gstep}: n={eval_summary["n"]} mean@1 '
+                    f'[eval] g{gstep}: n={eval_summary["n"]} viewB mean@1 '
                     f'acc={eval_summary["baseline_acc_mean1"]:.3f}->{eval_summary["acc_mean1"]:.3f} '
                     f'lift={eval_summary["lift_mean1"]:+.3f} '
-                    f'A[{eval_summary["n_A"]} {eval_summary["acc_A_mean1"]:.3f}] '
-                    f'B[{eval_summary["n_B"]} {eval_summary["acc_B_mean1"]:.3f}] '
                     f'fmt={eval_summary["format_mean1"]:.2f} rounds={rounds}\n')
 
             if (gstep + 1) % args.trend_every == 0:
