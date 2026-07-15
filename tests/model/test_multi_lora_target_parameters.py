@@ -260,5 +260,10 @@ def test_multilora_transformers_installs_target_parameters_once():
     else:
         raise AssertionError("different target_parameters should be rejected")
 
+# Run in the local environment.
 if __name__ == "__main__":
-    test_target_parameter_state_dict_loads_with_peft()
+    assert test_peft_target_parameter_key_shapes_for_3d_experts() == True
+    assert test_target_parameter_multi_lora_updates_only_active_adapter() == True
+    assert test_multilora_releases_target_parameter_slot_to_initial_weights() == True
+    assert test_multilora_state_dict_round_trips_target_parameters() == True
+    assert test_multilora_transformers_installs_target_parameters_once() == True
