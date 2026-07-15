@@ -170,7 +170,7 @@ class LeakVerifier(Verifier):
         max_content_chars: int = 4000,
         max_query_chars: int = 4000,
         uncertain_is_leak: bool = False,
-        answer_only: bool = False,
+        answer_only: bool = True,
         judge_system: Optional[str] = None,
     ):
         self.sampler = sampler
