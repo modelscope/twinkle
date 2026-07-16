@@ -142,6 +142,17 @@ def shard_experts(
     block._ep_tensor_experts = is_tensor_experts
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
 
+    # Duplicate EP metadata on block.experts as a defensive measure —
+    # this ensures the experts module has all needed context even if accessed separately.
+    block.experts._ep_num_experts = num_experts
+    block.experts._ep_experts_per_rank = experts_per_rank
+    block.experts._ep_local_start = local_start
+    block.experts._ep_local_end = local_end
+    block.experts._ep_rank = ep_rank
+    block.experts._ep_world_size = ep_world_size
+    block.experts._ep_tensor_experts = is_tensor_experts
+    block.experts._ep_ignore_shared_experts = cfg.ignore_shared_experts
+
     return ExpertShardingSpec(
         block=block,
         experts_module=block.experts,
@@ -471,6 +482,15 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
     experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
     if hasattr(experts, 'num_experts'):
         experts.num_experts = end - start
+
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraWrapper
+    for mod_name, target_param_wrapper in experts.named_children():
+        if not isinstance(target_param_wrapper, TargetParameterLoraWrapper):
+            continue
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_A.items():
+            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_B.items():
+            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
 
 
 def _run_local_experts(

@@ -400,6 +400,8 @@ def _ep_expert_state_dict_gather_dim(name: str) -> int:
     # [out, r * num_experts]. EP therefore owns a contiguous expert block on
     # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
     # parallelism, so the forward pass does not need an EP all-reduce.
+    if '_twinkle_lora_' in name:
+        return 0
     if 'lora_B' in name:
         return 1
     return 0
@@ -723,6 +725,10 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
     if _is_lora_state_key(param_name):
         raise KeyError(f"LoRA parameter '{param_name}' must be loaded from adapter source state.")
 
+    # Parametrization renames MoE layer parameters. full_sd stores the original
+    # weights, so we need to align the naming to match the expected keys.
+    if 'parametrizations' in param_name:
+        param_name = param_name.replace('.parametrizations', '').replace('.original', '')
     candidates = _source_key_candidates(param_name)
     for candidate in candidates:
         if candidate in source_state:
