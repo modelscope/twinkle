@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
-import numpy as np
 import os
 import re
 import time
@@ -12,29 +11,7 @@ from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import Rollout
-from .bridge import extend_with_bridge
-
-
-def _to_plain(obj: Any) -> Any:
-    """Recursively convert numpy arrays/scalars to plain Python lists/numbers.
-
-    Mirrors ``vllm_sampler._convert_ndarray_to_list`` but lives locally so we
-    do not depend on a private symbol.
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, dict):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        conv = [_to_plain(x) for x in obj]
-        return type(obj)(conv) if isinstance(obj, tuple) else conv
-    return obj
+from .bridge import _to_plain, extend_with_bridge
 
 
 @remote_class()

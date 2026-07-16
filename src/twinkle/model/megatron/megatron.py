@@ -698,7 +698,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        loss = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        # Gather over the DP group, not WORLD: under PP the loss runs only on the last
+        # pipeline stage, so a WORLD-group all-gather (e.g. InfonceLoss in-batch negatives)
+        # would deadlock on earlier-stage ranks that never enter the loss. Mirrors add_metric.
+        if getattr(loss, 'process_group', None) is None and getattr(optimizer_config, '_dp_group', None) is not None:
+            loss.process_group = optimizer_config._dp_group
+        optimizer_config.loss_instance = loss
 
     @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):

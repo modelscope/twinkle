@@ -695,7 +695,11 @@ def test_gpu_embedding_real_model_loss_is_finite(gpu_embedding_model):
     assert minibatches, 'expected at least one minibatch'
     assert all(mb for mb in minibatches), 'expected every minibatch to be non-empty'
 
-    result = run_embedding_training(model, minibatches)
+    # Configure the embedding pipeline and attach an optimizer before training:
+    # run_embedding_training issues clip_grad_and_step, which requires a set optimizer.
+    configure_embedding_adapter(model, temperature=DEFAULT_TEMPERATURE)
+    model.set_optimizer('AdamW', lr=1e-4)
+    result = run_embedding_training(model, minibatches, configure=False)
 
     losses = result['losses']
     # One loss per minibatch, and the sequence actually issued forward_backward calls.
@@ -796,9 +800,13 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
     configure_embedding_adapter(model)
 
     causal_sample = _build_causal_sample(seq_len=DEFAULT_SEQ_LEN)
+    # Use two identical samples so the baseline/post forward_only can be split across
+    # a multi-DP model server (dp>=2); the assertions only inspect the logits' trailing
+    # vocab dimension, which is invariant to batch size.
+    causal_batch = [causal_sample, causal_sample]
 
     # (2) Baseline vocab-dim logits with the patch NEVER applied.
-    baseline_resp = model.forward_only(inputs=[causal_sample], return_logits=True)
+    baseline_resp = model.forward_only(inputs=causal_batch, return_logits=True)
     baseline_result = getattr(baseline_resp, 'result', baseline_resp)
     assert isinstance(baseline_result, dict), f'malformed forward_only response: {baseline_result!r}'
     baseline_logits = baseline_result.get('logits')
@@ -814,7 +822,7 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
     assert math.isfinite(emb_loss), f'embedding forward_backward loss not finite: {emb_loss!r}'
 
     # (4) Post-embedding causal forward_only WITHOUT task: patch must be gone.
-    post_resp = model.forward_only(inputs=[causal_sample], return_logits=True)
+    post_resp = model.forward_only(inputs=causal_batch, return_logits=True)
     post_result = getattr(post_resp, 'result', post_resp)
     assert isinstance(post_result, dict), (
         f'post-embedding forward_only returned malformed result (patch may have leaked): {post_result!r}')

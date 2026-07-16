@@ -204,7 +204,12 @@ def _build_embedding_model_with_mesh(
         device_type='cuda',
     )
 
-    model = MultiLoraTransformersModel(model_id=MODEL_ID, device_mesh=mesh)
+    # find_unused_parameters=True is REQUIRED for embedding training: only the last
+    # hidden states contribute to the InfoNCE loss, so some parameters receive no
+    # gradient and DDP would otherwise abort the reduction (see Embedding训练.md).
+    model = MultiLoraTransformersModel(
+        model_id=MODEL_ID, device_mesh=mesh,
+        ddp_config={'find_unused_parameters': True})
     model.add_adapter_to_model(adapter_name, LoraConfig(target_modules='all-linear'))
     model.set_processor(InputProcessor, adapter_name=adapter_name)
     model.set_loss(

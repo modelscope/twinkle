@@ -107,7 +107,9 @@ class ClientMultiTurnRollout:
             kwargs.get('tool_manager', self.tool_manager), n)
 
         # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
-        #    state for trajectory ``i``.
+        #    state for trajectory ``i``. ``vLLMSampler.sample`` is responsible for
+        #    JSON-serialising the feature (ndarray / tensor -> list) before the
+        #    HTTP POST, so no conversion is needed here.
         pifs: List[Dict[str, Any]] = []
         for traj in trajectories:
             pif = self.template.encode(traj, add_generation_prompt=True)

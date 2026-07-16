@@ -8,6 +8,28 @@ from twinkle.data_format import Trajectory, InputFeature
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
 # that base pulls ``twinkle.sampler.__init__`` → ``VLLMEngine`` → torch + zmq,
 # which the mock / CPU-only client environments don't have.
+def _json_safe(obj: Any) -> Any:
+    """Recursively coerce numpy arrays / torch tensors to JSON-serialisable lists.
+
+    ``sample()`` accepts pre-encoded ``InputFeature`` dicts (e.g. from a multi-turn
+    rollout's ``template.encode``) whose values are numpy arrays or torch tensors;
+    these are not JSON-serialisable and would break the HTTP POST. Detection is by
+    duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
+    honouring the CPU-only client contract noted above.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    tolist = getattr(obj, 'tolist', None)
+    if callable(tolist) and not isinstance(obj, (str, bytes, int, float, bool)):
+        try:
+            return _json_safe(tolist())
+        except Exception:
+            return obj
+    return obj
+
+
 class vLLMSampler:
     """Client wrapper for Sampler that calls server HTTP endpoints.
 
@@ -64,7 +86,7 @@ class vLLMSampler:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
         json_data = {
-            'inputs': inputs,
+            'inputs': _json_safe(inputs),
             'sampling_params': sampling_params,
             'adapter_name': adapter_name,
             'num_samples': num_samples,
