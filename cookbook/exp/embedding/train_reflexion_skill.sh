@@ -45,7 +45,7 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --sft-batch-size 8 \
   --grpo-epsilon 0.2 \
   --format-in-reward \
-  --lr 6e-6 \
+  --lr 1e-6 \
   --max-train-rounds 1500 \
   --save-rounds 200 \
   --trend-every 10 \
