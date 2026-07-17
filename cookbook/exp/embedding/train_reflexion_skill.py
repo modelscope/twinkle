@@ -279,7 +279,7 @@ SKILL_GEN_SYSTEM = (
 
 SKILL_GEN_SYSTEM_Q = (
     'You are a math guidance writer. Given the problem below, write reusable guidance '
-    'for this and similar problems.\n'
+    'for this and similar problems, you can recall the diagnosis or check happend before.\n'
     'Output only a non-empty <skills>...</skills> block.')
 
 SKILL_GEN_USER_Q = (
@@ -864,11 +864,17 @@ def diagnose_views(checker, problems: List[Dict[str, Any]], args: argparse.Names
         r, key = item
         seg = {'messages': [{'role': 'user', 'content': r['problem']},
                             {'role': 'assistant', 'content': r['_init'][0]['text']}]}
-        try:
-            return r, key, _format_diagnosis(checker.diagnose(seg, query=r['problem']))
-        except Exception as exc:  # teacher hiccup -> no-diagnosis prompt (not cached)
-            logger.warning(f'[rubric] diagnose error: {exc}')
-            return r, key, None
+        attempts = max(1, args.rubric_retries + 1)
+        for attempt in range(attempts):
+            try:
+                return r, key, _format_diagnosis(checker.diagnose(seg, query=r['problem']))
+            except Exception as exc:  # teacher hiccup -> retry, then no-diagnosis prompt (not cached)
+                if attempt + 1 < attempts:
+                    logger.warning(f'[rubric] diagnose error: {exc}; retry {attempt + 1}/{args.rubric_retries}')
+                    time.sleep(min(2.0, 0.5 * (2 ** attempt)))
+                    continue
+                logger.warning(f'[rubric] diagnose error: {exc}; giving up after {attempts} attempts')
+                return r, key, None
 
     workers = max(1, min(args.rubric_workers, len(pending)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1164,7 +1170,9 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
     clean = [c for c in cands if c['leaked'] is False]
     ws_rolls = [x for c in scored for x in c['rolls']]
     base_acc = (sum(r['_baseline_pass'] for r in chunk) / len(chunk)) if chunk else 0.0
-    ws_acc = _mean([c['with_pass'] for c in scored])
+    ws_acc = _mean([1.0 if any(c.get('reward') for c in r['_cands']) else 0.0 for r in chunk])
+    cand_pass_parseable = _mean([c['with_pass'] for c in scored])
+    cand_pass_all = _mean([1.0 if c.get('reward') else 0.0 for c in all_cands])
     # base failure taxonomy (you asked whether skills fail because the base loops out of length)
     classes = [_baseline_class(r) for r in chunk]
     n_fail = sum(1 for c in classes if c != 'success')
@@ -1188,6 +1196,8 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
         'withskill_trunc_frac': (trunc / len(ws_rolls)) if ws_rolls else 0.0,
         'avg_baseline_pass': base_acc, 'avg_withskill_pass': ws_acc,
         'avg_lift': ws_acc - base_acc,
+        'candidate_withskill_pass_parseable': cand_pass_parseable,
+        'candidate_withskill_pass_all': cand_pass_all,
         'termination_rate_withskill': _mean([1.0 if x['terminated'] else 0.0 for x in ws_rolls]),
         'view_A': _view_stats(chunk, 'A'), 'view_B': _view_stats(chunk, 'B'),
         **_xproblem_stats(chunk, args),
@@ -1393,6 +1403,8 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]]) -> Dic
     if sig['n_groups'] > 0:
         d.update({'acc/baseline_pass': summary['avg_baseline_pass'],
                   'acc/withskill_pass': summary['avg_withskill_pass'], 'acc/lift': summary['avg_lift'],
+                  'candidate/withskill_pass_parseable': summary['candidate_withskill_pass_parseable'],
+                  'candidate/withskill_pass_all': summary['candidate_withskill_pass_all'],
                   'adopt/A': summary['view_A']['adoption_rate'],
                   'adopt/B': summary['view_B']['adoption_rate'],
                   'term/withskill': summary['termination_rate_withskill'],
@@ -1456,7 +1468,7 @@ def init_components(args: argparse.Namespace):
     skill_model = TransformersModel(model_id=MODEL_ID, device_mesh=train_mesh, remote_group='train',
                                     ddp_config={'find_unused_parameters': False})
     skill_model.apply_patch(NoSplitModulesPatch({'Qwen3DecoderLayer'}))
-    skill_model.set_template(Template, model_id=MODEL_ID, enable_thinking=True,
+    skill_model.set_template(Template, model_id=MODEL_ID, enable_thinking=False,
                              max_length=args.max_model_len, truncation_strategy='delete')
     skill_model.set_processor(InputProcessor, padding_free=False)
     skill_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon, beta=args.kl_beta)
@@ -1519,6 +1531,9 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--max-tokens', type=int, default=8192)
     p.add_argument('--skill-max-tokens', type=int, default=8192)
     p.add_argument('--rubric-workers', type=int, default=16)
+    p.add_argument('--rubric-retries', type=int, default=2,
+                   help='Retry failed/timeout rubric diagnose calls this many times before '
+                        'falling back to an empty diagnosis without caching the failure.')
     p.add_argument('--sft-batch-size', type=int, default=8,
                    help='Driver micro-batch (gradient-accumulation unit); multiple of train dp.')
     p.add_argument('--ppo-mini-batch-size', type=int, default=0,
