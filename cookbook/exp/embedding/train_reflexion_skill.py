@@ -14,7 +14,10 @@ query only (deployment form). Skill-gen trains only the final <skills> turn.
 Base greedy rollouts and rubric diagnoses are cached to disk (jsonl, md5-keyed) so
 restarts skip them; skill-gen is on-policy and never cached.
 
-8 GPUs: ranks 0-3 train (FSDP2), 4-5 skill_sampler (synced), 6-7 base_sampler (frozen).
+8 GPUs default for high-memory cards: rank 0 trains the actor, rank 1 hosts a
+frozen reference model, ranks 2-3 skill_sampler (synced), ranks 4-7 base_sampler
+(frozen). Override TRAIN_GPUS / REF_GPUS / SKILL_SAMPLER_GPUS / BASE_SAMPLER_GPUS
+for other layouts.
 Leak / rubric use the backup teacher API: set LLM_BACKUP_API_KEY / LLM_BACKUP_BASE_URL /
 LLM_BACKUP_MODEL.
 
@@ -64,13 +67,25 @@ GEN_TOP_P = float(os.environ.get('GEN_TOP_P', 0.95))
 AOPS_DATASET_ID = os.environ.get('AOPS_DATASET_ID', 'AI-MO/aops')
 MATH_DATASET_ID = os.environ.get('MATH_DATASET_ID', 'modelscope/competition_math')
 
-# GPU layout: train (FSDP2) + skill_sampler (synced) + base_sampler (frozen).
-TRAIN_GPUS = int(os.environ.get('TRAIN_GPUS', 4))
+# GPU layout: train actor (synced to skill_sampler) + frozen ref model + skill_sampler + base_sampler.
+# High-memory cards can keep Qwen3-4B actor/ref as one GPU each and spend more GPUs
+# on vLLM data-parallel sampling. The base side is heavier here because every
+# clean skill candidate is re-solved by the frozen base model, plus balance/eval baselines.
+TRAIN_GPUS = int(os.environ.get('TRAIN_GPUS', 2))
+REF_GPUS = int(os.environ.get('REF_GPUS', 2))
 SKILL_SAMPLER_GPUS = int(os.environ.get('SKILL_SAMPLER_GPUS', 2))
 BASE_SAMPLER_GPUS = int(os.environ.get('BASE_SAMPLER_GPUS', 2))
-NUM_GPUS = TRAIN_GPUS + SKILL_SAMPLER_GPUS + BASE_SAMPLER_GPUS
-TRAIN_FSDP = int(os.environ.get('TRAIN_FSDP', 2))
-TRAIN_DP = max(1, TRAIN_GPUS // TRAIN_FSDP)
+NUM_GPUS = TRAIN_GPUS + REF_GPUS + SKILL_SAMPLER_GPUS + BASE_SAMPLER_GPUS
+TRAIN_FSDP = int(os.environ.get('TRAIN_FSDP', min(1, TRAIN_GPUS)))
+REF_FSDP = int(os.environ.get('REF_FSDP', min(1, REF_GPUS)))
+if min(TRAIN_GPUS, REF_GPUS, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS, TRAIN_FSDP, REF_FSDP) < 1:
+    raise ValueError('TRAIN_GPUS, REF_GPUS, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS, TRAIN_FSDP and REF_FSDP must all be >= 1')
+if TRAIN_GPUS % TRAIN_FSDP != 0:
+    raise ValueError(f'TRAIN_GPUS ({TRAIN_GPUS}) must be divisible by TRAIN_FSDP ({TRAIN_FSDP})')
+if REF_GPUS % REF_FSDP != 0:
+    raise ValueError(f'REF_GPUS ({REF_GPUS}) must be divisible by REF_FSDP ({REF_FSDP})')
+TRAIN_DP = TRAIN_GPUS // TRAIN_FSDP
+REF_DP = REF_GPUS // REF_FSDP
 
 
 # ===========================================================================
@@ -246,54 +261,52 @@ def build_direct_prompt(problem: str) -> Dict[str, Any]:
 
 
 def build_skill_solve_prompt(problem: str, skill: str) -> Dict[str, Any]:
+    skill = (skill or '').strip()
+    if not skill:
+        return build_direct_prompt(problem)
     # Concatenation (not .format): DIRECT_SYSTEM/skill contain literal braces.
     return {'messages': [
         {'role': 'system', 'content': _SKILL_SOLVE_PREFIX + skill + _SKILL_SOLVE_SUFFIX},
         {'role': 'user', 'content': problem}]}
 
 
-# -- skill-gen prompts (view A: problem + rubric findings; view B: query only) --
+# -- skill-gen prompts (view A: problem + rubric source; view B: query only) --
 SKILL_GEN_SYSTEM = (
-    'You are a math problem-solving coach. You are given a problem and an automated '
-    'process-check of an earlier attempt at it (which criteria it passed or failed, with '
-    'suggested fixes). Use the check to see where a solver of this problem tends to go '
-    'wrong, then give reusable guidance that helps a separate solver avoid those failures '
-    'on this and similar problems.\n'
-    '- Do not solve it or state the final answer or any specific intermediate value.\n'
-    '- Turn each relevant failure into general guidance (the method to reach for, the '
-    'pitfall to watch, a quick check) rather than narrating this attempt.\n'
-    'Think briefly, then output only the guidance wrapped in <skills> and </skills>.')
+    'You are a math guidance writer. You are given a target problem and an automated '
+    'process-check from a related problem. Use it as context to write reusable guidance '
+    'for this and similar problems.\n'
+    'Output only a non-empty <skills>...</skills> block.')
 
 SKILL_GEN_SYSTEM_Q = (
-    'You are a math problem-solving coach. Read the problem below and give reusable '
-    'guidance that would help a separate solver reach the answer on this and similar '
-    'problems.\n'
-    '- Do not solve it or state the final answer or any specific intermediate value.\n'
-    '- Name the key idea or method to reach for and the main pitfall to avoid.\n'
-    'Think briefly, then output only the guidance wrapped in <skills> and </skills>.')
+    'You are a math guidance writer. Given the problem below, write reusable guidance '
+    'for this and similar problems.\n'
+    'Output only a non-empty <skills>...</skills> block.')
 
 SKILL_GEN_USER_Q = (
     'Problem:\n{problem}\n\n'
-    'Now output the guidance.')
+    '<skills>')
 
 SKILL_GEN_USER_RUBRIC = (
-    'Problem:\n{problem}\n\n'
-    'Process check of an earlier attempt (automated rubric verifier -- treat as '
-    'evidence, not gospel; PASS/FAIL per criterion with suggested fixes for failures):\n'
+    'Target problem:\n{problem}\n\n'
+    'Problem used for the process check:\n{rubric_problem}\n\n'
+    'Process check:\n'
     '{diagnosis}\n\n'
-    'Now output the guidance.')
+    '<skills>')
 
 
-def _skillgen_messages(problem: str, view: str, diagnosis: str) -> List[Dict[str, Any]]:
+def _skillgen_messages(problem: str, view: str, diagnosis: str,
+                       rubric_problem: str = '') -> List[Dict[str, Any]]:
     """Single source of truth for the skill-gen prompt (used at BOTH generation and
-    training so they never diverge). View A with a localisable failure uses problem +
-    rubric findings; view B -- or a view-A problem whose rubric flagged nothing (no
-    ``[FAIL]``) -- degrades to the query-only prompt."""
+    training so they never diverge). View A with a localisable failure uses the target
+    problem plus the rubric source problem and findings; view B -- or a view-A problem
+    whose rubric flagged nothing (no ``[FAIL]``) -- degrades to the query-only prompt."""
     if view == 'B' or '[FAIL]' not in (diagnosis or ''):
         return [{'role': 'system', 'content': SKILL_GEN_SYSTEM_Q},
                 {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=problem)}]
+    rubric_problem = rubric_problem or problem
     return [{'role': 'system', 'content': SKILL_GEN_SYSTEM},
-            {'role': 'user', 'content': SKILL_GEN_USER_RUBRIC.format(problem=problem, diagnosis=diagnosis)}]
+            {'role': 'user', 'content': SKILL_GEN_USER_RUBRIC.format(
+                problem=problem, rubric_problem=rubric_problem, diagnosis=diagnosis)}]
 
 
 def _assign_view(problem: str, args: argparse.Namespace) -> str:
@@ -302,7 +315,8 @@ def _assign_view(problem: str, args: argparse.Namespace) -> str:
 
 
 def _view_prompt(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {'messages': _skillgen_messages(r['problem'], r['_view'], r.get('_rubric_diag', ''))}
+    return {'messages': _skillgen_messages(
+        r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''))}
 
 
 _SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>')
@@ -329,7 +343,9 @@ def _extract_skills_block(text: str) -> Optional[str]:
         return None
     inner = s + len('<skills>')
     e = low_a.find('</skills>', inner)
-    block = (answer[inner:e] if e >= 0 else answer[inner:]).strip()
+    if e < 0:
+        return None
+    block = answer[inner:e].strip()
     block = re.sub(r'</?(?:skills|think)>', '', block, flags=re.IGNORECASE).strip()
     return block or None
 
@@ -386,7 +402,7 @@ def load_problems(dataset: str, n: int, seed: int, num_proc: int = 0) -> List[Di
     ``num_proc`` defaults to all cores (set 1 to force serial)."""
     ds_id = AOPS_DATASET_ID if dataset == 'aops' else MATH_DATASET_ID
     ds = Dataset(DatasetMeta(dataset_id=f'ms://{ds_id}', split='train'))
-    nproc = num_proc if num_proc > 0 else (os.cpu_count() or 1)
+    nproc = num_proc if num_proc > 0 else min(32, os.cpu_count() or 1)
     ds.map(lambda rows: _boxed_batch(rows, dataset), num_proc=nproc)
     ds.filter(lambda row: row['_keep'], num_proc=nproc)
     has_level = 'level' in ds.dataset.column_names
@@ -940,8 +956,7 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
     for r in hard:
         for c in r['_cands']:
             c['advantage'], c['grpo_adv'], c['kept'] = 0.0, 0.0, False
-        cs = ([c for c in r['_cands'] if c.get('reward') is not None] if args.format_in_reward
-              else [c for c in r['_cands'] if c['leaked'] is False and c.get('reward') is not None])
+        cs = [c for c in r['_cands'] if c.get('reward') is not None]
         if len(cs) < 2:
             continue
         rewards = [c['reward'] for c in cs]
@@ -1031,10 +1046,9 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                 still.append(r)
         pending = still
 
-    # leak filter: deterministic verbatim-answer check only (no LLM). Measured on prior
-    # runs, the LLM judge flagged ~2% and leak rate was view-independent, so we drop the
-    # teacher-served LeakVerifier and just block the one exploit the reward can't catch --
-    # the final answer written into the skill (see _answer_leaked).
+    # leak audit: deterministic verbatim-answer check only (no LLM). This is observability
+    # only: it records leak metrics for swanlab/jsonl, but does not block scoring, reward,
+    # advantage assignment, or training sample selection.
     for r, c in flat:
         leaked = _answer_leaked(c['skills'], r['reference_answer'])
         c['leaked'] = leaked
@@ -1042,16 +1056,16 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
         c['leak_source'] = 'deterministic'
 
     # with-skill greedy pass (T=0, M=1); reward = correct, absolute (group mean is baseline).
-    clean = [(r, c) for r, c in flat if c['leaked'] is False]
-    if clean:
+    scored_inputs = flat
+    if scored_inputs:
         ws_out = _run_samples(base_sampler,
-                              [build_skill_solve_prompt(r['problem'], c['skills']) for r, c in clean],
+                              [build_skill_solve_prompt(r['problem'], c['skills']) for r, c in scored_inputs],
                               1, args.max_tokens, base_dp, temperature=0.0)
-        for (r, c), seqs in zip(clean, ws_out):
+        for (r, c), seqs in zip(scored_inputs, ws_out):
             c['rolls'] = [_parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()]
             c['with_pass'] = 1.0 if c['rolls'][0]['correct'] else 0.0
             c['reward'] = c['with_pass']
-    if args.format_in_reward:  # unparseable/leaked score 0 and still join the group
+    if args.format_in_reward:  # unparseable candidates score 0 and still join the group
         for r in hard:
             for c in r['_cands']:
                 if c['reward'] is None:
@@ -1068,12 +1082,11 @@ def _roll(x: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_trainable(c: Dict[str, Any], args: argparse.Namespace) -> bool:
-    """Reaches the GRPO update iff advantage is non-zero (and, without --format-in-reward,
-    also clean and scored)."""
+    """Reaches the GRPO update iff advantage is non-zero. Leak flags are audit-only."""
     adv_nz = abs(c.get('advantage') or 0.0) > 1e-9
     if args.format_in_reward:
         return adv_nz
-    return c['leaked'] is False and c.get('with_pass') is not None and adv_nz
+    return c.get('with_pass') is not None and adv_nz
 
 
 def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
@@ -1107,8 +1120,7 @@ def _view_stats(problems: List[Dict[str, Any]], view: str) -> Dict[str, Any]:
     cands = [c for r in pv for c in r['_cands'] if c['parseable']]
     clean = [c for c in cands if c['leaked'] is False]
     adopted = sum(1 for r in pv
-                  if any(c['leaked'] is False and abs(c.get('advantage') or 0.0) > 1e-9
-                         for c in r['_cands']))
+                  if any(abs(c.get('advantage') or 0.0) > 1e-9 for c in r['_cands']))
     return {'n': len(pv), 'n_candidates_parseable': len(cands), 'n_clean': len(clean),
             'n_adopted_problems': adopted, 'adoption_rate': (adopted / len(pv)) if pv else 0.0}
 
@@ -1231,32 +1243,61 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     train/inference match) + the generated (think + skills) response. ``key_rounds``
     selects the final assistant turn; Template masks the prompt and trains the whole
     response (the key-round prefix already excludes the prompt-provided <think>)."""
-    msgs = _skillgen_messages(rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''))
+    msgs = _skillgen_messages(
+        rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''))
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
             'user_data': {'key_rounds': [len(msgs)]}}
 
 
-def _train_chunk(skill_model, ckpt: CheckpointEngineManager, samples: List[Dict[str, Any]],
+def _train_chunk(skill_model, ref_model, ckpt: CheckpointEngineManager, samples: List[Dict[str, Any]],
                  args: argparse.Namespace) -> Dict[str, Any]:
-    """One on-policy GRPO optimizer step on this chunk, then sync weights. Skills were
-    sampled from the current policy (ratio ~1, no old_logps); all micro-batches accumulate
-    into one step. The batch is padded to a multiple of ``sft_batch_size`` with
-    advantage-0 copies that contribute no gradient."""
+    """On-policy GRPO update over one chunk, then sync weights. Micro-batches of
+    ``sft_batch_size`` accumulate gradients; ONE optimizer step is taken per PPO
+    mini-batch of ``ppo_mini_batch_size`` samples (0 -> a single step over the whole
+    chunk, the original behaviour). A frozen reference model provides ref_logps for the
+    SEAM-style KL penalty.
+
+    Multi-step correctness: with more than one step over the SAME rollout, later
+    mini-batches see an already-updated policy, so we FREEZE the sampling-policy
+    ``old_logps`` (recomputed once, before any step) and let GRPOLoss form the PPO ratio
+    against them. A single step keeps ``old_logps=None`` (ratio==1, pure on-policy).
+    The batch is padded to a multiple of ``sft_batch_size`` with advantage-0 copies that
+    contribute no policy gradient."""
     trajs = [_train_trajectory(rec) for rec in samples]
     advs = [float(rec['advantage']) for rec in samples]
     rem = (-len(trajs)) % args.sft_batch_size
     if rem:
         trajs += [trajs[-1]] * rem
         advs += [0.0] * rem
-    micro = 0
-    for i in range(0, len(trajs), args.sft_batch_size):
-        skill_model.forward_backward(inputs=trajs[i:i + args.sft_batch_size],
-                                     advantages=advs[i:i + args.sft_batch_size])
-        micro += 1
-    skill_model.clip_grad_and_step()
+
+    n, sft = len(trajs), args.sft_batch_size
+    mini = args.ppo_mini_batch_size if args.ppo_mini_batch_size > 0 else n
+    mini = max(sft, (mini // sft) * sft)  # align to a whole number of micro-batches
+    multi_step = mini < n
+
+    # Freeze ref_logps (frozen model) and -- only when we take multiple steps -- the
+    # sampling-policy old_logps, BOTH before any optimizer step touches the weights. With
+    # a single step old_logps stays None so GRPOLoss uses ratio==1 (pure on-policy).
+    micro_ref, micro_old = [], []
+    for i in range(0, n, sft):
+        mb = trajs[i:i + sft]
+        micro_ref.append(ref_model.forward_only(inputs=mb).get('logps'))
+        micro_old.append(skill_model.forward_only(inputs=mb).get('logps') if multi_step else None)
+
+    micro, n_steps = 0, 0
+    for ms in range(0, n, mini):
+        for i in range(ms, min(ms + mini, n), sft):
+            k = i // sft
+            skill_model.forward_backward(inputs=trajs[i:i + sft],
+                                         advantages=advs[i:i + sft],
+                                         old_logps=micro_old[k],
+                                         ref_logps=micro_ref[k])
+            micro += 1
+        skill_model.clip_grad_and_step()
+        n_steps += 1
     ckpt.sync_weights(merge_and_sync=True)
     metric = skill_model.calculate_metric(is_training=True)
-    return {'n_samples': len(samples), 'n_steps': 1, 'n_micro_batches': micro,
+    return {'n_samples': len(samples), 'n_steps': n_steps, 'n_micro_batches': micro,
             'metric': {k: (float(v) if _is_num(v) else v) for k, v in (metric or {}).items()}}
 
 
@@ -1370,17 +1411,46 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]]) -> Dic
     return d
 
 
+def _view_a_rubric_leak_metrics(chunk: List[Dict[str, Any]],
+                                pool_answers: Optional[Dict[str, str]] = None) -> Dict[str, float]:
+    """Swanlab-only audit for answer leakage in view-A rubric text. This never changes
+    rewards, advantages, filtering, or training records."""
+    view_a = [r for r in chunk if r.get('_view') == 'A']
+    with_diag = [r for r in view_a if r.get('_rubric_diag')]
+    target_leaks = sum(1 for r in with_diag
+                       if _answer_leaked(r.get('_rubric_diag', ''), r.get('reference_answer', '')))
+    source_leaks = 0
+    pool_answers = pool_answers or {}
+    for r in with_diag:
+        src = r.get('_rubric_src')
+        src_ref = pool_answers.get(src, '') if src else r.get('reference_answer', '')
+        if _answer_leaked(r.get('_rubric_diag', ''), src_ref):
+            source_leaks += 1
+    n = len(with_diag)
+    return {
+        'rubric_leak/n_view_a': float(len(view_a)),
+        'rubric_leak/n_checked': float(n),
+        'rubric_leak/target_answer_n': float(target_leaks),
+        'rubric_leak/target_answer_rate': (target_leaks / n) if n else 0.0,
+        'rubric_leak/source_answer_n': float(source_leaks),
+        'rubric_leak/source_answer_rate': (source_leaks / n) if n else 0.0,
+    }
+
+
 # ===========================================================================
 # Block F -- components, args, main
 # ===========================================================================
 def init_components(args: argparse.Namespace):
-    """8 GPUs: ranks 0-3 train (FSDP2), 4-5 skill_sampler (synced), 6-7 base_sampler
-    (frozen). Returns (skill_model, skill_sampler, base_sampler, ckpt, skill_dp, base_dp)."""
-    r0, r1, r2 = TRAIN_GPUS, TRAIN_GPUS + SKILL_SAMPLER_GPUS, NUM_GPUS
+    """Default 8-GPU layout: rank 0 trains the actor, rank 1 hosts a frozen ref model,
+    2-3 skill_sampler (synced), 4-7 base_sampler (frozen). Returns
+    (skill_model, ref_model, skill_sampler, base_sampler, ckpt, skill_dp, base_dp)."""
+    r0, r1 = TRAIN_GPUS, TRAIN_GPUS + REF_GPUS
+    r2, r3 = r1 + SKILL_SAMPLER_GPUS, NUM_GPUS
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, lazy_collect=False, groups=[
         DeviceGroup(name='train', ranks=list(range(0, r0)), device_type='GPU'),
-        DeviceGroup(name='skill_sampler', ranks=list(range(r0, r1)), device_type='GPU'),
-        DeviceGroup(name='base_sampler', ranks=list(range(r1, r2)), device_type='GPU')])
+        DeviceGroup(name='ref', ranks=list(range(r0, r1)), device_type='GPU'),
+        DeviceGroup(name='skill_sampler', ranks=list(range(r1, r2)), device_type='GPU'),
+        DeviceGroup(name='base_sampler', ranks=list(range(r2, r3)), device_type='GPU')])
 
     train_mesh = DeviceMesh.from_sizes(world_size=TRAIN_GPUS, dp_size=TRAIN_DP, fsdp_size=TRAIN_FSDP)
     skill_model = TransformersModel(model_id=MODEL_ID, device_mesh=train_mesh, remote_group='train',
@@ -1389,10 +1459,19 @@ def init_components(args: argparse.Namespace):
     skill_model.set_template(Template, model_id=MODEL_ID, enable_thinking=True,
                              max_length=args.max_model_len, truncation_strategy='delete')
     skill_model.set_processor(InputProcessor, padding_free=False)
-    skill_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon)
+    skill_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon, beta=args.kl_beta)
     skill_model.set_optimizer('AdamW', lr=args.lr)
     skill_model.set_lr_scheduler('CosineWarmupScheduler', num_warmup_steps=10,
                                  num_training_steps=args.max_train_rounds)
+
+    ref_mesh = DeviceMesh.from_sizes(world_size=REF_GPUS, dp_size=REF_DP, fsdp_size=REF_FSDP)
+    ref_model = TransformersModel(model_id=MODEL_ID, device_mesh=ref_mesh, remote_group='ref',
+                                  ddp_config={'find_unused_parameters': False})
+    ref_model.apply_patch(NoSplitModulesPatch({'Qwen3DecoderLayer'}))
+    ref_model.set_template(Template, model_id=MODEL_ID, enable_thinking=True,
+                           max_length=args.max_model_len, truncation_strategy='delete')
+    ref_model.set_processor(InputProcessor, padding_free=False)
+    ref_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon)
 
     def _sampler(group, world):
         s = vLLMSampler(model_id=MODEL_ID,
@@ -1407,7 +1486,7 @@ def init_components(args: argparse.Namespace):
     # base_sampler is shared by the main thread and the baseline-prefetch thread -> serialise.
     base_sampler = _LockedSampler(_sampler('base_sampler', BASE_SAMPLER_GPUS))
     ckpt = CheckpointEngineManager(model=skill_model, sampler=skill_sampler)
-    return skill_model, skill_sampler, base_sampler, ckpt, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS
+    return skill_model, ref_model, skill_sampler, base_sampler, ckpt, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS
 
 
 def _build_args() -> argparse.Namespace:
@@ -1441,8 +1520,16 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--skill-max-tokens', type=int, default=8192)
     p.add_argument('--rubric-workers', type=int, default=16)
     p.add_argument('--sft-batch-size', type=int, default=8,
-                   help='Driver micro-batch before the chunk optimizer step; multiple of train dp.')
+                   help='Driver micro-batch (gradient-accumulation unit); multiple of train dp.')
+    p.add_argument('--ppo-mini-batch-size', type=int, default=0,
+                   help='Samples per optimizer step (SEAM-style PPO mini-batch). 0 = one step '
+                        'over the whole chunk (on-policy, ratio==1). When >0 and smaller than '
+                        'the trainable count, multiple steps are taken over the same rollout and '
+                        'old_logps are frozen so the PPO ratio/clip stays valid. Rounded down to '
+                        'a multiple of --sft-batch-size.')
     p.add_argument('--grpo-epsilon', type=float, default=0.2)
+    p.add_argument('--kl-beta', type=float, default=0.001,
+                   help='SEAM-style reference KL coefficient for GRPOLoss.')
     p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--lr', type=float, default=6e-6)
     p.add_argument('--max-train-rounds', type=int, default=1500)
@@ -1493,9 +1580,10 @@ def main() -> None:
                              'view_b_frac': args.view_b_frac, 'balance': args.balance,
                              'balance_success_frac': args.balance_success_frac,
                              'skill_gen_temp': args.skill_gen_temperature,
-                             'grpo_epsilon': args.grpo_epsilon, 'lr': args.lr})
+                             'grpo_epsilon': args.grpo_epsilon, 'kl_beta': args.kl_beta,
+                             'lr': args.lr})
 
-    skill_model, skill_sampler, base_sampler, ckpt, skill_dp, base_dp = init_components(args)
+    skill_model, ref_model, skill_sampler, base_sampler, ckpt, skill_dp, base_dp = init_components(args)
     checker = build_rubric_checker()
     if checker is None:
         sys.stderr.write('[rft] no LLM backup env -> view-A rubric process-check DISABLED\n')
@@ -1520,11 +1608,15 @@ def main() -> None:
            'advantage': 'group_relative', 'format_in_reward': args.format_in_reward, 'cache': use_cache,
            'rubric_check': 'fixed_math_5crit(viewA)' if checker else 'disabled',
            'xproblem_rubric': args.xproblem_rubric,
-           'grpo_epsilon': args.grpo_epsilon, 'lr': args.lr,
+           'grpo_epsilon': args.grpo_epsilon, 'kl_beta': args.kl_beta, 'lr': args.lr,
+           'train_gpus': TRAIN_GPUS, 'ref_gpus': REF_GPUS, 'ref_fsdp': REF_FSDP,
+           'train_fsdp': TRAIN_FSDP, 'train_dp': TRAIN_DP,
+           'skill_sampler_gpus': SKILL_SAMPLER_GPUS, 'base_sampler_gpus': BASE_SAMPLER_GPUS,
            'max_train_rounds': args.max_train_rounds, 'started': int(time.time())}
     sys.stderr.write(f'[rft] raw={data_stats["raw_loaded"]} numeric_drop={data_stats["numeric_dropped"]} '
                      f'train={len(records)} eval={len(eval_records)} {args.dataset}; '
-                     f'train_gpus={TRAIN_GPUS} skill_dp={skill_dp} base_dp={base_dp}\n')
+                     f'train_gpus={TRAIN_GPUS} ref_gpus={REF_GPUS} train_fsdp={TRAIN_FSDP} '
+                     f'train_dp={TRAIN_DP} skill_dp={skill_dp} base_dp={base_dp}\n')
 
     hist: List[Dict[str, float]] = []
     rounds = 0
@@ -1549,6 +1641,24 @@ def main() -> None:
             if peeked:
                 baseline_rollout(base_sampler, peeked, base_dp, args, base_cache)
 
+        # Baseline (round 0) eval BEFORE any training: measures the untrained skill model on
+        # the fixed holdout so every later eval has a step-0 reference point on the same axis.
+        if eval_records:
+            eval_recs, eval_summary, eval_metrics = run_greedy_eval(
+                base_sampler, skill_sampler, eval_records, -1, rounds, base_dp, skill_dp,
+                args, eval_base_cache)
+            for rec in eval_recs:
+                _write(eval_f, rec)
+            _write(eval_f, eval_summary)
+            eval_f.flush()
+            if use_swan:
+                swanlab.log({f'eval/{k}': v for k, v in eval_metrics.items()}, step=0)
+            sys.stderr.write(
+                f'[eval] g-1 (init): n={eval_summary["n"]} viewB mean@1 '
+                f'acc={eval_summary["baseline_acc_mean1"]:.3f}->{eval_summary["acc_mean1"]:.3f} '
+                f'lift={eval_summary["lift_mean1"]:+.3f} '
+                f'fmt={eval_summary["format_mean1"]:.2f} rounds={rounds}\n')
+
         # Each chunk is drawn fresh + RE-GENERATED with the current policy (on-policy);
         # with --balance, draw_chunk keeps drawing until the base fail:success mix hits target.
         while rounds < args.max_train_rounds:
@@ -1566,7 +1676,7 @@ def main() -> None:
 
             log = None
             if groups:
-                log = _train_chunk(skill_model, ckpt, groups, args)
+                log = _train_chunk(skill_model, ref_model, ckpt, groups, args)
                 rounds += 1
                 log.update({'record_type': 'train_round', 'round': rounds, 'chunk': gstep,
                             'epoch': pool.epoch, 'ts': int(time.time())})
@@ -1602,7 +1712,9 @@ def main() -> None:
                 f'A[{sa["n"]} {sa["adoption_rate"]:.2f}] B[{sb["n"]} {sb["adoption_rate"]:.2f}] '
                 f'rounds={rounds}\n')
             if use_swan:
-                swanlab.log(_swan_metrics(summary, log), step=gstep)
+                swan_metrics = _swan_metrics(summary, log)
+                swan_metrics.update(_view_a_rubric_leak_metrics(chunk, pool_answers))
+                swanlab.log(swan_metrics, step=gstep)
 
             if eval_records and (gstep + 1) % args.eval_every == 0:
                 eval_recs, eval_summary, eval_metrics = run_greedy_eval(

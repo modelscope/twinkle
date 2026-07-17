@@ -1,7 +1,10 @@
 #!/bin/bash
 # Online GRPO RFT for the reflexion skill generator (unified, self-contained, cached).
-# GPUs: 8 — ranks 0-3 train (skill model, FSDP2), 4-5 skill sampler (synced), 6-7 base
-# sampler (frozen). Per chunk: base greedy solve -> rubric process-check (view A) ->
+# GPUs: 8 — default high-memory layout uses rank 0 for actor training, rank 1 for
+# the frozen ref model, ranks 2-3 for skill sampler (synced), and ranks 4-7 for
+# base sampler (frozen). Override TRAIN_GPUS / REF_GPUS / SKILL_SAMPLER_GPUS /
+# BASE_SAMPLER_GPUS for other layouts. Per chunk: base greedy
+# solve -> rubric process-check (view A) ->
 # skill-gen (thinking ON, N candidates) -> deterministic leak filter -> with-skill greedy
 # pass -> group-relative advantage -> ONE on-policy GRPO step -> sync weights.
 #
@@ -28,22 +31,24 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --dataset aops \
   --n 5000 \
   --numeric-only \
-  --chunk-size 16 \
-  --n-skills 8 \
+  --chunk-size 32 \
+  --n-skills 16 \
   --view-b-frac 0.5 \
   --xproblem-rubric \
   --skill-retries 2 \
   --balance \
-  --balance-success-frac 0.4 \
+  --balance-success-frac 0.3 \
   --balance-loop-frac 0.5 \
   --balance-max-draws-mult 8 \
-  --max-tokens 25000 \
-  --skill-max-tokens 8192 \
-  --max-model-len 30000 \
+  --max-tokens 8192 \
+  --skill-max-tokens 4096 \
+  --max-model-len 16384 \
   --eval-size 128 \
   --eval-every 5 \
   --sft-batch-size 8 \
+  --ppo-mini-batch-size 0 \
   --grpo-epsilon 0.2 \
+  --kl-beta 0.001 \
   --format-in-reward \
   --lr 1e-6 \
   --max-train-rounds 1500 \
