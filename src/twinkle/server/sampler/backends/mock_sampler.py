@@ -23,11 +23,6 @@ from twinkle.utils.seed import stable_seed
 
 logger = get_logger()
 
-# Recognised ctor / per-call knobs that tune multi-turn control flow. Kept in a
-# set so the ctor can log only *genuinely* unknown kwargs (a real backend
-# signature drift) while still accepting these opt-in multi-turn knobs.
-_MULTI_TURN_KNOBS = ('stop_reason', 'tool_call_text', 'tool_call_turns')
-
 
 @remote_class()
 class MockSampler:
