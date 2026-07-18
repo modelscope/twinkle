@@ -163,27 +163,27 @@ class Torch(Framework):
     def seed_everything(seed: Optional[int] = 42, deterministic: bool = False):
         random.seed(seed)
         np.random.seed(seed)
+        import torch
+        torch.manual_seed(seed)
+
         if Torch.is_gpu_available():
-            import torch
-            torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
-            if Torch.is_npu_available():
-                import torch_npu
-                torch.npu.manual_seed_all(seed)
+        if Torch.is_npu_available():
+            import torch_npu
+            torch.npu.manual_seed_all(seed)
 
-            if deterministic:
-                torch.use_deterministic_algorithms(True)
+        if deterministic:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            if Torch.is_gpu_available():
                 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
                 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
                 os.environ['FLASH_ATTENTION_DETERMINISTIC'] = '1'
-                torch.use_deterministic_algorithms(True, warn_only=True)
                 torch.backends.cudnn.deterministic = True
                 torch.backends.cudnn.benchmark = False
-
-                if Torch.is_npu_available():
-                    os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
-                    os.environ['HCCL_DETERMINISTIC'] = '1'
+            if Torch.is_npu_available():
+                os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+                os.environ['HCCL_DETERMINISTIC'] = '1'
 
     @staticmethod
     def to_local_tensor(tensor: 'torch.Tensor') -> 'torch.Tensor':

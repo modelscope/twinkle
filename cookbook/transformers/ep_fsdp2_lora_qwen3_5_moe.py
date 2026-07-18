@@ -5,6 +5,7 @@ Run on 8 GPUs:
     torchrun --nproc-per-node=8 cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py
 """
 from pathlib import Path
+import os
 
 from peft import LoraConfig
 from transformers import AutoConfig
@@ -17,7 +18,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize, npu_builtin
+from twinkle.kernel import kernelize, liger_builtin, npu_builtin
 
 logger = get_logger()
 args = CLI.from_args()
@@ -58,13 +59,19 @@ def train():
     if hasattr(text_config, 'use_cache'):
         text_config.use_cache = False
 
-    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id))
+    # Slice the dataset to the training budget (default 320, matching the other
+    # cookbooks) so encoding the full LongAlpaca set (~12k examples) doesn't
+    # dominate runtime; this is a data-amount knob, not a sharding/batch change.
+    _train_samples = args.training.train_samples or 320
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(_train_samples)))
     try:
         dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
-                             max_length=args.template.max_length)
+                             max_length=args.template.max_length,
+                             truncation_strategy=args.template.truncation_strategy)
     except ValueError:
         dataset.set_template('Qwen3_5Template', model_id=args.model.model_id,
-                             max_length=args.template.max_length)
+                            max_length=args.template.max_length,
+                            truncation_strategy=args.template.truncation_strategy)
     dataset.map(SelfCognitionProcessor(
         args.extra.get('model_name', 'twinkle'),
         args.extra.get('model_author', 'ModelScope'),
@@ -85,9 +92,19 @@ def train():
             }
         },
     )
-    # npu patch
-    if Torch.is_npu_available():
-        model = kernelize(model, npu_builtin(model))
+    # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,
+    # CANN + FLA) | npu+liger (--enable-liger, Liger per-layer on top of CANN).
+    # Sharding/batch are unchanged across modes.
+    _torch_baseline = os.environ.get('TWINKLE_TORCH_BASELINE', '').lower() in ('1', 'true', 'yes')
+    kernel_mapping = {}
+    if Torch.is_npu_available() and not _torch_baseline:
+        kernel_mapping.update(npu_builtin(model))
+    if args.model.enable_liger and not _torch_baseline:
+        kernel_mapping.update(liger_builtin(model))
+    if kernel_mapping:
+        model = kernelize(model, kernel_mapping)
+    _use_fused_ce = args.model.enable_liger and not _torch_baseline and args.model.enable_fused_ce
+    _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
     lora_cfg = _build_lora_config()
     model.add_adapter_to_model(args.lora.adapter_name, lora_cfg,
                                gradient_accumulation_steps=args.training.gradient_accumulation_steps)
@@ -97,6 +114,9 @@ def train():
         num_warmup_steps=args.scheduler.num_warmup_steps,
         num_training_steps=len(dataloader),
     )
+    if _use_fused_ce:
+        model.set_loss('LigerFusedLinearCrossEntropyLoss', adapter_name=args.lora.adapter_name,
+                       reduction='sum')
 
     if args.training.resume_from_checkpoint:
         checkpoint_path = Path(args.training.resume_from_checkpoint).expanduser().resolve()
@@ -116,10 +136,20 @@ def train():
         f'enable_ep={ENABLE_EP}, output_dir={args.training.output_dir}')
 
     optimizer_group = model.optimizer_group[args.lora.adapter_name]
+    if _use_fused_ce:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            _dist.barrier()
+        try:
+            import torch_npu
+            if torch_npu.npu.is_available():
+                torch_npu.npu.synchronize()
+        except ImportError:
+            pass
     for batch in dataloader:
         if callable(batch):
             batch = batch()
-        model.forward_backward(inputs=batch)
+        model.forward_backward(inputs=batch, task=_task)
         model.clip_grad_and_step(max_grad_norm=args.optimizer.max_grad_norm,
                                 gradient_accumulation_steps=args.training.gradient_accumulation_steps)
         cur_step = optimizer_group.cur_step

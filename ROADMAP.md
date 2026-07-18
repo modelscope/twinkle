@@ -55,7 +55,7 @@
 
 - [x] 支持多模态模型
 - [ ] 支持megatron VPP
-- [ ] 支持liger kernel
+- [x] 支持liger kernel
 - [ ] 支持transformers模型的ulysses/ring-attention
 - [ ] 兼容transformers v5的tp、pp
 - [ ] 支持多轮RL
@@ -75,7 +75,7 @@
 
 - [x] Support for multimodal models
 - [ ] Support for Megatron VPP
-- [ ] Support for Liger kernel
+- [x] Support for Liger kernel
 - [ ] Support for Ulysses/Ring-Attention for Transformers models
 - [ ] Compatibility with Transformers v5 TP and PP
 - [ ] Support for multi-turn RL

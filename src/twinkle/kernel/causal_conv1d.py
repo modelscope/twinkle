@@ -1093,10 +1093,21 @@ def npu_causal_conv1d_fn(
     backend: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
 ):
-    """Adapter matching twinkle's ``causal_conv1d_fn`` call signature."""
-    del seq_idx, backend
+    """Adapter for twinkle's ``causal_conv1d_fn`` call signature.
 
-    if x.dim() == 3 and weight.dim() == 2 and x.shape[-1] == weight.shape[0] and x.shape[-1] != weight.shape[-1]:
+    Handles two input layouts: standard Qwen3.5 path passes ``x=[B, D, T]``
+    (needs transpose), SP path passes ``x=[B, T, D]`` (no transpose needed).
+    Detected via ``x.shape[-1] == D and x.shape[1] != D``; when ``T == D``
+    (ambiguous) defaults to transposing (standard path).
+    """
+    del seq_idx, backend
+    D, W = weight.shape[0], weight.shape[1]
+    is_bt_d_layout = (
+        x.dim() == 3 and weight.dim() == 2 and x.shape[-1] == D  # last dim is the channel dim
+        and x.shape[1] != D  # second dim is NOT D -> genuinely [B, T, D]
+        and D != W  # sanity: D != kernel_size
+    )
+    if is_bt_d_layout:
         weight_t = weight.transpose(0, 1).contiguous()
         y_t, _ = causal_conv1d(x=x, weight=weight_t, bias=bias, activation=activation, cu_seqlens=cu_seqlens)
         return y_t
