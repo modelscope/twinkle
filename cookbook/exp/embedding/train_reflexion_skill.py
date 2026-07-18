@@ -274,13 +274,19 @@ def build_skill_solve_prompt(problem: str, skill: str) -> Dict[str, Any]:
 SKILL_GEN_SYSTEM = (
     'You are a math guidance writer. You are given a target problem and an automated '
     'process-check from a related problem. Use it as context to write reusable guidance '
-    'for this and similar problems.\n'
-    'Output only a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
+    'for this and similar problems.\n')
 
 SKILL_GEN_SYSTEM_Q = (
     'You are a math guidance writer. Given the problem below, write reusable guidance '
-    'for this and similar problems, you can recall the diagnosis or check happend before.\n'
-    'Output only a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
+    'for this and similar problems, you need to recall the diagnosis or check happened before.\n')
+
+_SKILL_OUTPUT_DUAL = (
+    'Output non-empty:\n'
+    '<diagnose>Your diagnoses from previous process checking here...</diagnose>\n'
+    '<skill>Your reminds and skills here...</skill> blocks')
+
+_SKILL_OUTPUT_LEGACY = (
+    'Output a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
 
 SKILL_GEN_USER_Q = (
     'Problem:\n{problem}\n\n')
@@ -292,17 +298,22 @@ SKILL_GEN_USER_RUBRIC = (
     '{diagnosis}\n\n')
 
 
+def _skill_output_instruction(diagnose_skill_format: bool) -> str:
+    return _SKILL_OUTPUT_DUAL if diagnose_skill_format else _SKILL_OUTPUT_LEGACY
+
+
 def _skillgen_messages(problem: str, view: str, diagnosis: str,
-                       rubric_problem: str = '') -> List[Dict[str, Any]]:
+                       rubric_problem: str = '', diagnose_skill_format: bool = True) -> List[Dict[str, Any]]:
     """Single source of truth for the skill-gen prompt (used at BOTH generation and
     training so they never diverge). View A with a localisable failure uses the target
     problem plus the rubric source problem and findings; view B -- or a view-A problem
     whose rubric flagged nothing (no ``[FAIL]``) -- degrades to the query-only prompt."""
+    out = _skill_output_instruction(diagnose_skill_format)
     if view == 'B' or '[FAIL]' not in (diagnosis or ''):
-        return [{'role': 'system', 'content': SKILL_GEN_SYSTEM_Q},
+        return [{'role': 'system', 'content': SKILL_GEN_SYSTEM_Q + out},
                 {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=problem)}]
     rubric_problem = rubric_problem or problem
-    return [{'role': 'system', 'content': SKILL_GEN_SYSTEM},
+    return [{'role': 'system', 'content': SKILL_GEN_SYSTEM + out},
             {'role': 'user', 'content': SKILL_GEN_USER_RUBRIC.format(
                 problem=problem, rubric_problem=rubric_problem, diagnosis=diagnosis)}]
 
@@ -312,9 +323,10 @@ def _assign_view(problem: str, args: argparse.Namespace) -> str:
     return 'B' if (h % 100000) / 100000.0 < args.view_b_frac else 'A'
 
 
-def _view_prompt(r: Dict[str, Any]) -> Dict[str, Any]:
+def _view_prompt(r: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     return {'messages': _skillgen_messages(
-        r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''))}
+        r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''),
+        args.diagnose_skill_format)}
 
 
 _SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>')
@@ -324,28 +336,42 @@ def _clean_text(decoded: Optional[str]) -> str:
     return _SPECIAL_TOKEN_RE.sub('', decoded or '').rstrip()
 
 
-def _extract_skills_block(text: str) -> Optional[str]:
-    """Return the non-empty content inside the last ``<skills>...</skills>`` block.
+def _extract_tag_block(answer: str, tag: str) -> Optional[str]:
+    low = answer.lower()
+    open_tag, close_tag = f'<{tag}>', f'</{tag}>'
+    s = low.rfind(open_tag)
+    if s < 0:
+        return None
+    inner = s + len(open_tag)
+    e = low.find(close_tag, inner)
+    if e < 0:
+        return None
+    block = answer[inner:e].strip()
+    block = re.sub(r'</?(?:skills|skill|diagnose|think)>', '', block, flags=re.IGNORECASE).strip()
+    return block or None
 
-    Skill generation may run with thinking either ON or OFF. If a ``</think>`` marker is
-    present, parse only the text after the last marker so drafts inside thinking are ignored;
-    otherwise parse the full response. This keeps the parser compatible with thinking-off
-    skill generation while preserving the old thinking-on safety behavior.
+
+def _extract_skill_blocks(text: str, diagnose_skill_format: bool = True) -> Optional[Dict[str, str]]:
+    """Parse skill-generation output.
+
+    With diagnose-skill format enabled, both ``<diagnose>`` and ``<skill>`` must be
+    present and non-empty; their inner texts are concatenated for executor injection. With
+    the legacy format, a non-empty ``<skills>`` block is enough. If a ``</think>`` marker is
+    present, parse only the text after the last marker; otherwise parse the full response.
     """
     low = text.lower()
     end_think = low.rfind('</think>')
     answer = text[end_think + len('</think>'):] if end_think >= 0 else text
-    low_a = answer.lower()
-    s = low_a.rfind('<skills>')
-    if s < 0:
+    if diagnose_skill_format:
+        diagnose = _extract_tag_block(answer, 'diagnose')
+        skill = _extract_tag_block(answer, 'skill')
+        if not diagnose or not skill:
+            return None
+        return {'diagnose': diagnose, 'skill': skill, 'skills': f'{diagnose}\n\n{skill}'}
+    block = _extract_tag_block(answer, 'skills')
+    if not block:
         return None
-    inner = s + len('<skills>')
-    e = low_a.find('</skills>', inner)
-    if e < 0:
-        return None
-    block = answer[inner:e].strip()
-    block = re.sub(r'</?(?:skills|think)>', '', block, flags=re.IGNORECASE).strip()
-    return block or None
+    return {'diagnose': '', 'skill': block, 'skills': block}
 
 
 def _parse_seq(seq, gold: str) -> Dict[str, Any]:
@@ -1024,13 +1050,13 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
     else:
         diagnose_views(checker, hard, args, rubric_cache)
 
-    # skill-gen (thinking ON), per-view prompt; re-sample problems with no clean candidate.
+    # skill-gen (thinking OFF), per-view prompt; re-sample problems with no clean candidate.
     flat: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     pending = list(hard)
     for _ in range(args.skill_retries + 1):
         if not pending:
             break
-        sg_out = _run_samples(skill_sampler, [_view_prompt(r) for r in pending],
+        sg_out = _run_samples(skill_sampler, [_view_prompt(r, args) for r in pending],
                               args.n_skills, args.skill_max_tokens, skill_dp,
                               temperature=args.skill_gen_temperature,
                               top_p=args.skill_gen_top_p, top_k=args.skill_gen_top_k)
@@ -1039,8 +1065,11 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
             got = False
             for s in seqs:
                 resp = _clean_text(getattr(s, 'decoded', '') or '')
-                block = _extract_skills_block(resp)
-                cand = {'skills': block or '', 'response': resp, 'parseable': bool(block),
+                parsed = _extract_skill_blocks(resp, args.diagnose_skill_format)
+                block = parsed['skills'] if parsed else ''
+                cand = {'skills': block, 'diagnose': (parsed or {}).get('diagnose', ''),
+                        'skill': (parsed or {}).get('skill', ''),
+                        'response': resp, 'parseable': bool(parsed),
                         'view': r['_view'], 'leaked': None, 'leak_reason': '',
                         'leak_source': '', 'with_pass': None, 'reward': None, 'rolls': [],
                         'skillgen_stop': getattr(s, 'stop_reason', None),
@@ -1112,7 +1141,8 @@ def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
         'rubric_src': r.get('_rubric_src', ''), 'neighbor_sim': r.get('_neighbor_sim'),
         'baseline_rolls': [_roll(x) for x in r['_baseline_rolls']],
         'candidates': [{
-            'skills': c['skills'], 'response': c['response'], 'parseable': c['parseable'],
+            'skills': c['skills'], 'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
+            'response': c['response'], 'parseable': c['parseable'],
             'skillgen_stop': c.get('skillgen_stop'), 'skillgen_tokens': c.get('skillgen_tokens'),
             'leaked': c['leaked'], 'leak_reason': c['leak_reason'], 'leak_source': c['leak_source'],
             'with_pass': c['with_pass'], 'reward': c.get('reward'), 'advantage': c.get('advantage'),
@@ -1232,6 +1262,8 @@ def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
                     'view': r.get('_view', 'A'), 'diagnosis': r.get('_rubric_diag', ''),
                     'rubric_src': r.get('_rubric_src', ''),
                     'response': c['response'], 'skills': c['skills'],
+                    'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
+                    'diagnose_skill_format': args.diagnose_skill_format,
                     'skillgen_stop': c.get('skillgen_stop'),
                     'advantage': c['advantage'], 'grpo_adv': c['grpo_adv'], 'kept': c['kept'],
                     'reward': c['reward'], 'with_pass': c['with_pass']})
@@ -1255,7 +1287,8 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     selects the final assistant turn; Template masks the prompt and trains the whole
     response (the key-round prefix already excludes the prompt-provided <think>)."""
     msgs = _skillgen_messages(
-        rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''))
+        rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''),
+        rec.get('diagnose_skill_format', True))
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
             'user_data': {'key_rounds': [len(msgs)]}}
 
@@ -1326,22 +1359,25 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
     baseline_rollout(base_sampler, eval_records, base_dp, args, base_cache)
     for r in eval_records:
         r['_view'], r['_rubric_diag'] = 'B', ''
-    sg_out = _run_samples(skill_sampler, [_view_prompt(r) for r in eval_records],
+    sg_out = _run_samples(skill_sampler, [_view_prompt(r, args) for r in eval_records],
                           1, args.skill_max_tokens, skill_dp, temperature=0.0)
-    skills = [(_extract_skills_block(_clean_text(getattr(seqs[0], 'decoded', '') or '')) or '',
-               _clean_text(getattr(seqs[0], 'decoded', '') or '')) if seqs else ('', '')
+    skills = [((parsed := _extract_skill_blocks(_clean_text(getattr(seqs[0], 'decoded', '') or ''),
+                                                args.diagnose_skill_format))['skills'] if parsed else '',
+               (parsed or {}).get('diagnose', ''), (parsed or {}).get('skill', ''),
+               _clean_text(getattr(seqs[0], 'decoded', '') or '')) if seqs else ('', '', '', '')
               for seqs in sg_out]
     ws_out = _run_samples(base_sampler,
-                          [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _) in zip(eval_records, skills)],
+                          [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _, _, _) in zip(eval_records, skills)],
                           1, args.max_tokens, base_dp, temperature=0.0)
     recs = []
-    for r, (sk, sresp), seqs in zip(eval_records, skills, ws_out):
+    for r, (sk, diag_text, skill_text, sresp), seqs in zip(eval_records, skills, ws_out):
         roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
         recs.append({
             'record_type': 'eval_problem', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
             'problem': r['problem'], 'reference_answer': r['reference_answer'],
             'view': r['_view'], 'rubric_diag': r.get('_rubric_diag', ''),
-            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_parseable': bool(sk),
+            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_diagnose': diag_text,
+            'skill_action': skill_text, 'skill_parseable': bool(sk),
             'skill_response': sresp, 'withskill_pred': roll['pred'],
             'withskill_correct': roll['correct'], 'withskill_terminated': roll['terminated'],
             'withskill_stop_reason': roll['stop_reason'], 'withskill_text': roll['text'],
@@ -1528,6 +1564,9 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--skill-gen-temperature', type=float, default=1.0)
     p.add_argument('--skill-gen-top-p', type=float, default=1.0)
     p.add_argument('--skill-gen-top-k', type=int, default=-1)
+    p.add_argument('--diagnose-skill-format', action=argparse.BooleanOptionalAction, default=True,
+                   help='Require both <diagnose> and <skill> blocks for skill-gen format; '
+                        '--no-diagnose-skill-format falls back to legacy <skills>.')
     p.add_argument('--max-model-len', type=int, default=16384)
     p.add_argument('--max-tokens', type=int, default=8192)
     p.add_argument('--skill-max-tokens', type=int, default=8192)
@@ -1620,6 +1659,7 @@ def main() -> None:
            'numeric_only': args.numeric_only, 'raw_loaded': data_stats['raw_loaded'],
            'numeric_dropped': data_stats['numeric_dropped'], 'eval_every': args.eval_every,
            'n_skills': args.n_skills, 'view_b_frac': args.view_b_frac,
+           'diagnose_skill_format': args.diagnose_skill_format,
            'skill_retries': args.skill_retries, 'balance': args.balance,
            'balance_success_frac': args.balance_success_frac,
            'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct)',
