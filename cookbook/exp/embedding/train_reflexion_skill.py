@@ -1361,11 +1361,17 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
         r['_view'], r['_rubric_diag'] = 'B', ''
     sg_out = _run_samples(skill_sampler, [_view_prompt(r, args) for r in eval_records],
                           1, args.skill_max_tokens, skill_dp, temperature=0.0)
-    skills = [((parsed := _extract_skill_blocks(_clean_text(getattr(seqs[0], 'decoded', '') or ''),
-                                                args.diagnose_skill_format))['skills'] if parsed else '',
-               (parsed or {}).get('diagnose', ''), (parsed or {}).get('skill', ''),
-               _clean_text(getattr(seqs[0], 'decoded', '') or '')) if seqs else ('', '', '', '')
-              for seqs in sg_out]
+    skills = []
+    for seqs in sg_out:
+        if not seqs:
+            skills.append(('', '', '', ''))
+            continue
+        sresp = _clean_text(getattr(seqs[0], 'decoded', '') or '')
+        parsed = _extract_skill_blocks(sresp, args.diagnose_skill_format)
+        skills.append((parsed['skills'] if parsed else '',
+                       (parsed or {}).get('diagnose', ''),
+                       (parsed or {}).get('skill', ''),
+                       sresp))
     ws_out = _run_samples(base_sampler,
                           [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _, _, _) in zip(eval_records, skills)],
                           1, args.max_tokens, base_dp, temperature=0.0)
