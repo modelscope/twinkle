@@ -65,7 +65,7 @@ def train():
     # ``Qwen3_5MoeDecoderLayer``).
     discovered = {type(m).__name__ for m in model.model.modules()
                   if type(m).__name__.endswith('DecoderLayer')}
-    model.model._no_split_modules = discovered or {model.model.config.model_type.title() + 'DecoderLayer'}
+    model.model._no_split_modules = list(discovered) or [model.model.config.model_type.title() + 'DecoderLayer']
     # Compose the kernel mapping: NPU built-ins first, then Liger on top so
     # `--enable-liger` opts into Liger's cross-device Triton/Ascend kernels
     # (later keys win on overlap — see twinkle.kernel Kernel.md).
@@ -145,18 +145,12 @@ def train():
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
             _dist.barrier()
-        try:
+        if Torch.is_npu_available():
             import torch_npu
-            if torch_npu.npu.is_available():
-                torch_npu.npu.synchronize()
-        except ImportError:
-            pass
-        try:
+            torch.npu.synchronize()
+        if Torch.is_gpu_available():
             import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except Exception:
-            pass
+            torch.cuda.synchronize()
         logger.info('[fsdp2] fused-CE: pre-loop barrier+device-sync drain applied')
     for batch in dataloader:
         model.forward_backward(inputs=batch, task=_task)

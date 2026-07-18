@@ -125,7 +125,7 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
                  ignore_index: int = -100,
                  reduction: str = 'sum',
                  label_smoothing: float = 0.0,
-                 softcap: Optional[float] = None,
+                 softcap: float | None = None,
                  **kwargs):
         super().__init__()
         assert reduction in ('mean', 'sum'), f"reduction must be 'mean' or 'sum', got {reduction!r}"
@@ -150,6 +150,8 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         if hasattr(weight, 'full_tensor'):
             weight = weight.full_tensor()
         bias = getattr(lm_head, 'bias', None)
+        if bias is not None and hasattr(bias, 'full_tensor'):
+            bias = bias.full_tensor()
         logits = F.linear(hidden.reshape(-1, hidden.shape[-1]), weight, bias=bias)
         out = dict(outputs)
         out['logits'] = logits.view(*hidden.shape[:-1], -1)

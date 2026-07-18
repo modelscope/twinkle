@@ -140,12 +140,9 @@ def train():
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
             _dist.barrier()
-        try:
+        if Torch.is_npu_available():
             import torch_npu
-            if torch_npu.npu.is_available():
-                torch_npu.npu.synchronize()
-        except ImportError:
-            pass
+            torch.npu.synchronize()
     for batch in dataloader:
         if callable(batch):
             batch = batch()
