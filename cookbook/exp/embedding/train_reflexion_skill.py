@@ -275,23 +275,21 @@ SKILL_GEN_SYSTEM = (
     'You are a math guidance writer. You are given a target problem and an automated '
     'process-check from a related problem. Use it as context to write reusable guidance '
     'for this and similar problems.\n'
-    'Output only a non-empty <skills>...</skills> block.')
+    'Output only a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
 
 SKILL_GEN_SYSTEM_Q = (
     'You are a math guidance writer. Given the problem below, write reusable guidance '
     'for this and similar problems, you can recall the diagnosis or check happend before.\n'
-    'Output only a non-empty <skills>...</skills> block.')
+    'Output only a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
 
 SKILL_GEN_USER_Q = (
-    'Problem:\n{problem}\n\n'
-    '<skills>')
+    'Problem:\n{problem}\n\n')
 
 SKILL_GEN_USER_RUBRIC = (
     'Target problem:\n{problem}\n\n'
     'Problem used for the process check:\n{rubric_problem}\n\n'
     'Process check:\n'
-    '{diagnosis}\n\n'
-    '<skills>')
+    '{diagnosis}\n\n')
 
 
 def _skillgen_messages(problem: str, view: str, diagnosis: str,
@@ -327,18 +325,18 @@ def _clean_text(decoded: Optional[str]) -> str:
 
 
 def _extract_skills_block(text: str) -> Optional[str]:
-    """Non-empty ``<skills>...</skills>`` block, or None. Requires ``</think>`` (skill-gen
-    runs thinking ON); reads only the answer after the last one, so a mid-reasoning draft
-    or a demo echo can never be mistaken for the answer. No format/wording gate beyond
-    that -- the reward (does the frozen executor solve a similar problem with this skill?)
-    is what judges skill quality (SEAM-style), so we do not lexically second-guess it."""
+    """Return the non-empty content inside the last ``<skills>...</skills>`` block.
+
+    Skill generation may run with thinking either ON or OFF. If a ``</think>`` marker is
+    present, parse only the text after the last marker so drafts inside thinking are ignored;
+    otherwise parse the full response. This keeps the parser compatible with thinking-off
+    skill generation while preserving the old thinking-on safety behavior.
+    """
     low = text.lower()
     end_think = low.rfind('</think>')
-    if end_think < 0:
-        return None
-    answer = text[end_think + len('</think>'):]
+    answer = text[end_think + len('</think>'):] if end_think >= 0 else text
     low_a = answer.lower()
-    s = low_a.find('<skills>')
+    s = low_a.rfind('<skills>')
     if s < 0:
         return None
     inner = s + len('<skills>')
@@ -957,8 +955,10 @@ def draw_chunk(pool: ProblemPool, base_sampler, base_dp: int, args: argparse.Nam
 def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> None:
     """Group-relative advantage over each problem's scored candidates using the greedy
     binary reward R in {0,1}: ``A = (R - mean) / (std + eps)``. std==0 groups get no
-    gradient -- GRPO's variance selects informative problems (no explicit difficulty gate)."""
+    gradient -- GRPO's variance selects informative problems (no explicit difficulty gate).
+    A symmetric clip limits both positive and negative outliers from sparse 1-vs-many groups."""
     eps = 1e-6
+    adv_clip = abs(float(getattr(args, 'adv_clip', 0.0) or 0.0))
     for r in hard:
         for c in r['_cands']:
             c['advantage'], c['grpo_adv'], c['kept'] = 0.0, 0.0, False
@@ -971,7 +971,8 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
         if std < 1e-9:
             continue
         for c in cs:
-            adv = (c['reward'] - mean_r) / (std + eps)
+            raw_adv = (c['reward'] - mean_r) / (std + eps)
+            adv = max(-adv_clip, min(adv_clip, raw_adv)) if adv_clip > 0 else raw_adv
             c['advantage'], c['grpo_adv'], c['kept'] = adv, adv, c['reward'] > mean_r
 
 
@@ -1485,18 +1486,18 @@ def init_components(args: argparse.Namespace):
     ref_model.set_processor(InputProcessor, padding_free=False)
     ref_model.set_loss('GRPOLoss', epsilon=args.grpo_epsilon)
 
-    def _sampler(group, world):
+    def _sampler(group, world, enable_thinking: bool = True):
         s = vLLMSampler(model_id=MODEL_ID,
                         engine_args={'gpu_memory_utilization': GPU_MEM,
                                      'max_model_len': args.max_model_len, 'tensor_parallel_size': 1},
                         device_mesh=DeviceMesh.from_sizes(world_size=world, dp_size=world),
                         remote_group=group)
-        s.set_template(Template, model_id=MODEL_ID, enable_thinking=True, max_length=args.max_model_len)
+        s.set_template(Template, model_id=MODEL_ID, enable_thinking=enable_thinking, max_length=args.max_model_len)
         return s
 
-    skill_sampler = _sampler('skill_sampler', SKILL_SAMPLER_GPUS)
+    skill_sampler = _sampler('skill_sampler', SKILL_SAMPLER_GPUS, enable_thinking=False)
     # base_sampler is shared by the main thread and the baseline-prefetch thread -> serialise.
-    base_sampler = _LockedSampler(_sampler('base_sampler', BASE_SAMPLER_GPUS))
+    base_sampler = _LockedSampler(_sampler('base_sampler', BASE_SAMPLER_GPUS, enable_thinking=True))
     ckpt = CheckpointEngineManager(model=skill_model, sampler=skill_sampler)
     return skill_model, ref_model, skill_sampler, base_sampler, ckpt, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS
 
@@ -1543,6 +1544,8 @@ def _build_args() -> argparse.Namespace:
                         'old_logps are frozen so the PPO ratio/clip stays valid. Rounded down to '
                         'a multiple of --sft-batch-size.')
     p.add_argument('--grpo-epsilon', type=float, default=0.2)
+    p.add_argument('--adv-clip', type=float, default=3.0,
+                   help='Symmetric clip for group-relative advantages; <=0 disables clipping.')
     p.add_argument('--kl-beta', type=float, default=0.001,
                    help='SEAM-style reference KL coefficient for GRPOLoss.')
     p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
@@ -1550,7 +1553,7 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--max-train-rounds', type=int, default=1500)
     p.add_argument('--save-rounds', type=int, default=200)
     p.add_argument('--trend-every', type=int, default=10)
-    p.add_argument('--output-dir', default='./output/reflexion_skill_rft')
+    p.add_argument('--output-dir', default='./output/reflexion_skill')
     p.add_argument('--cache-dir', default='', help='Baseline/rubric cache dir (default <output-dir>/cache).')
     p.add_argument('--no-cache', action='store_true', help='Disable disk cache read/write.')
     p.add_argument('--prefetch-baseline', action=argparse.BooleanOptionalAction, default=True,
@@ -1623,6 +1626,7 @@ def main() -> None:
            'advantage': 'group_relative', 'format_in_reward': args.format_in_reward, 'cache': use_cache,
            'rubric_check': 'fixed_math_5crit(viewA)' if checker else 'disabled',
            'xproblem_rubric': args.xproblem_rubric,
+           'adv_clip': args.adv_clip,
            'grpo_epsilon': args.grpo_epsilon, 'kl_beta': args.kl_beta, 'lr': args.lr,
            'train_gpus': TRAIN_GPUS, 'ref_gpus': REF_GPUS, 'ref_fsdp': REF_FSDP,
            'train_fsdp': TRAIN_FSDP, 'train_dp': TRAIN_DP,
