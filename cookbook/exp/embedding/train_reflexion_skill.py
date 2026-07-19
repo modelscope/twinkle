@@ -9,7 +9,7 @@ Reward is deterministic (T=0, M=1) binary correctness; A = (R - mean) / (std + e
 within each problem-group, so std=0 groups give no gradient (GRPO variance selects).
 
 Each problem is routed to EXACTLY ONE view: A = problem + rubric findings, B =
-query only (deployment form). Skill-gen trains only the final <skills> turn.
+query only (deployment form). Skill-gen trains only the final structured guidance turn.
 
 Base greedy rollouts and rubric diagnoses are cached to disk (jsonl, md5-keyed) so
 restarts skip them; skill-gen is on-policy and never cached.
@@ -274,16 +274,18 @@ def build_skill_solve_prompt(problem: str, skill: str) -> Dict[str, Any]:
 SKILL_GEN_SYSTEM = (
     'You are a math guidance writer. You are given a target problem and an automated '
     'process-check from a related problem. Use it as context to write reusable guidance '
-    'for this and similar problems.\n')
+    'for this and similar problems. In <pitfall>, write likely mistakes or checks only. '
+    'Leave empty if unclear. In <strategy>, write reusable solving advice.\n')
 
 SKILL_GEN_SYSTEM_Q = (
     'You are a math guidance writer. Given the problem below, write reusable guidance '
-    'for this and similar problems, you need to recall the diagnosis or check happened before.\n')
+    'for this and similar problems. In <pitfall>, write likely mistakes or checks only. '
+    'Leave empty if unclear. In <strategy>, write reusable solving advice.\n')
 
 _SKILL_OUTPUT_DUAL = (
-    'Output non-empty:\n'
-    '<diagnose>Your diagnoses from previous process checking here...</diagnose>\n'
-    '<skill>Your reminds and skills here...</skill> blocks')
+    'Output:\n'
+    '<pitfall>Your likely mistakes or checks here</pitfall>\n'
+    '<strategy>Your reusable solving advice here...</strategy>')
 
 _SKILL_OUTPUT_LEGACY = (
     'Output a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
@@ -336,7 +338,7 @@ def _clean_text(decoded: Optional[str]) -> str:
     return _SPECIAL_TOKEN_RE.sub('', decoded or '').rstrip()
 
 
-def _extract_tag_block(answer: str, tag: str) -> Optional[str]:
+def _extract_tag_block(answer: str, tag: str, allow_empty: bool = False) -> Optional[str]:
     low = answer.lower()
     open_tag, close_tag = f'<{tag}>', f'</{tag}>'
     s = low.rfind(open_tag)
@@ -347,31 +349,40 @@ def _extract_tag_block(answer: str, tag: str) -> Optional[str]:
     if e < 0:
         return None
     block = answer[inner:e].strip()
-    block = re.sub(r'</?(?:skills|skill|diagnose|think)>', '', block, flags=re.IGNORECASE).strip()
-    return block or None
+    block = re.sub(r'</?(?:skills|skill|diagnose|pitfall|strategy|think)>', '', block, flags=re.IGNORECASE).strip()
+    return block if (block or allow_empty) else None
+
+
+def _join_pitfall_strategy(pitfall: str, strategy: str) -> str:
+    pitfall = (pitfall or '').strip()
+    strategy = (strategy or '').strip()
+    return strategy if not pitfall else f'{pitfall}\n\n{strategy}'
 
 
 def _extract_skill_blocks(text: str, diagnose_skill_format: bool = True) -> Optional[Dict[str, str]]:
     """Parse skill-generation output.
 
-    With diagnose-skill format enabled, both ``<diagnose>`` and ``<skill>`` must be
-    present and non-empty; their inner texts are concatenated for executor injection. With
-    the legacy format, a non-empty ``<skills>`` block is enough. If a ``</think>`` marker is
-    present, parse only the text after the last marker; otherwise parse the full response.
+    With the pitfall-strategy format enabled, both ``<pitfall>`` and ``<strategy>`` tags
+    must be present, while ``<pitfall>`` may be empty; their inner texts are concatenated
+    for executor injection. With the legacy format, a non-empty ``<skills>`` block is
+    enough. If a ``</think>`` marker is present, parse only the text after the last marker;
+    otherwise parse the full response.
     """
     low = text.lower()
     end_think = low.rfind('</think>')
     answer = text[end_think + len('</think>'):] if end_think >= 0 else text
     if diagnose_skill_format:
-        diagnose = _extract_tag_block(answer, 'diagnose')
-        skill = _extract_tag_block(answer, 'skill')
-        if not diagnose or not skill:
+        pitfall = _extract_tag_block(answer, 'pitfall', allow_empty=True)
+        strategy = _extract_tag_block(answer, 'strategy')
+        if pitfall is None or not strategy:
             return None
-        return {'diagnose': diagnose, 'skill': skill, 'skills': f'{diagnose}\n\n{skill}'}
+        joined = _join_pitfall_strategy(pitfall, strategy)
+        return {'pitfall': pitfall, 'strategy': strategy,
+                'diagnose': pitfall, 'skill': strategy, 'skills': joined}
     block = _extract_tag_block(answer, 'skills')
     if not block:
         return None
-    return {'diagnose': '', 'skill': block, 'skills': block}
+    return {'pitfall': '', 'strategy': block, 'diagnose': '', 'skill': block, 'skills': block}
 
 
 def _parse_seq(seq, gold: str) -> Dict[str, Any]:
@@ -746,11 +757,15 @@ def _empty_roll() -> Dict[str, Any]:
             'stop_reason': 'empty', 'gen_tokens': 0, 'text': ''}
 
 
+def _roll_passed(roll: Dict[str, Any]) -> bool:
+    return bool(roll.get('passed', bool(roll.get('correct') and roll.get('terminated'))))
+
+
 def _apply_baseline(r: Dict[str, Any], roll: Dict[str, Any]) -> None:
     """Attach a greedy baseline roll and reset per-chunk working state."""
     r['_baseline_rolls'], r['_cands'], r['_init'] = [roll], [], [roll]
-    r['_failed'] = not roll['correct']
-    r['_baseline_pass'] = 1.0 if roll['correct'] else 0.0
+    r['_failed'] = not _roll_passed(roll)
+    r['_baseline_pass'] = 1.0 if _roll_passed(roll) else 0.0
     r['_hard'] = True  # process every problem; group variance selects (SEAM-style)
 
 
@@ -914,7 +929,7 @@ def diagnose_views(checker, problems: List[Dict[str, Any]], args: argparse.Names
 def _baseline_class(r: Dict[str, Any]) -> str:
     """success | fail_loop (out of length / never terminated) | fail_wrong."""
     roll = r['_init'][0]
-    if roll['correct']:
+    if _roll_passed(roll):
         return 'success'
     return 'fail_loop' if (roll['stop_reason'] == 'length' or not roll['terminated']) else 'fail_wrong'
 
@@ -1067,7 +1082,9 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                 resp = _clean_text(getattr(s, 'decoded', '') or '')
                 parsed = _extract_skill_blocks(resp, args.diagnose_skill_format)
                 block = parsed['skills'] if parsed else ''
-                cand = {'skills': block, 'diagnose': (parsed or {}).get('diagnose', ''),
+                cand = {'skills': block, 'pitfall': (parsed or {}).get('pitfall', ''),
+                        'strategy': (parsed or {}).get('strategy', ''),
+                        'diagnose': (parsed or {}).get('diagnose', ''),
                         'skill': (parsed or {}).get('skill', ''),
                         'response': resp, 'parseable': bool(parsed),
                         'view': r['_view'], 'leaked': None, 'leak_reason': '',
@@ -1091,7 +1108,7 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
         c['leak_reason'] = 'answer_verbatim' if leaked else ''
         c['leak_source'] = 'deterministic'
 
-    # with-skill greedy pass (T=0, M=1); reward = correct, absolute (group mean is baseline).
+    # with-skill greedy pass (T=0, M=1); reward = correct and terminated, absolute (group mean is baseline).
     scored_inputs = flat
     if scored_inputs:
         ws_out = _run_samples(base_sampler,
@@ -1099,7 +1116,7 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                               1, args.max_tokens, base_dp, temperature=0.0)
         for (r, c), seqs in zip(scored_inputs, ws_out):
             c['rolls'] = [_parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()]
-            c['with_pass'] = 1.0 if c['rolls'][0]['correct'] else 0.0
+            c['with_pass'] = 1.0 if _roll_passed(c['rolls'][0]) else 0.0
             c['reward'] = c['with_pass']
     if args.format_in_reward:  # unparseable candidates score 0 and still join the group
         for r in hard:
@@ -1141,7 +1158,8 @@ def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
         'rubric_src': r.get('_rubric_src', ''), 'neighbor_sim': r.get('_neighbor_sim'),
         'baseline_rolls': [_roll(x) for x in r['_baseline_rolls']],
         'candidates': [{
-            'skills': c['skills'], 'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
+            'skills': c['skills'], 'pitfall': c.get('pitfall', ''), 'strategy': c.get('strategy', ''),
+            'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
             'response': c['response'], 'parseable': c['parseable'],
             'skillgen_stop': c.get('skillgen_stop'), 'skillgen_tokens': c.get('skillgen_tokens'),
             'leaked': c['leaked'], 'leak_reason': c['leak_reason'], 'leak_source': c['leak_source'],
@@ -1262,6 +1280,7 @@ def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
                     'view': r.get('_view', 'A'), 'diagnosis': r.get('_rubric_diag', ''),
                     'rubric_src': r.get('_rubric_src', ''),
                     'response': c['response'], 'skills': c['skills'],
+                    'pitfall': c.get('pitfall', ''), 'strategy': c.get('strategy', ''),
                     'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
                     'diagnose_skill_format': args.diagnose_skill_format,
                     'skillgen_stop': c.get('skillgen_stop'),
@@ -1283,7 +1302,7 @@ def _is_num(v: Any) -> bool:
 
 def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     """Training sample = the exact skill-gen prompt (rebuilt by ``_skillgen_messages`` so
-    train/inference match) + the generated (think + skills) response. ``key_rounds``
+    train/inference match) + the generated structured guidance response. ``key_rounds``
     selects the final assistant turn; Template masks the prompt and trains the whole
     response (the key-round prefix already excludes the prompt-provided <think>)."""
     msgs = _skillgen_messages(
@@ -1355,7 +1374,7 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
     """SEAM ``val-core/math/acc/mean@1`` on the fixed holdout: ONE greedy skill (T=0) per
     problem into ONE greedy base solve (T=0). Eval ALWAYS uses view B (query-only, the
     deployment form: no rubric, since rubric needs an online teacher unavailable at deploy);
-    no leak filter (acc scores correctness alone). Baseline reuses the disk cache."""
+    no leak filter. Main acc requires both correctness and normal termination. Baseline reuses the disk cache."""
     baseline_rollout(base_sampler, eval_records, base_dp, args, base_cache)
     for r in eval_records:
         r['_view'], r['_rubric_diag'] = 'B', ''
@@ -1369,37 +1388,40 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
         sresp = _clean_text(getattr(seqs[0], 'decoded', '') or '')
         parsed = _extract_skill_blocks(sresp, args.diagnose_skill_format)
         skills.append((parsed['skills'] if parsed else '',
-                       (parsed or {}).get('diagnose', ''),
-                       (parsed or {}).get('skill', ''),
+                       (parsed or {}).get('pitfall', ''),
+                       (parsed or {}).get('strategy', ''),
                        sresp))
     ws_out = _run_samples(base_sampler,
                           [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _, _, _) in zip(eval_records, skills)],
                           1, args.max_tokens, base_dp, temperature=0.0)
     recs = []
-    for r, (sk, diag_text, skill_text, sresp), seqs in zip(eval_records, skills, ws_out):
+    for r, (sk, pitfall_text, strategy_text, sresp), seqs in zip(eval_records, skills, ws_out):
         roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
         recs.append({
             'record_type': 'eval_problem', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
             'problem': r['problem'], 'reference_answer': r['reference_answer'],
             'view': r['_view'], 'rubric_diag': r.get('_rubric_diag', ''),
-            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_diagnose': diag_text,
-            'skill_action': skill_text, 'skill_parseable': bool(sk),
+            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_pitfall': pitfall_text,
+            'skill_strategy': strategy_text, 'skill_diagnose': pitfall_text,
+            'skill_action': strategy_text, 'skill_parseable': bool(sk),
             'skill_response': sresp, 'withskill_pred': roll['pred'],
             'withskill_correct': roll['correct'], 'withskill_terminated': roll['terminated'],
+            'withskill_pass': _roll_passed(roll),
             'withskill_stop_reason': roll['stop_reason'], 'withskill_text': roll['text'],
         })
-    acc = lambda rs: sum(1 for x in rs if x['withskill_correct']) / len(rs) if rs else 0.0
+    acc = lambda rs: sum(1 for x in rs if x['withskill_pass']) / len(rs) if rs else 0.0
     ws = acc(recs)  # all view B (deployment form)
     base = sum(x['baseline_pass'] for x in recs) / len(recs) if recs else 0.0
+    correct = (sum(1 for x in recs if x['withskill_correct']) / len(recs)) if recs else 0.0
     fmt = (sum(1 for x in recs if x['skill_parseable']) / len(recs)) if recs else 0.0
     term = (sum(1 for x in recs if x['withskill_terminated']) / len(recs)) if recs else 0.0
     summary = {'record_type': 'eval_summary', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
                'n': len(recs), 'view': 'B', 'acc_mean1': ws,
                'baseline_acc_mean1': base, 'lift_mean1': ws - base,
-               'format_mean1': fmt, 'term_mean1': term}
+               'correct_mean1': correct, 'format_mean1': fmt, 'term_mean1': term}
     metrics = {'core/math/acc/mean@1': ws, 'core/math/baseline_acc/mean@1': base,
-               'core/math/lift/mean@1': ws - base, 'core/math/format/mean@1': fmt,
-               'core/math/term/mean@1': term}
+               'core/math/lift/mean@1': ws - base, 'core/math/correct/mean@1': correct,
+               'core/math/format/mean@1': fmt, 'core/math/term/mean@1': term}
     return recs, summary, metrics
 
 
@@ -1571,7 +1593,7 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--skill-gen-top-p', type=float, default=1.0)
     p.add_argument('--skill-gen-top-k', type=int, default=-1)
     p.add_argument('--diagnose-skill-format', action=argparse.BooleanOptionalAction, default=True,
-                   help='Require both <diagnose> and <skill> blocks for skill-gen format; '
+                   help='Require <pitfall> and <strategy> blocks for skill-gen format; '
                         '--no-diagnose-skill-format falls back to legacy <skills>.')
     p.add_argument('--max-model-len', type=int, default=16384)
     p.add_argument('--max-tokens', type=int, default=8192)
@@ -1668,7 +1690,7 @@ def main() -> None:
            'diagnose_skill_format': args.diagnose_skill_format,
            'skill_retries': args.skill_retries, 'balance': args.balance,
            'balance_success_frac': args.balance_success_frac,
-           'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct)',
+           'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct_and_terminated)',
            'advantage': 'group_relative', 'format_in_reward': args.format_in_reward, 'cache': use_cache,
            'rubric_check': 'fixed_math_5crit(viewA)' if checker else 'disabled',
            'xproblem_rubric': args.xproblem_rubric,
