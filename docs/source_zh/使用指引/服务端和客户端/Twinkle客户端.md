@@ -202,3 +202,97 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 ```
 
 其余数据处理、训练循环、检查点保存等代码完全相同。
+
+## 可训练多轮 Rollout（ClientMultiTurnRollout）
+
+前面的示例都是单轮训练。如果你要做**带工具调用的多轮 agentic RL**（如 GRPO），并且需要产出可直接用于训练的 token 级对齐信息，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它在客户端侧驱动 “采样 → 调用工具 → 拼接上下文 → 再采样” 的多轮循环，每轮采样走 HTTP（`/twinkle/sample`），每条 trajectory 产出带 `logprobs` 的可训练结果，可直接用于 GRPO 等 RL 训练。
+
+### 依赖与约束
+
+- **本地 Template**：bridge token 拼接（渲染工具轮 + 下一轮生成提示）需要在客户端本地持有一个 `Template` 实例。
+- **vLLMSampler**：指向服务端 Sampler 服务的客户端采样器。
+- **ToolManager**（可选）：注册你的工具；若某条 trajectory 产生了 tool_calls 但未提供 tool_manager，会在派发时抛 `ValueError`。
+- **`num_samples=1`**：当前每条 trajectory 只采样一次。做 GRPO group 时，把同一个 prompt 复制成 `NUM_GENERATIONS` 条独立 trajectory 即可。
+
+### 最小示例
+
+```python
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.advantage import GRPOAdvantage
+from twinkle.data_format import SamplingParams
+from twinkle.template import Qwen3_5Template
+from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.rollout import ClientMultiTurnRollout
+from twinkle_client.sampler import vLLMSampler
+
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+NUM_GENERATIONS = 2   # GRPO group size（rollout 每条采样 num_samples=1）
+
+init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+
+# 训练模型（GRPO）
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
+model.set_loss('GRPOLoss', epsilon=0.2)
+model.set_optimizer('Adam', lr=1e-5)
+model.set_processor('InputProcessor')
+model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+
+# 客户端采样器（HTTP）
+sampler = vLLMSampler(model_id=MODEL_ID)
+sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+
+# 多轮 rollout：需要本地 Template（bridge 拼接）与 ToolManager
+rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
+rollout_template.truncation_strategy = 'delete'
+tool_manager = ToolManager([MyCalculatorTool()])   # 你的工具
+
+rollout = ClientMultiTurnRollout(
+    sampler=sampler,
+    template=rollout_template,
+    tool_manager=tool_manager,
+    sampling_params=SamplingParams(max_tokens=512, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
+    max_turns=4,
+)
+advantage_fn = GRPOAdvantage()
+
+for step in range(3):
+    # 1. 批量多轮 rollout：每个 prompt 复制成 NUM_GENERATIONS 条 trajectory
+    trajectories = build_trajectories(tool_manager.tool_infos())  # 见 cookbook
+    rolled = rollout(trajectories, tool_manager=tool_manager)
+
+    # 2. 读回 token 级 logprobs（top-1）与 reward
+    all_inputs, all_old_logps = [], []
+    for traj in rolled:
+        all_old_logps.append([lp[0][1] for lp in (traj.get('logprobs') or [])])
+        all_inputs.append(traj)
+    rewards = compute_rewards(rolled)   # 见 cookbook
+
+    # 3. GRPO 优势（组内相对）
+    advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+
+    # 4. 策略更新
+    model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
+    model.clip_grad_and_step()
+```
+
+### 输出字段
+
+每条返回的 trajectory 在原 dict 基础上追加以下顶层字段：
+
+| 字段 | 含义 |
+|:----|:-----|
+| `messages` | 完整多轮对话（含 assistant 的 tool_calls 与 tool 响应轮） |
+| `logprobs` | 各可训练 token 的 top-1 logprob；本轮未采样 logprobs 时为 `None` |
+| `turns` | 实际经历的轮数（`<= max_turns`） |
+| `stop_reason` | `'stop'` / `'length'` / `'max_turns'` 之一 |
+| `truncated` | 是否因 `max_turns` 或长度上限被截断 |
+
+### 常见错误
+
+- 某条 trajectory 触发了工具调用，但没有提供 `tool_manager` → 抛 `ValueError`。构造时或按调用传入 `tool_manager` 即可。
+- 采样器的网络 / 超时错误会**原样抛出**（不被吞掉），重试、退避请在你的循环外层处理。
+
+完整可运行示例见 `cookbook/client/twinkle/self_host/multi_turn_rollout.py`。

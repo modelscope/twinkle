@@ -202,3 +202,97 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 ```
 
 The rest of the data processing, training loop, checkpoint saving, and other code remains exactly the same.
+
+## Trainable Multi-turn Rollout (ClientMultiTurnRollout)
+
+The examples above are all single-turn training. If you want to do **multi-turn agentic RL with tool use** (e.g. GRPO) and need training-ready token-level alignment info, use `twinkle_client.rollout.ClientMultiTurnRollout`. It drives the "sample → call tool → stitch context → sample again" multi-turn loop on the client side, samples over HTTP each round (`/twinkle/sample`), and produces a trainable result with `logprobs` per trajectory that can be fed directly into GRPO and other RL training.
+
+### Dependencies and Constraints
+
+- **Local Template**: bridge-token stitching (rendering tool turns + the next generation prompt) requires a local `Template` instance on the client.
+- **vLLMSampler**: the client sampler pointing at the server's Sampler service.
+- **ToolManager** (optional): register your tools; if a trajectory produces tool_calls but no tool_manager is provided, a `ValueError` is raised at dispatch.
+- **`num_samples=1`**: each trajectory is sampled once. For a GRPO group, replicate the same prompt into `NUM_GENERATIONS` independent trajectories.
+
+### Minimal Example
+
+```python
+from peft import LoraConfig
+from twinkle import init_twinkle_client
+from twinkle.advantage import GRPOAdvantage
+from twinkle.data_format import SamplingParams
+from twinkle.template import Qwen3_5Template
+from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.rollout import ClientMultiTurnRollout
+from twinkle_client.sampler import vLLMSampler
+
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+NUM_GENERATIONS = 2   # GRPO group size (rollout samples num_samples=1 per trajectory)
+
+init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+
+# Training model (GRPO)
+model = MultiLoraTransformersModel(model_id=MODEL_ID)
+model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
+model.set_loss('GRPOLoss', epsilon=0.2)
+model.set_optimizer('Adam', lr=1e-5)
+model.set_processor('InputProcessor')
+model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+
+# Client sampler (HTTP)
+sampler = vLLMSampler(model_id=MODEL_ID)
+sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+
+# Multi-turn rollout: needs a local Template (bridge stitching) and a ToolManager
+rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
+rollout_template.truncation_strategy = 'delete'
+tool_manager = ToolManager([MyCalculatorTool()])   # your tools
+
+rollout = ClientMultiTurnRollout(
+    sampler=sampler,
+    template=rollout_template,
+    tool_manager=tool_manager,
+    sampling_params=SamplingParams(max_tokens=512, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
+    max_turns=4,
+)
+advantage_fn = GRPOAdvantage()
+
+for step in range(3):
+    # 1. Batched multi-turn rollout: replicate each prompt into NUM_GENERATIONS trajectories
+    trajectories = build_trajectories(tool_manager.tool_infos())  # see cookbook
+    rolled = rollout(trajectories, tool_manager=tool_manager)
+
+    # 2. Read back token-level logprobs (top-1) and rewards
+    all_inputs, all_old_logps = [], []
+    for traj in rolled:
+        all_old_logps.append([lp[0][1] for lp in (traj.get('logprobs') or [])])
+        all_inputs.append(traj)
+    rewards = compute_rewards(rolled)   # see cookbook
+
+    # 3. GRPO advantages (group-relative)
+    advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+
+    # 4. Policy update
+    model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
+    model.clip_grad_and_step()
+```
+
+### Output Fields
+
+Each returned trajectory has the following top-level fields appended to the original dict:
+
+| Field | Meaning |
+|:------|:--------|
+| `messages` | Full multi-turn conversation (including assistant tool_calls and tool-response turns) |
+| `logprobs` | Top-1 logprob per trainable token; `None` if the round sampled no logprobs |
+| `turns` | Number of turns actually taken (`<= max_turns`) |
+| `stop_reason` | One of `'stop'` / `'length'` / `'max_turns'` |
+| `truncated` | Whether truncated due to `max_turns` or the length cap |
+
+### Common Errors
+
+- A trajectory triggered a tool call but no `tool_manager` was provided → raises `ValueError`. Pass `tool_manager` at construction or per call.
+- The sampler's network / timeout errors are **raised as-is** (not swallowed); handle retry/backoff outside your loop.
+
+See `cookbook/client/twinkle/self_host/multi_turn_rollout.py` for a full runnable example.

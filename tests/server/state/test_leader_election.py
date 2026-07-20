@@ -1,6 +1,6 @@
 """Tests for the cleanup-leader election loop and metrics gauge in ``ServerState``.
 
-Validates:
+Covers:
 - exactly one ``ServerState`` instance over the same backend becomes leader;
 - the cleanup task is gated on leadership (non-leaders never call cleanup);
 - when the leader stops, another instance can take over;

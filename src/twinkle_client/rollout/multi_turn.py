@@ -192,8 +192,8 @@ class ClientMultiTurnRollout:
                     continue
 
                 # 3c. Hit the turn cap while still wanting to call a tool: force
-                #     truncation. Also covers the ``max_turns == 1`` edge (task
-                #     8.3), where the very first sampled turn trips this branch.
+                #     truncation. Also covers the ``max_turns == 1`` edge, where
+                #     the very first sampled turn trips this branch.
                 if turns[global_idx] >= self.max_turns:
                     truncated[global_idx] = True
                     stop_reasons[global_idx] = 'max_turns'

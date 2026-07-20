@@ -108,7 +108,7 @@ for step, batch in enumerate(dataloader):
 
 ## 通过 Twinkle Client 训练
 
-除了直接使用裸库 `TransformersModel`，你也可以通过 `twinkle_client` 的 `MultiLoraTransformersModel` 以 HTTP 方式驱动服务端完成 Embedding 训练。协议层（`/twinkle/*`）已经具备完成 Embedding 训练所需的全部能力，**无需引入任何新的高层封装函数**（例如 `setup_embedding_training`），只需按正确顺序调用现有方法即可。
+除了直接使用裸库 `TransformersModel`，你也可以通过 `twinkle_client` 的 `MultiLoraTransformersModel` 以 HTTP 方式驱动服务端完成 Embedding 训练。用法与裸库一致，只需按正确顺序调用现有方法。
 
 ### 完整调用顺序
 
@@ -156,19 +156,9 @@ for step, mb in enumerate(minibatches):
 metric = model.calculate_metric(is_training=True)
 ```
 
-### 关于 `TransformersEmbeddingPatch` 的自动应用
+**无需手动 apply_patch。** 只要在 `forward_backward`（或 `forward_only`）中传入 `task='embedding'`，服务端就会在这一次 `forward` 期间自动切换到 embedding 模式、并在结束后自动回滚——你**不需要**显式调用 `apply_patch(...)`。因此同一个 adapter 在 `forward_backward(task='embedding')` 之后，再调用不带 `task` 的 `forward_only` 仍会返回正常的词表维度 `logits`，互不影响。
 
-Embedding 训练依赖 `TransformersEmbeddingPatch` 把 causal LM 的 `lm_head` 替换为 identity 输出，从而得到 per-token hidden states 用于池化。**你不需要显式调用 `apply_patch(TransformersEmbeddingPatch())`**：当你在 `forward_backward`（或 `forward_only`）中传入 `task='embedding'` 时，服务端的 `_resolve_task_context` 会在该次 `forward` 调用期间自动应用该 patch，并在调用结束后自动回滚。
-
-这意味着：
-
-- 同一个 adapter 在一次 `forward_backward(task='embedding')` 之后，紧接着调用不带 `task` 参数的 `forward_only` 仍会返回正常的词表维度 `logits`，不会残留上一次 embedding 任务的 identity hidden states。
-- 你在 client 侧真正需要显式调用的前置步骤只有三个：`set_processor('InputProcessor')`、`set_loss('InfonceLoss', ...)` 与 `add_metric('EmbeddingMetric', is_training=True)`。
-
-### 说明
-
-- 本节不引入任何新的高层封装函数，仅说明现有 `MultiLoraTransformersModel` 方法的正确调用顺序。
-- 各参数（`temperature`、`use_batch`、`hard_negatives` 等）的含义与取值建议参见上文「关键参数」；`calculate_metric` 返回的指标含义参见下文「监控指标」。
+client 侧真正需要显式配置的只有三步：`set_processor('InputProcessor')`、`set_loss('InfonceLoss', ...)`、`add_metric('EmbeddingMetric', is_training=True)`；各参数含义与取值建议见上文「关键参数」，返回指标见下文「监控指标」。
 
 ---
 

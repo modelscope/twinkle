@@ -486,10 +486,7 @@ class _NetworkFailingSampler:
 
 
 def test_missing_new_input_feature_raises_indexed_runtime_error():
-    """new_input_feature=None -> RuntimeError naming batch AND trajectory index.
-
-    _Requirements: 3.7_
-    """
+    """new_input_feature=None -> RuntimeError naming batch AND trajectory index."""
     trajectories, _script_sampler, template = _build_from_scripts(
         [{'num_tools': 0, 'terminal': 'stop', 'logprobs': False}])
     sampler = _NullFeatureSampler(template)
@@ -508,10 +505,7 @@ def test_missing_new_input_feature_raises_indexed_runtime_error():
 
 
 def test_tool_calls_without_tool_manager_raises_value_error():
-    """tool_calls produced but tool_manager missing -> ValueError.
-
-    _Requirements: 3.10, 4.5_
-    """
+    """tool_calls produced but tool_manager missing -> ValueError."""
     # One tool-call turn then a terminal turn; max_turns=2 so the tool-dispatch
     # site (not the max_turns truncation edge) is what fails.
     trajectories, sampler, template = _build_from_scripts(
@@ -528,10 +522,7 @@ def test_tool_calls_without_tool_manager_raises_value_error():
 
 
 def test_tool_calls_without_tool_manager_via_per_call_kwarg_raises_value_error():
-    """Passing tool_manager=None as a per-call kwarg also raises at dispatch.
-
-    _Requirements: 3.10, 4.5_
-    """
+    """Passing tool_manager=None as a per-call kwarg also raises at dispatch."""
     trajectories, sampler, template = _build_from_scripts(
         [{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
     # Constructed WITH a manager, but the per-call override nulls it out.
@@ -543,10 +534,7 @@ def test_tool_calls_without_tool_manager_via_per_call_kwarg_raises_value_error()
 
 
 def test_sampler_network_error_propagates_unchanged():
-    """vLLMSampler.sample() network error propagates unchanged (not swallowed/wrapped).
-
-    _Requirements: 3.9_
-    """
+    """vLLMSampler.sample() network error propagates unchanged (not swallowed/wrapped)."""
     trajectories, _script_sampler, template = _build_from_scripts(
         [{'num_tools': 0, 'terminal': 'stop', 'logprobs': False}])
     sentinel = NetworkError('simulated connection reset by peer')
@@ -564,10 +552,7 @@ def test_sampler_network_error_propagates_unchanged():
 
 
 def test_dependencies_are_reused_not_reimplemented():
-    """ClientMultiTurnRollout imports (does not copy) ToolManager & extend_with_bridge.
-
-    _Requirements: 4.3, 4.4, 7.1_
-    """
+    """ClientMultiTurnRollout imports (does not copy) ToolManager & extend_with_bridge."""
     import twinkle_agentic.rollout.bridge as bridge_mod
     import twinkle_agentic.tools.tool_manager as tool_manager_mod
     import twinkle_client.rollout.multi_turn as m
