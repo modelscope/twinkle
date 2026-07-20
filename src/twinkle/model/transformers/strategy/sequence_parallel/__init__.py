@@ -1006,8 +1006,8 @@ class SequenceParallelStrategy:
         # gather below. The hidden tensor ([B, T_local, H]) is tiny vs logits,
         # and the fused loss still chunks the GEMM internally, so the memory
         # win is preserved.
-        if (logps is None and labels is not None and 'lm_head' in outputs
-                and torch.is_tensor(outputs.get('logits')) and outputs['logits'].dim() >= 2):
+        if (logps is None and labels is not None and 'lm_head' in outputs and torch.is_tensor(outputs.get('logits'))
+                and outputs['logits'].dim() >= 2):
             hidden = outputs['logits']
             inputs = copy(inputs)
             outputs = copy(outputs)
