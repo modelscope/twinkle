@@ -15,13 +15,13 @@ It exposes TWO switchable backend entrypoints (fixtures):
   * ``mock_embedding_model`` — local CPU-only entrypoint backed by
     ``TwinkleCompatMockModel`` (src/twinkle/server/model/backends/mock_model.py).
     Requires NO GPU. Boots an in-process Ray Serve cluster from the CPU-only
-    mock server config fixture. Consumed by task 4.2 (protocol/link validation).
+    mock server config fixture. Consumed by the local CPU protocol/link validation.
 
   * ``gpu_embedding_model`` — real transformers model entrypoint. Gated behind
     the ``TWINKLE_TEST_GPU_E2E=1`` environment variable (skipped otherwise) and
     connects to an already-running GPU server (see
-    tests/server/start_e2e_server.py). Consumed by tasks 4.3-4.5 (real numeric
-    validation).
+    tests/server/start_e2e_server.py). Consumed by the real numeric
+    validation cases.
 
 Plus two reusable helpers:
 
@@ -29,7 +29,7 @@ Plus two reusable helpers:
     anchor/positive contrastive-learning dataset (even number of samples, with
     ``labels = [1, 0, 1, 0, ...]`` anchor/positive semantics) in the embedding
     pooling input format consumed by ``InputProcessor``.
-  * ``run_embedding_training(...)`` — issues the design-document "verification
+  * ``run_embedding_training(...)`` — issues the "verification
     call sequence" against a client model and returns the observed losses and
     the final metric result.
 
@@ -40,12 +40,12 @@ ALL test cases in this file MUST be run inside the ``twinkle`` conda env, e.g.:
 
     conda run -n twinkle pytest tests/server/test_embedding_e2e.py -v
 
-The local, CPU-only mock cases (task 4.2) run without a GPU and must pass in
+The local, CPU-only mock cases run without a GPU and must pass in
 that environment:
 
     conda run -n twinkle pytest tests/server/test_embedding_e2e.py -v -k mock
 
-The GPU-gated cases (tasks 4.3-4.5) additionally require ``TWINKLE_TEST_GPU_E2E=1``
+The GPU-gated cases additionally require ``TWINKLE_TEST_GPU_E2E=1``
 and a running GPU server; they are skipped automatically when the variable is
 unset:
 
@@ -200,7 +200,7 @@ def configure_embedding_adapter(
 ) -> None:
     """Apply the embedding-training configuration steps to a client model.
 
-    Order matches the design document verification call sequence:
+    Order matches the verification call sequence:
         set_processor('InputProcessor')
         -> set_loss('InfonceLoss', temperature=..., use_batch=True)
         -> add_metric('EmbeddingMetric', is_training=True)
@@ -435,7 +435,7 @@ def mock_embedding_model():
 
     Boots the mock server in-process and yields a client model configured with a
     LoRA adapter, ready for the embedding verification call sequence. Consumed by
-    task 4.2.
+    the local CPU protocol/link validation cases.
     """
     harness = MockEmbeddingServerHarness()
     base_url = harness.start()
@@ -526,7 +526,7 @@ def test_gpu_fixture_gating_env_flag():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 4.2 — Local CPU protocol/link validation against the mock backend.
+# Local CPU protocol/link validation against the mock backend.
 #
 # These cases boot the CPU-only mock server (module-scoped ``mock_embedding_model``
 # fixture — booted ONCE, never rebooted per example) and drive the full embedding
@@ -540,10 +540,10 @@ def test_gpu_fixture_gating_env_flag():
 #
 # They assert each HTTP request/response hop is well-formed, that ``task='embedding'``
 # is transmitted through the protocol layer to the mock backend without protocol
-# errors, and — Property 1 (Validates: Requirements 1.1) — that the loss returned by
+# errors, and that the loss returned by
 # ``forward_backward(task='embedding')`` is a finite number (math.isfinite: not NaN,
 # not Inf). Here the mock loss layer validates the numeric-finiteness contract at the
-# protocol-link level; real-model numeric semantics live in the GPU-gated tasks 4.3-4.5.
+# protocol-link level; real-model numeric semantics live in the GPU-gated cases.
 #
 # Run locally (no GPU) via:
 #     conda run -n twinkle pytest tests/server/test_embedding_e2e.py -v -k mock
@@ -556,13 +556,11 @@ from hypothesis import strategies as st
 def test_mock_embedding_protocol_link_full_sequence(mock_embedding_model):
     """Full ordered call sequence runs over HTTP against the mock backend.
 
-    Validates that every hop of the design-document verification call sequence
+    Validates that every hop of the verification call sequence
     (set_processor -> set_loss -> add_metric -> forward_backward(task='embedding')
     -> calculate_metric) completes without any protocol-layer exception, that
     ``task='embedding'`` is accepted through the /twinkle/* protocol and reaches
-    the mock backend, and — Property 1 — that every returned loss is finite.
-
-    Validates: Requirements 1.1, 1.7, 7.1, 7.2
+    the mock backend, and that every returned loss is finite.
     """
     model = mock_embedding_model
 
@@ -576,7 +574,7 @@ def test_mock_embedding_protocol_link_full_sequence(mock_embedding_model):
     assert len(losses) == len(minibatches)
     assert losses, 'expected at least one forward_backward loss'
 
-    # Property 1: every embedding forward_backward loss is a finite number.
+    # Every embedding forward_backward loss is a finite number.
     for step, loss in enumerate(losses):
         assert math.isfinite(loss), f'loss at step {step} is not finite: {loss!r}'
 
@@ -594,8 +592,6 @@ def test_mock_embedding_task_embedding_is_passed_through(mock_embedding_model):
     response whose extracted loss is finite. This confirms the extra kwarg is
     transported (via ``ForwardRequest.model_extra``) rather than rejected by the
     /twinkle/forward_backward endpoint.
-
-    Validates: Requirements 1.1, 1.7, 7.1, 7.2
     """
     model = mock_embedding_model
     configure_embedding_adapter(model)
@@ -625,15 +621,13 @@ def test_mock_embedding_task_embedding_is_passed_through(mock_embedding_model):
     seed=st.integers(min_value=0, max_value=10_000),
 )
 def test_mock_embedding_loss_is_finite_property(mock_embedding_model, num_pairs, seq_len, seed):
-    """Property 1: forward_backward(task='embedding') loss is always finite.
+    """forward_backward(task='embedding') loss is always finite.
 
     Varied contrastive dataset shapes (num_pairs, seq_len) and seeds are generated
     within a SINGLE module-scoped mock server instance — the server is never
     rebooted per example. For every generated minibatch, the loss returned by the
     mock backend over the HTTP protocol link must be a finite number
     (math.isfinite: not NaN, not Inf).
-
-    Validates: Requirements 1.1
     """
     model = mock_embedding_model
     # Idempotent no-op configuration on the mock backend; keeps the case self-contained.
@@ -653,16 +647,16 @@ def test_mock_embedding_loss_is_finite_property(mock_embedding_model, num_pairs,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 4.3 — Single-GPU real-model loss finiteness (Property 1, GPU-gated).
+# Single-GPU real-model loss finiteness (GPU-gated).
 #
 # This case exercises the REAL transformers model backend through the Twinkle
 # client HTTP path (module-scoped ``gpu_embedding_model`` fixture, gated behind
 # TWINKLE_TEST_GPU_E2E=1 and an already-running GPU server; skipped otherwise).
 # For a non-empty contrastive minibatch, the real-model
 # ``forward_backward(task='embedding')`` loss must be a finite number
-# (math.isfinite: not NaN, not Inf). Unlike the mock cases in task 4.2 (which
+# (math.isfinite: not NaN, not Inf). Unlike the mock cases (which
 # validate the numeric-finiteness contract only at the protocol-link level), this
-# asserts Property 1 against real InfoNCE numeric semantics on real model weights.
+# asserts finiteness against real InfoNCE numeric semantics on real model weights.
 #
 # Run on GPU via:
 #     TWINKLE_TEST_GPU_E2E=1 conda run -n twinkle pytest \
@@ -671,9 +665,9 @@ def test_mock_embedding_loss_is_finite_property(mock_embedding_model, num_pairs,
 
 
 def test_gpu_embedding_real_model_loss_is_finite(gpu_embedding_model):
-    """Property 1: real-model forward_backward(task='embedding') loss is finite.
+    """Real-model forward_backward(task='embedding') loss is finite.
 
-    Drives the design-document embedding verification call sequence
+    Drives the embedding verification call sequence
     (set_processor -> set_loss('InfonceLoss', ...) -> add_metric('EmbeddingMetric')
     -> forward_backward(task='embedding') + clip_grad_and_step) against the REAL
     transformers backend and asserts that every loss returned by
@@ -683,15 +677,13 @@ def test_gpu_embedding_real_model_loss_is_finite(gpu_embedding_model):
     GPU-gated (TWINKLE_TEST_GPU_E2E=1 + running GPU server): skipped automatically
     on machines without a GPU, so this asserts real numeric semantics only on GPU
     CI while collecting/skipping cleanly locally.
-
-    Validates: Requirements 1.1
     """
     model = gpu_embedding_model
 
     dataset = build_synthetic_contrastive_dataset(DEFAULT_NUM_PAIRS, seq_len=DEFAULT_SEQ_LEN, seed=0)
     minibatches = iter_minibatches(dataset, batch_size=2 * DEFAULT_NUM_PAIRS)
 
-    # Property 1 requires a non-empty minibatch to actually exercise the loss path.
+    # A non-empty minibatch is required to actually exercise the loss path.
     assert minibatches, 'expected at least one minibatch'
     assert all(mb for mb in minibatches), 'expected every minibatch to be non-empty'
 
@@ -706,18 +698,18 @@ def test_gpu_embedding_real_model_loss_is_finite(gpu_embedding_model):
     assert len(losses) == len(minibatches)
     assert losses, 'expected at least one forward_backward loss'
 
-    # Property 1: every real-model embedding forward_backward loss is finite.
+    # Every real-model embedding forward_backward loss is finite.
     for step, loss in enumerate(losses):
         assert math.isfinite(loss), f'real-model loss at step {step} is not finite: {loss!r}'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 4.4 — Single-GPU: TransformersEmbeddingPatch auto-rollback (Property 2).
+# Single-GPU: TransformersEmbeddingPatch auto-rollback.
 #
 # GPU-gated (TWINKLE_TEST_GPU_E2E=1). Skipped automatically on this GPU-less dev
 # machine, and on any environment where the variable is unset.
 #
-# Property 2 (Validates: Requirements 1.2): TransformersEmbeddingPatch is applied
+# TransformersEmbeddingPatch is applied
 # *and rolled back automatically* inside a single forward call via
 # ``_resolve_task_context(model, task='embedding')`` (src/twinkle/model/transformers/
 # transformers.py). While the patch is active, ``lm_head`` is swapped for identity
@@ -770,7 +762,7 @@ def _build_causal_sample(seq_len: int = DEFAULT_SEQ_LEN) -> Dict[str, Any]:
 
 
 def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
-    """Property 2: TransformersEmbeddingPatch auto-rolls back after an embedding step.
+    """TransformersEmbeddingPatch auto-rolls back after an embedding step.
 
     Flow (single real GPU adapter, via the ``gpu_embedding_model`` fixture):
 
@@ -793,8 +785,6 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
       * The post-embedding logits' trailing dimension equals the baseline vocabulary
         dimension, proving ``lm_head``/the forward hook were restored (not left as
         identity emitting hidden states).
-
-    Validates: Requirements 1.2, 7.2
     """
     model = gpu_embedding_model
     configure_embedding_adapter(model)
@@ -832,7 +822,7 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
         'did NOT roll back (feature hook suppresses the logits key)')
     post_dim = _innermost_dim(post_logits)
 
-    # Property 2: trailing dim is the vocab dim (identical to baseline), NOT the
+    # Trailing dim is the vocab dim (identical to baseline), NOT the
     # leftover identity hidden-state dim.
     assert post_dim == vocab_dim, (
         f'TransformersEmbeddingPatch did NOT auto-rollback: post-embedding logits '
@@ -841,7 +831,7 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 4.5 — Single-GPU: bare-library parity + pos_sim upward trend (GPU-gated).
+# Single-GPU: bare-library parity + pos_sim upward trend (GPU-gated).
 #
 # These cases exercise the REAL transformers model backend and assert real
 # numeric semantics that the mock backend cannot express, so they live behind
@@ -849,15 +839,15 @@ def test_gpu_embedding_patch_auto_rollback_property(gpu_embedding_model):
 # TWINKLE_TEST_GPU_E2E=1 and a running GPU server; skipped automatically
 # otherwise). Two properties are validated:
 #
-#   * Requirement 1.5 — Twinkle client HTTP path vs. bare-library path parity:
+#   * Twinkle client HTTP path vs. bare-library path parity:
 #     the same small synthetic contrastive dataset is trained for the same number
-#     of steps through (a) the Twinkle client HTTP path (task 4.1 helpers) and
+#     of steps through (a) the Twinkle client HTTP path and
 #     (b) the bare-library training path used by
 #     ``cookbook/exp/embedding/train_embedding_full_ddp.py``. The two losses must
 #     stay within the SAME ORDER OF MAGNITUDE (digit-for-digit equality is NOT
 #     required).
 #
-#   * Requirement 1.6 — pos_sim upward trend: after several real training steps
+#   * pos_sim upward trend: after several real training steps
 #     on a dataset with a clear contrastive signal, ``calculate_metric(is_training=
 #     True)`` must report an increasing anchor-positive cosine similarity
 #     (``pos_sim``) relative to the untrained baseline.
@@ -925,7 +915,7 @@ def _assert_same_order_of_magnitude(a: float, b: float, *, label: str) -> None:
 
     "Same order of magnitude" is interpreted as a bounded ratio in [0.1, 10]
     (equivalently, their base-10 exponents differ by at most 1). Digit-for-digit
-    equality is intentionally NOT required (Requirement 1.5).
+    equality is intentionally NOT required.
     """
     assert math.isfinite(a) and math.isfinite(b), f'[{label}] non-finite losses: {a!r}, {b!r}'
     assert a > 0 and b > 0, f'[{label}] expected positive InfoNCE losses, got {a!r}, {b!r}'
@@ -1026,12 +1016,12 @@ def run_bare_library_embedding_training(
 
 
 def test_gpu_embedding_loss_matches_bare_library_order_of_magnitude(gpu_embedding_model):
-    """Requirement 1.5: client HTTP path and bare-library path losses match in magnitude.
+    """Client HTTP path and bare-library path losses match in magnitude.
 
     Trains the SAME small synthetic contrastive dataset for the SAME number of
     steps through two independent paths:
 
-      * the Twinkle client HTTP path (task 4.1 helpers), against the real GPU
+      * the Twinkle client HTTP path, against the real GPU
         server, and
       * the bare-library training path reproduced in-process from
         ``cookbook/exp/embedding/train_embedding_full_ddp.py``.
@@ -1046,8 +1036,6 @@ def test_gpu_embedding_loss_matches_bare_library_order_of_magnitude(gpu_embeddin
     GPU-gated (TWINKLE_TEST_GPU_E2E=1 + running GPU server): skipped automatically
     on machines without a GPU, so it collects/skips cleanly locally and asserts
     real numeric semantics only on GPU CI.
-
-    Validates: Requirements 1.5, 7.2
     """
     # ``gpu_embedding_model`` guarantees the GPU gate + a live server/session; use a
     # dedicated fresh client adapter so the comparison is order-independent of other
@@ -1091,7 +1079,7 @@ def test_gpu_embedding_loss_matches_bare_library_order_of_magnitude(gpu_embeddin
 
 
 def test_gpu_embedding_pos_sim_increases_after_training(gpu_embedding_model):
-    """Requirement 1.6: pos_sim rises after several real training steps.
+    """pos_sim rises after several real training steps.
 
     Uses a fresh, untrained LoRA adapter on the real GPU model and repeatedly
     trains on a fixed synthetic contrastive minibatch (anchors and their positives
@@ -1106,8 +1094,6 @@ def test_gpu_embedding_pos_sim_increases_after_training(gpu_embedding_model):
 
     GPU-gated (TWINKLE_TEST_GPU_E2E=1 + running GPU server): skipped automatically
     on machines without a GPU.
-
-    Validates: Requirements 1.6, 7.2
     """
     # Fresh dedicated adapter -> clean untrained baseline, independent of other cases.
     model = build_embedding_client_model(MODEL_ID, adapter_name='emb_trend_adapter')

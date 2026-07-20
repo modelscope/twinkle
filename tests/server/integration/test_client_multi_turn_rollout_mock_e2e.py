@@ -2,7 +2,7 @@
 """Local CPU-only multi-turn control-flow E2E for ``ClientMultiTurnRollout``.
 
 This test boots a REAL CPU-only Twinkle server (Ray Serve, in-process) whose
-sampler backend is the enhanced :class:`MockSampler` (task 8.6), then drives
+sampler backend is the enhanced :class:`MockSampler`, then drives
 :class:`twinkle_client.rollout.multi_turn.ClientMultiTurnRollout` over ACTUAL
 HTTP through :class:`twinkle_client.sampler.vLLMSampler`. No GPU is required.
 
@@ -20,7 +20,7 @@ What is "real" vs "test double" here
     tokenizer (network/model weights) which is unavailable in a local offline
     CPU environment, so a deterministic char-level double is used instead —
     exactly the established pattern from
-    ``tests/twinkle_client/test_client_multi_turn_rollout.py`` (task 8.4).
+    ``tests/twinkle_client/test_client_multi_turn_rollout.py``.
 
 Why the sampler knobs are set at CONSTRUCTION time
 --------------------------------------------------
@@ -98,7 +98,7 @@ SAMPLE_MAX_TOKENS = 4
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Client-local test doubles: char-level tokenizer + Template + echo tool.
-# (Mirrors tests/twinkle_client/test_client_multi_turn_rollout.py — task 8.4.)
+# (Mirrors tests/twinkle_client/test_client_multi_turn_rollout.py.)
 # ═══════════════════════════════════════════════════════════════════════════
 class _FakeTokenizer:
     """Char-level tokenizer with atomic special tokens.
@@ -452,8 +452,8 @@ def _make_rollout(model_id: str, *, tool_manager: Optional[ToolManager], max_tur
 #
 # With ``stop_reason='stop'`` and a tool call injected every round, the loop
 # runs "sample -> tool -> bridge -> sample -> ..." until it hits ``max_turns``
-# and force-truncates. Exercises Property 3 (len/order), Property 4
-# ('max_turns' in the allowed set), and Property 6 (turns <= max_turns).
+# and force-truncates. Exercises the output length/order, stop_reason value
+# range ('max_turns' in the allowed set), and turns <= max_turns invariants.
 # ═══════════════════════════════════════════════════════════════════════════
 @pytest.mark.parametrize('n_traj,max_turns', [(1, 3), (3, 2), (2, 4)])
 def test_multi_turn_tool_loop_over_http(mock_multi_turn_server, n_traj, max_turns):
@@ -462,23 +462,21 @@ def test_multi_turn_tool_loop_over_http(mock_multi_turn_server, n_traj, max_turn
     Boots a real CPU server, drives ClientMultiTurnRollout via vLLMSampler HTTP
     calls through several "sample -> tool -> bridge -> sample" rounds, and
     checks the batch invariants.
-
-    Validates: Requirements 3.2 (Property 3), 3.3 (Property 4), 3.5 (Property 6), 7.1, 7.2
     """
     rollout = _make_rollout(MODEL_TOOL, tool_manager=_make_tool_manager(), max_turns=max_turns)
     trajectories = _make_trajectories(n_traj)
 
     outs = rollout(copy.deepcopy(trajectories))
 
-    # Property 3: output list is same length and order as the input.
+    # Output list is same length and order as the input.
     assert len(outs) == n_traj
     for i, out in enumerate(outs):
         assert out['_tid'] == i, 'output order must match input order'
 
     for out in outs:
-        # Property 4: stop_reason is within the allowed set.
+        # stop_reason is within the allowed set.
         assert out['stop_reason'] in {'length', 'stop', 'max_turns'}, out['stop_reason']
-        # Property 6: actual turns never exceed the configured max_turns.
+        # Actual turns never exceed the configured max_turns.
         assert out['turns'] <= max_turns, f"turns({out['turns']}) > max_turns({max_turns})"
         # A tool call on every round means the loop must hit the turn cap.
         assert out['stop_reason'] == 'max_turns'
@@ -493,13 +491,10 @@ def test_multi_turn_tool_loop_over_http(mock_multi_turn_server, n_traj, max_turn
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Property 7: max_turns == 1 with a first-round tool call forces truncation.
+# max_turns == 1 with a first-round tool call forces truncation.
 # ═══════════════════════════════════════════════════════════════════════════
-def test_property7_max_turns_one_forces_truncation(mock_multi_turn_server):
-    """max_turns==1 + first-round tool call -> truncated=True, stop_reason='max_turns'.
-
-    Validates: Requirements 3.6 (Property 7), 7.1, 7.2
-    """
+def test_max_turns_one_forces_truncation(mock_multi_turn_server):
+    """max_turns==1 + first-round tool call -> truncated=True, stop_reason='max_turns'."""
     rollout = _make_rollout(MODEL_TOOL, tool_manager=_make_tool_manager(), max_turns=1)
     trajectories = _make_trajectories(3)
 
@@ -514,13 +509,10 @@ def test_property7_max_turns_one_forces_truncation(mock_multi_turn_server):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Property 4: natural termination reasons ('stop' and 'length') over real HTTP.
+# Natural termination reasons ('stop' and 'length') over real HTTP.
 # ═══════════════════════════════════════════════════════════════════════════
 def test_natural_stop_termination_over_http(mock_multi_turn_server):
-    """No tool call + stop_reason='stop' -> single-turn natural termination.
-
-    Validates: Requirements 3.2 (Property 3), 3.3 (Property 4), 3.5 (Property 6), 7.1, 7.2
-    """
+    """No tool call + stop_reason='stop' -> single-turn natural termination."""
     rollout = _make_rollout(MODEL_STOP, tool_manager=_make_tool_manager(), max_turns=4)
     trajectories = _make_trajectories(2)
 
@@ -536,10 +528,7 @@ def test_natural_stop_termination_over_http(mock_multi_turn_server):
 
 
 def test_length_termination_over_http(mock_multi_turn_server):
-    """stop_reason='length' -> immediate termination on the first round.
-
-    Validates: Requirements 3.3 (Property 4), 3.5 (Property 6), 7.1, 7.2
-    """
+    """stop_reason='length' -> immediate termination on the first round."""
     rollout = _make_rollout(MODEL_LENGTH, tool_manager=_make_tool_manager(), max_turns=4)
     trajectories = _make_trajectories(2)
 
@@ -553,19 +542,16 @@ def test_length_termination_over_http(mock_multi_turn_server):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Exception path (task 8.3): tool_calls produced but no tool_manager -> ValueError.
+# Exception path: tool_calls produced but no tool_manager -> ValueError.
 #
 # Note on ``new_input_feature=None``: the enhanced MockSampler ALWAYS populates
-# new_input_feature, so that specific 8.3 error path is not reproducible against
+# new_input_feature, so that specific error path is not reproducible against
 # a real mock server and is covered by the unit tests in
 # tests/twinkle_client/test_client_multi_turn_rollout.py instead. The
 # tool_manager-missing path IS reachable over real HTTP and is asserted here.
 # ═══════════════════════════════════════════════════════════════════════════
 def test_tool_calls_without_tool_manager_raises_value_error_over_http(mock_multi_turn_server):
-    """A tool call with no tool_manager raises ValueError over the real HTTP path.
-
-    Validates: Requirements 3.10, 7.1, 7.2
-    """
+    """A tool call with no tool_manager raises ValueError over the real HTTP path."""
     rollout = _make_rollout(MODEL_TOOL, tool_manager=None, max_turns=3)
     trajectories = _make_trajectories(1)
 

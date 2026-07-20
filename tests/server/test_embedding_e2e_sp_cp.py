@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Embedding training E2E validation under SP/CP distributed configs (task 5.1).
+"""Embedding training E2E validation under SP/CP distributed configs.
 
 This module reuses the synthetic contrastive dataset and the embedding
 verification call sequence from ``tests/server/test_embedding_e2e.py`` and reruns
@@ -53,7 +53,7 @@ if _PROJECT_ROOT not in sys.path:
 
 import pytest
 
-# Reuse the task 4.1-4.5 scaffolding (dataset, minibatching, model id, metric
+# Reuse the single-card scaffolding (dataset, minibatching, model id, metric
 # parsing, loss extraction, GPU gate) so the SP/CP flow exercises the SAME
 # synthetic dataset and the SAME verification call sequence as the single-card
 # path — the only difference is the distributed device mesh.
@@ -74,7 +74,7 @@ from tests.server.integration.e2e_helpers import log
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Dataset / training shape (kept small for GPU speed while still giving InfoNCE a
-# real contrastive signal). Mirrors the pos_sim-trend shape used in task 4.5.
+# real contrastive signal). Mirrors the pos_sim-trend shape used on the single card.
 SP_CP_NUM_PAIRS = 6        # -> 12 samples
 SP_CP_BATCH_SIZE = 4       # -> 3 minibatches == 3 training steps
 SP_CP_TRAIN_STEPS = 8      # real training steps before measuring pos_sim
@@ -179,7 +179,7 @@ def _build_embedding_model_with_mesh(
 ):
     """Build a real ``MultiLoraTransformersModel`` bound to an SP/CP device mesh.
 
-    Uses the SAME bare-library primitives as the single-card path in task 4.5
+    Uses the SAME bare-library primitives as the single-card path
     (InputProcessor + InfonceLoss + EmbeddingMetric + AdamW), the only difference
     being the distributed ``DeviceMesh`` passed to the constructor. SP is enabled
     automatically by the transformers backend whenever ``ulysses_size > 1``.
@@ -351,7 +351,7 @@ def single_card_pos_sim():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 5.1 — SP/CP pos_sim consistency (multi-GPU, GPU-gated).
+# SP/CP pos_sim consistency (multi-GPU, GPU-gated).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -359,7 +359,7 @@ def single_card_pos_sim():
 def test_gpu_sp_cp_pos_sim_matches_single_card(config, single_card_pos_sim):
     """SP/CP pos_sim agrees with the single-card baseline within tolerance.
 
-    Reruns the task 4.1-4.5 embedding verification flow on the SAME synthetic
+    Reruns the embedding verification flow on the SAME synthetic
     contrastive dataset under a distributed device mesh built with
     ``DeviceMesh.from_sizes(fsdp_size=world_size, ulysses_size=..., cp_size=...)``
     (SP when ``ulysses_size > 1``, CP when ``cp_size > 1``), then asserts the
@@ -369,8 +369,6 @@ def test_gpu_sp_cp_pos_sim_matches_single_card(config, single_card_pos_sim):
     its required GPU count is available, so the file collects/skips cleanly on a
     GPU-less machine and asserts real distributed numeric semantics only on
     multi-GPU CI.
-
-    Validates: Requirements 1.3, 7.2
     """
     world_size = int(config['world_size'])
     if not multi_gpu_e2e_enabled(min_devices=world_size):

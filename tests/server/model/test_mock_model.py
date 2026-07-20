@@ -58,12 +58,12 @@ _REQUIRED_METHODS = (
 
 
 @pytest.mark.parametrize('method_name', _REQUIRED_METHODS)
-def test_property_1_required_method_present(method_name: str) -> None:
+def test_required_method_present(method_name: str) -> None:
     m = TwinkleCompatMockModel('mid')
     assert callable(getattr(m, method_name)), method_name
 
 
-def test_property_1_constructor_does_not_raise() -> None:
+def test_constructor_does_not_raise() -> None:
     TwinkleCompatMockModel('mid')
 
 
@@ -75,7 +75,7 @@ def test_property_1_constructor_does_not_raise() -> None:
     seq_lens=st.lists(st.integers(min_value=1, max_value=12), min_size=1, max_size=5),
     seed=st.integers(min_value=0, max_value=99),
 )
-def test_property_2_forward_only_deterministic_and_shaped(seq_lens: list, seed: int) -> None:
+def test_forward_only_deterministic_and_shaped(seq_lens: list, seed: int) -> None:
     inputs = [{'tokens': list(range(n))} for n in seq_lens]
     a = TwinkleCompatMockModel('mid', seed=seed)
     b = TwinkleCompatMockModel('mid', seed=seed)
@@ -90,7 +90,7 @@ def test_property_2_forward_only_deterministic_and_shaped(seq_lens: list, seed: 
 
 @settings(max_examples=100)
 @given(seq_lens=st.lists(st.integers(min_value=1, max_value=8), min_size=1, max_size=4))
-def test_property_2_tinker_forward_backward_loss_is_finite(seq_lens: list) -> None:
+def test_tinker_forward_backward_loss_is_finite(seq_lens: list) -> None:
     m = TwinkleCompatMockModel('mid')
     inputs = [{'tokens': list(range(n))} for n in seq_lens]
     result, loss = m.tinker_forward_backward(inputs=inputs, adapter_name='a', loss_fn='cross_entropy')
@@ -106,7 +106,7 @@ def test_property_2_tinker_forward_backward_loss_is_finite(seq_lens: list) -> No
 @given(
     name=st.text(
         min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
-def test_property_3_adapter_add_remove_round_trip(name: str) -> None:
+def test_adapter_add_remove_round_trip(name: str) -> None:
     m = TwinkleCompatMockModel('mid')
     assert not m.has_adapter(name)
     m.add_adapter(name, rank=4)
@@ -120,7 +120,7 @@ def test_property_3_adapter_add_remove_round_trip(name: str) -> None:
 
 @settings(max_examples=100)
 @given(name=st.text(min_size=1, max_size=12))
-def test_property_4_remove_absent_raises(name: str) -> None:
+def test_remove_absent_raises(name: str) -> None:
     m = TwinkleCompatMockModel('mid')
     pre = dict(m._adapters)
     with pytest.raises(KeyError):
@@ -131,14 +131,14 @@ def test_property_4_remove_absent_raises(name: str) -> None:
 # ---------- Model backend dispatch ---------------------------------------- #
 
 
-def test_property_10_mock_dispatch_returns_mock_model() -> None:
+def test_mock_dispatch_returns_mock_model() -> None:
     m = MODEL_SELECTOR.construct(MODEL_SELECTOR.validate('mock'), {'model_id': 'mid'})
     assert isinstance(m, TwinkleCompatMockModel)
 
 
 @settings(max_examples=100)
 @given(bad=st.text(min_size=1, max_size=10).filter(lambda s: s not in _MODEL_BACKENDS))
-def test_property_10_invalid_backend_raises_config_error(bad: str) -> None:
+def test_invalid_backend_raises_config_error(bad: str) -> None:
     """Validation runs BEFORE any backend import / instantiation."""
     with pytest.raises(ConfigError) as exc:
         MODEL_SELECTOR.validate(bad)
@@ -148,7 +148,7 @@ def test_property_10_invalid_backend_raises_config_error(bad: str) -> None:
 
 
 @pytest.mark.parametrize('value', [None, ''])
-def test_property_10_absent_or_empty_backend_raises(value) -> None:
+def test_absent_or_empty_backend_raises(value) -> None:
     with pytest.raises(ConfigError) as exc:
         MODEL_SELECTOR.validate(value)
     assert exc.value.field == 'backend'

@@ -12,7 +12,7 @@ Why this must be GPU-gated
 ---------------------------
 Real numeric semantics (actual token sampling + per-token ``logprobs`` on real
 model weights) cannot be reproduced by the CPU-only mock sampler used in the
-local mock E2E (task 9.1). Two things in particular are only observable with a
+local mock E2E. Two things in particular are only observable with a
 real sampler and are therefore asserted here under GPU gating:
 
   * The two rollout paths agree on the ``messages`` structure and on *when*
@@ -286,29 +286,29 @@ def assert_logprobs_align_with_labels(traj: Dict[str, Any], label: str) -> None:
         f'(labels != -100)')
 
 
-# Allowed stop reasons (Property 4 in the design doc / task 8.4).
+# Allowed stop reasons.
 _ALLOWED_STOP_REASONS = {'length', 'stop', 'max_turns'}
 
 
-def assert_properties_3_4_6_7(outs: List[Dict[str, Any]], n_inputs: int, max_turns: int, label: str) -> None:
-    """Re-assert the multi-turn Properties 3/4/6/7 on a rollout output list.
+def assert_multi_turn_invariants(outs: List[Dict[str, Any]], n_inputs: int, max_turns: int, label: str) -> None:
+    """Re-assert the multi-turn output invariants on a rollout output list.
 
-    * Property 3 — output length & order preserved (via hidden ``_tid``).
-    * Property 4 — stop_reason within ``{'length','stop','max_turns'}``.
-    * Property 6 — actual turns never exceed max_turns.
-    * Property 7 — a ``max_turns`` truncation implies ``truncated=True``.
+    * Output length & order preserved (via hidden ``_tid``).
+    * stop_reason within ``{'length','stop','max_turns'}``.
+    * Actual turns never exceed max_turns.
+    * A ``max_turns`` truncation implies ``truncated=True``.
     """
-    # Property 3: same length and order.
+    # Same length and order.
     assert len(outs) == n_inputs, f'[{label}] expected {n_inputs} outputs, got {len(outs)}'
     for i, out in enumerate(outs):
         assert out.get('_tid') == i, f'[{label}] output order mismatch at index {i}'
-        # Property 4: stop_reason value range.
+        # stop_reason value range.
         assert out.get('stop_reason') in _ALLOWED_STOP_REASONS, \
             f"[{label}] stop_reason={out.get('stop_reason')!r} not in {_ALLOWED_STOP_REASONS}"
-        # Property 6: turns bounded by max_turns.
+        # Turns bounded by max_turns.
         assert out.get('turns') is not None and out['turns'] <= max_turns, \
             f"[{label}] turns({out.get('turns')}) > max_turns({max_turns})"
-        # Property 7: max_turns truncation implies truncated=True.
+        # max_turns truncation implies truncated=True.
         if out.get('stop_reason') == 'max_turns':
             assert out.get('truncated') is True, \
                 f'[{label}] stop_reason==max_turns but truncated is not True'
@@ -438,8 +438,6 @@ def test_client_and_bare_multi_turn_control_flow_aligned(aligned_rollouts):
         non-determinism is allowed, but the control flow must match.
       * On each path, ``len(logprobs) == count(labels != -100)`` for every
         trajectory that collected logprobs (real-sampler numeric alignment).
-
-    Validates: Requirements 3.12, 7.2
     """
     client_rollout, bare_rollout = aligned_rollouts
     trajectories = build_alignment_trajectories()
@@ -448,9 +446,9 @@ def test_client_and_bare_multi_turn_control_flow_aligned(aligned_rollouts):
     client_outs = client_rollout(copy.deepcopy(trajectories))
     bare_outs = bare_rollout(copy.deepcopy(trajectories))
 
-    # Per-path structural properties (3/4/6/7).
-    assert_properties_3_4_6_7(client_outs, n, ALIGN_MAX_TURNS, label='client')
-    assert_properties_3_4_6_7(bare_outs, n, ALIGN_MAX_TURNS, label='bare')
+    # Per-path structural invariants.
+    assert_multi_turn_invariants(client_outs, n, ALIGN_MAX_TURNS, label='client')
+    assert_multi_turn_invariants(bare_outs, n, ALIGN_MAX_TURNS, label='bare')
 
     # Per-path real-sampler logprobs/labels alignment (strict equality).
     for out in client_outs:
@@ -543,34 +541,34 @@ def test_assert_logprobs_align_with_labels_pass_and_fail():
         assert_logprobs_align_with_labels(bad, label='unit')
 
 
-def test_assert_properties_3_4_6_7_detects_violations():
+def test_assert_multi_turn_invariants_detects_violations():
     good = [
         {'_tid': 0, 'stop_reason': 'stop', 'turns': 1, 'truncated': False},
         {'_tid': 1, 'stop_reason': 'max_turns', 'turns': 3, 'truncated': True},
     ]
-    assert_properties_3_4_6_7(good, n_inputs=2, max_turns=3, label='unit')  # no raise
+    assert_multi_turn_invariants(good, n_inputs=2, max_turns=3, label='unit')  # no raise
 
-    # Property 4 violation: unknown stop_reason.
+    # stop_reason value-range violation: unknown stop_reason.
     with pytest.raises(AssertionError):
-        assert_properties_3_4_6_7(
+        assert_multi_turn_invariants(
             [{'_tid': 0, 'stop_reason': 'weird', 'turns': 1, 'truncated': False}],
             n_inputs=1, max_turns=3, label='unit')
 
-    # Property 6 violation: turns exceed max_turns.
+    # Turn-bound violation: turns exceed max_turns.
     with pytest.raises(AssertionError):
-        assert_properties_3_4_6_7(
+        assert_multi_turn_invariants(
             [{'_tid': 0, 'stop_reason': 'stop', 'turns': 5, 'truncated': False}],
             n_inputs=1, max_turns=3, label='unit')
 
-    # Property 7 violation: max_turns but not truncated.
+    # Truncation-flag violation: max_turns but not truncated.
     with pytest.raises(AssertionError):
-        assert_properties_3_4_6_7(
+        assert_multi_turn_invariants(
             [{'_tid': 0, 'stop_reason': 'max_turns', 'turns': 3, 'truncated': False}],
             n_inputs=1, max_turns=3, label='unit')
 
-    # Property 3 violation: order/length mismatch.
+    # Order/length violation.
     with pytest.raises(AssertionError):
-        assert_properties_3_4_6_7(
+        assert_multi_turn_invariants(
             [{'_tid': 1, 'stop_reason': 'stop', 'turns': 1, 'truncated': False}],
             n_inputs=1, max_turns=3, label='unit')
 

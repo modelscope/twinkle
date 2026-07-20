@@ -2,14 +2,10 @@
 """Property + unit tests for the typed ``ServerConfig``.
 
 Properties covered:
-- # Feature: server-config-observability-refactor,
-  Property 12: Valid configuration yields a fully validated instance
-- # Feature: server-config-observability-refactor,
-  Property 13: Any constraint violation is rejected with the offending field named
-- # Feature: server-config-observability-refactor,
-  Property 14: Configuration round-trip fidelity
-- # Feature: server-config-observability-refactor,
-  Property 15: Legacy / unknown field names are rejected
+- Valid configuration yields a fully validated instance
+- Any constraint violation is rejected with the offending field named
+- Configuration round-trip fidelity
+- Legacy / unknown field names are rejected
 """
 from __future__ import annotations
 
@@ -66,12 +62,12 @@ _VALID_CONFIG = st.fixed_dictionaries({
     'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
 })
 
-# ---------- Property 12: valid → fully validated ----------------------------- #
+# ---------- valid → fully validated ---------------------------------------- #
 
 
 @settings(max_examples=100)
 @given(payload=_VALID_CONFIG)
-def test_property_12_valid_payload_yields_full_instance(payload: dict) -> None:
+def test_valid_payload_yields_full_instance(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)
     assert isinstance(cfg, ServerConfig)
     assert all(isinstance(a, ApplicationSpec) for a in cfg.applications)
@@ -80,17 +76,17 @@ def test_property_12_valid_payload_yields_full_instance(payload: dict) -> None:
     assert cfg.task_queue.rps_limit >= 0
 
 
-# ---------- Property 13: violation → field-named error ---------------------- #
+# ---------- violation → field-named error ---------------------------------- #
 
 
-def test_property_13_redis_mode_missing_url() -> None:
+def test_redis_mode_missing_url() -> None:
     with pytest.raises(ValidationError) as exc:
         ServerConfig.model_validate({'persistence': {'mode': 'redis'}})
     msg = str(exc.value)
     assert 'persistence.redis_url' in msg or 'redis_url' in msg
 
 
-def test_property_13_file_mode_missing_path() -> None:
+def test_file_mode_missing_path() -> None:
     with pytest.raises(ValidationError) as exc:
         ServerConfig.model_validate({'persistence': {'mode': 'file'}})
     msg = str(exc.value)
@@ -99,7 +95,7 @@ def test_property_13_file_mode_missing_path() -> None:
 
 @settings(max_examples=100)
 @given(bad_backend=st.text(min_size=1, max_size=8).filter(lambda s: s not in ('mock', 'transformers', 'megatron')))
-def test_property_13_bad_backend_names_field(bad_backend: str) -> None:
+def test_bad_backend_names_field(bad_backend: str) -> None:
     payload = {
         'applications': [{
             'name': 'm',
@@ -120,7 +116,7 @@ def test_property_13_bad_backend_names_field(bad_backend: str) -> None:
 
 @settings(max_examples=100)
 @given(bad_max_input_tokens=st.integers(max_value=0, min_value=-1000))
-def test_property_13_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> None:
+def test_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> None:
     """Nested-section constraints (here ``task_queue.max_input_tokens``) are
     enforced together with cross-field ones and the offending path is
     visible in the error."""
@@ -135,7 +131,7 @@ def test_property_13_nested_field_constraint_violation_named(bad_max_input_token
 
 @settings(max_examples=100)
 @given(payload=_VALID_CONFIG)
-def test_property_14_round_trip_fidelity(payload: dict) -> None:
+def test_round_trip_fidelity(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)
     dumped = cfg.to_yaml_dict()
     re_loaded = ServerConfig.model_validate(dumped)
@@ -143,14 +139,14 @@ def test_property_14_round_trip_fidelity(payload: dict) -> None:
     assert re_loaded.model_dump() == cfg.model_dump()
 
 
-# ---------- Property 15: legacy/unknown rejected ----------------------------- #
+# ---------- legacy/unknown rejected ---------------------------------------- #
 
 
 @pytest.mark.parametrize(
     'legacy_field',
     ['telemetry_config', 'persistence_config'],
 )
-def test_property_15_legacy_field_rejected(legacy_field: str) -> None:
+def test_legacy_field_rejected(legacy_field: str) -> None:
     payload = {legacy_field: {}}
     with pytest.raises(ValidationError) as exc:
         ServerConfig.model_validate(payload)
@@ -161,7 +157,7 @@ def test_property_15_legacy_field_rejected(legacy_field: str) -> None:
 
 @settings(max_examples=100)
 @given(unknown=st.text(min_size=1, max_size=20).filter(lambda s: not s.startswith('_')))
-def test_property_15_unknown_field_rejected(unknown: str) -> None:
+def test_unknown_field_rejected(unknown: str) -> None:
     known = {
         'ray_namespace',
         'proxy_location',
@@ -178,7 +174,7 @@ def test_property_15_unknown_field_rejected(unknown: str) -> None:
 
 
 @pytest.mark.parametrize('section', ['telemetry', 'persistence'])
-def test_property_15_unknown_nested_field_rejected(section: str) -> None:
+def test_unknown_nested_field_rejected(section: str) -> None:
     """Nested config sections also reject unknown keys (defends against typos
     inside ``telemetry: {...}`` / ``persistence: {...}``)."""
     payload = {section: {'unknown_typo': 1}}
@@ -187,7 +183,7 @@ def test_property_15_unknown_nested_field_rejected(section: str) -> None:
     assert any('unknown_typo' in err['loc'] for err in exc.value.errors())
 
 
-# ---------- 3.11: from_yaml error paths + launcher dict rejection ---------- #
+# ---------- from_yaml error paths + launcher dict rejection ---------------- #
 
 
 def test_from_yaml_missing_path(tmp_path: Path) -> None:

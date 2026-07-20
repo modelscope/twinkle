@@ -5,7 +5,7 @@ endpoint proves the returned Trajectory carries NO ``logprobs`` field.
 Purpose
 -------
 This is the "generation-only, not trainable" counterpart to the trainable
-``ClientMultiTurnRollout`` path validated in task 9.2. It drives the SAME
+``ClientMultiTurnRollout`` path. It drives the SAME
 tool-calling scenario, but through the OpenAI-compatible route:
 
     OpenAI client  ->  Gateway POST /chat/completions  ->  /twinkle/sample
@@ -15,7 +15,7 @@ field (or that it is ``None``/absent). The OpenAI chat-completions protocol only
 surfaces assistant ``content`` / ``tool_calls`` / ``finish_reason`` — it never
 carries the token-level ``logprobs`` + ``new_input_feature`` alignment info that
 GRPO training requires. This test locks in the accuracy of that limitation
-statement (Requirement 5.2 / 5.5): the Gateway indirection is fine for
+statement: the Gateway indirection is fine for
 generation/evaluation but cannot feed token-aligned RL training.
 
 What is "real" here
@@ -175,20 +175,18 @@ def gpu_gateway_ready():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Task 9.3 — APIMultiTurnRollout via Gateway: Trajectory carries NO logprobs.
+# APIMultiTurnRollout via Gateway: Trajectory carries NO logprobs.
 # ═══════════════════════════════════════════════════════════════════════════
 def test_api_multi_turn_rollout_trajectory_has_no_logprobs(gpu_gateway_ready):
     """The Gateway /chat/completions path yields Trajectories without logprobs.
 
-    Runs the same tool-calling scenario as task 9.2 but through
+    Runs the same tool-calling scenario as the trainable client rollout but through
     ``APIMultiTurnRollout`` + an OpenAI-compatible client pointed at the Gateway.
     Asserts the returned Trajectory does NOT expose a ``logprobs`` field (absent
     or ``None``), confirming the "generation-only, not trainable" limitation is
     accurate: token-level alignment info never crosses the OpenAI protocol.
 
     GPU-gated (TWINKLE_TEST_GPU_E2E=1 + running GPU server); skipped locally.
-
-    Validates: Requirements 5.2, 5.5, 7.2
     """
     rollout = _build_rollout(max_turns=3)
     trajectories = [_make_trajectory()]
@@ -207,7 +205,7 @@ def test_api_multi_turn_rollout_trajectory_has_no_logprobs(gpu_gateway_ready):
     # A functional run should not have surfaced an API error.
     assert out.get('stop_reason') != 'api_error', f"unexpected api_error: {out.get('error')!r}"
 
-    # Core assertion (Requirement 5.2 / 5.5): NO trainable token-level logprobs.
+    # Core assertion: NO trainable token-level logprobs.
     assert out.get('logprobs') is None, (
         f'Gateway APIMultiTurnRollout Trajectory unexpectedly carries logprobs: '
         f'{out.get("logprobs")!r}. The OpenAI /chat/completions path is '
@@ -225,11 +223,9 @@ def test_api_multi_turn_rollout_tool_call_scenario_shape(gpu_gateway_ready):
 
     Complements the no-logprobs assertion by checking the conversation shape:
     messages accumulate across turns and, when the model invokes the calculator,
-    a matching ``role='tool'`` message is stitched back in. This mirrors the 9.2
-    scenario so the two paths are compared on the same workload. Tool invocation
-    itself is model-dependent, so it is asserted conditionally.
-
-    Validates: Requirements 5.2, 5.5, 7.2
+    a matching ``role='tool'`` message is stitched back in. This mirrors the
+    trainable client rollout scenario so the two paths are compared on the same
+    workload. Tool invocation itself is model-dependent, so it is asserted conditionally.
     """
     rollout = _build_rollout(max_turns=3)
 

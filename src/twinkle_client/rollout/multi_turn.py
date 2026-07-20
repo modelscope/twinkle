@@ -15,7 +15,7 @@ Design notes:
     * The ``tool_manager`` type is reused directly from
       ``twinkle_agentic.tools.tool_manager.ToolManager`` (imported, not copied).
     * Bridge-token stitching is reused from
-      ``twinkle_agentic.rollout.bridge.extend_with_bridge`` (see task 8.2).
+      ``twinkle_agentic.rollout.bridge.extend_with_bridge``.
 """
 import dataclasses
 from typing import Any, Dict, List, Optional
@@ -281,7 +281,7 @@ class ClientMultiTurnRollout:
 
         Unlike the core-lib rollout, ``None`` is tolerated here and broadcast as
         ``[None] * n``; the ValueError is raised lazily at the tool-dispatch site
-        only when a trajectory actually produces tool_calls (requirement 3.10).
+        only when a trajectory actually produces tool_calls.
         """
         if isinstance(arg, list):
             if len(arg) != n:

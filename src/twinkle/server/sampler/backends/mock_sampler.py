@@ -43,10 +43,10 @@ class MockSampler:
       corresponds to one ``sample()`` invocation (one multi-turn round).
 
     All three knobs may be supplied at construction time or overridden per call
-    via ``sample()`` keyword arguments or matching attributes on
-    ``sampling_params``. When none are configured the backend keeps its previous
-    behaviour exactly (``stop_reason='length'``, ``decoded=None``), so existing
-    callers are unaffected. Outputs stay deterministic and CPU-only.
+    via ``sample()`` keyword arguments. When none are configured the backend
+    keeps its previous behaviour exactly (``stop_reason='length'``,
+    ``decoded=None``), so existing callers are unaffected. Outputs stay
+    deterministic and CPU-only.
     """
 
     def __init__(
@@ -104,12 +104,12 @@ class MockSampler:
             raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r} '
                              '(set sampling_params.max_tokens to a positive integer)')
 
-        # Resolve per-call multi-turn knobs (precedence: explicit sample()
-        # kwargs > sampling_params attributes > ctor defaults) and advance the
-        # round counter that ``tool_call_turns`` addresses.
-        stop_reason = self._resolve_stop_reason(sampling_params, kwargs)
-        tool_call_text = self._resolve_tool_call_text(sampling_params, kwargs)
-        tool_call_turns = self._resolve_tool_call_turns(sampling_params, kwargs, tool_call_text)
+        # Resolve per-call multi-turn knobs (explicit sample() kwargs override
+        # ctor defaults) and advance the round counter that ``tool_call_turns``
+        # addresses.
+        stop_reason = self._resolve_stop_reason(kwargs)
+        tool_call_text = self._resolve_tool_call_text(kwargs)
+        tool_call_turns = self._resolve_tool_call_turns(kwargs, tool_call_text)
         self._round += 1
         inject_tool_call = tool_call_text is not None and self._round in tool_call_turns
         decoded = tool_call_text if inject_tool_call else None
@@ -215,35 +215,23 @@ class MockSampler:
             return frozenset({1}) if tool_call_text is not None else frozenset()
         return frozenset(int(t) for t in turns)
 
-    def _resolve_stop_reason(self, params: SamplingParams | None, kwargs: dict[str, Any]) -> str:
+    def _resolve_stop_reason(self, kwargs: dict[str, Any]) -> str:
         if 'stop_reason' in kwargs and kwargs['stop_reason'] is not None:
             return str(kwargs['stop_reason'])
-        override = getattr(params, 'stop_reason', None)
-        if override is not None:
-            return str(override)
         return self._stop_reason
 
-    def _resolve_tool_call_text(self, params: SamplingParams | None, kwargs: dict[str, Any]) -> str | None:
+    def _resolve_tool_call_text(self, kwargs: dict[str, Any]) -> str | None:
         if 'tool_call_text' in kwargs:
             return kwargs['tool_call_text']
-        override = getattr(params, 'tool_call_text', None)
-        if override is not None:
-            return override
         return self._tool_call_text
 
     def _resolve_tool_call_turns(
         self,
-        params: SamplingParams | None,
         kwargs: dict[str, Any],
         tool_call_text: str | None,
     ) -> frozenset[int]:
         if 'tool_call_turns' in kwargs and kwargs['tool_call_turns'] is not None:
             return self._normalize_turns(kwargs['tool_call_turns'], tool_call_text)
-        override = getattr(params, 'tool_call_turns', None)
-        if override is not None:
-            return self._normalize_turns(override, tool_call_text)
-        # Fall back to the ctor-configured turns, but keep the "default to {1}
-        # when text is injected via a per-call override" behaviour consistent.
         if tool_call_text is not None and not self._tool_call_turns:
             return frozenset({1})
         return self._tool_call_turns

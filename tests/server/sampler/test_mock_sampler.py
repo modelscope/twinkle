@@ -29,7 +29,7 @@ _REQUIRED_METHODS = ('sample', 'apply_patch', 'add_adapter_to_sampler', 'has_ada
 
 
 @pytest.mark.parametrize('method', _REQUIRED_METHODS)
-def test_property_5_required_method_present(method: str) -> None:
+def test_required_method_present(method: str) -> None:
     s = MockSampler('mid')
     assert callable(getattr(s, method))
 
@@ -42,7 +42,7 @@ def test_property_5_required_method_present(method: str) -> None:
     max_tokens=st.integers(min_value=1, max_value=20),
     num_samples=st.integers(min_value=1, max_value=4),
 )
-def test_property_6_output_length_and_logprob_count(max_tokens: int, num_samples: int) -> None:
+def test_output_length_and_logprob_count(max_tokens: int, num_samples: int) -> None:
     s = MockSampler('mid')
     inp = InputFeature(input_ids=[1, 2, 3])
     responses = s.sample(inp, SamplingParams(max_tokens=max_tokens), adapter_name='a', num_samples=num_samples)
@@ -63,7 +63,7 @@ def test_property_6_output_length_and_logprob_count(max_tokens: int, num_samples
     num_samples=st.integers(min_value=1, max_value=3),
     adapter=st.sampled_from(['', 'a', 'lora-1']),
 )
-def test_property_7_determinism(max_tokens: int, num_samples: int, adapter: str) -> None:
+def test_determinism(max_tokens: int, num_samples: int, adapter: str) -> None:
     s = MockSampler('mid', seed=42)
     inp = InputFeature(input_ids=[1, 2, 3])
     r1 = s.sample(inp, SamplingParams(max_tokens=max_tokens), adapter_name=adapter, num_samples=num_samples)
@@ -76,7 +76,7 @@ def test_property_7_determinism(max_tokens: int, num_samples: int, adapter: str)
 
 @settings(max_examples=50)
 @given(bad=st.integers(max_value=0, min_value=-1000))
-def test_property_8_max_tokens_lt_1_raises(bad: int) -> None:
+def test_max_tokens_lt_1_raises(bad: int) -> None:
     s = MockSampler('mid')
     inp = InputFeature(input_ids=[1])
     with pytest.raises(ValueError) as exc:
@@ -84,7 +84,7 @@ def test_property_8_max_tokens_lt_1_raises(bad: int) -> None:
     assert 'max_tokens' in str(exc.value)
 
 
-def test_property_8_no_sampling_params_raises() -> None:
+def test_no_sampling_params_raises() -> None:
     s = MockSampler('mid')
     inp = InputFeature(input_ids=[1])
     with pytest.raises(ValueError):
@@ -98,7 +98,7 @@ def test_property_8_no_sampling_params_raises() -> None:
 @given(
     name=st.text(
         min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
-def test_property_9_add_adapter_to_sampler(name: str) -> None:
+def test_add_adapter_to_sampler(name: str) -> None:
     s = MockSampler('mid')
     assert not s.has_adapter(name)
     s.add_adapter_to_sampler(name, {'rank': 4})
@@ -109,14 +109,14 @@ def test_property_9_add_adapter_to_sampler(name: str) -> None:
 # ---------- Sampler backend dispatch -------------------------------------- #
 
 
-def test_property_11_mock_dispatch_returns_mock_sampler() -> None:
+def test_mock_dispatch_returns_mock_sampler() -> None:
     s = SAMPLER_SELECTOR.construct(SAMPLER_SELECTOR.validate('mock'), {'model_id': 'mid'})
     assert isinstance(s, MockSampler)
 
 
 @settings(max_examples=100)
 @given(bad=st.text(min_size=1, max_size=10).filter(lambda s: s not in _SAMPLER_TYPES))
-def test_property_11_invalid_sampler_type_raises_config_error(bad: str) -> None:
+def test_invalid_sampler_type_raises_config_error(bad: str) -> None:
     """Validation runs BEFORE any sampler import / instantiation."""
     with pytest.raises(ConfigError) as exc:
         SAMPLER_SELECTOR.validate(bad)
@@ -126,7 +126,7 @@ def test_property_11_invalid_sampler_type_raises_config_error(bad: str) -> None:
 
 
 @pytest.mark.parametrize('value', [None, ''])
-def test_property_11_absent_or_empty_sampler_type_raises(value) -> None:
+def test_absent_or_empty_sampler_type_raises(value) -> None:
     with pytest.raises(ConfigError) as exc:
         SAMPLER_SELECTOR.validate(value)
     assert exc.value.field == 'sampler_type'
@@ -162,7 +162,7 @@ def test_sample_stream_rejects_bad_max_tokens() -> None:
         list(s.sample_stream(inp, SamplingParams(max_tokens=0)))
 
 
-# ---------- Multi-turn contract knobs (task 8.6) -------------------------- #
+# ---------- Multi-turn contract knobs -------------------------- #
 
 
 def test_default_new_input_feature_appends_sampled_tokens() -> None:

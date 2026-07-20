@@ -100,7 +100,7 @@ async def test_renew_keeps_leader() -> None:
 
 @pytest.mark.asyncio
 async def test_leader_recovers_after_renewal_failure() -> None:
-    """Regression (Requirement 19): when a leader's renewal raises, it releases
+    """Regression: when a leader's renewal raises, it releases
     the lease best-effort so the very next election tick re-acquires leadership
     without waiting LEASE_TTL.
 
@@ -140,7 +140,7 @@ async def test_leader_recovers_after_renewal_failure() -> None:
 @pytest.mark.asyncio
 async def test_renewal_failure_does_not_steal_other_leader_lease() -> None:
     """A non-leader whose election attempt raises must NOT delete a lease that
-    another replica legitimately holds (Requirement 19.3)."""
+    another replica legitimately holds."""
     backend = RayActorBackend()
     leader = ServerState(backend=backend, cleanup_interval=600.0)
     follower = ServerState(backend=backend, cleanup_interval=600.0)

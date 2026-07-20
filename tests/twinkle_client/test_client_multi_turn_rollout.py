@@ -10,12 +10,12 @@ to the ``twinkle_client`` HTTP contract: ``FakeClientSampler.sample()`` mirrors
 from ``twinkle_client.types.sampler``) whose ``sequences[0]`` carries a populated
 ``new_input_feature`` so the multi-turn loop can proceed round after round.
 
-Properties covered (see design doc "Correctness Properties"):
-    * Property 3 - output length & order preservation      (Validates: Requirements 3.2)
-    * Property 4 - stop_reason value range                 (Validates: Requirements 3.3)
-    * Property 5 - logprobs / trainable-label alignment     (Validates: Requirements 3.4)
-    * Property 6 - actual turns never exceed max_turns      (Validates: Requirements 3.5)
-    * Property 7 - forced truncation at the max_turns edge  (Validates: Requirements 3.6)
+Properties covered:
+    * Output length & order preservation
+    * stop_reason value range
+    * logprobs / trainable-label alignment
+    * Actual turns never exceed max_turns
+    * Forced truncation at the max_turns edge
 """
 from __future__ import annotations
 
@@ -328,14 +328,12 @@ def _batch_specs(min_size: int = 1, max_size: int = 4):
 
 
 # =============================================================================
-# Property 3: multi-turn output length & order preservation (Req 3.2)
+# Multi-turn output length & order preservation
 # =============================================================================
 @settings(deadline=None, max_examples=60)
 @given(scripts_spec=_batch_specs(min_size=0, max_size=5), max_turns=st.integers(min_value=1, max_value=6))
-def test_property3_output_length_and_order_preserved(scripts_spec, max_turns):
-    """**Validates: Requirements 3.2**
-
-    ``__call__`` returns a list of the same length as the input, in the exact
+def test_output_length_and_order_preserved(scripts_spec, max_turns):
+    """``__call__`` returns a list of the same length as the input, in the exact
     same order (verified via the hidden per-trajectory ``_tid`` tag)."""
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
     rollout = ClientMultiTurnRollout(
@@ -349,14 +347,12 @@ def test_property3_output_length_and_order_preserved(scripts_spec, max_turns):
 
 
 # =============================================================================
-# Property 4: stop_reason value range (Req 3.3)
+# stop_reason value range
 # =============================================================================
 @settings(deadline=None, max_examples=60)
 @given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_property4_stop_reason_value_range(scripts_spec, max_turns):
-    """**Validates: Requirements 3.3**
-
-    Every returned trajectory's ``stop_reason`` is one of
+def test_stop_reason_value_range(scripts_spec, max_turns):
+    """Every returned trajectory's ``stop_reason`` is one of
     ``{'length', 'stop', 'max_turns'}``."""
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
     rollout = ClientMultiTurnRollout(
@@ -369,14 +365,12 @@ def test_property4_stop_reason_value_range(scripts_spec, max_turns):
 
 
 # =============================================================================
-# Property 5: logprobs / trainable-label alignment (Req 3.4)
+# logprobs / trainable-label alignment
 # =============================================================================
 @settings(deadline=None, max_examples=60)
 @given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_property5_logprobs_align_with_trainable_labels(scripts_spec, max_turns):
-    """**Validates: Requirements 3.4**
-
-    For every returned trajectory with a non-empty ``logprobs`` list, its length
+def test_logprobs_align_with_trainable_labels(scripts_spec, max_turns):
+    """For every returned trajectory with a non-empty ``logprobs`` list, its length
     equals the number of trainable labels (``label != -100``)."""
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
     rollout = ClientMultiTurnRollout(
@@ -393,14 +387,12 @@ def test_property5_logprobs_align_with_trainable_labels(scripts_spec, max_turns)
 
 
 # =============================================================================
-# Property 6: actual turns never exceed max_turns (Req 3.5)
+# Actual turns never exceed max_turns
 # =============================================================================
 @settings(deadline=None, max_examples=60)
 @given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_property6_turns_do_not_exceed_max_turns(scripts_spec, max_turns):
-    """**Validates: Requirements 3.5**
-
-    Every returned trajectory's ``turns`` count is <= the configured
+def test_turns_do_not_exceed_max_turns(scripts_spec, max_turns):
+    """Every returned trajectory's ``turns`` count is <= the configured
     ``max_turns``."""
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
     rollout = ClientMultiTurnRollout(
@@ -413,14 +405,12 @@ def test_property6_turns_do_not_exceed_max_turns(scripts_spec, max_turns):
 
 
 # =============================================================================
-# Property 7: forced truncation at the max_turns edge (Req 3.6)
+# Forced truncation at the max_turns edge
 # =============================================================================
 @settings(deadline=None, max_examples=60)
 @given(logprobs_flags=st.lists(st.booleans(), min_size=1, max_size=5))
-def test_property7_max_turns_one_forces_truncation(logprobs_flags):
-    """**Validates: Requirements 3.6**
-
-    With ``max_turns == 1`` and a first-round tool_call, every trajectory is
+def test_max_turns_one_forces_truncation(logprobs_flags):
+    """With ``max_turns == 1`` and a first-round tool_call, every trajectory is
     marked ``truncated=True`` and ``stop_reason='max_turns'`` and stops after
     exactly one turn."""
     # Every trajectory emits a tool_call on its first (and only allowed) turn.
@@ -442,7 +432,7 @@ def test_property7_max_turns_one_forces_truncation(logprobs_flags):
 # Deterministic unit tests: exception paths & dependency reuse (non-hypothesis)
 #
 # These cover the failure/edge contract described in the module docstring of
-# ``twinkle_client.rollout.multi_turn`` and requirements 3.7-3.10, 4.3-4.5, 7.1.
+# ``twinkle_client.rollout.multi_turn``.
 # All are CPU-only and reuse the Fake infra above.
 # =============================================================================
 class NetworkError(Exception):
