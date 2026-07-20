@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -271,24 +271,20 @@ def build_skill_solve_prompt(problem: str, skill: str) -> Dict[str, Any]:
 
 
 # -- skill-gen prompts (view A: problem + rubric source; view B: query only) --
+# Kept deliberately short: this is the RL policy's system prompt, so over-specifying
+# the output hurts convergence. The concrete output format is appended separately by
+# ``_SKILL_OUTPUT`` so the task text stays format-agnostic.
 SKILL_GEN_SYSTEM = (
-    'You are a math guidance writer. You are given a target problem and an automated '
-    'process-check from a related problem. Use it as context to write reusable guidance '
-    'for this and similar problems. In <pitfall>, write likely mistakes or checks only. '
-    'Leave empty if unclear. In <strategy>, write reusable solving advice.\n')
+    'You are a math guidance writer. A process-check on a related problem hints at '
+    'likely mistakes. Write short reusable guidance for this and similar problems, '
+    'and note what to watch out for.\n')
 
 SKILL_GEN_SYSTEM_Q = (
-    'You are a math guidance writer. Given the problem below, write reusable guidance '
-    'for this and similar problems. In <pitfall>, write likely mistakes or checks only. '
-    'Leave empty if unclear. In <strategy>, write reusable solving advice.\n')
+    'You are a math guidance writer. Write short reusable guidance for this and '
+    'similar problems.\n')
 
-_SKILL_OUTPUT_DUAL = (
-    'Output:\n'
-    '<pitfall>Your likely mistakes or checks here</pitfall>\n'
-    '<strategy>Your reusable solving advice here...</strategy>')
-
-_SKILL_OUTPUT_LEGACY = (
-    'Output a non-empty:\n<skills>\nYour remind and skill here...\n</skills>\nblock.')
+_SKILL_OUTPUT = (
+    'Output only:\n<skills>\nYour reusable solving guidance here.\n</skills>')
 
 SKILL_GEN_USER_Q = (
     'Problem:\n{problem}\n\n')
@@ -300,22 +296,25 @@ SKILL_GEN_USER_RUBRIC = (
     '{diagnosis}\n\n')
 
 
-def _skill_output_instruction(diagnose_skill_format: bool) -> str:
-    return _SKILL_OUTPUT_DUAL if diagnose_skill_format else _SKILL_OUTPUT_LEGACY
+def _rubric_has_fail(diagnosis: str) -> bool:
+    """View A uses the open-book rubric prompt (and, under --viewa-sft, SFT distillation)
+    IFF its rubric localised a failure. No ``[FAIL]`` => nothing to inject: generation
+    degrades to query-only and the problem is trained by GRPO exactly like view B. Single
+    source of truth so ``_skillgen_messages`` and ``_group_records`` never diverge."""
+    return '[FAIL]' in (diagnosis or '')
 
 
 def _skillgen_messages(problem: str, view: str, diagnosis: str,
-                       rubric_problem: str = '', diagnose_skill_format: bool = True) -> List[Dict[str, Any]]:
+                       rubric_problem: str = '') -> List[Dict[str, Any]]:
     """Single source of truth for the skill-gen prompt (used at BOTH generation and
     training so they never diverge). View A with a localisable failure uses the target
     problem plus the rubric source problem and findings; view B -- or a view-A problem
     whose rubric flagged nothing (no ``[FAIL]``) -- degrades to the query-only prompt."""
-    out = _skill_output_instruction(diagnose_skill_format)
-    if view == 'B' or '[FAIL]' not in (diagnosis or ''):
-        return [{'role': 'system', 'content': SKILL_GEN_SYSTEM_Q + out},
+    if view == 'B' or not _rubric_has_fail(diagnosis):
+        return [{'role': 'system', 'content': SKILL_GEN_SYSTEM_Q + _SKILL_OUTPUT},
                 {'role': 'user', 'content': SKILL_GEN_USER_Q.format(problem=problem)}]
     rubric_problem = rubric_problem or problem
-    return [{'role': 'system', 'content': SKILL_GEN_SYSTEM + out},
+    return [{'role': 'system', 'content': SKILL_GEN_SYSTEM + _SKILL_OUTPUT},
             {'role': 'user', 'content': SKILL_GEN_USER_RUBRIC.format(
                 problem=problem, rubric_problem=rubric_problem, diagnosis=diagnosis)}]
 
@@ -327,8 +326,7 @@ def _assign_view(problem: str, args: argparse.Namespace) -> str:
 
 def _view_prompt(r: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     return {'messages': _skillgen_messages(
-        r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''),
-        args.diagnose_skill_format)}
+        r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''))}
 
 
 _SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>')
@@ -353,36 +351,14 @@ def _extract_tag_block(answer: str, tag: str, allow_empty: bool = False) -> Opti
     return block if (block or allow_empty) else None
 
 
-def _join_pitfall_strategy(pitfall: str, strategy: str) -> str:
-    pitfall = (pitfall or '').strip()
-    strategy = (strategy or '').strip()
-    return strategy if not pitfall else f'{pitfall}\n\n{strategy}'
-
-
-def _extract_skill_blocks(text: str, diagnose_skill_format: bool = True) -> Optional[Dict[str, str]]:
-    """Parse skill-generation output.
-
-    With the pitfall-strategy format enabled, both ``<pitfall>`` and ``<strategy>`` tags
-    must be present, while ``<pitfall>`` may be empty; their inner texts are concatenated
-    for executor injection. With the legacy format, a non-empty ``<skills>`` block is
-    enough. If a ``</think>`` marker is present, parse only the text after the last marker;
-    otherwise parse the full response.
-    """
+def _extract_skill(text: str) -> Optional[str]:
+    """Parse skill-generation output: return the inner text of a non-empty ``<skills>``
+    block, or None. If a ``</think>`` marker is present, parse only the text after the
+    last one; otherwise parse the full response."""
     low = text.lower()
     end_think = low.rfind('</think>')
     answer = text[end_think + len('</think>'):] if end_think >= 0 else text
-    if diagnose_skill_format:
-        pitfall = _extract_tag_block(answer, 'pitfall', allow_empty=True)
-        strategy = _extract_tag_block(answer, 'strategy')
-        if pitfall is None or not strategy:
-            return None
-        joined = _join_pitfall_strategy(pitfall, strategy)
-        return {'pitfall': pitfall, 'strategy': strategy,
-                'diagnose': pitfall, 'skill': strategy, 'skills': joined}
-    block = _extract_tag_block(answer, 'skills')
-    if not block:
-        return None
-    return {'pitfall': '', 'strategy': block, 'diagnose': '', 'skill': block, 'skills': block}
+    return _extract_tag_block(answer, 'skills')
 
 
 def _parse_seq(seq, gold: str) -> Dict[str, Any]:
@@ -441,9 +417,10 @@ def load_problems(dataset: str, n: int, seed: int, num_proc: int = 0) -> List[Di
     ds.map(lambda rows: _boxed_batch(rows, dataset), num_proc=nproc)
     ds.filter(lambda row: row['_keep'], num_proc=nproc)
     has_level = 'level' in ds.dataset.column_names
-    out = [{'problem': row['problem'], 'reference_answer': row['reference_answer'],
+    out = [{'data_id': f'{dataset}:{i}', 'problem': row['problem'],
+            'reference_answer': row['reference_answer'],
             **({'level': row['level']} if has_level and row.get('level') else {})}
-           for row in ds.dataset]
+           for i, row in enumerate(ds.dataset)]
     logger.info(f'[data] {dataset}: {len(out)} boxed problems ({nproc} procs)')
     rng = np.random.RandomState(seed)
     rng.shuffle(out)
@@ -599,18 +576,43 @@ def _numeric_value(raw: Any) -> Optional[str]:
 
 
 def _answer_leaked(skill: str, reference: str) -> bool:
-    """Deterministic answer-leak check (replaces the LLM LeakVerifier). Flags ONLY the one
-    real way a skill can game the deterministic reward: writing the final answer verbatim.
-    On our numeric-only data the answer is a single number, so we require it as a
-    standalone token (digit boundaries) -- that avoids matching an intermediate value like
-    '3' inside '36'. Everything else (methods, plans, pitfalls) is left to the reward, the
-    way SEAM/POPE handle it (no content audit). Non-numeric answers -> not flagged."""
+    """Audit whether a generated skill contains the final answer verbatim. This is NOT
+    a training filter: if the skill model derives an answer from the problem, that is a
+    legitimate answer-bearing skill under this experiment. The real leakage boundary is the
+    external API/rubric diagnosis, which is constrained by prompt to stay answer-free."""
     if not skill:
         return False
     for cand in {_numeric_value(reference), (str(reference).strip() or None)}:
         if cand and re.search(r'(?<![\d.])' + re.escape(cand) + r'(?![\d.])', skill):
             return True
     return False
+
+
+def _load_excluded_records(paths_arg: str) -> Tuple[Set[str], Set[str]]:
+    """Read jsonl files and collect data_id/problem keys that must be excluded.
+
+    The cold-start SFT builder writes stable ``data_id`` values. ``problem`` is kept as a
+    backward-compatible fallback for older jsonl files produced before data_id existed."""
+    ids: Set[str] = set()
+    problems: Set[str] = set()
+    for raw_path in (paths_arg or '').split(','):
+        path = raw_path.strip()
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get('record_type') in {'config', 'summary'}:
+                    continue
+                data_id = str(row.get('data_id') or '').strip()
+                problem = str(row.get('problem') or '').strip()
+                if data_id:
+                    ids.add(data_id)
+                elif problem:
+                    problems.add(problem)
+    return ids, problems
 
 
 def _load_records(args: argparse.Namespace
@@ -630,9 +632,22 @@ def _load_records(args: argparse.Namespace
                    if v is not None]
         dropped = raw_n - len(records)
     np.random.RandomState(args.seed).shuffle(records)
+    exclude_ids, exclude_problems = _load_excluded_records(getattr(args, 'exclude_data_ids', ''))
+    excluded = 0
+    if exclude_ids or exclude_problems:
+        before = len(records)
+        records = [r for r in records
+                   if str(r.get('data_id', '')) not in exclude_ids
+                   and str(r.get('problem', '')).strip() not in exclude_problems]
+        excluded = before - len(records)
     eval_n = min(args.eval_size, len(records)) if args.eval_size > 0 else 0
     eval_records = [dict(r) for r in records[:eval_n]]
     pool = records[eval_n:]
+    pool_offset = max(0, int(getattr(args, 'pool_offset', 0) or 0))
+    if pool_offset:
+        if pool_offset >= len(pool):
+            raise ValueError(f'--pool-offset ({pool_offset}) leaves no train records from pool size {len(pool)}')
+        pool = pool[pool_offset:]
     train_n = args.n if args.n > 0 else len(pool)
     # Cross-problem rubric: pick the train_n problems with the strongest qualifying neighbour
     # (dense same-type pairs) and build {Q -> (P, sim)} in one index pass. Otherwise keep the
@@ -646,6 +661,7 @@ def _load_records(args: argparse.Namespace
     if {r['problem'] for r in train_records} & {r['problem'] for r in eval_records}:
         raise ValueError('eval/train overlap detected')
     stats = {'raw_loaded': raw_n, 'numeric_dropped': dropped,
+             'excluded_records': excluded, 'pool_offset': pool_offset,
              'train_records': len(train_records), 'eval_records': len(eval_records)}
     return train_records, eval_records, neighbor_map, pool_answers, stats
 
@@ -757,15 +773,11 @@ def _empty_roll() -> Dict[str, Any]:
             'stop_reason': 'empty', 'gen_tokens': 0, 'text': ''}
 
 
-def _roll_passed(roll: Dict[str, Any]) -> bool:
-    return bool(roll.get('passed', bool(roll.get('correct') and roll.get('terminated'))))
-
-
 def _apply_baseline(r: Dict[str, Any], roll: Dict[str, Any]) -> None:
     """Attach a greedy baseline roll and reset per-chunk working state."""
     r['_baseline_rolls'], r['_cands'], r['_init'] = [roll], [], [roll]
-    r['_failed'] = not _roll_passed(roll)
-    r['_baseline_pass'] = 1.0 if _roll_passed(roll) else 0.0
+    r['_failed'] = not roll['correct']
+    r['_baseline_pass'] = 1.0 if roll['correct'] else 0.0
     r['_hard'] = True  # process every problem; group variance selects (SEAM-style)
 
 
@@ -787,39 +799,44 @@ def baseline_rollout(base_sampler, problems: List[Dict[str, Any]], base_dp: int,
 
 # -- rubric process-check (view A): teacher diagnoses the base's attempt --
 _RFT_DIAG_SYSTEM = """\
-You are a process error checker for a math solution attempt. You are given a math
-problem, a rubric, and one attempted solution segment. Decide PASS or FAIL for each
-criterion and explain only the process error type.
+You are a strategy-level process checker for a math solution attempt. You are given a
+math problem, a rubric, and one attempted solution segment. Decide PASS or FAIL for each
+criterion, and write the diagnosis so it can become useful reusable guidance for solving
+similar problems without seeing this segment.
 
 Output STRICT JSON (no prose outside it) with this shape:
 {
   "items": [
     {"index": 1, "verdict": "PASS", "reason": "<why the process satisfies it>",
      "fix": ""},
-    {"index": 2, "verdict": "FAIL", "reason": "<what process step is wrong>",
-     "fix": "<method-level correction, without computing the corrected result>"}
+    {"index": 2, "verdict": "FAIL", "reason": "<what reusable process issue is present>",
+     "fix": "<local strategy correction, without solving the problem>"}
   ],
   "overall": "OK" | "ISSUES",
-  "summary": "<one sentence naming the process issue, not the answer>"
+  "summary": "<one sentence naming the reusable process issue, not the answer>"
 }
 
 Rules:
-- Judge every criterion independently and literally; a [Hard Rule] is FAIL unless
-  unambiguously satisfied.
-- Judge ONLY what is observable in THIS segment.
-- Content inside <think>...</think> (or <thinking>) is internal reasoning, not
-  user-facing output; ignore it for "output only X" style criteria.
+- Judge every criterion independently; a [Hard Rule] is FAIL unless clearly satisfied.
+- Judge ONLY what is observable in THIS segment. Ignore hidden <think> or <thinking>
+  content for output-format criteria.
+- The API diagnosis is an external teacher signal, so it must stay answer-free.
+- Prefer diagnosis that transfers to view-B skill generation: name the route choice,
+  structural observation, missing check, or length-control habit that a solver should
+  remember before solving a similar problem.
 - For PASS items, leave "fix" as "".
-- For FAIL items, "reason", "fix", and "summary" must describe only the flawed
-  step, theorem, arithmetic operation, case split, or verification habit.
-- NEVER state the correct final answer, corrected final expression, option letter,
-  graph/choice label, or any exact value that the answer should become.
-- NEVER write phrases like "the correct answer is", "which gives", "yielding",
-  "should be <value>", "Option <letter>", or "Graph <letter>".
-- If a fix would require naming a corrected value, replace it with a method-level
-  instruction such as "redo that computation carefully" or "apply the theorem with
-  the correct quantities".
-- Keep every "reason" and "fix" clear and concise — one short sentence each.
+- For FAIL items, describe the process problem at strategy level: unsuitable method,
+  missed structure, invalid transformation, missing constraint check, redundant cases,
+  off-track approach, contradiction, or inefficient/unfinished reasoning.
+- A fix may suggest the LOCAL correction direction, such as identify the key structure,
+  verify constraints, preserve equivalence, reduce redundant cases, or choose a more
+  direct route. Do not carry out the correction.
+- Never reveal the final answer, a corrected value/expression, an option label, or a
+  step-by-step solution that would let another model copy the solve.
+- If the segment contains a process note saying it was cut off before a final boxed
+  answer, mark the length-budget criterion as FAIL and suggest a method-level way to
+  finish faster.
+- Keep every "reason" and "fix" concise: one short sentence each.
 - "overall" is "OK" only if NO criterion is FAIL.
 - Output only the JSON object."""
 
@@ -836,12 +853,18 @@ _RFT_DIAG_USER = """\
 Now output the diagnostic JSON object."""
 
 _MATH_RUBRIC = [
-    ('The reasoning contains no arithmetic or algebraic error', True),
-    ('Each step follows logically from the previous ones', True),
-    ('No formula or theorem is misstated or misapplied', True),
-    ('The approach is on track to answer the actual question asked', False),
-    ('No step contradicts an earlier established fact', False),
+    ('The attempt chooses a method suitable for the problem structure', False),
+    ('The attempt identifies the key constraint, invariant, or quantity before computing', False),
+    ('Algebraic and logical transformations preserve validity at each step', True),
+    ('The attempt checks required constraints, domains, boundary cases, or validity conditions', False),
+    ('The attempt avoids redundant casework, looping, or re-deriving known facts', False),
+    ('The attempt reaches a final boxed answer within the length budget', False),
+    ('The approach stays focused on the actual question asked', False),
 ]
+
+# Bump when the rubric criteria or the diagnosis prompt change so the disk-cached
+# diagnoses written under an older rubric are not silently reused.
+_RUBRIC_VERSION = 'rubric_v5_viewb_strategy'
 
 
 class _RftRubricVerifier(RubricVerifier):
@@ -887,7 +910,9 @@ def diagnose_views(checker, problems: List[Dict[str, Any]], args: argparse.Names
         return
 
     def _key(r: Dict[str, Any]) -> str:
-        return DiskCache.key_for(r['problem'], r.get('_init', [{}])[0].get('text', ''))
+        init = r.get('_init', [{}])[0]
+        term = 'L' if (init.get('stop_reason') == 'length' or not init.get('terminated')) else 'T'
+        return DiskCache.key_for(r['problem'], init.get('text', ''), _RUBRIC_VERSION, term)
 
     pending = []
     for r in targets:
@@ -901,8 +926,13 @@ def diagnose_views(checker, problems: List[Dict[str, Any]], args: argparse.Names
 
     def _run(item):
         r, key = item
+        init = r['_init'][0]
+        seg_text = init['text']
+        if init.get('stop_reason') == 'length' or not init.get('terminated'):
+            seg_text += ('\n\n[Process note: this attempt was cut off at the token budget '
+                         'and never produced a final \\boxed{} answer.]')
         seg = {'messages': [{'role': 'user', 'content': r['problem']},
-                            {'role': 'assistant', 'content': r['_init'][0]['text']}]}
+                            {'role': 'assistant', 'content': seg_text}]}
         attempts = max(1, args.rubric_retries + 1)
         for attempt in range(attempts):
             try:
@@ -929,7 +959,7 @@ def diagnose_views(checker, problems: List[Dict[str, Any]], args: argparse.Names
 def _baseline_class(r: Dict[str, Any]) -> str:
     """success | fail_loop (out of length / never terminated) | fail_wrong."""
     roll = r['_init'][0]
-    if _roll_passed(roll):
+    if roll['correct']:
         return 'success'
     return 'fail_loop' if (roll['stop_reason'] == 'length' or not roll['terminated']) else 'fail_wrong'
 
@@ -1017,6 +1047,31 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
             c['advantage'], c['grpo_adv'], c['kept'] = adv, adv, c['reward'] > mean_r
 
 
+def _best_sft_candidate(r: Dict[str, Any], args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Pick ONE view-A candidate to distill (online context distillation). PREFER the
+    executor-verified PASSING skills (reward==1); if NONE passed -- common on the hard
+    problems that are exactly the cases worth distilling -- FALL BACK to any parseable
+    open-book skill regardless of the executor outcome. Answer-bearing skills produced by
+    the skill model itself are allowed here; only the external API/rubric diagnosis must be
+    answer-free. Within the chosen tier, take the one whose skill length is CLOSEST to
+    ``--sft-target-len`` -- an empirically high-pass-rate length (~500-600 chars in this
+    run) -- breaking ties by the fewest executor solve tokens. Targeting a length (rather
+    than the minimum) avoids a distillation feedback loop that would otherwise drive
+    rollouts ever shorter. None only when no parseable candidate exists at all."""
+    eligible = [c for c in r['_cands'] if c.get('parseable') and c.get('skills')]
+    if not eligible:
+        return None
+    passing = [c for c in eligible if c.get('reward') == 1.0]
+    cs = passing or eligible
+    target = int(getattr(args, 'sft_target_len', 550) or 550)
+
+    def _solve_tokens(c: Dict[str, Any]) -> int:
+        rolls = c.get('rolls') or []
+        return rolls[0].get('gen_tokens', 1 << 30) if rolls else (1 << 30)
+
+    return min(cs, key=lambda c: (abs(len(c['skills']) - target), _solve_tokens(c)))
+
+
 def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
                           neighbor_map: Dict[str, Tuple[str, float]],
                           pool_answers: Dict[str, str], base_dp: int,
@@ -1053,7 +1108,7 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                   neighbor_map: Optional[Dict[str, Tuple[str, float]]] = None,
                   pool_answers: Optional[Dict[str, str]] = None
                   ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
-    """view assign -> rubric-check (view A) -> skill-gen -> leak-filter -> with-skill
+    """view assign -> rubric-check (view A) -> skill-gen -> answer audit -> with-skill
     greedy pass -> GRPO advantages. ``chunk`` arrives already baselined by draw_chunk.
     With --xproblem-rubric, view A gets its NEIGHBOUR's rubric (see apply_neighbor_rubric)."""
     hard = chunk
@@ -1066,8 +1121,10 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
         diagnose_views(checker, hard, args, rubric_cache)
 
     # skill-gen (thinking OFF), per-view prompt; re-sample problems with no clean candidate.
+    # View-A problems that cannot yield a training record (no [FAIL] rubric, or rubric
+    # leaked the answer) are dropped from training entirely -- skip their generation.
     flat: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    pending = list(hard)
+    pending = [r for r in hard if not _viewa_dropped(r, args)]
     for _ in range(args.skill_retries + 1):
         if not pending:
             break
@@ -1080,13 +1137,8 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
             got = False
             for s in seqs:
                 resp = _clean_text(getattr(s, 'decoded', '') or '')
-                parsed = _extract_skill_blocks(resp, args.diagnose_skill_format)
-                block = parsed['skills'] if parsed else ''
-                cand = {'skills': block, 'pitfall': (parsed or {}).get('pitfall', ''),
-                        'strategy': (parsed or {}).get('strategy', ''),
-                        'diagnose': (parsed or {}).get('diagnose', ''),
-                        'skill': (parsed or {}).get('skill', ''),
-                        'response': resp, 'parseable': bool(parsed),
+                block = _extract_skill(resp) or ''
+                cand = {'skills': block, 'response': resp, 'parseable': bool(block),
                         'view': r['_view'], 'leaked': None, 'leak_reason': '',
                         'leak_source': '', 'with_pass': None, 'reward': None, 'rolls': [],
                         'skillgen_stop': getattr(s, 'stop_reason', None),
@@ -1099,16 +1151,16 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                 still.append(r)
         pending = still
 
-    # leak audit: deterministic verbatim-answer check only (no LLM). This is observability
-    # only: it records leak metrics for swanlab/jsonl, but does not block scoring, reward,
-    # advantage assignment, or training sample selection.
+    # Answer-bearing skill audit: deterministic verbatim-answer check only (no LLM). This
+    # is observability only; it records metrics for swanlab/jsonl, but does not block
+    # scoring, reward, advantage assignment, SFT candidate selection, or GRPO training.
     for r, c in flat:
         leaked = _answer_leaked(c['skills'], r['reference_answer'])
         c['leaked'] = leaked
         c['leak_reason'] = 'answer_verbatim' if leaked else ''
         c['leak_source'] = 'deterministic'
 
-    # with-skill greedy pass (T=0, M=1); reward = correct and terminated, absolute (group mean is baseline).
+    # with-skill greedy pass (T=0, M=1); reward = correct, absolute (group mean is baseline).
     scored_inputs = flat
     if scored_inputs:
         ws_out = _run_samples(base_sampler,
@@ -1116,7 +1168,7 @@ def process_chunk(base_sampler, skill_sampler, chunk: List[Dict[str, Any]],
                               1, args.max_tokens, base_dp, temperature=0.0)
         for (r, c), seqs in zip(scored_inputs, ws_out):
             c['rolls'] = [_parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()]
-            c['with_pass'] = 1.0 if _roll_passed(c['rolls'][0]) else 0.0
+            c['with_pass'] = 1.0 if c['rolls'][0]['correct'] else 0.0
             c['reward'] = c['with_pass']
     if args.format_in_reward:  # unparseable candidates score 0 and still join the group
         for r in hard:
@@ -1158,9 +1210,7 @@ def _full_record(r: Dict[str, Any], ci: int) -> Dict[str, Any]:
         'rubric_src': r.get('_rubric_src', ''), 'neighbor_sim': r.get('_neighbor_sim'),
         'baseline_rolls': [_roll(x) for x in r['_baseline_rolls']],
         'candidates': [{
-            'skills': c['skills'], 'pitfall': c.get('pitfall', ''), 'strategy': c.get('strategy', ''),
-            'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
-            'response': c['response'], 'parseable': c['parseable'],
+            'skills': c['skills'], 'response': c['response'], 'parseable': c['parseable'],
             'skillgen_stop': c.get('skillgen_stop'), 'skillgen_tokens': c.get('skillgen_tokens'),
             'leaked': c['leaked'], 'leak_reason': c['leak_reason'], 'leak_source': c['leak_source'],
             'with_pass': c['with_pass'], 'reward': c.get('reward'), 'advantage': c.get('advantage'),
@@ -1218,8 +1268,11 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
     scored = [c for c in cands if c['with_pass'] is not None]
     clean = [c for c in cands if c['leaked'] is False]
     ws_rolls = [x for c in scored for x in c['rolls']]
-    base_acc = (sum(r['_baseline_pass'] for r in chunk) / len(chunk)) if chunk else 0.0
-    ws_acc = _mean([1.0 if any(c.get('reward') for c in r['_cands']) else 0.0 for r in chunk])
+    # viewa-dropped problems generate no candidates; keep acc/* on the generated subset
+    # so the with-skill/lift trend stays comparable across view_b_frac settings.
+    gen_probs = [r for r in chunk if r['_cands']]
+    base_acc = _mean([1.0 if r['_baseline_pass'] else 0.0 for r in gen_probs])
+    ws_acc = _mean([1.0 if any(c.get('reward') for c in r['_cands']) else 0.0 for r in gen_probs])
     cand_pass_parseable = _mean([c['with_pass'] for c in scored])
     cand_pass_all = _mean([1.0 if c.get('reward') else 0.0 for c in all_cands])
     # base failure taxonomy (you asked whether skills fail because the base loops out of length)
@@ -1228,6 +1281,9 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
     skill_tokens = [c.get('skillgen_tokens') or 0 for c in cands]  # skill-gen response length
     trunc = sum(1 for r in chunk for c in r['_cands']
                 for x in c['rolls'] if x['stop_reason'] == 'length')
+    rubric_answer_leaks = sum(
+        1 for r in chunk
+        if r.get('_view') == 'A' and _rubric_has_fail(r.get('_rubric_diag')) and _rubric_answer_leaked(r))
     return {
         'record_type': 'summary', 'chunk': ci, 'n': len(chunk),
         'n_failed_first_try': sum(1 for r in chunk if r['_failed']),
@@ -1237,6 +1293,8 @@ def _chunk_summary(chunk: List[Dict[str, Any]], ci: int, args: argparse.Namespac
         'n_leaked': sum(1 for c in cands if c['leaked']), 'n_clean': len(clean),
         'leak_rate': (sum(1 for c in cands if c['leaked']) / len(cands)) if cands else 0.0,
         'n_reward_pos': sum(1 for c in scored if c['reward']),
+        'n_rubric_answer_leaked': rubric_answer_leaks,
+        'n_viewa_dropped': sum(1 for r in chunk if _viewa_dropped(r, args)),
         'n_train_samples': sum(1 for c in all_cands if _is_trainable(c, args)),
         'signal': _signal_stats(chunk),
         'fail_loop_frac': (sum(1 for c in classes if c == 'fail_loop') / n_fail) if n_fail else 0.0,
@@ -1266,23 +1324,66 @@ def _xproblem_stats(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> Di
         'neighbor_sim_mean': _mean([r.get('_neighbor_sim', 0.0) for r in paired])}}
 
 
+def _sft_record(r: Dict[str, Any], c: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    """A view-A context-distillation sample: the OPEN-BOOK (rubric-conditioned) skill ``c``
+    is the target, but the prompt is rebuilt as query-only (view B, no rubric) so the model
+    learns to produce it CLOSED-BOOK. Rides the same GRPOLoss with a positive constant
+    advantage (``--sft-weight``); single-step (old_logps=None) this reduces to
+    ``-w*logp + beta*KL`` -- a KL-anchored weighted cross-entropy toward the skill."""
+    return {
+        'data_id': r.get('data_id'),
+        'problem': r['problem'], 'reference_answer': r['reference_answer'],
+        'view': 'B', 'diagnosis': '', 'rubric_src': '', 'orig_view': 'A', 'sft': True,
+        'response': c['response'], 'skills': c['skills'],
+        'skillgen_stop': c.get('skillgen_stop'),
+        'advantage': float(args.sft_weight), 'grpo_adv': 0.0, 'kept': True,
+        'reward': c['reward'], 'with_pass': c['with_pass']}
+
+
+def _rubric_answer_leaked(r: Dict[str, Any]) -> bool:
+    """Hard safety gate for external API/rubric diagnosis. Unlike answer-bearing skills
+    generated by the policy itself, a rubric that contains the target final answer is an
+    external teacher leak and must not be distilled into view B."""
+    return _answer_leaked(r.get('_rubric_diag', ''), r.get('reference_answer', ''))
+
+
+def _viewa_dropped(r: Dict[str, Any], args: argparse.Namespace) -> bool:
+    """Under --viewa-sft a view-A problem trains ONLY through the SFT path (rubric with
+    [FAIL], answer-free). No-FAIL and rubric-leaked problems produce no training record
+    at all (no GRPO backflow: those prompts are query-only and would muddy the pure
+    view-B GRPO pool), so their skill-gen + executor scoring is skipped entirely."""
+    return (bool(args.viewa_sft) and r.get('_view') == 'A'
+            and (not _rubric_has_fail(r.get('_rubric_diag'))
+                 or _rubric_answer_leaked(r)))
+
+
 def _group_records(chunk: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
-    """GRPO training records: every trainable candidate with its view + rubric diagnosis
-    (the prompt is rebuilt from those by ``_skillgen_messages``, no trajectory stored)."""
+    """Training records. Under --viewa-sft, view A is SFT-only: a problem whose rubric
+    localised a failure (has ``[FAIL]``, answer-free) contributes ONE context-distillation
+    SFT sample (best parseable open-book skill -- preferring an executor-verified pass,
+    else any parseable candidate -- rebuilt query-only); no-FAIL / rubric-leaked view-A
+    problems are dropped (``_viewa_dropped``, generation already skipped). GRPO candidates
+    come from view B only, keeping that pool purely closed-book. Prompts are rebuilt from
+    the stored view/diagnosis by ``_skillgen_messages``."""
     out = []
     for r in chunk:
         if not r['_hard']:
             continue
+        if args.viewa_sft and r.get('_view') == 'A':
+            if _viewa_dropped(r, args):
+                continue
+            best = _best_sft_candidate(r, args)
+            if best is not None:
+                out.append(_sft_record(r, best, args))
+            continue
         for c in r['_cands']:
             if _is_trainable(c, args):
                 out.append({
+                    'data_id': r.get('data_id'),
                     'problem': r['problem'], 'reference_answer': r['reference_answer'],
                     'view': r.get('_view', 'A'), 'diagnosis': r.get('_rubric_diag', ''),
-                    'rubric_src': r.get('_rubric_src', ''),
+                    'rubric_src': r.get('_rubric_src', ''), 'sft': False,
                     'response': c['response'], 'skills': c['skills'],
-                    'pitfall': c.get('pitfall', ''), 'strategy': c.get('strategy', ''),
-                    'diagnose': c.get('diagnose', ''), 'skill': c.get('skill', ''),
-                    'diagnose_skill_format': args.diagnose_skill_format,
                     'skillgen_stop': c.get('skillgen_stop'),
                     'advantage': c['advantage'], 'grpo_adv': c['grpo_adv'], 'kept': c['kept'],
                     'reward': c['reward'], 'with_pass': c['with_pass']})
@@ -1306,8 +1407,7 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     selects the final assistant turn; Template masks the prompt and trains the whole
     response (the key-round prefix already excludes the prompt-provided <think>)."""
     msgs = _skillgen_messages(
-        rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''),
-        rec.get('diagnose_skill_format', True))
+        rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''))
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
             'user_data': {'key_rounds': [len(msgs)]}}
 
@@ -1325,7 +1425,9 @@ def _train_chunk(skill_model, ref_model, ckpt: CheckpointEngineManager, samples:
     ``old_logps`` (recomputed once, before any step) and let GRPOLoss form the PPO ratio
     against them. A single step keeps ``old_logps=None`` (ratio==1, pure on-policy).
     The batch is padded to a multiple of ``sft_batch_size`` with advantage-0 copies that
-    contribute no policy gradient."""
+    contribute no policy gradient. View-A context-distillation samples ride the same loss
+    with a positive constant advantage (``--sft-weight``); single-step (old_logps=None)
+    that is ``-w*logp + beta*KL`` (KL-anchored weighted cross-entropy)."""
     trajs = [_train_trajectory(rec) for rec in samples]
     advs = [float(rec['advantage']) for rec in samples]
     rem = (-len(trajs)) % args.sft_batch_size
@@ -1360,7 +1462,9 @@ def _train_chunk(skill_model, ref_model, ckpt: CheckpointEngineManager, samples:
         n_steps += 1
     ckpt.sync_weights(merge_and_sync=True)
     metric = skill_model.calculate_metric(is_training=True)
-    return {'n_samples': len(samples), 'n_steps': n_steps, 'n_micro_batches': micro,
+    n_sft = sum(1 for s in samples if s.get('sft'))
+    return {'n_samples': len(samples), 'n_sft': n_sft, 'n_grpo': len(samples) - n_sft,
+            'n_steps': n_steps, 'n_micro_batches': micro,
             'metric': {k: (float(v) if _is_num(v) else v) for k, v in (metric or {}).items()}}
 
 
@@ -1374,7 +1478,7 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
     """SEAM ``val-core/math/acc/mean@1`` on the fixed holdout: ONE greedy skill (T=0) per
     problem into ONE greedy base solve (T=0). Eval ALWAYS uses view B (query-only, the
     deployment form: no rubric, since rubric needs an online teacher unavailable at deploy);
-    no leak filter. Main acc requires both correctness and normal termination. Baseline reuses the disk cache."""
+    no leak filter (acc scores correctness alone). Baseline reuses the disk cache."""
     baseline_rollout(base_sampler, eval_records, base_dp, args, base_cache)
     for r in eval_records:
         r['_view'], r['_rubric_diag'] = 'B', ''
@@ -1383,45 +1487,38 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records: List[Dict[str, An
     skills = []
     for seqs in sg_out:
         if not seqs:
-            skills.append(('', '', '', ''))
+            skills.append(('', ''))
             continue
         sresp = _clean_text(getattr(seqs[0], 'decoded', '') or '')
-        parsed = _extract_skill_blocks(sresp, args.diagnose_skill_format)
-        skills.append((parsed['skills'] if parsed else '',
-                       (parsed or {}).get('pitfall', ''),
-                       (parsed or {}).get('strategy', ''),
-                       sresp))
+        skills.append((_extract_skill(sresp) or '', sresp))
     ws_out = _run_samples(base_sampler,
-                          [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _, _, _) in zip(eval_records, skills)],
+                          [build_skill_solve_prompt(r['problem'], sk) for r, (sk, _) in zip(eval_records, skills)],
                           1, args.max_tokens, base_dp, temperature=0.0)
     recs = []
-    for r, (sk, pitfall_text, strategy_text, sresp), seqs in zip(eval_records, skills, ws_out):
+    for r, (sk, sresp), seqs in zip(eval_records, skills, ws_out):
         roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
         recs.append({
             'record_type': 'eval_problem', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
+            'data_id': r.get('data_id'),
             'problem': r['problem'], 'reference_answer': r['reference_answer'],
             'view': r['_view'], 'rubric_diag': r.get('_rubric_diag', ''),
-            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_pitfall': pitfall_text,
-            'skill_strategy': strategy_text, 'skill_diagnose': pitfall_text,
-            'skill_action': strategy_text, 'skill_parseable': bool(sk),
+            'baseline_pass': r['_baseline_pass'], 'skill': sk, 'skill_parseable': bool(sk),
             'skill_response': sresp, 'withskill_pred': roll['pred'],
             'withskill_correct': roll['correct'], 'withskill_terminated': roll['terminated'],
-            'withskill_pass': _roll_passed(roll),
             'withskill_stop_reason': roll['stop_reason'], 'withskill_text': roll['text'],
         })
-    acc = lambda rs: sum(1 for x in rs if x['withskill_pass']) / len(rs) if rs else 0.0
+    acc = lambda rs: sum(1 for x in rs if x['withskill_correct']) / len(rs) if rs else 0.0
     ws = acc(recs)  # all view B (deployment form)
     base = sum(x['baseline_pass'] for x in recs) / len(recs) if recs else 0.0
-    correct = (sum(1 for x in recs if x['withskill_correct']) / len(recs)) if recs else 0.0
     fmt = (sum(1 for x in recs if x['skill_parseable']) / len(recs)) if recs else 0.0
     term = (sum(1 for x in recs if x['withskill_terminated']) / len(recs)) if recs else 0.0
     summary = {'record_type': 'eval_summary', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
                'n': len(recs), 'view': 'B', 'acc_mean1': ws,
                'baseline_acc_mean1': base, 'lift_mean1': ws - base,
-               'correct_mean1': correct, 'format_mean1': fmt, 'term_mean1': term}
+               'format_mean1': fmt, 'term_mean1': term}
     metrics = {'core/math/acc/mean@1': ws, 'core/math/baseline_acc/mean@1': base,
-               'core/math/lift/mean@1': ws - base, 'core/math/correct/mean@1': correct,
-               'core/math/format/mean@1': fmt, 'core/math/term/mean@1': term}
+               'core/math/lift/mean@1': ws - base, 'core/math/format/mean@1': fmt,
+               'core/math/term/mean@1': term}
     return recs, summary, metrics
 
 
@@ -1457,6 +1554,9 @@ def _swan_metrics(summary: Dict[str, Any], log: Optional[Dict[str, Any]]) -> Dic
         # --- base failure taxonomy (loop-out-of-length vs plain wrong) ---
         'fail/loop_frac': summary['fail_loop_frac'], 'fail/wrong_frac': summary['fail_wrong_frac'],
         'fail/frac_first_try': (summary['n_failed_first_try'] / summary['n']) if summary['n'] else 0.0,
+        # --- view-A routing: dropped = no-FAIL rubric or rubric leak (SFT-only view A) ---
+        'viewa/dropped_frac': (summary['n_viewa_dropped'] / summary['view_A']['n']
+                               if summary['view_A']['n'] else 0.0),
     }
     bal = summary.get('balance') or {}
     if bal.get('enabled'):
@@ -1571,6 +1671,12 @@ def _build_args() -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--dataset', choices=('aops', 'math'), default='aops')
     p.add_argument('--n', type=int, default=2000, help='Problems loaded into the draw pool.')
+    p.add_argument('--pool-offset', type=int, default=0,
+                   help='Skip this many shuffled non-eval records before building the train pool; '
+                        'useful to avoid cold-start SFT data ranges.')
+    p.add_argument('--exclude-data-ids', default='',
+                   help='Comma-separated jsonl files whose data_id/problem keys are excluded '
+                        'from train/eval selection, e.g. coldstart_sft.jsonl.')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--eval-size', type=int, default=128, help='Fixed holdout size (0 disables).')
@@ -1583,18 +1689,15 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--balance-max-draws-mult', type=int, default=8)
     p.add_argument('--n-skills', type=int, default=8)
     p.add_argument('--view-b-frac', type=float, default=0.5)
-    p.add_argument('--xproblem-rubric', action=argparse.BooleanOptionalAction, default=True,
-                   help='View A uses its bag-of-words NEIGHBOUR problem\'s rubric (transfer '
-                        'test; kills answer leakage since the neighbour\'s answer differs). '
-                        'On (default); --no-xproblem-rubric = each problem uses its own rubric '
-                        '(may leak).')
+    p.add_argument('--xproblem-rubric', action=argparse.BooleanOptionalAction, default=False,
+                   help='When enabled, view A uses a bag-of-words NEIGHBOUR problem rubric. '
+                        'Default is off: each view-A problem uses its own baseline attempt, '
+                        'while the API diagnosis prompt is constrained to be answer-free and '
+                        'method-level only.')
     p.add_argument('--skill-retries', type=int, default=2)
     p.add_argument('--skill-gen-temperature', type=float, default=1.0)
     p.add_argument('--skill-gen-top-p', type=float, default=1.0)
     p.add_argument('--skill-gen-top-k', type=int, default=-1)
-    p.add_argument('--diagnose-skill-format', action=argparse.BooleanOptionalAction, default=True,
-                   help='Require <pitfall> and <strategy> blocks for skill-gen format; '
-                        '--no-diagnose-skill-format falls back to legacy <skills>.')
     p.add_argument('--max-model-len', type=int, default=16384)
     p.add_argument('--max-tokens', type=int, default=8192)
     p.add_argument('--skill-max-tokens', type=int, default=8192)
@@ -1615,6 +1718,19 @@ def _build_args() -> argparse.Namespace:
                    help='Symmetric clip for group-relative advantages; <=0 disables clipping.')
     p.add_argument('--kl-beta', type=float, default=0.001,
                    help='SEAM-style reference KL coefficient for GRPOLoss.')
+    p.add_argument('--viewa-sft', action=argparse.BooleanOptionalAction, default=True,
+                   help='Route view-A problems to online context distillation (SFT on the best '
+                        'passing open-book skill, rebuilt as a query-only prompt) instead of GRPO. '
+                        'View B stays GRPO; both share one optimizer step.')
+    p.add_argument('--sft-weight', type=float, default=0.5,
+                   help='Advantage magnitude (lambda) for view-A SFT distillation samples in the '
+                        'shared GRPOLoss. Single-step this is -lambda*logp + beta*KL (weighted CE). '
+                        'Keep <~1 so one-signed SFT gradients do not swamp mean-0 GRPO advantages.')
+    p.add_argument('--sft-target-len', type=int, default=550,
+                   help='Target skill length (chars) for view-A SFT distillation: among passing '
+                        'candidates pick the one CLOSEST to this length (not the shortest). Set near '
+                        'the empirical pass-rate peak (~500-600 here) so distillation neither shrinks '
+                        'rollouts toward zero nor lets them grow unbounded.')
     p.add_argument('--format-in-reward', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--lr', type=float, default=6e-6)
     p.add_argument('--max-train-rounds', type=int, default=1500)
@@ -1684,16 +1800,19 @@ def main() -> None:
 
     cfg = {'record_type': 'config', 'model': MODEL_ID, 'dataset': args.dataset,
            'n': len(records), 'eval_n': len(eval_records), 'seed': args.seed,
+           'pool_offset': args.pool_offset, 'exclude_data_ids': args.exclude_data_ids,
+           'excluded_records': data_stats.get('excluded_records', 0),
            'numeric_only': args.numeric_only, 'raw_loaded': data_stats['raw_loaded'],
            'numeric_dropped': data_stats['numeric_dropped'], 'eval_every': args.eval_every,
            'n_skills': args.n_skills, 'view_b_frac': args.view_b_frac,
-           'diagnose_skill_format': args.diagnose_skill_format,
            'skill_retries': args.skill_retries, 'balance': args.balance,
            'balance_success_frac': args.balance_success_frac,
-           'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct_and_terminated)',
+           'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct)',
            'advantage': 'group_relative', 'format_in_reward': args.format_in_reward, 'cache': use_cache,
-           'rubric_check': 'fixed_math_5crit(viewA)' if checker else 'disabled',
+           'rubric_check': f'fixed_math_{len(_MATH_RUBRIC)}crit+term(viewA)' if checker else 'disabled',
            'xproblem_rubric': args.xproblem_rubric,
+           'viewa_sft': args.viewa_sft, 'sft_weight': args.sft_weight,
+           'sft_target_len': args.sft_target_len,
            'adv_clip': args.adv_clip,
            'grpo_epsilon': args.grpo_epsilon, 'kl_beta': args.kl_beta, 'lr': args.lr,
            'train_gpus': TRAIN_GPUS, 'ref_gpus': REF_GPUS, 'ref_fsdp': REF_FSDP,
@@ -1790,9 +1909,11 @@ def main() -> None:
                        + ('!' if balance.get('budget_hit') else '') + ') ') if balance.get('enabled') else ''
             xp = summary.get('xproblem')
             xp_str = f'pair={xp["pair_rate"]:.2f}@{xp["neighbor_sim_mean"]:.2f} ' if xp else ''
+            tr_str = (f'train={log["n_grpo"]}g/{log["n_sft"]}s ' if log
+                      else f'train={summary["n_train_samples"]} ')
             sys.stderr.write(
                 f'[gen] e{pool.epoch} g{gstep}: {bal_str}n={summary["n"]} '
-                f'clean={summary["n_clean"]} leak={summary["leak_rate"]:.2f} train={summary["n_train_samples"]} '
+                f'clean={summary["n_clean"]} leak={summary["leak_rate"]:.2f} {tr_str}'
                 f'0grad={sig["zero_grad_frac"]:.2f} R={sig["reward_mean"]:.2f}±{sig["reward_std"]:.2f} '
                 f'acc={summary["avg_baseline_pass"]:.2f}->{summary["avg_withskill_pass"]:.2f} '
                 f'lift={summary["avg_lift"]:+.3f} {xp_str}'

@@ -26,24 +26,25 @@ export GEN_GPU_MEM=${GEN_GPU_MEM:-0.8}
 export LLM_BACKUP_API_KEY=${LLM_BACKUP_API_KEY:-}
 export LLM_BACKUP_BASE_URL=${LLM_BACKUP_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
 export LLM_BACKUP_MODEL=${LLM_BACKUP_MODEL:-qwen3.7-max}
+export EXCLUDE_DATA_IDS=${EXCLUDE_DATA_IDS:-./output/reflexion_coldstart_sft/coldstart_sft.jsonl}
 
 python cookbook/exp/embedding/train_reflexion_skill.py \
   --dataset aops \
   --n 5000 \
   --numeric-only \
-  --chunk-size 32 \
-  --n-skills 16 \
-  --view-b-frac 0.5 \
-  --xproblem-rubric \
+  --chunk-size 64 \
+  --n-skills 8 \
+  --view-b-frac 0.30 \
   --skill-retries 2 \
   --balance \
-  --balance-success-frac 0.3 \
+  --balance-success-frac 0.2 \
   --balance-loop-frac 0.5 \
   --balance-max-draws-mult 8 \
   --max-tokens 8192 \
   --skill-max-tokens 4096 \
   --max-model-len 16384 \
   --eval-size 128 \
+  --exclude-data-ids "${EXCLUDE_DATA_IDS}" \
   --eval-every 5 \
   --sft-batch-size 8 \
   --ppo-mini-batch-size 0 \
@@ -57,4 +58,4 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --prefetch-baseline \
   --output-dir ./output/reflexion_skill \
   --swanlab-project twinkle \
-  --swanlab-exp reflexion_skill_rft
+  --swanlab-exp reflexion_skill_sft35
