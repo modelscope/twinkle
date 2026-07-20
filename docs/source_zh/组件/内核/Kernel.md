@@ -2,12 +2,13 @@
 
 `twinkle.kernel` 提供一个 mapping 驱动的内核替换接口，把“用一种实现替换模型里的另一种实现”压缩为一次 `kernelize(model, mapping)` 调用。
 
-公开符号只有三个：
+公开符号只有四个：
 
 | 符号 | 作用 |
 | --- | --- |
 | `kernelize(model, mapping=None)` | 在 `model` 上应用 `mapping`，原地修改后返回。省略 `mapping` 时按当前平台自动检测（见下文） |
 | `npu_builtin(model=None)` | 返回 Ascend NPU 内置替换的 mapping dict（可与用户 mapping 自由组合） |
+| `liger_builtin(model=None)` | 返回 Liger Kernel 内置替换的 mapping dict —— 跨设备（CUDA Triton + Ascend NPU）。值为裸 impl，不做设备门控 |
 | `hub(ref, *, revision=None, version=None, backend=None, trust_remote_code=False)` | 构造一个 `HubRef`，用作 mapping value；真实下载推迟到 `kernelize` 执行 |
 
 ## Mapping 语义
@@ -131,6 +132,39 @@ mapping = {
 }
 model = kernelize(model, mapping)
 ```
+
+## Liger Kernel 内置
+
+`liger_builtin(model)` 返回**裸** Liger impl（不做设备门控）的 mapping，覆盖 Qwen / Llama / Mistral / Mixtral / Phi3 / Gemma / Olmo2 / GLM4 / Granite / InternVL 各族的 RoPE、RMSNorm、SwiGLU/GeGLU 及 MoE experts。值为裸 impl，是因为 Liger 自身就跨设备分派：CUDA 走 Triton、Ascend NPU 走自动应用的 `backends/_ascend` 后端（经 `liger_kernel.utils.infer_device`）。若包成 `{'cuda': impl}` 会在 NPU 上错误跳过——而 Liger 在 NPU 上是完全支持的。
+
+融合线性 CE 的 `forward` 替换与全局 `nn.functional.cross_entropy` 替换**不在此 bundle 内**——它们属于 loss 层（`twinkle.loss`），不属于 kernel 层。
+
+```python
+from twinkle.kernel import kernelize, liger_builtin
+
+model = kernelize(model, liger_builtin(model))
+```
+
+### Liger 与 NPU bundle 组合
+
+在 NPU 上 `npu_builtin` 与 `liger_builtin` 都是同一批算子的 NPU 实现。普通 dict 合并即可选择优先级（后写的 key 胜出）：
+
+```python
+from twinkle.kernel import kernelize, liger_builtin, npu_builtin
+
+# 重叠算子由 Liger 胜出
+model = kernelize(model, {**npu_builtin(model), **liger_builtin(model)})
+# 重叠算子由 Twinkle-NPU 胜出
+model = kernelize(model, {**liger_builtin(model), **npu_builtin(model)})
+```
+
+### NPU 优先级：逐层算子上 CANN 胜过 Liger-Triton
+
+在 Ascend NPU 上，`liger_builtin()` 会通过 `_prefer_cann_on_npu` 做后处理：对带宽敏感的逐层算子（RMSNorm、SwiGLU、RoPE），Liger 的 Triton-on-Ascend 内核会被替换为 `npu_impls` 里更快的 CANN 厂商算子；`LigerExperts` / `LigerQwen3MoeSwiGLUMLP` 的类替换也会被丢弃，从而让 `npu_builtin` 的 forward 级 CANN 分组矩阵乘 MoE expert 路径生效。没有 CANN 对应实现的非 Qwen 族仍保留 Liger impl。因此在 NPU 上 `liger_builtin` 与 `npu_builtin` 是**叠加**关系（只贡献 CANN 缺少的算子），`npu + liger` 在这些算子上不会比单独 `npu` 更慢。融合线性 CE loss（`twinkle.loss`）不受影响——该处没有 CANN 对应实现，仍用 Liger 的融合内核。CUDA 上 bundle 不变。
+
+### RMSNorm 属性迁移
+
+Liger 的 `LigerRMSNorm.forward` 读取的实例属性（`offset` / `casting_mode` / `in_place` / `row_mode`）在 HuggingFace 的 RMSNorm 变体上并不存在。Liger 的 monkey-patch 通过 `_patch_rms_norm_module` 急切地设置这些属性；`liger_impls.rms_norm` 适配器改为在 `forward` 内**懒设置**（按族默认值：llama 风格 `offset=0.0, casting_mode="llama"`，gemma 风格 `offset=1.0, casting_mode="gemma"`，gemma4 `offset=0.0`）。不污染任何全局状态——与 `npu_builtin` 的 SDPA 全局 install 形成对比。
 
 ## 环境变量
 

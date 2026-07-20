@@ -1,8 +1,9 @@
-def test_public_exports_exactly_three_symbols():
+def test_public_exports_exactly_four_symbols():
     import twinkle.kernel as k
-    assert sorted(k.__all__) == ['hub', 'kernelize', 'npu_builtin']
+    assert sorted(k.__all__) == ['hub', 'kernelize', 'liger_builtin', 'npu_builtin']
     assert callable(k.kernelize)
     assert callable(k.npu_builtin)
+    assert callable(k.liger_builtin)
     assert callable(k.hub)
 
 

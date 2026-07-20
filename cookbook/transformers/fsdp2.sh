@@ -1,6 +1,12 @@
 #!/bin/sh
 # All training config passed as CLI flags. Override at invocation, e.g.:
 #   sh fsdp2.sh --batch-size 16 --lr 5e-5
+#
+# Liger Kernel: pass --enable-liger to swap in Liger's Triton (CUDA) / Ascend
+# (NPU) kernels via `kernelize(model, liger_builtin(model))`. Without the flag
+# the NPU path uses `npu_builtin()` and the CUDA path is untouched.
+#   sh fsdp2.sh --enable-liger            # enable Liger
+#   sh fsdp2.sh --no-enable-liger         # explicitly disable (default)
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun --nproc_per_node=8 fsdp2.py \

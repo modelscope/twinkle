@@ -1,4 +1,5 @@
 from functools import partial
+import os
 from peft import LoraConfig
 
 import twinkle
@@ -9,7 +10,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize, npu_builtin
+from twinkle.kernel import kernelize, liger_builtin, npu_builtin
 
 logger = get_logger()
 args = CLI.from_args()
@@ -45,7 +46,9 @@ def eval(model):
 def create_dataset(data_slice=None):
     train_samples = args.training.train_samples or 500
     dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=data_slice or range(train_samples)))
-    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
+                         max_length=args.template.max_length,
+                         truncation_strategy=args.template.truncation_strategy)
     dataset.map(SelfCognitionProcessor(
         args.extra.get('model_name', 'twinkle模型'),
         args.extra.get('model_author', 'twinkle团队'),
@@ -66,9 +69,19 @@ def train():
         device_mesh=device_mesh,
         strategy=args.model.strategy,
     )
-    # npu patch
-    if Torch.is_npu_available():
-        model = kernelize(model, npu_builtin(model))
+    # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,
+    # CANN + FLA) | npu+liger (--enable-liger, Liger per-layer on top of CANN).
+    # Sharding/batch are unchanged across modes.
+    _torch_baseline = os.environ.get('TWINKLE_TORCH_BASELINE', '').lower() in ('1', 'true', 'yes')
+    kernel_mapping = {}
+    if Torch.is_npu_available() and not _torch_baseline:
+        kernel_mapping.update(npu_builtin(model))
+    if args.model.enable_liger and not _torch_baseline:
+        kernel_mapping.update(liger_builtin(model))
+    if kernel_mapping:
+        model = kernelize(model, kernel_mapping)
+    _use_fused_ce = args.model.enable_liger and not _torch_baseline and args.model.enable_fused_ce
+    _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
     lora_config = LoraConfig(**args.get_lora_args())
     model.add_adapter_to_model(args.lora.adapter_name, lora_config,
                                gradient_accumulation_steps=args.training.gradient_accumulation_steps)
@@ -81,11 +94,23 @@ def train():
         adapter_name=args.lora.adapter_name,
     )
 
+    if _use_fused_ce:
+        model.set_loss('LigerFusedLinearCrossEntropyLoss', adapter_name=args.lora.adapter_name,
+                       reduction='sum')
+
     logger.info(model.get_train_configs(adapter_name=args.lora.adapter_name))
     logger.info(f'Total steps: {len(dataloader)}')
 
+    if _use_fused_ce:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            _dist.barrier()
+        if Torch.is_npu_available():
+            import torch_npu
+            torch.npu.synchronize()
+
     for step, batch in enumerate(dataloader):
-        model.forward_backward(inputs=batch, adapter_name=args.lora.adapter_name)
+        model.forward_backward(inputs=batch, task=_task, adapter_name=args.lora.adapter_name)
         model.clip_grad_and_step(adapter_name=args.lora.adapter_name)
         if step % args.training.log_interval == 0:
             metric = model.calculate_metric(is_training=True, adapter_name=args.lora.adapter_name)

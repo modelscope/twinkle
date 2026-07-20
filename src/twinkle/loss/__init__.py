@@ -6,12 +6,14 @@ from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .infonce import InfonceLoss
+from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .mse import MSELoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
     'cross_entropy': CrossEntropyLoss,
+    'liger_fused_linear_cross_entropy': LigerFusedLinearCrossEntropyLoss,
     # KD losses
     'gkd': GKDLoss,
     # RL losses

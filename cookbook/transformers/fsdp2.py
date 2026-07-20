@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from peft import LoraConfig
@@ -12,7 +13,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize, npu_builtin
+from twinkle.kernel import kernelize, liger_builtin, npu_builtin
 
 logger = get_logger()
 args = CLI.from_args()
@@ -23,7 +24,9 @@ twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 def build_dataset(num_samples: int) -> Dataset:
     dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(num_samples)))
-    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id,
+                        max_length=args.template.max_length,
+                        truncation_strategy=args.template.truncation_strategy)
     dataset.map(SelfCognitionProcessor(
         args.extra.get('model_name', 'twinkle大模型'),
         args.extra.get('model_author', 'ModelScope社区'),
@@ -56,10 +59,36 @@ def train():
     dataset = build_dataset(train_samples)
     dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)
     model = TransformersModel(model_id=args.model.model_id)
-    model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
-    # npu patch
-    if Torch.is_npu_available():
-        model = kernelize(model, npu_builtin(model))
+    # Discover the actual decoder-layer class name(s) from the live model — the
+    # ``model_type.title() + 'DecoderLayer'`` heuristic misnames MoE models
+    # (e.g. ``qwen3_5_moe`` -> ``Qwen3_5_MoeDecoderLayer`` vs the real
+    # ``Qwen3_5MoeDecoderLayer``).
+    discovered = {type(m).__name__ for m in model.model.modules()
+                  if type(m).__name__.endswith('DecoderLayer')}
+    model.model._no_split_modules = list(discovered) or [model.model.config.model_type.title() + 'DecoderLayer']
+    # Compose the kernel mapping: NPU built-ins first, then Liger on top so
+    # `--enable-liger` opts into Liger's cross-device Triton/Ascend kernels
+    # (later keys win on overlap — see twinkle.kernel Kernel.md).
+    kernel_mapping = {}
+    # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,
+    # CANN + FLA) | npu+liger (--enable-liger, Liger per-layer + fused-CE).
+    _torch_baseline = os.environ.get('TWINKLE_TORCH_BASELINE', '').lower() in ('1', 'true', 'yes')
+    if Torch.is_npu_available() and not _torch_baseline:
+        kernel_mapping.update(npu_builtin(model))
+    if args.model.enable_liger and not _torch_baseline:
+        kernel_mapping.update(liger_builtin(model))
+    if kernel_mapping:
+        model = kernelize(model, kernel_mapping)
+
+    # `--enable-liger` turns on BOTH the per-layer Liger/CANN kernels (above)
+    # AND, by default (`enable_fused_ce=True`), the LigerFusedLinearCrossEntropyLoss
+    # which skips the lm_head GEMM so the (B,T,V) logits tensor is never materialised.
+    # The forward then runs under task='fused_lm_ce' (TransformersFusedCEPatch).
+    # Pass `--no-fused-ce` to keep only the per-layer kernels (standard CE loss).
+    # The loss is device-agnostic: on NPU/CUDA it auto-falls-back to materialised
+    # CE if the fused kernel raises for a given shape (defensive).
+    _use_fused_ce = args.model.enable_liger and args.model.enable_fused_ce
+    _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
 
     lora_config = LoraConfig(**args.get_lora_args())
     model.add_adapter_to_model(
@@ -81,6 +110,9 @@ def train():
         scheduler_cls=args.scheduler.scheduler_cls,
         num_warmup_steps=args.scheduler.num_warmup_steps,
         num_training_steps=len(dataloader))
+    if _use_fused_ce:
+        model.set_loss('LigerFusedLinearCrossEntropyLoss', adapter_name=args.lora.adapter_name,
+                       reduction='sum')
 
     if args.training.resume_from_checkpoint:
         checkpoint_path = Path(args.training.resume_from_checkpoint).expanduser().resolve()
@@ -97,8 +129,31 @@ def train():
     optimizer_group = model.optimizer_group[args.lora.adapter_name]
     best_loss = float('inf')
     eval_interval = args.training.eval_interval or 40
+    if _use_fused_ce:
+        # One-time cross-rank + device drain before the first fused-CE step.
+        # Under accelerate-FSDP2 the first forward lazily runs fully_shard init
+        # (collectives) and the fused-CE loss issues an ad-hoc lm_head.weight
+        # full_tensor() gather after the (identity) lm_head forward; if ranks
+        # enter the loop slightly desynchronised (asymmetric setup), the
+        # collective streams order differently across ranks and the first
+        # backward deadlocks (rank A in autograd backward, rank B already in
+        # the Muon optimizer's DTensor redistribution). A single barrier +
+        # device sync re-aligns the ranks; later steps stay aligned because
+        # the fused-CE + FSDP2 collectives are rank-symmetric. liger_bench.py
+        # avoids this with a per-step _synchronize(); one pre-loop drain is
+        # sufficient (verified on 35B MoE, 4x Ascend, FSDP2).
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            _dist.barrier()
+        if Torch.is_npu_available():
+            import torch_npu
+            torch.npu.synchronize()
+        if Torch.is_gpu_available():
+            import torch
+            torch.cuda.synchronize()
+        logger.info('[fsdp2] fused-CE: pre-loop barrier+device-sync drain applied')
     for batch in dataloader:
-        model.forward_backward(inputs=batch)
+        model.forward_backward(inputs=batch, task=_task)
         model.clip_grad_and_step()
         cur_step = optimizer_group.cur_step
         if cur_step % args.training.log_interval == 0:

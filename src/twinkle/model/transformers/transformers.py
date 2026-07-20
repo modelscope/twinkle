@@ -60,7 +60,12 @@ def _resolve_task_context(model, task):
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
+    if task == 'fused_lm_ce':
+        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
+        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
+        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
+        return apply_context(model, TransformersFusedCEPatch())
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce.')
 
 
 @dataclass
