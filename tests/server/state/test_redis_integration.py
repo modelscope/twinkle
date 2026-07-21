@@ -104,7 +104,7 @@ def make_state(isolation_prefix: str):
 
 
 @pytest.mark.asyncio
-async def test_property_26_replica_write_via_a_visible_via_b(make_state) -> None:
+async def test_replica_write_via_a_visible_via_b(make_state) -> None:
     """One worker registers a replica; a second worker on the same shared
     backend sees the same capacity / availability view."""
     a = make_state()
@@ -118,7 +118,7 @@ async def test_property_26_replica_write_via_a_visible_via_b(make_state) -> None
 
 
 @pytest.mark.asyncio
-async def test_property_26_model_write_visible(make_state) -> None:
+async def test_model_write_visible(make_state) -> None:
     a = make_state()
     b = make_state()
     rid = f'r-{uuid.uuid4().hex[:6]}'
@@ -132,7 +132,7 @@ async def test_property_26_model_write_visible(make_state) -> None:
 
 
 @pytest.mark.asyncio
-async def test_property_26_session_and_config(make_state) -> None:
+async def test_session_and_config(make_state) -> None:
     a = make_state()
     b = make_state()
     sid = await a.create_session({'session_id': f'sess-{uuid.uuid4().hex[:6]}'})
@@ -146,7 +146,7 @@ async def test_property_26_session_and_config(make_state) -> None:
 
 
 @pytest.mark.asyncio
-async def test_property_27_concurrent_config_writes_no_torn_records(make_state) -> None:
+async def test_concurrent_config_writes_no_torn_records(make_state) -> None:
     """Many concurrent writes of distinct keys complete and every record
     equals one of the writes (no torn / partial value)."""
     a = make_state()
@@ -168,7 +168,7 @@ async def test_property_27_concurrent_config_writes_no_torn_records(make_state) 
 
 
 @pytest.mark.asyncio
-async def test_property_27_concurrent_same_key_lands_one_of_committed(make_state) -> None:
+async def test_concurrent_same_key_lands_one_of_committed(make_state) -> None:
     """Two writers race on the same key — final value equals one of the
     writes; no torn record."""
     a = make_state()
@@ -182,7 +182,7 @@ async def test_property_27_concurrent_same_key_lands_one_of_committed(make_state
 
 
 @pytest.mark.asyncio
-async def test_property_27_concurrent_replica_registration(make_state) -> None:
+async def test_concurrent_replica_registration(make_state) -> None:
     a = make_state()
     b = make_state()
     rid = f'r-{uuid.uuid4().hex[:6]}'

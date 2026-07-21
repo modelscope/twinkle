@@ -24,9 +24,9 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3.5-4B'
-base_url = 'http://localhost:8000'
-api_key = 'EMPTY_API_KEY'
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
+api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 
 
 def train():

@@ -152,7 +152,7 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
         # dict — this mirrors what the production launcher does at
         # ``launcher/server_launcher.py:161`` and is required since the
         # builders + deployment ``__init__`` accept ``TaskQueueConfig`` directly
-        # (Task 27 removed the ``from_dict`` revival path).
+        # (the ``from_dict`` revival path was removed).
         args = {k: v for k, v in dict(app_spec.args).items() if v is not None}
         if app_spec.import_path == 'server':
             # Gateway's ServiceProxy reads http_options.port to build internal

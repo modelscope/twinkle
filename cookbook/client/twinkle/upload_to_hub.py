@@ -18,15 +18,17 @@ import dotenv
 
 dotenv.load_dotenv('.env')
 
+import os
+
 from twinkle import get_logger, init_twinkle_client
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-base_model = 'Qwen/Qwen3.5-4B'
-base_url = 'http://localhost:8000'
-api_key = 'EMPTY_TOKEN'  # token used for model training / server access
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
+api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 
 # Checkpoint to upload: either a twinkle:// path or a local directory path.
 # Example twinkle:// path (from model.save()):
