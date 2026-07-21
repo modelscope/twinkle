@@ -324,6 +324,18 @@ def _assign_view(problem: str, args: argparse.Namespace) -> str:
     return 'B' if (h % 100000) / 100000.0 < args.view_b_frac else 'A'
 
 
+def _curriculum_view_b_frac(gstep: int, args: argparse.Namespace) -> float:
+    """View-A anneal (--viewa-frac-start): the view-A share holds at ``viewa_frac_start``
+    for the first ``viewa_warmup_chunks`` chunks (pure-SFT warmup when start==1.0), then
+    decays linearly to ``viewa_frac_end`` over ``viewa_decay_chunks`` chunks and holds.
+    Because _assign_view is a fixed hash against a moving threshold, the B set grows
+    MONOTONICALLY: a problem trained open-book (A) early can only reappear closed-book
+    (B) later, never the reverse."""
+    t = min(max(gstep - args.viewa_warmup_chunks, 0) / max(args.viewa_decay_chunks, 1), 1.0)
+    share = args.viewa_frac_start + (args.viewa_frac_end - args.viewa_frac_start) * t
+    return 1.0 - share
+
+
 def _view_prompt(r: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     return {'messages': _skillgen_messages(
         r['problem'], r['_view'], r.get('_rubric_diag', ''), r.get('_rubric_src', ''))}
@@ -1048,28 +1060,28 @@ def _assign_advantages(hard: List[Dict[str, Any]], args: argparse.Namespace) -> 
 
 
 def _best_sft_candidate(r: Dict[str, Any], args: argparse.Namespace) -> Optional[Dict[str, Any]]:
-    """Pick ONE view-A candidate to distill (online context distillation). PREFER the
-    executor-verified PASSING skills (reward==1); if NONE passed -- common on the hard
-    problems that are exactly the cases worth distilling -- FALL BACK to any parseable
-    open-book skill regardless of the executor outcome. Answer-bearing skills produced by
-    the skill model itself are allowed here; only the external API/rubric diagnosis must be
-    answer-free. Within the chosen tier, take the one whose skill length is CLOSEST to
-    ``--sft-target-len`` -- an empirically high-pass-rate length (~500-600 chars in this
-    run) -- breaking ties by the fewest executor solve tokens. Targeting a length (rather
-    than the minimum) avoids a distillation feedback loop that would otherwise drive
-    rollouts ever shorter. None only when no parseable candidate exists at all."""
+    """Pick ONE view-A candidate to distill (online context distillation). ONLY
+    executor-verified PASSING skills (reward==1) are distilled: the earlier fallback to
+    unverified skills meant ~60% of SFT targets had failed their own executor pass
+    (measured on the sft35 run) and the model was imitating plausible-but-wrong skills.
+    Problems with no passing candidate now yield NO SFT record. Answer-bearing skills
+    produced by the skill model itself are allowed here; only the external API/rubric
+    diagnosis must be answer-free. Among the passing candidates, take the one whose skill
+    length is CLOSEST to ``--sft-target-len`` -- an empirically high-pass-rate length
+    (~500-600 chars in this run) -- breaking ties by the fewest executor solve tokens.
+    Targeting a length (rather than the minimum) avoids a distillation feedback loop that
+    would otherwise drive rollouts ever shorter."""
     eligible = [c for c in r['_cands'] if c.get('parseable') and c.get('skills')]
-    if not eligible:
-        return None
     passing = [c for c in eligible if c.get('reward') == 1.0]
-    cs = passing or eligible
+    if not passing:
+        return None
     target = int(getattr(args, 'sft_target_len', 550) or 550)
 
     def _solve_tokens(c: Dict[str, Any]) -> int:
         rolls = c.get('rolls') or []
         return rolls[0].get('gen_tokens', 1 << 30) if rolls else (1 << 30)
 
-    return min(cs, key=lambda c: (abs(len(c['skills']) - target), _solve_tokens(c)))
+    return min(passing, key=lambda c: (abs(len(c['skills']) - target), _solve_tokens(c)))
 
 
 def apply_neighbor_rubric(base_sampler, chunk: List[Dict[str, Any]],
@@ -1689,6 +1701,16 @@ def _build_args() -> argparse.Namespace:
     p.add_argument('--balance-max-draws-mult', type=int, default=8)
     p.add_argument('--n-skills', type=int, default=8)
     p.add_argument('--view-b-frac', type=float, default=0.5)
+    p.add_argument('--viewa-frac-start', type=float, default=None,
+                   help='Enable the view-A curriculum: chunk 0 uses this view-A share '
+                        '(view_b_frac = 1 - share), decaying linearly to --viewa-frac-end '
+                        'over --viewa-decay-chunks chunks, then holding. Overrides '
+                        '--view-b-frac for every chunk.')
+    p.add_argument('--viewa-frac-end', type=float, default=0.1)
+    p.add_argument('--viewa-warmup-chunks', type=int, default=0,
+                   help='Hold the view-A share at --viewa-frac-start for this many chunks '
+                        'before the linear decay begins.')
+    p.add_argument('--viewa-decay-chunks', type=int, default=40)
     p.add_argument('--xproblem-rubric', action=argparse.BooleanOptionalAction, default=False,
                    help='When enabled, view A uses a bag-of-words NEIGHBOUR problem rubric. '
                         'Default is off: each view-A problem uses its own baseline attempt, '
@@ -1805,6 +1827,9 @@ def main() -> None:
            'numeric_only': args.numeric_only, 'raw_loaded': data_stats['raw_loaded'],
            'numeric_dropped': data_stats['numeric_dropped'], 'eval_every': args.eval_every,
            'n_skills': args.n_skills, 'view_b_frac': args.view_b_frac,
+           'viewa_frac_start': args.viewa_frac_start, 'viewa_frac_end': args.viewa_frac_end,
+           'viewa_warmup_chunks': args.viewa_warmup_chunks,
+           'viewa_decay_chunks': args.viewa_decay_chunks,
            'skill_retries': args.skill_retries, 'balance': args.balance,
            'balance_success_frac': args.balance_success_frac,
            'skill_gen_temp': args.skill_gen_temperature, 'reward': 'greedy_binary(correct)',
@@ -1871,6 +1896,8 @@ def main() -> None:
             if pending is not None:
                 pending.result()  # finish last round's prefetch before drawing (cache-warm)
                 pending = None
+            if args.viewa_frac_start is not None:
+                args.view_b_frac = _curriculum_view_b_frac(gstep, args)
             chunk, balance = draw_chunk(pool, base_sampler, base_dp, args, base_cache)
             if prefetch_pool is not None:
                 peeked = pool.peek(int(args.chunk_size * (args.balance_max_draws_mult if args.balance else 1)))
@@ -1879,6 +1906,7 @@ def main() -> None:
                 base_sampler, skill_sampler, chunk, gstep, base_dp, skill_dp,
                 args, checker, rubric_cache, base_cache, neighbor_map, pool_answers)
             summary['balance'] = balance
+            summary['view_b_frac'] = round(args.view_b_frac, 4)
 
             log = None
             if groups:
@@ -1922,6 +1950,7 @@ def main() -> None:
             if use_swan:
                 swan_metrics = _swan_metrics(summary, log)
                 swan_metrics.update(_view_a_rubric_leak_metrics(chunk, pool_answers))
+                swan_metrics['train/view_b_frac'] = float(args.view_b_frac)
                 swanlab.log(swan_metrics, step=gstep)
 
             if eval_records and (gstep + 1) % args.eval_every == 0:

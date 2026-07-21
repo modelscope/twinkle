@@ -30,11 +30,14 @@ export EXCLUDE_DATA_IDS=${EXCLUDE_DATA_IDS:-./output/reflexion_coldstart_sft/col
 
 python cookbook/exp/embedding/train_reflexion_skill.py \
   --dataset aops \
-  --n 5000 \
+  --n 10000 \
   --numeric-only \
   --chunk-size 64 \
   --n-skills 8 \
-  --view-b-frac 0.30 \
+  --viewa-frac-start 1.0 \
+  --viewa-frac-end 0.1 \
+  --viewa-warmup-chunks 20 \
+  --viewa-decay-chunks 40 \
   --skill-retries 2 \
   --balance \
   --balance-success-frac 0.2 \
@@ -56,6 +59,6 @@ python cookbook/exp/embedding/train_reflexion_skill.py \
   --save-rounds 200 \
   --trend-every 10 \
   --prefetch-baseline \
-  --output-dir ./output/reflexion_skill \
+  --output-dir ./output/reflexion_skill_curriculum \
   --swanlab-project twinkle \
-  --swanlab-exp reflexion_skill_sft35
+  --swanlab-exp reflexion_skill_curriculum
