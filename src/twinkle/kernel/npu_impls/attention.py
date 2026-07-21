@@ -442,5 +442,5 @@ def npu_dsv4_csa_compressor_forward(
     valid = top_k_indices >= 0
     safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
     block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float('-inf'))
-    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+    block_bias.scatter_(-1, safe_indices.unsqueeze(1).to(torch.int64), 0.0)
     return compressed_kv, block_bias[..., :compressed_len], top_k_indices
