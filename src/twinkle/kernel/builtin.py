@@ -32,8 +32,7 @@ def _import_optional(name: str):
 def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     """Return the NPU builtin mapping; optionally apply per-instance FLA."""
     from .npu_impls.attention import (npu_dsv4_attention_forward, npu_dsv4_csa_compressor_forward,
-                                  npu_dsv4_indexer_forward, npu_sdpa_attention_forward)
-    from .npu_impls.attention import npu_sdpa_attention_forward
+                                      npu_dsv4_indexer_forward, npu_sdpa_attention_forward)
     from .npu_impls.fla import apply_qwen3_5_fla
     from .npu_impls.moe import npu_packed_moe_experts_forward, npu_qwen3_5_moe_sparse_block_forward
     from .npu_impls.rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
