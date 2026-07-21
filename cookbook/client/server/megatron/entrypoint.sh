@@ -9,6 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="$SCRIPT_DIR/run.sh"
 TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-/dashscope/caches/application/twinkle}"
 TEMP_DIR="${TWINKLE_TEMP_DIR:-/dashscope/caches/application/ray_logs}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/dashscope/caches/application/.cache}"
+export FLA_TILELANG="${FLA_TILELANG:-0}"
 LOG_FILE="$TWINKLE_WORK_DIR/run.log"
 TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:9000/api/v1/healthz}"
 TWINKLE_DEEP_HEALTH_URL="${TWINKLE_DEEP_HEALTH_URL:-http://127.0.0.1:9000/api/v1/twinkle/healthz/deep}"
@@ -20,6 +22,8 @@ TWINKLE_DEEP_HEALTH_GRACE_SECONDS="${TWINKLE_DEEP_HEALTH_GRACE_SECONDS:-${TWINKL
 RESTART_BACKOFF_SECONDS="${TWINKLE_ENTRYPOINT_RESTART_BACKOFF_SECONDS:-10}"
 
 CHILD_PID=""
+
+mkdir -p "$TWINKLE_WORK_DIR" "$MODELSCOPE_CACHE"
 
 print_warning() {
     echo -e "\033[33m[WARNING]\033[0m $1"
