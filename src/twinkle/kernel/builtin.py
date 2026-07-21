@@ -31,7 +31,8 @@ def _import_optional(name: str):
 
 def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     """Return the NPU builtin mapping; optionally apply per-instance FLA."""
-    from .npu_impls.attention import npu_sdpa_attention_forward
+    from .npu_impls.attention import (npu_dsv4_attention_forward, npu_dsv4_csa_compressor_forward,
+                                      npu_dsv4_indexer_forward, npu_sdpa_attention_forward)
     from .npu_impls.fla import apply_qwen3_5_fla
     from .npu_impls.moe import npu_packed_moe_experts_forward, npu_qwen3_5_moe_sparse_block_forward
     from .npu_impls.rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
@@ -82,6 +83,12 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
         npu_swiglu_forward,
         npu_packed_moe_experts_forward,
         npu_qwen3_5_moe_sparse_block_forward,
+    )
+    _add_deepseek_v4_entries(
+        bundle,
+        npu_dsv4_attention_forward,
+        npu_dsv4_indexer_forward,
+        npu_dsv4_csa_compressor_forward,
     )
 
     # === FLA (side-effect; mapping-incompatible) ===
@@ -216,3 +223,43 @@ def _add_qwen3_5_moe_entries(bundle, rms_cls, gated_rms_fn, rope_fn, swiglu_fn, 
     _add_attr_if_present(bundle, base, 'Qwen3_5MoeExperts.forward', experts_fn)
     _add_attr_if_present(bundle, base, 'Qwen3_5MoeSparseMoeBlock.forward', sparse_fn)
     _add_attr_if_present(bundle, base, 'Qwen3_5MoeGatedRMSNorm.forward', gated_rms_fn)
+
+
+def _add_deepseek_v4_entries(bundle, attention_fn, indexer_fn, csa_compressor_fn):
+    """Register DeepSeek-V4 NPU attention / indexer / compressor forwards.
+
+    Opt-in via the single env var ``TWINKLE_NPU_DSV4_SAS`` (Sparse Attention).
+    When enabled, the full patch set is applied as one unit:
+
+      - ``DeepseekV4Attention.forward``     → NPU sparse attention (SAS)
+      - ``DeepseekV4Indexer.forward``       → Lightning Indexer (LI) — selects
+        top-512 compressed blocks per query for CSA layers via mindspeed
+      - ``DeepseekV4CSACompressor.forward`` → full replacement returning a
+        3-tuple ``(compressed_kv, block_bias, top_k_indices)``
+
+    HCA compressor is **not** patched: its stock forward returns a 2-tuple,
+    which the SAS attention forward handles via ``len(compressor_out)`` —
+    HCA layers don't use top-k (``cmp_sparse_indices = None``), so
+    ``top_k_indices`` staying ``None`` is the correct behavior.
+
+    LI is always on under SAS — there is no use case for SAS without LI
+    (CSA would fall back to the slower stock indexer) or LI without SAS
+    (indices would go unused). The CSA compressor is a **full forward
+    replacement** rather than a wrapper: the stock forward already calls
+    ``self.indexer(...)`` to build ``block_bias``, so a wrapper that fetched
+    ``top_k_indices`` by re-calling the indexer would mutate
+    ``DeepseekV4CSACache`` twice (``store_compression_weights`` appends on
+    every call). Under gradient checkpointing the recomputed forward would
+    see a cache already mutated by the first forward, producing a different
+    compressed length and triggering ``CheckpointError``. The replacement
+    calls the indexer **once** and returns ``top_k_indices`` alongside the
+    other outputs.
+    """
+    base = 'transformers.models.deepseek_v4.modeling_deepseek_v4'
+    if _import_optional(base) is None:
+        return
+
+    _add_attr_if_present(bundle, base, 'DeepseekV4Attention.forward', attention_fn)
+    _add_attr_if_present(bundle, base, 'DeepseekV4Indexer.forward', indexer_fn)
+    _add_attr_if_present(bundle, base, 'DeepseekV4CSACompressor.forward', csa_compressor_fn)
+    logger.info('[NPU] [DSV4] SAS + LI patch registered (CSA uses Lightning Indexer top-k)')
