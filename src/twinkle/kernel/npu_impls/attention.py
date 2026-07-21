@@ -318,22 +318,22 @@ def npu_dsv4_indexer_forward(
     q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
     def torch_indexer_top_k_indices():
-        index_scores = self.scorer(q, compressed_kv, hidden_states)
         compressed_len = compressed_kv.shape[1]
+        if compressed_len == 0:
+            return q.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
+        index_scores = self.scorer(q, compressed_kv, hidden_states)
         top_k = min(self.index_topk, compressed_len)
-        if compressed_len > 0:
-            causal_threshold = (position_ids + 1) // self.compress_rate
-            entry_indices = torch.arange(compressed_len, device=index_scores.device)
-            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
-            index_scores = index_scores.masked_fill(future_mask, float('-inf'))
-            top_k_indices = index_scores.topk(top_k, dim=-1).indices
-            invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
-            top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
-            if top_k < self.index_topk:
-                padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
-                top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
-            return top_k_indices
-        return index_scores.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
+        causal_threshold = (position_ids + 1) // self.compress_rate
+        entry_indices = torch.arange(compressed_len, device=index_scores.device)
+        future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+        index_scores = index_scores.masked_fill(future_mask, float('-inf'))
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices
+        invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+        top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+        if top_k < self.index_topk:
+            padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
+            top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
+        return top_k_indices
 
     if compressed_kv.shape[1] > 0:
         try:
