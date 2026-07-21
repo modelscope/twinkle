@@ -186,7 +186,7 @@ Twinkle Client 场景下，推荐的断点续训流程是：
 2. 调用 `model.resume_from_checkpoint(resume_path)` 恢复权重、优化器、调度器、随机数状态和训练进度元数据。
 3. 使用返回结果中的 `consumed_train_samples` 调用 `dataloader.resume_from_checkpoint(...)`，跳过已经训练过的数据。
 
-完整示例可直接参考 `cookbook/client/twinkle/self_host/self_cognition.py`。
+完整示例可直接参考 `cookbook/client/twinkle/self_cognition.py`。
 
 ## Megatron 后端的差异
 
@@ -295,4 +295,4 @@ for step in range(3):
 - 某条 trajectory 触发了工具调用，但没有提供 `tool_manager` → 抛 `ValueError`。构造时或按调用传入 `tool_manager` 即可。
 - 采样器的网络 / 超时错误会**原样抛出**（不被吞掉），重试、退避请在你的循环外层处理。
 
-完整可运行示例见 `cookbook/client/twinkle/self_host/multi_turn_rollout.py`。
+完整可运行示例见 `cookbook/client/twinkle/multi_turn_rollout.py`。

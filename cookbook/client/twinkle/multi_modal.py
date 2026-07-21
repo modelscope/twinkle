@@ -24,13 +24,14 @@ from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
-base_model = 'Qwen/Qwen3.6-27B'
-base_url = 'http://www.modelscope.cn/twinkle'
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
+api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(base_url=base_url, api_key=os.environ.get('MODELSCOPE_TOKEN'))
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.

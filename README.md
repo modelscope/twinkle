@@ -100,10 +100,8 @@ sh INSTALL_MEGATRON.sh
 | DPO multi-LoRA training              | transformers    | [Script](cookbook/rl/dpo/dpo_multi_lora.py)                |
 | GKD on-policy distillation           | megatron        | [Script](cookbook/rl/gkd/gkd_on_policy.py)                 |
 | GKD off-policy distillation          | megatron        | [Script](cookbook/rl/gkd/gkd_off_policy.py)                |
-| Tinker client finetuning (self-host) | transformers    | [Script](cookbook/client/tinker/self_host)             |
-| Tinker client finetuning (ModelScope) | transformers   | [Script](cookbook/client/tinker/modelscope)            |
-| Twinkle client finetuning (self-host) | transformers   | [Script](cookbook/client/twinkle/self_host)            |
-| Twinkle client finetuning (ModelScope) | transformers  | [Script](cookbook/client/twinkle/modelscope)           |
+| Tinker client finetuning             | transformers    | [Script](cookbook/client/tinker)                       |
+| Twinkle client finetuning            | transformers    | [Script](cookbook/client/twinkle)                      |
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog

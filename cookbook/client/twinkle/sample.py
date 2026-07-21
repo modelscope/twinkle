@@ -22,7 +22,7 @@ from twinkle_client.sampler import vLLMSampler
 
 logger = get_logger()
 
-MODEL_ID = 'Qwen/Qwen3.5-4B'
+MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 
 # Optional: adapter URI for LoRA inference
 # This can be a twinkle:// path from a training run checkpoint
@@ -34,8 +34,8 @@ ADAPTER_URI = 'twinkle://20260301_142318-Qwen_Qwen3-4B-199d2cdb/weights/twinkle-
 def sample():
     # Step 2: Initialize the Twinkle client to communicate with the remote server.
     client = init_twinkle_client(
-        base_url='http://127.0.0.1:8000',
-        api_key='EMPTY_API_KEY',
+        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
     )
 
     # Step 3: Create the sampler client pointing to the model on the server

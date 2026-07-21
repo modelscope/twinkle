@@ -27,6 +27,7 @@ import dotenv
 
 dotenv.load_dotenv('.env')
 
+import os
 from typing import Any, Dict, List
 
 from peft import LoraConfig
@@ -38,7 +39,8 @@ from twinkle_client.model import MultiLoraTransformersModel
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+MODEL_ID = f'ms://{BASE_MODEL}'
 ADAPTER_NAME = 'emb_adapter'
 TEMPERATURE = 0.07
 LEARNING_RATE = 1e-4
@@ -82,7 +84,10 @@ def build_minibatch(tokenizer) -> List[Dict[str, Any]]:
 
 def train():
     # Step 1: connect to the running Twinkle server.
-    init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+    init_twinkle_client(
+        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
+    )
 
     # Step 2: build the client model with a fresh LoRA adapter.
     model = MultiLoraTransformersModel(model_id=MODEL_ID)

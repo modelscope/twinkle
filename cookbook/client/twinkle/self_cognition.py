@@ -21,13 +21,21 @@ from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
-base_model = 'Qwen/Qwen3.6-27B'
-base_url = 'http://www.modelscope.cn/twinkle'
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
+api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
+save_dir = '/tmp/twinkle_sft_output'
+
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(base_url=base_url, api_key=os.environ.get('MODELSCOPE_TOKEN'))
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+
+# List available models of the server
+print('Available models:')
+for item in client.get_server_capabilities().supported_models:
+    print('- ' + item.model_name)
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.
@@ -74,7 +82,7 @@ def train():
     # Attach the LoRA adapter named 'default' to the model.
     # gradient_accumulation_steps=2 means gradients are accumulated over 2 micro-batches
     # before an optimizer step, effectively doubling the batch size.
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2, save_dir=save_dir)
 
     # Set the same chat template used during data preprocessing
     model.set_template('Qwen3_5Template')
@@ -92,16 +100,21 @@ def train():
     # model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
+    start_step = 0
     if resume_path:
-        logger.info(f'Resuming training from {resume_path}')
-        model.load(resume_path, load_optimizer=True)
+        logger.info(f'Resuming from checkpoint {resume_path}')
+        progress = model.resume_from_checkpoint(resume_path)
+        dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+        start_step = progress['cur_step']
 
     # Step 7: Run the training loop
+    max_steps = 10  # Limit to 10 steps for quick verification
     logger.info(model.get_train_configs().model_dump())
 
+    global_step = 0
     for epoch in range(3):
         logger.info(f'Starting epoch {epoch}')
-        for step, batch in enumerate(dataloader):
+        for cur_step, batch in enumerate(dataloader, start=start_step + 1):
             # Forward pass + backward pass (computes gradients)
             model.forward_backward(inputs=batch)
 
@@ -117,14 +130,28 @@ def train():
             # # Advance the learning rate scheduler by one step
             # model.lr_step()
 
+            global_step += 1
+
             # Log the loss every 2 steps (aligned with gradient accumulation)
-            if step % 2 == 0:
+            if cur_step % 2 == 0:
                 # Print metric
                 metric = model.calculate_metric(is_training=True)
-                logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric.result}')
+                logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric.result}')
+
+            # Stop after max_steps
+            if global_step >= max_steps:
+                logger.info(f'Reached max_steps={max_steps}, stopping training.')
+                break
+
+        if global_step >= max_steps:
+            break
 
         # Step 8: Save the trained checkpoint
-        twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+        twinkle_path = model.save(
+            name=f'twinkle-epoch-{epoch}',
+            save_optimizer=True,
+            consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+        )
         logger.info(f'Saved checkpoint: {twinkle_path}')
 
     # Step 9: Upload the checkpoint to ModelScope Hub

@@ -186,7 +186,7 @@ For checkpoint resumption, the recommended client-side flow is:
 2. Call `model.resume_from_checkpoint(resume_path)` to restore weights, optimizer, scheduler, RNG, and progress metadata.
 3. Call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip already-consumed samples.
 
-This matches the end-to-end example in `cookbook/client/twinkle/self_host/self_cognition.py`.
+This matches the end-to-end example in `cookbook/client/twinkle/self_cognition.py`.
 
 ## Differences with Megatron Backend
 
@@ -295,4 +295,4 @@ Each returned trajectory has the following top-level fields appended to the orig
 - A trajectory triggered a tool call but no `tool_manager` was provided → raises `ValueError`. Pass `tool_manager` at construction or per call.
 - The sampler's network / timeout errors are **raised as-is** (not swallowed); handle retry/backoff outside your loop.
 
-See `cookbook/client/twinkle/self_host/multi_turn_rollout.py` for a full runnable example.
+See `cookbook/client/twinkle/multi_turn_rollout.py` for a full runnable example.
