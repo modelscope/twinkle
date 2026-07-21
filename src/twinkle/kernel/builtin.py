@@ -260,9 +260,6 @@ def _add_deepseek_v4_entries(bundle, attention_fn, indexer_fn, csa_compressor_fn
     if _import_optional(base) is None:
         return
 
-    if not _is_env_enabled('TWINKLE_NPU_DSV4_SAS', default=False):
-        return
-
     _add_attr_if_present(bundle, base, 'DeepseekV4Attention.forward', attention_fn)
     _add_attr_if_present(bundle, base, 'DeepseekV4Indexer.forward', indexer_fn)
     _add_attr_if_present(bundle, base, 'DeepseekV4CSACompressor.forward', csa_compressor_fn)
