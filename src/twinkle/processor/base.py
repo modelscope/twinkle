@@ -738,8 +738,8 @@ class InputProcessor:
                     result[key] = result[key].reshape(len(values), num_axes, -1).permute(1, 0, 2).contiguous()
                 elif isinstance(values[0], torch.Tensor):
                     concat = False if (key == 'routed_experts') else None
-                    result[key] = InputProcessor._pad_sequence(
-                        values, self.padding_map.get(key, 0), self.padding_side, concat)
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map.get(key, 0), self.padding_side,
+                                                               concat)
                     if result[key].dim() == 1:
                         result[key] = result[key].unsqueeze(0)
                 else:
