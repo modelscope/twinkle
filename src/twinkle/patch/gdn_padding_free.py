@@ -56,11 +56,6 @@ def _get_flash_linear_attention_kernels():
     return causal_conv1d, chunk_gated_delta_rule
 
 
-def _get_mindspeed_ops_causal_conv1d():
-    from twinkle.kernel.causal_conv1d import causal_conv1d as _ms_causal_conv1d
-    return _ms_causal_conv1d
-
-
 def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
     return Version(transformers.__version__) < Version('5.9.0')
 
@@ -76,7 +71,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
 ) -> torch.Tensor:
     is_npu = getattr(mod, '_twinkle_npu_patched', False)
     if is_npu:
-        from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
+        from twinkle.kernel.npu_impls.fla import npu_causal_conv1d_fn
     else:
         causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
 
