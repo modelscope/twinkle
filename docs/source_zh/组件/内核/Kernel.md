@@ -118,7 +118,7 @@ model = kernelize(model, {
 - Qwen3.5 / Qwen3.5-MoE 的 GatedRMSNorm forward 替换
 - Qwen2.5-VL 的 `apply_multimodal_rotary_pos_emb` 替换
 - 全局 SDPA 替换（一次性副作用，写入 `ALL_ATTENTION_FUNCTIONS['sdpa']`）
-- Qwen3.5 Flash Linear Attention 启用（一次性副作用 + 实例遍历，由 `npu_builtin(model)` 内部触发）
+- Qwen3.5 Flash Linear Attention 启用（一次性副作用 + 实例遍历，由 `npu_builtin(model)` 内部触发）。直接委托给 fla 原生算子（`fla.modules.convolution.causal_conv1d` 与 `fla.ops.gated_delta_rule.chunk_gated_delta_rule`）；在 NPU 上由 fla 的 `triton_ascend` 后端 dispatch 处理 Ascend 专用 kernel。需要 `flash-linear-attention` >= 0.5.2
 
 **未默认包含** `transformers.integrations.moe._grouped_mm` 的 NPU 替换（在没有 Expert Parallelism 时会带来约 8x 开销）。需要时手动加入：
 

@@ -6,7 +6,7 @@ replacement) or ``setattr(module, attr, fn)`` (function replacement). No impl
 here is meant to be instantiated directly.
 """
 from .attention import npu_sdpa_attention_forward
-from .fla import apply_qwen3_5_fla
+from .fla import apply_qwen3_5_fla, npu_causal_conv1d_fn
 from .moe import GmmFunction, npu_grouped_mm, npu_packed_moe_experts_forward, npu_qwen3_5_moe_sparse_block_forward
 from .rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
 from .rotary import npu_apply_multimodal_rotary_pos_emb, npu_apply_rotary_pos_emb
@@ -24,4 +24,5 @@ __all__ = [
     'npu_packed_moe_experts_forward',
     'npu_qwen3_5_moe_sparse_block_forward',
     'apply_qwen3_5_fla',
+    'npu_causal_conv1d_fn',
 ]
