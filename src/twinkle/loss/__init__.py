@@ -4,9 +4,10 @@ from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
 from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
-from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
+from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss, SEAMBNPOLoss
 from .infonce import InfonceLoss
 from .mse import MSELoss
+from .opsd import OPSDLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -20,7 +21,10 @@ torch_loss_mapping = {
     'sapo': SAPOLoss,
     'cispo': CISPOLoss,
     'bnpo': BNPOLoss,
+    'seam_bnpo': SEAMBNPOLoss,
     'dr_grpo': DRGRPOLoss,
+    # Self-distillation losses
+    'opsd': OPSDLoss,
     # DPO family losses
     'dpo': DPOLoss,
     'simpo': SimPOLoss,
