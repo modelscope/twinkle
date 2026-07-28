@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.utils import get_logger
@@ -8,9 +8,6 @@ from twinkle.utils.transformers_utils import align_logps_to_mask
 from .base import Metric
 
 logger = get_logger()
-
-if TYPE_CHECKING:
-    import torch
 
 
 class GRPOMetric(Metric):
@@ -44,8 +41,6 @@ class GRPOMetric(Metric):
         self.sum_new: float = 0.0
         self.sum_old: float = 0.0
         self.sum_diff: float = 0.0
-        self.sum_diff_sq: float = 0.0
-        self.sum_ratio: float = 0.0
         self.sum_approx_kl: float = 0.0
         self.max_token_kl: float = 0.0
         self.max_token_ratio: float = 0.0
@@ -190,16 +185,13 @@ class GRPOMetric(Metric):
             old_f = old_f * scale
 
         d = logps_f - old_f  # new - old
-        ratio = torch.exp(d)
         self.sum_old += float((old_f * mask_f).sum().item())
         self.sum_diff += float((d * mask_f).sum().item())
-        self.sum_diff_sq += float((d.square() * mask_f).sum().item())
-        self.sum_ratio += float((ratio * mask_f).sum().item())
 
         # Schulman K3 estimator of KL(old || new):
         #   samples x ~ old,  r(x) = new(x) / old(x),
         #   k3 = r - 1 - log(r) = exp(new - old) - (new - old) - 1.
-        kl = ratio - d - 1.0
+        kl = torch.exp(d) - d - 1.0
         kl_masked = kl * mask_f
         self.sum_approx_kl += float(kl_masked.sum().item())
         # Per-token extremes for collapse detection
@@ -208,7 +200,7 @@ class GRPOMetric(Metric):
             if cur_max_kl > self.max_token_kl:
                 self.max_token_kl = cur_max_kl
             # Track ratio extremes
-            ratio_masked = ratio * mask_f
+            ratio_masked = torch.exp(d) * mask_f
             cur_max_ratio = float(ratio_masked.max().item())
             if cur_max_ratio > self.max_token_ratio:
                 self.max_token_ratio = cur_max_ratio
@@ -319,12 +311,11 @@ class GRPOMetric(Metric):
             cursor += advanced
 
     def calculate(self) -> Dict[str, Any]:
+        import torch
         local = [{
             'sum_new': self.sum_new,
             'sum_old': self.sum_old,
             'sum_diff': self.sum_diff,
-            'sum_diff_sq': self.sum_diff_sq,
-            'sum_ratio': self.sum_ratio,
             'sum_kl': self.sum_approx_kl,
             'max_token_kl': self.max_token_kl,
             'max_token_ratio': self.max_token_ratio,
@@ -353,15 +344,11 @@ class GRPOMetric(Metric):
         if any(r['has_old'] for r in all_results):
             mean_old = sum(r['sum_old'] for r in all_results) / n_total
             mean_diff = sum(r['sum_diff'] for r in all_results) / n_total
-            mean_diff_sq = sum(r['sum_diff_sq'] for r in all_results) / n_total
-            mean_ratio = sum(r['sum_ratio'] for r in all_results) / n_total
             mean_kl = sum(r['sum_kl'] for r in all_results) / n_total
             global_max_kl = max(r['max_token_kl'] for r in all_results)
             global_max_ratio = max(r['max_token_ratio'] for r in all_results)
             results['train/mean_old_logp'] = mean_old
             results['train/logp_diff_mean'] = mean_diff
-            results['train/logp_diff_std'] = math.sqrt(max(mean_diff_sq - mean_diff**2, 0.0))
-            results['train/importance_ratio_mean'] = mean_ratio
             results['train/approx_kl'] = mean_kl
             results['train/token_kl_max'] = global_max_kl
             results['train/token_ratio_max'] = global_max_ratio

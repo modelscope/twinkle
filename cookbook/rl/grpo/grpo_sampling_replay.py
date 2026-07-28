@@ -1,5 +1,4 @@
 import os
-import time
 from typing import List, Tuple, Dict, Any
 
 from peft import LoraConfig
@@ -16,10 +15,7 @@ from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
 from twinkle.sampler import vLLMSampler
-from twinkle.metric import (
-    CompletionRewardMetric,
-    compute_grpo_rollout_metrics,
-)
+from twinkle.metric import CompletionRewardMetric
 from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
@@ -79,7 +75,6 @@ def extract_rollout_batch(sample_responses, *, require_sampling_masks: bool):
         'old_logps': [],
         'sampling_masks': [],
         'completion_lengths': [],
-        'stop_reasons': [],
     }
     for sample_response in sample_responses:
         for sequence in sample_response.sequences:
@@ -93,7 +88,6 @@ def extract_rollout_batch(sample_responses, *, require_sampling_masks: bool):
                 [logprob[0][1] for logprob in sequence.logprobs])
             rollout_batch['sampling_masks'].append(sequence.sampling_mask)
             rollout_batch['completion_lengths'].append(len(sequence.tokens))
-            rollout_batch['stop_reasons'].append(sequence.stop_reason)
     return rollout_batch
 
 
@@ -191,23 +185,7 @@ def main():
         top_k=-1,
         repetition_penalty=1.0,
     )
-    if ENABLE_SAMPLING_REPLAY:
-        model.add_metric(
-            'GRPOMetric',
-            is_training=True,
-            temperature=sampling_params.temperature,
-            epsilon=0.2,
-        )
-        logger.info(
-            'Sampling replay enabled: model_runner=v2, logprobs_mode=processed_logprobs, '
-            'temperature=%s, top_p=%s, top_k=%s',
-            sampling_params.temperature,
-            sampling_params.top_p,
-            sampling_params.top_k,
-        )
-
     optim_step = 0
-    sampling_replay_stats_logged = False
     logger.info(get_device_placement())
 
     for batch in dataloader:
@@ -218,27 +196,22 @@ def main():
         # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
         # meaning only sync lora weights, if merge_and_sync=True,
         # lora will be merged into the base model and sync all weights to vLLM
-        weight_sync_started = time.perf_counter()
         ckpt_manager.sync_weights(merge_and_sync=False)
-        weight_sync_seconds = time.perf_counter() - weight_sync_started
         sampler.reset_prefix_cache()
         def sample_prompt_groups(prompts):
             expand_prompts = []
             for prompt in prompts:
                 expand_prompts.extend([prompt] * NUM_GENERATIONS)
-            started = time.perf_counter()
             responses = sampler.sample(expand_prompts, sampling_params)
-            elapsed = time.perf_counter() - started
             return extract_rollout_batch(
                 responses,
                 require_sampling_masks=ENABLE_SAMPLING_REPLAY,
-            ), elapsed
+            )
 
-        rollout_batch, sampling_seconds = sample_prompt_groups(global_prompts)
-        sampled_tokens_total = sum(rollout_batch['completion_lengths'])
+        rollout_batch = sample_prompt_groups(global_prompts)
         # Match the original GRPO control flow: every sampled rollout is scored,
         # logged, and trained. Zero-variance groups keep their zero advantages;
-        # they are diagnosed below but never resampled, dropped, or skipped.
+        # they are never resampled, dropped, or skipped.
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             rollout_batch['input_data'])
 
@@ -246,7 +219,6 @@ def main():
         all_old_logps: List[List[float]] = rollout_batch['old_logps']
         all_sampling_masks = rollout_batch['sampling_masks']
         all_completion_lengths: List[int] = rollout_batch['completion_lengths']
-        all_stop_reasons = rollout_batch['stop_reasons']
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
@@ -258,20 +230,6 @@ def main():
         rollout_reward_log_dict = metrics.calculate()
 
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-        rollout_log_dict = compute_grpo_rollout_metrics(
-            completion_lengths=all_completion_lengths,
-            stop_reasons=all_stop_reasons,
-            rewards=total_rewards,
-            advantages=advantages,
-            num_generations=NUM_GENERATIONS,
-            sampling_masks=all_sampling_masks if ENABLE_SAMPLING_REPLAY else None,
-        )
-        num_rollout_tokens = sum(all_completion_lengths)
-        rollout_log_dict['profiling/weight_sync_seconds'] = weight_sync_seconds
-        rollout_log_dict['profiling/sampling_seconds'] = sampling_seconds
-        rollout_log_dict['profiling/sampling_tokens_per_second'] = (
-            sampled_tokens_total / sampling_seconds if sampling_seconds else 0.0)
-        rollout_log_dict['profiling/sampling_generated_tokens'] = sampled_tokens_total
 
         # Split completions into mini-batches and run one optim step per mini-batch.
         total_completions = len(all_input_data)
@@ -287,7 +245,6 @@ def main():
                     'temperature': sampling_params.temperature,
                 }
 
-            training_started = time.perf_counter()
             model.forward_backward(
                 inputs=mb_inputs,
                 old_logps=mb_old_logps,
@@ -296,15 +253,6 @@ def main():
                 **replay_kwargs,
             )
             model.clip_grad_and_step()
-            training_seconds = time.perf_counter() - training_started
-            if ENABLE_SAMPLING_REPLAY and not sampling_replay_stats_logged:
-                logger.info(
-                    'Sampling replay active: sequences=%d, tokens=%d, mean_kept_tokens=%.2f',
-                    len(all_sampling_masks),
-                    num_rollout_tokens,
-                    rollout_log_dict['replay/support_size_mean'],
-                )
-                sampling_replay_stats_logged = True
             optim_step += 1
 
             if optim_step % SAVE_STEPS == 0:
@@ -313,12 +261,6 @@ def main():
             # rollout can span multiple mini-batches, but no Step lacks reward.
             log_dict = dict(rollout_reward_log_dict)
             log_dict.update(model.calculate_metric(is_training=True))
-            if mb_start == 0:
-                log_dict.update(rollout_log_dict)
-            num_training_tokens = sum(all_completion_lengths[mb_start:mb_end])
-            log_dict['profiling/training_seconds'] = training_seconds
-            log_dict['profiling/training_completion_tokens_per_second'] = (
-                num_training_tokens / training_seconds if training_seconds else 0.0)
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
             if optim_step >= MAX_STEPS:
                 break

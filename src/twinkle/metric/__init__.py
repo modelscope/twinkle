@@ -6,5 +6,4 @@ from .dpo import DPOMetric
 from .embedding import EmbeddingMetric
 from .grpo import CISPOMetric, GRPOMetric, GSPOMetric
 from .loss import LossMetric
-from .rollout import compute_grpo_rollout_metrics, zero_variance_reward_group_indices
 from .train_metric import TrainMetric
