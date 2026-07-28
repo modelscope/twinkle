@@ -331,18 +331,12 @@ def _extract_skill(text: str) -> Optional[str]:
 
 def _parse_seq(seq, gold: str) -> Dict[str, Any]:
     text = _clean_text(getattr(seq, 'decoded', '') or '')
-    if _ALIGN_MODE == 'seam':
-        # seam：SEAM lpem parity——整段贪婪 sanitize 成单一数值后精确匹配。
-        san = _seam_sanitize(text)
-        pred = san or None
-        correct = bool(san) and (san == _seam_sanitize(str(gold)))
-    else:
-        # v2：只从 \boxed{} 抽取（executor 被要求把最终数值写进 \boxed{}），再走同一套数值归一
-        # （frac/inline/number）后精确匹配；不做“整段抓首个数字”的贪婪回退（避免从推理里误抓）。
-        # extract_boxed 取最后一个配平的 \boxed{}、截断（未闭合）时不误取；都没有则判错。
-        raw = extract_boxed(text)
-        pred = _seam_sanitize(raw) if raw else None
-        correct = bool(pred) and (pred == _seam_sanitize(str(gold)))
+    # 判分口径统一（人工拍板，2026-07-27）：seam/v2 都只从 \boxed{} 抽取，再走同一套数值归一
+    # （frac/inline/number）后精确匹配；不做 lpem 式“整段抓数字”贪婪回退，保证 E13 与 E1-E12
+    # 的 acc/lift 横向可比。extract_boxed 取最后一个配平的 \boxed{}、截断时不误取；没有则判错。
+    raw = extract_boxed(text)
+    pred = _seam_sanitize(raw) if raw else None
+    correct = bool(pred) and (pred == _seam_sanitize(str(gold)))
     terminated = getattr(seq, 'stop_reason', None) != 'length'
     return {'pred': pred, 'correct': correct, 'terminated': terminated,
             'stop_reason': getattr(seq, 'stop_reason', None),
@@ -710,18 +704,17 @@ First think privately: solve the problem in your head AND identify the single mo
 _SKILL_STYLE = 'narrative'  # 'narrative' | 'toy' | 'pitfall'；由 main() 依据 --skill-style 设置
 
 # ---- Executor prompt (with skill injection) ----
-# 中文注释：executor 提示词。答案格式对齐 SEAM 的 slove_qwen.txt（numeric-only，降截断）。
-# v2 模式：新版采用英文单 user turn——题目 + “技巧提示（skill 作为 advisory）” + 答案格式（见
-#   build_skill_solve_prompt）。v2 执行器输出用 \boxed{}（_ANSWER_FORMAT_V2），先不用 <answer>；
-#   seam 基线 DIRECT_SYSTEM 仍用 <answer>（_ANSWER_FORMAT），对齐 SEAM。skill 不再注入 system。
+# 中文注释：executor 提示词。答案格式已统一为 \boxed{}（人工拍板，2026-07-27）：seam/v2 两模式的
+# 格式说明与判分口径完全一致，保证 E13(seam) 与 E1-E12 横向可比；prompt 结构差异（seam 嵌套/
+# system+user vs v2 单 user）作为方案级差异保留。_ANSWER_FORMAT(<answer> 版) 已弃用。
 _ANSWER_FORMAT = ('Present your reasoning and answer in the following format:\n'
                   '<think> Content of Thinking</think><answer>[Final numeric result only]</answer>')
-# v2 执行器答案格式：把最终数值放进 \boxed{}（不再要求 <answer>）；判分对应走 extract_boxed。
+# 统一执行器答案格式：把最终数值放进 \boxed{}；判分对应走 extract_boxed。
 _ANSWER_FORMAT_V2 = ('Present your reasoning, then put ONLY the final numeric result inside '
                      '\\boxed{}. For example: \\boxed{42}.')
 DIRECT_SYSTEM = (
     'You are an expert competition mathematician. Be concise and accurate. '
-    + _ANSWER_FORMAT)
+    + _ANSWER_FORMAT_V2)
 _SKILL_SOLVE_PREFIX = (
     'You are an expert competition mathematician. Be concise and accurate.\n\n'
     'Before you start, keep these reminders in mind to avoid common mistakes on this '
@@ -758,8 +751,7 @@ _SEAM_SOLVE_ADVISORY = (
     'prefer using its techniques when they fit, but you may use alternative correct methods '
     'if they are more efficient or clearer. If you diverge from the advisory context, briefly '
     'explain why. Be concise and accurate.\n'
-    'Present your reasoning and answer in the following format:\n'
-    '<think> Content of Thinking</think><answer>[Final numeric result only]</answer>')
+    + _ANSWER_FORMAT_V2)
 
 
 def build_skill_solve_prompt_seam(problem, skill, raw_response=None):
@@ -1135,7 +1127,10 @@ def _train_step(skill_model, ref_model, ckpt, samples, args):
         return {'n_samples': n_in, 'n_sft': 0, 'n_grpo': 0, 'n_empty': n_empty,
                 'n_steps': 0, 'n_micro_batches': 0, 'metric': {}}
     trajs, advs = trajs[:n_keep], advs[:n_keep]
-    n, sft = len(trajs), args.sft_batch_size
+    # micro 尺寸可由 train_micro_batch 覆盖（ablate think/8192 实验防 backward OOM）；
+    # 默认 0 = 跟随 sft_batch_size，主训练行为不变。梯度按 micro 数归一，切细数学等价。
+    n = len(trajs)
+    sft = getattr(args, 'train_micro_batch', 0) or args.sft_batch_size
     mini = args.ppo_mini_batch_size if args.ppo_mini_batch_size > 0 else n
     mini = max(sft, (mini // sft) * sft)
     multi_step = mini < n
@@ -1409,7 +1404,10 @@ def init_components(args):
     # 主权重必须 fp32（对齐 verl actor：fp32 master + bf16 autocast）。twinkle 默认不传 dtype 时
     # transformers 会按 config 加载 bf16 主权重，lr=1e-6 的更新量(~1e-6)远小于 bf16 ulp(~4e-5)，
     # optimizer.step 的更新几乎全被舍入吞掉——这是 v2 学不动/与 SEAM 对不上的根因（A/B 实测差 10-20 倍）。
-    skill_model = TransformersModel(model_id=MODEL_ID, device_mesh=train_mesh, remote_group='train',
+    # resume 旁路（skill_ablate）：skill_init_model_id 指向已保存的 checkpoint 目录时，仅 skill_model
+    # 从该目录初始化（TransformersModel.load 无全量模型路径）；ref/samplers/template 仍用 MODEL_ID。
+    _skill_init_id = getattr(args, 'skill_init_model_id', '') or MODEL_ID
+    skill_model = TransformersModel(model_id=_skill_init_id, device_mesh=train_mesh, remote_group='train',
                                     torch_dtype='float32',
                                     ddp_config={'find_unused_parameters': False})
     skill_model.apply_patch(NoSplitModulesPatch({'Qwen3DecoderLayer'}))

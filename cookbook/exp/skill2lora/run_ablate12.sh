@@ -18,11 +18,24 @@
 # Env knobs (all optional):
 #   DEEPMATH_DIR=$HERE/../../../deepmath_103k   TRAIN_N=5000   MAX_UPDATES=50   EVAL_EVERY=5
 #   LR=1e-6   RUN_SFT=1   FORCE=1   ONLY="E5 E6"   SLEEP=30   SWANLAB_PROJECT=twinkle
+#   MIN_LEVEL=6   CHUNK_SIZE=32   (gradient-signal fix: E1/E5 audit — level<=5 all-pass
+#   dominated, 16-problem chunks leave only ~6 mixed groups per update; eval split unaffected)
 # ==============================================================================
 set -euo pipefail
 
+# avoid backward-pass OOM from allocator fragmentation (E6 crash: 15GiB reserved-unallocated);
+# inherited by the Ray training actors via twinkle's runtime env passthrough
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
+
+# central env file (optional): put all knobs in one place. ENV_FILE=xxx overrides the path.
+ENV_FILE="${ENV_FILE:-$HERE/ablate12.env}"
+if [ -f "$ENV_FILE" ]; then
+    echo "[ablate12] loading env from $ENV_FILE"
+    set -a; . "$ENV_FILE"; set +a
+fi
 
 OUT_ROOT="${OUT_ROOT:-$HERE/output.ablate12}"
 # DeepMath-103K (difficulty-stratified loader in skill_ablate/data.py); replaces the old
@@ -33,6 +46,8 @@ EVAL_SIZE="${EVAL_SIZE:-128}"
 MAX_UPDATES="${MAX_UPDATES:-50}"
 EVAL_EVERY="${EVAL_EVERY:-5}"
 LR="${LR:-1e-6}"
+MIN_LEVEL="${MIN_LEVEL:-6}"
+CHUNK_SIZE="${CHUNK_SIZE:-32}"
 SLEEP="${SLEEP:-30}"
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-twinkle}"
 RUN_SFT="${RUN_SFT:-0}"
@@ -93,6 +108,8 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL; do
         --skill-max-tokens "$SMT" \
         --max-updates "$MAX_UPDATES" \
         --eval-every-updates "$EVAL_EVERY" \
+        --min-level "$MIN_LEVEL" \
+        --chunk-size "$CHUNK_SIZE" \
         --lr "$LR" \
         --swanlab-project "$SWANLAB_PROJECT" \
         $FORCE_FLAG \
