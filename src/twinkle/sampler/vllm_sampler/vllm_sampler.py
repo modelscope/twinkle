@@ -269,6 +269,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     logprobs=seq.logprobs,
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
+                    sampling_mask=seq.sampling_mask,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(

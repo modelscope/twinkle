@@ -167,6 +167,13 @@ class SamplingParams:
 
 
 @dataclass
+class SamplingMask:
+    """CSR token support sets aligned with sampled sequence tokens."""
+    token_ids: List[int]
+    offsets: List[int]
+
+
+@dataclass
 class SampledSequence:
     """A single sampled sequence with tokens and logprobs."""
     stop_reason: StopReason
@@ -175,6 +182,7 @@ class SampledSequence:
     decoded: str = None
     new_input_feature: InputFeature = None
     routed_experts: Optional[Any] = None
+    sampling_mask: Optional[SamplingMask] = None
 
 
 @dataclass

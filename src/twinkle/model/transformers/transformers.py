@@ -39,7 +39,7 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
+from twinkle.utils import construct_class, get_logger, replayed_selective_log_softmax, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
@@ -446,6 +446,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -466,6 +467,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+        if enable_sampling_replay:
+            if sampling_masks is None:
+                raise ValueError('sampling_masks are required when sampling replay is enabled')
+            if kwargs.get('old_logps') is None:
+                raise ValueError('old_logps are required when sampling replay is enabled')
+            cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+            if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                raise ValueError('sampling replay does not support sequence or context parallelism')
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -497,11 +507,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
             logits = outputs['logits']
-            logits.div_(temperature)
-            if loss_require_entropy:
+            if enable_sampling_replay:
+                outputs['logps'] = replayed_selective_log_softmax(
+                    logits=logits,
+                    labels=masked_labels,
+                    loss_mask=loss_mask,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                )
+            elif loss_require_entropy:
+                logits.div_(temperature)
                 outputs['logps'], outputs['entropies'] = selective_log_softmax(
                     logits, masked_labels, return_entropy=True)
             else:
+                logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
         outputs['past_key_values'] = None
@@ -535,6 +554,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -557,6 +577,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_require_logits = getattr(loss_instance, 'require_logits', False)
             loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+            if enable_sampling_replay:
+                if sampling_masks is None:
+                    raise ValueError('sampling_masks are required when sampling replay is enabled')
+                if kwargs.get('old_logps') is None:
+                    raise ValueError('old_logps are required when sampling replay is enabled')
+                cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+                if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                    raise ValueError('sampling replay does not support sequence or context parallelism')
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -591,11 +620,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
                 logits = outputs['logits']
-                logits.div_(temperature)
-                if loss_require_entropy:
+                if enable_sampling_replay:
+                    outputs['logps'] = replayed_selective_log_softmax(
+                        logits=logits,
+                        labels=masked_labels,
+                        loss_mask=loss_mask,
+                        sampling_masks=sampling_masks,
+                        temperature=temperature,
+                    )
+                elif loss_require_entropy:
+                    logits.div_(temperature)
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
                         logits, masked_labels, return_entropy=True)
                 else:
+                    logits.div_(temperature)
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
             outputs['past_key_values'] = None

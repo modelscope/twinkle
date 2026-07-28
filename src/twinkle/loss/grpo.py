@@ -32,12 +32,20 @@ class GRPOLoss(Loss):
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
+        enable_sampling_replay: bool = False,
         **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
         self.entropy_coef = entropy_coef
+        self.enable_sampling_replay = enable_sampling_replay
+        if enable_sampling_replay and self.__class__ is not GRPOLoss:
+            raise ValueError('sampling replay is only supported by GRPOLoss')
+        if enable_sampling_replay and beta != 0.0:
+            raise ValueError('sampling replay does not support a GRPO KL penalty (beta must be 0)')
+        if enable_sampling_replay and entropy_coef != 0.0:
+            raise ValueError('sampling replay does not support a GRPO entropy bonus')
         # Gate the expensive entropy compute path in the model forward.
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
@@ -201,6 +209,7 @@ class GRPOLoss(Loss):
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
+        sampling_masks=None,
         **kwargs,
     ):
         """
@@ -222,6 +231,11 @@ class GRPOLoss(Loss):
             **kwargs: Additional arguments
         """
         import torch
+        if self.enable_sampling_replay:
+            if sampling_masks is None:
+                raise ValueError('sampling_masks are required when sampling replay is enabled')
+            if old_logps is None:
+                raise ValueError('old_logps are required when sampling replay is enabled')
         labels = inputs.get('labels')
         assert labels is not None, "inputs must contain 'labels'"
         if not torch.is_tensor(labels):
@@ -230,6 +244,8 @@ class GRPOLoss(Loss):
             labels = labels.unsqueeze(0)
 
         logps = outputs.get('logps')
+        if self.enable_sampling_replay and logps is None:
+            raise RuntimeError('sampling replay logps must be computed by the model forward')
         loss_mask = (labels != self.ignore_index).bool()
         if logps is None:
             logits = outputs.get('logits')

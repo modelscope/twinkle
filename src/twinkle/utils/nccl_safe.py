@@ -78,6 +78,7 @@ class SafeLossWrapper(Loss):
         self.require_logps = getattr(loss_instance, 'require_logps', True)
         self.require_entropy = getattr(loss_instance, 'require_entropy', False)
         self.require_logits = getattr(loss_instance, 'require_logits', False)
+        self.enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
         self.reduction = getattr(loss_instance, 'reduction', 'mean')
         self._nccl_safe_wrapped = True
 
