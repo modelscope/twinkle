@@ -80,7 +80,8 @@ class GSM8KBrevityReward(Reward):
         return rewards
 
 # ========== Configuration ==========
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
+BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+MODEL_ID = f'ms://{BASE_MODEL}'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 2e-5
@@ -141,8 +142,8 @@ def train():
 
     # Step 1: Initialize the Twinkle client
     client = init_twinkle_client(
-        base_url='http://127.0.0.1:8000',
-        api_key='EMPTY_TOKEN',
+        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
     )
 
     # Step 2: Prepare dataset and dataloader

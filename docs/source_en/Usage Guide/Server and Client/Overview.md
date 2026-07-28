@@ -65,29 +65,22 @@ cookbook/
 │   │   └── mock/                   # Mock backend (CPU-only quick start)
 │   │       └── server_config.yaml
 ├── twinkle/                        # Twinkle Client examples
-│   ├── self_host/                  # Self-hosted Server
-│   │   ├── dpo.py                  # DPO training client
-│   │   ├── multi_modal.py          # Multi-modal training client
-│   │   ├── sample.py               # Inference sampling client
-│   │   ├── self_congnition.py      # Self-cognition training client
-│   │   └── short_math_grpo.py      # GRPO math training client
-│   └── modelscope/                 # ModelScope managed service
-│       ├── dpo.py
-│       ├── multi_modal.py
-│       └── self_congnition.py
+│   ├── dpo.py                      # DPO training client
+│   ├── embedding.py                # Embedding training client
+│   ├── multi_modal.py              # Multi-modal training client
+│   ├── multi_turn_rollout.py       # Multi-turn rollout client
+│   ├── sample.py                   # Inference sampling client
+│   ├── self_cognition.py           # Self-cognition training client
+│   ├── short_math_grpo.py          # GRPO math training client
+│   └── upload_to_hub.py            # Checkpoint upload client
 └── tinker/                         # Tinker Client examples
-    ├── self_host/                  # Self-hosted Server
-    │   ├── dpo.py                  # DPO training client
-    │   ├── lora.py                 # LoRA training client
-    │   ├── multi_modal.py          # Multi-modal training client
-    │   ├── sample.py               # Inference sampling client
-    │   ├── self_cognition.py       # Self-cognition training client
-    │   └── short_math_grpo.py      # GRPO math training client
-    └── modelscope/                 # ModelScope managed service
-        ├── dpo.py
-        ├── sample.py
-        ├── self_cognition.py
-        └── short_math_grpo.py
+    ├── dpo.py                      # DPO training client
+    ├── lora.py                     # LoRA training client
+    ├── multi_modal.py              # Multi-modal training client
+    ├── sample.py                   # Inference sampling client
+    ├── self_cognition.py           # Self-cognition training client
+    ├── short_math_grpo.py          # GRPO math training client
+    └── upload_to_hub.py            # Checkpoint upload client
 ```
 
 Running steps:
@@ -96,9 +89,22 @@ Running steps:
 # 1. Start Server first
 twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
 
-# 2. Run Client in another terminal (Tinker Client example)
-python cookbook/client/tinker/self_host/self_cognition.py
+# 2. Configure the client in another terminal
+export TWINKLE_SERVER_URL=http://localhost:8000
+export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+export TWINKLE_MODEL_ID=Qwen/Qwen3.5-4B
+
+# 3. Run a Tinker Client example
+python cookbook/client/tinker/self_cognition.py
 
 # Or use Twinkle Client
-python cookbook/client/twinkle/self_host/self_cognition.py
+python cookbook/client/twinkle/self_cognition.py
+```
+
+The same examples work with the ModelScope managed service by changing only the environment:
+
+```bash
+export TWINKLE_SERVER_URL=https://www.modelscope.cn/twinkle
+export TWINKLE_SERVER_TOKEN="$MODELSCOPE_TOKEN"
+export TWINKLE_MODEL_ID=Qwen/Qwen3.6-27B
 ```

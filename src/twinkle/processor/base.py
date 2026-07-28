@@ -194,7 +194,24 @@ class InputProcessor:
             self.framework == 'transformers' and sp_strategy is not None and getattr(sp_strategy, 'enabled', False)
             and getattr(sp_strategy, 'world_size', 1) > 1)
 
-        ref_pos = sp_strategy.real_position_ids if sp_enabled else inputs['position_ids']
+        if sp_enabled:
+            ref_pos = sp_strategy.real_position_ids
+        elif inputs.get('position_ids') is not None:
+            ref_pos = inputs['position_ids']
+        else:
+            # Standard padded batch: HF omits position_ids (it derives them internally).
+            # Rebuild a position_ids-like reference (valid token -> its index, padding -> -1)
+            # so the last-valid-token pooling below, which keys off ``ref_pos >= 0`` for
+            # validity and a single ``== 0`` per row for packing detection, still works.
+            T = features.shape[1]
+            arange = torch.arange(T, device=features.device)
+            am = inputs.get('attention_mask')
+            if am is None:
+                ref_pos = arange.expand(features.shape[0], T)
+            else:
+                if am.dim() >= 3:
+                    am = am.reshape(am.shape[0], -1)[:, :T]
+                ref_pos = torch.where(am.bool(), arange, arange.new_tensor(-1))
         if ref_pos.dim() == 3:
             ref_pos = ref_pos[0]
         # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
@@ -721,7 +738,8 @@ class InputProcessor:
                     result[key] = result[key].reshape(len(values), num_axes, -1).permute(1, 0, 2).contiguous()
                 elif isinstance(values[0], torch.Tensor):
                     concat = False if (key == 'routed_experts') else None
-                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side, concat)
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map.get(key, 0), self.padding_side,
+                                                               concat)
                     if result[key].dim() == 1:
                         result[key] = result[key].unsqueeze(0)
                 else:

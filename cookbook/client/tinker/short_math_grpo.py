@@ -38,7 +38,7 @@ from twinkle.template import Qwen3_5Template
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen3.6-27B'
+BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 4096
 LEARNING_RATE = 2e-5
@@ -127,8 +127,8 @@ def main():
 
     from tinker import ServiceClient
     service_client = ServiceClient(
-        base_url='http://www.modelscope.cn/twinkle',
-        api_key=os.environ.get('MODELSCOPE_TOKEN')
+        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
     )
 
     logger.info('Creating LoRA training client...')
@@ -214,8 +214,8 @@ def main():
                     },
                     {
                         'role': 'user',
-                        'content': 'Math problem'
-                    },  # Placeholder
+                        'content': 'Math problem'  # Placeholder
+                    },
                     {
                         'role': 'assistant',
                         'content': decoded_text

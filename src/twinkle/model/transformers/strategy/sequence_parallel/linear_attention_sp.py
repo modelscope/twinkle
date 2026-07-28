@@ -106,7 +106,7 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         out = _apply_conv_activation(out[:, :, :seq_len], activation)
         return out.transpose(1, 2).contiguous()
 
-    # NPU: MindSpeed Triton causal_conv1d and chunk_gated_delta_rule
+    # NPU: fla native causal_conv1d and chunk_gated_delta_rule
     # are both patched by twinkle.kernel.npu_impls.fla at model initialization.
     # No need to set them here - they are already bound on the module.
     if getattr(mod, '_twinkle_npu_patched', False):

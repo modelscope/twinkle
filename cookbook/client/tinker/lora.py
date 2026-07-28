@@ -10,6 +10,8 @@
 import dotenv
 dotenv.load_dotenv('.env')
 
+import os
+
 # Step 2: Initialize Tinker client before importing ServiceClient
 from twinkle import init_tinker_client
 
@@ -19,12 +21,8 @@ init_tinker_client()
 from tinker import ServiceClient
 
 service_client = ServiceClient(
-	# BASE_URL can be a local server endpoint such as http://localhost:8000, or
-	# points to a previously deployed remote server, or
-	# modelscope server such as 'http://www.modelscope.cn/twinkle'
-    base_url='http://localhost:8000',
-	# API_KEY can be empty or a meaninful one according to sever configuration
-    api_key='EMPTY-TOKEN'
+    base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+    api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
 )
 
 # Step 4: List models available on the server to verify the connection
@@ -61,7 +59,7 @@ for tr in response.training_runs:
 
 # Step 6: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
-base_model = 'Qwen/Qwen3.5-4B'
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 if not resume_path:
     training_client = service_client.create_lora_training_client(base_model=base_model)
 else:

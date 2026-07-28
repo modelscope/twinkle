@@ -120,7 +120,7 @@ Safe to run on CUDA — entries whose dict misses the current device just skip.
 - GatedRMSNorm forward for Qwen3.5 / Qwen3.5-MoE
 - `apply_multimodal_rotary_pos_emb` for Qwen2.5-VL
 - Global SDPA replacement (one-shot side effect on `ALL_ATTENTION_FUNCTIONS['sdpa']`)
-- Qwen3.5 Flash Linear Attention enablement (one-shot side effect + per-instance traversal, triggered inside `npu_builtin(model)`)
+- Qwen3.5 Flash Linear Attention enablement (one-shot side effect + per-instance traversal, triggered inside `npu_builtin(model)`). Delegates to fla's native operators (`fla.modules.convolution.causal_conv1d` and `fla.ops.gated_delta_rule.chunk_gated_delta_rule`); on NPU, fla's `triton_ascend` backend dispatch handles the Ascend-specific kernels. Requires `flash-linear-attention` >= 0.5.2
 
 **Not included by default:** the NPU replacement for `transformers.integrations.moe._grouped_mm`. Without Expert Parallelism the contiguous-copy overhead is ~8x. Opt in explicitly when EP is enabled:
 

@@ -38,8 +38,9 @@ logger = get_logger()
 # =============================================================================
 # Step 3: Configuration
 # =============================================================================
-base_model = 'Qwen/Qwen3.5-4B'  # Multimodal vision-language model
-base_url = 'http://localhost:8000'
+base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
+api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 
 # =============================================================================
 # Step 4: Define Preprocessor (identical to Twinkle version)
@@ -100,7 +101,7 @@ def train():
     logger.info(f'Connecting to Tinker server at {base_url}')
     service_client = ServiceClient(
         base_url=base_url,
-        api_key=os.environ.get('MODELSCOPE_TOKEN', 'EMPTY-TOKEN')
+        api_key=api_key,
     )
 
     training_client = service_client.create_lora_training_client(
