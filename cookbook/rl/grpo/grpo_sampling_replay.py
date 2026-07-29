@@ -68,7 +68,7 @@ def compute_rewards(
     return total_rewards, format_rewards, accuracy_rewards
 
 
-def extract_rollout_batch(sample_responses, *, require_sampling_masks: bool):
+def extract_rollout_batch(sample_responses):
     """Flatten sampler responses into aligned lists used by reward and training."""
     rollout_batch = {
         'input_data': [],
@@ -80,9 +80,6 @@ def extract_rollout_batch(sample_responses, *, require_sampling_masks: bool):
         for sequence in sample_response.sequences:
             if sequence.logprobs is None:
                 raise RuntimeError('A sampled sequence is missing token log probabilities')
-            if require_sampling_masks and sequence.sampling_mask is None:
-                raise RuntimeError(
-                    'Sampling replay is enabled but a sampled sequence has no sampling mask')
             rollout_batch['input_data'].append(sequence.new_input_feature)
             rollout_batch['old_logps'].append(
                 [logprob[0][1] for logprob in sequence.logprobs])
@@ -203,10 +200,7 @@ def main():
             for prompt in prompts:
                 expand_prompts.extend([prompt] * NUM_GENERATIONS)
             responses = sampler.sample(expand_prompts, sampling_params)
-            return extract_rollout_batch(
-                responses,
-                require_sampling_masks=ENABLE_SAMPLING_REPLAY,
-            )
+            return extract_rollout_batch(responses)
 
         rollout_batch = sample_prompt_groups(global_prompts)
         # Match the original GRPO control flow: every sampled rollout is scored,

@@ -40,8 +40,6 @@ class GRPOLoss(Loss):
         self.beta = beta
         self.entropy_coef = entropy_coef
         self.enable_sampling_replay = enable_sampling_replay
-        if enable_sampling_replay and self.__class__ is not GRPOLoss:
-            raise ValueError('sampling replay is only supported by GRPOLoss')
         if enable_sampling_replay and beta != 0.0:
             raise ValueError('sampling replay does not support a GRPO KL penalty (beta must be 0)')
         if enable_sampling_replay and entropy_coef != 0.0:
@@ -209,7 +207,6 @@ class GRPOLoss(Loss):
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
-        sampling_masks=None,
         **kwargs,
     ):
         """
@@ -232,8 +229,6 @@ class GRPOLoss(Loss):
         """
         import torch
         if self.enable_sampling_replay:
-            if sampling_masks is None:
-                raise ValueError('sampling_masks are required when sampling replay is enabled')
             if old_logps is None:
                 raise ValueError('old_logps are required when sampling replay is enabled')
         labels = inputs.get('labels')

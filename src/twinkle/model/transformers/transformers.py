@@ -471,8 +471,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if enable_sampling_replay:
             if sampling_masks is None:
                 raise ValueError('sampling_masks are required when sampling replay is enabled')
-            if kwargs.get('old_logps') is None:
-                raise ValueError('old_logps are required when sampling replay is enabled')
             cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
             if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                 raise ValueError('sampling replay does not support sequence or context parallelism')
@@ -581,8 +579,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if enable_sampling_replay:
                 if sampling_masks is None:
                     raise ValueError('sampling_masks are required when sampling replay is enabled')
-                if kwargs.get('old_logps') is None:
-                    raise ValueError('old_logps are required when sampling replay is enabled')
                 cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')

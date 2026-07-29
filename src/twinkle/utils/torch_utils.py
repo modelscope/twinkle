@@ -136,6 +136,9 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
     return per_token_logps
 
 
+# Re-normalize trainer logits over each rollout-time top-p/top-k support set
+# before reading the sampled token's log probability. Replaying the sampler's
+# action space removes the sampling/training distribution mismatch in GRPO.
 def replayed_selective_log_softmax(
     logits: 'torch.Tensor',
     labels: 'torch.Tensor',
@@ -165,18 +168,6 @@ def replayed_selective_log_softmax(
             raise ValueError(f'sampling mask is missing for sample {batch_idx}')
         token_ids = [int(token_id) for token_id in sampling_mask.token_ids]
         offsets = [int(offset) for offset in sampling_mask.offsets]
-        if not offsets or offsets[0] != 0:
-            raise ValueError(f'sampling mask offsets for sample {batch_idx} must start at 0')
-        if offsets[-1] != len(token_ids):
-            raise ValueError(f'sampling mask offsets for sample {batch_idx} must end at {len(token_ids)}')
-        for row_idx, (start, end) in enumerate(zip(offsets, offsets[1:])):
-            if start > end:
-                raise ValueError(f'sampling mask offsets are not monotonic at sample {batch_idx}, row {row_idx}')
-            if start == end:
-                raise ValueError(f'sampling mask contains an empty row at sample {batch_idx}, row {row_idx}')
-            row_token_ids = token_ids[start:end]
-            if len(set(row_token_ids)) != len(row_token_ids):
-                raise ValueError(f'sampling mask contains duplicate token IDs at sample {batch_idx}, row {row_idx}')
 
         num_rows = len(offsets) - 1
         num_train_tokens = int(loss_mask[batch_idx].sum().item())
@@ -197,8 +188,6 @@ def replayed_selective_log_softmax(
     # CSR rows are ordered exactly like the masked training-token positions.
     positions = loss_mask.nonzero(as_tuple=False)
     num_rows = positions.shape[0]
-    if len(global_offsets) != num_rows + 1:
-        raise ValueError(f'sampling masks contain {len(global_offsets) - 1} rows for {num_rows} training tokens')
     result = torch.zeros(labels.shape, dtype=torch.float32, device=logits.device)
     if num_rows == 0:
         return result
