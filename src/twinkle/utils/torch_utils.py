@@ -154,8 +154,7 @@ def replayed_selective_log_softmax(
     if labels.shape != logits.shape[:2] or loss_mask.shape != labels.shape:
         raise ValueError('labels and loss_mask must match the first two logits dimensions')
     if len(sampling_masks) != labels.shape[0]:
-        raise ValueError(
-            f'sampling mask batch has {len(sampling_masks)} samples, expected {labels.shape[0]}')
+        raise ValueError(f'sampling mask batch has {len(sampling_masks)} samples, expected {labels.shape[0]}')
 
     # Flatten per-sample CSR rows into one global CSR layout.
     vocab_size = logits.shape[-1]
@@ -169,32 +168,27 @@ def replayed_selective_log_softmax(
         if not offsets or offsets[0] != 0:
             raise ValueError(f'sampling mask offsets for sample {batch_idx} must start at 0')
         if offsets[-1] != len(token_ids):
-            raise ValueError(
-                f'sampling mask offsets for sample {batch_idx} must end at {len(token_ids)}')
+            raise ValueError(f'sampling mask offsets for sample {batch_idx} must end at {len(token_ids)}')
         for row_idx, (start, end) in enumerate(zip(offsets, offsets[1:])):
             if start > end:
-                raise ValueError(
-                    f'sampling mask offsets are not monotonic at sample {batch_idx}, row {row_idx}')
+                raise ValueError(f'sampling mask offsets are not monotonic at sample {batch_idx}, row {row_idx}')
             if start == end:
                 raise ValueError(f'sampling mask contains an empty row at sample {batch_idx}, row {row_idx}')
             row_token_ids = token_ids[start:end]
             if len(set(row_token_ids)) != len(row_token_ids):
-                raise ValueError(
-                    f'sampling mask contains duplicate token IDs at sample {batch_idx}, row {row_idx}')
+                raise ValueError(f'sampling mask contains duplicate token IDs at sample {batch_idx}, row {row_idx}')
 
         num_rows = len(offsets) - 1
         num_train_tokens = int(loss_mask[batch_idx].sum().item())
         if num_rows != num_train_tokens:
-            raise ValueError(
-                f'sampling mask for sample {batch_idx} has {num_rows} rows but '
-                f'{num_train_tokens} training tokens')
+            raise ValueError(f'sampling mask for sample {batch_idx} has {num_rows} rows but '
+                             f'{num_train_tokens} training tokens')
         invalid_token_id = next(
             (token_id for token_id in token_ids if token_id < 0 or token_id >= vocab_size),
             None,
         )
         if invalid_token_id is not None:
-            raise ValueError(
-                f'sampling mask token ID {invalid_token_id} is outside vocabulary [0, {vocab_size})')
+            raise ValueError(f'sampling mask token ID {invalid_token_id} is outside vocabulary [0, {vocab_size})')
 
         base_offset = global_offsets[-1]
         flat_token_ids.extend(token_ids)
@@ -204,8 +198,7 @@ def replayed_selective_log_softmax(
     positions = loss_mask.nonzero(as_tuple=False)
     num_rows = positions.shape[0]
     if len(global_offsets) != num_rows + 1:
-        raise ValueError(
-            f'sampling masks contain {len(global_offsets) - 1} rows for {num_rows} training tokens')
+        raise ValueError(f'sampling masks contain {len(global_offsets) - 1} rows for {num_rows} training tokens')
     result = torch.zeros(labels.shape, dtype=torch.float32, device=logits.device)
     if num_rows == 0:
         return result
@@ -225,9 +218,8 @@ def replayed_selective_log_softmax(
     missing_rows = (match_counts == 0).nonzero(as_tuple=False)
     if missing_rows.numel():
         row_idx = int(missing_rows[0].item())
-        raise ValueError(
-            f'sampled label {int(sampled_labels[row_idx].item())} is absent from '
-            f'sampling mask row {row_idx}')
+        raise ValueError(f'sampled label {int(sampled_labels[row_idx].item())} is absent from '
+                         f'sampling mask row {row_idx}')
 
     # Gather only logits retained by the rollout sampler, then normalize per CSR row.
     kept_logits = logits[
@@ -243,7 +235,7 @@ def replayed_selective_log_softmax(
 
     # Use max-shifted log-sum-exp for numerically stable restricted softmax.
     row_max = torch.full(
-        (num_rows,),
+        (num_rows, ),
         -torch.inf,
         dtype=torch.float32,
         device=logits.device,

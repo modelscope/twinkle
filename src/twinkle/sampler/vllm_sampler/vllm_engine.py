@@ -37,9 +37,8 @@ def _filter_engine_config(
     valid_args = set(valid_args)
     invalid_args = set(engine_config) - valid_args
     if enable_sampling_replay and 'enable_return_sampling_mask' in invalid_args:
-        raise RuntimeError(
-            'Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
-            'enable_return_sampling_mask')
+        raise RuntimeError('Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
+                           'enable_return_sampling_mask')
     filtered_engine_config = {key: value for key, value in engine_config.items() if key in valid_args}
     return filtered_engine_config, invalid_args
 
@@ -54,8 +53,7 @@ def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[Sampl
     offsets = [int(offset) for offset in mask.offsets]
     num_rows = len(offsets) - 1
     if num_rows != num_tokens:
-        raise RuntimeError(
-            f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
+        raise RuntimeError(f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
     if not offsets or offsets[0] != 0 or offsets[-1] != len(token_ids):
         raise RuntimeError('vLLM sampling mask has invalid CSR endpoints')
     if any(start >= end for start, end in zip(offsets, offsets[1:])):
@@ -141,8 +139,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.quantization = quantization
         self.load_format = load_format
         self.enable_sampling_replay = enable_sampling_replay
-        self.logprobs_mode = 'processed_logprobs' if enable_sampling_replay else (
-            logprobs_mode or 'processed_logprobs')
+        self.logprobs_mode = 'processed_logprobs' if enable_sampling_replay else (logprobs_mode or 'processed_logprobs')
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
