@@ -70,8 +70,8 @@ class InputProcessor:
         self.framework = framework
         self.process_pipeline = [
             self.prepare_inputs,
-            self.align_routed_experts,
             self.pad_cp,
+            self.align_routed_experts,
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
@@ -827,10 +827,8 @@ class InputProcessor:
 
         def align_to(_input):
             routed_experts = _input.get('routed_experts', None)
-            input_seq_len = _input.get('length', None)
-            if input_seq_len is None:
-                input_ids = _input.get('input_ids', None)
-                input_seq_len = input_ids.shape[1] if input_ids is not None else 0
+            input_ids = _input.get('input_ids', None)
+            input_seq_len = input_ids.shape[-1] if input_ids is not None else 0
             if routed_experts is not None:
                 # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
                 # This gap of 1 is expected
