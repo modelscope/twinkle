@@ -157,6 +157,7 @@ def replayed_selective_log_softmax(
         raise ValueError(
             f'sampling mask batch has {len(sampling_masks)} samples, expected {labels.shape[0]}')
 
+    # Flatten per-sample CSR rows into one global CSR layout.
     vocab_size = logits.shape[-1]
     flat_token_ids = []
     global_offsets = [0]
@@ -199,6 +200,7 @@ def replayed_selective_log_softmax(
         flat_token_ids.extend(token_ids)
         global_offsets.extend(base_offset + offset for offset in offsets[1:])
 
+    # CSR rows are ordered exactly like the masked training-token positions.
     positions = loss_mask.nonzero(as_tuple=False)
     num_rows = positions.shape[0]
     if len(global_offsets) != num_rows + 1:
@@ -227,6 +229,7 @@ def replayed_selective_log_softmax(
             f'sampled label {int(sampled_labels[row_idx].item())} is absent from '
             f'sampling mask row {row_idx}')
 
+    # Gather only logits retained by the rollout sampler, then normalize per CSR row.
     kept_logits = logits[
         positions[row_ids, 0],
         positions[row_ids, 1],
@@ -238,6 +241,7 @@ def replayed_selective_log_softmax(
         sampled_labels,
     ].float() / temperature
 
+    # Use max-shifted log-sum-exp for numerically stable restricted softmax.
     row_max = torch.full(
         (num_rows,),
         -torch.inf,
