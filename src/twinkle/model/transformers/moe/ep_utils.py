@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
+from twinkle import torch_util
+
 
 # ========================== comm ==========================
 class _AllToAll(torch.autograd.Function):
@@ -113,7 +115,11 @@ def permute(tokens: torch.Tensor, expert_mask: torch.Tensor):
     sorted_indices = token_indices.masked_select(expert_mask)
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    # NOTE: use advanced indexing instead of index_select — index_select's
+    # backward (index_add) is broken on some torch_npu/CANN versions
+    # (aclnnIndexAdd fails for any dtype), while x[idx] backward (index_put)
+    # works. Mathematically identical.
+    permuted_input = tokens[sorted_indices]
 
     return permuted_input, sorted_indices
 
@@ -203,6 +209,12 @@ def preprocess(
     )
     dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
 
+    # The collective may run on a separate stream (e.g. HCCL on NPU) whose
+    # completion is not always ordered with the host reads (.tolist()/.item())
+    # below — observed in practice as garbage split sizes. Force a device sync
+    # before reading gathered results back on the host.
+    torch_util.synchronize()
+
     # [ep_size, num_local_experts]
     start_idx, end_idx = rank * num_local_experts, (rank + 1) * num_local_experts
     num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, start_idx:end_idx].contiguous()
@@ -211,11 +223,13 @@ def preprocess(
     output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
 
     # [num_local_expert]
-    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0).to(
-        torch.device('cpu'), non_blocking=True)
+    # NOTE: keep these copies synchronous. With non_blocking=True the CPU
+    # tensors are read (tolist()/item()) before the async D2H copy lands,
+    # producing garbage split sizes (observed on NPU).
+    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0).to(torch.device('cpu'))
 
     num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(-1, num_local_experts).to(
-        torch.device('cpu'), non_blocking=True)
+        torch.device('cpu'))
 
     return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
 

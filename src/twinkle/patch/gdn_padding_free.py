@@ -71,7 +71,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
 ) -> torch.Tensor:
     is_npu = getattr(mod, '_twinkle_npu_patched', False)
     if is_npu:
-        from twinkle.kernel.npu_impls.fla import npu_causal_conv1d_fn
+        from twinkle.kernel.ops.fla.npu import npu_causal_conv1d_fn
     else:
         causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
 

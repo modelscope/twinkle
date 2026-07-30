@@ -34,8 +34,8 @@ class ModelArgs:
     ddp_config: dict[str, Any] | None = None
     fsdp_config: dict[str, Any] | None = None
     grad_scaler_config: dict[str, Any] | None = None
-    # Liger Kernel toggle: when True, the cookbook applies `liger_builtin()` via
-    # `kernelize`. Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
+    # Liger Kernel toggle: gates the fused-linear-CE loss in the cookbooks.
+    # Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
     enable_liger: bool = False
     # Fused-linear-CE loss toggle. Only meaningful when `enable_liger` is True.
     # Defaults True so `--enable-liger` turns on BOTH the per-layer Liger/CANN
