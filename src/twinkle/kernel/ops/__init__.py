@@ -11,10 +11,9 @@ rms_norm, rotary, geglu, moe, sdpa_attention, fla) into
 ``twinkle.kernel.registry`` — registration modules are lightweight (lazy
 references + availability checks only, no optional-dependency imports).
 """
-from .ep import EpExpertsGmm, ep_forward
-
 # Trigger built-in op registration (must happen before the first kernelize() call)
 from . import fla, geglu, moe, rms_norm, rotary, sdpa_attention, swiglu  # noqa: F401,E402
+from .ep import EpExpertsGmm, ep_forward
 
 __all__ = [
     'EpExpertsGmm',

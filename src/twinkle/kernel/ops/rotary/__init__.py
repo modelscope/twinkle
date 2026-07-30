@@ -13,11 +13,13 @@ from ...registry import KernelImpl, is_liger_available, is_npu_available, lazy_i
 register_op(
     'rotary',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.rotary.npu:npu_apply_rotary_pos_emb'),
             available=is_npu_available,
         ),
-        'liger': KernelImpl(
+        'liger':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.rotary.liger:liger_rotary_pos_emb'),
             available=is_liger_available,
         ),
@@ -28,7 +30,8 @@ register_op(
 register_op(
     'multimodal_rotary',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.rotary.npu:npu_apply_multimodal_rotary_pos_emb'),
             available=is_npu_available,
         ),

@@ -10,10 +10,9 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import torch.nn as nn
 from dataclasses import dataclass
 from typing import Any, Callable
-
-import torch.nn as nn
 
 from twinkle import get_logger
 from twinkle.utils.device_mesh import Platform
@@ -34,7 +33,6 @@ __all__ = [
     'is_liger_available',
     'exists',
 ]
-
 
 # ── Data structures ───────────────────────────────────────────────────────
 
@@ -132,8 +130,7 @@ def resolve_impl(
             continue
         ok, reason = impl_entry.available()
         if not ok:
-            logger.log(level, "[kernelize] op '%s': backend '%s' unavailable (%s), skipping", op.name, backend,
-                       reason)
+            logger.log(level, "[kernelize] op '%s': backend '%s' unavailable (%s), skipping", op.name, backend, reason)
             continue
         try:
             return impl_entry.load(target), backend

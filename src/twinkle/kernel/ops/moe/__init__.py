@@ -15,11 +15,13 @@ from ...registry import KernelImpl, is_liger_available, is_npu_available, lazy_i
 register_op(
     'moe_experts',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.moe.npu:npu_packed_moe_experts_forward'),
             available=is_npu_available,
         ),
-        'liger': KernelImpl(
+        'liger':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.moe.liger:LigerExperts'),
             available=is_liger_available,
         ),
@@ -29,7 +31,8 @@ register_op(
 register_op(
     'moe_block',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.moe.npu:npu_qwen3_5_moe_sparse_block_forward'),
             available=is_npu_available,
         ),

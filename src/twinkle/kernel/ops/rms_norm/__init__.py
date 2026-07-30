@@ -45,7 +45,8 @@ register_op(
 register_op(
     'gated_rms_norm',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.rms_norm.npu:npu_gated_rms_norm_forward'),
             available=is_npu_available,
         ),

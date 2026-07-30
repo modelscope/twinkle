@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from twinkle import get_logger
-
 from .registry import KernelChoice, get_op, resolve_impl
 
 logger = get_logger()
@@ -156,10 +155,10 @@ def _install_dotted(model: nn.Module, target: str, impl, *, warn: bool = False) 
         if target.startswith('transformers.'):
             level = logging.WARNING if warn else logging.DEBUG
             hint = ' (explicit mapping: check for typos)' if warn else ''
-            logger.log(level, "[kernelize] target %r unresolvable (%r); family not installed, skipping%s",
-                       target, e, hint)
+            logger.log(level, '[kernelize] target %r unresolvable (%r); family not installed, skipping%s', target, e,
+                       hint)
             return False
-        raise ValueError(f"Cannot resolve mapping target {target!r} with the default installer "
+        raise ValueError(f'Cannot resolve mapping target {target!r} with the default installer '
                          f'(logical targets require a custom installer): {e!r}') from e
     if isinstance(resolved, type) and issubclass(resolved, nn.Module):
         _replace_class(model, resolved, impl)
@@ -200,9 +199,9 @@ def _installer_name(installer) -> str:
 
 def _log_all_unavailable(target: Any, choice: KernelChoice, *, warn: bool) -> None:
     level = logging.WARNING if warn else logging.DEBUG
-    logger.log(level, "[kernelize] target %s: no available backend for op '%s' (tried: %s); "
-               'keeping the original implementation', _target_name(target), choice.op,
-               ', '.join(choice.backends))
+    logger.log(
+        level, "[kernelize] target %s: no available backend for op '%s' (tried: %s); "
+        'keeping the original implementation', _target_name(target), choice.op, ', '.join(choice.backends))
 
 
 def kernelize(model: nn.Module, mapping: dict | None = None) -> nn.Module:
@@ -256,12 +255,13 @@ def kernelize(model: nn.Module, mapping: dict | None = None) -> nn.Module:
         if installer is default_installer:
             installed = installer(model, target, impl, warn=warn)
         else:
-            installed = installer(model, target, impl)  # failures propagate, never swallowed (half-installed state stays visible)
+            installed = installer(model, target,
+                                  impl)  # failures propagate, never swallowed (half-installed state stays visible)
         if installed is False:
             continue
         if isinstance(replacement, KernelChoice):
-            logger.info('[kernelize] target=%s op=%s backend=%s installer=%s', _target_name(target), op.name,
-                        backend, _installer_name(installer))
+            logger.info('[kernelize] target=%s op=%s backend=%s installer=%s', _target_name(target), op.name, backend,
+                        _installer_name(installer))
         else:
             impl_repr = getattr(impl, '__qualname__', repr(impl))
             logger.info('[kernelize] target=%s impl=%s installer=%s', _target_name(target), impl_repr,

@@ -7,11 +7,13 @@ from ...registry import KernelImpl, is_liger_available, is_npu_available, lazy_i
 register_op(
     'swiglu',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.swiglu.npu:npu_swiglu_forward'),
             available=is_npu_available,
         ),
-        'liger': KernelImpl(
+        'liger':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.swiglu.liger:liger_swiglu_forward'),
             available=is_liger_available,
         ),

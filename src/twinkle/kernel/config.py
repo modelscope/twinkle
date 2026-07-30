@@ -21,15 +21,15 @@ _QWEN_DENSE = [
     ('transformers.models.qwen2.modeling_qwen2', 'Qwen2RMSNorm', ['Qwen2MLP'], []),
     ('transformers.models.qwen3.modeling_qwen3', 'Qwen3RMSNorm', ['Qwen3MLP'], []),
     ('transformers.models.qwen2_5_vl.modeling_qwen2_5_vl', 'Qwen2_5_VLRMSNorm', ['Qwen2MLP', 'Qwen2_5_VLMLP'], []),
-    ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3_5RMSNorm', ['Qwen3_5MLP', 'Qwen3_5VisionMLP'],
-     ['Qwen3_5VisionRMSNorm']),
+    ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3_5RMSNorm', ['Qwen3_5MLP',
+                                                                        'Qwen3_5VisionMLP'], ['Qwen3_5VisionRMSNorm']),
 ]
 # (module, rms_cls, mlp_cls, experts_cls, block_cls)
 _QWEN_MOE = [
     ('transformers.models.qwen3_moe.modeling_qwen3_moe', 'Qwen3MoeRMSNorm', 'Qwen3MoeMLP', 'Qwen3MoeExperts',
      'Qwen3MoeSparseMoeBlock'),
-    ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3_5MoeRMSNorm', 'Qwen3_5MoeMLP',
-     'Qwen3_5MoeExperts', 'Qwen3_5MoeSparseMoeBlock'),
+    ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3_5MoeRMSNorm', 'Qwen3_5MoeMLP', 'Qwen3_5MoeExperts',
+     'Qwen3_5MoeSparseMoeBlock'),
 ]
 # qwen3_5 Gated RMSNorm (forward-level replacement, no liger impl)
 _QWEN_GATED_RMS = {

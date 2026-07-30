@@ -10,7 +10,6 @@ resolved by the generic replacer.
 from __future__ import annotations
 
 from twinkle import get_logger
-
 from ...registry import KernelImpl, is_npu_available, lazy_import, register_op
 
 logger = get_logger()
@@ -37,7 +36,8 @@ def install_sdpa(model, target, impl) -> None:
 register_op(
     'sdpa_attention',
     implementations={
-        'npu': KernelImpl(
+        'npu':
+        KernelImpl(
             load=lazy_import('twinkle.kernel.ops.sdpa_attention.npu:npu_sdpa_attention_forward'),
             available=is_npu_available,
         ),
