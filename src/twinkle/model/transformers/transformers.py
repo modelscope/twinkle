@@ -146,6 +146,44 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
 
 
+def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+    """Read a full HuggingFace checkpoint directory into a CPU state dict.
+
+    Supports both single-file and sharded ``safetensors`` layouts, falling back
+    to ``pytorch_model.bin`` variants. Returns tensors on CPU.
+    """
+    import json
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    st_index = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+    st_single = os.path.join(checkpoint_dir, 'model.safetensors')
+    bin_index = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+    bin_single = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+    if os.path.exists(st_index) or os.path.exists(st_single):
+        from safetensors.torch import load_file
+        if os.path.exists(st_index):
+            with open(st_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(load_file(os.path.join(checkpoint_dir, shard), device='cpu'))
+        else:
+            state_dict.update(load_file(st_single, device='cpu'))
+    elif os.path.exists(bin_index) or os.path.exists(bin_single):
+        if os.path.exists(bin_index):
+            with open(bin_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
+        else:
+            state_dict.update(torch.load(bin_single, map_location='cpu', weights_only=True))
+    else:
+        raise FileNotFoundError(f'No safetensors/bin weights found in {checkpoint_dir}')
+    return state_dict
+
+
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
@@ -856,7 +894,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optim_params = kwargs.pop('optim_params', {})
         if optim_params:
-            assert isinstance(optimizer, (AdamW, Adam))
+            # After _lazy_wrap_model the optimizer may be wrapped (e.g.
+            # accelerate's AcceleratedOptimizer); check the inner instance.
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            assert isinstance(inner_optimizer, (AdamW, Adam)), \
+                f'optim_params is only supported for Adam/AdamW, got {type(inner_optimizer).__name__}'
             for group in optimizer.param_groups:
                 group['lr'] = optim_params['lr']
                 if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
@@ -1137,10 +1179,30 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
             self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
-            raise NotImplementedError
+            # Full-parameter model: load a plain HF checkpoint in-place.
+            state_dict = _read_hf_state_dict(checkpoint_dir)
+            self.strategy.load_full_state_dict(self.model, state_dict)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+
+    @remote_function()
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from ``self.model_id``.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        if not self.model_id:
+            logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
+            return
+        state_dict = _read_hf_state_dict(self.model_id)
+        self.strategy.load_full_state_dict(self.model, state_dict)
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        for param in self.model.parameters():
+            param.grad = None
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)

@@ -345,6 +345,24 @@ class NativeFSDPStrategy:
 
         return state_dict
 
+    def load_full_state_dict(self, model, state_dict) -> None:
+        """Load a full (non-sharded) state dict into the (possibly sharded) model.
+
+        Used by full-parameter training to (re)load base weights. Uses
+        ``set_model_state_dict`` when the model is distributed (FSDP2), else a
+        plain in-place ``load_state_dict``.
+        """
+        if self.device_mesh is not None:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            set_model_state_dict(
+                model,
+                state_dict,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+            return
+        unwrapped = self.unwrap_model(model)
+        unwrapped.load_state_dict(state_dict, strict=False)
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect only LoRA adapter parameters, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)

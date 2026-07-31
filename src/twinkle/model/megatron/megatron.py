@@ -650,8 +650,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # For DDP-wrapped models, ALWAYS zero the gradient buffer
         # This is essential because Megatron's forward_backward_func uses
         # the buffer's state to track gradient accumulation
-        if self._is_model_ddp_wrapped() and hasattr(self.model, 'zero_grad_buffer'):
-            self.model.zero_grad_buffer()
+        # (self.model is a list of chunks; zero_grad_buffer lives on each chunk)
+        if self._is_model_ddp_wrapped():
+            for model_chunk in self.model:
+                if hasattr(model_chunk, 'zero_grad_buffer'):
+                    model_chunk.zero_grad_buffer()
 
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
@@ -985,6 +988,32 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 peft_format=(adapter_name != _default_adapter_name),
             )
 
+        if dist.is_initialized():
+            dist.barrier()
+
+    @remote_function(dispatch='all')
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from the original model path.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        bridge = self.strategy.bridge
+        bridge.load_weights(
+            self.strategy.unwrap_model(self.model),
+            self._model_path,
+            peft_format=False,
+        )
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        if self._is_model_ddp_wrapped():
+            for model_chunk in self.model:
+                if hasattr(model_chunk, 'zero_grad_buffer'):
+                    model_chunk.zero_grad_buffer()
+        for _model in self.strategy.unwrap_model(self.model):
+            for param in _model.parameters():
+                param.grad = None
         if dist.is_initialized():
             dist.barrier()
 

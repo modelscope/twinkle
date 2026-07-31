@@ -158,3 +158,4 @@ ast_index_file.py
 test_cookbook/
 /test*.py
 swanlog/
+tests/server/config/_generated_e2e.yaml

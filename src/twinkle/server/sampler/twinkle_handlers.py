@@ -101,11 +101,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
+                import os
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-                _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+                _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
                 # Reset prefix cache only when new weights are loaded
                 self.sampler.reset_prefix_cache()
+                # LoRA adapter dir (has adapter_config.json) vs full-parameter
+                # HF checkpoint. Full checkpoints replace the sampler base model.
+                if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
+                    adapter_path = resolved_uri
+                elif resolved_uri:
+                    self.sampler.load_full_weights_from_path(resolved_uri)
 
             # Parse inputs
             inputs = body.inputs
@@ -227,10 +234,15 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
         if body.adapter_uri:
+            import os
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+            _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
             self.sampler.reset_prefix_cache()
+            if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
+                adapter_path = resolved_uri
+            elif resolved_uri:
+                self.sampler.load_full_weights_from_path(resolved_uri)
 
         inputs = body.inputs
         if isinstance(inputs, list):
