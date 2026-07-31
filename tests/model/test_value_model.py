@@ -46,6 +46,7 @@ def test_value_model_constructor_exposes_device_mesh():
 def test_value_model_forward_and_backward():
     model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
     model.set_loss(PPOValueLoss())
+    model._lazy_wrap_model()
     model_device = str(next(model.model.parameters()).device)
     with patch('twinkle.processor.base.Platform.get_local_device', return_value=model_device):
         outputs = model.forward_backward(
@@ -64,6 +65,7 @@ def test_value_model_forward_and_backward():
 def test_value_model_forward_only_returns_values():
     model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
     model.set_loss(PPOValueLoss())
+    model._lazy_wrap_model()
     model_device = str(next(model.model.parameters()).device)
     with patch('twinkle.processor.base.Platform.get_local_device', return_value=model_device):
         outputs = model.forward_only(
