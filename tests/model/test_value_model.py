@@ -1,4 +1,5 @@
 import inspect
+import os
 import tempfile
 from unittest.mock import patch
 
@@ -9,6 +10,14 @@ from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
 from twinkle.loss import PPOValueLoss
 from twinkle.model import TransformersValueModel
+
+
+# These tests validate the value-head forward/backward on a tiny model and are
+# designed to run on CPU regardless of the host. On a GPU box, `accelerate` moves
+# the model to cuda during wrap while the patched input processor stays on CPU,
+# which raises a device-mismatch error. Hiding CUDA forces the whole path to CPU.
+def _force_cpu():
+    return patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': ''})
 
 
 def _tiny_model_dir():
@@ -44,14 +53,15 @@ def test_value_model_constructor_exposes_device_mesh():
 
 
 def test_value_model_forward_and_backward():
-    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
-    model.set_loss(PPOValueLoss())
-    with patch('twinkle.processor.base.Platform.get_local_device', return_value='cpu'):
-        outputs = model.forward_backward(
-            inputs=[{'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]}],
-            old_values=[[0.0, 0.0]],
-            returns=[[1.0, 1.0]],
-        )
+    with _force_cpu():
+        model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+        model.set_loss(PPOValueLoss())
+        with patch('twinkle.processor.base.Platform.get_local_device', return_value='cpu'):
+            outputs = model.forward_backward(
+                inputs=[{'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]}],
+                old_values=[[0.0, 0.0]],
+                returns=[[1.0, 1.0]],
+            )
     assert outputs['values'].shape == (1, 3)
     assert outputs.get('logps') is None
     head = model.model.get_output_embeddings()
@@ -61,12 +71,13 @@ def test_value_model_forward_and_backward():
 
 
 def test_value_model_forward_only_returns_values():
-    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
-    model.set_loss(PPOValueLoss())
-    with patch('twinkle.processor.base.Platform.get_local_device', return_value='cpu'):
-        outputs = model.forward_only(
-            inputs=[{'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]}],
-        )
+    with _force_cpu():
+        model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+        model.set_loss(PPOValueLoss())
+        with patch('twinkle.processor.base.Platform.get_local_device', return_value='cpu'):
+            outputs = model.forward_only(
+                inputs=[{'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]}],
+            )
     assert outputs['values'].shape == (1, 3)
     assert outputs.get('logps') is None
     assert not outputs['values'].requires_grad
