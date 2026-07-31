@@ -87,6 +87,7 @@ sh INSTALL_MEGATRON.sh
 | pp/tp/cp MoE 微调                   | megatron              | [脚本](cookbook/megatron/tp_moe.py)                    |
 | 多模态 FSDP 微调                    | transformers          | [脚本](cookbook/mm/fsdp2.py)                           |
 | GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo/grpo.py)                            |
+| PPO 强化学习训练                     | transformers          | [脚本](cookbook/rl/ppo/ppo.py)                              |
 | GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo/grpo_mm.py)                         |
 | GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/grpo/short_math_grpo.py)                 |
 | DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo/dpo_full.py)                        |

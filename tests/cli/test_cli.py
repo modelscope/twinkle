@@ -307,6 +307,33 @@ class TestCLIEndToEnd:
         assert args.infra.sequence_parallel is True
         assert args.infra.world_size == 32
 
+    def test_cli_ppo_fields(self):
+        args = CLI.from_args(argv=[
+            '--critic_model_gpus',
+            '2',
+            '--ppo_epochs',
+            '3',
+            '--gamma',
+            '0.99',
+            '--gae_lambda',
+            '0.9',
+            '--kl_coef',
+            '0.01',
+            '--no_normalize_advantages',
+            '--critic_learning_rate',
+            '2e-5',
+            '--value_clip',
+            '0.1',
+        ])
+        assert args.infra.critic_model_gpus == 2
+        assert args.rl.ppo_epochs == 3
+        assert args.rl.gamma == pytest.approx(0.99)
+        assert args.rl.gae_lambda == pytest.approx(0.9)
+        assert args.rl.kl_coef == pytest.approx(0.01)
+        assert args.rl.normalize_advantages is False
+        assert args.rl.critic_learning_rate == pytest.approx(2e-5)
+        assert args.loss.value_clip == pytest.approx(0.1)
+
     def test_use_megatron_true_flips_strategy(self):
         args = CLI.from_args(argv=['--use_megatron', 'true'])
         assert args.model.strategy == 'native_fsdp'

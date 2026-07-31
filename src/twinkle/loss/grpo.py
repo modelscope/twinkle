@@ -304,6 +304,15 @@ class GRPOLoss(Loss):
         return LossOutput(loss=loss, num_tokens=0)
 
 
+class PPOLoss(GRPOLoss):
+    """PPO clipped policy loss.
+
+    PPO and GRPO share the same clipped policy objective. The algorithms differ
+    in how advantages are produced, so this class provides the PPO-facing name
+    without maintaining a second implementation.
+    """
+
+
 class GSPOLoss(GRPOLoss):
     """
     GRPO with sequence-level importance sampling.

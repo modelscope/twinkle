@@ -71,7 +71,24 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init(ignore_reinit_error=True)
+            # Auto-detect device resources for accelerators that Ray doesn't
+            # natively recognise (e.g. Ascend NPU).  Ray auto-detects GPU via
+            # nvidia-smi, but has no built-in detection for NPU / other devices,
+            # so without explicit resources Ray nodes report 0 NPU and the
+            # subsequent ResourceManager assertion fails.
+            _non_cpu_types = {g.device_type.upper() for g in device_groups} - {'CPU'}
+            _resources: dict[str, float] = {}
+            if len(_non_cpu_types) == 1:
+                _dev_type = next(iter(_non_cpu_types))
+                if _dev_type == 'NPU':
+                    try:
+                        import torch
+                        _npu_count = torch.npu.device_count() if hasattr(torch, 'npu') else 0
+                        if _npu_count > 0:
+                            _resources['NPU'] = float(_npu_count)
+                    except Exception:
+                        pass
+            ray.init(ignore_reinit_error=True, resources=_resources or None)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
