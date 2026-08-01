@@ -21,6 +21,8 @@ import train_skill_v2 as v2
 
 from .config import ExpSpec
 from .data import load_deepmath_records
+from .data_code import load_code_records
+from .eval_reflexion import run_reflexion_eval
 from .methods import MethodContext, build_method
 from .pool import SamplePool
 from .rubric_cache import build_rubric_cache
@@ -34,9 +36,9 @@ except ImportError:
 def _rubric_scope(method: str) -> str:
     """Bare-problem lines (rl/sft) share a GLOBAL cache; with-skill lines (opsd/improve) use
     a per-experiment LOCAL cache. bnpo needs no rubric."""
-    if method in ('rl_ab', 'rl_err', 'sft'):
+    if method in ('rl_ab', 'rl_err', 'sft', 'reflexion', 'rejection_sft'):
         return 'global'
-    if method in ('opsd', 'improve_sft'):
+    if method in ('opsd', 'improve_sft', 'logp_rl'):
         return 'local'
     return ''
 
@@ -47,6 +49,11 @@ def _build_pool(spec: ExpSpec, args) -> Any:
                           max_pool=args.pool_max)
     if spec.method == 'sft':
         return SamplePool(batch_size=args.sft_batch_size, balanced=False,
+                          max_pool=args.pool_max)
+    if spec.method == 'rejection_sft':
+        # E18：攒够 --e18-accumulate（128）条才 fire 一次 SFT；_train_batch 内部仍按
+        # sft_batch_size 切 micro，所以这里只需保证是 TRAIN_DP 倍数（main.py 校验）。
+        return SamplePool(batch_size=args.e18_accumulate, balanced=False,
                           max_pool=args.pool_max)
     return None  # RL / OPSD / bnpo train per-chunk, no accumulation pool
 
@@ -68,6 +75,11 @@ def _load_resume_state(args) -> dict:
     if os.path.exists(state_path):
         with open(state_path, encoding='utf-8') as f:
             st = json.load(f)
+        # bugfix #17: 旧/手写 train_state.json 缺键时给出可读报错而非裸 KeyError
+        missing = [k for k in ('updates', 'chunk_idx') if k not in st]
+        if missing:
+            raise ValueError(f'resume: {state_path} missing keys {missing}; '
+                             f'present keys: {sorted(st)}')
         for k in ('chunk_size', 'min_level', 'n', 'seed'):
             if k in st and getattr(args, k, None) not in (None, '') and st[k] != getattr(args, k):
                 sys.stderr.write(f'[ablate] WARNING: resume data config mismatch: {k} '
@@ -100,7 +112,9 @@ def run_experiment(args, spec: ExpSpec) -> None:
         sys.stderr.write(f'[ablate] resuming {spec.name} from {resume["ckpt_dir"]} '
                          f'(updates={resume["updates"]} chunk={resume["chunk_idx"]}).\n')
 
-    # 1) style / align globals must be set BEFORE any prompt is built.
+    # 1) task / style / align globals must be set BEFORE any prompt is built.
+    # set_task 必须在最前：它同时决定 prompt 分派、判分方式与 rubric 判据版本（缓存键）。
+    v2.set_task(spec.task, getattr(args, 'test_workers', 24), getattr(args, 'test_timeout', 60))
     v2._ALIGN_MODE = spec.align
     v2._SKILL_STYLE = spec.style
     args.skill_thinking = spec.thinking
@@ -114,6 +128,11 @@ def run_experiment(args, spec: ExpSpec) -> None:
     elif args.skill_max_tokens != spec.skill_max_tokens:
         sys.stderr.write(f'[ablate] WARNING: --skill-max-tokens {args.skill_max_tokens} '
                          f'overrides the {spec.name} default {spec.skill_max_tokens}.\n')
+    # E14 信噪比消融：训练判分 rollout 数/温度，CLI 显式值优先，否则取 spec（E1-E13=1×T0）。
+    if getattr(args, 'reward_rollouts', None) is None:
+        args.reward_rollouts = spec.reward_rollouts
+    if getattr(args, 'reward_temperature', None) is None:
+        args.reward_temperature = spec.reward_temperature
     # OOM guard: think/8192 实验的训练序列长一倍，fp32 主权重下 16/2卡 的 micro backward
     # 会爆显存（E13 实测 Tried to allocate 37.9GiB）；自动把 micro 减半到 8，梯度归一后数学等价，
     # 攒批/采样批（sft_batch_size）冻结口径不变。显式 --train-micro-batch 优先。
@@ -122,8 +141,11 @@ def run_experiment(args, spec: ExpSpec) -> None:
         sys.stderr.write(f'[ablate] train_micro_batch auto-set to {args.train_micro_batch} '
                          f'(skill_max_tokens={args.skill_max_tokens} OOM guard).\n')
 
-    records, eval_records = (load_deepmath_records(args) if getattr(args, 'deepmath_dir', '')
-                             else v2._load_records(args))
+    if spec.task == 'code':
+        records, eval_records = load_code_records(args)
+    else:
+        records, eval_records = (load_deepmath_records(args) if getattr(args, 'deepmath_dir', '')
+                                 else v2._load_records(args))
     if len(records) < args.chunk_size:
         raise ValueError(f'--chunk-size ({args.chunk_size}) exceeds loaded ({len(records)})')
 
@@ -150,16 +172,18 @@ def run_experiment(args, spec: ExpSpec) -> None:
     scope = _rubric_scope(spec.method)
     rubric_cache = build_rubric_cache(scope, args.output_dir,
                                       global_dir=args.rubric_global_dir,
-                                      enabled=not args.no_cache) if scope else None
+                                      enabled=not args.no_cache,
+                                      task=spec.task,
+                                      executor_thinking=spec.executor_thinking) if scope else None
 
-    # client-side Template clone (OPSD only): encodes student/teacher trajectories locally to
-    # extract the teacher's RESPONSE-ONLY logp positions (prompts differ in length, so the
-    # remote full-sequence logps must be sliced before OPSDLoss can align them per token).
-    # Mirrors init_components' set_template call exactly (same tokenizer/thinking/truncation).
+    # client-side Template clone:
+    # - OPSD: skill-model template, used to align response-token positions for teacher logps.
+    # - logp_rl / logp_gt: executor template (thinking on), used to slice logP(S | executor prompt).
     encode_template = None
-    if spec.method == 'opsd':
+    if spec.method in ('opsd', 'logp_rl', 'logp_gt'):
         encode_template = v2.Template(model_id=v2.MODEL_ID,
-                                      enable_thinking=(spec.thinking == 'on'),
+                                      enable_thinking=(True if spec.method in ('logp_rl', 'logp_gt')
+                                                       else spec.thinking == 'on'),
                                       max_length=args.max_model_len,
                                       truncation_strategy='delete')
 
@@ -202,8 +226,11 @@ def run_experiment(args, spec: ExpSpec) -> None:
 
     use_swan = swanlab is not None and os.environ.get('SWANLAB_MODE') != 'disabled'
     if use_swan:
-        # timestamp suffix so FORCE reruns never collide in swanlab (接口方案 #9)
-        swan_exp = f'{spec.swanlab_exp}_{time.strftime("%Y%m%d_%H%M%S")}'
+        # timestamp suffix so FORCE reruns never collide in swanlab (接口方案 #9);
+        # --run-tag 用于区分共用同一 ExpSpec 的变体（如 kl_beta 0.001 vs 0.01）。
+        _tag = (getattr(args, 'run_tag', '') or '').strip()
+        swan_exp = (f'{spec.swanlab_exp}' + (f'_{_tag}' if _tag else '')
+                    + f'_{time.strftime("%Y%m%d_%H%M%S")}')
         swanlab.init(project=args.swanlab_project, experiment_name=swan_exp,
                      config={'exp': spec.name, 'view': spec.view, 'method': spec.method,
                              'thinking': spec.thinking, 'style': spec.style, 'align': spec.align,
@@ -211,10 +238,23 @@ def run_experiment(args, spec: ExpSpec) -> None:
                              'max_updates': args.max_updates, 'lr': args.lr,
                              'n_skills': args.n_skills, 'sft_batch_size': args.sft_batch_size,
                              'len_budget': args.len_budget,
+                             'run_tag': _tag,
+                             'reward_rollouts': args.reward_rollouts,
+                             'reward_temperature': args.reward_temperature,
+                             'kl_beta': getattr(args, 'kl_beta', 0.01),
+                             'grpo_epsilon': getattr(args, 'grpo_epsilon', 0.2),
+                             'adv_clip': getattr(args, 'adv_clip', 0.0),
+                             'logp_leak_penalty': getattr(args, 'logp_leak_penalty', 0.0),
+                             'reward_leak_gate': getattr(args, 'reward_leak_gate', 0.0),
+                             'reward_trunc_penalty': getattr(args, 'reward_trunc_penalty', 0.25),
+                             'reward_trunc_lo': getattr(args, 'reward_trunc_lo', 6000),
+                             'base_tok_floor': getattr(args, 'base_tok_floor', 5000),
                              'drop_zero_adv': args.drop_zero_adv})
 
-    cfg = {'record_type': 'config', 'exp': spec.name, 'view': spec.view, 'method': spec.method,
+    cfg = {'record_type': 'config', 'exp': spec.name, 'task': spec.task, 'view': spec.view,
+           'method': spec.method,
            'thinking': spec.thinking, 'style': spec.style, 'align': spec.align, 'loss': spec.loss,
+           'executor_thinking': spec.executor_thinking,
            'skill_max_tokens': args.skill_max_tokens, 'needs_rubric': spec.needs_rubric,
            'rubric_scope': scope, 'rubric_check': bool(checker),
            'n': len(records), 'eval_n': len(eval_records), 'model': v2.MODEL_ID,
@@ -223,10 +263,28 @@ def run_experiment(args, spec: ExpSpec) -> None:
            'sft_batch_size': args.sft_batch_size, 'len_budget': args.len_budget,
            'skill_char_limit': args.skill_char_limit, 'drop_zero_adv': args.drop_zero_adv,
            'improve_skill_temperature': args.improve_skill_temperature,
+           'reward_rollouts': args.reward_rollouts,
+           'reward_temperature': args.reward_temperature,
+           'run_tag': (getattr(args, 'run_tag', '') or ''),
+           # loss 侧旋钮同样入账：kl_beta 是唯一对抗漂移的恢复力，此前不落盘导致已跑的臂
+           # 无法从 gen_records 反推当时的锚强度（全部是旧默认 0.001；现默认 0.01）。
+           'kl_beta': getattr(args, 'kl_beta', 0.01),
+           'grpo_epsilon': getattr(args, 'grpo_epsilon', 0.2),
+           'adv_clip': getattr(args, 'adv_clip', 0.0),
+           # reward 公式的所有旋钮全部入账：之前 leak 惩罚默认开着却不落盘，导致已跑的臂无法
+           # 从 gen_records 反推当时用的是哪个 reward。leak 一律不进 reward，此处应恒为 0。
+           'logp_leak_penalty': getattr(args, 'logp_leak_penalty', 0.0),
+           'reward_leak_gate': getattr(args, 'reward_leak_gate', 0.0),
+           'reward_trunc_penalty': getattr(args, 'reward_trunc_penalty', 0.25),
+           'reward_trunc_lo': getattr(args, 'reward_trunc_lo', 6000),
+           'base_tok_floor': getattr(args, 'base_tok_floor', 5000),
+           'reflexion_k': int(getattr(args, 'reflexion_k', 0) or 0),
+           'eval_protocol': ('reflexion' if spec.method == 'reflexion' else 'query_only'),
            'eval_rollouts': args.eval_rollouts, 'eval_skill_temperature': args.eval_skill_temperature,
            'seam_parquet_dir': (getattr(args, 'seam_parquet_dir', '') or ''),
            'deepmath_dir': (getattr(args, 'deepmath_dir', '') or ''),
            'min_level': int(getattr(args, 'min_level', 0) or 0),
+           'eval_min_level': int(getattr(args, 'eval_min_level', 0) or 0),
            'save_every_updates': int(getattr(args, 'save_every_updates', 0) or 0),
            'resumed_from': (resume['ckpt_dir'] if resume else ''),
            'resumed_updates': (resume['updates'] if resume else 0),
@@ -242,9 +300,33 @@ def run_experiment(args, spec: ExpSpec) -> None:
             v2._write(f, cfg)
 
         def _do_eval(updates_done: int, swan_step: int) -> None:
-            recs, summary, metrics = v2.run_greedy_eval(
-                base_sampler, skill_sampler, eval_records, updates_done, updates_done,
-                base_dp, skill_dp, args, eval_base_cache)
+            # E17 用 reflexion 协议 eval（只干预裸解做错的题、skill-gen 带 rubric），与训练
+            # 同分布；其余臂一律走 v2 的 query-only 全量 eval。两者 summary 键名兼容。
+            if spec.method == 'reflexion':
+                recs, summary, metrics = run_reflexion_eval(
+                    base_sampler, skill_sampler, eval_records, updates_done, updates_done,
+                    base_dp, skill_dp, args, eval_base_cache, rubric_cache, checker)
+            elif spec.method == 'rejection_sft':
+                # E18：eval 用 nothink rollout，且与采集共用同一个 skill_sampler vLLM（用户
+                # 2026-07-30 拍板）。set_template 只换客户端编码（sampler/base.py:106），
+                # 引擎不重建；训练响应是裸 <skills>（空 think 布局），与 nothink 生成布局
+                # 逐 token 一致，所以这才是本臂的同分布读数。finally 必须切回 think，
+                # 否则下一个 chunk 的采集会静默变成 nothink。
+                skill_sampler.set_template(v2.Template, model_id=v2.MODEL_ID,
+                                           enable_thinking=False,
+                                           max_length=args.max_model_len)
+                try:
+                    recs, summary, metrics = v2.run_greedy_eval(
+                        base_sampler, skill_sampler, eval_records, updates_done, updates_done,
+                        base_dp, skill_dp, args, eval_base_cache)
+                finally:
+                    skill_sampler.set_template(v2.Template, model_id=v2.MODEL_ID,
+                                               enable_thinking=(spec.thinking == 'on'),
+                                               max_length=args.max_model_len)
+            else:
+                recs, summary, metrics = v2.run_greedy_eval(
+                    base_sampler, skill_sampler, eval_records, updates_done, updates_done,
+                    base_dp, skill_dp, args, eval_base_cache)
             for rec in recs:
                 v2._write(eval_f, rec)
             v2._write(eval_f, summary)
@@ -321,6 +403,13 @@ def run_experiment(args, spec: ExpSpec) -> None:
             if save_every and updates >= last_save_at + save_every and n_upd > 0:
                 _save_ckpt(f'{spec.name}-u{updates}', updates, chunk_idx + 1, pool_pp.epoch)
                 last_save_at = updates
+            # bugfix #12: 方法把候选/rollout 全文挂在共享 record dict 上（ProblemPool 跨 epoch
+            # 复用同一批对象），gen_records 已落盘后不清理会让 driver RAM 随触达题数线性增长
+            # （5000 题 × 8 候选 × 几十 KB 可达数 GB）。训练/日志都结束后安全清理。
+            for r in chunk:
+                for k in ('_cands', '_pseudo_rolls', '_pseudo_roll', '_pseudo_solution',
+                          '_rubric', '_base_tok', '_base_correct', '_base_stop'):
+                    r.pop(k, None)
             chunk_idx += 1
 
         # final readout — skip if the periodic eval already covered this exact update count

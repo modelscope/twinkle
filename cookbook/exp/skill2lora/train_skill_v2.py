@@ -43,6 +43,9 @@ from twinkle.template import Template
 from twinkle_agentic.verifier import RubricVerifier
 from twinkle_agentic.verifier.rubric_verifier import RubricItem
 
+# 任务适配器（BigCodeBench）。code_task 刻意不 import 本模块，所以这里可以顶层 import。
+import code_task
+
 logger = get_logger()
 
 try:
@@ -65,6 +68,32 @@ TRAIN_FSDP = int(os.environ.get('TRAIN_FSDP', min(1, TRAIN_GPUS)))
 REF_FSDP = int(os.environ.get('REF_FSDP', min(1, REF_GPUS)))
 TRAIN_DP = TRAIN_GPUS // TRAIN_FSDP
 REF_DP = REF_GPUS // REF_FSDP
+
+
+# ===========================================================================
+# Section A0 — task switch (math = DeepMath \boxed{}, code = BigCodeBench unittest)
+# ===========================================================================
+# 与 _ALIGN_MODE / _SKILL_STYLE 同型的模块级开关（由 set_task 设置，trainer 在任何 prompt
+# 构造之前调用）。**math 分支逐字不变**，所以 E1-E16 的行为、判分与可复现性不受影响。
+# 分派点一共 7 处：build_direct_prompt / build_skill_solve_prompt / _skillgen_prompt /
+# _parse_seq(+_parse_many) / _answer_leaked / build_rubric_checker / _diagnose_entry。
+# 换成 code 时 reference_answer 不再是数值，而是 code_task.payload_of() 的判分载荷
+# （task_id / entry_point / test / code_prompt / doc_struct / canonical_solution）。
+_TASK = 'math'                # 'math' | 'code'
+_CODE_TEST_WORKERS = 24       # 单测线程池（子进程并行度）
+_CODE_TEST_TIMEOUT = 60       # 单题单测墙钟上限（秒）
+
+
+def set_task(task: str, test_workers: int = 24, test_timeout: int = 60) -> None:
+    """Set the task family. MUST run before any prompt is built or any roll is judged."""
+    global _TASK, _CODE_TEST_WORKERS, _CODE_TEST_TIMEOUT, _RUBRIC_VERSION
+    if task not in ('math', 'code'):
+        raise ValueError(f"task must be 'math' or 'code', got {task!r}")
+    _TASK = task
+    _CODE_TEST_WORKERS = max(1, int(test_workers))
+    _CODE_TEST_TIMEOUT = max(5, int(test_timeout))
+    # 判据表换了，rubric 缓存键必须跟着换（rubric_cache 动态读 v2._RUBRIC_VERSION）。
+    _RUBRIC_VERSION = code_task.RUBRIC_VERSION if task == 'code' else _RUBRIC_VERSION_MATH
 
 
 # ===========================================================================
@@ -249,9 +278,12 @@ def _numeric_value(raw) -> Optional[str]:
     return (str(int(float(s))) if float(s) == int(float(s)) else str(float(s))) if _NUM_RE.fullmatch(s) else None
 
 
-def _answer_leaked(skill: str, reference: str) -> bool:
+def _answer_leaked(skill: str, reference) -> bool:
     if not skill:
         return False
+    if _TASK == 'code':
+        # 代码域：leak = skill 里出现参考解答的实质代码行（与数学域一致，只做监控）
+        return code_task.leaked(skill, reference)
     # Suffix guard: reject only a following DIGIT or a following '.<digit>' (decimal point),
     # NOT a sentence-ending '.'. Old '(?![\d.])' let leaks like "...= 675." slip through
     # because the trailing period satisfied the [\d.] class. 中文注释：尾断言只排除"后接数字"
@@ -288,6 +320,10 @@ def _seam_sanitize(txt: str) -> str:
         txt = m.group(1).strip()
     elif (m := _SEAM_INLINE_RE.search(txt)):
         txt = (m.group(1) or m.group(2)).strip()
+    # bugfix 2026-07-29：\dfrac/\tfrac/\cfrac 不被下行字面 \frac 正则匹配，曾致
+    # \boxed{\dfrac{1}{2}} 落到 _SEAM_NUM_RE 抓首个数字 → pred='1'（分数答案题全判错；
+    # 实测被标"错"的 boxed rolls 中 70-85% 实为正确，见 skill_quality_analysis.md 末章）。
+    txt = txt.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac').replace(r'\cfrac', r'\frac')
     txt = re.sub(r'\\frac\s*\{\s*([^}]+?)\s*}\s*\{\s*([^}]+?)\s*}', r'\1/\2', txt)
     if (m := _SEAM_FRAC_RE.search(txt)):
         p, q = map(float, m.groups())
@@ -329,7 +365,9 @@ def _extract_skill(text: str) -> Optional[str]:
     return block or None
 
 
-def _parse_seq(seq, gold: str) -> Dict[str, Any]:
+def _parse_seq(seq, gold) -> Dict[str, Any]:
+    if _TASK == 'code':
+        return _parse_many([(seq, gold)])[0]
     text = _clean_text(getattr(seq, 'decoded', '') or '')
     # 判分口径统一（人工拍板，2026-07-27）：seam/v2 都只从 \boxed{} 抽取，再走同一套数值归一
     # （frac/inline/number）后精确匹配；不做 lpem 式“整段抓数字”贪婪回退，保证 E13 与 E1-E12
@@ -343,7 +381,34 @@ def _parse_seq(seq, gold: str) -> Dict[str, Any]:
             'gen_tokens': len(getattr(seq, 'tokens', None) or []), 'text': text}
 
 
+def _parse_many(pairs) -> List[Dict[str, Any]]:
+    """批量判分入口。``pairs`` = [(seq_or_None, gold)]，返回同序 roll 列表。
+
+    math 分支逐条 _parse_seq（与逐条调用 bit 一致）；code 分支必须批量 —— 判分要起子进程跑
+    unittest（典型 1-3s），一个 chunk 有几百次判分，串行会比同 chunk 的 GPU 时间还长一个量级。
+    所有 rollout 汇合点（process_chunk / run_greedy_eval / methods / eval_reflexion）都走这里。
+    """
+    if _TASK != 'code':
+        return [(_parse_seq(s, g) if s is not None else _empty_roll()) for s, g in pairs]
+    items = []
+    for s, g in pairs:
+        if s is None:
+            items.append(None)
+            continue
+        items.append((_clean_text(getattr(s, 'decoded', '') or ''),
+                      getattr(s, 'stop_reason', None),
+                      len(getattr(s, 'tokens', None) or []), g))
+    return code_task.judge_many(items, _CODE_TEST_WORKERS, _CODE_TEST_TIMEOUT)
+
+
+def _first_seq(seqs):
+    """rollout 列表 -> 首个 sequence 或 None（判分批量化后统一用它取 seq）。"""
+    return seqs[0] if seqs else None
+
+
 def _empty_roll():
+    if _TASK == 'code':
+        return code_task.empty_roll()
     return {'pred': '', 'correct': False, 'terminated': False,
             'stop_reason': 'empty', 'gen_tokens': 0, 'text': ''}
 
@@ -566,7 +631,7 @@ Rules:
 - For FAIL items: describe the process problem at strategy level.
 - A fix suggests the LOCAL correction direction without solving.
 - Never reveal the final answer or a corrected expression.
-- If segment was cut off (no final <answer> reached), mark length-budget as FAIL.
+- If segment was cut off (no final <answer> reached), mark the output-format criterion as FAIL.
 - Keep "reason" and "fix" concise: one short sentence each.
 - Output only the JSON object."""
 
@@ -582,16 +647,28 @@ _RFT_DIAG_USER = """\
 
 Now output the diagnostic JSON object."""
 
+# 判据按「错误类型」组织，但文本一律写成正向陈述 —— 全流程的语义是 PASS=没问题 /
+# FAIL=该类错误存在（见 _format_diagnosis 与 gate），写成否定句会把 PASS/FAIL 反过来。
 _MATH_RUBRIC = [
-    ('The attempt chooses a method suitable for the problem structure', False),
-    ('The attempt identifies the key constraint, invariant, or quantity before computing', False),
-    ('Algebraic and logical transformations preserve validity at each step', True),
-    ('The attempt checks required constraints, domains, boundary cases, or validity conditions', False),
-    ('The attempt avoids redundant casework, looping, or re-deriving known facts', False),
-    ('The attempt reaches a final <answer> within the length budget', False),
-    ('The approach stays focused on the actual question asked', False),
+    # 1. 代数计算错误
+    ('Arithmetic and algebraic manipulations are carried out correctly', True),
+    # 2. 公式定理使用错误
+    ('Formulas and theorems are invoked correctly and their preconditions hold', False),
+    # 3. 起始方法论错误
+    ('The initial approach is viable for this problem rather than a dead end', False),
+    # 4. 题目目标分析错误
+    ('The attempt correctly identifies what the problem actually asks for', False),
+    # 5. 输出格式错误
+    ('The attempt reaches a final answer in the required output format', False),
+    # 6. 对计算过程反复犹豫
+    ('The attempt commits to its computation instead of repeatedly second-guessing it', False),
+    # 7. 构成自相矛盾
+    ('The attempt stays internally consistent and never contradicts its own results', False),
 ]
-_RUBRIC_VERSION = 'rubric_v5_viewb_strategy'
+# 版本号进 rubric 缓存键（GlobalRubricCache._key）：判据一改，旧诊断必须失效，
+# 否则 rubric_cache_global.jsonl 里按 data_id 存的旧taxonomy诊断会被当成新判据的结果返回。
+_RUBRIC_VERSION_MATH = 'rubric_v6_error_taxonomy'
+_RUBRIC_VERSION = _RUBRIC_VERSION_MATH   # set_task('code') 会换成 code_task.RUBRIC_VERSION
 
 
 class _RftRubricVerifier(RubricVerifier):
@@ -602,10 +679,23 @@ class _RftRubricVerifier(RubricVerifier):
                 query=query, rubric=rubric_block, segment=segment_text)}]}
 
 
+class _CodeRubricVerifier(RubricVerifier):
+    """代码域 judge：判据 = code_task.CODE_RUBRIC，且 segment 里带**单测真实报错**。"""
+
+    def _diagnose_trajectory(self, query, rubric_block, segment_text):
+        return {'messages': [
+            {'role': 'system', 'content': code_task.DIAG_SYSTEM},
+            {'role': 'user', 'content': code_task.DIAG_USER.format(
+                query=query, rubric=rubric_block, segment=segment_text)}]}
+
+
 def build_rubric_checker():
     if not (os.environ.get('LLM_BACKUP_API_KEY') or os.environ.get('LLM_BACKUP_BASE_URL')
             or os.environ.get('OPENAI_API_KEY')):
         return None
+    if _TASK == 'code':
+        return _CodeRubricVerifier(
+            fixed_rubric=[RubricItem(t, is_hard=h) for t, h in code_task.CODE_RUBRIC], gate=True)
     return _RftRubricVerifier(
         fixed_rubric=[RubricItem(t, is_hard=h) for t, h in _MATH_RUBRIC], gate=True)
 
@@ -632,6 +722,17 @@ def _diagnose_entry(checker, entry: Dict[str, Any]) -> Optional[str]:
     while GRPO trains. Shared by the background pre-diagnosis pool and distill_buffer's
     fallback for any entry the pool did not reach in time.
     中文注释：单条失败轨迹的 rubric 诊断（纯 API，不吃 GPU）。后台预诊断与 distill 补诊断共用。"""
+    if _TASK == 'code':
+        # 代码域：query 里补上题面声明的硬约定（签名/返回/异常/示例，不含参考解答），
+        # segment 由调用方（_rubric_entry）拼成"提交的代码 + 单测真实报错"。
+        query = code_task.diag_query(entry['problem'], entry['reference_answer'])
+        seg = {'messages': [{'role': 'user', 'content': query},
+                            {'role': 'assistant', 'content': entry['fail_segment']}]}
+        try:
+            return _format_diagnosis(checker.diagnose(seg, query=query))
+        except Exception as exc:
+            logger.warning(f'[rubric] diagnose error: {exc}')
+            return None
     seg_text = entry['fail_segment']
     if entry.get('fail_stop_reason') == 'length':
         seg_text += ('\n\n[Process note: this attempt was cut off at the token budget '
@@ -668,12 +769,13 @@ Then write the <skills> block following these rules:
 - Write it as one coherent analysis narrative (not a bullet list): first name what the problem is essentially asking, then walk through how to approach it, blending concepts, steps, pitfalls and reasons into a single connected story.
 - CRITICAL: Do NOT solve the problem for the executor. Do NOT reveal or compute the final answer, and do NOT substitute the problem's specific given numbers into the steps or state any intermediate numeric results. Leave ALL concrete numbers for the executor to compute on its own. If you catch yourself writing a specific number from the problem, replace it with a description of the quantity instead.
 - Keep it concise: aim for roughly one focused paragraph.
+- End the block with this exact sentence: "Avoid re-checking loops; box a bare number as soon as it is computed."
 
 Put ONLY the methodology inside <skills></skills>.
 
 Example:
 <skills>
-This problem is essentially asking for the units (last) digit of an integer raised to a high power; first get clear on what the problem is asking before deciding where to start. Since only the last digit matters, you should first look only at the units digit of the base, because the units digit of an integer power is determined solely by the units digit of the base and the higher digits do not affect the result — so at this step be careful not to expand or compute the whole large number, which is both unnecessary and error-prone. Next, repeatedly multiply this units digit by itself and record the units digit each time, until it starts to repeat, thereby obtaining its cycle period. The part about "determining the period length" is important here: be careful not to count one term too many or too few, otherwise all the later positioning will be off. Finally, take the given exponent modulo the period length and land on the corresponding term within the period; here pay special attention that when the remainder is 0 it corresponds to the last term of the period rather than the first. Overall, I summarize the approach for this kind of problem as "first recognize that it asks for the units digit of a power, then fix on the units digit to find the cycle period, and finally use the exponent modulo to locate the term", while leaving the concrete numbers for the downstream solver to substitute and compute on its own.
+This problem is essentially asking for the units (last) digit of an integer raised to a high power; first get clear on what the problem is asking before deciding where to start. Since only the last digit matters, you should first look only at the units digit of the base, because the units digit of an integer power is determined solely by the units digit of the base and the higher digits do not affect the result — so at this step be careful not to expand or compute the whole large number, which is both unnecessary and error-prone. Next, repeatedly multiply this units digit by itself and record the units digit each time, until it starts to repeat, thereby obtaining its cycle period. The part about "determining the period length" is important here: be careful not to count one term too many or too few, otherwise all the later positioning will be off. Finally, take the given exponent modulo the period length and land on the corresponding term within the period; here pay special attention that when the remainder is 0 it corresponds to the last term of the period rather than the first. Overall, I summarize the approach for this kind of problem as "first recognize that it asks for the units digit of a power, then fix on the units digit to find the cycle period, and finally use the exponent modulo to locate the term", while leaving the concrete numbers for the downstream solver to substitute and compute on its own. Avoid re-checking loops; box a bare number as soon as it is computed.
 </skills>
 """
 
@@ -770,6 +872,8 @@ def build_skill_solve_prompt_seam(problem, skill, raw_response=None):
 
 
 def build_direct_prompt(problem):
+    if _TASK == 'code':
+        return code_task.direct_prompt(problem)
     if _ALIGN_MODE == 'seam':
         # seam 基线保持英文原样，不受 v2 prompt 改动影响
         return {'messages': [{'role': 'system', 'content': DIRECT_SYSTEM},
@@ -781,6 +885,9 @@ def build_direct_prompt(problem):
 
 def build_skill_solve_prompt(problem, skill, raw_response=None):
     skill = (skill or '').strip()
+    if _TASK == 'code':
+        # 空 skill -> 干净 direct（与数学分支同规则，见下方注释）
+        return code_task.skill_solve_prompt(problem, skill)
     if not skill:
         # 空 skill → 干净 direct。训练侧根本不会用空 skill 走 executor（process_chunk 只对非空 flat 跑，
         # 空候选直接 reward=0），故此分支仅影响 eval 口径——让空 skill 题 withskill==baseline、对 lift 贡献 0，
@@ -813,13 +920,14 @@ You previously generated a skill, but that skill did not help the model. The exe
 Your steps:
 1. Re-read and understand the original problem.
 2. Tell a coherent analysis story for this problem as one flowing narrative: first identify what it is essentially asking, then walk through how to approach it, naturally weaving together the solving points that were already correct last time, the pitfalls that actually tripped up the solving process and how to avoid them, and your reasoning for why you give this advice, blended into a single connected story, and leave the concrete numbers for the downstream solver to compute.
-3. Put the above inside <skills></skills>.
+3. End the block with this exact sentence: "Avoid re-checking loops; box a bare number as soon as it is computed."
+4. Put the above inside <skills></skills>.
 
 Output requirement: Write your judgments and pitfall reminders about this problem directly in the first person (e.g. "I think this step tends to ...", "A common mistake is ..., so you need to ..."), and phrase the issues you find as self-contained, general techniques. Do NOT use phrasings that point to external context such as "according to the given analysis/hints" or "the previous skill" — the downstream executor cannot see that context, and such phrasings will cause hallucination.
 
 Example:
 <skills>
-This problem is essentially asking "how many arrangements satisfy the given constraints", which is a counting problem; first get clear on "what exactly is being counted" before deciding whether to use permutations or combinations. Since it is counting, you should first clearly define the objects being counted and the constraints, and judge whether the elements are distinguishable and whether order matters, because this directly determines whether you will need to divide out duplicates later. Next, first compute a total as if things were "ordered/distinguishable", then find which seemingly different arrangements actually correspond to the same configuration. The part about "recognizing symmetry and determining the duplication factor" is important here: I think the step most likely to go wrong in this problem is ignoring symmetry and treating essentially identical configurations as different, which makes the result too large; I think it is also easy to directly miss the "divide by the duplication factor" step — as long as the choices can be interchanged, you must divide out duplicates, otherwise you overcount. Finally, divide the total by the duplication factor to get the truly non-duplicated count; here pay special attention not to jump straight to permutation/combination formulas, but first think clearly about whether the elements are distinguishable and then decide whether to divide out duplicates. Overall, I summarize the approach for this kind of problem as "first recognize that it is a counting problem and judge whether the elements are distinguishable, then compute the total, recognize symmetry and remove duplicates", because I judge that the loss points for such problems almost all concentrate on overcounting; while leaving the concrete numbers for the downstream solver to substitute and compute on its own.
+This problem is essentially asking "how many arrangements satisfy the given constraints", which is a counting problem; first get clear on "what exactly is being counted" before deciding whether to use permutations or combinations. Since it is counting, you should first clearly define the objects being counted and the constraints, and judge whether the elements are distinguishable and whether order matters, because this directly determines whether you will need to divide out duplicates later. Next, first compute a total as if things were "ordered/distinguishable", then find which seemingly different arrangements actually correspond to the same configuration. The part about "recognizing symmetry and determining the duplication factor" is important here: I think the step most likely to go wrong in this problem is ignoring symmetry and treating essentially identical configurations as different, which makes the result too large; I think it is also easy to directly miss the "divide by the duplication factor" step — as long as the choices can be interchanged, you must divide out duplicates, otherwise you overcount. Finally, divide the total by the duplication factor to get the truly non-duplicated count; here pay special attention not to jump straight to permutation/combination formulas, but first think clearly about whether the elements are distinguishable and then decide whether to divide out duplicates. Overall, I summarize the approach for this kind of problem as "first recognize that it is a counting problem and judge whether the elements are distinguishable, then compute the total, recognize symmetry and remove duplicates", because I judge that the loss points for such problems almost all concentrate on overcounting; while leaving the concrete numbers for the downstream solver to substitute and compute on its own. Avoid re-checking loops; box a bare number as soon as it is computed.
 </skills>"""
 
 REGEN_USER = """\
@@ -860,6 +968,9 @@ Hard rules: the block must be self-contained - never reference "the diagnosis" o
 def _skillgen_prompt(problem: str) -> Dict[str, Any]:
     """Skill-gen prompt: query-only. seam mode uses SEAM EXPERIENCE_PROMPT (single user turn,
     <memory_item> output); v2 uses SKILL_GEN_SYSTEM (<skills>)."""
+    if _TASK == 'code':
+        # 代码域只做 narrative 一种文体（E4/E17 都是 narrative；toy/pitfall 未移植）
+        return code_task.skillgen_prompt(problem)
     if _ALIGN_MODE == 'seam':
         return {'messages': [{'role': 'user', 'content': _SEAM_EXPERIENCE_PROMPT.format(problem=problem)}]}
     # 中文注释：按 --skill-style 选主链路文体（narrative=现版叙述式 / toy / pitfall）。
@@ -880,10 +991,11 @@ def _regen_prompt(problem: str, orig_skill: str, rubric_diag: str) -> Dict[str, 
 
 
 # ---- Reward ----
-# 中文注释：reward = parseable × correct（对齐 SEAM lpem：去 terminated、去长度惩罚）。
-# parseable=0 的候选 reward=0 仍参与 group（格式压力）。
-def _skill_reward(parseable: bool, correct: bool) -> float:
-    return 1.0 if (parseable and correct) else 0.0
+# 中文注释：reward = parseable × 通过率（对齐 SEAM lpem：去 terminated、去长度惩罚）。
+# parseable=0 的候选 reward=0 仍参与 group（格式压力）。correct 兼容 bool（greedy 0/1，
+# E1-E13）与 float 通过率（E14 多 rollout 判分，见 process_chunk reward_rollouts）。
+def _skill_reward(parseable: bool, correct) -> float:
+    return float(correct) if parseable else 0.0
 
 
 # ---- Buffer A: collect adv=0 all-fail problems ----
@@ -1195,16 +1307,29 @@ def process_chunk(base_sampler, skill_sampler, chunk, ci, base_dp, skill_dp, arg
     for r, c in flat:
         c['leaked'] = _answer_leaked(c['skills'], r['reference_answer'])
 
-    # with-skill greedy pass (T=0)
+    # with-skill executor pass：默认 greedy×1（E1-E13，reward 0/1 与旧口径 bit 一致）；
+    # E14: reward_rollouts>1 时 T=reward_temperature × K 采样，reward = parseable × 通过率，
+    # 把内容信号从 greedy 0/1 量化里释放出来（提升组内 std>0 比例）。
     if flat:
+        K = max(1, int(getattr(args, 'reward_rollouts', 1) or 1))
+        rT = float(getattr(args, 'reward_temperature', 0.0) or 0.0)
         ws_out = _run_samples(base_sampler,
                               [build_skill_solve_prompt(r['problem'], c['skills'], c.get('response')) for r, c in flat],
-                              1, args.max_tokens, base_dp, temperature=0.0)
+                              K, args.max_tokens, base_dp, temperature=rT)
+        # 判分一次性批量化（code 任务要起子进程跑单测，逐条会比 GPU 还慢一个量级）
+        pairs, spans = [], []
         for (r, c), seqs in zip(flat, ws_out):
-            roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
-            c['rolls'] = [roll]
-            c['with_pass'] = 1.0 if roll['correct'] else 0.0
-            c['reward'] = _skill_reward(c['parseable'], roll['correct'])
+            start = len(pairs)
+            pairs.extend((s, r['reference_answer']) for s in (seqs or []))
+            spans.append((start, len(pairs)))
+        judged = _parse_many(pairs)
+        for (r, c), (a, b) in zip(flat, spans):
+            rolls = judged[a:b] or [_empty_roll()]
+            for x in rolls[1:]:
+                x['text'] = ''  # 磁盘保护：K>1 时只留首 rollout 全文（gen_records 体积控制）
+            c['rolls'] = rolls
+            c['with_pass'] = sum(1.0 for x in rolls if x['correct']) / len(rolls)
+            c['reward'] = _skill_reward(c['parseable'], c['with_pass'])
     # unparseable candidates score 0 and still join the group (format pressure)
     for r in chunk:
         for c in r['_cands']:
@@ -1229,7 +1354,12 @@ def process_chunk(base_sampler, skill_sampler, chunk, ci, base_dp, skill_dp, arg
 
 
 def _roll(x):
-    return {k: x[k] for k in ('pred', 'correct', 'terminated', 'stop_reason', 'gen_tokens', 'text')}
+    out = {k: x[k] for k in ('pred', 'correct', 'terminated', 'stop_reason', 'gen_tokens', 'text')}
+    # 代码域审计字段：判分结论 / 单测报错 / 用例数（离线分析错误类型分布靠它，_trim_err 已限长）
+    for k in ('kind', 'error', 'n_tests'):
+        if k in x:
+            out[k] = x[k]
+    return out
 
 
 def _full_records(chunk, ci):
@@ -1244,6 +1374,8 @@ def _full_records(chunk, ci):
                 'advantage': c.get('advantage'), 'kept': c.get('kept'),
                 'skillgen_stop': c.get('skillgen_stop'), 'skillgen_tokens': c.get('skillgen_tokens'),
                 'rolls': [_roll(x) for x in c['rolls']],
+                'logp_base': c.get('logp_base'), 'logp_skill': c.get('logp_skill'),
+                'logp_delta': c.get('logp_delta'),
             } for c in r['_cands']],
         })
     return out
@@ -1279,7 +1411,9 @@ def _chunk_summary(chunk, ci):
             zero_grad += 1
     n_train = sum(1 for c in all_cands if abs(c.get('advantage') or 0.0) > 1e-9)
     trunc = sum(1 for x in ws_rolls if x['stop_reason'] == 'length')
-    ws_acc = _mean([1.0 if any(c.get('reward') for c in r['_cands']) else 0.0
+    # bugfix（ablate #6）：旧版 any(c.get('reward')) 用 truthiness，负 reward（E16 hinge/leak_gate、
+    # E14 地板 -1.0）也被当“通过”；改用 with_pass>0（真正的 executor 通过率），greedy 0/1 臂语义不变。
+    ws_acc = _mean([1.0 if any((c.get('with_pass') or 0) > 0 for c in r['_cands']) else 0.0
                     for r in chunk if r['_cands']])
     return {
         'record_type': 'summary', 'chunk': ci, 'n': len(chunk),
@@ -1311,8 +1445,9 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
     if todo:
         out = _run_samples(base_sampler, [build_direct_prompt(r['problem']) for r in todo],
                            1, args.max_tokens, base_dp, temperature=0.0)
-        for r, seqs in zip(todo, out):
-            roll = _parse_seq(seqs[0], r['reference_answer']) if seqs else _empty_roll()
+        rolls = _parse_many([(_first_seq(seqs), r['reference_answer'])
+                             for r, seqs in zip(todo, out)])
+        for r, roll in zip(todo, rolls):
             base_cache.put(DiskCache.key_for(r['problem']), roll)
     for r in eval_records:
         br = base_cache.get(DiskCache.key_for(r['problem']))
@@ -1341,9 +1476,9 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
             flat_prompts.append(build_skill_solve_prompt(r['problem'], sk, sresp))
             flat_idx.append((pi, j))
     ws_out = _run_samples(base_sampler, flat_prompts, 1, args.max_tokens, base_dp, temperature=0.0)
-    roll_by = {}
-    for (pi, j), seqs in zip(flat_idx, ws_out):
-        roll_by[(pi, j)] = _parse_seq(seqs[0], eval_records[pi]['reference_answer']) if seqs else _empty_roll()
+    judged = _parse_many([(_first_seq(seqs), eval_records[pi]['reference_answer'])
+                          for (pi, _j), seqs in zip(flat_idx, ws_out)])
+    roll_by = {idx: roll for idx, roll in zip(flat_idx, judged)}
     recs = []
     for pi, (r, row) in enumerate(zip(eval_records, per_skills)):
         rolls = [roll_by[(pi, j)] for j in range(len(row))]
@@ -1351,12 +1486,17 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
         parses = [1.0 if sk else 0.0 for sk, _ in row]
         terms = [1.0 if x['terminated'] else 0.0 for x in rolls]
         acc_mean = sum(corr) / len(corr) if corr else 0.0
+        # bugfix（ablate #8）：unparseable skill 的 rollout 实际走了 direct 回退（≈baseline），
+        # 主指标里格式崩塌会被 baseline 成绩掩护。strict 通道：unparseable 计 0，格式失败
+        # 直接计入代价；主指标口径不变（与历史臂可比），两条曲线分叉即格式崩塌告警。
+        acc_strict = (sum(c * p for c, p in zip(corr, parses)) / len(corr)) if corr else 0.0
         recs.append({
             'record_type': 'eval_problem', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
             'data_id': r.get('data_id', ''), 'problem': r['problem'],
             'reference_answer': r['reference_answer'], 'baseline_pass': r['_baseline_pass'],
             'n_rollouts': len(row), 'eval_skill_temperature': args.eval_skill_temperature,
             'withskill_acc_mean': acc_mean,                              # per-problem mean over R rollouts
+            'withskill_acc_strict_mean': acc_strict,                     # unparseable counted wrong
             'withskill_pass_any': 1.0 if any(corr) else 0.0,            # pass@R (bonus readout)
             'skill_parseable_mean': sum(parses) / len(parses) if parses else 0.0,
             'withskill_terminated_mean': sum(terms) / len(terms) if terms else 0.0,
@@ -1369,6 +1509,7 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
     n = len(recs)
     # acc = 跨题平均的"每题 R 次平均正确率"（mean-over-rollouts）
     ws = (sum(x['withskill_acc_mean'] for x in recs) / n) if n else 0.0
+    ws_strict = (sum(x['withskill_acc_strict_mean'] for x in recs) / n) if n else 0.0
     pass_any = (sum(x['withskill_pass_any'] for x in recs) / n) if n else 0.0
     base = (sum(x['baseline_pass'] for x in recs) / n) if n else 0.0
     fmt = (sum(x['skill_parseable_mean'] for x in recs) / n) if n else 0.0
@@ -1379,11 +1520,13 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
     hard_rescued = sum(x['withskill_acc_mean'] for x in hard)  # 期望救活数(分数)
     summary = {'record_type': 'eval_summary', 'split': 'eval', 'chunk': ci, 'rounds_done': rounds,
                'n': n, 'acc_mean1': ws, 'baseline_acc_mean1': base, 'lift_mean1': ws - base,
+               'acc_strict_mean1': ws_strict, 'lift_strict_mean1': ws_strict - base,
                'acc_pass_any': pass_any, 'n_rollouts': R, 'eval_skill_temperature': args.eval_skill_temperature,
                'format_mean1': fmt, 'term_mean1': term,
                'hard_n': len(hard), 'hard_rescued': hard_rescued, 'hard_rescue_rate': hard_rescue_rate}
     metrics = {'core/math/acc/mean@1': ws, 'core/math/baseline_acc/mean@1': base,
                'core/math/lift/mean@1': ws - base, 'core/math/format/mean@1': fmt,
+               'core/math/acc_strict/mean@1': ws_strict, 'core/math/lift_strict/mean@1': ws_strict - base,
                'core/math/term/mean@1': term, 'core/math/hard_rescue/mean@1': hard_rescue_rate}
     return recs, summary, metrics
 
@@ -1416,7 +1559,8 @@ def init_components(args):
     # 因此不构成 SEAM 那种“把 think 喂给 executor”的泄漏。skill_model/ref_model/skill_sampler 三者
     # enable_thinking 必须一致，否则训练轨迹 token 布局与采样对不上。
     # 中文注释：skill_model/ref_model/skill_sampler 三者 enable_thinking 由 --skill-thinking 统一控制
-    # （必须一致，否则训练轨迹 token 布局与采样对不上）；base_sampler（executor）恒 thinking on。
+    # （必须一致，否则训练轨迹 token 布局与采样对不上）；base_sampler（executor）走独立开关
+    # --executor-thinking（默认 on，E1-E18 全部 on；E19/E20 为 off，见下方 base_sampler 处注释）。
     _think = args.skill_thinking == 'on'
     skill_model.set_template(Template, model_id=MODEL_ID, enable_thinking=_think,
                              max_length=args.max_model_len, truncation_strategy='delete')
@@ -1453,7 +1597,16 @@ def init_components(args):
 
     # 方案1：skill 采样器开 thinking，与 skill_model/ref_model 一致（actor 先想再写 <skills>）。
     skill_sampler = _sampler('skill_sampler', SKILL_SAMPLER_GPUS, enable_thinking=_think)
-    base_sampler = _LockedSampler(_sampler('base_sampler', BASE_SAMPLER_GPUS, enable_thinking=True))
+    # executor（base_sampler）的 thinking 单独一个开关，默认 on（E1-E18 全部如此）。
+    # ⭐ 为什么要能关（2026-07-31 bcb 探针实测，n=275 同题配对）：BigCodeBench 上 think 的
+    #   executor 有 34-50% 的 rollout 撞满预算、连代码块都没写出来（截断样本 8-gram 重复率
+    #   p50=0.835、同一长句重复 92 次 = 字面死循环），把预算从 4096 加到 20000 也只把截断
+    #   从 0.496 压到 0.338 且 pass 不涨。关掉 thinking 后截断归零、裸解反而更高
+    #   （0.378 vs 0.324），rubric 增量从 +0.080 抬到 +0.135（p=1e-4）。
+    #   见 bcb/bcb_eval0_{nothink,think12k,think20k}.jsonl。
+    _exec_think = getattr(args, 'executor_thinking', 'on') == 'on'
+    base_sampler = _LockedSampler(_sampler('base_sampler', BASE_SAMPLER_GPUS,
+                                           enable_thinking=_exec_think))
     ckpt = CheckpointEngineManager(model=skill_model, sampler=skill_sampler)
     return skill_model, ref_model, skill_sampler, base_sampler, ckpt, SKILL_SAMPLER_GPUS, BASE_SAMPLER_GPUS
 
@@ -1494,6 +1647,10 @@ def _build_args():
                         '主链路与 regen 同文体。')
     p.add_argument('--skill-thinking', choices=('on', 'off'), default='on',
                    help='skill_model/ref_model/skill_sampler 三者的 enable_thinking（必须一致）')
+    p.add_argument('--executor-thinking', choices=('on', 'off'), default='on',
+                   help='executor(base_sampler) 的 enable_thinking。off 用于 BigCodeBench 这类'
+                        '"解答短、难点在选 API 而非多步推理"的任务：think 下 34-50% 的 rollout '
+                        '陷入字面死循环撞满预算，关掉后截断归零且裸解更高（见 build 处注释）。')
     p.add_argument('--align-mode', choices=('v2', 'seam'), default='v2',
                    help="SEAM-alignment toggle for PROMPT/SKILL FORMAT only. "
                         "'v2'=clean single-user executor prompt + <skills> skill-gen. "
@@ -1546,7 +1703,9 @@ def _build_args():
     p.add_argument('--adv-clip', type=float, default=0.0,
                    help='clip group-relative advantage to [-adv_clip, adv_clip]; '
                         '0 = no clipping (matches SEAM/verl GRPO which does not clip advantages)')
-    p.add_argument('--kl-beta', type=float, default=0.001)
+    # 与 skill_ablate/main.py 的默认值必须一致（两个入口默认值分叉 = 静默不可比）。
+    # 2026-07-29 拍板 0.001 -> 0.01：对抗侵蚀 executor 收束能力的自发漂移。
+    p.add_argument('--kl-beta', type=float, default=0.01)
     p.add_argument('--lr', type=float, default=6e-6)
     p.add_argument('--max-train-rounds', type=int, default=1500)
     p.add_argument('--save-rounds', type=int, default=200)
