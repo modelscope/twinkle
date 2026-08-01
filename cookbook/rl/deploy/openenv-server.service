@@ -1,0 +1,44 @@
+# OpenEnv environment server, kept alive across reboots and crashes.
+#
+# A rollout batch dies with the server, so a long training run needs this
+# supervised rather than started from an interactive shell.
+#
+# Install:
+#   sudo cp openenv-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now openenv-server
+#   journalctl -u openenv-server -f
+#
+# Adjust User, WorkingDirectory and the HOST/WORKERS values before installing.
+
+[Unit]
+Description=OpenEnv code environment server for Twinkle Agentic RL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=CHANGEME
+WorkingDirectory=/path/to/twinkle/cookbook/rl/openenv_code
+
+# Bind to the private NIC (training on another host in the same network) or
+# 127.0.0.1 (same-host training, or reached over SSH port forwarding).
+# Never 0.0.0.0 — the server has no authentication.
+Environment=HOST=10.0.1.20
+Environment=PORT=8000
+Environment=WORKERS=4
+Environment=MAX_CONCURRENT_ENVS=64
+
+ExecStart=/bin/sh serve.sh
+Restart=always
+RestartSec=5
+
+# The server executes model-generated code; keep the blast radius small.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
