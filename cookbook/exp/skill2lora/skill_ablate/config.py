@@ -44,7 +44,7 @@ METHODS = ('bnpo', 'rl_ab', 'rl_err', 'opsd', 'improve_sft', 'sft', 'logp_rl', '
 VIEW_OF_METHOD = {'bnpo': 'B', 'rl_ab': 'A', 'rl_err': 'A', 'reflexion': 'A',
                   'opsd': 'A', 'improve_sft': 'A', 'sft': 'A', 'logp_rl': 'A', 'logp_gt': 'B',
                   'passrate_hinge': 'B', 'rejection_sft': 'A'}
-STYLES = ('narrative', 'pitfall')
+STYLES = ('narrative', 'pitfall', 'freeform')
 THINKINGS = ('on', 'off')
 TASKS = ('math', 'code')
 
@@ -249,6 +249,15 @@ MATRIX: List[ExpSpec] = [
             reward_rollouts=1, reward_temperature=0.0, smt_override=8192),
     ExpSpec('E20', 'reflexion', 'on', 'narrative', task='code', executor_thinking='off',
             reward_rollouts=1, reward_temperature=0.0, smt_override=8192),
+    # group 11 — E21 freeform 文体（2026-08-01 用户拍板）：以 E2 为模板的 query-only BNPO（view B、
+    # 无 rubric），唯一变量是 skill-gen system 换成 SKILL_GEN_FREEFORM“招式菜单”：不锁 narrative/
+    # pitfall/toy 固定文体，让模型按题自选最有用的形态（分析/概念/预判纠错/迷你示范/直白执行
+    # 指令，甚至 “let's think step by step”），T=1.0×8 自然铺开、组内择优。动机：固定 hint
+    # 消融实测 hint 内容语义贡献≈0、增益几乎全来自“有个 skill 块 + 催答案收尾”（fixed_hint_probe.py：
+    # A9_wrapperonly/A4_garbage 与有义 hint 打平、A7_budget 最高 +0.16），故放开文体看模型能否自选出更优组合。
+    # ★ 刷 thinking='on'（非照 E2 的 off）：freeform prompt 依赖“先私下想再选形态”，nothink 下无处
+    #   思考会把推理直接写进 <skills>（line 758 记录的泄漏失败模式）。其余同 E2：bnpo/math/narrative-长度预算。
+    ExpSpec('E21', 'bnpo', 'on', 'freeform'),
 ]
 
 # execution order: all nothink first, then think; E13 (seam-align baseline) right after E6;
@@ -256,7 +265,7 @@ MATRIX: List[ExpSpec] = [
 # E15 (GT-target logP validation) right after E14; the data-hungry SFT method dead last.
 # 2026-07-31 用户拍板：E19/E20（executor nothink）排在 E4/E17 之前先跑 —— 探针已判定
 # nothink 是 rubric 增量最大且唯一无截断混杂的口径，先拿这两个臂的结论。
-RUN_ORDER: List[str] = ['E1', 'E2', 'E5', 'E6', 'E13', 'E3', 'E7', 'E14', 'E15', 'E19', 'E20', 'E4', 'E8', 'E16', 'E17', 'E18', 'E9', 'E10', 'E11', 'E12']
+RUN_ORDER: List[str] = ['E1', 'E2', 'E5', 'E6', 'E13', 'E3', 'E7', 'E14', 'E15', 'E19', 'E20', 'E21', 'E4', 'E8', 'E16', 'E17', 'E18', 'E9', 'E10', 'E11', 'E12']
 
 BY_NAME: Dict[str, ExpSpec] = {e.name: e for e in MATRIX}
 

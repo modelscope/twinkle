@@ -803,7 +803,44 @@ First think privately: solve the problem in your head AND identify the single mo
 - End with: "Avoid re-checking loops; box a bare number as soon as it is computed."
 """
 
-_SKILL_STYLE = 'narrative'  # 'narrative' | 'toy' | 'pitfall'；由 main() 依据 --skill-style 设置
+# freeform 主链路（2026-08-01 用户拍板）：不锁死 narrative/pitfall/toy 固定文体，而是给模型一份
+# "招式菜单"，让它按题自选最有用的形态（可组合、可极简）。设计目标是让 T=1.0×8 的候选自然铺开
+# 到不同形态（分析 / 概念 / 预判纠错 / 迷你示范 / 直白执行指令，甚至 "let's think step by step"），
+# 由 GRPO/BNPO 组内择优。依据：固定 hint 消融（good_skill_hard_fail/fixed_hint_probe.py）显示 hint
+# 的"内容语义"贡献≈0、增益几乎全来自"存在一个 skill 块 + 催答案收尾"（A7_budget 最高 +0.16、
+# exec_answered 3.95σ），所以放开文体、把"催收尾"作为可选招式之一，看模型能否自选出更优组合。
+# 硬约束仍与 narrative 一致：只输出 <skills> 块、不解题、不代入本题数值、不给最终答案。
+SKILL_GEN_FREEFORM = """\
+You are a skill-generation model. Your <skills> block will be fed to a SEPARATE downstream executor model that must solve the problem on its own. The executor will NOT see your private reasoning — it only sees what is inside <skills>...</skills>.
+
+First, think privately: actually work the problem out in your head until you understand what really makes it solvable, then decide what ONE kind of help would most raise a fresh solver's chance on THIS specific problem.
+
+There is NO fixed format and no required style. Different problems are helped by different things — pick whatever you judge most useful here. Any of the following is allowed (the list is not exhaustive, and you may blend a couple if they genuinely help):
+- a short transferable analysis of what this TYPE of problem is really asking and the recommended approach;
+- naming the key concept / theorem / trick to reach for;
+- a WARNING about the single most likely wrong turn on this type, and the correct move instead;
+- a tiny worked example of the SAME type using DIFFERENT, smaller numbers (never the problem's own);
+- a blunt execution directive that keeps the solver on track (e.g. "commit to one method and don't keep second-guessing", "let's think step by step", or "box a bare number as soon as it is computed");
+- or plain, nothing-fancy encouragement if that is honestly all this problem needs.
+- Any other freeform skill you can imagine to try on this query
+
+Choose the form that fits THIS problem; do not pad. If one sharp sentence is the best help, give only that sentence; if a short focused paragraph is warranted, keep it tight. Being genuinely useful matters far more than being long or elaborate.
+
+Hard rules (always apply, whatever form you pick):
+- Do NOT solve the problem for the executor. Do NOT reveal or compute the final answer, and do NOT substitute the problem's specific given numbers or state any intermediate numeric result — leave ALL concrete numbers for the executor to compute.
+- Put ONLY your chosen help inside <skills></skills>, and nothing else.
+
+Whatever form you choose, it MUST be wrapped in a single <skills></skills> block with a proper closing tag. For example, a rich form:
+<skills>
+This is a modular-arithmetic problem: reduce each factor modulo the given modulus before multiplying, and never expand the full product — that is the whole trick. Commit to that reduction and don't second-guess it, then box a bare number as soon as it is computed.
+</skills>
+or, when the problem only needs a nudge, a minimal form is equally valid:
+<skills>
+Let's think step by step, and box a bare number as soon as it is computed.
+</skills>
+"""
+
+_SKILL_STYLE = 'narrative'  # 'narrative' | 'toy' | 'pitfall' | 'freeform'；由 main() 依据 --skill-style 设置
 
 # ---- Executor prompt (with skill injection) ----
 # 中文注释：executor 提示词。答案格式已统一为 \boxed{}（人工拍板，2026-07-27）：seam/v2 两模式的
@@ -964,6 +1001,19 @@ First think privately: from the diagnosis, pinpoint the decisive error. Then, in
 Hard rules: the block must be self-contained - never reference "the diagnosis" or "the previous skill"; the executor cannot see them.
 """
 
+# freeform 的 regen 版（buffer B 蒸馏用）。bnpo/view-B 臂不会走 regen，此处仅为分派完整性与
+# 未来 view-A + freeform 组合预留；同样放开形态、保留"自持、不指涉外部上下文、不泄漏"硬规则。
+REGEN_FREEFORM_SYSTEM = """\
+You are a skill-generation model. A separate executor model previously FAILED this problem even with your earlier skill. You will see that earlier skill and an expert rubric diagnosis of the failure. The executor will retry seeing ONLY your new <skills> block.
+
+First think privately: from the diagnosis, pinpoint the ONE thing that actually went wrong. Then choose whatever form of help would best fix it for THIS problem — there is no fixed format. It may be a short transferable analysis, the key concept to reach for, a WARNING naming the decisive mistake plus the correct move instead, a tiny worked example with DIFFERENT smaller numbers, or a blunt execution directive (e.g. "box a bare number as soon as it is computed"). Blend a couple only if it genuinely helps, and do not pad.
+
+Hard rules:
+- Do NOT solve the problem or reveal/compute the final answer, and do NOT substitute the problem's own numbers.
+- The block must be self-contained — never reference "the diagnosis", "the previous skill", or any context the executor cannot see, or it will hallucinate.
+- Put ONLY your chosen help inside <skills></skills>.
+"""
+
 
 def _skillgen_prompt(problem: str) -> Dict[str, Any]:
     """Skill-gen prompt: query-only. seam mode uses SEAM EXPERIENCE_PROMPT (single user turn,
@@ -974,7 +1024,8 @@ def _skillgen_prompt(problem: str) -> Dict[str, Any]:
     if _ALIGN_MODE == 'seam':
         return {'messages': [{'role': 'user', 'content': _SEAM_EXPERIENCE_PROMPT.format(problem=problem)}]}
     # 中文注释：按 --skill-style 选主链路文体（narrative=现版叙述式 / toy / pitfall）。
-    sys_p = {'toy': SKILL_GEN_TOY, 'pitfall': SKILL_GEN_PITFALL}.get(_SKILL_STYLE, SKILL_GEN_SYSTEM)
+    sys_p = {'toy': SKILL_GEN_TOY, 'pitfall': SKILL_GEN_PITFALL,
+             'freeform': SKILL_GEN_FREEFORM}.get(_SKILL_STYLE, SKILL_GEN_SYSTEM)
     return {'messages': [
         {'role': 'system', 'content': sys_p},
         {'role': 'user', 'content': f'Problem:\n{problem}'}]}
@@ -983,7 +1034,8 @@ def _skillgen_prompt(problem: str) -> Dict[str, Any]:
 def _regen_prompt(problem: str, orig_skill: str, rubric_diag: str) -> Dict[str, Any]:
     """Regeneration prompt for buffer B distillation."""
     # 中文注释：regen 与主链路同文体（--skill-style），user 模板复用 REGEN_USER 三字段。
-    sys_p = {'toy': REGEN_TOY_SYSTEM, 'pitfall': REGEN_PITFALL_SYSTEM}.get(_SKILL_STYLE, REGEN_SYSTEM)
+    sys_p = {'toy': REGEN_TOY_SYSTEM, 'pitfall': REGEN_PITFALL_SYSTEM,
+             'freeform': REGEN_FREEFORM_SYSTEM}.get(_SKILL_STYLE, REGEN_SYSTEM)
     return {'messages': [
         {'role': 'system', 'content': sys_p},
         {'role': 'user', 'content': REGEN_USER.format(
@@ -1642,9 +1694,9 @@ def _build_args():
     # 会截断成空块（_extract_skill 找不到 </skills> 返回 None）。提到 8192 给两段都留足空间。
     p.add_argument('--skill-max-tokens', type=int, default=8192)
     # 中文注释：文体消融开关——主链路与 buffer B regen 同文体（分布一致才可联合训练）。
-    p.add_argument('--skill-style', choices=('narrative', 'toy', 'pitfall'), default='narrative',
-                   help='skill文体: narrative=现版叙述式; toy=异数字玩具题示范; pitfall=预判纠错。'
-                        '主链路与 regen 同文体。')
+    p.add_argument('--skill-style', choices=('narrative', 'toy', 'pitfall', 'freeform'), default='narrative',
+                   help='skill文体: narrative=现版叙述式; toy=异数字玩具题示范; pitfall=预判纠错; '
+                        'freeform=招式菜单/模型按题自选形态。主链路与 regen 同文体。')
     p.add_argument('--skill-thinking', choices=('on', 'off'), default='on',
                    help='skill_model/ref_model/skill_sampler 三者的 enable_thinking（必须一致）')
     p.add_argument('--executor-thinking', choices=('on', 'off'), default='on',
@@ -1760,7 +1812,7 @@ def main():
     args = _build_args()
     global _ALIGN_MODE, _SKILL_STYLE
     _ALIGN_MODE = args.align_mode  # 'v2' | 'seam'
-    _SKILL_STYLE = args.skill_style  # 'narrative' | 'toy' | 'pitfall'
+    _SKILL_STYLE = args.skill_style  # 'narrative' | 'toy' | 'pitfall' | 'freeform'
     records, eval_records = _load_records(args)
     if len(records) < args.chunk_size:
         raise ValueError(f'--chunk-size ({args.chunk_size}) exceeds loaded ({len(records)}); raise --n')

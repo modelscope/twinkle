@@ -119,9 +119,9 @@ def run_experiment(args, spec: ExpSpec) -> None:
     v2._SKILL_STYLE = spec.style
     args.skill_thinking = spec.thinking
     # per-style length budget (#9 statistics: narrative≈1100 / pitfall≈300 chars);
-    # an explicit --len-budget on the CLI wins.
+    # freeform 可能产出叙述式长文本，按 narrative 档给 1100 以免误伤；explicit --len-budget on the CLI wins.
     if args.len_budget is None:
-        args.len_budget = 1100 if spec.style == 'narrative' else 300
+        args.len_budget = 1100 if spec.style in ('narrative', 'freeform') else 300
     # explicit --skill-max-tokens on the CLI wins over the per-experiment default.
     if args.skill_max_tokens is None:
         args.skill_max_tokens = spec.skill_max_tokens
