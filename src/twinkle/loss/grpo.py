@@ -423,22 +423,40 @@ class BNPOLoss(GRPOLoss):
     Normalizes by total completion tokens across batch.
 
     ``token_mean_scope``:
-      'global' (default, correct): return the UN-normalized token sum and report
-        ``num_tokens=Σmask``, so the framework's SUM-loss path divides the accumulated
-        gradient by the GLOBAL token count => exact token-mean, invariant to how the
-        batch is split into micro/dp groups (matches verl/SEAM BNPO).
-      'micro' (legacy): per-(micro÷dp)-group token-mean, equal-weighted across groups
-        (``num_tokens=0`` => PER-TOKEN-MEAN accumulation). This is the pre-fix behavior;
-        it double-averages (group token-mean, then equal-weight over groups), biasing
-        toward short responses and degrading to sequence-mean as groups multiply. Keep it
-        ONLY to reproduce arms trained before the 2026-08-01 fix (skill2lora E1–E20).
+      'micro' (default, matches verl/SEAM): per-(micro÷dp)-group token-mean,
+        equal-weighted across groups (``num_tokens=0`` => PER-TOKEN-MEAN accumulation).
+        This is what verl actually does -- see verl/workers/actor/dp_actor.py: pg_loss =
+        agg_loss(..., 'token-mean') is ``masked_mean`` computed WITHIN each micro-batch,
+        then ``loss = policy_loss * (1/gradient_accumulation)`` before ``backward()``.
+        So verl's effective gradient is the equal-weighted mean of per-micro token-means,
+        NOT a global token-mean.
+      'global': return the UN-normalized token sum and report ``num_tokens=Σmask``, so the
+        framework's SUM-loss path divides the accumulated gradient by the GLOBAL token
+        count => strict token-mean, invariant to micro/dp splitting.
+
+    Why 'global' is NOT the default, despite being the "textbook" token-mean
+    (measured on skill2lora E13, 2026-08-01):
+      Group-relative advantages cancel exactly per group (mean A = 0), but the
+      TOKEN-weighted mean does not: it equals -cov(len, A)/mean(len). With
+      corr(len, A) = -0.42 (long skill-gen responses hit the 8192 budget, lose their
+      closing tag, and score 0), 'global' yields a per-token pg_loss of +0.031 versus
+      verl/SEAM's +3.2e-4 -- a ~100x coherent "emit fewer tokens" gradient. Under
+      'global', E13 collapsed its <think> from 3977 to 1942 tokens in 25 updates
+      (SEAM: -17% in 76 updates) and overshot the optimum: corr(len, correct) flipped
+      from -0.42 to +0.23 while reward fell 0.816 -> 0.734. 'micro' localizes the
+      normalization, so the length coupling largely cancels (it degenerates to
+      sequence-mean as the micro size approaches 1).
     """
 
-    def __init__(self, *args, token_mean_scope: str = 'global', **kwargs):
+    def __init__(self, *args, token_mean_scope: str = 'micro', **kwargs):
         super().__init__(*args, **kwargs)
         assert token_mean_scope in ('global', 'micro'), \
             f'token_mean_scope must be global|micro, got {token_mean_scope!r}'
         self.token_mean_scope = token_mean_scope
+        # 'global' 返回的是 token 和（梯度在下游按 num_tokens=Σmask 归一）。必须同步告诉展示层
+        # 这是 sum-reduction，否则 LossMetric（metric/loss.py）不会除以 num_tokens，会把每个 micro 的
+        # token 和当均值直接平均，展示出一个被 token 数放大的巨大 loss（梯度不受影响，纯展示失真）。
+        self.reduction = 'sum' if token_mean_scope == 'global' else 'mean'
 
     def _aggregate_loss(
         self,

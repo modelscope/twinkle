@@ -182,6 +182,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
+        # equivalent): sporadic `mha_graph.execute` RuntimeError on Blackwell + CUDA 13
+        # (ablate12 E7 crashed at update 21 mid-forward). Env-gated to keep default behavior.
+        if os.environ.get('TWINKLE_DISABLE_CUDNN_SDP', '0') == '1':
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         # The Default tokenizer will be used to save with a model if no template was set.

@@ -274,25 +274,42 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL TASK EXEC_THINK; do
         MIN_LEVEL_ARG="${E13_MIN_LEVEL:-0}"
         [ -z "$REWARD_TRUNC_PENALTY" ] && E16_FLAGS="$E16_FLAGS --reward-trunc-penalty 0"
         E16_FLAGS="$E16_FLAGS --eval-rollouts 1 --eval-skill-temperature 0.0"
-        # 显存：E13 8×140G 实测 micro=8（trainer.py 的 8192 自动档）仍 OOM（132G 已用 + 4.77G）。
-        # 降 train_micro_batch 到 2×dp（默认 TRAIN_GPUS=2 → 4）；grpo.py 的 global token-mean 修复后
-        # 切 micro 数学等价，不改有效批量(chunk=128=SEAM batch)与可比性，只降训练前向峰值显存。
-        # 显式 TRAIN_MICRO_BATCH 优先；E13_TRAIN_MICRO_BATCH 单独可调。值恒为 TRAIN_GPUS 倍数(满足 %TRAIN_DP)。
+        # ---- 与 SEAM 逐行对齐的优化器参数（2026-08-01）----------------------------------
+        # 上一版 E13 只对了 chunk/min_level/惩罚/eval，三个真正控制更新幅度的参数全部跑默认值，
+        # 与 SEAM 差得很远（实测后果：think 25 步从 3977 塔到 1942 token、reward 0.816→0.734）。
+        # SEAM 侧真值来自 scripts/train_deepmath_paper.sh + verl 的 fsdp_workers.py:198-199 归一化：
+        #   ppo_mini_batch_size=20 × rollout.n=8 = 160 全局序列（再 /4gpu = 40/gpu）
+        #   → 每 batch 的 optimizer step 数 = 256/40 = 7（verl data.split 的余数也算一步），
+        #     twinkle 端 range(0,1024,160) 同样 7 步；且 mini<n 使 multi_step=True、启用 PPO ratio，
+        #     与 verl 用 rollout 时 old_log_prob 的行为一致（旧值 mini=n → 1 步/batch、ratio 恒=1）。
+        #   kl_loss_coef=0.001（main.py 默认 0.01，旧 E13 就是 0.01，整整差 10 倍）。
+        # 显式同名 env 仍可覆盖。
+        E16_FLAGS="$E16_FLAGS --ppo-mini-batch-size ${E13_PPO_MINI:-160}"
+        [ -z "$KL_BETA" ] && E16_FLAGS="$E16_FLAGS --kl-beta ${E13_KL_BETA:-0.001}"
+        # 显存：E13 8×140G 实测 micro=8（trainer.py 的 8192 自动档）OOM（132G 已用 + 4.77G），
+        # micro=4（2 序列/卡）已实测跑得通，所以继续用 2×dp。
+        # 注：verl 的聚合单元是 5 序列/卡（ppo_micro_batch_size_per_gpu=5），这里是 2；在
+        # token_mean_scope='micro' 下这只是聚合粒度差（实测偏离真 token-mean 的倍率
+        # 1.415@2 vs 1.35@5，约 5%），而且方向是更靠近 sequence-mean、长度耦合更弱，
+        # 不会重新引入 'global' 那个 97 倍的“少写 token”梯度。想完全对齐需 TRAIN_FSDP=2 腾显存后设 5。
         _tmb=${E13_TRAIN_MICRO_BATCH:-$((2*${TRAIN_GPUS:-2}))}
         [ -n "${TRAIN_MICRO_BATCH:-}" ] && _tmb=$TRAIN_MICRO_BATCH
         E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
         echo "[ablate12] E13 SEAM-repro: chunk=$CHUNK_ARG min_level=$MIN_LEVEL_ARG train_micro_batch=$_tmb"\
-" reward_trunc_penalty=0 eval=R1/T0 executor=nothink skill_max_tokens=$SMT (executor 预算 8192/16384, K=n_skills 默认 8)"
+" ppo_mini=${E13_PPO_MINI:-160} kl_beta=${KL_BETA:-${E13_KL_BETA:-0.001}} reward_trunc_penalty=0 eval=R1/T0"\
+" executor=nothink skill_max_tokens=$SMT (executor 预算 8192/16384, K=n_skills 默认 8)"
     fi
     if [ "$NAME" = "E21" ]; then
         # 显存：E21 每卡 80G，4B 不分片 + fp32 Adam 主权重≈64G、余量仅 ~16G，micro=8（自动档）必 OOM。
-        # 默认 train_micro_batch=1×dp（= TRAIN_GPUS，最小且满足 %TRAIN_DP==0）；global token-mean 修复后
-        # 切 micro 数学等价。若仍 OOM：改用 TRAIN_GPUS=1（micro→1）或 TRAIN_FSDP=2 分片权重腾显存。
+        # 默认 train_micro_batch=1×dp（= TRAIN_GPUS，最小且满足 %TRAIN_DP==0）。
+        # 注：token_mean_scope 已改回 'micro'（= verl 口径），所以切 micro 不再是数学等价，
+        # 而是会改变聚合粒度（micro 越小越接近 sequence-mean）。E21 与其它臂横比时需记一笔。
+        # 若仍 OOM：TRAIN_FSDP=2 REF_FSDP=2（分片权重、且 dp→1 允许 micro=1）。
         # 显式 TRAIN_MICRO_BATCH 优先；E21_TRAIN_MICRO_BATCH 单独可调。
         _tmb=${E21_TRAIN_MICRO_BATCH:-${TRAIN_GPUS:-2}}
         [ -n "${TRAIN_MICRO_BATCH:-}" ] && _tmb=$TRAIN_MICRO_BATCH
         E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
-        echo "[ablate12] E21 freeform: train_micro_batch=$_tmb (80G OOM guard; global token-mean 使切 micro 等价，不改批量)"
+        echo "[ablate12] E21 freeform: train_micro_batch=$_tmb (80G OOM guard; micro 口径下会改变聚合粒度)"
     fi
     case "$NAME" in
         E4|E17|E19|E20)

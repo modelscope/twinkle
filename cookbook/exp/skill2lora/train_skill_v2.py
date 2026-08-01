@@ -311,8 +311,12 @@ def _seam_norm(num: str) -> str:
         return num.strip()
 
 
-def _seam_sanitize(txt: str) -> str:
-    """Port of SEAM lpem.sanitize_math_answer + normalize_number_format."""
+def _seam_sanitize(txt: str, dfrac_fix: bool = True) -> str:
+    """Port of SEAM lpem.sanitize_math_answer + normalize_number_format.
+
+    ``dfrac_fix=False`` gives BIT parity with the upstream function (which only rewrites the
+    literal ``\\frac``); it is used by the ``align='seam'`` judge so that E13's acc is
+    reproducible against SEAM's step_summary. See _parse_seq."""
     txt = (txt or '').strip()
     if (m := _SEAM_TAG_RE.search(txt)):
         txt = m.group(1).strip()
@@ -323,7 +327,9 @@ def _seam_sanitize(txt: str) -> str:
     # bugfix 2026-07-29：\dfrac/\tfrac/\cfrac 不被下行字面 \frac 正则匹配，曾致
     # \boxed{\dfrac{1}{2}} 落到 _SEAM_NUM_RE 抓首个数字 → pred='1'（分数答案题全判错；
     # 实测被标"错"的 boxed rolls 中 70-85% 实为正确，见 skill_quality_analysis.md 末章）。
-    txt = txt.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac').replace(r'\cfrac', r'\frac')
+    # 注：SEAM 上游没有这一步，seam 对齐口径下必须关掉（dfrac_fix=False）。
+    if dfrac_fix:
+        txt = txt.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac').replace(r'\cfrac', r'\frac')
     txt = re.sub(r'\\frac\s*\{\s*([^}]+?)\s*}\s*\{\s*([^}]+?)\s*}', r'\1/\2', txt)
     if (m := _SEAM_FRAC_RE.search(txt)):
         p, q = map(float, m.groups())
@@ -346,12 +352,16 @@ def _clean_text(decoded: Optional[str]) -> str:
 
 def _extract_skill(text: str) -> Optional[str]:
     """Parse the skill block: <memory_item> in seam mode (SEAM format_pass parity), else <skills>."""
+    if _ALIGN_MODE == 'seam':
+        # ⭐ 整段搜、取首个匹配，不先剔掉 <think> —— 与 SEAM 两处实现逐字一致：
+        #   lpem.format_pass：MEMORY_RE.search(resp)；fsdp_workers.py:836：_re.search(..., response_text)。
+        #   旧实现只搜 </think> 之后，会把"只在 think 里写了 memory_item"的候选当成格式失败
+        #   （reward=0），而 SEAM 那边算格式通过 —— 直接影响 format 率与组内 reward 方差。
+        m = re.search(r'<memory_item>(.*?)</memory_item>', text or '', re.DOTALL | re.IGNORECASE)
+        return (m.group(1).strip() or None) if m else None
     low = text.lower()
     end_think = low.rfind('</think>')
     answer = text[end_think + len('</think>'):] if end_think >= 0 else text
-    if _ALIGN_MODE == 'seam':
-        m = re.search(r'<memory_item>(.*?)</memory_item>', answer, re.DOTALL | re.IGNORECASE)
-        return (m.group(1).strip() or None) if m else None
     open_tag, close_tag = '<skills>', '</skills>'
     s = answer.lower().rfind(open_tag)
     if s < 0:
@@ -369,9 +379,22 @@ def _parse_seq(seq, gold) -> Dict[str, Any]:
     if _TASK == 'code':
         return _parse_many([(seq, gold)])[0]
     text = _clean_text(getattr(seq, 'decoded', '') or '')
-    # 判分口径统一（人工拍板，2026-07-27）：seam/v2 都只从 \boxed{} 抽取，再走同一套数值归一
-    # （frac/inline/number）后精确匹配；不做 lpem 式“整段抓数字”贪婪回退，保证 E13 与 E1-E12
-    # 的 acc/lift 横向可比。extract_boxed 取最后一个配平的 \boxed{}、截断时不误取；没有则判错。
+    if _ALIGN_MODE == 'seam':
+        # ⭐ seam 对齐口径（2026-08-02 修正）= SEAM_JUDGE=answer，即 train_deepmath_paper.sh 的默认值：
+        #   整段文本走 sanitize 级联 <answer> → \boxed → $..$/\(..\) → 分数 → **首个数字**。
+        #   之前这里走的是 boxed-only（等价 SEAM_JUDGE=boxed），与 executor prompt 要求
+        #   "<think>...</think><answer>...</answer>" 直接冲突 —— 换成原版 prompt 后 boxed-only
+        #   会把几乎所有 rollout 判错。prompt 与判分必须成对切换，见 _SEAM_SOLVE_ADVISORY 注释。
+        #   dfrac_fix=False 是为了与 lpem.sanitize_math_answer 逐字节一致。
+        pred = _seam_sanitize(text, dfrac_fix=False) or None
+        correct = bool(pred) and (pred == _seam_sanitize(str(gold), dfrac_fix=False))
+        terminated = getattr(seq, 'stop_reason', None) != 'length'
+        return {'pred': pred, 'correct': correct, 'terminated': terminated,
+                'stop_reason': getattr(seq, 'stop_reason', None),
+                'gen_tokens': len(getattr(seq, 'tokens', None) or []), 'text': text}
+    # v2（E1-E12/E14-E21）：只从 \boxed{} 抽取，再走同一套数值归一（frac/inline/number）后精确匹配；
+    # 不做 lpem 式"整段抓数字"贪婪回退，保证这些臂之间的 acc/lift 横向可比。extract_boxed 取最后一个
+    # 配平的 \boxed{}、截断时不误取；没有则判错。
     raw = extract_boxed(text)
     pred = _seam_sanitize(raw) if raw else None
     correct = bool(pred) and (pred == _seam_sanitize(str(gold)))
@@ -884,16 +907,26 @@ _SEAM_EXPERIENCE_PROMPT = (
     '- Output ONLY the experience, wrapped EXACTLY as '
     '<memory_item> ... </memory_item>.\n\n'
     'Problem:\n{problem}')
+# 逐字节复刻 SEAM templates/slove_qwen.txt（注意第一行末尾那个空格，EOF 无换行）。
 _SEAM_SOLVE_ADVISORY = (
-    'The above is a Q&A dialogue between a user and a problem-solving guidance model.\n'
+    'The above is a Q&A dialogue between a user and a problem-solving guidance model. \n'
     'Treat the output of the guidance model as advisory context to solve the math problem: '
     'prefer using its techniques when they fit, but you may use alternative correct methods '
     'if they are more efficient or clearer. If you diverge from the advisory context, briefly '
     'explain why. Be concise and accurate.\n'
-    + _ANSWER_FORMAT_V2)
+    + _ANSWER_FORMAT)
+# seam 模式的 baseline/空-skill 回退 system。必须用 _ANSWER_FORMAT（<think>/<answer>）而不是
+# _ANSWER_FORMAT_V2（\boxed{}）：SEAM 的 fsdp_workers.py:850-856 在 SEAM_JUDGE=answer（默认）下
+# 就是这个串，且 executor 关 thinking 时 Qwen3 会自动补一个空 <think></think>，与"请输出 <think>"
+# 的要求撞在一起，抽答案更容易失败 —— 这正是 SEAM baseline 只有 0.57 的原因。用 boxed 会把
+# baseline 抬到 0.72、给定可解析 skill 的 acc 抬到 0.923（SEAM 0.865），曲线水平就对不上。
+# 判分侧无需改动：_seam_sanitize 优先匹配 <answer>、其次 boxed，两种格式都吃。
+DIRECT_SYSTEM_SEAM = (
+    'You are an expert competition mathematician. Be concise and accurate. '
+    + _ANSWER_FORMAT)
 
 
-def build_skill_solve_prompt_seam(problem, skill, raw_response=None):
+def build_skill_solve_prompt_seam(problem, skill, raw_response=None, resp_terminated=True):
     """SEAM executor prompt. Non-empty skills use the actor's raw response_text, preserving
     actor <think> exactly as SEAM's reward worker does: prompt_text + response_text + grm.
     If raw_response is missing, fall back to reconstructing a minimal <memory_item> response."""
@@ -904,6 +937,12 @@ def build_skill_solve_prompt_seam(problem, skill, raw_response=None):
                    + '<|im_end|>\n<|im_start|>assistant\n')
     if not response_text:
         response_text = f'<memory_item>{skill}</memory_item>'
+    elif resp_terminated:
+        # SEAM 的 response_text 是 skip_special_tokens=False 解码的（fsdp_workers.py:828），正常终止的
+        # rollout 末尾带着 EOS，即 "</memory_item><|im_end|>"；twinkle 的 _clean_text 把 <|...|> 全剔了。
+        # 差这一个 token 也会改变 executor 的贪心解码，补回来。截断的 rollout（stop=length）
+        # SEAM 那边也没有 EOS，所以不补。
+        response_text = response_text + '<|im_end|>'
     content = prompt_text + response_text + '\n' + _SEAM_SOLVE_ADVISORY
     return {'messages': [{'role': 'user', 'content': content}]}
 
@@ -912,15 +951,15 @@ def build_direct_prompt(problem):
     if _TASK == 'code':
         return code_task.direct_prompt(problem)
     if _ALIGN_MODE == 'seam':
-        # seam 基线保持英文原样，不受 v2 prompt 改动影响
-        return {'messages': [{'role': 'system', 'content': DIRECT_SYSTEM},
+        # seam 基线逐字复刻 SEAM fsdp_workers.py:850-858（system + user，<think>/<answer> 格式）
+        return {'messages': [{'role': 'system', 'content': DIRECT_SYSTEM_SEAM},
                              {'role': 'user', 'content': problem}]}
     # v2：英文 executor 基线——与带 skill 版同格式，仅去掉“技巧提示”部分
     content = f'The problem you need to solve:\n{problem}\n\n' + _ANSWER_FORMAT_V2
     return {'messages': [{'role': 'user', 'content': content}]}
 
 
-def build_skill_solve_prompt(problem, skill, raw_response=None):
+def build_skill_solve_prompt(problem, skill, raw_response=None, resp_terminated=True):
     skill = (skill or '').strip()
     if _TASK == 'code':
         # 空 skill -> 干净 direct（与数学分支同规则，见下方注释）
@@ -929,10 +968,12 @@ def build_skill_solve_prompt(problem, skill, raw_response=None):
         # 空 skill → 干净 direct。训练侧根本不会用空 skill 走 executor（process_chunk 只对非空 flat 跑，
         # 空候选直接 reward=0），故此分支仅影响 eval 口径——让空 skill 题 withskill==baseline、对 lift 贡献 0，
         # 去掉空壳嵌套的框架水分，指标更干净。
+        # （seam 模式下这正好等于 SEAM fsdp_workers.py:846-858 的 else 分支。）
         return build_direct_prompt(problem)
     if _ALIGN_MODE == 'seam':
         # 非空 skill 走 SEAM 原始 reward worker 路径：executor 可见 actor 完整 response_text（含 <think>）。
-        return build_skill_solve_prompt_seam(problem, skill, raw_response=raw_response)
+        return build_skill_solve_prompt_seam(problem, skill, raw_response=raw_response,
+                                            resp_terminated=resp_terminated)
     # v2：英文 executor——题目 + 技巧提示(skill 作为 advisory) + 答案格式，单 user turn
     content = (f'The problem you need to solve:\n{problem}\n\n'
                'Skill hint:\nFor this problem, a skill-generation model has analyzed it and '
@@ -1359,23 +1400,34 @@ def process_chunk(base_sampler, skill_sampler, chunk, ci, base_dp, skill_dp, arg
     for r, c in flat:
         c['leaked'] = _answer_leaked(c['skills'], r['reference_answer'])
 
+    # ⭐ executor 覆盖面（seam 对齐，2026-08-02）：SEAM 对**每一条**候选都跑 executor ——
+    # fsdp_workers.py:842-858，抽不到 <memory_item> 时走 else 分支（direct_system + 裸题目），
+    # 它的 acc 照样计入 reward_extra_info["acc"]，也就是 train/with_skill_accuracy 的分子。
+    # 旧实现只跑 parseable 的，于是 twinkle 算不出同口径的 withskill 准确率，只能拿
+    # P(correct|parseable) 去对 SEAM 的 P(correct)，两条曲线分母不同、根本无法对齐。
+    # reward 口径不变：_skill_reward 仍然乘 parseable，空 skill 永远 reward=0。仅 seam 模式开，
+    # 其余臂（E1-E12/E14-E21）行为与开销不动。
+    exec_list = ([(r, c) for r in chunk for c in r['_cands']] if _ALIGN_MODE == 'seam' else flat)
+
     # with-skill executor pass：默认 greedy×1（E1-E13，reward 0/1 与旧口径 bit 一致）；
     # E14: reward_rollouts>1 时 T=reward_temperature × K 采样，reward = parseable × 通过率，
     # 把内容信号从 greedy 0/1 量化里释放出来（提升组内 std>0 比例）。
-    if flat:
+    if exec_list:
         K = max(1, int(getattr(args, 'reward_rollouts', 1) or 1))
         rT = float(getattr(args, 'reward_temperature', 0.0) or 0.0)
         ws_out = _run_samples(base_sampler,
-                              [build_skill_solve_prompt(r['problem'], c['skills'], c.get('response')) for r, c in flat],
+                              [build_skill_solve_prompt(r['problem'], c['skills'], c.get('response'),
+                                                        resp_terminated=(c.get('skillgen_stop') != 'length'))
+                               for r, c in exec_list],
                               K, args.max_tokens, base_dp, temperature=rT)
         # 判分一次性批量化（code 任务要起子进程跑单测，逐条会比 GPU 还慢一个量级）
         pairs, spans = [], []
-        for (r, c), seqs in zip(flat, ws_out):
+        for (r, c), seqs in zip(exec_list, ws_out):
             start = len(pairs)
             pairs.extend((s, r['reference_answer']) for s in (seqs or []))
             spans.append((start, len(pairs)))
         judged = _parse_many(pairs)
-        for (r, c), (a, b) in zip(flat, spans):
+        for (r, c), (a, b) in zip(exec_list, spans):
             rolls = judged[a:b] or [_empty_roll()]
             for x in rolls[1:]:
                 x['text'] = ''  # 磁盘保护：K>1 时只留首 rollout 全文（gen_records 体积控制）
@@ -1465,8 +1517,16 @@ def _chunk_summary(chunk, ci):
     trunc = sum(1 for x in ws_rolls if x['stop_reason'] == 'length')
     # bugfix（ablate #6）：旧版 any(c.get('reward')) 用 truthiness，负 reward（E16 hinge/leak_gate、
     # E14 地板 -1.0）也被当“通过”；改用 with_pass>0（真正的 executor 通过率），greedy 0/1 臂语义不变。
-    ws_acc = _mean([1.0 if any((c.get('with_pass') or 0) > 0 for c in r['_cands']) else 0.0
+    # 同时限 parseable：seam 模式下 unparseable 候选也有 with_pass（走 direct 回退），不限的话
+    # 这条 pass@K 会被 baseline 成绩推高、与历史臂不可比。
+    ws_acc = _mean([1.0 if any((c.get('with_pass') or 0) > 0 and c.get('parseable') for c in r['_cands'])
+                    else 0.0
                     for r in chunk if r['_cands']])
+    # ⭐ SEAM 同口径的 withskill 准确率：**全部**候选上的 mean(correct)，不看格式、不条件化。
+    # = ray_trainer.py:1529 float(np.mean(reward_extra_infos_dict["acc"]))
+    # = step_summary 的 withskill_pass = swanlab 的 train/with_skill_accuracy。
+    # 只有 seam 模式会给 unparseable 候选跑 executor，其余臂这个值等于 candidate_withskill_pass。
+    pass_all = [c['with_pass'] for c in all_cands if c['with_pass'] is not None]
     return {
         'record_type': 'summary', 'chunk': ci, 'n': len(chunk),
         'n_generated': len(all_cands), 'n_candidates_parseable': len(cands),
@@ -1481,6 +1541,8 @@ def _chunk_summary(chunk, ci):
         'skill_chars_mean': _mean([len(c['skills']) for c in cands]),
         'avg_withskill_pass': ws_acc,
         'candidate_withskill_pass': _mean([c['with_pass'] for c in scored]),
+        'withskill_pass_all_cands': _mean(pass_all),
+        'n_exec_cands': len(pass_all),
         'withskill_trunc_frac': (trunc / len(ws_rolls)) if ws_rolls else 0.0,
         'termination_rate_withskill': _mean([1.0 if x['terminated'] else 0.0 for x in ws_rolls]),
     }
@@ -1516,16 +1578,17 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
         for j in range(R):
             s = seqs[j] if j < len(seqs) else None
             if s is None:
-                row.append(('', ''))
+                row.append(('', '', 'stop'))
             else:
                 sresp = _clean_text(getattr(s, 'decoded', '') or '')
-                row.append((_extract_skill(sresp) or '', sresp))
+                row.append((_extract_skill(sresp) or '', sresp, getattr(s, 'stop_reason', None)))
         per_skills.append(row)
     # flatten R×N for a single batched greedy executor pass
     flat_prompts, flat_idx = [], []
     for pi, (r, row) in enumerate(zip(eval_records, per_skills)):
-        for j, (sk, sresp) in enumerate(row):
-            flat_prompts.append(build_skill_solve_prompt(r['problem'], sk, sresp))
+        for j, (sk, sresp, sstop) in enumerate(row):
+            flat_prompts.append(build_skill_solve_prompt(r['problem'], sk, sresp,
+                                                        resp_terminated=(sstop != 'length')))
             flat_idx.append((pi, j))
     ws_out = _run_samples(base_sampler, flat_prompts, 1, args.max_tokens, base_dp, temperature=0.0)
     judged = _parse_many([(_first_seq(seqs), eval_records[pi]['reference_answer'])
@@ -1535,7 +1598,7 @@ def run_greedy_eval(base_sampler, skill_sampler, eval_records, ci, rounds,
     for pi, (r, row) in enumerate(zip(eval_records, per_skills)):
         rolls = [roll_by[(pi, j)] for j in range(len(row))]
         corr = [1.0 if x['correct'] else 0.0 for x in rolls]
-        parses = [1.0 if sk else 0.0 for sk, _ in row]
+        parses = [1.0 if sk else 0.0 for sk, _sresp, _sstop in row]
         terms = [1.0 if x['terminated'] else 0.0 for x in rolls]
         acc_mean = sum(corr) / len(corr) if corr else 0.0
         # bugfix（ablate #8）：unparseable skill 的 rollout 实际走了 direct 回退（≈baseline），
@@ -1794,6 +1857,14 @@ def _swan_metrics(summary, log):
     if summary['n_groups'] > 0:
         d.update({'acc/withskill_pass': summary['avg_withskill_pass'],
                   'term/withskill_trunc_frac': summary['withskill_trunc_frac']})
+        # ⭐ 与 SEAM 同名同口径的三条（ray_trainer.py:1569-1583），专为 swanlab 叠图对齐而发：
+        #   train/with_skill_accuracy = 全部候选的 mean(correct)；acc/reward_mean = mean(correct∧format)；
+        #   skill/format_rate = SEAM 的 format_mean。
+        #   注：旧的 acc/withskill_pass 是**题级 pass@K**，与 SEAM 同名指标不同口径（它接近 1
+        #   且会随训练小幅下行）—— 之前把这两条叠在一张图上看"趋势相反"就是这个原因。
+        d['train/with_skill_accuracy'] = summary['withskill_pass_all_cands']
+        d['acc/reward_mean'] = summary['reward_mean']
+        d['skill/format_rate'] = summary['parse_rate']
     if log:
         d['train/n_grpo'] = log['n_grpo']
         d['train/n_sft'] = log['n_sft']
