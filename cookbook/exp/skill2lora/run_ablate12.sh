@@ -279,7 +279,7 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL TASK EXEC_THINK; do
         # 切 micro 数学等价，不改有效批量(chunk=128=SEAM batch)与可比性，只降训练前向峰值显存。
         # 显式 TRAIN_MICRO_BATCH 优先；E13_TRAIN_MICRO_BATCH 单独可调。值恒为 TRAIN_GPUS 倍数(满足 %TRAIN_DP)。
         _tmb=${E13_TRAIN_MICRO_BATCH:-$((2*${TRAIN_GPUS:-2}))}
-        [ -n "$TRAIN_MICRO_BATCH" ] && _tmb=$TRAIN_MICRO_BATCH
+        [ -n "${TRAIN_MICRO_BATCH:-}" ] && _tmb=$TRAIN_MICRO_BATCH
         E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
         echo "[ablate12] E13 SEAM-repro: chunk=$CHUNK_ARG min_level=$MIN_LEVEL_ARG train_micro_batch=$_tmb"\
 " reward_trunc_penalty=0 eval=R1/T0 executor=nothink skill_max_tokens=$SMT (executor 预算 8192/16384, K=n_skills 默认 8)"
@@ -290,7 +290,7 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL TASK EXEC_THINK; do
         # 切 micro 数学等价。若仍 OOM：改用 TRAIN_GPUS=1（micro→1）或 TRAIN_FSDP=2 分片权重腾显存。
         # 显式 TRAIN_MICRO_BATCH 优先；E21_TRAIN_MICRO_BATCH 单独可调。
         _tmb=${E21_TRAIN_MICRO_BATCH:-${TRAIN_GPUS:-2}}
-        [ -n "$TRAIN_MICRO_BATCH" ] && _tmb=$TRAIN_MICRO_BATCH
+        [ -n "${TRAIN_MICRO_BATCH:-}" ] && _tmb=$TRAIN_MICRO_BATCH
         E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
         echo "[ablate12] E21 freeform: train_micro_batch=$_tmb (80G OOM guard; global token-mean 使切 micro 等价，不改批量)"
     fi
