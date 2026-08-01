@@ -274,8 +274,25 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL TASK EXEC_THINK; do
         MIN_LEVEL_ARG="${E13_MIN_LEVEL:-0}"
         [ -z "$REWARD_TRUNC_PENALTY" ] && E16_FLAGS="$E16_FLAGS --reward-trunc-penalty 0"
         E16_FLAGS="$E16_FLAGS --eval-rollouts 1 --eval-skill-temperature 0.0"
-        echo "[ablate12] E13 SEAM-repro: chunk=$CHUNK_ARG min_level=$MIN_LEVEL_ARG"\
+        # 显存：E13 8×140G 实测 micro=8（trainer.py 的 8192 自动档）仍 OOM（132G 已用 + 4.77G）。
+        # 降 train_micro_batch 到 2×dp（默认 TRAIN_GPUS=2 → 4）；grpo.py 的 global token-mean 修复后
+        # 切 micro 数学等价，不改有效批量(chunk=128=SEAM batch)与可比性，只降训练前向峰值显存。
+        # 显式 TRAIN_MICRO_BATCH 优先；E13_TRAIN_MICRO_BATCH 单独可调。值恒为 TRAIN_GPUS 倍数(满足 %TRAIN_DP)。
+        _tmb=${E13_TRAIN_MICRO_BATCH:-$((2*${TRAIN_GPUS:-2}))}
+        [ -n "$TRAIN_MICRO_BATCH" ] && _tmb=$TRAIN_MICRO_BATCH
+        E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
+        echo "[ablate12] E13 SEAM-repro: chunk=$CHUNK_ARG min_level=$MIN_LEVEL_ARG train_micro_batch=$_tmb"\
 " reward_trunc_penalty=0 eval=R1/T0 executor=nothink skill_max_tokens=$SMT (executor 预算 8192/16384, K=n_skills 默认 8)"
+    fi
+    if [ "$NAME" = "E21" ]; then
+        # 显存：E21 每卡 80G，4B 不分片 + fp32 Adam 主权重≈64G、余量仅 ~16G，micro=8（自动档）必 OOM。
+        # 默认 train_micro_batch=1×dp（= TRAIN_GPUS，最小且满足 %TRAIN_DP==0）；global token-mean 修复后
+        # 切 micro 数学等价。若仍 OOM：改用 TRAIN_GPUS=1（micro→1）或 TRAIN_FSDP=2 分片权重腾显存。
+        # 显式 TRAIN_MICRO_BATCH 优先；E21_TRAIN_MICRO_BATCH 单独可调。
+        _tmb=${E21_TRAIN_MICRO_BATCH:-${TRAIN_GPUS:-2}}
+        [ -n "$TRAIN_MICRO_BATCH" ] && _tmb=$TRAIN_MICRO_BATCH
+        E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
+        echo "[ablate12] E21 freeform: train_micro_batch=$_tmb (80G OOM guard; global token-mean 使切 micro 等价，不改批量)"
     fi
     case "$NAME" in
         E4|E17|E19|E20)

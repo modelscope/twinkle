@@ -131,6 +131,17 @@ class GRPOLoss(Loss):
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 
+    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
+        """Token denominator reported in ``LossOutput.num_tokens``.
+
+        0 (default) => framework uses the PER-TOKEN-MEAN accumulation path, where each
+        micro/dp group is equal-weighted. Subclasses that want a strict GLOBAL token-mean
+        (the SUM-loss path in transformers.py / megatron.py) return ``Σmask`` instead, so
+        the accumulated gradient is divided by the global token count and the result is
+        invariant to how the batch is split into micro/dp groups.
+        """
+        return 0
+
     def _pad_and_align_to_batch(
         self,
         data: 'Union[torch.Tensor, List, np.ndarray]',
@@ -315,7 +326,7 @@ class GRPOLoss(Loss):
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
-        return LossOutput(loss=loss, num_tokens=0)
+        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
 
 class GSPOLoss(GRPOLoss):
@@ -410,7 +421,24 @@ class BNPOLoss(GRPOLoss):
     BNPO (Batch-Normalized Policy Optimization) Loss.
 
     Normalizes by total completion tokens across batch.
+
+    ``token_mean_scope``:
+      'global' (default, correct): return the UN-normalized token sum and report
+        ``num_tokens=Σmask``, so the framework's SUM-loss path divides the accumulated
+        gradient by the GLOBAL token count => exact token-mean, invariant to how the
+        batch is split into micro/dp groups (matches verl/SEAM BNPO).
+      'micro' (legacy): per-(micro÷dp)-group token-mean, equal-weighted across groups
+        (``num_tokens=0`` => PER-TOKEN-MEAN accumulation). This is the pre-fix behavior;
+        it double-averages (group token-mean, then equal-weight over groups), biasing
+        toward short responses and degrading to sequence-mean as groups multiply. Keep it
+        ONLY to reproduce arms trained before the 2026-08-01 fix (skill2lora E1–E20).
     """
+
+    def __init__(self, *args, token_mean_scope: str = 'global', **kwargs):
+        super().__init__(*args, **kwargs)
+        assert token_mean_scope in ('global', 'micro'), \
+            f'token_mean_scope must be global|micro, got {token_mean_scope!r}'
+        self.token_mean_scope = token_mean_scope
 
     def _aggregate_loss(
         self,
@@ -418,8 +446,18 @@ class BNPOLoss(GRPOLoss):
         loss_mask: 'torch.Tensor',
         **kwargs,
     ) -> 'torch.Tensor':
-        """Sum over all tokens, divide by total token count."""
-        return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+        """global: return the token SUM (the global division is done downstream via
+        num_tokens=Σmask). micro (legacy): local token-mean, later equal-weighted across
+        micro/dp groups."""
+        summed = (per_token_loss * loss_mask).sum()
+        if self.token_mean_scope == 'global':
+            return summed
+        return summed / loss_mask.sum().clamp(min=1.0)
+
+    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
+        if self.token_mean_scope == 'global':
+            return loss_mask.sum().clamp(min=1.0)
+        return 0
 
 
 class SEAMBNPOLoss(BNPOLoss):
@@ -518,7 +556,7 @@ class SEAMBNPOLoss(BNPOLoss):
             per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
-        return LossOutput(loss=loss, num_tokens=0)
+        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
 
 class DRGRPOLoss(GRPOLoss):
