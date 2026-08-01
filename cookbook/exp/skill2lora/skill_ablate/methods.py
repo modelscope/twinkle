@@ -468,7 +468,18 @@ class BnpoMethod(TrainMethod):
             tmetrics = _train_metrics(log.get('metric'))
             tmetrics['train/n_samples'] = float(log.get('n_grpo', 0) + log.get('n_sft', 0))
         metrics = {'signal/zero_grad_frac': summary['zero_grad_frac'],
+                   'signal/group_reward_std_mean': summary['group_reward_std_mean'],
+                   'signal/n_train_samples': float(summary['n_train_samples']),
+                   'signal/n_groups': float(summary['n_groups']),
+                   # 旧名（题级 pass@K，历史面板兼容）
                    'acc/withskill_pass': summary['avg_withskill_pass'],
+                   # ⭐ 与 SEAM ray_trainer.py:1569-1583 同名同口径，用于 swanlab 直接叠图对齐：
+                   #   train/with_skill_accuracy = 全部候选的 mean(correct)（SEAM withskill_pass）
+                   #   acc/reward_mean = mean(correct∧format)（SEAM reward_mean）
+                   #   skill/format_rate = SEAM format_mean
+                   'train/with_skill_accuracy': summary['withskill_pass_all_cands'],
+                   'acc/reward_mean': summary['reward_mean'],
+                   'skill/format_rate': summary['parse_rate'],
                    'leak/rate': summary['leak_rate'], **tmetrics,
                    **_cand_pass_metrics(chunk),
                    **_leak_split(_cand_leak_pairs(chunk))}
