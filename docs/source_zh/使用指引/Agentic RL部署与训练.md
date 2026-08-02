@@ -141,14 +141,152 @@ sudo systemctl start aenv
 
 脚本会创建专用的非 root `aenv` 账户（仅授予 `CAP_NET_ADMIN`/`CAP_SYS_ADMIN` 和 kvm 组权限）、加载 ublk 模块、下载 Firecracker/内核等运行时资源，并注册 systemd 服务。`AENV_HOME_PATH` 是数据目录（默认 `/var/lib/aenv`），镜像层和快照都放这里，建议指向大容量磁盘。它同时会装上 `aenv` CLI。
 
-方式 B — Docker：
+它只依赖两个外网点：`api.github.com` 取 release 元数据，然后从 `github.com/.../releases/download/` 下两个资产（`aenv-linux-x86_64` 9.3MB、`aenv-server-linux-x86_64.tar.gz` 68MB）。后者会 302 到 `release-assets.githubusercontent.com`，国内很容易在传输中途被 RST（`curl: (56) Recv failure` 或 `(92)`）。先试代理：`export https_proxy=...` 后重跑脚本，`install.sh` 全程用 curl，认 env 代理。没代理就走下面的方式 B。
+
+方式 B — 源码编译（install.sh 下不动时）
+
+先明确一件事：**编译只能解决 Rust 二进制那部分**。预编译 tarball 里除了 `server` 还带了一个 `deps/`（firecracker、guest kernel、tools 驱动、overlaybd、regctl），**这些不在编译产物里**，得单独准备。这是这条路最容易踩空的地方。
+
+**1. 前置**
+
+国内直连 `static.rust-lang.org` / `crates.io` 下不动，走阿里云镜像。**先设变量再装 rustup**，反了要重来。
+
+```bash
+# 写进 profile：AgentENV 有 rust-toolchain.toml，首次 cargo build 会再拉一次工具链
+cat >> ~/.bashrc <<'EOF'
+export RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+export RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+EOF
+. ~/.bashrc
+
+curl --proto '=https' --tlsv1.2 -sSf https://mirrors.aliyun.com/repo/rust/rustup-init.sh | sh
+. "$HOME/.cargo/env"
+
+# 阿里云只支持 sparse 索引，需 cargo >= 1.68。用覆盖写：>> 跟两次会出现重复的
+# [source.crates-io]，TOML 直接解析失败
+tee "${CARGO_HOME:-$HOME/.cargo}/config.toml" >/dev/null <<'EOF'
+[source.crates-io]
+replace-with = 'aliyun'
+
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[net]
+retry = 5
+
+[http]
+timeout = 60
+EOF
+
+sudo apt-get update      # upgrade 不刷索引；漏了会报 Unable to locate package
+
+# 编译依赖（同 Dockerfile.agentenv 的 builder 阶段）。clang / libclang-dev 是
+# uvm-ublk-daemon 必需：它用 bindgen 生成 ublk 内核绑定，缺了报 Unable to find libclang
+sudo apt-get install -y build-essential pkg-config libssl-dev \
+     clang libclang-dev libprotobuf-dev protobuf-compiler
+
+# 运行依赖（同 Dockerfile.agentenv 的 runtime-base 阶段）。libaio1t64 是 Ubuntu 24.04
+# 的包名，22.04 / Debian 12 上叫 libaio1
+sudo apt-get install -y ca-certificates curl dpkg e2fsprogs iproute2 iptables \
+     jq libaio1t64 sudo umoci zstd
+```
+
+`protobuf-compiler` 必须用系统包：`make ci-deps-protoc` 会从 GitHub Releases 下 protoc，正是堵住的那条路。Debian 13+ 上 `pkg-config` 已改名 `pkgconf`。
+
+镜像生没生效看 `cargo build` 的第一行：必须是 ``Updating `aliyun` index``。若仍是 `Updating crates.io index`，就是 `config.toml` 没被读到（常见原因：`CARGO_HOME` 指向其他位置；写文件时 `~/.cargo` 还不存在）。注意报错里的 `an/yh/anyhow` 是 sparse 路径，但 cargo >= 1.70 默认就走 sparse，**不能拿它当镜像生效的依据**。
+
+**2. 编译与安装**
+
+```bash
+git clone https://github.com/kvcache-ai/AgentENV.git && cd AgentENV
+cargo build --release -p agentenv --bin server
+cargo build --release -p aenv
+cargo build --release -p uvm-ublk -p uvm-ublk-daemon
+
+sudo install -m 0755 target/release/aenv   /usr/local/bin/aenv
+sudo install -m 0755 target/release/server /usr/local/bin/server
+sudo install -D -m 0755 target/release/uvm-ublk-daemon /var/lib/aenv/ublk/uvm-ublk-daemon
+sudo install -D -m 0640 config/default.toml /var/lib/aenv/config/config.toml
+
+sudo groupadd --system aenv
+sudo useradd --system --gid aenv --home-dir /var/lib/aenv \
+     --no-create-home --shell /usr/sbin/nologin aenv
+```
+
+**3. 准备 deps**
+
+```bash
+E="AENV_CONFIG_PATH=/var/lib/aenv/config/config.toml AENV_HOME_PATH=/var/lib/aenv"
+sudo env $E /usr/local/bin/server --setup-only
+```
+
+下不动先弄清文件从哪来——这五个 URL 就是它要下的全部（`config/deps_manifest.toml`）：
+
+```
+firecracker + cpu-template-helper  https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/firecracker-1.15.1-patch-v1-x86_64.tgz
+guest kernel                      https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/vmlinux-6.1.175
+regctl                            https://github.com/regclient/regclient/releases/download/v0.11.5/regctl-linux-amd64
+overlaybd .deb                    https://github.com/containerd/overlaybd/releases/download/v1.0.18/overlaybd-1.0.18-20260710.cee2186.{target}.deb
+tools.ext4                        ghcr.io/zlzgithub-0801/agentenv-tools:0.1.0   （OCI 镜像，需 regctl/docker 导出）
+```
+
+在能联网的机器上把卡住的那个下好，然后两种绕法。
+
+**一、预放文件（推荐，5 样通用，不用改配置）** —— `download_file` 发现目标文件已存在且非空就跳过下载。目标路径就是失败日志里的 `dest=`：
+
+```bash
+# 日志：downloading url="https://pub-...r2.dev/firecracker-1.15.1-patch-v1-x86_64.tgz"
+#                    dest=/var/lib/aenv/deps/firecracker/1.15.1-patch-v1/firecracker-1.15.1-patch-v1-x86_64.tgz
+# scp 到 dest= 路径（文件名必须一模一样），然后：
+sudo chown -R aenv:aenv /var/lib/aenv/deps
+sudo env $E /usr/local/bin/server --setup-only
+```
+
+overlaybd 没有本地路径开关，但同样吃这一招：`.deb` 放到 `/var/lib/aenv/deps/overlaybd/downloads/` 下（文件名照 URL 末段，`{target}` 已替换），`package_url` 就不会被访问。
+
+**二、改 `/var/lib/aenv/config/config.toml`** 指向你存文件的目录（下面的 `/opt/aenv-assets` 自己建，不是现成的）。这三段原本就有，**把键加进段内，不要追加同名段**（TOML 重复表直接解析失败）。只配当前卡住的那一项：
+
+```toml
+[firecracker]                                      # 已有段，boot_args 等原样保留
+binary_path = "/opt/aenv-assets/firecracker"       # 注意是解开 tgz 后的二进制，不是 tgz
+[kernel]                                           # 已有段（空）
+image_path = "/opt/aenv-assets/vmlinux.bin"
+[tools]                                            # 已有段，control_plane_port 原样保留
+version = "0.1.0"                                  # 与 drive_path 必须成对
+drive_path = "/opt/aenv-assets/tools.ext4"
+```
+
+或摆进 `deps_path`，版本号须与 `deps_manifest.toml` 逐字一致：
+
+```bash
+/var/lib/aenv/deps/firecracker/1.15.1-patch-v1/{firecracker,cpu-template-helper}
+/var/lib/aenv/deps/kernel/vmlinux-6.1.175/vmlinux.bin      # 须重命名为 vmlinux.bin
+/var/lib/aenv/deps/tools/0.1.0/tools.ext4
+/var/lib/aenv/deps/regctl/v0.11.5/regctl
+
+sudo chown -R aenv:aenv /var/lib/aenv/deps
+```
+
+**4. 起服务**
+
+```bash
+sudo env $E /usr/local/bin/server --setup-host --runtime-user aenv --runtime-group aenv
+sudo chown -R aenv:aenv /var/lib/aenv
+sudo env $E API_ADDR=127.0.0.1:8000 ./scripts/run-with-capabilities.sh /usr/local/bin/server
+```
+
+`/health` 返回 204 后，systemd unit 照 `scripts/install.sh` 第 3 段抄。
+
+> 未端到端实测；deps 下载可达性因机器而异。
+
+方式 C — Docker：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker run -d --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-server:latest
 ```
 
-这里的 Docker 只是**部署载体**，沙箱依然是 Firecracker microVM，仍然需要宿主机的 KVM。
+这里的 Docker 只是**部署载体**，沙箱依然是 Firecracker microVM，仍然需要宿主机的 KVM。注意 `ghcr.io` 的镜像拉取走的也是 GitHub 的分发，国内可能同样不通，需要配镜像加速。
 
 验证：`curl http://127.0.0.1:8000/health` 期望返回 204。
 
