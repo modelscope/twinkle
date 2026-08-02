@@ -14,6 +14,20 @@ def align_logps_to_mask(
     mask: 'torch.Tensor',
     dtype: 'torch.dtype',
 ) -> Optional['torch.Tensor']:
+    """Scatter ragged per-sample values onto the trainable positions of ``mask``.
+
+    Two per-sample forms are supported, disambiguated by length exactly like
+    ``GRPOLoss._pad_and_align_to_batch`` (the two MUST agree, otherwise the metric
+    reports ratios computed on different tokens than the loss optimises):
+      * Response-only form (``len == mask[i].sum()``): scattered directly.
+      * Full-sequence form (``len >= mask.shape[1]``, right-padded): sliced to
+        ``seq_len`` and indexed by ``mask[i]`` first.  This is what a ref/old model
+        forward returns; its padding width is the max over the WHOLE micro batch
+        before the dp split, so it is routinely LONGER than the local ``logps``
+        (which is padded only to the local rank's max).  Taking ``vals[:n_pos]``
+        instead would read prompt positions and silently misalign every ratio.
+    Anything shorter than both is unusable and returns None rather than guessing.
+    """
     import torch
 
     device = mask.device
@@ -40,8 +54,12 @@ def align_logps_to_mask(
             result[i, pos] = float(sample)
             continue
         vals = torch.as_tensor(sample, dtype=dtype, device=device).flatten()
-        n = min(len(pos), int(vals.numel()))
-        if n > 0:
+        n = int(vals.numel())
+        if n == len(pos):
+            result[i, pos] = vals
+        elif n >= seq_len:
+            result[i, pos] = vals[:seq_len][mask[i]]
+        elif n > 0:
             result[i, pos[:n]] = vals[:n]
     return result
 

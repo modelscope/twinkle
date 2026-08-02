@@ -339,18 +339,29 @@ class GRPOMetric(Metric):
             if flat_old is not None:
                 old_slice = flat_old[cursor:cursor + num_seq_est]
             elif old_logps is not None and hasattr(old_logps, 'shape'):
-                # Uncommon: aligned global tensor. Only honour when it
-                # exactly matches the single-mb shape; otherwise drop.
+                # Aligned tensor from a ref/old model forward. Its seq width is the max over
+                # the WHOLE micro batch (padded before the dp split), while ``logps_mb`` is
+                # padded only to this rank's own max — so old is routinely LONGER, and
+                # requiring exact equality here threw away ratio/kl on most steps whenever the
+                # longest sample of the micro batch lived on another rank. The loss never had
+                # this problem (GRPOLoss._pad_and_align_to_batch has the full-sequence branch),
+                # so the gradients were right all along and only the panel went blank.
+                # align_logps_to_mask now shares that branch; accept anything it can align.
                 import torch as _torch  # noqa: F811
-                if _torch.is_tensor(old_logps) and old_logps.shape == logps_mb.shape:
+                usable = (_torch.is_tensor(old_logps)
+                          and old_logps.dim() == logps_mb.dim()
+                          and old_logps.shape[0] == logps_mb.shape[0]
+                          and old_logps.shape[-1] >= logps_mb.shape[-1])
+                if usable:
                     old_slice = old_logps
                 else:
                     if mb_idx == 0:
                         # Warn once per accumulate call (not per mb) to avoid log spam.
                         old_shape = tuple(old_logps.shape) if _torch.is_tensor(old_logps) else 'unknown'
-                        logger.warning(f'GRPOMetric: old_logps shape {old_shape} does not match '
-                                       f'logps_mb shape {tuple(logps_mb.shape)}; ratio/kl metrics will '
-                                       f'be skipped for this step.')
+                        logger.warning(f'GRPOMetric: old_logps shape {old_shape} cannot be aligned to '
+                                       f'logps_mb shape {tuple(logps_mb.shape)} (row count must match and '
+                                       f'seq width must be >=); ratio/kl metrics will be skipped for '
+                                       f'this step.')
                     old_slice = None
             else:
                 old_slice = None

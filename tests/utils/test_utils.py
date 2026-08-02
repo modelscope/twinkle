@@ -365,6 +365,36 @@ class TestAlignLogpsToMask:
         result = align_logps_to_mask(42, mask, torch.float32)
         assert result is None
 
+    def test_full_sequence_form_indexes_by_mask(self):
+        """全序列形式（len >= seq_len，右 pad）必须先按 mask 取位置再 scatter。
+
+        这是 ref/old 模型 forward 返回的形式：它的 pad 宽度是 dp split 前整个 micro batch
+        的最大长度，所以常常比本 rank 的 logps 更宽。若退化成取行首 n_pos 个，读到的
+        就是 prompt 位置，每一个 IS ratio 都会错位。
+        """
+        mask = torch.tensor([[False, False, True, True],
+                            [False, False, False, True]])
+        full = torch.zeros(2, 7)          # 7 > seq_len=4
+        full[0, 2:4] = torch.tensor([-1.0, -2.0])
+        full[1, 3] = -3.0
+        result = align_logps_to_mask(full, mask, torch.float32)
+        assert result.shape == (2, 4)
+        assert result[0, 2].item() == pytest.approx(-1.0)
+        assert result[0, 3].item() == pytest.approx(-2.0)
+        assert result[1, 3].item() == pytest.approx(-3.0)
+        assert result[0, :2].abs().sum().item() == 0.0
+        assert result[1, :3].abs().sum().item() == 0.0
+
+    def test_full_sequence_matches_grpo_loss_alignment(self):
+        """指标侧与损失侧必须对齐到**同一批 token**，否则面板上的 ratio 不是优化器看到的。"""
+        from twinkle.loss.grpo import GRPOLoss
+        mask = torch.tensor([[False, True, True, True],
+                            [False, False, True, True]])
+        full = torch.randn(2, 9)
+        got = align_logps_to_mask(full, mask, torch.float32)
+        want = GRPOLoss()._pad_and_align_to_batch(full, mask, mask.device, torch.float32)
+        assert torch.equal(got, want)
+
 
 class TestFilterFromConfigKwargs:
 
