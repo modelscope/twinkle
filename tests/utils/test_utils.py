@@ -151,7 +151,14 @@ class TestPadAndStackTensors:
     def test_different_length(self):
         tensors = [torch.randn(3), torch.randn(5)]
         result = pad_and_stack_tensors(tensors, pad_value=0)
-        assert result.shape == (10, )  # padded to max length then concat
+        # concat 沿 dim 0，而 dim 0 就是拼接维：不能 pad，否则会插入不存在的元素（旧行为给 (10,)）
+        assert result.shape == (8, )
+
+    def test_concat_does_not_pad_batch_dim(self):
+        tensors = [torch.randn(3, 4), torch.randn(2, 6)]
+        result = pad_and_stack_tensors(tensors, pad_value=0)
+        # 只对齐 seq 维；行数必须是 3+2，不能被拉成 3+3
+        assert result.shape == (5, 6)
 
     def test_different_length_stack(self):
         tensors = [torch.randn(3), torch.randn(5)]

@@ -53,6 +53,14 @@ class GRPOMetric(Metric):
         self.clip_n_total: float = 0.0
         self.high_kl_records: list = []
         self._gsi_cursor: int = 0
+        # 异常 token 探针：logp 尾部统计 + 与采样端的对账。
+        self.min_new_logp: float = 0.0
+        self.n_logp_lt5: int = 0
+        self.n_logp_lt10: int = 0
+        self.sum_sampler_abs: float = 0.0
+        self.max_sampler_abs: float = 0.0
+        self.n_sampler_matched: int = 0
+        self.n_sampler_given: int = 0
 
     @staticmethod
     def _as_mb_list(logps_val) -> Optional[List]:
@@ -111,6 +119,7 @@ class GRPOMetric(Metric):
         entropies: Optional['torch.Tensor'] = None,
         adv_slice: Any = None,
         gsi_base: int = 0,
+        sampler_slice: Any = None,
     ) -> int:
         """Reduce one microbatch into ``self.sum_*`` counters.
 
@@ -150,13 +159,21 @@ class GRPOMetric(Metric):
         # Rescaling keeps ``logp_diff`` / ``approx_kl`` unchanged because
         # both new and old logps receive the same multiplier.
         scale = self.temperature
-        logps_f = logps.float()
-        if scale > 0.0 and scale != 1.0:
-            logps_f = logps_f * scale
+        logps_raw = logps.float()
+        logps_f = logps_raw * scale if (scale > 0.0 and scale != 1.0) else logps_raw
         mask_f = mask.float()
 
         self.n_tokens += n_tok
         self.sum_new += float((logps_f * mask_f).sum().item())
+
+        cur_min = float(logps_raw.masked_fill(~mask, 0.0).min().item())
+        if cur_min < self.min_new_logp:
+            self.min_new_logp = cur_min
+        self.n_logp_lt5 += int(((logps_raw < -5.0) & mask).sum().item())
+        self.n_logp_lt10 += int(((logps_raw < -10.0) & mask).sum().item())
+
+        if sampler_slice is not None:
+            self._accumulate_sampler(logps_raw, sampler_slice, mask, mask_f)
 
         # Entropy is loss-type-agnostic; aligned to logps shape by the model forward.
         if entropies is not None and torch.is_tensor(entropies) and entropies.numel() > 0:
@@ -231,6 +248,36 @@ class GRPOMetric(Metric):
         self.sum_clip_high += float((is_high.float() * mask_f).sum().item())
         self.clip_n_total += float(mask_f.sum().item())
 
+    def _accumulate_sampler(
+        self,
+        logps_raw: 'torch.Tensor',
+        sampler_slice: Any,
+        mask: 'torch.Tensor',
+        mask_f: 'torch.Tensor',
+    ) -> None:
+        smp = align_logps_to_mask(sampler_slice, mask, logps_raw.dtype)
+        if smp is None:
+            return
+        rows = sampler_slice if isinstance(sampler_slice, (list, tuple)) else [sampler_slice]
+        lens = []
+        for row in rows:
+            try:
+                lens.append(int(len(row)))
+            except TypeError:
+                lens.append(1)
+        self.n_sampler_given += sum(lens)
+        cov = align_logps_to_mask([[1.0] * n for n in lens], mask, logps_raw.dtype)
+        if cov is None:
+            return
+        valid = cov * mask_f
+        diff_abs = (logps_raw - smp).abs() * valid
+        self.sum_sampler_abs += float(diff_abs.sum().item())
+        self.n_sampler_matched += int(valid.sum().item())
+        if diff_abs.numel() > 0:
+            cur = float(diff_abs.max().item())
+            if cur > self.max_sampler_abs:
+                self.max_sampler_abs = cur
+
     def accumulate(
         self,
         inputs: Union[InputFeature, List[InputFeature]],
@@ -238,6 +285,7 @@ class GRPOMetric(Metric):
         *,
         old_logps: Any = None,
         advantages: Any = None,
+        sampler_logps: Any = None,
         **kwargs,
     ):
         import torch
@@ -268,6 +316,9 @@ class GRPOMetric(Metric):
         flat_adv: Optional[List] = None
         if advantages is not None and isinstance(advantages, (list, tuple)):
             flat_adv = list(advantages)
+        flat_sampler: Optional[List] = None
+        if sampler_logps is not None and isinstance(sampler_logps, (list, tuple)):
+            flat_sampler = list(sampler_logps)
 
         cursor = 0
         n_mb = min(len(inputs_list), len(logps_list))
@@ -305,8 +356,10 @@ class GRPOMetric(Metric):
                 old_slice = None
 
             adv_mb = flat_adv[cursor:cursor + num_seq_est] if flat_adv is not None else None
+            smp_mb = flat_sampler[cursor:cursor + num_seq_est] if flat_sampler is not None else None
             gsi_base = self._gsi_cursor
-            advanced = self._accumulate_mb(labels, logps_mb, old_slice, ent_mb, adv_mb, gsi_base=gsi_base)
+            advanced = self._accumulate_mb(labels, logps_mb, old_slice, ent_mb, adv_mb,
+                                           gsi_base=gsi_base, sampler_slice=smp_mb)
             self._gsi_cursor += advanced
             cursor += advanced
 
@@ -326,6 +379,13 @@ class GRPOMetric(Metric):
             'sum_clip_low': self.sum_clip_low,
             'sum_clip_high': self.sum_clip_high,
             'clip_n_total': self.clip_n_total,
+            'min_new_logp': self.min_new_logp,
+            'n_logp_lt5': self.n_logp_lt5,
+            'n_logp_lt10': self.n_logp_lt10,
+            'sum_sampler_abs': self.sum_sampler_abs,
+            'max_sampler_abs': self.max_sampler_abs,
+            'n_sampler_matched': self.n_sampler_matched,
+            'n_sampler_given': self.n_sampler_given,
         }]
         all_results = self.gather_results(local)
 
@@ -340,6 +400,10 @@ class GRPOMetric(Metric):
         results: Dict[str, Any] = {
             'train/policy_confidence': math.exp(mean_new),
             'train/mean_new_logp': mean_new,
+            'train/n_trainable_tokens': n_total,
+            'train/logp_min': min(r.get('min_new_logp', 0.0) for r in all_results),
+            'train/logp_frac_lt_5': sum(r.get('n_logp_lt5', 0) for r in all_results) / n_total,
+            'train/logp_frac_lt_10': sum(r.get('n_logp_lt10', 0) for r in all_results) / n_total,
         }
         if any(r['has_old'] for r in all_results):
             mean_old = sum(r['sum_old'] for r in all_results) / n_total
@@ -364,6 +428,14 @@ class GRPOMetric(Metric):
             results['train/clip_ratio_low'] = sum_low / clip_n
             results['train/clip_ratio_high'] = sum_high / clip_n
             results['train/clip_ratio'] = (sum_low + sum_high) / clip_n
+
+        # 采样端对账（只在调用方传了 sampler_logps 时出现）。两条都是断言型指标：
+        # sampler_logp_mae 应在引擎精度量级（bf16 约 1e-2），sampler_token_delta 应恒为 0。
+        n_smp = sum(r.get('n_sampler_matched', 0) for r in all_results)
+        if n_smp > 0:
+            results['train/sampler_logp_mae'] = sum(r.get('sum_sampler_abs', 0.0) for r in all_results) / n_smp
+            results['train/sampler_logp_max_abs'] = max(r.get('max_sampler_abs', 0.0) for r in all_results)
+            results['train/sampler_token_delta'] = n_total - sum(r.get('n_sampler_given', 0) for r in all_results)
 
         # Underscore-prefixed key bypasses swanlab numeric coercion; script can pop and consume.
         if self.high_kl_records:

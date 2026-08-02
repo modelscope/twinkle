@@ -286,13 +286,32 @@ while IFS=$'\t' read -r NAME EXP_DIR THINK SMT OPTIONAL TASK EXEC_THINK; do
         # 显式同名 env 仍可覆盖。
         E16_FLAGS="$E16_FLAGS --ppo-mini-batch-size ${E13_PPO_MINI:-160}"
         [ -z "$KL_BETA" ] && E16_FLAGS="$E16_FLAGS --kl-beta ${E13_KL_BETA:-0.001}"
-        # 显存：E13 8×140G 实测 micro=8（trainer.py 的 8192 自动档）OOM（132G 已用 + 4.77G），
-        # micro=4（2 序列/卡）已实测跑得通，所以继续用 2×dp。
-        # 注：verl 的聚合单元是 5 序列/卡（ppo_micro_batch_size_per_gpu=5），这里是 2；在
-        # token_mean_scope='micro' 下这只是聚合粒度差（实测偏离真 token-mean 的倍率
-        # 1.415@2 vs 1.35@5，约 5%），而且方向是更靠近 sequence-mean、长度耦合更弱，
-        # 不会重新引入 'global' 那个 97 倍的“少写 token”梯度。想完全对齐需 TRAIN_FSDP=2 腾显存后设 5。
-        _tmb=${E13_TRAIN_MICRO_BATCH:-$((2*${TRAIN_GPUS:-2}))}
+        # ---- 钉住训练 batch 序列（2026-08-02）-------------------------------------------
+        # verl 的 dataloader 默认 data.shuffle=True，所以 SEAM 的 step k 不是 train.parquet 的
+        # 第 k 个 128 切片。实测（align5 chunk0 vs SEAM step1）：同一个 5000 题池、同 batch
+        # size，但两边第一步喂的 128 题交集只有 1 题 -> withskill 0.848 vs 0.789、
+        # baseline 0.562 vs 0.634、lift +0.285 vs +0.155，全是抽样差。
+        # seam_train_order.jsonl 是从 SEAM rollout dump 反推的真实喂题序列（40×128=5120 行，
+        # 用 .tmp_analysis/mk_seam_train_order.py 生成），挂上后 chunk k 逐题 == SEAM step k+1。
+        # 置空 E13_TRAIN_ORDER 即可回到自己的 shuffle（但就不能逐 step 对了）。
+        _order=${E13_TRAIN_ORDER-/mnt/data/yzhao/tastelikefeet/twinkle/.tmp_analysis/seam_train_order.jsonl}
+        if [ -n "$_order" ] && [ -f "$_order" ]; then
+            E16_FLAGS="$E16_FLAGS --train-order-file $_order"
+        elif [ -n "$_order" ]; then
+            echo "[ablate12] WARN: train order file not found: $_order (fallback to shuffle)"
+        fi
+        # 显存 / 聚合粒度（2026-08-02 修正）：
+        # verl 的等权聚合单元是 ppo_micro_batch_size_per_gpu=5 条（dp_actor.py 在每个 micro 内部
+        # masked_mean，再 *1/gas 累加），每 step 共 160条/5 = 32 个「5 条组」等权。
+        # 旧配置 TRAIN_FSDP=1/DP=2 + micro=4（=2 条/卡）给出 80 个「2 条组」等权 —— micro 越小越
+        # 靠 sequence-mean，短序列的每 token 权重越高、压长度的分量越强。align6 实测后果：
+        #   actor 输出 12382 -> 9265 chars 只用 6 个 chunk，format 0.883 -> 0.988；
+        #   SEAM 走完同一段要 40 步（12248 -> 9981，format 0.883 -> 0.943）。
+        #   即长度收缩快约 6 倍，是 40 步里唯一超出 SEAM 自身噪声的偏离（format Δ0.056 = 2.4×sd）。
+        # TRAIN_FSDP=2 把 fp32 权重+Adam(约 64G) 分到 2 卡，腾出的显存正好够 5 条/卡；
+        # 此时 TRAIN_DP=1、sft=5 -> 32 个「5 条组」等权，与 verl 逐组一致。
+        # REF_FSDP 必须同为 2：否则 REF_DP=2 而 micro=5 不整除，会报 Batch too small。
+        _tmb=${E13_TRAIN_MICRO_BATCH:-$([ "${TRAIN_FSDP:-1}" = 2 ] && echo 5 || echo $((2*${TRAIN_GPUS:-2})))}
         [ -n "${TRAIN_MICRO_BATCH:-}" ] && _tmb=$TRAIN_MICRO_BATCH
         E16_FLAGS="$E16_FLAGS --train-micro-batch $_tmb"
         echo "[ablate12] E13 SEAM-repro: chunk=$CHUNK_ARG min_level=$MIN_LEVEL_ARG train_micro_batch=$_tmb"\

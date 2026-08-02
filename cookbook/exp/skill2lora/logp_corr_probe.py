@@ -31,6 +31,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 import numpy as np
+from twinkle.data_format import pack_user_data
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 E15_DIR = os.path.join(SCRIPT_DIR, 'output.ablate12', 'E15_logp_gt_on_narrative')
@@ -165,7 +166,7 @@ def load_pairs():
 def phase_rollout():
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
-    from twinkle.data_format import SamplingParams
+    from twinkle.data_format import SamplingParams, pack_user_data
     from twinkle.sampler import vLLMSampler
     from twinkle.template import Template
 
@@ -239,7 +240,7 @@ def phase_logps():
     def encode(problem, skill, gt):
         msgs = [dict(m) for m in build_skill_solve_prompt(problem, skill)['messages']]
         enc = tmpl.encode({'messages': msgs + [{'role': 'assistant', 'content': gt}],
-                           'user_data': {'key_rounds': [len(msgs)]}})
+                           'user_data': pack_user_data({'key_rounds': [len(msgs)]})})
         if enc is None:
             return None, None
         ids = [int(x) for x in enc['input_ids']]   # numpy int64 -> int（vllm msgspec 拒收 np 类型）

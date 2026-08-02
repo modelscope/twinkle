@@ -144,6 +144,8 @@ def _seam_sanitize(txt):
         txt = m.group(1).strip()
     elif (m := _SEAM_INLINE_RE.search(txt)):
         txt = (m.group(1) or m.group(2)).strip()
+    # bugfix 2026-07-29：\dfrac/\tfrac/\cfrac 归一，同 train_skill_v2._seam_sanitize
+    txt = txt.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac').replace(r'\cfrac', r'\frac')
     txt = re.sub(r'\\frac\s*\{\s*([^}]+?)\s*}\s*\{\s*([^}]+?)\s*}', r'\1/\2', txt)
     if (m := _SEAM_FRAC_RE.search(txt)):
         p, q = map(float, m.groups())

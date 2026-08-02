@@ -27,6 +27,8 @@ Adds ONLY the view-A rubric-conditioned pieces that v2 lacks:
 """
 from typing import Any, Dict
 
+from twinkle.data_format import pack_user_data
+
 import train_skill_v2 as v2
 from train_skill_v2 import (  # noqa: F401  (re-exported for methods.py convenience)
     _answer_leaked,
@@ -172,17 +174,21 @@ def rubric_skillgen_prompt(problem: str, rubric: str) -> Dict[str, Any]:
 
 
 def rubric_train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Train trajectory whose PROMPT is the query+rubric skill-gen prompt + the response.
+    """Train sample whose PROMPT is the query+rubric skill-gen prompt + the sampled response.
 
-    Used by view-A RL (rl_ab / rl_err) only: train WITH rubric in the prompt (knowledge-
-    transfer probe; eval is still query-only via v2 ``_skillgen_prompt``). The rebuilt prompt
-    matches the prompt the skills were SAMPLED under (on-policy consistency).
-    ``rec`` must carry 'problem', 'rubric' and 'response'. ``key_rounds`` marks the final
-    assistant turn as the only trainable span (identical convention to v2 ``_train_trajectory``).
+    Used by view-A RL (rl_ab / rl_err / reflexion) only: train WITH rubric in the prompt
+    (knowledge-transfer probe; eval is still query-only via v2 ``_skillgen_prompt``). The
+    rebuilt prompt matches the prompt the skills were SAMPLED under (on-policy consistency).
+
+    response 段直接拼采样返回的 token（``rec['tokens']``），绝不 decode 后重新过模板 ——
+    重渲染会把模板自己补的换行/EOS/空思考块训进去，详见 v2.build_train_feature 的注释。
+    只有合成文本（没有 tokens 的 SFT 记录）才回退到 messages 编码。
     """
     msgs = rubric_skillgen_prompt(rec['problem'], rec.get('rubric', ''))['messages']
+    if rec.get('tokens'):
+        return v2.build_train_feature(msgs, rec['tokens'])
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
-            'user_data': {'key_rounds': [len(msgs)]}}
+            'user_data': pack_user_data({'key_rounds': [len(msgs)]})}
 
 
 # 中文注释：OPSD teacher 的特权信息块——按设计 871 行要求放进 SYSTEM prompt，且只做“追加”，
@@ -196,15 +202,21 @@ Use it to judge which guidance actually helps, but do NOT reference it explicitl
 
 
 def opsd_teacher_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """OPSD teacher trajectory: student's query-only prompt + rubric appended to the SYSTEM
-    prompt + the SAME response. With an empty rubric the teacher degenerates to the student
-    (zero distillation pull), which is the safe behaviour on rubric API failure."""
+    """OPSD teacher: student's query-only prompt + rubric appended to the SYSTEM prompt + the
+    SAME sampled response tokens. With an empty rubric the teacher degenerates to the student
+    (zero distillation pull), which is the safe behaviour on rubric API failure.
+
+    teacher 与 student 必须打分**同一串 token**，所以两边的 response 段都直接拼 ``rec['tokens']``；
+    只有 prompt 段不同（多一段 rubric）。
+    """
     msgs = [dict(m) for m in _skillgen_prompt(rec['problem'])['messages']]
     rubric = (rec.get('rubric') or '').strip()
     if rubric and msgs[0]['role'] == 'system':
         msgs[0]['content'] = msgs[0]['content'] + _OPSD_TEACHER_SUFFIX.format(rubric=rubric)
+    if rec.get('tokens'):
+        return v2.build_train_feature(msgs, rec['tokens'])
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
-            'user_data': {'key_rounds': [len(msgs)]}}
+            'user_data': pack_user_data({'key_rounds': [len(msgs)]})}
 
 
 def query_only_train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:

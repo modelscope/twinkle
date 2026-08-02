@@ -247,17 +247,22 @@ def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200
             t = t.unsqueeze(0)
         expanded_tensors.append(t)
 
-    max_shape = []
-    for dim in range(max_ndim):
-        max_shape.append(max(t.shape[dim] for t in expanded_tensors))
+    # dim 0 是 concat 的拼接维，torch.cat 本来就不要求它对齐 —— 把它也 pad 到最大值会**凭空造出
+    # 不存在的样本行**（例如 dp rank0 收 3 行、rank1 收 2 行时，结果是 3+3=6 行而不是 5 行，多出来
+    # 的那行全是 pad_value）。这些假行流进下游后：损失侧 GRPOLoss._pad_and_align_to_batch 靠
+    # `data[i] for i in range(batch_size)` 把它们丢掉所以侥幸无害，但指标侧 align_logps_to_mask 是
+    # 严格判等，行数一多就整步跳过 ratio/kl/clip（日志里的 `old_logps shape (3, N) does not match
+    # logps_mb shape (2, N)` 就是它）。所以 concat 时只对齐 dim>=1，stack 时才需要全维对齐。
+    pad_from = 1 if concat else 0
+    max_shape = [max(t.shape[dim] for t in expanded_tensors) for dim in range(max_ndim)]
 
     padded_tensors = []
     for t in expanded_tensors:
-        if list(t.shape) == max_shape:
+        if all(t.shape[dim] == max_shape[dim] for dim in range(pad_from, max_ndim)):
             padded_tensors.append(t)
         else:
             pad_params = []
-            for dim in range(max_ndim - 1, -1, -1):
+            for dim in range(max_ndim - 1, pad_from - 1, -1):
                 pad_params.extend([0, max_shape[dim] - t.shape[dim]])
             padded = torch.nn.functional.pad(t, pad_params, value=pad_value)
             padded_tensors.append(padded)

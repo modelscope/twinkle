@@ -59,6 +59,11 @@ def _build_args(argv=None):
     p.add_argument('--numeric-only', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--eval-size', type=int, default=128)
     p.add_argument('--seam-parquet-dir', type=str, default='')
+    p.add_argument('--train-order-file', type=str, default='',
+                   help='jsonl of {data_id,problem,reference_answer} in a FIXED training order; '
+                        'replaces the train split and disables ProblemPool shuffling, so chunk k '
+                        'is exactly batch k. Used to pin twinkle to SEAM\'s realized batch '
+                        'sequence (verl shuffles its dataloader, so same pool != same batches).')
     p.add_argument('--deepmath-dir', type=str, default='',
                    help='DeepMath-103K parquet dir; when set, overrides --seam-parquet-dir/--dataset '
                         'and uses the difficulty-stratified split (eval/train same level mix).')

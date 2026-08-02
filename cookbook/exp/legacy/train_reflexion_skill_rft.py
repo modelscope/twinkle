@@ -45,6 +45,7 @@ import numpy as np
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.data_format import pack_user_data
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
@@ -1017,7 +1018,7 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     prefix already excludes the prompt-provided ``<think>``, so no extra masking is needed."""
     msgs = _skillgen_messages(rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''))
     full = msgs + [{'role': 'assistant', 'content': rec['response']}]
-    return {'messages': full, 'user_data': {'key_rounds': [len(msgs)]}}
+    return {'messages': full, 'user_data': pack_user_data({'key_rounds': [len(msgs)]})}
 
 
 def _train_chunk(skill_model, ckpt: Optional[CheckpointEngineManager],

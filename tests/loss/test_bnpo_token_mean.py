@@ -1,7 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""BNPO token-mean fix: 'global' scope must be invariant to how a batch is split into
-micro/dp groups (strict global token-mean); 'micro' scope reproduces the pre-fix
-double-average bias that skews toward short responses.
+"""BNPO ``token_mean_scope`` semantics.
+
+'micro' (the DEFAULT) reproduces verl/SEAM: ``masked_mean`` inside each micro-batch, then
+an equal-weighted average across micro/dp groups (see verl/workers/actor/dp_actor.py --
+``pg_loss = agg_loss(..., 'token-mean')`` per micro, then ``* 1/gradient_accumulation``
+before ``backward()``). It is deliberately NOT split-invariant.
+
+'global' is the strict, split-invariant token-mean. It is available but NOT the default:
+with group-relative advantages the token-weighted mean does not cancel (it equals
+-cov(len, A)/mean(len)), which on skill2lora E13 produced a ~100x stronger coherent
+"emit fewer tokens" gradient than verl and collapsed the response length. See BNPOLoss's
+docstring for the measurements.
 
 The framework combines groups per LossOutput semantics (transformers.py / metric/loss.py):
   effective_loss = Σ_g loss_g / Σ_g num_tokens_g
@@ -54,29 +63,36 @@ def test_global_is_split_invariant():
     assert abs(whole - split) < 1e-6
 
 
-def test_micro_is_biased_and_split_dependent():
+def test_micro_matches_verl_equal_weighted_micro_means():
     ptl, mask = _fixture()
     loss = BNPOLoss(token_mean_scope='micro')
     whole = _combine(loss, ptl, mask, [[0, 1]])          # one group -> token-mean 0.625
     split = _combine(loss, ptl, mask, [[0], [1]])        # per-group means (1.0, 0.5) -> 0.75
     assert abs(whole - 0.625) < 1e-6
-    assert abs(split - 0.75) < 1e-6                       # short response over-weighted
-    assert split > whole                                 # bias toward short is real
-    # and it disagrees with the correct global answer
+    assert abs(split - 0.75) < 1e-6                      # equal weight per micro, as verl does
+    # Not split-invariant, by design: this is exactly verl's behaviour.
     assert abs(split - 0.625) > 1e-3
 
 
-def test_seam_inherits_global_by_default():
+def test_seam_defaults_to_micro_like_verl():
     from twinkle.loss.grpo import SEAMBNPOLoss
     seam = SEAMBNPOLoss(epsilon=0.2, beta=0.001)
-    assert seam.token_mean_scope == 'global'
+    assert seam.token_mean_scope == 'micro'
+    assert seam.reduction == 'mean'                      # display layer must not divide again
     ptl, mask = _fixture()
     split = _combine(seam, ptl, mask, [[0], [1]])
-    assert abs(split - 0.625) < 1e-6
+    assert abs(split - 0.75) < 1e-6
+
+
+def test_global_reports_sum_reduction_for_display():
+    """'global' returns a token SUM, so LossMetric must be told reduction='sum' or the
+    logged loss is inflated by the token count."""
+    assert BNPOLoss(token_mean_scope='global').reduction == 'sum'
 
 
 if __name__ == '__main__':
     test_global_is_split_invariant()
-    test_micro_is_biased_and_split_dependent()
-    test_seam_inherits_global_by_default()
-    print('OK: global split-invariant; micro reproduces the biased double-average')
+    test_micro_matches_verl_equal_weighted_micro_means()
+    test_seam_defaults_to_micro_like_verl()
+    test_global_reports_sum_reduction_for_display()
+    print('OK: micro (default) == verl equal-weighted micro-means; global is split-invariant')

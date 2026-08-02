@@ -29,6 +29,7 @@ if _REPO_ROOT not in sys.path:
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.data_format import pack_user_data
 from twinkle.sampler import vLLMSampler
 
 from cookbook.exp.embedding.train_reflexion_skill import (
@@ -468,7 +469,7 @@ def main() -> None:
                 messages = _sft_messages(r['problem'], response)
                 sft_row = {
                     'messages': messages,
-                    'user_data': {'key_rounds': [len(messages) - 1]},
+                    'user_data': pack_user_data({'key_rounds': [len(messages) - 1]}),
                     'data_id': r.get('data_id'),
                     'problem': r['problem'], 'reference_answer': r['reference_answer'],
                     'skills': g['skills'], 'response': response,

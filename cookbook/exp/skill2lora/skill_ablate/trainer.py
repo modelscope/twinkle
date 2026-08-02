@@ -146,6 +146,20 @@ def run_experiment(args, spec: ExpSpec) -> None:
     else:
         records, eval_records = (load_deepmath_records(args) if getattr(args, 'deepmath_dir', '')
                                  else v2._load_records(args))
+    # ⭐ --train-order-file：用 SEAM 已实现的 batch 序列覆盖 train 分支（eval 划分不动 —— twinkle 的
+    # eval 128 题已逐题验证与 SEAM val.parquet 一致）。verl 的 dataloader 会 shuffle，所以两边
+    # 即使同题池、同 batch size，step k 实际喂的 128 题也几乎不重叠（实测交集 1/128），
+    # 单此一项就能把 acc/baseline/lift 拉开 6-7 个点。给了 order 文件后 chunk k 逐题 == SEAM step k+1。
+    order_file = (getattr(args, 'train_order_file', '') or '').strip()
+    if order_file:
+        records = v2.load_train_order_file(order_file)
+        ev = {r['problem'] for r in eval_records}
+        overlap = sum(1 for r in records if r['problem'] in ev)
+        if overlap:
+            raise ValueError(f'--train-order-file overlaps eval on {overlap} rows: {order_file}')
+        sys.stderr.write(f'[ablate] train order pinned to {order_file}: {len(records)} rows '
+                         f'({len(records) // max(1, args.chunk_size)} chunks of {args.chunk_size}), '
+                         f'ProblemPool shuffle DISABLED.\n')
     if len(records) < args.chunk_size:
         raise ValueError(f'--chunk-size ({args.chunk_size}) exceeds loaded ({len(records)})')
 
@@ -186,6 +200,13 @@ def run_experiment(args, spec: ExpSpec) -> None:
                                                        else spec.thinking == 'on'),
                                       max_length=args.max_model_len,
                                       truncation_strategy='delete')
+    # 所有臂都需要的 skill 侧模板副本：训练样本的 prompt 段在客户端编码，response 段直接拼
+    # 采样返回的 token（见 v2.build_train_feature）。必须与 skill_model/skill_sampler 同配置，
+    # 否则 prompt 段的 token 会与采样时对不上。
+    v2.set_encode_template(v2.Template(model_id=v2.MODEL_ID,
+                                       enable_thinking=(spec.thinking == 'on'),
+                                       max_length=args.max_model_len,
+                                       truncation_strategy='delete'))
 
     pool = _build_pool(spec, args)
     ctx = MethodContext(skill_model=skill_model, ref_model=ref_model, skill_sampler=skill_sampler,
@@ -344,7 +365,8 @@ def run_experiment(args, spec: ExpSpec) -> None:
         if eval_records and resume is None:
             _do_eval(-1, 0)  # baseline before any update (chunk axis position 0)
 
-        pool_pp = v2.ProblemPool(records, args.seed)
+        pool_pp = v2.ProblemPool(records, args.seed,
+                                 fixed_order=bool((getattr(args, 'train_order_file', '') or '').strip()))
         updates = 0
         last_eval_at = 0
         last_eval_updates = -1

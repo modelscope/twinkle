@@ -43,7 +43,7 @@ import numpy as np
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.data_format import SamplingParams
+from twinkle.data_format import SamplingParams, pack_user_data
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.patch.no_split_modules import NoSplitModulesPatch
@@ -1465,7 +1465,7 @@ def _train_trajectory(rec: Dict[str, Any]) -> Dict[str, Any]:
     msgs = _skillgen_messages(
         rec['problem'], rec.get('view', 'A'), rec.get('diagnosis', ''), rec.get('rubric_src', ''))
     return {'messages': msgs + [{'role': 'assistant', 'content': rec['response']}],
-            'user_data': {'key_rounds': [len(msgs)]}}
+            'user_data': pack_user_data({'key_rounds': [len(msgs)]})}
 
 
 def _train_chunk(skill_model, ref_model, ckpt: CheckpointEngineManager, samples: List[Dict[str, Any]],

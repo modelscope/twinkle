@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from twinkle.data_format import pack_user_data
 
 import train_skill_v2 as v2
 from train_skill_v2 import (
@@ -139,18 +140,22 @@ def _skillgen_solve(ctx: MethodContext, items: List[Dict[str, Any]], n_skills: i
     sg_out = _run_samples(ctx.skill_sampler, [it['prompt'] for it in items], n_skills,
                           args.skill_max_tokens, ctx.skill_dp,
                           temperature=temperature, top_p=args.skill_gen_top_p,
-                          top_k=args.skill_gen_top_k)
+                          top_k=args.skill_gen_top_k, logprobs=1)
     flat = []
     for it, seqs in zip(items, sg_out):
         it['record']['_cands'] = []
         for s in seqs:
             resp = _clean_text(getattr(s, 'decoded', '') or '')
             block = _extract_skill(resp) or ''
+            # tokens = 采样端真实吐出的 token id；训练样本只能用它拼（见 v2.build_train_feature）。
+            # logprobs 同长，只给 GRPOMetric 做采样/训练对账，不进 loss。
+            _toks = [int(t) for t in (getattr(s, 'tokens', None) or [])]
             cand = {'skills': block, 'response': resp, 'parseable': bool(block),
                     'leaked': None, 'with_pass': None, 'reward': None, 'rolls': [],
-                    'advantage': 0.0, 'kept': False,
+                    'advantage': 0.0, 'kept': False, 'tokens': _toks,
+                    'logprobs': v2.sampler_logprobs(s),
                     'skillgen_stop': getattr(s, 'stop_reason', None),
-                    'skillgen_tokens': len(getattr(s, 'tokens', None) or [])}
+                    'skillgen_tokens': len(_toks)}
             it['record']['_cands'].append(cand)
             if block:
                 flat.append((it, cand))
@@ -177,7 +182,11 @@ def _skillgen_solve(ctx: MethodContext, items: List[Dict[str, Any]], n_skills: i
 
 def _grpo_records(records: List[Dict[str, Any]], with_rubric: bool) -> List[Dict[str, Any]]:
     """Flatten per-problem _cands into GRPO train records (v2 shape).
-    ``with_rubric`` tags each record so the trajectory builder knows which prompt to rebuild."""
+    ``with_rubric`` tags each record so the trajectory builder knows which prompt to rebuild.
+
+    ``tokens`` 必须带上：它是训练样本的唯一来源（response 只留给 reward/审计），少了它
+    trajectory builder 就会回退到 decode->重编码那条有偏差的路。``logprobs`` 同长，给
+    GRPOMetric 做采样/训练对账。"""
     recs = []
     for r in records:
         for c in r.get('_cands', []):
@@ -186,6 +195,8 @@ def _grpo_records(records: List[Dict[str, Any]], with_rubric: bool) -> List[Dict
             recs.append({'problem': r['problem'], 'reference_answer': r['reference_answer'],
                          'data_id': r.get('data_id', ''), 'response': c['response'],
                          'skills': c['skills'], 'advantage': c['advantage'],
+                         'tokens': c.get('tokens') or [],
+                         'logprobs': c.get('logprobs') or [],
                          'kept': c['kept'], 'reward': c['reward'], 'rubric': r.get('_rubric', ''),
                          'with_rubric': with_rubric, 'sft': False})
     return recs
@@ -253,6 +264,9 @@ def _train_metrics(metric: Optional[Dict[str, Any]]) -> Dict[str, float]:
         if k.startswith('learning rate'):
             if 'group 1' in k:
                 d['train/lr'] = float(val)
+        elif k.startswith('train/'):
+            # GRPOMetric 等已经自带 train/ 前缀，不能再套一层。
+            d[k.replace(' ', '_')] = float(val)
         else:
             d[f'train/{k.replace(" ", "_")}'] = float(val)
     return d
@@ -261,6 +275,12 @@ def _train_metrics(metric: Optional[Dict[str, Any]]) -> Dict[str, float]:
 # ===========================================================================================
 # OPSD teacher alignment: client-side encode -> response-only teacher logps
 # ===========================================================================================
+def _encode_for_align(tmpl, built):
+    """``traj_fn``/``teacher_fn`` 现在可能直接返回成品 InputFeature（token 直通路径），
+    那就无需再编码；只有回退的 messages 形式才走 tmpl.encode。"""
+    return built if 'input_ids' in built else tmpl.encode(built)
+
+
 def _align_teacher(ctx: MethodContext, samples, traj_fn, teacher_fn):
     """Encode student & teacher trajectories with a CLIENT-SIDE clone of the remote template
     and keep only samples whose response-token counts match (they always should — same
@@ -276,8 +296,8 @@ def _align_teacher(ctx: MethodContext, samples, traj_fn, teacher_fn):
     assert tmpl is not None, 'OPSD needs ctx.encode_template (built by the trainer)'
     keep, pos_lists, dropped = [], [], 0
     for s in samples:
-        st = tmpl.encode(traj_fn(s))
-        tt = tmpl.encode(teacher_fn(s))
+        st = _encode_for_align(tmpl, traj_fn(s))
+        tt = _encode_for_align(tmpl, teacher_fn(s))
         if st is None or tt is None:               # deleted by max-length truncation
             dropped += 1
             continue
@@ -307,11 +327,21 @@ def _gather_response_logps(full_logps, pos_lists) -> List[List[float]]:
 # E14+ helpers: executor pseudo-GT + dense logP reward
 # ===========================================================================================
 def _executor_answer_trajectory(problem: str, skill: str, answer_text: str,
-                                raw_response: Optional[str] = None) -> Dict[str, Any]:
-    """Teacher-forcing trajectory for executor logP(S | problem + skill)."""
+                                raw_response: Optional[str] = None,
+                                answer_tokens: Optional[List[int]] = None,
+                                template=None) -> Dict[str, Any]:
+    """Teacher-forcing sample for executor logP(S | problem + skill).
+
+    S 是 executor 自己采出来的伪 GT（E14），所以带了 ``answer_tokens`` 时直接拼采样 token：
+    这里的 prompt 每次都不同（换 skill）但被打分的 token 必须是同一串，正是
+    ``build_train_feature`` 的场景。E15 的 S 是 DeepMath 的外部 R1 参考解，本来就不是模型
+    产出、没有对应 token，只能走 messages 编码。
+    """
     msgs = [dict(m) for m in build_skill_solve_prompt(problem, skill, raw_response)['messages']]
+    if answer_tokens:
+        return v2.build_train_feature(msgs, answer_tokens, template=template)
     return {'messages': msgs + [{'role': 'assistant', 'content': answer_text}],
-            'user_data': {'key_rounds': [len(msgs)]}}
+            'user_data': pack_user_data({'key_rounds': [len(msgs)]})}
 
 
 def _set_ref_executor_template(ctx: MethodContext, enable_thinking: bool) -> None:
@@ -334,7 +364,7 @@ def _score_executor_mean_logps(ctx: MethodContext, trajs: List[Dict[str, Any]]) 
     out: List[Optional[float]] = [None] * len(trajs)
     valid_trajs, pos_lists, valid_idx = [], [], []
     for i, tr in enumerate(trajs):
-        enc = tmpl.encode(tr)
+        enc = _encode_for_align(tmpl, tr)
         if enc is None:
             continue
         pos = np.where(np.asarray(enc.get('labels')) != -100)[0]
@@ -378,7 +408,8 @@ def _train_batch(ctx: MethodContext, samples: List[Dict[str, Any]],
     it after a step would go off-policy). Returns (n_updates, train metrics).
     """
     args = ctx.args
-    samples = [s for s in samples if (s.get('response') or '').strip()]
+    samples = [s for s in samples
+               if (s.get('tokens') if s.get('tokens') is not None else (s.get('response') or '').strip())]
     is_opsd = teacher_fn is not None
     teacher_pos: Optional[List] = None
     n_align_drop = 0
@@ -403,9 +434,15 @@ def _train_batch(ctx: MethodContext, samples: List[Dict[str, Any]],
     mini = max(sft, (mini // sft) * sft)
     multi_step = mini < n
     # pre-compute every micro's ref/old/teacher logps BEFORE any update (v2 pattern)
-    micro_ref, micro_old, micro_teacher = [], [], []
+    micro_ref, micro_old, micro_teacher, micro_smp = [], [], [], []
+    # 采样端 logprob，只给 GRPOMetric 做对账（sampler_logp_mae / sampler_token_delta），不进 loss。
+    # 整个 micro 都带齐了才传：SFT 样本的 response 是合成文本、没有采样 logprob，混进去会
+    # 让 token_delta 无法解释（它的语义是「应恒为 0」）。
+    smp_all = [list(s.get('logprobs') or []) for s in samples]
     for i in range(0, n, sft):
         mb = trajs[i:i + sft]
+        smp = smp_all[i:i + sft]
+        micro_smp.append(smp if all(smp) else None)
         if is_opsd:
             # no ref forward at all: OPSDLoss uses only teacher_logps (kl_beta plays no role)
             t_mb = [teacher_fn(s) for s in samples[i:i + sft]]
@@ -423,10 +460,12 @@ def _train_batch(ctx: MethodContext, samples: List[Dict[str, Any]],
             k = i // sft
             if is_opsd:
                 ctx.skill_model.forward_backward(inputs=trajs[i:i + sft],
-                                                 teacher_logps=micro_teacher[k])
+                                                 teacher_logps=micro_teacher[k],
+                                                 sampler_logps=micro_smp[k])
             else:
                 ctx.skill_model.forward_backward(inputs=trajs[i:i + sft], advantages=advs[i:i + sft],
-                                                 old_logps=micro_old[k], ref_logps=micro_ref[k])
+                                                 old_logps=micro_old[k], ref_logps=micro_ref[k],
+                                                 sampler_logps=micro_smp[k])
         ctx.skill_model.clip_grad_and_step()
         n_steps += 1
     ctx.ckpt.sync_weights(merge_and_sync=True)
@@ -483,6 +522,13 @@ class BnpoMethod(TrainMethod):
                    'leak/rate': summary['leak_rate'], **tmetrics,
                    **_cand_pass_metrics(chunk),
                    **_leak_split(_cand_leak_pairs(chunk))}
+        if summary.get('baseline_pass_train') is not None:
+            # 训练侧 no-skill baseline：SEAM 只在 step1 跑（ray_trainer.py:1461），所以 twinkle 也只在
+            # chunk 0 有值，两边 lift 就是同一个可比的点。
+            metrics['acc/baseline_pass'] = summary['baseline_pass_train']
+            metrics['acc/lift'] = summary['lift_train']
+            metrics['train/baseline_accuracy'] = summary['baseline_pass_train']
+            metrics['train/lift'] = summary['lift_train']
         return {'n_updates': n_upd, 'summary': summary, 'metrics': metrics,
                 'gen_records': full}
 
@@ -572,10 +618,16 @@ class OpsdMethod(TrainMethod):
         # first-pass ONE skill per problem (query-only, improve temperature)
         sg = _run_samples(ctx.skill_sampler, [_skillgen_prompt(r['problem']) for r in chunk],
                           1, args.skill_max_tokens, ctx.skill_dp,
-                          temperature=args.improve_skill_temperature)
-        first = []
+                          temperature=args.improve_skill_temperature, logprobs=1)
+        first, toks_by, lps_by = [], {}, {}
         for r, seqs in zip(chunk, sg):
             resp = _clean_text(getattr(seqs[0], 'decoded', '') or '') if seqs else ''
+            # 采样 token 另存一份（每题只一个 skill，用 id(r) 做键就够）：它是 student/teacher 两边
+            # 要打分的同一串 token，不能拿 decode 后的文本重编码（见 v2.build_train_feature）。
+            # logprobs 同长，只给 GRPOMetric 做采样/训练对账。
+            toks_by[id(r)] = ([int(t) for t in (getattr(seqs[0], 'tokens', None) or [])]
+                              if seqs else [])
+            lps_by[id(r)] = v2.sampler_logprobs(seqs[0]) if seqs else []
             first.append((r, resp, _extract_skill(resp) or ''))
         # executor solve WITH skill (only parseable skills)
         flat = [(r, resp, sk) for r, resp, sk in first if sk]
@@ -594,7 +646,9 @@ class OpsdMethod(TrainMethod):
         diags = _diagnose_parallel(
             ctx, [(_rubric_entry(r, roll), sk) for r, _resp, sk, roll in wrong])
         samples = [{'problem': r['problem'], 'reference_answer': r['reference_answer'],
-                    'data_id': r.get('data_id', ''), 'response': resp, 'rubric': diag}
+                    'data_id': r.get('data_id', ''), 'response': resp, 'rubric': diag,
+                    'tokens': toks_by.get(id(r)) or [],
+                    'logprobs': lps_by.get(id(r)) or []}
                    for (r, resp, sk, _roll), diag in zip(wrong, diags)]
         n_upd, tmetrics = 0, {}
         if samples:
@@ -631,7 +685,7 @@ class LogpRlMethod(TrainMethod):
         return _run_samples(ctx.skill_sampler, [_skillgen_prompt(r['problem']) for r in usable],
                             args.n_skills, args.skill_max_tokens, ctx.skill_dp,
                             temperature=args.skill_gen_temperature, top_p=args.skill_gen_top_p,
-                            top_k=args.skill_gen_top_k)
+                            top_k=args.skill_gen_top_k, logprobs=1)
 
     def _prepare(self, chunk, ci):
         """executor T>0 采 K 条 -> 选本地判分正确且非截断的伪 GT S -> rubric API 后台审计
@@ -647,12 +701,18 @@ class LogpRlMethod(TrainMethod):
         usable, audit_jobs = [], []
         for r, seqs in zip(chunk, out):
             rolls = [_parse_seq(s, r['reference_answer']) for s in (seqs or [])]
-            ok = next((x for x in rolls if x['correct'] and x.get('stop_reason') != 'length'), None)
+            ok_i = next((j for j, x in enumerate(rolls)
+                         if x['correct'] and x.get('stop_reason') != 'length'), None)
             r['_pseudo_rolls'] = rolls
-            if ok is None:
+            if ok_i is None:
                 continue
+            ok = rolls[ok_i]
             r['_pseudo_roll'] = ok
             r['_pseudo_solution'] = ok.get('text', '')
+            # 伪 GT 是 executor 采样产出，打分时直接用它的 token，不拿 _clean_text 后的文本重编码。
+            # 从 seq 取而不是从 roll 取：roll 会被每个候选持有，token 存进去会把内存撑爆
+            # （E16 那种 M=8 的臂一个 chunk 就是上千条 rollout）。
+            r['_pseudo_tokens'] = [int(t) for t in (getattr(seqs[ok_i], 'tokens', None) or [])]
             usable.append(r)
             audit_jobs.append((_rubric_entry(r, ok), ok.get('text', '')))
         # rubric 审计是纯 API：后台线程跑，与 skill-gen 的 GPU rollout 重叠（API/GPU overlap）
@@ -678,11 +738,13 @@ class LogpRlMethod(TrainMethod):
                 pseudo = dict(r['_pseudo_roll'])
                 if si > 0:
                     pseudo['text'] = ''  # 磁盘保护：伪 GT 全文每题只在首个候选保留一份
+                _toks = [int(t) for t in (getattr(s, 'tokens', None) or [])]
                 cand = {'skills': block, 'response': resp, 'parseable': bool(block),
                         'leaked': None, 'with_pass': None, 'reward': None, 'rolls': [pseudo],
-                        'advantage': 0.0, 'kept': False,
+                        'advantage': 0.0, 'kept': False, 'tokens': _toks,
+                        'logprobs': v2.sampler_logprobs(s),
                         'skillgen_stop': getattr(s, 'stop_reason', None),
-                        'skillgen_tokens': len(getattr(s, 'tokens', None) or []),
+                        'skillgen_tokens': len(_toks),
                         'logp_base': None, 'logp_skill': None, 'logp_delta': None}
                 r['_cands'].append(cand)
                 if block:
@@ -692,12 +754,17 @@ class LogpRlMethod(TrainMethod):
                 if c['leaked'] is None:
                     c['leaked'] = False
         if flat:
-            base_trajs = [_executor_answer_trajectory(r['problem'], '', r['_pseudo_solution'])
+            base_trajs = [_executor_answer_trajectory(r['problem'], '', r['_pseudo_solution'],
+                                                      answer_tokens=r.get('_pseudo_tokens'),
+                                                      template=ctx.encode_template)
                           for r in usable]
             base_logps = _score_executor_mean_logps(ctx, base_trajs)
             base_by_id = {id(r): lp for r, lp in zip(usable, base_logps)}
             cand_trajs = [_executor_answer_trajectory(r['problem'], c['skills'], r['_pseudo_solution'],
-                                                       c.get('response')) for r, c in flat]
+                                                      c.get('response'),
+                                                      answer_tokens=r.get('_pseudo_tokens'),
+                                                      template=ctx.encode_template)
+                          for r, c in flat]
             cand_logps = _score_executor_mean_logps(ctx, cand_trajs)
             # bugfix #14: logP 目标超长被 truncation='delete' 删掉时 lp=None → reward 地板，
             # 整组塔到 -1.0 会零梯度空转；这里显式监控 encode 失败占比（E15 的 R1 参考解尤其长）。
@@ -1033,17 +1100,19 @@ class PassrateHingeMethod(TrainMethod):
         sg = _run_samples(ctx.skill_sampler, list(prompts),
                           args.n_skills, args.skill_max_tokens, ctx.skill_dp,
                           temperature=args.skill_gen_temperature, top_p=args.skill_gen_top_p,
-                          top_k=args.skill_gen_top_k)
+                          top_k=args.skill_gen_top_k, logprobs=1)
         flat = []
         for r, seqs in zip(kept, sg):
             for s in seqs or []:
                 resp = _clean_text(getattr(s, 'decoded', '') or '')
                 block = _extract_skill(resp) or ''
+                _toks = [int(t) for t in (getattr(s, 'tokens', None) or [])]
                 cand = {'skills': block, 'response': resp, 'parseable': bool(block),
                         'leaked': None, 'with_pass': None, 'reward': None, 'rolls': [],
-                        'advantage': 0.0, 'kept': False,
+                        'advantage': 0.0, 'kept': False, 'tokens': _toks,
+                        'logprobs': v2.sampler_logprobs(s),
                         'skillgen_stop': getattr(s, 'stop_reason', None),
-                        'skillgen_tokens': len(getattr(s, 'tokens', None) or []),
+                        'skillgen_tokens': len(_toks),
                         'trunc_pen': None, 'pass_rate': None,
                         'loop_pen': None, 'eff': None, 'loop_density': None}
                 r['_cands'].append(cand)
