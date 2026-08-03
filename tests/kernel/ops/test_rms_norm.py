@@ -11,21 +11,21 @@ except ImportError:
 
 def test_imports():
     """NpuRMSNorm and npu_gated_rms_norm_forward import without torch_npu."""
-    from twinkle.kernel.npu_impls.rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
+    from twinkle.kernel.ops.rms_norm.npu import NpuRMSNorm, npu_gated_rms_norm_forward
     assert NpuRMSNorm is not None
     assert callable(npu_gated_rms_norm_forward)
 
 
 def test_npu_rmsnorm_has_no_init():
     """Class-replacement contract: NpuRMSNorm must not define its own __init__."""
-    from twinkle.kernel.npu_impls.rms_norm import NpuRMSNorm
+    from twinkle.kernel.ops.rms_norm.npu import NpuRMSNorm
     # If NpuRMSNorm defines __init__, it'd appear in NpuRMSNorm.__dict__
     assert '__init__' not in NpuRMSNorm.__dict__
 
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 def test_npu_rmsnorm_forward_runs_on_npu():
-    from twinkle.kernel.npu_impls.rms_norm import NpuRMSNorm
+    from twinkle.kernel.ops.rms_norm.npu import NpuRMSNorm
 
     class _Orig(nn.Module):
         def __init__(self):
@@ -38,3 +38,21 @@ def test_npu_rmsnorm_forward_runs_on_npu():
     x = torch.randn(2, 8, device='npu')
     y = m(x)
     assert y.shape == (2, 8)
+
+
+@pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
+def test_npu_rmsnorm_matches_torch_reference():
+    """Numerical parity: npu_rms_norm output ~= x * rsqrt(mean(x^2)+eps) * weight."""
+    from twinkle.kernel.ops.rms_norm.npu import NpuRMSNorm
+
+    class _Orig(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(64))
+            self.variance_epsilon = 1e-6
+
+    m = _Orig().to('npu')
+    m.__class__ = NpuRMSNorm
+    x = torch.randn(4, 64, device='npu')
+    ref = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * m.weight
+    torch.testing.assert_close(m(x), ref, rtol=1e-4, atol=1e-5)

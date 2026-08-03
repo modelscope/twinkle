@@ -1,12 +1,12 @@
 def test_attention_imports():
-    from twinkle.kernel.npu_impls.attention import npu_sdpa_attention_forward
+    from twinkle.kernel.ops.sdpa_attention.npu import npu_sdpa_attention_forward
     assert callable(npu_sdpa_attention_forward)
 
 
 def test_attention_signature():
     import inspect
 
-    from twinkle.kernel.npu_impls.attention import npu_sdpa_attention_forward
+    from twinkle.kernel.ops.sdpa_attention.npu import npu_sdpa_attention_forward
 
     sig = inspect.signature(npu_sdpa_attention_forward)
     params = list(sig.parameters)

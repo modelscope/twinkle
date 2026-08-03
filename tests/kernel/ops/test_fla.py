@@ -1,11 +1,11 @@
 def test_fla_imports():
-    from twinkle.kernel.npu_impls.fla import apply_qwen3_5_fla
+    from twinkle.kernel.ops.fla.npu import apply_qwen3_5_fla
     assert callable(apply_qwen3_5_fla)
 
 
 def test_fla_disabled_by_env(monkeypatch):
     monkeypatch.setenv('TWINKLE_NPU_FLA', '0')
-    from twinkle.kernel.npu_impls.fla import apply_qwen3_5_fla
+    from twinkle.kernel.ops.fla.npu import apply_qwen3_5_fla
     # With env=0, function returns 0 (no-op) without raising
     assert apply_qwen3_5_fla(None) == 0
 
@@ -14,7 +14,7 @@ def test_fla_skips_when_no_torch_npu(monkeypatch):
     import sys
     monkeypatch.setenv('TWINKLE_NPU_FLA', '1')
     monkeypatch.setitem(sys.modules, 'torch_npu', None)  # forces ImportError on import
-    from twinkle.kernel.npu_impls import fla as fla_mod
+    from twinkle.kernel.ops.fla import npu as fla_mod
     # Reload-tolerant: should return 0 when torch_npu is missing.
     assert fla_mod.apply_qwen3_5_fla(None) == 0
 
@@ -34,7 +34,7 @@ def test_fla_does_not_flip_flag_when_fla_missing(monkeypatch):
     spec = importlib.util.spec_from_loader('torch_npu', loader=None)
     fake_npu = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, 'torch_npu', fake_npu)
-    # Force the fla-backed operator import to fail. twinkle.kernel.npu_impls.fla
+    # Force the fla-backed operator import to fail. twinkle.kernel.ops.fla.npu
     # imports ``fla.modules.convolution`` and ``fla.ops.gated_delta_rule``
     # lazily inside ``apply_qwen3_5_fla``; stubbing the top-level ``fla`` package
     # as None makes both imports raise ImportError.
@@ -42,7 +42,7 @@ def test_fla_does_not_flip_flag_when_fla_missing(monkeypatch):
 
     original_flag = tui.is_flash_linear_attention_available
     try:
-        from twinkle.kernel.npu_impls.fla import apply_qwen3_5_fla
+        from twinkle.kernel.ops.fla.npu import apply_qwen3_5_fla
         assert apply_qwen3_5_fla(None) == 0
         assert tui.is_flash_linear_attention_available is original_flag, (
             'is_flash_linear_attention_available was flipped to True while the '

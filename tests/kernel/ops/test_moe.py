@@ -1,5 +1,5 @@
 def test_moe_imports():
-    from twinkle.kernel.npu_impls.moe import (
+    from twinkle.kernel.ops.moe.npu import (
         GmmFunction,
         npu_grouped_mm,
         npu_packed_moe_experts_forward,
