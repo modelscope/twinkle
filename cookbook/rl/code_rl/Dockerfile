@@ -18,8 +18,12 @@
 # dependencies pre-installed. Rebuild only when this file changes.
 FROM python:3.11-slim
 
-# Use a pip mirror if your sandbox network requires it, e.g.:
-# ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+# Behind the Great Firewall neither of these two lines works as written: the
+# server resolves FROM against docker.io / ghcr.io (timeout / 401), and pip
+# cannot reach pypi.org from inside the sandbox. Swap both for reachable
+# mirrors — see the "Run: agentenv" section in README.md for probed hosts, e.g.
+#   FROM docker.1panel.live/library/python:3.11-slim
+#   ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 RUN pip install --no-cache-dir numpy sympy
 
 ENV PYTHONUNBUFFERED=1

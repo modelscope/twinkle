@@ -84,11 +84,51 @@ aenv build cookbook/rl/code_rl/Dockerfile -t twinkle-code --cpu-count 1 --memory
 aenv template watch <template-id>
 ```
 
+`aenv build` 是**服务端**拉镜像并转 overlaybd，本机不需要 docker。别名不可改绑，重建前先 `aenv template delete twinkle-code`。
+
+国内网络下 `Dockerfile` 里的 `FROM python:3.11-slim` 拉不到——服务端默认只搜 `docker.io` / `ghcr.io`，前者超时、后者 401。换成能通的镜像站（**`library/` 不能省**，官方镜像的真实路径是 `library/python`）：
+
+```dockerfile
+FROM docker.1panel.live/library/python:3.11-slim
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+```
+
+先在环境机上验，200/401 都算通，超时就换下一个：
+
+```bash
+for R in docker.1panel.live docker.m.daocloud.io docker.1ms.run; do
+    printf "%-24s " "$R"
+    timeout 15 curl -s -o /dev/null -w '%{http_code}\n' \
+        "https://$R/v2/library/python/manifests/3.11-slim"
+done
+```
+
+这些是第三方公益站，随时可能挂或限速；长期用建议转存到自己的 ACR。`PIP_INDEX_URL` 同理必须换，沙箱走官方 pypi 也不通。
+
 训练机：
 
 ```bash
 pip install e2b
 AENV_API_URL=http://<环境机IP>:8000 sh run_agentenv.sh
+```
+
+只设 `E2B_API_KEY` / `E2B_API_URL` 无效——必须用 `AENV_API_URL`，否则会静默回落到 `http://127.0.0.1:8000`。
+
+服务端只绑了 `127.0.0.1` 而训练在别的机器上时，用 SSH 隧道（`ssh -N` 不返回是正常的，挂着就是隧道在工作；`-f` 转后台）：
+
+```bash
+ssh -f -N -L 8000:127.0.0.1:8000 root@<环境机IP>
+```
+
+跑训练前先验沙箱能起，几秒出结果，比等 vLLM 加载快得多：
+
+```bash
+python -c "
+from twinkle_agentic.envs import AgentEnv
+e = AgentEnv(template='twinkle-code', api_url='http://127.0.0.1:8000')
+e.reset(); print('sandbox ok')
+print(e.run_command({'command': 'python -c \"import numpy, sympy; print(numpy.__version__)\"'}))
+"
 ```
 
 ## 参数
@@ -99,11 +139,23 @@ AENV_API_URL=http://<环境机IP>:8000 sh run_agentenv.sh
 sh run_openenv.sh --max-steps 500 --batch-size 8
 ```
 
-冒烟测试（`batch-size × num-generations` 需 ≥ `--model-gpus`）：
+冒烟测试。`batch-size × num-generations` **必须 ≥ `--model-gpus`**，否则每个 batch 都被长度过滤器静默丢掉、只有一条 warning，比报错难查。参数要放在脚本名**后面**才生效：
 
 ```bash
 sh run_openenv.sh --batch-size 2 --num-generations 4 --max-steps 2
 ```
+
+## 排查
+
+| 现象 | 原因 |
+|---|---|
+| `Invalid API key format: expected "e2b_"` | e2b SDK 的客户端本地校验。`AgentEnv` 已默认设 `E2B_VALIDATE_API_KEY=false`；仍报错说明被显式覆盖成 `true` 了 |
+| `400: template twinkle-code not found` | 模板没建，或 build 失败没到 ready。`aenv template list` 看状态 |
+| `alias 'twinkle-code' already points to ...` | 别名不可改绑，先 `aenv template delete twinkle-code` |
+| `dial tcp ...: i/o timeout` on `registry-1.docker.io` | Docker Hub 不通，`FROM` 换镜像站 |
+| `overlaybd-commit ... No such file or directory` | overlaybd 装得不全。查 `/var/lib/aenv/deps/overlaybd/bin/` 是否有 create/apply/commit/resize 四个、`/etc/overlaybd/overlaybd.json` 是否存在 |
+| `open /root/.regctl/config.json: permission denied` | server 降权成 `aenv` 却读 root 家目录。拉公开镜像时只是 WARN；配私有 registry 凭据前要给它一个可写 HOME（`install -d -o aenv -g aenv /var/lib/aenv/home` 并设 `HOME=`） |
+| env 数量与 `--batch-size` 不符 | 参数加在了 `sh run_*.sh` 之前，没进 `"$@"` |
 
 ## 实验记录
 
@@ -219,11 +271,51 @@ aenv build cookbook/rl/code_rl/Dockerfile -t twinkle-code --cpu-count 1 --memory
 aenv template watch <template-id>
 ```
 
+`aenv build` pulls the image and converts it to overlaybd **on the server**; no local docker is needed. Aliases cannot be rebound — run `aenv template delete twinkle-code` before rebuilding.
+
+Behind the Great Firewall, `FROM python:3.11-slim` cannot be resolved: the server only searches `docker.io` / `ghcr.io`, which time out and return 401 respectively. Point `FROM` at a working mirror (**keep `library/`** — the real Hub path for official images is `library/python`):
+
+```dockerfile
+FROM docker.1panel.live/library/python:3.11-slim
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+```
+
+Probe from the environment host first; 200 and 401 both mean reachable, a timeout means try the next one:
+
+```bash
+for R in docker.1panel.live docker.m.daocloud.io docker.1ms.run; do
+    printf "%-24s " "$R"
+    timeout 15 curl -s -o /dev/null -w '%{http_code}\n' \
+        "https://$R/v2/library/python/manifests/3.11-slim"
+done
+```
+
+These are third-party community mirrors and may go down or throttle; mirror the image into your own registry for anything long-lived. `PIP_INDEX_URL` needs the same treatment — the sandbox cannot reach pypi.org either.
+
 Training host:
 
 ```bash
 pip install e2b
 AENV_API_URL=http://<env-host-ip>:8000 sh run_agentenv.sh
+```
+
+Setting `E2B_API_KEY` / `E2B_API_URL` alone has no effect — use `AENV_API_URL`, otherwise the script silently falls back to `http://127.0.0.1:8000`.
+
+When the server is bound to `127.0.0.1` and training runs elsewhere, use an SSH tunnel (`ssh -N` not returning is normal — that blocking state *is* the tunnel; `-f` backgrounds it):
+
+```bash
+ssh -f -N -L 8000:127.0.0.1:8000 root@<env-host-ip>
+```
+
+Verify a sandbox boots before launching training — it takes seconds instead of waiting for vLLM to load:
+
+```bash
+python -c "
+from twinkle_agentic.envs import AgentEnv
+e = AgentEnv(template='twinkle-code', api_url='http://127.0.0.1:8000')
+e.reset(); print('sandbox ok')
+print(e.run_command({'command': 'python -c \"import numpy, sympy; print(numpy.__version__)\"'}))
+"
 ```
 
 ## Arguments
@@ -234,11 +326,23 @@ Command-line arguments are forwarded to `train.py` and override the defaults in 
 sh run_openenv.sh --max-steps 500 --batch-size 8
 ```
 
-Smoke test (`batch-size × num-generations` must be ≥ `--model-gpus`):
+Smoke test. `batch-size × num-generations` **must be ≥ `--model-gpus`**, otherwise every batch is dropped by the length filter with only a warning — harder to diagnose than a crash. Arguments only take effect **after** the script name:
 
 ```bash
 sh run_openenv.sh --batch-size 2 --num-generations 4 --max-steps 2
 ```
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `Invalid API key format: expected "e2b_"` | Client-side check in the e2b SDK. `AgentEnv` already defaults `E2B_VALIDATE_API_KEY=false`; still failing means it was explicitly set back to `true` |
+| `400: template twinkle-code not found` | Template not built, or the build failed before reaching ready. Check `aenv template list` |
+| `alias 'twinkle-code' already points to ...` | Aliases cannot be rebound; `aenv template delete twinkle-code` first |
+| `dial tcp ...: i/o timeout` on `registry-1.docker.io` | Docker Hub unreachable; point `FROM` at a mirror |
+| `overlaybd-commit ... No such file or directory` | Incomplete overlaybd install. Check that `/var/lib/aenv/deps/overlaybd/bin/` holds create/apply/commit/resize and that `/etc/overlaybd/overlaybd.json` exists |
+| `open /root/.regctl/config.json: permission denied` | The server dropped to `aenv` but reads root's home. Only a WARN for public images; give it a writable HOME before configuring private registry credentials (`install -d -o aenv -g aenv /var/lib/aenv/home`, then set `HOME=`) |
+| env count does not match `--batch-size` | Arguments were placed before `sh run_*.sh` and never reached `"$@"` |
 
 ## Results
 

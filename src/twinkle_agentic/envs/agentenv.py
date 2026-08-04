@@ -164,7 +164,10 @@ class AgentEnv(Env):
             api_url: AgentENV server or gateway base URL. Falls back to the
                 ``E2B_API_URL`` environment variable.
             api_key: API key; AgentENV accepts any non-empty string on a
-                trusted network. Falls back to ``E2B_API_KEY``.
+                trusted network. Falls back to ``E2B_API_KEY``. Client-side
+                format validation is disabled by default because AgentENV does
+                not issue ``e2b_``-prefixed keys; set
+                ``E2B_VALIDATE_API_KEY=true`` to re-enable it.
             sandbox_timeout: Sandbox idle timeout in seconds. AgentENV pauses
                 (not kills) idle sandboxes and auto-resumes them on access.
             command_timeout: Per-command execution timeout in seconds.
@@ -189,6 +192,13 @@ class AgentEnv(Env):
             os.environ['E2B_API_KEY'] = api_key
         os.environ.setdefault('E2B_API_KEY', 'dummy')
         os.environ.setdefault('E2B_ACCESS_TOKEN', 'dummy')
+        # AgentENV has no authorization, so any non-empty key works — but the
+        # SDK client-side asserts the key matches ``e2b_[0-9a-f]+`` before it
+        # ever sends a request, which rejects placeholders like 'dummy'. The
+        # SDK exposes this opt-out for exactly this case (deployments that do
+        # not issue e2b-format keys); set E2B_VALIDATE_API_KEY=true to restore
+        # validation when pointing at e2b.dev itself.
+        os.environ.setdefault('E2B_VALIDATE_API_KEY', 'false')
 
         self._template = template
         self._sandbox_timeout = sandbox_timeout

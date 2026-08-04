@@ -272,8 +272,28 @@ sudo chown -R aenv:aenv /var/lib/aenv/deps
 ```bash
 sudo env $E /usr/local/bin/server --setup-host --runtime-user aenv --runtime-group aenv
 sudo chown -R aenv:aenv /var/lib/aenv
-sudo env $E API_ADDR=127.0.0.1:8000 ./scripts/run-with-capabilities.sh /usr/local/bin/server
+
+# run-with-capabilities.sh 在仓库里，用相对路径得先 cd 过去
+cd AgentENV
+sudo env $E AENV_RUN_USER=aenv API_ADDR=127.0.0.1:8000 \
+     ./scripts/run-with-capabilities.sh /usr/local/bin/server
 ```
+
+后台版：
+
+```bash
+sudo install -d -o aenv -g aenv /var/log/aenv
+cd AgentENV
+sudo env $E AENV_RUN_USER=aenv API_ADDR=127.0.0.1:8000 \
+     setsid nohup ./scripts/run-with-capabilities.sh /usr/local/bin/server \
+     > /var/log/aenv/server.log 2>&1 < /dev/null &
+
+sleep 5; curl -i http://127.0.0.1:8000/health      # 期望 204
+tail -f /var/log/aenv/server.log                  # 看日志
+sudo pkill -f '/usr/local/bin/server'             # 停
+```
+
+`AENV_RUN_USER=aenv` 别省：不给就走 `SUDO_USER` → 仓库 owner → `aenv` 三层 fallback，root 直接跑时结果不稳。`--setup-host` 把 `aenv` 加进 kvm 组的变更对已有会话不生效，靠这个脚本的 `--init-groups` 重新初始化；绕过它直接起 server 会因拿不到 kvm 权限而失败。
 
 `/health` 返回 204 后，systemd unit 照 `scripts/install.sh` 第 3 段抄。
 
