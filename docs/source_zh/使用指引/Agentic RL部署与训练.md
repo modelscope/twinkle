@@ -4,7 +4,7 @@ Agentic RL 需要两个部分：供模型执行动作的执行环境，以及消
 
 两者相互正交：更换执行后端仅需修改 `CODE_RL_BACKEND` 环境变量，跨机部署仅需修改一个 URL，训练代码无需变动。因此建议先在单机验证完整链路，再扩展到多机。
 
-全文以 [`cookbook/rl/env/`](https://github.com/modelscope/twinkle/tree/main/cookbook/rl/env) 为例：MBPP 数据集上的多轮代码生成任务，同一份 `train.py` 支持两个后端。任务、工具、奖励公式完全一致，仅代码执行位置不同，因此实验曲线的差异可归因于执行环境本身。
+全文以 [`cookbook/rl/envs/`](https://github.com/modelscope/twinkle/tree/main/cookbook/rl/envs) 为例：MBPP 数据集上的多轮代码生成任务，同一份 `train.py` 支持两个后端。任务、工具、奖励公式完全一致，仅代码执行位置不同，因此实验曲线的差异可归因于执行环境本身。
 
 ## 执行后端的选择
 
@@ -58,7 +58,7 @@ ENV_REMOTE=1 ENV_NUM_WORKERS=8 ENV_POOL_SIZE=64 python multi_turn_grpo.py
 环境机不需要 GPU、KVM 或 Docker：
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 sh openenv_server/install.sh    # pip install openenv + 从源码装 coding_env
 sh openenv_server/serve.sh      # 4 workers x 64 sessions = 256 并发
 ```
@@ -69,7 +69,7 @@ sh openenv_server/serve.sh      # 4 workers x 64 sessions = 256 并发
 
 ### 不使用上游 server 的原因
 
-`serve.sh` 启动的是[本目录下的 `server_app.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/env/openenv_server/server_app.py)，而非上游的 `coding_env.server.app`。直接沿用 upstream 会遇到三个问题：
+`serve.sh` 启动的是[本目录下的 `server_app.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/envs/openenv_server/server_app.py)，而非上游的 `coding_env.server.app`。直接沿用 upstream 会遇到三个问题：
 
 ```python
 class ConcurrentCodeEnv(PythonCodeActEnv):
@@ -126,7 +126,7 @@ modinfo ublk_drv >/dev/null && echo ublk-ok  # 需要 ublk 内核模块
 ### 安装服务端
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 sh agentenv_server/install.sh
 ```
 
@@ -237,7 +237,23 @@ AENV_API_URL=http://10.0.1.20:8000     sh run_agentenv.sh
 
 安全组入方向仅放行**训练机的 IP/32 或其安全组 ID**，端口仅开放 8000，不得使用 `0.0.0.0/0`。用 `ss -tlnp | grep 8000` 确认绑定生效——输出必须为 `10.0.1.20:8000` 而非 `0.0.0.0:8000`。
 
-环境服务需配置保活，[`deploy/openenv-server.service`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/deploy/openenv-server.service) 可直接使用。服务一旦中断，整批 rollout 随之作废。
+环境服务需配置保活：服务一旦中断，整批 rollout 随之作废。这属于运维基础设施的范畴，使用现有的进程管理器即可。最小可用的 systemd 配置：
+
+```ini
+# /etc/systemd/system/openenv-server.service
+[Service]
+User=openenv
+WorkingDirectory=/opt/twinkle/cookbook/rl/envs/openenv_server
+Environment=HOST=10.0.1.20 MAX_CONCURRENT_ENVS=64
+ExecStart=/bin/sh serve.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Restart=always` 是关键项——覆盖进程崩溃与 OOM 被杀两种情况。启用：`sudo systemctl enable --now openenv-server`。
 
 ### SSH 端口转发
 
@@ -300,7 +316,7 @@ always_denied_cidrs = [
 
 # 第二部分：训练对接
 
-本部分继续以 `cookbook/rl/env/` 为例。选择代码生成作为任务有两个原因：其奖励可由单元测试客观计算，无需裁判模型；且多轮交互具备内在语义——编写、试跑、修正、提交。
+本部分继续以 `cookbook/rl/envs/` 为例。选择代码生成作为任务有两个原因：其奖励可由单元测试客观计算，无需裁判模型；且多轮交互具备内在语义——编写、试跑、修正、提交。
 
 ## 模型可见的动作空间
 
@@ -420,7 +436,7 @@ advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale=
 建议先以小并发验证全链路，以节约时间与算力成本：
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 
 # OpenEnv
 sh run_openenv.sh --batch-size 2 --num-generations 4 --max-steps 2
@@ -720,7 +736,7 @@ drive_path = "/opt/aenv-assets/tools.ext4"
 ```bash
 sudo env $E /usr/local/bin/server --setup-host --runtime-user aenv --runtime-group aenv
 sudo chown -R aenv:aenv /var/lib/aenv
-sh cookbook/rl/env/agentenv_server/serve.sh
+sh cookbook/rl/envs/agentenv_server/serve.sh
 ```
 
 `serve.sh` 中有几个不可省略的环境变量：`AENV_RUN_USER=aenv`（不设则走 `SUDO_USER` → 仓库 owner → `aenv` 三层 fallback，root 直接运行时结果不稳定）、`AENV_HOME_PATH=/var/lib/aenv`（不设则落到 `/tmp/aenv-test-<uid>/`，被清理后需重新下载数百 MB）、`AENV_CONFIG_PATH`（上述的编译路径问题）。
@@ -744,6 +760,6 @@ docker run -d --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-ser
 
 - 组件参考：[执行环境](../组件/Agentic/Envs.md)（`Env` 抽象、`EnvTool`、OpenEnv 两种模式、`EnvPool`）
 - 多轮工具调用：[多轮工具调用](../组件/Agentic/Multi-Turn-Tool-Usage.md)
-- 可运行示例：`cookbook/rl/env/`（代码任务，两个后端）、`cookbook/rl/multi_turn/`（嵌入式 OpenEnv）
+- 可运行示例：`cookbook/rl/envs/`（代码任务，两个后端）、`cookbook/rl/multi_turn/`（嵌入式 OpenEnv）
 - OpenEnv 上游仓库：<https://github.com/meta-pytorch/OpenEnv>
 - AgentENV 官方文档：<https://kvcache-ai.github.io/AgentENV/>

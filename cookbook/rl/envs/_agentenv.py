@@ -1,38 +1,28 @@
-"""Tool definitions for AgentENV-backed code-writing RL (MBPP).
-
-Mirrors ``cookbook/rl/openenv_code/tools.py`` — identical task and tool names —
-but the tools execute inside a real Firecracker microVM instead of a remote
-OpenEnv interpreter session. The differences that matter to the prompt:
-
-  * Full CPython, so ``assert`` / ``try`` / imports / files all work, and the
-    hidden tests can be replayed as one ordinary script.
-  * Each ``run_python`` call is a FRESH process, so snippets must be
-    self-contained (an OpenEnv session, by contrast, keeps its namespace).
-
-Two tools are exposed to the model:
-  * ``run_python``      — write a snippet to /workspace/scratch.py and run it.
-  * ``submit_solution`` — hand in the final function (recorded client-side).
-"""
+import os
 import textwrap
 from typing import Any, Dict, List, Tuple
 
 from twinkle_agentic.envs import AgentEnv
 
+NAME = 'agentenv'
+
+API_URL = os.environ.get('AENV_API_URL', 'http://127.0.0.1:8000')
+TEMPLATE = os.environ.get('AENV_TEMPLATE', 'twinkle-code')
+SANDBOX_TIMEOUT = int(os.environ.get('SANDBOX_TIMEOUT', '600'))
+COMMAND_TIMEOUT = int(os.environ.get('AENV_COMMAND_TIMEOUT', '60'))
+
 SYSTEM_PROMPT = """You are an expert Python programmer with access to a Linux sandbox.
 
-Write a function that solves the given task, verify it, then submit it.
+Solve the task by writing a Python function.
 
-Rules:
 - Use `run_python` to try out your function. Each call runs in a FRESH process,
   so every snippet must be self-contained (include the imports and the function
   definition, then call it) and must `print(...)` what you want to see.
 - The full Python standard library is available, plus `numpy` and `sympy`.
-- Match the function name and signature implied by the task description and
-  the example call, otherwise the hidden tests cannot find your function.
-- When your function works, call `submit_solution` with the COMPLETE final
-  source (imports plus the function definition).
-- After submitting, reply with one short sentence and do NOT call any more tools.
-- You have a limited number of turns, so do not run redundant code."""
+- When you are confident, call `submit_solution` with the complete final source
+  (imports plus the function definition).
+
+Submit exactly once, and only after the code runs correctly."""
 
 TOOL_SCHEMA: List[Dict[str, Any]] = [
     {
@@ -90,8 +80,20 @@ def _submit_solution(env: AgentEnv, arguments: Dict[str, Any]) -> str:
     return 'Solution submitted.'
 
 
-def register_tools(env: AgentEnv) -> AgentEnv:
-    """Attach the task tools to a fresh AgentEnv instance."""
+def make_env() -> AgentEnv:
+    """Boot one sandbox per trajectory, exposing only the two task tools.
+
+    ``include_default_tools=False`` hides AgentEnv's built-ins (raw command
+    execution, file read/write) so the action space matches the task exactly and
+    reward attribution stays clean.
+    """
+    env = AgentEnv(
+        template=TEMPLATE,
+        api_url=API_URL,
+        sandbox_timeout=SANDBOX_TIMEOUT,
+        command_timeout=COMMAND_TIMEOUT,
+        include_default_tools=False,
+    )
     env.submitted_code = None
     return (env.register_tool(TOOL_SCHEMA[0], _run_python).register_tool(TOOL_SCHEMA[1], _submit_solution))
 
@@ -116,6 +118,9 @@ def _build_test_script(solution: str, test_list: List[str], setup_code: str) -> 
 def run_tests(env: AgentEnv, test_list: List[str], setup_code: str = '') -> Tuple[int, int]:
     """Replay the hidden tests against the submitted solution inside the sandbox.
 
+    Real CPython means the tests can run as one ordinary script, unlike the
+    OpenEnv backend which drives them one expression at a time.
+
     Returns:
         ``(n_passed, n_total)``. ``(0, n)`` when nothing was submitted, or when
         the script never reaches its tally line (syntax error, timeout, ...).
@@ -135,3 +140,7 @@ def run_tests(env: AgentEnv, test_list: List[str], setup_code: str = '') -> Tupl
             if len(fields) >= 3 and fields[1].isdigit():
                 return int(fields[1]), total
     return 0, total
+
+
+def describe() -> str:
+    return f'AgentENV microVM: api_url={API_URL}, template={TEMPLATE}'

@@ -1,37 +1,30 @@
-"""Tool definitions for OpenEnv-backed code-writing RL (MBPP).
-
-Same role as ``cookbook/rl/agentenv/tools.py``, but the tools run against a
-remote OpenEnv **server session** instead of a Firecracker sandbox. The pair of
-examples is intentionally symmetric: identical task, identical tool names,
-different execution backend.
-
-Two tools are exposed to the model:
-  * ``run_python``      — execute a snippet in the session (server-backed).
-  * ``submit_solution`` — hand in the final function (recorded client-side).
-
-The session namespace persists across ``run_python`` calls, so the model can
-define a function in one turn and probe it in the next.
-"""
+import os
 from typing import Any, Dict, List, Tuple
 
 from twinkle_agentic.envs import OpenEnvClient
 
+NAME = 'openenv'
+
+BASE_URL = os.environ.get('OPENENV_BASE_URL', 'http://127.0.0.1:8000')
+ENV_NAME = os.environ.get('OPENENV_ENV_NAME', 'coding_env')
+# Code execution can be slow; keep the per-message timeout generous. Note the
+# executor's own caps still apply (operation count, while-loop iterations, and
+# a wall-clock limit in newer smolagents releases).
+MESSAGE_TIMEOUT_S = float(os.environ.get('OPENENV_MESSAGE_TIMEOUT_S', '120'))
+
 SYSTEM_PROMPT = """You are an expert Python programmer with access to a Python interpreter.
 
-Write a function that solves the given task, verify it, then submit it.
+Solve the task by writing a Python function.
 
-Rules:
 - Use `run_python` to define and test your function. The interpreter keeps its
   state between calls, so a function defined in one call stays available.
 - Available modules: math, re, collections, itertools, functools, operator,
   heapq, bisect, string, statistics, fractions, decimal, datetime, copy, json.
   There is no file or network access.
-- Match the function name and signature implied by the task description and
-  the example call, otherwise the hidden tests cannot find your function.
-- When your function works, call `submit_solution` with the COMPLETE final
-  source (imports plus the function definition).
-- After submitting, reply with one short sentence and do NOT call any more tools.
-- You have a limited number of turns, so do not run redundant code."""
+- When you are confident, call `submit_solution` with the complete final source
+  (imports plus the function definition).
+
+Submit exactly once, and only after the code runs correctly."""
 
 TOOL_SCHEMA: List[Dict[str, Any]] = [
     {
@@ -80,23 +73,30 @@ def _submit_solution(env: OpenEnvClient, arguments: Dict[str, Any]) -> str:
     return 'Solution submitted.'
 
 
-def register_tools(env: OpenEnvClient) -> OpenEnvClient:
-    """Attach the task tools to a fresh OpenEnvClient instance.
+def make_env() -> OpenEnvClient:
+    """Open one session per trajectory, exposing only the two task tools.
 
     ``run_python`` stays server-backed: the default action mapper turns
-    ``{'code': ...}`` straight into the env's ``CodeAction``.
+    ``{'code': ...}`` straight into the env's ``CodeAction``. Only
+    ``submit_solution`` needs a client-side handler.
     """
+    env = OpenEnvClient(
+        env_name=ENV_NAME,
+        base_url=BASE_URL,
+        tools=[TOOL_SCHEMA[0]],
+        message_timeout_s=MESSAGE_TIMEOUT_S,
+    )
     env.submitted_code = None
     return env.register_tool(TOOL_SCHEMA[1], _submit_solution)
+
+
+def _ok(result) -> bool:
+    return not (getattr(result.observation, 'exit_code', 0) or 0)
 
 
 def _last_line(text: str) -> str:
     lines = [line for line in (text or '').splitlines() if line.strip()]
     return lines[-1].strip() if lines else ''
-
-
-def _ok(result) -> bool:
-    return not (getattr(result.observation, 'exit_code', 0) or 0)
 
 
 def run_tests(env: OpenEnvClient, test_list: List[str], setup_code: str = '') -> Tuple[int, int]:
@@ -109,8 +109,8 @@ def run_tests(env: OpenEnvClient, test_list: List[str], setup_code: str = '') ->
     inside the solution; and one step per test isolates a test that raises, so
     the remaining ones still run.
 
-    The executor does support ``assert``/``try`` (smolagents implements both),
-    so this is a diagnosability choice, not a capability workaround.
+    The executor does support ``assert``/``try``, so this is a diagnosability
+    choice, not a capability workaround.
 
     Returns:
         ``(n_passed, n_total)``. ``(0, n)`` when nothing was submitted or the
@@ -136,3 +136,7 @@ def run_tests(env: OpenEnvClient, test_list: List[str], setup_code: str = '') ->
         if _ok(result) and _last_line(getattr(result.observation, 'stdout', '')) == 'True':
             passed += 1
     return passed, total
+
+
+def describe() -> str:
+    return f'OpenEnv server mode: base_url={BASE_URL}, env={ENV_NAME}'

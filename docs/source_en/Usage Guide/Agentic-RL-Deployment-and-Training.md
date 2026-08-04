@@ -4,7 +4,7 @@ Agentic RL has two parts: the execution environment where the model performs act
 
 The two are orthogonal: switching execution backends requires only a change to the `CODE_RL_BACKEND` environment variable, and moving to a separate host requires only a change to one URL — the training code stays untouched. Validate the full pipeline on a single machine first, then scale out.
 
-The examples throughout use [`cookbook/rl/env/`](https://github.com/modelscope/twinkle/tree/main/cookbook/rl/env): a multi-turn code generation task on the MBPP dataset, where one `train.py` supports both backends. The task, tools, and reward formula are identical; only the location of code execution differs, so differences between experiment curves can be attributed to the execution environment itself.
+The examples throughout use [`cookbook/rl/envs/`](https://github.com/modelscope/twinkle/tree/main/cookbook/rl/envs): a multi-turn code generation task on the MBPP dataset, where one `train.py` supports both backends. The task, tools, and reward formula are identical; only the location of code execution differs, so differences between experiment curves can be attributed to the execution environment itself.
 
 ## Choosing an Execution Backend
 
@@ -58,7 +58,7 @@ Sharding only actually happens with `ENV_REMOTE=1`; without it, environments run
 The environment host needs no GPU, KVM, or Docker:
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 sh openenv_server/install.sh    # pip install openenv + coding_env from source
 sh openenv_server/serve.sh      # 4 workers x 64 sessions = 256 concurrent
 ```
@@ -69,7 +69,7 @@ The training host only needs `pip install openenv`, which provides the client cl
 
 ### Why not use the upstream server
 
-`serve.sh` starts [the `server_app.py` in this directory](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/env/openenv_server/server_app.py) rather than the upstream `coding_env.server.app`. Adopting upstream directly runs into three problems:
+`serve.sh` starts [the `server_app.py` in this directory](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/envs/openenv_server/server_app.py) rather than the upstream `coding_env.server.app`. Adopting upstream directly runs into three problems:
 
 ```python
 class ConcurrentCodeEnv(PythonCodeActEnv):
@@ -129,7 +129,7 @@ When the prerequisites are not met, no code changes are needed: deploy AgentENV 
 ### Installing the server
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 sh agentenv_server/install.sh
 ```
 
@@ -240,7 +240,23 @@ AENV_API_URL=http://10.0.1.20:8000     sh run_agentenv.sh
 
 Security-group ingress should admit **only the training host's IP/32 or its security-group ID**, open only port 8000, and never use `0.0.0.0/0`. Confirm the binding took effect with `ss -tlnp | grep 8000` — the output must be `10.0.1.20:8000`, not `0.0.0.0:8000`.
 
-The environment service needs a keep-alive mechanism; [`deploy/openenv-server.service`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/deploy/openenv-server.service) can be used as-is. Once the service goes down, the entire rollout batch is wasted.
+The environment service needs a keep-alive mechanism: once it goes down, the entire rollout batch is wasted. This belongs to operations infrastructure, so use whatever process manager you already have. A minimal systemd unit:
+
+```ini
+# /etc/systemd/system/openenv-server.service
+[Service]
+User=openenv
+WorkingDirectory=/opt/twinkle/cookbook/rl/envs/openenv_server
+Environment=HOST=10.0.1.20 MAX_CONCURRENT_ENVS=64
+ExecStart=/bin/sh serve.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Restart=always` is the essential line — it covers both a process crash and an OOM kill. Enable it with `sudo systemctl enable --now openenv-server`.
 
 ### SSH port forwarding
 
@@ -302,7 +318,7 @@ One final point deserves emphasis: the API key used by `aenv auth` **provides no
 
 # Part Two: Wiring Up Training
 
-This part continues with `cookbook/rl/env/`. Code generation was chosen as the task for two reasons: its reward can be computed objectively from unit tests, with no judge model required; and multi-turn interaction has intrinsic meaning — write, try, fix, submit.
+This part continues with `cookbook/rl/envs/`. Code generation was chosen as the task for two reasons: its reward can be computed objectively from unit tests, with no judge model required; and multi-turn interaction has intrinsic meaning — write, try, fix, submit.
 
 ## The action space the model sees
 
@@ -422,7 +438,7 @@ Note how `expanded` is written: `for s in batch for _ in range(N)` places the N 
 Validate the full pipeline at low concurrency first, to save both time and compute cost:
 
 ```bash
-cd cookbook/rl/env
+cd cookbook/rl/envs
 
 # OpenEnv
 sh run_openenv.sh --batch-size 2 --num-generations 4 --max-steps 2
@@ -725,7 +741,7 @@ drive_path = "/opt/aenv-assets/tools.ext4"
 ```bash
 sudo env $E /usr/local/bin/server --setup-host --runtime-user aenv --runtime-group aenv
 sudo chown -R aenv:aenv /var/lib/aenv
-sh cookbook/rl/env/agentenv_server/serve.sh
+sh cookbook/rl/envs/agentenv_server/serve.sh
 ```
 
 Several environment variables in `serve.sh` cannot be omitted: `AENV_RUN_USER=aenv` (without it the three-level fallback `SUDO_USER` → repository owner → `aenv` applies, giving unstable results when run directly as root), `AENV_HOME_PATH=/var/lib/aenv` (without it the path falls back to `/tmp/aenv-test-<uid>/`, requiring a few hundred MB to be re-downloaded after cleanup), and `AENV_CONFIG_PATH` (the build-path issue described above).
@@ -749,6 +765,6 @@ Docker here is only a **deployment vehicle**; the sandbox is still a Firecracker
 
 - Component reference: [Execution Environments](../Components/Agentic/Envs.md) (the `Env` abstraction, `EnvTool`, both OpenEnv modes, `EnvPool`)
 - Multi-turn tool calling: [Multi-Turn Tool Usage](../Components/Agentic/Multi-Turn-Tool-Usage.md)
-- Runnable examples: `cookbook/rl/env/` (code task, both backends), `cookbook/rl/multi_turn/` (embedded OpenEnv)
+- Runnable examples: `cookbook/rl/envs/` (code task, both backends), `cookbook/rl/multi_turn/` (embedded OpenEnv)
 - OpenEnv upstream repository: <https://github.com/meta-pytorch/OpenEnv>
 - AgentENV official documentation: <https://kvcache-ai.github.io/AgentENV/>

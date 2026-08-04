@@ -182,7 +182,7 @@ env.close()
 - `execute(action)`：直接发送动作并返回服务端**原始** `StepResult`，可以读取 `exit_code` 等结构化字段。训练循环用它在同一个 session 里追加执行单元测试。
 - `episode_reward` / `last_result` / `client`：累计奖励、上一次原始结果、底层同步客户端。
 
-**容量与并发**：`OpenEnvClient` 内部调用 OpenEnv 客户端的 `.sync()`，每个实例拥有独立的后台事件循环，因此可以放在线程池里并发 reset/step。但服务端必须能容纳全部并发 session：环境类需声明 `SUPPORTS_CONCURRENT_SESSIONS = True`，且 `create_app(..., max_concurrent_envs=N)` 要够大，否则多出的连接会被拒绕。由于该上限按 worker 进程生效，总容量为 `workers x max_concurrent_envs`。OpenEnv 自带的 `coding_env` 将 `SUPPORTS_CONCURRENT_SESSIONS` 留在保守的默认值，需要子类化后打开（否则 `create_app` 会在 `max_concurrent_envs > 1` 时抛出 `ConcurrencyConfigurationError`）；`cookbook/rl/openenv_code/server_app.py` 给出了完整写法。
+**容量与并发**：`OpenEnvClient` 内部调用 OpenEnv 客户端的 `.sync()`，每个实例拥有独立的后台事件循环，因此可以放在线程池里并发 reset/step。但服务端必须能容纳全部并发 session：环境类需声明 `SUPPORTS_CONCURRENT_SESSIONS = True`，且 `create_app(..., max_concurrent_envs=N)` 要够大，否则多出的连接会被拒绝。由于该上限按 worker 进程生效，总容量为 `workers x max_concurrent_envs`。OpenEnv 自带的 `coding_env` 将 `SUPPORTS_CONCURRENT_SESSIONS` 留在保守的默认值，需要子类化后打开（否则 `create_app` 会在 `max_concurrent_envs > 1` 时抛出 `ConcurrencyConfigurationError`）；`cookbook/rl/envs/openenv_server/server_app.py` 给出了完整写法。
 
 ### 与 Rollout 集成使用
 
