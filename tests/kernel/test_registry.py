@@ -316,6 +316,34 @@ def test_dotted_target_dispatch(fake_ops, twinkle_log):
         sys.modules.pop(mod_name, None)
 
 
+def test_dotted_function_target_with_class_impl_replaces_owner_class(fake_ops):
+    """Module-class impl on a ``...Experts.forward``-style target -> owner class
+    replacement, NOT setattr (moe_experts liger regression: LigerExperts must
+    not end up assigned to ``Experts.forward``)."""
+    mod_name = 'tests.kernel._tmp_class_impl'
+    mod = types.ModuleType(mod_name)
+
+    class FakeExperts(nn.Module):
+        def forward(self, x):
+            return x
+
+    class LigerLikeExperts(nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    mod.FakeExperts = FakeExperts
+    original_forward = FakeExperts.forward
+    sys.modules[mod_name] = mod
+    try:
+        parent = nn.Sequential(FakeExperts())
+        kernelize(parent, {f'{mod_name}.FakeExperts.forward': LigerLikeExperts})
+        assert type(parent[0]) is LigerLikeExperts
+        # the class attribute must stay untouched (no class assigned to forward)
+        assert FakeExperts.forward is original_forward
+    finally:
+        sys.modules.pop(mod_name, None)
+
+
 def test_family_skip_default_path_stays_debug(twinkle_log):
     """Default config path (warn=False): a missing family stays DEBUG, not escalated to WARNING."""
     default_installer(nn.Linear(1, 1),

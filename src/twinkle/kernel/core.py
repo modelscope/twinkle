@@ -139,6 +139,10 @@ def _install_dotted(model: nn.Module, target: str, impl, *, warn: bool = False) 
 
     - resolves to an ``nn.Module`` subclass -> ``_replace_class(model, cls, impl)``
       (exactly equivalent to a class-object key, exact type match)
+    - resolves to a function / class method but the impl is an ``nn.Module``
+      subclass (e.g. liger's ``LigerExperts`` on a ``...Experts.forward``
+      target) -> ``_replace_class(model, owner_cls, impl)``; setattr'ing a
+      class onto ``forward`` would fail on the first call
     - otherwise -> ``setattr`` (module function / class method)
     - unresolvable ``transformers.*`` family path (missing module/attr) ->
       skip, return False (a missing family is normal). ``warn=False``
@@ -162,6 +166,11 @@ def _install_dotted(model: nn.Module, target: str, impl, *, warn: bool = False) 
                          f'(logical targets require a custom installer): {e!r}') from e
     if isinstance(resolved, type) and issubclass(resolved, nn.Module):
         _replace_class(model, resolved, impl)
+    elif isinstance(impl, type) and issubclass(impl, nn.Module) and isinstance(owner, type):
+        # function target (e.g. ``...Experts.forward``) with a Module-class impl
+        # (e.g. liger's LigerExperts): setattr'ing a class onto ``forward`` would
+        # fail on first call -> replace the owner class instead
+        _replace_class(model, owner, impl)
     else:
         setattr(owner, final_attr, impl)
     return True
@@ -211,8 +220,9 @@ def kernelize(model: nn.Module, mapping: dict | None = None) -> nn.Module:
       - ``type[nn.Module]``: replace ``m.__class__`` for every module of the
         exact type (no subclass walking).
       - ``str`` dotted path: resolved by the default installer — an
-        ``nn.Module`` subclass resolves to class replacement, anything else
-        (module function / class method) to ``setattr``. Unresolvable
+        ``nn.Module`` subclass resolves to class replacement; a Module-class
+        impl on a function target (e.g. ``...Experts.forward``) replaces the
+        owner class; anything else resolves to ``setattr``. Unresolvable
         ``transformers.*`` family paths are skipped: DEBUG on the default
         path, WARNING (with typo hint) for explicit mappings.
 

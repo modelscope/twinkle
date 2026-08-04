@@ -88,7 +88,7 @@ class LigerRMSNormGemma4Replacement(_LigerRMSNormBase):
 
     Note: Gemma4RMSNorm has a ``with_scale=False`` variant (no weight, used for
     attention ``v_norm``). That path falls back to a plain torch RMSNorm; this
-    adapter is only wired onto the scale-bearing variants — see ``liger_builtin``.
+    adapter is only wired onto the scale-bearing variants — see ``config.py``.
     """
 
     _liger_offset = 0.0
