@@ -231,7 +231,7 @@ class AgentEnv(Env):
         """
         name = tool_info.get('function', {}).get('name')
         if not name:
-            raise ValueError("tool_info must contain function.name, got: {!r}".format(tool_info))
+            raise ValueError(f'tool_info must contain function.name, got: {tool_info!r}')
         self._custom_tools = [t for t in self._custom_tools if t['function']['name'] != name]
         self._custom_tools.append(tool_info)
         self._custom_handlers[name] = handler
