@@ -311,7 +311,7 @@ class TestCLIEndToEnd:
         args = CLI.from_args(argv=[
             '--critic_model_gpus',
             '2',
-            '--ppo_epochs',
+            '--num_train_epochs',
             '3',
             '--gamma',
             '0.99',
@@ -326,7 +326,7 @@ class TestCLIEndToEnd:
             '0.1',
         ])
         assert args.infra.critic_model_gpus == 2
-        assert args.rl.ppo_epochs == 3
+        assert args.training.num_train_epochs == 3
         assert args.rl.gamma == pytest.approx(0.99)
         assert args.rl.gae_lambda == pytest.approx(0.9)
         assert args.rl.kl_coef == pytest.approx(0.01)

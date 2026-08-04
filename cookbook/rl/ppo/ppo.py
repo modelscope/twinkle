@@ -40,7 +40,9 @@ MAX_STEPS = args.training.max_steps or 200
 BATCH_SIZE = args.training.batch_size or 4
 MINI_BATCH_SIZE = args.training.mini_batch_size or 4
 MICRO_BATCH_SIZE = args.training.micro_batch_size or 1
-PPO_EPOCHS = args.rl.ppo_epochs
+# Number of policy/value updates over each rollout batch.  Reuse the common
+# training argument whaohile preserving PPO's historical default.
+PPO_EPOCHS = args.training.num_train_epochs if args.training.num_train_epochs is not None else 4
 SAVE_STEPS = args.training.save_steps or 50
 ADAPTER_NAME = args.lora.adapter_name or 'default'
 

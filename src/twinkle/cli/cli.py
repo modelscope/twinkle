@@ -207,7 +207,6 @@ class RLArgs:
     gkd_temperature: float = 1.0
     gkd_topk: int = 64
     router_replay_mode: Literal['disabled', 'R2', 'R3'] = 'disabled'
-    ppo_epochs: int = 4
     gamma: float = 1.0
     gae_lambda: float = 0.95
     kl_coef: float = 0.0
