@@ -108,7 +108,12 @@ def main():
     policy.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     policy.set_optimizer('AdamW', lr=POLICY_LR)
     policy.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
-    policy.set_loss('PPOLoss', epsilon=args.loss.epsilon, entropy_coef=args.loss.entropy_coef)
+    policy.set_loss(
+        'PPOLoss',
+        epsilon=args.loss.epsilon,
+        entropy_coef=args.loss.entropy_coef,
+        loss_agg_mode='token-mean',
+    )
     policy.add_metric(PPOMetric, epsilon=args.loss.epsilon)
     policy.set_processor(InputProcessor)
     policy.set_template('Qwen3_5Template', model_id=MODEL_ID)

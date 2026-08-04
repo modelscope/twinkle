@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
@@ -309,8 +309,32 @@ class PPOLoss(GRPOLoss):
 
     PPO and GRPO share the same clipped policy objective. The algorithms differ
     in how advantages are produced, so this class provides the PPO-facing name
-    without maintaining a second implementation.
+    while using PPO-specific loss aggregation.
+
+    Args:
+        loss_agg_mode: ``'token-mean'`` averages over every valid response
+            token. ``'seq-mean-token-mean'`` averages tokens within each
+            sequence and then averages the sequences.
     """
+
+    _LOSS_AGG_MODES = {'token-mean', 'seq-mean-token-mean'}
+
+    def __init__(self, loss_agg_mode: Literal['token-mean', 'seq-mean-token-mean'] = 'token-mean', **kwargs):
+        super().__init__(**kwargs)
+        if loss_agg_mode not in self._LOSS_AGG_MODES:
+            raise ValueError(f'Unsupported PPO loss_agg_mode: {loss_agg_mode}. '
+                             f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
+        self.loss_agg_mode = loss_agg_mode
+
+    def _aggregate_loss(
+        self,
+        per_token_loss: 'torch.Tensor',
+        loss_mask: 'torch.Tensor',
+        **kwargs,
+    ) -> 'torch.Tensor':
+        if self.loss_agg_mode == 'token-mean':
+            return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+        return super()._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
 
 class GSPOLoss(GRPOLoss):

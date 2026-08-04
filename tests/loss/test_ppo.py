@@ -16,6 +16,19 @@ def test_ppo_policy_loss_reuses_grpo_objective():
     torch.testing.assert_close(ppo, grpo)
 
 
+def test_ppo_loss_aggregation_modes():
+    per_token_loss = torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0]])
+    loss_mask = torch.tensor([[True, True, False], [True, True, True]])
+
+    token_mean = PPOLoss()._aggregate_loss(per_token_loss, loss_mask)
+    sequence_mean = PPOLoss(loss_agg_mode='seq-mean-token-mean')._aggregate_loss(per_token_loss, loss_mask)
+
+    # token-mean: (1 + 3 + 2 + 4 + 6) / 5
+    torch.testing.assert_close(token_mean, torch.tensor(3.2))
+    # seq-mean-token-mean: ((1 + 3) / 2 + (2 + 4 + 6) / 3) / 2
+    torch.testing.assert_close(sequence_mean, torch.tensor(3.0))
+
+
 def test_value_loss_without_clipping():
     values = torch.tensor([[0.0, 1.0, 10.0]], requires_grad=True)
     result = PPOValueLoss(epsilon=0.2)(
