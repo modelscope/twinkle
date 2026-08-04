@@ -76,13 +76,15 @@ def train():
     if not _torch_baseline:
         model = kernelize(model)
 
-    # `--enable-liger` turns on BOTH the per-layer Liger/CANN kernels (above)
-    # AND, by default (`enable_fused_ce=True`), the LigerFusedLinearCrossEntropyLoss
-    # which skips the lm_head GEMM so the (B,T,V) logits tensor is never materialised.
-    # The forward then runs under task='fused_lm_ce' (TransformersFusedCEPatch).
-    # Pass `--no-fused-ce` to keep only the per-layer kernels (standard CE loss).
-    # The loss is device-agnostic: on NPU/CUDA it auto-falls-back to materialised
-    # CE if the fused kernel raises for a given shape (defensive).
+    # `--enable-liger` gates ONLY the fused-CE loss here — per-layer kernels
+    # above come from kernelize(model)'s default config regardless of the flag.
+    # With `enable_fused_ce=True` (default) it enables the
+    # LigerFusedLinearCrossEntropyLoss, which skips the lm_head GEMM so the
+    # (B,T,V) logits tensor is never materialised; the forward then runs under
+    # task='fused_lm_ce' (TransformersFusedCEPatch). Pass `--no-fused-ce` to
+    # keep the standard CE loss. The loss is device-agnostic: on NPU/CUDA it
+    # auto-falls-back to materialised CE if the fused kernel raises for a
+    # given shape (defensive).
     _use_fused_ce = args.model.enable_liger and args.model.enable_fused_ce
     _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
 

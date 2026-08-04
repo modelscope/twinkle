@@ -38,11 +38,12 @@ class ModelArgs:
     # Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
     enable_liger: bool = False
     # Fused-linear-CE loss toggle. Only meaningful when `enable_liger` is True.
-    # Defaults True so `--enable-liger` turns on BOTH the per-layer Liger/CANN
-    # kernels AND the LigerFusedLinearCrossEntropyLoss (skip-lm_head-GEMM, no
-    # (B,T,V) logits). Pass `--no-fused-ce` to opt out of the fused-CE loss and
-    # keep only the per-layer kernels (the loss falls back to standard CE). The
-    # loss itself is device-agnostic: on NPU/CUDA it auto-falls-back to
+    # Defaults True so `--enable-liger` alone turns on the
+    # LigerFusedLinearCrossEntropyLoss (skip-lm_head-GEMM, no (B,T,V) logits).
+    # Pass `--no-fused-ce` to opt out (the loss falls back to standard CE).
+    # Note: per-layer kernels are NOT gated by these flags — they come from
+    # kernelize(model)'s default config (NPU: CANN-first chains). The loss
+    # itself is device-agnostic: on NPU/CUDA it auto-falls-back to
     # materialised CE if the fused kernel raises for a given shape.
     enable_fused_ce: bool = True
 
