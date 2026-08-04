@@ -78,7 +78,7 @@ manager = ToolManager(env_tools)
 | `from_env(env)` | Factory: creates one `EnvTool` per tool in `env.tools()`. |
 | `last_result` | Stores the most recent `StepResult` for inspection. |
 | `done` | Property: whether the last step terminated the episode. |
-| `episode_reward` | Property: cumulative reward from `info['episode_reward']`. |
+| `episode_reward` | Property: cumulative reward from `info['episode_reward']`, falling back to the last step's `reward`. |
 
 ### Manual Construction
 
@@ -135,6 +135,8 @@ result = env.step('play', {'action': 'hit'})
 | `action_cls` | `str` or class | Explicit Action class; auto-discovered from `env_name` when omitted. |
 | `action_mapper` | `Callable` | `(tool_name, arguments) -> action`. Defaults to passing the tool arguments as Action fields. |
 
+Note that embedded `OpenEnv` does not implement `tools()`, so it inherits the base class's empty list and `EnvTool.from_env(env)` falls back to a single generic `env_action` tool. Pass explicit schemas to `EnvTool` (or subclass and override `tools()`) when the model needs to see the real action names.
+
 ### Mode 2: Server `OpenEnvClient`
 
 First, run the OpenEnv environment as an ordinary HTTP/WebSocket service on the environment host (no Docker required):
@@ -180,11 +182,11 @@ Additional capabilities:
 - `execute(action)`: send an action and return the server's **raw** `StepResult`, so you can read typed fields such as `exit_code`. The training loop uses it to run scoring code inside the same session.
 - `episode_reward` / `last_result` / `client`: cumulative reward, last raw result, and the underlying synchronous client.
 
-**Capacity and concurrency**: `OpenEnvClient` calls the OpenEnv client's `.sync()`, giving every instance a dedicated background event loop, so a thread pool of concurrent resets/steps is safe. But the server must have room for every concurrent session: the environment class has to declare `SUPPORTS_CONCURRENT_SESSIONS = True` and `create_app(..., max_concurrent_envs=N)` must be large enough, otherwise extra connections are rejected. OpenEnv's bundled `coding_env` is **single-session** by default (`SUPPORTS_CONCURRENT_SESSIONS = False`) and needs to be subclassed to lift that; `cookbook/rl/openenv_code/server_app.py` shows the full pattern.
+**Capacity and concurrency**: `OpenEnvClient` calls the OpenEnv client's `.sync()`, giving every instance a dedicated background event loop, so a thread pool of concurrent resets/steps is safe. But the server must have room for every concurrent session: the environment class has to declare `SUPPORTS_CONCURRENT_SESSIONS = True` and `create_app(..., max_concurrent_envs=N)` must be large enough, otherwise extra connections are rejected. Total capacity is `workers x max_concurrent_envs`, since the limit applies per worker process. OpenEnv's bundled `coding_env` leaves `SUPPORTS_CONCURRENT_SESSIONS` at the conservative default and needs to be subclassed to lift it (`create_app` raises `ConcurrencyConfigurationError` for `max_concurrent_envs > 1` otherwise); `cookbook/rl/openenv_code/server_app.py` shows the full pattern.
 
 ### Usage with Rollout
 
-Downstream usage is identical for both modes:
+Downstream usage is the same for both modes:
 
 ```python
 from twinkle_agentic.envs.env_tool import EnvTool
@@ -202,11 +204,94 @@ rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
 results = rollout(trajectories)
 ```
 
-See [Agentic RL Best Practices](../../Usage%20Guide/Agentic-RL-Best-Practices.md) for an end-to-end multi-turn GRPO example.
+See [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md) for an end-to-end multi-turn GRPO example.
+
+## AgentEnv: Firecracker microVM Sandboxes
+
+`AgentEnv` is a client-side `Env` over an [AgentENV](https://github.com/kvcache-ai/AgentENV) deployment, which runs Firecracker microVM sandboxes behind an E2B-compatible HTTP API. One sandbox is created per episode, giving the model **real operating-system semantics**: a genuine CPython interpreter, a writable filesystem, subprocesses, and `pip install`.
+
+Compared with the OpenEnv adapters:
+
+| | `OpenEnvClient` | `AgentEnv` |
+|---|---|---|
+| Isolation | Process / container | microVM (KVM), destroyed on teardown |
+| Executor | smolagents AST interpreter | Real CPython |
+| Memory per environment | KBs | ~1GB |
+| Files / pip / subprocesses | Not supported | Supported |
+| Transport | Persistent WebSocket | Stateless HTTP (E2B SDK) |
+| Prerequisites | An OpenEnv service | AgentENV server + a built template + `/dev/kvm`, kernel 6.8+ |
+
+OpenEnv's `coding_env` runs on smolagents' `LocalPythonExecutor`, **an AST interpreter rather than an OS-level sandbox**. It does not handle `decorator_list` at all, so **decorators are silently ignored**: `@patch` has no effect, the test does not error, and the reward comes out as a plausible-looking wrong number. Such silent errors are harder to diagnose than a crash. It is a good fit for enforcing an import allowlist, but not for executing adversarial code. When tests rely on decorators, or the model must write files, install packages, or spawn subprocesses, use `AgentEnv`.
+
+Three things must be in place before training (all one-time, outside the training loop): the AgentENV server is deployed, a template is built (`aenv pull ubuntu:22.04 --name my-env`), and `pip install e2b` has been run on the training side.
+
+```python
+from twinkle_agentic.envs import AgentEnv
+
+env = AgentEnv(
+    template='my-env',                     # Template built beforehand with the aenv CLI
+    api_url='http://10.0.0.5:8000',        # Server or gateway; falls back to E2B_API_URL
+    sandbox_timeout=600,                   # Must outlast one episode plus any test replay
+)
+env.reset()                                # Boots a fresh sandbox; the scheduler picks the node
+result = env.step('run_command', {'command': 'python -c "print(1 + 1)"'})
+print(result.observation)                  # '2'
+env.close()                                # Kills the sandbox
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `template` | `str` | AgentENV template name/ID. Required — build it first via `aenv build` / `aenv pull`. |
+| `api_url` | `str` | Server or gateway base URL. Falls back to `E2B_API_URL`. |
+| `api_key` | `str` | Any non-empty string works, since AgentENV performs no authorization. Falls back to `E2B_API_KEY`, defaulting to `'dummy'`. |
+| `sandbox_timeout` | `int` | Sandbox idle timeout in seconds, default 300. Idle sandboxes are **paused**, not killed, and auto-resume on access. |
+| `command_timeout` | `int` | Per-command timeout in seconds, default 120. |
+| `setup_commands` | `List[str]` | Commands run once after each `reset`; their output becomes the reset observation. |
+| `sandbox_envs` | `Dict[str, str]` | Environment variables injected into the sandbox. |
+| `metadata` | `Dict[str, str]` | Sandbox metadata, visible in the list APIs — useful for tagging a run name or trajectory id. |
+| `refresh_timeout` | `bool` | Extend the timeout after every step, default `True`, so long episodes are not paused mid-flight. |
+| `include_default_tools` | `bool` | Expose the built-in `run_command` / `write_file` / `read_file`, default `True`. |
+
+### Registering task tools
+
+The AgentENV server defines no tools of its own; it only provides capability primitives (arbitrary command execution, file I/O, port proxying). Tools are therefore a purely client-side concept, registered in one of two ways:
+
+```python
+# 1. Shell command template, formatted with the tool arguments
+env.register_command_tool(
+    {'type': 'function', 'function': {
+        'name': 'run_tests',
+        'description': 'Run the task test suite.',
+        'parameters': {'type': 'object',
+                       'properties': {'test_file': {'type': 'string'}},
+                       'required': ['test_file']}}},
+    'cd /workspace && pytest {test_file} -x -q')
+
+# 2. Arbitrary Python handler: handler(env, arguments) -> str
+def _submit(env, arguments):
+    env.submitted_code = arguments.get('code', '')
+    return 'Solution submitted.'
+
+env.register_tool(submit_schema, _submit)      # Both return self, so calls can be chained
+```
+
+Setting `include_default_tools=False` hides the built-ins so the action space matches the task exactly, which keeps reward attribution clean. A registered tool whose name collides with a built-in overrides it.
+
+Additional capabilities:
+
+- `run_command(arguments)`: public, so custom handlers can reuse it. A non-zero exit code is **not** raised; stdout, stderr, and the exit code are formatted into the observation so the model can react to the failure.
+- `sandbox` / `sandbox_id`: the underlying E2B handle (giving access to PTY, file watching, and similar) and the current sandbox id.
+- Observations are truncated to 32K characters to keep a runaway command from blowing up the context.
+
+**Error handling and rewards**: `step` never raises. Tool errors come back as `observation='Error: ...'` with `done=False`, letting the rollout loop continue or the model recover, bounded by `max_turns`. The sandbox produces no reward — `evaluate` returns zeros by default — so score trajectories in the training loop, or subclass and override `step` / `evaluate`.
+
+**Concurrency**: unlike `OpenEnv` / `EnvPool`, `AgentEnv` is deliberately **not** a `@remote_class`. Sandbox placement, load balancing, pause/resume, and node failover are all handled server-side by AgentENV's gateway/scheduler/orchestrator, so the adapter is a stateless HTTP client that can be instantiated directly inside rollout workers. Do **not** wrap it in `EnvPool`. Because `reset()` blocks on a network call while a sandbox boots, create trajectories concurrently from a thread pool.
+
+The primary capacity constraint is memory: concurrent sandboxes equal `batch_size x num_generations`, and each consumes the template's `--memory-mb` (the cookbook builds with `--memory-mb 1024`). See [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md) for the deployment steps, memory budget, and troubleshooting.
 
 ## EnvPool: Distributed Environment Pool
 
-`EnvPool` is a `@remote_class` that shards `pool_size` **embedded** `OpenEnv` instances across Ray workers. Each worker manages `pool_size // world_size` slots, and `reset` / `step` are routed to the owning worker automatically via `remote_function`.
+`EnvPool` is a `@remote_class` that shards `pool_size` **embedded** `OpenEnv` instances across Ray workers. Each worker manages `ceil(pool_size / world_size)` slots (the last shard is clipped to `pool_size`, so it may hold fewer), and `reset` / `step` are routed to the owning worker automatically via `remote_function`.
 
 ```python
 from twinkle_agentic.envs.openenv import EnvPool
@@ -226,10 +311,10 @@ env_tools = EnvTool.from_env(envs[0])
 |--------|-------------|
 | `reset(idx)` / `step(idx, tool_name, arguments)` | Operate on a single slot. |
 | `reset_batch(indices)` / `step_batch(indices, tool_names, arguments_list)` | Batch operations covering many slots in one RPC, returned in `indices` order. |
-| `get_adapters(n)` | Wrap the first `n` slots as `EnvPoolAdapter` (a standard `Env`) on the driver side. |
+| `get_adapters(n)` | Wrap the first `n` slots as `EnvPoolAdapter` (a standard `Env`) on the driver side. Raises if `n > pool_size`. |
 | `close()` | Close all environments. |
 
-`EnvPoolAdapter` implements the standard `Env` interface and proxies `reset` / `step` to the owning worker. On a `step` failure it returns `done=True` with the error in `info['error']`, so one broken environment does not stall the whole rollout batch.
+`EnvPoolAdapter` implements the standard `Env` interface and proxies `reset` / `step` to the owning worker. On a `step` failure it returns `done=True` with the error in `info['error']`, so one broken environment does not stall the whole rollout batch. Its own `close()` is a no-op — release resources through the pool's `close()`.
 
 ## Implementing a Custom Environment
 

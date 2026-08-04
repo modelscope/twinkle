@@ -14,9 +14,7 @@ Twinkle DOCUMENTATION
    Usage Guide/Server and Client/index.rst
    Usage Guide/NPU-Support.md
    Usage Guide/Train-as-a-Service.md
-   Usage Guide/Agentic-RL-Sandbox.md
-   Usage Guide/Agentic-RL-Best-Practices.md
-   Usage Guide/Agentic-RL-Deployment.md
+   Usage Guide/Agentic-RL-Deployment-and-Training.md
    Usage Guide/Introduction-with-Qwen3.5.md
    Usage Guide/Embedding-Training.md
 

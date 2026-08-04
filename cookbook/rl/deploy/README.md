@@ -2,7 +2,7 @@
 
 Network and supervision templates for the three runnable examples in
 `cookbook/rl/`. Full reasoning and the selection matrix live in the
-[Agentic RL Deployment Guide](../../../docs/source_en/Usage%20Guide/Agentic-RL-Deployment.md).
+[Agentic RL Deployment and Training](../../../docs/source_en/Usage%20Guide/Agentic-RL-Deployment-and-Training.md).
 
 ## Which example do I run?
 

@@ -103,6 +103,7 @@ sh INSTALL_MEGATRON.sh
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)
 
 ## 更新日志
+- 🎉2026-08-04 支持沙箱环境下的多轮RL训练：模型生成的代码可在隔离的 [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVM 或 OpenEnv 服务中执行，两个后端共用同一份 `train.py`。参考 [cookbook](cookbook/rl/env) 和[部署文档](docs/source_zh/使用指引/Agentic%20RL部署与训练.md)。
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
 - 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用`from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout`进行多轮rollout。
 - 🎉2026-05-20 支持训练任务失败后的IM消息告警, 使用方式: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`。
