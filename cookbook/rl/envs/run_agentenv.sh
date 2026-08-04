@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 export CODE_RL_BACKEND=agentenv
 # LOCAL AgentENV instance or:
-# ssh -N -L 8000:127.0.0.1:8000 root@xx.xx.xx.xx 
+# ssh -N -L 8000:127.0.0.1:8000 root@xx.xx.xx.xx
 # if you can connect the agent env server by ssh
 export AENV_API_URL="${AENV_API_URL:-http://127.0.0.1:8000}"
 export AENV_TEMPLATE="${AENV_TEMPLATE:-twinkle-code}"
