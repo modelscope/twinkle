@@ -329,12 +329,50 @@ aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
 # API key: dummy          # 本地部署任意非空字符串即可
 
-aenv build cookbook/rl/code_rl/Dockerfile -t twinkle-code --cpu-count 1 --memory-mb 1024
+aenv build cookbook/rl/env/agentenv_server/Dockerfile -t twinkle-code --cpu-count 1 --memory-mb 1024
 aenv template watch <template-id>      # 等到 ready
 aenv template list                     # 确认模板存在
 ```
 
 `aenv build` 支持 `FROM / RUN / ENV / WORKDIR / USER`（`ENTRYPOINT` 转为启动命令；`EXPOSE / VOLUME / LABEL` 被忽略）。只在 Dockerfile 变化时才需要重新构建。不加工直接用现成镜像：`aenv pull ubuntu:22.04 --name ubuntu`。
+
+拉镜像、转 overlaybd 都在**服务端**做，本机不需要 docker。别名不可改绑，报 `alias 'xxx' already points to ...` 就先 `aenv template delete xxx`。
+
+**国内网络下默认的 Dockerfile 两行都拉不到，得各自换镜像。**
+
+基础镜像：服务端只按 `[image.resolver] search_registries` 搜，默认 `docker.io` / `ghcr.io`——前者 `dial tcp ...: i/o timeout`，后者 401。写全限定名绕开搜索列表，**`library/` 不能省**（官方镜像在 Hub 上的真实路径是 `library/python`）：
+
+```dockerfile
+FROM docker.1panel.live/library/python:3.11-slim
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+RUN pip install --no-cache-dir numpy sympy
+```
+
+先探一下哪个站能用，别白跑一次 build。200 和 401 都算可达（401 是要先取 token，正常），超时就换下一个：
+
+```bash
+for R in docker.1panel.live docker.m.daocloud.io docker.1ms.run; do
+    printf "%-24s " "$R"
+    timeout 15 curl -s -o /dev/null -w '%{http_code}\n' \
+        "https://$R/v2/library/python/manifests/3.11-slim"
+done
+```
+
+这三个是第三方公益站，随时可能挂或限速；长期用把镜像转存到自己的 ACR（阿里云个人版免费，且在 VPC 内网）。
+
+pip：沙箱内同样连不上 pypi.org，`ENV PIP_INDEX_URL` 必须设，而且要写在 `RUN pip install` **之前**。
+
+构建失败用 `aenv template watch <id>` 看原因。两个常见的：
+
+- `all registry candidates failed during manifest fetch` —— 基础镜像拉不到，按上面换 `FROM`。
+- `overlaybd-commit ... failed to perform commit(), 2: No such file or directory` —— 拉到了但转换失败。先确认 `FROM` 是不是指错了（几十 GB、上百层的大镜像容易卡在这里）；确认没错再查 overlaybd 装没装全：`/var/lib/aenv/deps/overlaybd/bin/` 应有 create / apply / commit / resize 四个，`/etc/overlaybd/overlaybd.json` 应存在。
+
+日志里的 `open /root/.regctl/config.json: permission denied` 只是 WARN（server 降权成 `aenv` 却去读 root 家目录），拉公开镜像不受影响；但要配私有 registry 凭据就得先给它一个可写 HOME：
+
+```bash
+sudo install -d -o aenv -g aenv /var/lib/aenv/home
+# 启动时 $E 里加 HOME=/var/lib/aenv/home
+```
 
 复杂工具的实现也建议烤进模板，工具 handler 只是一行调用：
 
@@ -481,7 +519,7 @@ always_denied_cidrs = [
 
 #### 1. 工具：模型看到什么
 
-只暴露两个工具（`backends/openenv.py` / `backends/agentenv.py`）：
+只暴露两个工具（`cookbook/rl/env/_openenv.py` / `_agentenv.py`）：
 
 - `run_python(code)` —— 在环境里执行代码。
 - `submit_solution(code)` —— **不发给服务端**，用 `register_tool` 在客户端本地处理，只把最终源码记在 env 上，供训练循环打分。
@@ -631,7 +669,7 @@ sh run_openenv.sh --batch-size 8 --num-generations 16 --max-steps 500
 | `SANDBOX_TIMEOUT` | `600` | 沙箱空闲超时（秒） |
 | `AENV_COMMAND_TIMEOUT` | `60` | 沙箱内单条命令超时（秒） |
 
-训练超参（`--model-gpus`/`--batch-size`/`--num-generations` 等）走 CLI 参数，默认值在 `common_args.sh`——两个后端共用同一份，这样奖励的变化才能归因到执行后端而不是超参差异。
+训练超参（`--model-gpus`/`--batch-size`/`--num-generations` 等）走 CLI 参数，默认值写在各自的 `run_*.sh` 里。两个后端的 `TRAIN_ARGS` 要保持一致，否则奖励的变化无法归因到执行后端而不是超参差异。
 
 #### 指标
 
