@@ -401,8 +401,8 @@ class OpenEnvClient(Env):
     # Tool registration
     # ------------------------------------------------------------------
 
-    def register_tool(self, tool_info: ToolInfo,
-                      handler: Callable[['OpenEnvClient', Dict[str, Any]], str]) -> 'OpenEnvClient':
+    def register_tool(self, tool_info: ToolInfo, handler: Callable[['OpenEnvClient', Dict[str, Any]],
+                                                                   str]) -> 'OpenEnvClient':
         """Register a tool handled locally instead of being sent to the server.
 
         Useful for bookkeeping tools such as ``submit_solution``, which record
@@ -448,8 +448,8 @@ class OpenEnvClient(Env):
             except Exception as e:  # noqa
                 logger.warning(f'OpenEnvClient handler error (tool={tool_name}): {e}')
                 observation = f'Error: {e}'
-            return StepResult(observation=observation, reward=0.0, done=False,
-                              info={'episode_reward': self._episode_reward})
+            return StepResult(
+                observation=observation, reward=0.0, done=False, info={'episode_reward': self._episode_reward})
         try:
             result = self.execute(self._build_action(tool_name, arguments))
         except Exception as e:  # noqa
