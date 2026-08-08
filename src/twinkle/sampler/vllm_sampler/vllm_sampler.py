@@ -481,6 +481,60 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._run_in_loop(_receive_and_load())
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def load_weights_from_path(self, path: Optional[str] = None):
+        """Reload base weights into the running vLLM engine directly from a checkpoint.
+
+        Unlike :meth:`receive_weights`, this does **not** involve the training model:
+        weights are read from disk and streamed straight into vLLM. This is what makes
+        it possible to restore the sampler to a known checkpoint without a trainer
+        round-trip -- no ``save``/``load`` on the training model, so training weights
+        and optimizer state are never touched.
+
+        Weights are yielded **lazily** one tensor at a time (never materialising a full
+        state dict) because ``VLLMEngine.update_weights`` accepts a generator and packs
+        tensors into fixed-size transfer buckets itself. Tensors stay on CPU, so the
+        engine takes its shared-memory path rather than CUDA IPC.
+
+        Names are passed through untouched: safetensors files already store canonical
+        HF names, which is exactly what the worker's ``model.load_weights()`` expects
+        (it does the q/k/v -> qkv and gate/up -> gate_up stacking internally).
+
+        Args:
+            path: Local checkpoint dir or a hub model id. Defaults to the ``model_id``
+                the sampler was constructed with, i.e. the original pretrained weights.
+        """
+        import glob
+        import json
+        from safetensors import safe_open
+
+        path = path or self.model_id
+        checkpoint_dir = path if os.path.exists(path) else HubOperation.download_model(path)
+
+        index_path = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+        if os.path.exists(index_path):
+            with open(index_path, encoding='utf-8') as f:
+                weight_map = json.load(f)['weight_map']
+            shards = [os.path.join(checkpoint_dir, s) for s in sorted(set(weight_map.values()))]
+        else:
+            shards = sorted(glob.glob(os.path.join(checkpoint_dir, '*.safetensors')))
+        if not shards:
+            raise FileNotFoundError(f'No .safetensors weights found under {checkpoint_dir}')
+
+        def _iter_weights():
+            # safe_open + get_tensor reads one tensor at a time (mmap-backed), so peak
+            # host memory is a single tensor rather than the whole shard.
+            for shard in shards:
+                with safe_open(shard, framework='pt', device='cpu') as f:
+                    for name in f.keys():
+                        yield name, f.get_tensor(name)
+
+        self._run_in_loop(self.engine.update_weights(_iter_weights(), base_sync_done=False))
+        # A base-model load invalidates any previously synced LoRA adapter, mirroring
+        # the `not base_sync_done` branch of receive_weights().
+        self.engine.invalidate_synced_lora()
+        logger.info(f'Reloaded base weights from {checkpoint_dir} ({len(shards)} shard(s))')
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):
         """Gracefully shutdown the vLLM engine and background event loop.
 
