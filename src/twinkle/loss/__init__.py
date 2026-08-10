@@ -8,7 +8,8 @@ from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, 
 from .infonce import InfonceLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .mse import MSELoss
-from .value import PPOValueLoss
+from .sao import SAOLoss
+from .value import PPOValueLoss, SAOValueLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -21,6 +22,8 @@ torch_loss_mapping = {
     'grpo': GRPOLoss,
     'ppo': PPOLoss,
     'ppo_value': PPOValueLoss,
+    'sao': SAOLoss,
+    'sao_value': SAOValueLoss,
     'gspo': GSPOLoss,
     'sapo': SAPOLoss,
     'cispo': CISPOLoss,

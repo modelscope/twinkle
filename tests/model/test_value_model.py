@@ -74,3 +74,15 @@ def test_value_model_forward_only_returns_values():
     assert outputs['values'].shape == (1, 3)
     assert outputs.get('logps') is None
     assert not outputs['values'].requires_grad
+
+
+def test_freeze_attention_keeps_mlp_and_value_head_trainable():
+    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+    summary = model.freeze_attention_for_value_training()
+    assert summary['attention_modules'] == 1
+    backbone = model.model.transformer.h[0]
+    assert all(not parameter.requires_grad for parameter in backbone.attn.parameters())
+    assert any(parameter.requires_grad for parameter in backbone.mlp.parameters())
+    assert all(parameter.requires_grad for parameter in model.model.get_output_embeddings().parameters())
+    counts = model.trainable_parameter_summary()
+    assert counts['frozen_parameters'] == summary['frozen_parameters']

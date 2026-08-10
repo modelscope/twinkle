@@ -94,6 +94,7 @@ sh INSTALL_MEGATRON.sh
 | Multimodal FSDP finetuning           | transformers    | [Script](cookbook/mm/fsdp2.py)                         |
 | GRPO RL training                     | megatron        | [Script](cookbook/rl/grpo/grpo.py)                          |
 | PPO RL training                      | transformers    | [Script](cookbook/rl/ppo/ppo.py)                            |
+| SAO synchronous correctness baseline | transformers    | [Script](cookbook/rl/sao/sao_sync.py) / [Guide](cookbook/rl/sao/README.md) |
 | GRPO Multimodal RL training          | megatron        | [Script](cookbook/rl/grpo/grpo_mm.py)                       |
 | GRPO Math RL training                | megatron        | [Script](cookbook/rl/grpo/short_math_grpo.py)               |
 | DPO full-parameter training          | transformers    | [Script](cookbook/rl/dpo/dpo_full.py)                      |
