@@ -4,11 +4,11 @@ from __future__ import annotations
 import inspect
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from dataclasses import dataclass
 from torch import nn
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from twinkle.kernel.ops import ep_forward
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
 
@@ -329,53 +329,6 @@ def patch_forward(
 def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
     if getattr(experts_mod, '_ep_forward_installed', False):
         return
-
-    def ep_forward(
-        self,
-        permuted_tokens: torch.Tensor,
-        num_global_sum_tokens_per_local_expert: torch.Tensor,
-        experts_per_rank: int,
-    ) -> torch.Tensor:
-        if permuted_tokens.numel() == 0:
-            # Preserve the autograd edge to token_pre_all2all. Returning a new
-            # empty tensor can make this rank skip the matching backward
-            # all-to-all, causing EP collective order divergence.
-            return permuted_tokens
-
-        input_dtype = permuted_tokens.dtype
-
-        cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
-        for i in range(experts_per_rank):
-            cumsum[i + 1] = cumsum[i] + int(num_global_sum_tokens_per_local_expert[i].item())
-
-        output_chunks = []
-        for i in range(experts_per_rank):
-            start = int(cumsum[i].item())
-            end = int(cumsum[i + 1].item())
-            expert_in = permuted_tokens[start:end]
-            if expert_in.numel() == 0:
-                output_chunks.append(expert_in)
-                continue
-
-            gate_up = self.gate_up_proj[i]
-            down = self.down_proj[i]
-            compute_dtype = gate_up.dtype
-            if expert_in.dtype != compute_dtype:
-                expert_in = expert_in.to(compute_dtype)
-            gate_up_out = F.linear(expert_in, gate_up)
-            if hasattr(self, '_apply_gate'):
-                out = self._apply_gate(gate_up_out)
-            else:
-                gate, up = gate_up_out.chunk(2, dim=-1)
-                out = self.act_fn(gate) * up
-            out = F.linear(out, down)
-
-            if out.dtype != input_dtype:
-                out = out.to(input_dtype)
-            output_chunks.append(out)
-
-        return torch.cat(
-            output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(0, permuted_tokens.size(-1))
 
     import types
     experts_mod.forward = types.MethodType(ep_forward, experts_mod)

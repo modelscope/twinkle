@@ -1,8 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""OpenEnv adapter and distributed EnvPool.
+"""OpenEnv adapters (embedded + server mode) and distributed EnvPool.
 
-- ``OpenEnv``: embedded adapter that replaces the HTTP server, implements ``Env``
-- ``EnvPool``: distributed pool with ``@remote_class`` (Ray worker pool)
+OpenEnv environments can be consumed in two ways:
+
+- **Embedded** (:class:`OpenEnv`): the environment object is instantiated
+  in-process, bypassing OpenEnv's FastAPI server. Zero network overhead, no
+  isolation. Shard it across Ray workers with :class:`EnvPool`.
+- **Server** (:class:`OpenEnvClient`): connect to a running OpenEnv server
+  over its WebSocket protocol. The environment runs in a separate process or
+  container, one server hosts many concurrent sessions. Do NOT wrap this in
+  ``EnvPool`` — a session lives on the server, so Ray sharding buys nothing.
+
 - ``EnvPoolAdapter``: wraps a single pool slot as a standard ``Env``
 """
 import importlib
@@ -14,6 +22,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function
+from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
 from .base import Env, StepResult
 
@@ -204,6 +213,313 @@ class OpenEnv(Env):
     def close(self) -> None:
         if hasattr(self._env, 'close'):
             self._env.close()
+
+
+# ==========================================================================
+# OpenEnvClient: server mode (WebSocket session against a running server)
+# ==========================================================================
+
+_DEFAULT_CODE_TOOL: ToolInfo = {
+    'type': 'function',
+    'function': {
+        'name': 'run_python',
+        'description': 'Execute Python code in the environment and return its output.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'code': {
+                    'type': 'string',
+                    'description': 'Python source to execute. Must print the result.'
+                },
+            },
+            'required': ['code'],
+        },
+    },
+}
+
+
+def _require_env_client():
+    """Import OpenEnv's EnvClient lazily with an actionable error message."""
+    try:
+        from openenv.core.env_client import EnvClient
+    except ImportError as e:
+        raise ImportError('OpenEnvClient requires the openenv package:\n'
+                          '  pip install openenv\n'
+                          'Plus the environment client package, e.g.\n'
+                          '  pip install openenv-coding_env') from e
+    return EnvClient
+
+
+def _discover_openenv_client_classes(env_name: str):
+    """Auto-discover the ``EnvClient`` subclass and Action class of a package."""
+    env_client_cls = _require_env_client()
+    try:
+        pkg = importlib.import_module(env_name)
+    except ModuleNotFoundError:
+        raise ModuleNotFoundError(f"Cannot import '{env_name}'. Install the environment package:\n"
+                                  f"  pip install openenv-{env_name.replace('_env', '').replace('_', '-')}\n"
+                                  f'Or from source:\n'
+                                  f'  pip install -e /path/to/OpenEnv/envs/{env_name}')
+
+    client_cls = None
+    action_cls = None
+    for name in getattr(pkg, '__all__', dir(pkg)):
+        obj = getattr(pkg, name, None)
+        if not isinstance(obj, type):
+            continue
+        if client_cls is None and issubclass(obj, env_client_cls) and obj is not env_client_cls:
+            client_cls = obj
+        elif action_cls is None and name.endswith('Action') and name != 'Action':
+            action_cls = obj
+
+    if client_cls is None:
+        raise ImportError(f"Cannot discover an EnvClient subclass in '{env_name}'. "
+                          f"Pass env_cls explicitly, e.g. env_cls='{env_name}:MyEnv'.")
+    return client_cls, action_cls
+
+
+def _format_client_observation(obs) -> str:
+    """Render a server observation as text for the model.
+
+    Understands the two shapes OpenEnv code environments use — flat
+    ``stdout``/``stderr``/``exit_code`` (``coding_env``) and a nested
+    ``result`` block (``repl_env``) — and falls back to the generic
+    formatter for everything else.
+    """
+    if obs is None:
+        return ''
+    inner = getattr(obs, 'result', None)
+    if inner is not None and hasattr(inner, 'stdout'):
+        obs = inner
+    if not hasattr(obs, 'stdout'):
+        return _format_observation(obs)
+
+    parts = []
+    stdout = getattr(obs, 'stdout', '') or ''
+    stderr = getattr(obs, 'stderr', '') or ''
+    if stdout:
+        parts.append(stdout)
+    if stderr:
+        parts.append(f'[stderr]\n{stderr}')
+    exit_code = getattr(obs, 'exit_code', 0) or 0
+    if exit_code:
+        parts.append(f'[exit code: {exit_code}]')
+    return '\n'.join(parts) if parts else '(no output)'
+
+
+class OpenEnvClient(Env):
+    """Env backed by one session on a running OpenEnv server.
+
+    Deliberately NOT a ``@remote_class``: a session lives server-side, so
+    every instance is just a WebSocket client and can be created directly in
+    the driver (one per trajectory, typically reset in a thread pool).
+
+    Usage::
+
+        env = OpenEnvClient(env_name='coding_env', base_url='http://host:8000')
+        result = env.reset()
+        result = env.step('run_python', {'code': 'print(1 + 1)'})
+        env.close()
+
+    The server must have capacity for every concurrent session
+    (``MAX_CONCURRENT_ENVS``), and its environment class must declare
+    ``SUPPORTS_CONCURRENT_SESSIONS = True``; otherwise extra connections are
+    rejected.
+    """
+
+    def __init__(self,
+                 env_name: Optional[str] = None,
+                 env_cls: Optional[Union[str, Type]] = None,
+                 base_url: Optional[str] = None,
+                 action_cls: Optional[Union[str, Type]] = None,
+                 action_mapper: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+                 tools: Optional[List[ToolInfo]] = None,
+                 reset_kwargs: Optional[Dict[str, Any]] = None,
+                 connect_timeout_s: float = 10.0,
+                 message_timeout_s: float = 120.0,
+                 client_kwargs: Optional[Dict[str, Any]] = None,
+                 **kwargs):
+        """
+        Args:
+            env_name: OpenEnv environment package, e.g. ``'coding_env'``. The
+                client and Action classes are auto-discovered from it.
+            env_cls: Explicit client class or ``'module:ClassName'``, used
+                instead of ``env_name``.
+            base_url: Server address, ``http(s)://`` or ``ws(s)://`` (converted
+                automatically). Falls back to ``OPENENV_BASE_URL``.
+            action_cls: Action class or ``'module:ClassName'``; auto-discovered
+                from ``env_name`` when omitted.
+            action_mapper: ``(tool_name, arguments) -> action`` (an Action
+                instance or a dict of Action fields). Defaults to passing the
+                tool arguments straight to ``action_cls``.
+            tools: Tool schemas exposed to the model. Defaults to a single
+                ``run_python(code)`` tool, matching OpenEnv's code environments.
+            reset_kwargs: Extra kwargs forwarded to the server's ``reset()``
+                (e.g. ``task_prompt`` / ``expected_answer`` for ``repl_env``).
+                Also settable per episode via the ``reset_kwargs`` attribute.
+            connect_timeout_s: WebSocket connect timeout.
+            message_timeout_s: Per-message timeout; raise it when the
+                environment runs long-executing code.
+            client_kwargs: Extra kwargs for the OpenEnv client constructor.
+        """
+        if env_cls is None and env_name is None:
+            raise ValueError("Either 'env_name' or 'env_cls' is required. "
+                             "Example: OpenEnvClient(env_name='coding_env', base_url='http://host:8000')")
+        base_url = base_url or os.environ.get('OPENENV_BASE_URL')
+        if not base_url:
+            raise ValueError("OpenEnvClient requires 'base_url' (or the OPENENV_BASE_URL env var), "
+                             'pointing at a running OpenEnv server.')
+
+        if env_cls is not None:
+            resolved_cls = _import_env_class(env_cls) if isinstance(env_cls, str) else env_cls
+        else:
+            resolved_cls, discovered_action_cls = _discover_openenv_client_classes(env_name)
+            if action_cls is None:
+                action_cls = discovered_action_cls
+
+        self._base_url = base_url
+        self._action_cls = _import_env_class(action_cls) if isinstance(action_cls, str) else action_cls
+        self._action_mapper = action_mapper
+        self._tools = list(tools) if tools is not None else [_DEFAULT_CODE_TOOL]
+        self._custom_tools: List[ToolInfo] = []
+        self._custom_handlers: Dict[str, Callable[['OpenEnvClient', Dict[str, Any]], str]] = {}
+        self.reset_kwargs: Dict[str, Any] = dict(reset_kwargs or {})
+        self._episode_reward = 0.0
+        self._last_result = None
+
+        async_client = resolved_cls(
+            base_url=base_url,
+            connect_timeout_s=connect_timeout_s,
+            message_timeout_s=message_timeout_s,
+            **(client_kwargs or {}),
+        )
+        # .sync() gives each instance a dedicated background event loop, which
+        # keeps a thread pool of concurrent episodes safe.
+        self._client = async_client.sync()
+
+    # ------------------------------------------------------------------
+    # Tool registration
+    # ------------------------------------------------------------------
+
+    def register_tool(self, tool_info: ToolInfo, handler: Callable[['OpenEnvClient', Dict[str, Any]],
+                                                                   str]) -> 'OpenEnvClient':
+        """Register a tool handled locally instead of being sent to the server.
+
+        Useful for bookkeeping tools such as ``submit_solution``, which record
+        the model's answer on the env for the training loop to score later.
+
+        Args:
+            tool_info: OpenAI-format tool schema exposed to the model.
+            handler: ``handler(env, arguments) -> str`` returning the
+                observation. Shadows a server-backed tool of the same name.
+
+        Returns:
+            self, to allow chained registration.
+        """
+        name = tool_info.get('function', {}).get('name')
+        if not name:
+            raise ValueError(f'tool_info must contain function.name, got: {tool_info!r}')
+        self._custom_tools = [t for t in self._custom_tools if t['function']['name'] != name]
+        self._custom_tools.append(tool_info)
+        self._custom_handlers[name] = handler
+        return self
+
+    # ------------------------------------------------------------------
+    # Env interface
+    # ------------------------------------------------------------------
+
+    def reset(self, trajectory=None) -> StepResult:
+        self._episode_reward = 0.0
+        # The server rebuilds its environment instance on reset, so the
+        # session (and its WebSocket) is reused across episodes.
+        result = self._client.reset(**self.reset_kwargs)
+        self._last_result = result
+        return StepResult(
+            observation=_format_client_observation(getattr(result, 'observation', None)),
+            reward=float(getattr(result, 'reward', 0.0) or 0.0),
+            done=bool(getattr(result, 'done', False)),
+        )
+
+    def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
+        arguments = arguments or {}
+        if tool_name in self._custom_handlers:
+            try:
+                observation = self._custom_handlers[tool_name](self, arguments)
+            except Exception as e:  # noqa
+                logger.warning(f'OpenEnvClient handler error (tool={tool_name}): {e}')
+                observation = f'Error: {e}'
+            return StepResult(
+                observation=observation, reward=0.0, done=False, info={'episode_reward': self._episode_reward})
+        try:
+            result = self.execute(self._build_action(tool_name, arguments))
+        except Exception as e:  # noqa
+            # Keep the episode alive on transient errors; max_turns bounds it.
+            logger.warning(f'OpenEnvClient step error (tool={tool_name}): {e}')
+            return StepResult(observation=f'Error: {e}', reward=0.0, done=False, info={'error': str(e)})
+        reward = float(getattr(result, 'reward', 0.0) or 0.0)
+        self._episode_reward += reward
+        return StepResult(
+            observation=_format_client_observation(getattr(result, 'observation', None)),
+            reward=reward,
+            done=bool(getattr(result, 'done', False)),
+            info={'episode_reward': self._episode_reward},
+        )
+
+    def tools(self) -> List[ToolInfo]:
+        custom_names = set(self._custom_handlers)
+        tools = [t for t in self._tools if t['function']['name'] not in custom_names]
+        tools.extend(self._custom_tools)
+        return tools
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception as e:  # noqa # best-effort: the server reaps the session anyway
+            logger.warning(f'OpenEnvClient failed to close session at {self._base_url}: {e}')
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def client(self):
+        """The underlying (synchronous) OpenEnv client."""
+        return self._client
+
+    @property
+    def episode_reward(self) -> float:
+        return self._episode_reward
+
+    @property
+    def last_result(self):
+        """Raw ``StepResult`` from the last server call, for reward extraction."""
+        return self._last_result
+
+    def execute(self, action) -> Any:
+        """Send an action and return the server's raw ``StepResult``.
+
+        Public so a training loop can run scoring code in the same session
+        (e.g. append unit tests to a submitted solution) and inspect typed
+        fields such as ``exit_code`` instead of the rendered text.
+        """
+        if isinstance(action, dict):
+            action = self._build_action_from_fields(action)
+        result = self._client.step(action)
+        self._last_result = result
+        return result
+
+    def _build_action(self, tool_name: str, arguments: Dict[str, Any]):
+        if self._action_mapper is not None:
+            action = self._action_mapper(tool_name, arguments)
+        else:
+            action = arguments
+        return self._build_action_from_fields(action) if isinstance(action, dict) else action
+
+    def _build_action_from_fields(self, fields: Dict[str, Any]):
+        if self._action_cls is None:
+            raise ValueError('No action_cls available: pass action_cls, or an action_mapper '
+                             'that returns a ready-made Action instance.')
+        return self._action_cls(**fields)
 
 
 # ==========================================================================

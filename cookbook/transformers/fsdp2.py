@@ -13,7 +13,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize, liger_builtin, npu_builtin
+from twinkle.kernel import kernelize
 
 logger = get_logger()
 args = CLI.from_args()
@@ -66,27 +66,25 @@ def train():
     discovered = {type(m).__name__ for m in model.model.modules()
                   if type(m).__name__.endswith('DecoderLayer')}
     model.model._no_split_modules = list(discovered) or [model.model.config.model_type.title() + 'DecoderLayer']
-    # Compose the kernel mapping: NPU built-ins first, then Liger on top so
-    # `--enable-liger` opts into Liger's cross-device Triton/Ascend kernels
-    # (later keys win on overlap — see twinkle.kernel Kernel.md).
-    kernel_mapping = {}
     # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,
-    # CANN + FLA) | npu+liger (--enable-liger, Liger per-layer + fused-CE).
+    # CANN + FLA via DEFAULT_KERNEL_CONFIG). `--enable-liger` gates the fused-CE
+    # loss below; per-layer kernels stay on CANN on NPU (the default config's
+    # npu-first chains), matching the old npu+liger mode after CANN preference.
+    # To force Liger per-layer kernels, pass a custom mapping with liger-first
+    # KernelChoice chains — see Kernel.md.
     _torch_baseline = os.environ.get('TWINKLE_TORCH_BASELINE', '').lower() in ('1', 'true', 'yes')
-    if Torch.is_npu_available() and not _torch_baseline:
-        kernel_mapping.update(npu_builtin(model))
-    if args.model.enable_liger and not _torch_baseline:
-        kernel_mapping.update(liger_builtin(model))
-    if kernel_mapping:
-        model = kernelize(model, kernel_mapping)
+    if not _torch_baseline:
+        model = kernelize(model)
 
-    # `--enable-liger` turns on BOTH the per-layer Liger/CANN kernels (above)
-    # AND, by default (`enable_fused_ce=True`), the LigerFusedLinearCrossEntropyLoss
-    # which skips the lm_head GEMM so the (B,T,V) logits tensor is never materialised.
-    # The forward then runs under task='fused_lm_ce' (TransformersFusedCEPatch).
-    # Pass `--no-fused-ce` to keep only the per-layer kernels (standard CE loss).
-    # The loss is device-agnostic: on NPU/CUDA it auto-falls-back to materialised
-    # CE if the fused kernel raises for a given shape (defensive).
+    # `--enable-liger` gates ONLY the fused-CE loss here — per-layer kernels
+    # above come from kernelize(model)'s default config regardless of the flag.
+    # With `enable_fused_ce=True` (default) it enables the
+    # LigerFusedLinearCrossEntropyLoss, which skips the lm_head GEMM so the
+    # (B,T,V) logits tensor is never materialised; the forward then runs under
+    # task='fused_lm_ce' (TransformersFusedCEPatch). Pass `--no-fused-ce` to
+    # keep the standard CE loss. The loss is device-agnostic: on NPU/CUDA it
+    # auto-falls-back to materialised CE if the fused kernel raises for a
+    # given shape (defensive).
     _use_fused_ce = args.model.enable_liger and args.model.enable_fused_ce
     _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
 

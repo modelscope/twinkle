@@ -40,7 +40,7 @@ Device selection is delegated to Liger's ``infer_device`` / ``select_impl``
 dispatch: this file contains no ``torch.cuda`` / ``Platform.is_npu`` probes.
 The same loss class runs on CUDA (Triton kernel) and Ascend NPU (the
 ``backends/_ascend`` fused-linear-CE backend), mirroring the bare-impl
-philosophy of ``liger_builtin``.
+philosophy of the Liger per-layer impls under ``twinkle.kernel.ops``.
 
 FSDP2 collective ordering
 ------------------------

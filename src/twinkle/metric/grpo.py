@@ -373,6 +373,10 @@ class GRPOMetric(Metric):
         return results
 
 
+class PPOMetric(GRPOMetric):
+    """PPO policy metric; shares token-level ratio and clipping statistics with GRPO."""
+
+
 class GSPOMetric(GRPOMetric):
     """GRPOMetric variant for GSPO: clip applies to per-sequence geometric-mean ratio."""
 

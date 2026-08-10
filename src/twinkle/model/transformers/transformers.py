@@ -474,6 +474,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
             if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                 raise ValueError('sampling replay does not support sequence or context parallelism')
+        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -521,6 +522,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
+        if loss_require_values:
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -582,6 +586,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
+            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -632,6 +637,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     logits.div_(temperature)
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
+            if loss_require_values:
+                values = outputs['logits']
+                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None

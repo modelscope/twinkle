@@ -143,25 +143,26 @@ rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
 
 ## 使用 OpenEnv 环境
 
-连接远程 OpenEnv WebSocket 服务器：
+连接一个运行中的 OpenEnv 服务（每个客户端实例对应服务端一个独立 session）：
 
 ```python
-from twinkle_agentic.envs.openenv import OpenEnv
+from twinkle_agentic.envs.openenv import OpenEnvClient
 from twinkle_agentic.envs.env_tool import EnvTool
 
-env = OpenEnv(
+env = OpenEnvClient(
+    env_name='coding_env',
     base_url='http://localhost:8000',
-    env_cls='coding_env.CodingEnv',
-    tool_schema=[{
+    tools=[{
         'type': 'function',
         'function': {
-            'name': 'submit',
-            'description': '提交代码解决方案。',
+            'name': 'run_python',
+            'description': '在远程解释器中执行 Python 代码。',
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'code': {'type': 'string'},
                 },
+                'required': ['code'],
             },
         },
     }],
@@ -171,6 +172,8 @@ env.reset()
 env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 ```
+
+如果希望环境跑在训练进程内（无隔离、零网络开销），把 `OpenEnvClient` 换成 `OpenEnv(env_name=..., env_kwargs=...)`。两种模式的完整对比见[执行环境](./Envs.md)。
 
 ## 每轨迹独立 ToolManager
 
