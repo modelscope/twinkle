@@ -547,11 +547,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                     init_method(self, *args, **kwargs)
                 else:
                     if device_mesh is not None:
-                        logger.warning(
-                            f'{cls.__name__} was given a device_mesh but it is being DROPPED: twinkle '
-                            'holds no device group, so call twinkle.initialize(...) before '
-                            'constructing it. Training will otherwise run with device_mesh=None '
-                            '(single-rank loss normalisation and no metric aggregation).')
+                        logger.warning(f'{cls.__name__} was given a device_mesh but it is being DROPPED: twinkle '
+                                       'holds no device group, so call twinkle.initialize(...) before '
+                                       'constructing it. Training will otherwise run with device_mesh=None '
+                                       '(single-rank loss normalisation and no metric aggregation).')
                     args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                     kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
