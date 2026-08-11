@@ -939,6 +939,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metrics are built inside OptimizerGroup.__post_init__, which runs before the process group
+        # exists, so they capture _dp_group=None and Metric.gather_results silently skips the gather --
+        # every rank then reports only its own loss instead of the dp-wide token-weighted average.
+        # _ensure_optimizer_dp_groups repairs that, but its only other call site is
+        # _maybe_apply_expert_parallel, which returns immediately unless expert parallel is on, so
+        # plain DDP/dense runs never reached it. set_optimizer is on every training path and runs
+        # after the process group is up, which is what makes the repair effective here.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
