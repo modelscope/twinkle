@@ -34,15 +34,16 @@ class ModelArgs:
     ddp_config: dict[str, Any] | None = None
     fsdp_config: dict[str, Any] | None = None
     grad_scaler_config: dict[str, Any] | None = None
-    # Liger Kernel toggle: when True, the cookbook applies `liger_builtin()` via
-    # `kernelize`. Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
+    # Liger Kernel toggle: gates the fused-linear-CE loss in the cookbooks.
+    # Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
     enable_liger: bool = False
     # Fused-linear-CE loss toggle. Only meaningful when `enable_liger` is True.
-    # Defaults True so `--enable-liger` turns on BOTH the per-layer Liger/CANN
-    # kernels AND the LigerFusedLinearCrossEntropyLoss (skip-lm_head-GEMM, no
-    # (B,T,V) logits). Pass `--no-fused-ce` to opt out of the fused-CE loss and
-    # keep only the per-layer kernels (the loss falls back to standard CE). The
-    # loss itself is device-agnostic: on NPU/CUDA it auto-falls-back to
+    # Defaults True so `--enable-liger` alone turns on the
+    # LigerFusedLinearCrossEntropyLoss (skip-lm_head-GEMM, no (B,T,V) logits).
+    # Pass `--no-fused-ce` to opt out (the loss falls back to standard CE).
+    # Note: per-layer kernels are NOT gated by these flags — they come from
+    # kernelize(model)'s default config (NPU: CANN-first chains). The loss
+    # itself is device-agnostic: on NPU/CUDA it auto-falls-back to
     # materialised CE if the fused kernel raises for a given shape.
     enable_fused_ce: bool = True
 
@@ -134,6 +135,7 @@ class LossArgs:
     beta: float = 0.1
     sft_weight: float = 1.0
     entropy_coef: float = 0.0
+    value_clip: float = 0.2
     ignore_index: int = -100
 
 
@@ -169,6 +171,7 @@ class InfraArgs:
     model_gpus: int | None = None
     sampler_gpus: int | None = None
     ref_model_gpus: int | None = None
+    critic_model_gpus: int | None = None
     world_size: int | None = None
     dp_size: int | None = None
     fsdp_size: int | None = None
@@ -205,6 +208,11 @@ class RLArgs:
     gkd_temperature: float = 1.0
     gkd_topk: int = 64
     router_replay_mode: Literal['disabled', 'R2', 'R3'] = 'disabled'
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+    kl_coef: float = 0.0
+    normalize_advantages: bool = True
+    critic_learning_rate: float = 1e-5
 
 
 @dataclass

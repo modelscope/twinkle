@@ -93,6 +93,7 @@ sh INSTALL_MEGATRON.sh
 | pp/tp/cp MoE finetuning              | megatron        | [Script](cookbook/megatron/tp_moe.py)                  |
 | Multimodal FSDP finetuning           | transformers    | [Script](cookbook/mm/fsdp2.py)                         |
 | GRPO RL training                     | megatron        | [Script](cookbook/rl/grpo/grpo.py)                          |
+| PPO RL training                      | transformers    | [Script](cookbook/rl/ppo/ppo.py)                            |
 | GRPO Multimodal RL training          | megatron        | [Script](cookbook/rl/grpo/grpo_mm.py)                       |
 | GRPO Math RL training                | megatron        | [Script](cookbook/rl/grpo/short_math_grpo.py)               |
 | DPO full-parameter training          | transformers    | [Script](cookbook/rl/dpo/dpo_full.py)                      |
@@ -105,6 +106,7 @@ sh INSTALL_MEGATRON.sh
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog
+- 🎉2026-08-04 Sandboxed multi-turn RL is now supported: run model-generated code in isolated [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVMs, or in an OpenEnv server, with the same `train.py`. See the [cookbook](cookbook/rl/envs) and the [deployment guide](docs/source_en/Usage%20Guide/Agentic-RL-Deployment-and-Training.md).
 - 🎉2026-05-20 Support DeepSeek-V4-Flash and DeepSeek-V4-Pro models.
 - 🎉2026-05-20 Multi-turn rollout and tool calling in RL are now supported. The Cookbook is currently being written. You can use `from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout` directly for multi-turn rollout.
 - 🎉2026-05-20 IM message alerting on training job failure is now supported. Usage: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`.

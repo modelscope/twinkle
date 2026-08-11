@@ -49,74 +49,30 @@ def test_kernelize_string_key_calls_setattr():
         sys.modules.pop(mod_name, None)
 
 
-def test_kernelize_device_dict_match(monkeypatch):
-    from twinkle.utils.device_mesh import Platform
-
-    parent = nn.Sequential(_SrcLayer())
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
-
-    kernelize(parent, {_SrcLayer: {'cpu': _DstLayer, 'npu': nn.Identity}})
-
-    assert type(parent[0]) is _DstLayer
-
-
-def test_kernelize_uses_platform_device_prefix(monkeypatch):
-    from twinkle.utils.device_mesh import Platform
-
-    parent = nn.Sequential(_SrcLayer())  # params may still be CPU before FSDP placement
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'npu'))
-
-    kernelize(parent, {_SrcLayer: {'npu': _DstLayer}})
-
-    assert type(parent[0]) is _DstLayer
-
-
-def test_kernelize_device_dict_miss_skips_silently(monkeypatch):
-    from twinkle.utils.device_mesh import Platform
-
-    parent = nn.Sequential(_SrcLayer())
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
-
-    kernelize(parent, {_SrcLayer: {'npu': _DstLayer}})
-
-    assert type(parent[0]) is _SrcLayer
-
-
 def test_kernelize_rejects_unknown_key_type():
-    with pytest.raises(TypeError, match='Unsupported mapping key'):
+    with pytest.raises(TypeError, match='Unsupported mapping target'):
         kernelize(nn.Linear(1, 1), {42: _DstLayer})
 
 
-def test_kernelize_no_mapping_on_npu_uses_npu_builtin(monkeypatch):
-    """kernelize(model) with no mapping auto-detects NPU and applies npu_builtin."""
-    from twinkle.utils.device_mesh import Platform
-    import twinkle.kernel.builtin as builtin
+def test_kernelize_no_mapping_applies_default_config(monkeypatch, caplog):
+    """kernelize(model) with no mapping applies DEFAULT_KERNEL_CONFIG.
 
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'npu'))
-    monkeypatch.setattr(builtin, 'npu_builtin', lambda model=None: {_SrcLayer: _DstLayer})
+    On a CPU platform with no liger_kernel installed, every default entry is
+    unavailable or its family is missing -> model unchanged, and (default
+    config path) no WARNING-level noise.
+    """
+    import logging
+
+    from twinkle.utils.device_mesh import Platform
+
+    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
 
     parent = nn.Sequential(_SrcLayer())
-    out = kernelize(parent)
-    assert out is parent
-    assert type(parent[0]) is _DstLayer
-
-
-def test_kernelize_no_mapping_on_non_npu_is_noop(monkeypatch):
-    """kernelize(model) with no mapping on a non-NPU device must not touch the
-    model and must not invoke npu_builtin (avoiding its side effects)."""
-    from twinkle.utils.device_mesh import Platform
-    import twinkle.kernel.builtin as builtin
-
-    called = []
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cuda'))
-    monkeypatch.setattr(builtin, 'npu_builtin',
-                        lambda model=None: called.append(model) or {_SrcLayer: _DstLayer})
-
-    parent = nn.Sequential(_SrcLayer())
-    out = kernelize(parent)
+    with caplog.at_level(logging.WARNING):
+        out = kernelize(parent)
     assert out is parent
     assert type(parent[0]) is _SrcLayer
-    assert called == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_kernelize_loads_hub_ref(monkeypatch):

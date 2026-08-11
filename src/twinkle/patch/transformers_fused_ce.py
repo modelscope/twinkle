@@ -19,7 +19,8 @@ This patch is deliberately hardware-agnostic: it contains no device probes
 (``torch.cuda`` / ``Platform.is_npu`` / ``infer_device``). Device selection of
 the fused-CE kernel is handled by Liger's own ``infer_device`` /
 ``select_impl`` dispatch (CUDA-Triton vs Ascend backend), exactly like the
-``liger_builtin`` bundle emits bare impls. See ``liger.py`` docstring.
+Liger per-layer impls under ``twinkle.kernel.ops`` are emitted bare (no
+device-conditional wrapping).
 
 The patch is applied per-forward via ``apply_context`` (see
 ``_resolve_task_context`` with ``task='fused_lm_ce'``), so it composes with

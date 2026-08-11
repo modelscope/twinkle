@@ -1,4 +1,5 @@
-from twinkle.template.deepseek_v4 import DeepseekV4Template
+from twinkle.template import deepseek_v4_encoding as bundled_encoding
+from twinkle.template.deepseek_v4 import DeepseekV4Template, load_deepseek_v4_encoding
 
 DSML_TOOL_CALL = ('Need data.\n\n'
                   '<｜DSML｜tool_calls>\n'
@@ -7,6 +8,28 @@ DSML_TOOL_CALL = ('Need data.\n\n'
                   '<｜DSML｜parameter name="limit" string="false">3</｜DSML｜parameter>\n'
                   '</｜DSML｜invoke>\n'
                   '</｜DSML｜tool_calls>')
+
+
+def test_load_encoding_from_model_directory(tmp_path):
+    encoding_dir = tmp_path / 'encoding'
+    encoding_dir.mkdir()
+    (encoding_dir / 'encoding_dsv4.py').write_text(
+        'dsml_token = "custom"\n'
+        'tool_calls_block_name = "calls"\n'
+        'eos_token = "eos"\n'
+        'def encode_messages(*args, **kwargs): return "custom prompt"\n'
+        'def parse_message_from_completion_text(*args, **kwargs): return {}\n',
+        encoding='utf-8',
+    )
+
+    encoding = load_deepseek_v4_encoding(str(tmp_path))
+
+    assert encoding.dsml_token == 'custom'
+    assert encoding.encode_messages([]) == 'custom prompt'
+
+
+def test_load_encoding_falls_back_to_bundled_module(tmp_path):
+    assert load_deepseek_v4_encoding(str(tmp_path)) is bundled_encoding
 
 
 def test_deepseek_v4_parse_and_clean_tool_call():

@@ -18,7 +18,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize, liger_builtin, npu_builtin
+from twinkle.kernel import kernelize
 
 logger = get_logger()
 args = CLI.from_args()
@@ -93,16 +93,14 @@ def train():
         },
     )
     # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,
-    # CANN + FLA) | npu+liger (--enable-liger, Liger per-layer on top of CANN).
+    # CANN + FLA via DEFAULT_KERNEL_CONFIG). `--enable-liger` gates the fused-CE
+    # loss below; per-layer kernels stay on CANN on NPU (the default config's
+    # npu-first chains). To force Liger per-layer kernels, pass a custom
+    # mapping with liger-first KernelChoice chains — see Kernel.md.
     # Sharding/batch are unchanged across modes.
     _torch_baseline = os.environ.get('TWINKLE_TORCH_BASELINE', '').lower() in ('1', 'true', 'yes')
-    kernel_mapping = {}
-    if Torch.is_npu_available() and not _torch_baseline:
-        kernel_mapping.update(npu_builtin(model))
-    if args.model.enable_liger and not _torch_baseline:
-        kernel_mapping.update(liger_builtin(model))
-    if kernel_mapping:
-        model = kernelize(model, kernel_mapping)
+    if not _torch_baseline:
+        model = kernelize(model)
     _use_fused_ce = args.model.enable_liger and not _torch_baseline and args.model.enable_fused_ce
     _task = 'fused_lm_ce' if _use_fused_ce else 'causal_lm'
     lora_cfg = _build_lora_config()

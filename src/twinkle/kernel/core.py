@@ -1,17 +1,25 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Minimal mapping-driven kernel replacement.
+"""Mapping-driven kernel replacement.
+
+``kernelize(model, mapping)`` installs the mapping entry by entry onto the
+model: keys are replacement targets (HF class objects or dotted-path
+strings), values are direct impls / ``HubRef`` / ``KernelChoice`` (picks an
+impl by backend priority, see ``twinkle.kernel.registry``). How each entry
+is installed is decided by the installer:
+``KernelChoice.installer`` → ``OpDefinition.installer`` → ``default_installer``.
 
 Public API: ``kernelize``, ``hub`` (re-exported from ``twinkle.kernel``).
 """
 from __future__ import annotations
 
 import importlib
+import logging
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Any
 
 from twinkle import get_logger
-from twinkle.utils.device_mesh import Platform
+from .registry import KernelChoice, get_op, resolve_impl
 
 logger = get_logger()
 
@@ -49,19 +57,6 @@ def hub(
     return HubRef(repo_id, layer_name, revision, version, backend)
 
 
-def _resolve_value(value: Any, device: str) -> Any | None:
-    """Resolve a mapping value against the selected device.
-
-    - ``dict``: device-conditional; recurse into ``value[device]`` or return None.
-    - anything else (including ``HubRef``): pass through.
-    """
-    if isinstance(value, dict):
-        if device not in value:
-            return None
-        return _resolve_value(value[device], device)
-    return value
-
-
 def _replace_class(model: nn.Module, target_cls: type, impl_cls: type) -> None:
     """Rewrite ``__class__`` of every module whose exact type is ``target_cls``.
 
@@ -73,15 +68,12 @@ def _replace_class(model: nn.Module, target_cls: type, impl_cls: type) -> None:
             m.__class__ = impl_cls
 
 
-def _replace_attr(dotted_path: str, impl) -> None:
-    """``setattr`` ``impl`` onto the attribute identified by the dotted path.
-
-    Supports two forms:
-      - ``pkg.mod.attr``                 (set module attribute)
-      - ``pkg.mod.ClassName.attr``       (set class attribute / method)
+def _resolve_dotted(dotted_path: str) -> tuple[Any, str]:
+    """Resolve ``pkg.mod[.Class].attr`` to ``(owner, final_attr)``.
 
     The split is found by walking the prefix from the longest importable
-    module backwards until ``importlib.import_module`` succeeds.
+    module backwards until ``importlib.import_module`` succeeds; the remaining
+    attributes (except the final one) are walked with ``getattr``.
     """
     parts = dotted_path.split('.')
     if len(parts) < 2:
@@ -103,11 +95,10 @@ def _replace_attr(dotted_path: str, impl) -> None:
     if module is None:
         raise ImportError(f'Could not import any prefix of {dotted_path!r}') from last_err
 
-    # Walk remaining attributes; the last one is the target.
     obj = module
     for attr in parts[module_depth:-1]:
         obj = getattr(obj, attr)
-    setattr(obj, parts[-1], impl)
+    return obj, parts[-1]
 
 
 def _load_hub_ref(ref: HubRef):
@@ -133,54 +124,156 @@ def _load_hub_ref(ref: HubRef):
     return impl
 
 
+# ── installer ─────────────────────────────────────────────────────────────
+
+
+def resolve_direct_value(replacement: Any) -> Any:
+    """Non-KernelChoice mapping values: HubRef -> lazy download; anything else passes through unchanged."""
+    if isinstance(replacement, HubRef):
+        return _load_hub_ref(replacement)
+    return replacement
+
+
+def _install_dotted(model: nn.Module, target: str, impl, *, warn: bool = False) -> bool:
+    """Dispatch a dotted-path target. Returns True = installed, False = family missing, skipped.
+
+    - resolves to an ``nn.Module`` subclass -> ``_replace_class(model, cls, impl)``
+      (exactly equivalent to a class-object key, exact type match)
+    - resolves to a function / class method but the impl is an ``nn.Module``
+      subclass (e.g. liger's ``LigerExperts`` on a ``...Experts.forward``
+      target) -> ``_replace_class(model, owner_cls, impl)``; setattr'ing a
+      class onto ``forward`` would fail on the first call
+    - otherwise -> ``setattr`` (module function / class method)
+    - unresolvable ``transformers.*`` family path (missing module/attr) ->
+      skip, return False (a missing family is normal). ``warn=False``
+      (default config path) -> DEBUG; ``warn=True`` (explicit mapping) ->
+      WARNING with a typo hint — explicit entries are the user's
+      responsibility and a silent skip would hide spelling mistakes
+    - unresolvable non-family string (e.g. a logical target mistakenly
+      routed to the default installer) -> explicit error
+    """
+    try:
+        owner, final_attr = _resolve_dotted(target)
+        resolved = getattr(owner, final_attr)
+    except (ImportError, AttributeError, ValueError) as e:
+        if target.startswith('transformers.'):
+            level = logging.WARNING if warn else logging.DEBUG
+            hint = ' (explicit mapping: check for typos)' if warn else ''
+            logger.log(level, '[kernelize] target %r unresolvable (%r); family not installed, skipping%s', target, e,
+                       hint)
+            return False
+        raise ValueError(f'Cannot resolve mapping target {target!r} with the default installer '
+                         f'(logical targets require a custom installer): {e!r}') from e
+    if isinstance(resolved, type) and issubclass(resolved, nn.Module):
+        _replace_class(model, resolved, impl)
+    elif isinstance(impl, type) and issubclass(impl, nn.Module) and isinstance(owner, type):
+        # function target (e.g. ``...Experts.forward``) with a Module-class impl
+        # (e.g. liger's LigerExperts): setattr'ing a class onto ``forward`` would
+        # fail on first call -> replace the owner class instead
+        _replace_class(model, owner, impl)
+    else:
+        setattr(owner, final_attr, impl)
+    return True
+
+
+def default_installer(model: nn.Module, target: Any, impl, *, warn: bool = False) -> bool:
+    """Generic installer: class objects -> ``_replace_class``; dotted-path strings -> ``_install_dotted``.
+
+    ``warn`` is forwarded to ``_install_dotted`` for the family-skip log
+    level; custom installers keep the ``(model, target, impl)`` three-arg
+    signature, with kernelize dispatching between the two call shapes.
+    """
+    if isinstance(target, type) and issubclass(target, nn.Module):
+        _replace_class(model, target, impl)
+        return True
+    if isinstance(target, str):
+        return _install_dotted(model, target, impl, warn=warn)
+    raise TypeError(f'Unsupported mapping target: {target!r}')
+
+
+# ── kernelize ─────────────────────────────────────────────────────────────
+
+
+def _target_name(target: Any) -> str:
+    if isinstance(target, type):
+        return f'{target.__module__}.{target.__qualname__}'
+    return str(target)
+
+
+def _installer_name(installer) -> str:
+    if installer is default_installer:
+        return 'default'
+    return getattr(installer, '__name__', repr(installer))
+
+
+def _log_all_unavailable(target: Any, choice: KernelChoice, *, warn: bool) -> None:
+    level = logging.WARNING if warn else logging.DEBUG
+    logger.log(
+        level, "[kernelize] target %s: no available backend for op '%s' (tried: %s); "
+        'keeping the original implementation', _target_name(target), choice.op, ', '.join(choice.backends))
+
+
 def kernelize(model: nn.Module, mapping: dict | None = None) -> nn.Module:
     """Apply ``mapping`` to ``model`` and return it (modified in place).
 
-    Keys:
+    Keys (targets):
       - ``type[nn.Module]``: replace ``m.__class__`` for every module of the
         exact type (no subclass walking).
-      - ``str`` (dotted path ``pkg.mod.attr``): ``setattr`` the impl onto the
-        identified module attribute.
+      - ``str`` dotted path: resolved by the default installer — an
+        ``nn.Module`` subclass resolves to class replacement; a Module-class
+        impl on a function target (e.g. ``...Experts.forward``) replaces the
+        owner class; anything else resolves to ``setattr``. Unresolvable
+        ``transformers.*`` family paths are skipped: DEBUG on the default
+        path, WARNING (with typo hint) for explicit mappings.
 
     Values:
-      - ``dict[str, V]``: device-conditional dispatch using the current
-        Twinkle platform device prefix; non-matching devices skip.
+      - ``KernelChoice``: pick the first available backend impl for the op
+        (see ``twinkle.kernel.registry``); installer priority is
+        ``KernelChoice.installer`` → ``OpDefinition.installer`` → default.
       - ``HubRef``: lazy-resolved via the optional ``kernels`` package.
-      - anything else: used directly as the impl.
+      - anything else: used directly as the impl (default installer).
 
-    If ``mapping`` is ``None`` it is auto-detected from the current platform
-    via ``Platform.device_prefix()``: on NPU the built-in ``npu_builtin(model)``
-    bundle is applied (including its side effects); on any other platform this
-    is a no-op and the model is returned unchanged.
+    ``mapping=None`` applies the built-in ``DEFAULT_KERNEL_CONFIG``; on this
+    default path all fallback/skip logs are DEBUG. Passing any explicit
+    mapping (even a copy of the default) raises them to WARNING. The mapping
+    fully *replaces* the default config — merge with
+    ``{**DEFAULT_KERNEL_CONFIG, ...}`` to customize on top of it.
     """
-    device = Platform.device_prefix()
-
-    if mapping is None:
-        if device == 'npu':
-            from .builtin import npu_builtin
-            mapping = npu_builtin(model)
-        else:
-            logger.debug(f'[kernelize] No mapping provided and device {device!r} '
-                         f'has no built-in bundle; returning model unchanged')
-            return model
+    default_mapping = mapping is None
+    if default_mapping:
+        from .config import DEFAULT_KERNEL_CONFIG  # in-function import, avoids the core<->config cycle
+        mapping = DEFAULT_KERNEL_CONFIG
 
     if not mapping:
         return model
 
-    for key, value in mapping.items():
-        impl = _resolve_value(value, device)
-        if impl is None:
-            continue
-        if isinstance(impl, HubRef):
-            impl = _load_hub_ref(impl)
-        if isinstance(key, type) and issubclass(key, nn.Module):
-            _replace_class(model, key, impl)
-            logger.info(f'[kernelize] Replaced {key.__module__}.{key.__qualname__} '
-                        f'with {impl.__module__}.{impl.__qualname__}')
-        elif isinstance(key, str):
-            _replace_attr(key, impl)
-            impl_repr = getattr(impl, '__qualname__', repr(impl))
-            logger.info(f'[kernelize] Replaced {key!r} with {impl_repr}')
+    warn = not default_mapping
+    for target, replacement in mapping.items():
+        if isinstance(replacement, KernelChoice):
+            op = get_op(replacement.op)  # unregistered -> ValueError
+            impl, backend = resolve_impl(op, replacement.backends, warn=warn, target=target)
+            if impl is None:
+                _log_all_unavailable(target, replacement, warn=warn)
+                continue  # keep the original implementation
+            installer = replacement.installer or op.installer or default_installer
         else:
-            raise TypeError(f'Unsupported mapping key: {key!r}')
+            impl = resolve_direct_value(replacement)
+            backend = None
+            installer = default_installer
+
+        # custom installers keep the three-arg signature; warn is only forwarded to default_installer
+        if installer is default_installer:
+            installed = installer(model, target, impl, warn=warn)
+        else:
+            installed = installer(model, target,
+                                  impl)  # failures propagate, never swallowed (half-installed state stays visible)
+        if installed is False:
+            continue
+        if isinstance(replacement, KernelChoice):
+            logger.info('[kernelize] target=%s op=%s backend=%s installer=%s', _target_name(target), op.name, backend,
+                        _installer_name(installer))
+        else:
+            impl_repr = getattr(impl, '__qualname__', repr(impl))
+            logger.info('[kernelize] target=%s impl=%s installer=%s', _target_name(target), impl_repr,
+                        _installer_name(installer))
     return model

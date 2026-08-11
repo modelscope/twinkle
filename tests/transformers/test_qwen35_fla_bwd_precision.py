@@ -126,7 +126,7 @@ def _force_fla_off(model: torch.nn.Module) -> None:
 
 def _force_fla_on(model: torch.nn.Module) -> int:
     import importlib
-    import twinkle.kernel.npu_impls.fla as fla_mod
+    import twinkle.kernel.ops.fla.npu as fla_mod
     importlib.reload(fla_mod)
     return fla_mod.apply_qwen3_5_fla(model)
 
@@ -275,8 +275,8 @@ class TestQwen35FlaBwdPrecision:
     """Compare FLA ON (bf16 Triton kernel) vs FLA OFF (fp32 torch reference).
 
     These tests do NOT require multiple devices and are the precise analogue of
-    the FLA toggle used by ``cookbook/transformers/fsdp2.sh`` (which sets the
-    same ``TWINKLE_NPU_FLA`` env var via ``npu_builtin(model)``).
+    the FLA toggle used by ``cookbook/transformers/fsdp2.sh`` (the NPU default
+    kernel config sets the same ``TWINKLE_NPU_FLA`` env var via ``kernelize(model)``).
     """
 
     @pytest.mark.parametrize('seed', [1234, 2024])
