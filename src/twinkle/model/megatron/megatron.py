@@ -125,7 +125,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._model_path = HubOperation.download_model(model_id)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
-        self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
+        self.use_distributed_optimizer = kwargs.pop('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         torch_util.set_device()
         self._try_init_process_group()
@@ -698,7 +698,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        loss = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        # Gather over the DP group, not WORLD: under PP the loss runs only on the last
+        # pipeline stage, so a WORLD-group all-gather (e.g. InfonceLoss in-batch negatives)
+        # would deadlock on earlier-stage ranks that never enter the loss. Mirrors add_metric.
+        if getattr(loss, 'process_group', None) is None and getattr(optimizer_config, '_dp_group', None) is not None:
+            loss.process_group = optimizer_config._dp_group
+        optimizer_config.loss_instance = loss
 
     @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
@@ -767,7 +773,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 - weight_decay: Weight decay (default: 0.0)
                 - use_distributed_optimizer: Shard optimizer states (default: True)
                 - clip_grad: Gradient clipping threshold (default: 1.0)
-                - bf16: Use bf16 training (default: True)
+                - bf16 / fp16: precision flags (default: derived from self.mixed_precision)
                 - adam_beta1, adam_beta2, adam_eps: Adam parameters
 
         Returns:
@@ -788,7 +794,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             adam_beta2=kwargs.pop('adam_beta2', 0.999),
             adam_eps=kwargs.pop('adam_eps', 1e-8),
             clip_grad=kwargs.pop('clip_grad', 1.0),
-            bf16=kwargs.pop('bf16', True),
+            bf16=kwargs.pop('bf16', self.mixed_precision == 'bf16'),
+            fp16=kwargs.pop('fp16', self.mixed_precision == 'fp16'),
             use_distributed_optimizer=self.use_distributed_optimizer,
             overlap_param_gather=kwargs.pop('overlap_param_gather', False),
             log_num_zeros_in_grad=kwargs.pop('log_num_zeros_in_grad', False),

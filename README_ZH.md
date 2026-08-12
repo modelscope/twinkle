@@ -87,6 +87,7 @@ sh INSTALL_MEGATRON.sh
 | pp/tp/cp MoE 微调                   | megatron              | [脚本](cookbook/megatron/tp_moe.py)                    |
 | 多模态 FSDP 微调                    | transformers          | [脚本](cookbook/mm/fsdp2.py)                           |
 | GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo/grpo.py)                            |
+| PPO 强化学习训练                     | transformers          | [脚本](cookbook/rl/ppo/ppo.py)                              |
 | GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo/grpo_mm.py)                         |
 | GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/grpo/short_math_grpo.py)                 |
 | DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo/dpo_full.py)                        |
@@ -94,15 +95,14 @@ sh INSTALL_MEGATRON.sh
 | DPO 多 LoRA 训练                    | transformers          | [脚本](cookbook/rl/dpo/dpo_multi_lora.py)                  |
 | GKD 在线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd/gkd_on_policy.py)                   |
 | GKD 离线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd/gkd_off_policy.py)                  |
-| Tinker 客户端微调（自部署）         | transformers          | [脚本](cookbook/client/tinker/self_host)               |
-| Tinker 客户端微调（ModelScope）      | transformers          | [脚本](cookbook/client/tinker/modelscope)              |
-| Twinkle 客户端微调（自部署）        | transformers          | [脚本](cookbook/client/twinkle/self_host)              |
-| Twinkle 客户端微调（ModelScope）     | transformers          | [脚本](cookbook/client/twinkle/modelscope)             |
+| Tinker 客户端微调                   | transformers          | [脚本](cookbook/client/tinker)                         |
+| Twinkle 客户端微调                  | transformers          | [脚本](cookbook/client/twinkle)                        |
 | 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/client/server)                         |
 
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)
 
 ## 更新日志
+- 🎉2026-08-04 支持沙箱环境下的多轮RL训练：模型生成的代码可在隔离的 [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVM 或 OpenEnv 服务中执行，两个后端共用同一份 `train.py`。参考 [cookbook](cookbook/rl/envs) 和[部署文档](docs/source_zh/使用指引/Agentic%20RL部署与训练.md)。
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
 - 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用`from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout`进行多轮rollout。
 - 🎉2026-05-20 支持训练任务失败后的IM消息告警, 使用方式: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`。

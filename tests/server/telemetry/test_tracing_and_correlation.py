@@ -3,11 +3,11 @@
 keys, and ``ResourceMetricsCollector``.
 
 Properties covered:
-- # Feature: server-config-observability-refactor, Property 19: Business-layer span lifecycle
-- # Feature: server-config-observability-refactor, Property 20: Span exception handling
-- # Feature: server-config-observability-refactor, Property 21: Tracing graceful-degradation equivalence
-- # Feature: server-config-observability-refactor, Property 22: Correlation attribute attachment
-- # Feature: server-config-observability-refactor, Property 23: Correlation prefix invariant
+- Business-layer span lifecycle
+- Span exception handling
+- Tracing graceful-degradation equivalence
+- Correlation attribute attachment
+- Correlation prefix invariant
 """
 from __future__ import annotations
 
@@ -24,11 +24,11 @@ from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
 
 
 @pytest.mark.parametrize('key', CORRELATION_KEYS)
-def test_property_23_prefix_invariant(key: str) -> None:
+def test_prefix_invariant(key: str) -> None:
     assert key.startswith(PREFIX), key
 
 
-def test_property_23_helper_constants_complete() -> None:
+def test_helper_constants_complete() -> None:
     expected = {
         'twinkle.session_id',
         'twinkle.model_id',
@@ -40,7 +40,7 @@ def test_property_23_helper_constants_complete() -> None:
     assert set(CORRELATION_KEYS) == expected
 
 
-# ---------- Property 22: attachment of present-only values ------------------ #
+# ---------- attachment of present-only values ------------------------------ #
 
 
 class _RecordingSpan:
@@ -63,14 +63,14 @@ class _RecordingSpan:
             correlation.TOKEN_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
         },
     ))
-def test_property_22_set_correlation_attrs_skips_none(payload: dict) -> None:
+def test_set_correlation_attrs_skips_none(payload: dict) -> None:
     span = _RecordingSpan()
     set_correlation_attrs(span, payload)
     expected = {k: v for k, v in payload.items() if v is not None}
     assert span.attrs == expected
 
 
-def test_property_22_noop_span_safe() -> None:
+def test_noop_span_safe() -> None:
     """``set_correlation_attrs`` is a no-op on a NoOp span (no SDK installed)."""
     span = _NoopSpan()
     set_correlation_attrs(span, {correlation.SESSION_ID: 's1'})
@@ -79,10 +79,10 @@ def test_property_22_noop_span_safe() -> None:
     set_correlation_attrs(span, None)
 
 
-# ---------- Property 21: NoOp degradation equivalence ---------------------- #
+# ---------- NoOp degradation equivalence ----------------------------------- #
 
 
-def test_property_21_noop_yields_same_result_as_active() -> None:
+def test_noop_yields_same_result_as_active() -> None:
     """When OTEL is absent, ``traced_operation`` runs the body and returns the
     body's result identically to when OTEL is active."""
     with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', False):
@@ -92,7 +92,7 @@ def test_property_21_noop_yields_same_result_as_active() -> None:
         assert result == 10
 
 
-def test_property_21_noop_propagates_exceptions() -> None:
+def test_noop_propagates_exceptions() -> None:
     """NoOp path still re-raises the original exception unchanged."""
     with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', False):
         with pytest.raises(RuntimeError, match='boom'):
@@ -100,7 +100,7 @@ def test_property_21_noop_propagates_exceptions() -> None:
                 raise RuntimeError('boom')
 
 
-# ---------- Property 19/20: span lifecycle + exception handling ----------- #
+# ---------- span lifecycle + exception handling ---------------------------- #
 
 
 def _otel_available() -> bool:
@@ -111,7 +111,7 @@ def _otel_available() -> bool:
     return True
 
 
-def test_property_19_span_lifecycle(in_memory_span_exporter) -> None:
+def test_span_lifecycle(in_memory_span_exporter) -> None:
     """When OTEL is present, a span is started before and ended after the block."""
     in_memory_span_exporter.clear()
     with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', True):
@@ -124,7 +124,7 @@ def test_property_19_span_lifecycle(in_memory_span_exporter) -> None:
     assert matches[-1].attributes.get(correlation.SESSION_ID) == 's1'
 
 
-def test_property_20_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
+def test_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
     """Exception inside the block is recorded on the span and re-raised."""
     in_memory_span_exporter.clear()
     with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', True):
@@ -268,8 +268,6 @@ def test_inbound_traceparent_continues_trace() -> None:
     runs nested inside the middleware's SERVER span), which makes the assertion
     independent of whichever global tracer provider another test may have
     installed.
-
-    Validates Requirement 15: inbound HTTP trace-context continuity.
     """
     if not _otel_available():
         pytest.skip('OTEL SDK not installed in test env')
@@ -304,7 +302,7 @@ def test_inbound_traceparent_continues_trace() -> None:
 
 def test_inbound_without_traceparent_starts_new_trace() -> None:
     """A request with no trace headers still completes without raising and runs
-    the handler under a span on a fresh trace (Requirement 15.3)."""
+    the handler under a span on a fresh trace."""
     if not _otel_available():
         pytest.skip('OTEL SDK not installed in test env')
 

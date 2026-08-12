@@ -60,7 +60,12 @@ def _resolve_task_context(model, task):
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
+    if task == 'fused_lm_ce':
+        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
+        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
+        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
+        return apply_context(model, TransformersFusedCEPatch())
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce.')
 
 
 @dataclass
@@ -384,7 +389,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns ``cleanup_fn``.
         Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
         """
-        if not self._router_replay_enabled:
+        if not getattr(self, '_router_replay_enabled', False):
             return lambda: None
 
         self._maybe_apply_router_replay()
@@ -461,6 +466,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -499,6 +505,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
+        if loss_require_values:
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -552,6 +561,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_require_logits = getattr(loss_instance, 'require_logits', False)
             loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -593,6 +603,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 else:
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
+            if loss_require_values:
+                values = outputs['logits']
+                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
@@ -934,6 +947,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metric copies the dp group at construction, and OptimizerGroup builds metrics before
+        # dist init -- so rebuild here (first path that runs post-init on every backend) to get
+        # dp-wide token-weighted logging. Logging only; gradients are unaffected.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
@@ -956,7 +973,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
-        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}\.')
+        # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
+        # parameters to be missed by the optimizer.
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():

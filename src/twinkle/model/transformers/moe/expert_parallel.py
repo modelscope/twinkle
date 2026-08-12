@@ -4,11 +4,11 @@ from __future__ import annotations
 import inspect
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from dataclasses import dataclass
 from torch import nn
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from twinkle.kernel.ops import ep_forward
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
 
@@ -141,6 +141,17 @@ def shard_experts(
     block._ep_world_size = ep_world_size
     block._ep_tensor_experts = is_tensor_experts
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
+
+    # Duplicate EP metadata on block.experts as a defensive measure —
+    # this ensures the experts module has all needed context even if accessed separately.
+    block.experts._ep_num_experts = num_experts
+    block.experts._ep_experts_per_rank = experts_per_rank
+    block.experts._ep_local_start = local_start
+    block.experts._ep_local_end = local_end
+    block.experts._ep_rank = ep_rank
+    block.experts._ep_world_size = ep_world_size
+    block.experts._ep_tensor_experts = is_tensor_experts
+    block.experts._ep_ignore_shared_experts = cfg.ignore_shared_experts
 
     return ExpertShardingSpec(
         block=block,
@@ -319,53 +330,6 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
     if getattr(experts_mod, '_ep_forward_installed', False):
         return
 
-    def ep_forward(
-        self,
-        permuted_tokens: torch.Tensor,
-        num_global_sum_tokens_per_local_expert: torch.Tensor,
-        experts_per_rank: int,
-    ) -> torch.Tensor:
-        if permuted_tokens.numel() == 0:
-            # Preserve the autograd edge to token_pre_all2all. Returning a new
-            # empty tensor can make this rank skip the matching backward
-            # all-to-all, causing EP collective order divergence.
-            return permuted_tokens
-
-        input_dtype = permuted_tokens.dtype
-
-        cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
-        for i in range(experts_per_rank):
-            cumsum[i + 1] = cumsum[i] + int(num_global_sum_tokens_per_local_expert[i].item())
-
-        output_chunks = []
-        for i in range(experts_per_rank):
-            start = int(cumsum[i].item())
-            end = int(cumsum[i + 1].item())
-            expert_in = permuted_tokens[start:end]
-            if expert_in.numel() == 0:
-                output_chunks.append(expert_in)
-                continue
-
-            gate_up = self.gate_up_proj[i]
-            down = self.down_proj[i]
-            compute_dtype = gate_up.dtype
-            if expert_in.dtype != compute_dtype:
-                expert_in = expert_in.to(compute_dtype)
-            gate_up_out = F.linear(expert_in, gate_up)
-            if hasattr(self, '_apply_gate'):
-                out = self._apply_gate(gate_up_out)
-            else:
-                gate, up = gate_up_out.chunk(2, dim=-1)
-                out = self.act_fn(gate) * up
-            out = F.linear(out, down)
-
-            if out.dtype != input_dtype:
-                out = out.to(input_dtype)
-            output_chunks.append(out)
-
-        return torch.cat(
-            output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(0, permuted_tokens.size(-1))
-
     import types
     experts_mod.forward = types.MethodType(ep_forward, experts_mod)
     experts_mod._ep_forward_installed = True
@@ -471,6 +435,15 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
     experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
     if hasattr(experts, 'num_experts'):
         experts.num_experts = end - start
+
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraWrapper
+    for mod_name, target_param_wrapper in experts.named_children():
+        if not isinstance(target_param_wrapper, TargetParameterLoraWrapper):
+            continue
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_A.items():
+            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_B.items():
+            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
 
 
 def _run_local_experts(

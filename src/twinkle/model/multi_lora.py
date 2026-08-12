@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
 from twinkle.utils import get_logger
+from .multi_lora_target_parameters import TargetParameterLoraManager
 
 logger = get_logger()
 
@@ -36,6 +37,7 @@ class MultiLora:
         self.module: PeftModel
         self._active_adapters = []
         self.max_length = max_length
+        self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -49,6 +51,10 @@ class MultiLora:
     @staticmethod
     def _is_distributed_param(parameter):
         return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
+
+    @staticmethod
+    def _is_target_parameter_lora_name(name: str) -> bool:
+        return '._twinkle_lora_' in name
 
     def _write_param_tensor(self, parameter, value):
         if value is None:
@@ -142,15 +148,19 @@ class MultiLora:
         else:
             self.module.disable_adapter_layers()
 
+    def patch_target_parameters(self, module, target_parameters):
+        self.target_parameter_manager.patch(module, target_parameters)
+
     @contextmanager
     def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
         self.activate_adapter(tenant_adapter_name)
-        if disable_lora:
-            # Temporarily disable all adapters while keeping optimizer_group active
-            with self._disable_lora_context(tenant_adapter_name):
+        with self.target_parameter_manager.adapter(tenant_adapter_name, disable_lora=disable_lora):
+            if disable_lora:
+                # Temporarily disable all adapters while keeping optimizer_group active
+                with self._disable_lora_context(tenant_adapter_name):
+                    yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+            else:
                 yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
-        else:
-            yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
 
     @contextmanager
     def _disable_lora_context(self, tenant_adapter_name):
@@ -206,6 +216,12 @@ class MultiLora:
             raise RuntimeError(f'Too big rank for lora: {config.r}')
         _available_lora.tenant_config = config
         _available_lora.tenant_adapter_name = tenant_adapter_name
+        if getattr(config, 'target_parameters', None):
+            self.target_parameter_manager.acquire(
+                tenant_adapter_name=tenant_adapter_name,
+                slot_name=_available_lora.adapter_name,
+                config=config,
+            )
         logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         return _available_lora.adapter_name
 
@@ -215,6 +231,7 @@ class MultiLora:
             _lora.tenant_config = None
             _lora.tenant_adapter_name = None
             self._load_initial_weights(_lora.adapter_name)
+            self.target_parameter_manager.release(tenant_adapter_name)
             logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         except ValueError:
             return
@@ -462,20 +479,29 @@ class MultiLora:
               target_modules='all-linear',
               *args,
               **kwargs):
+        module_device = getattr(module, 'device', None)
+        if module_device is None:
+            module_device = next(module.parameters())[1].device
+        low_cpu_mem_usage = module_device.type == 'meta'
+
         for i in range(self.max_loras):
-            config = LoraConfig(
-                r=self.max_r,
-                target_modules=target_modules,
-                lora_alpha=32,
-            )
+            config = kwargs.get('lora_config', None)
+            if config is None:
+                config = LoraConfig(
+                    r=self.max_r,
+                    target_modules=target_modules,
+                    lora_alpha=32,
+                    exclude_modules=['o_a_proj'],
+                )
             lora_tenant = LoraTenant(index=i, adapter_name=f'lora_{i}', config=config)
             self.loras.append(lora_tenant)
 
             def _patch_peft(_module):
                 if isinstance(_module, PeftModel):
-                    _module.add_adapter(lora_tenant.adapter_name, config)
+                    _module.add_adapter(lora_tenant.adapter_name, config, low_cpu_mem_usage=low_cpu_mem_usage)
                 else:
-                    _peft_model: PeftModel = get_peft_model(_module, config, lora_tenant.adapter_name)
+                    _peft_model: PeftModel = get_peft_model(
+                        _module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
                     _module.active_adapters = _peft_model.active_adapters
                     _module = _peft_model
 
@@ -488,7 +514,7 @@ class MultiLora:
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
                 if isinstance(_module, PeftModel):
-                    _module.add_adapter(lora_tenant.adapter_name, _config)
+                    _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
                 else:
                     # TODO first wrap needs parse target_modules, need to fix later
                     if _config.target_modules:
@@ -499,7 +525,8 @@ class MultiLora:
 
                         from .megatron import MegatronModel
                         _config.target_modules = MegatronModel.get_target_modules(_module, target_modules)
-                    _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
+                    _module = get_peft_model(
+                        _module, _config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
                 for name, submodule in _module.named_modules():
                     if isinstance(submodule, LoraLayer):
@@ -535,6 +562,8 @@ class MultiLora:
 
             def _store_weights(_module):
                 for name, parameter in _module.named_parameters():
+                    if self._is_target_parameter_lora_name(name):
+                        continue
                     if pattern.search(name):
                         lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
 
@@ -650,6 +679,8 @@ class MultiLora:
 
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
                     state_key = name.replace(f'.{_lora.adapter_name}.', '.')
                     target_tensor = self._read_param_tensor(parameter)
@@ -665,6 +696,7 @@ class MultiLora:
                 _load_weights(_module)
         else:
             _load_weights(self.module)
+        self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
 
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
@@ -674,6 +706,8 @@ class MultiLora:
         def _get_weights(_module):
             state_dict = {}
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
                     _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
                     if _param is None:
@@ -687,6 +721,11 @@ class MultiLora:
                 state_dict.update(_get_weights(_module))
         else:
             state_dict = _get_weights(self.module)
+        target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
+        overlap = state_dict.keys() & target_state_dict.keys()
+        if overlap:
+            raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
+        state_dict.update(target_state_dict)
         return state_dict
 
     def _load_initial_weights(self, origin_adapter_name):
@@ -696,6 +735,8 @@ class MultiLora:
 
         def _load_initial_weights(_module):
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern_A.search(name):
                     local_param = self._read_param_tensor(parameter)
                     if local_param is not None:
@@ -794,3 +835,9 @@ class MultiLora:
         trainable_param_names = trainable_param_names[:5] + ['...'] + trainable_param_names[-5:]
         trainable_param_names = '\n'.join(trainable_param_names)
         return trainable_param_names
+
+    def get_target_parameter_trainable_parameters(self, tenant_adapter_name):
+        return {
+            name: parameter
+            for name, parameter in self.target_parameter_manager.named_slot_parameters(tenant_adapter_name)
+        }

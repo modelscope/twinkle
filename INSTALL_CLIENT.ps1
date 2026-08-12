@@ -311,5 +311,5 @@ Write-Host "  conda activate $EnvName" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Example usage (see cookbook/client/tinker/):"
 Write-Host '  $env:MODELSCOPE_TOKEN = "your-token"' -ForegroundColor Yellow
-Write-Host "  python cookbook/client/tinker/modelscope_service/self_cognition.py" -ForegroundColor Yellow
+Write-Host "  python cookbook/client/tinker/self_cognition.py" -ForegroundColor Yellow
 Write-Host ""
