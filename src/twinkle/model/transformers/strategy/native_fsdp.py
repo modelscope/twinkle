@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
+MODULES_TO_SAVE_SEGMENT = '.modules_to_save.'
 PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
@@ -346,7 +347,7 @@ class NativeFSDPStrategy:
         return state_dict
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
-        """Collect only LoRA adapter parameters, with EP-aware all-gather."""
+        """Collect LoRA parameters and fully trained PEFT modules, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)
         state_dict = {}
 
@@ -361,7 +362,7 @@ class NativeFSDPStrategy:
         adapter_suffix = f'.{adapter_name}.'
 
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not _is_saveable_adapter_key(name) or adapter_suffix not in name:
                 continue
 
             local_full = torch_util.to_local_tensor(param)
@@ -692,6 +693,10 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
 
 def _is_lora_state_key(name: str) -> bool:
     return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
+
+
+def _is_saveable_adapter_key(name: str) -> bool:
+    return _is_lora_state_key(name) or MODULES_TO_SAVE_SEGMENT in name
 
 
 def _strip_peft_base_prefix(name: str) -> str:

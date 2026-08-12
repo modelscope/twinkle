@@ -956,7 +956,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}\.')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -1044,9 +1044,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Avoid collecting the full base model for large FSDP/EP jobs.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
+        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
         processed_state_dict = {}
         for key, value in adapter_state.items():
-            normalized = key.replace(adapter_suffix, '.')
+            if modules_to_save_infix in key:
+                normalized = key.replace(modules_to_save_infix, '.')
+            else:
+                normalized = key.replace(adapter_suffix, '.')
             processed_state_dict[normalized] = value
         return processed_state_dict
 
