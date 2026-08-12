@@ -28,26 +28,26 @@ _CANDIDATE_SUFFIXES = frozenset(CANDIDATE_TYPES.values())
 _LAYER_RE = re.compile(r'\blayers\.(\d+)\.')
 
 
-class ZeroShotScores(dict[str, float]):
-    """Zero-shot spectral scores with per-module metric details."""
+class SpectralScores(dict[str, float]):
+    """Spectral scores with per-module metric details."""
 
     def __init__(self, scores: Mapping[str, float], metrics: Mapping[str, Mapping[str, float]]) -> None:
         super().__init__(scores)
         self.metrics = {name: dict(values) for name, values in metrics.items()}
 
 
-def compute_zero_shot_spectral_metrics(
+def compute_spectral_metrics(
     singular_values: torch.Tensor,
     r: int,
     epsilon: float = 1e-12,
 ) -> Dict[str, float]:
-    """Compute the pretrained-spectrum metrics used for zero-shot allocation."""
+    """Compute pretrained-spectrum metrics for data-free spectral allocation."""
     if r <= 0:
-        raise ValueError('Zero-shot LoRA rank r must be positive.')
+        raise ValueError('Spectral LoRA rank r must be positive.')
     if singular_values.ndim != 1 or singular_values.numel() == 0:
-        raise ValueError('Zero-shot scoring requires a non-empty singular-value vector.')
+        raise ValueError('Spectral scoring requires a non-empty singular-value vector.')
     if epsilon <= 0:
-        raise ValueError('Zero-shot scoring epsilon must be positive.')
+        raise ValueError('Spectral scoring epsilon must be positive.')
 
     values = singular_values.detach().to(device='cpu', dtype=torch.float64).abs()
     values = values.sort(descending=True).values
@@ -84,8 +84,8 @@ def _is_candidate_module(module_name: str) -> bool:
     return _LAYER_RE.search(module_name) is not None and module_name.rsplit('.', 1)[-1] in _CANDIDATE_SUFFIXES
 
 
-def select_zero_shot_targets(model: nn.Module, config: LoraConfig) -> Dict[str, nn.Module]:
-    """Resolve materialized linear modules eligible for zero-shot allocation."""
+def select_spectral_targets(model: nn.Module, config: LoraConfig) -> Dict[str, nn.Module]:
+    """Resolve materialized linear modules eligible for spectral allocation."""
     resolved = _maybe_include_all_linear_layers(copy.deepcopy(config), model)
     targets: Dict[str, nn.Module] = {}
     for name, module in model.named_modules():
@@ -95,13 +95,13 @@ def select_zero_shot_targets(model: nn.Module, config: LoraConfig) -> Dict[str, 
         if not check_target_module_exists(resolved, name) or not _is_candidate_module(name):
             continue
         if not isinstance(module, nn.Linear):
-            raise ValueError(f'Zero-shot LoRA target {name!r} is not an nn.Linear module.')
+            raise ValueError(f'Spectral LoRA target {name!r} is not an nn.Linear module.')
         if weight.is_meta:
-            raise ValueError('Zero-shot spectral scoring requires materialized weights; '
+            raise ValueError('Spectral scoring requires materialized weights; '
                              'disable memory_efficient_init.')
         targets[name] = module
     if not targets:
-        raise ValueError(f'Zero-shot LoRA found no candidate modules for {config.target_modules!r}.')
+        raise ValueError(f'Spectral LoRA found no candidate modules for {config.target_modules!r}.')
     return targets
 
 
@@ -118,7 +118,7 @@ def _spectrum_cache_path(
 
 
 @torch.no_grad()
-def compute_zero_shot_scores(
+def compute_spectral_scores(
     model: nn.Module,
     config: LoraConfig,
     r: int,
@@ -127,9 +127,9 @@ def compute_zero_shot_scores(
     cache_key: str = '',
     epsilon: float = 1e-12,
     log_interval: int = 20,
-) -> ZeroShotScores:
-    """Score pretrained modules from singular-value spectra without training data."""
-    targets = select_zero_shot_targets(model, config)
+) -> SpectralScores:
+    """Score pretrained modules from singular-value spectra for data-free allocation."""
+    targets = select_spectral_targets(model, config)
     names = sorted(targets)
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
@@ -138,7 +138,7 @@ def compute_zero_shot_scores(
 
     if rank == 0:
         if log_interval > 0:
-            logger.info(f'Zero-shot spectral scoring: {len(names)} modules, LoRA rank={r}')
+            logger.info(f'Spectral Hybrid LoRA scoring: {len(names)} modules, LoRA rank={r}')
         for index, name in enumerate(names, start=1):
             weight = targets[name].weight.detach()
             shape = tuple(weight.shape)
@@ -153,7 +153,7 @@ def compute_zero_shot_scores(
                     if isinstance(cached, torch.Tensor) and cached.ndim == 1 and cached.numel() == min(shape):
                         singular_values = cached
                 except (OSError, RuntimeError, EOFError):
-                    logger.warning(f'Zero-shot spectrum cache is unreadable: {spectrum_path}; recomputing')
+                    logger.warning(f'Spectral spectrum cache is unreadable: {spectrum_path}; recomputing')
 
             if singular_values is None:
                 cpu_weight = weight.to(device='cpu')
@@ -166,11 +166,11 @@ def compute_zero_shot_scores(
                     torch.save(singular_values, temporary_path)
                     os.replace(temporary_path, spectrum_path)
 
-            metrics = compute_zero_shot_spectral_metrics(singular_values, r=r, epsilon=epsilon)
+            metrics = compute_spectral_metrics(singular_values, r=r, epsilon=epsilon)
             metrics_by_module[name] = metrics
             scores[name] = metrics['score']
             if log_interval > 0 and (index % log_interval == 0 or index == len(names)):
-                logger.info(f'Zero-shot spectral scoring: {index}/{len(names)} modules '
+                logger.info(f'Spectral Hybrid LoRA scoring: {index}/{len(names)} modules '
                             f'(last {name} -> score={metrics["score"]:.4f}, '
                             f'effective_rank={metrics["effective_rank"]:.1f}, '
                             f'rank_coverage={metrics["rank_coverage"]:.4f})')
@@ -179,23 +179,23 @@ def compute_zero_shot_scores(
         payload = [(scores, metrics_by_module) if rank == 0 else None]
         dist.broadcast_object_list(payload, src=0)
         scores, metrics_by_module = payload[0]
-    return ZeroShotScores(scores, metrics_by_module)
+    return SpectralScores(scores, metrics_by_module)
 
 
-def allocate_zero_shot_modules(
+def allocate_spectral_modules(
     scores: Mapping[str, float],
     param_counts: Mapping[str, int],
     fft_ratio: float = 0.1,
 ) -> Tuple[List[str], List[str]]:
     """Allocate the highest-scoring prefix to full fine-tuning within a parameter budget."""
     if not 0.0 <= fft_ratio < 1.0:
-        raise ValueError('Zero-shot FFT ratio must be in [0, 1).')
+        raise ValueError('Spectral FFT ratio must be in [0, 1).')
     missing = set(scores) - set(param_counts)
     if missing:
-        raise ValueError(f'Zero-shot allocation is missing parameter counts for: {sorted(missing)}.')
+        raise ValueError(f'Spectral allocation is missing parameter counts for: {sorted(missing)}.')
     total = sum(param_counts[name] for name in scores)
     if total <= 0:
-        raise ValueError('Zero-shot candidate parameter count must be positive.')
+        raise ValueError('Spectral candidate parameter count must be positive.')
 
     budget = fft_ratio * total
     ordered = sorted(scores, key=lambda name: (-scores[name], name))
@@ -212,7 +212,7 @@ def allocate_zero_shot_modules(
     return sorted(s_fft), sorted(s_lora)
 
 
-def build_zero_shot_lora_config(
+def build_spectral_lora_config(
     s_lora: List[str],
     s_fft: List[str],
     r: int = 16,
@@ -221,7 +221,7 @@ def build_zero_shot_lora_config(
     **kwargs,
 ) -> LoraConfig:
     if not s_lora:
-        raise ValueError('Zero-shot LoRA requires at least one LoRA module.')
+        raise ValueError('Spectral LoRA requires at least one LoRA module.')
     return LoraConfig(
         r=r,
         lora_alpha=lora_alpha,
@@ -232,7 +232,7 @@ def build_zero_shot_lora_config(
     )
 
 
-def build_zero_shot_param_groups(
+def build_spectral_param_groups(
     peft_model: nn.Module,
     lr_lora: float = 2.5e-5,
     lr_fft: float = 1e-6,
@@ -253,7 +253,7 @@ def build_zero_shot_param_groups(
             fft_params.append(param)
             fft_names.append(name)
         else:
-            raise ValueError(f'Zero-shot LoRA cannot classify trainable parameter {name!r}.')
+            raise ValueError(f'Spectral LoRA cannot classify trainable parameter {name!r}.')
 
     groups: List[dict] = []
     if lora_params:
@@ -261,5 +261,5 @@ def build_zero_shot_param_groups(
     if fft_params:
         groups.append({'params': fft_params, 'param_names': fft_names, 'lr': lr_fft, 'weight_decay': weight_decay})
     if not groups:
-        raise ValueError('Zero-shot LoRA found no trainable parameters to optimize.')
+        raise ValueError('Spectral LoRA found no trainable parameters to optimize.')
     return groups

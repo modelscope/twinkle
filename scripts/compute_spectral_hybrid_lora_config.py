@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Compute a zero-shot FFT/LoRA allocation from pretrained weight spectra.
+"""Compute a data-free spectral FFT/LoRA allocation from pretrained spectra.
 
 Example:
-    python scripts/compute_zero_shot_hybrid_config.py \
+    python scripts/compute_spectral_hybrid_lora_config.py \
         --model-id ms://Qwen/Qwen3.5-9B \
-        --zero-shot-r 64 \
-        --zero-shot-fft-ratio 0.3 \
-        --output-dir ./output/zero_shot \
-        --hybrid-config-output ./output/zero_shot/hybrid_config.json
+        --spectral-r 64 \
+        --spectral-fft-ratio 0.3 \
+        --output-dir ./output/spectral_hybrid_lora \
+        --spectral-config-output ./output/spectral_hybrid_lora/config.json
 """
 
 import json
@@ -19,8 +19,8 @@ import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.cli import CLI
 from twinkle.model import TransformersModel
-from twinkle.model.transformers.zero_shot_lora import (CANDIDATE_TYPES, allocate_zero_shot_modules,
-                                                       compute_zero_shot_scores, select_zero_shot_targets)
+from twinkle.model.transformers.spectral_hybrid_lora import (CANDIDATE_TYPES, allocate_spectral_modules,
+                                                             compute_spectral_scores, select_spectral_targets)
 
 logger = get_logger()
 args = CLI.from_args()
@@ -34,20 +34,20 @@ def main() -> None:
     if not args.model.model_id:
         raise ValueError('--model-id is required.')
 
-    r = int(args.extra.get('zero_shot_r', args.lora.lora_r))
-    lora_alpha = int(args.extra.get('zero_shot_alpha', r * 2))
-    fft_ratio = float(args.extra.get('zero_shot_fft_ratio', 0.1))
-    epsilon = float(args.extra.get('zero_shot_epsilon', 1e-12))
-    output_path = Path(args.extra.get('hybrid_config_output',
-                                      Path(args.training.output_dir) / 'hybrid_config.json')).expanduser()
-    cache_dir = Path(
-        args.extra.get('zero_shot_cache_dir',
-                       Path(args.training.output_dir) / 'zero-shot-spectrum-cache')).expanduser()
+    r = int(args.extra.get('spectral_r', args.lora.lora_r))
+    lora_alpha = int(args.extra.get('spectral_alpha', r * 2))
+    fft_ratio = float(args.extra.get('spectral_fft_ratio', 0.1))
+    epsilon = float(args.extra.get('spectral_epsilon', 1e-12))
+    output_path = Path(
+        args.extra.get('spectral_config_output',
+                       Path(args.training.output_dir) / 'spectral_hybrid_lora_config.json')).expanduser()
+    cache_dir = Path(args.extra.get('spectral_cache_dir',
+                                    Path(args.training.output_dir) / 'spectral-spectrum-cache')).expanduser()
 
-    logger.info(f'Loading pretrained model for zero-shot spectral scoring: {args.model.model_id}')
+    logger.info(f'Loading pretrained model for Spectral Hybrid LoRA scoring: {args.model.model_id}')
     model = TransformersModel(model_id=args.model.model_id)
     if model._memory_efficient_init:
-        raise ValueError('Zero-shot spectral scoring requires materialized weights; disable memory_efficient_init.')
+        raise ValueError('Spectral scoring requires materialized weights; disable memory_efficient_init.')
 
     target_config = LoraConfig(
         r=r,
@@ -55,9 +55,9 @@ def main() -> None:
         lora_dropout=0.0,
         target_modules=list(CANDIDATE_TYPES.values()),
     )
-    targets = select_zero_shot_targets(model.model, target_config)
+    targets = select_spectral_targets(model.model, target_config)
     param_counts = {name: module.weight.numel() for name, module in targets.items()}
-    scores = compute_zero_shot_scores(
+    scores = compute_spectral_scores(
         model.model,
         target_config,
         r=r,
@@ -67,12 +67,12 @@ def main() -> None:
         log_interval=args.training.log_interval,
     )
     counts = {name: param_counts[name] for name in scores}
-    s_fft, s_lora = allocate_zero_shot_modules(scores, counts, fft_ratio=fft_ratio)
+    s_fft, s_lora = allocate_spectral_modules(scores, counts, fft_ratio=fft_ratio)
     fft_params = sum(counts[name] for name in s_fft)
     total_params = sum(counts.values())
 
     config = {
-        'method': 'zero_shot_spectral',
+        'method': 'spectral_hybrid_lora',
         'model_id': args.model.model_id,
         's_fft': s_fft,
         's_lora': s_lora,
@@ -81,7 +81,7 @@ def main() -> None:
         'lora_dropout': 0.0,
         'fft_ratio': fft_ratio,
         'realized_fft_param_ratio': fft_params / total_params,
-        'zero_shot_epsilon': epsilon,
+        'spectral_epsilon': epsilon,
         'metrics': {
             name: {
                 'score': scores[name],
@@ -98,7 +98,7 @@ def main() -> None:
             json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write('\n')
         os.replace(temporary_path, output_path)
-        logger.info(f'Zero-shot config written to {output_path}: '
+        logger.info(f'Spectral config written to {output_path}: '
                     f'{len(s_fft)} FFT modules, {len(s_lora)} LoRA modules, '
                     f'realized FFT parameter ratio={fft_params / total_params:.2%}')
 

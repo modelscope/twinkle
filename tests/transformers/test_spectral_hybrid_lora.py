@@ -4,14 +4,14 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from peft.utils import get_peft_model_state_dict
 from torch import nn
 
-from twinkle.model.transformers.zero_shot_lora import (
+from twinkle.model.transformers.spectral_hybrid_lora import (
     CANDIDATE_TYPES,
-    allocate_zero_shot_modules,
-    build_zero_shot_lora_config,
-    build_zero_shot_param_groups,
-    compute_zero_shot_scores,
-    compute_zero_shot_spectral_metrics,
-    select_zero_shot_targets,
+    allocate_spectral_modules,
+    build_spectral_lora_config,
+    build_spectral_param_groups,
+    compute_spectral_scores,
+    compute_spectral_metrics,
+    select_spectral_targets,
 )
 
 
@@ -42,7 +42,7 @@ class TinyDecoder(nn.Module):
 
 def test_spectral_metrics_match_weighted_formula():
     singular_values = torch.tensor([4.0, 2.0, 1.0, 0.5], dtype=torch.float64)
-    metrics = compute_zero_shot_spectral_metrics(singular_values, r=1)
+    metrics = compute_spectral_metrics(singular_values, r=1)
 
     probabilities = singular_values / singular_values.sum()
     effective_rank = torch.exp(-(probabilities * probabilities.log()).sum()).item()
@@ -69,14 +69,14 @@ def test_spectral_metrics_match_weighted_formula():
 ])
 def test_spectral_metrics_validate_inputs(singular_values, r, message):
     with pytest.raises(ValueError, match=message):
-        compute_zero_shot_spectral_metrics(singular_values, r=r)
+        compute_spectral_metrics(singular_values, r=r)
 
 
 def test_select_targets_covers_supported_module_types():
     model = TinyDecoder(num_layers=2)
     config = LoraConfig(r=4, target_modules=list(CANDIDATE_TYPES.values()))
 
-    targets = select_zero_shot_targets(model, config)
+    targets = select_spectral_targets(model, config)
 
     assert len(targets) == 14
     assert all(name.rsplit('.', 1)[-1] in CANDIDATE_TYPES.values() for name in targets)
@@ -93,9 +93,9 @@ def test_scores_cache_pretrained_singular_values(tmp_path, monkeypatch):
         return original_svdvals(weight)
 
     monkeypatch.setattr(torch.linalg, 'svdvals', record_svdvals)
-    scores = compute_zero_shot_scores(
+    scores = compute_spectral_scores(
         model, config, r=2, cache_dir=tmp_path, cache_key='tiny', log_interval=0)
-    cached_scores = compute_zero_shot_scores(
+    cached_scores = compute_spectral_scores(
         model, config, r=2, cache_dir=tmp_path, cache_key='tiny', log_interval=0)
 
     assert set(scores) == {'layers.0.mlp.down_proj', 'layers.0.self_attn.q_proj'}
@@ -109,7 +109,7 @@ def test_allocation_prioritizes_high_scores_within_budget():
     scores = {'a': 0.2, 'b': 0.8, 'c': 0.4, 'd': 0.6}
     counts = {name: 100 for name in scores}
 
-    s_fft, s_lora = allocate_zero_shot_modules(scores, counts, fft_ratio=0.25)
+    s_fft, s_lora = allocate_spectral_modules(scores, counts, fft_ratio=0.25)
 
     assert s_fft == ['b']
     assert set(s_lora) == {'a', 'c', 'd'}
@@ -119,7 +119,7 @@ def test_allocation_uses_strict_ranked_prefix():
     scores = {'big': 0.9, 'small_a': 0.8, 'small_b': 0.7}
     counts = {'big': 80, 'small_a': 30, 'small_b': 15}
 
-    s_fft, s_lora = allocate_zero_shot_modules(scores, counts, fft_ratio=0.7)
+    s_fft, s_lora = allocate_spectral_modules(scores, counts, fft_ratio=0.7)
 
     assert s_fft == ['big']
     assert set(s_lora) == {'small_a', 'small_b'}
@@ -127,16 +127,16 @@ def test_allocation_uses_strict_ranked_prefix():
 
 def test_allocation_rejects_full_fft_budget():
     with pytest.raises(ValueError, match=r'\[0, 1\)'):
-        allocate_zero_shot_modules({'module': 1.0}, {'module': 10}, fft_ratio=1.0)
+        allocate_spectral_modules({'module': 1.0}, {'module': 10}, fft_ratio=1.0)
 
 
 def test_config_requires_a_lora_target():
     with pytest.raises(ValueError, match='at least one LoRA module'):
-        build_zero_shot_lora_config([], ['layers.0.self_attn.q_proj'])
+        build_spectral_lora_config([], ['layers.0.self_attn.q_proj'])
 
 
 def test_config_and_param_groups_cover_every_trainable_parameter():
-    config = build_zero_shot_lora_config(
+    config = build_spectral_lora_config(
         s_lora=['layers.0.mlp.down_proj'],
         s_fft=['layers.0.self_attn.q_proj'],
         r=4,
@@ -144,7 +144,7 @@ def test_config_and_param_groups_cover_every_trainable_parameter():
     )
     model = get_peft_model(TinyDecoder(num_layers=1), config)
 
-    groups = build_zero_shot_param_groups(model, lr_lora=2.5e-5, lr_fft=1e-6)
+    groups = build_spectral_param_groups(model, lr_lora=2.5e-5, lr_fft=1e-6)
 
     assert {group['lr'] for group in groups} == {2.5e-5, 1e-6}
     grouped = {id(param) for group in groups for param in group['params']}
@@ -166,7 +166,7 @@ def test_strategy_adapter_state_includes_full_modules(strategy_cls):
         strategy = object.__new__(Strategy)
         strategy.ep_fsdp_device_mesh = None
 
-    config = build_zero_shot_lora_config(
+    config = build_spectral_lora_config(
         s_lora=['layers.0.mlp.down_proj'],
         s_fft=['layers.0.self_attn.q_proj'],
         r=4,
@@ -188,7 +188,7 @@ def test_twinkle_checkpoint_normalization_round_trips_full_modules(tmp_path):
     torch.manual_seed(0)
     base = TinyDecoder(num_layers=1)
     base_state = {name: value.detach().clone() for name, value in base.state_dict().items()}
-    config = build_zero_shot_lora_config(
+    config = build_spectral_lora_config(
         s_lora=['layers.0.mlp.down_proj'],
         s_fft=['layers.0.self_attn.q_proj'],
         r=4,
@@ -222,11 +222,11 @@ def test_twinkle_checkpoint_normalization_round_trips_full_modules(tmp_path):
     assert torch.allclose(loaded(inputs), expected, atol=1e-5)
 
 
-@pytest.mark.parametrize('adapter_name', ['default', 'zero_shot'])
+@pytest.mark.parametrize('adapter_name', ['default', 'spectral_hybrid'])
 def test_trainable_parameter_filter_includes_full_modules(adapter_name):
     from twinkle.model.transformers.transformers import TransformersModel
 
-    config = build_zero_shot_lora_config(
+    config = build_spectral_lora_config(
         s_lora=['layers.0.mlp.down_proj'],
         s_fft=['layers.0.self_attn.q_proj'],
         r=4,
