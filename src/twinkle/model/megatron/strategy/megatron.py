@@ -122,6 +122,10 @@ class MegatronStrategy:
         """Read from device_mesh so auto-enable in args.py is visible."""
         return getattr(self.device_mesh, 'sequence_parallel', False)
 
+    def init_kwargs(self) -> Dict[str, Any]:
+        # Parallelism is configured through the megatron model config, not at construction time.
+        return {}
+
     @property
     def bridge(self):
         return self.config.bridge

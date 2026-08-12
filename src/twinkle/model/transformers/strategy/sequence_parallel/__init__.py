@@ -6,13 +6,14 @@ from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
 from transformers import PreTrainedTokenizer
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
+from twinkle.patch.transformers_qwen3_vl_deepstack import Qwen3VLDeepstackSPPatch
 from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch, _iter_qwen35_gated_delta_net_classes
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
@@ -373,37 +374,7 @@ class SequenceParallel:
     def _prepare_multimodal_deepstack(self, base_model: torch.nn.Module):
         if not is_qwen3_vl(base_model):
             return
-
-        def _patch_deepstack_process(module: torch.nn.Module) -> bool:
-            origin = getattr(module, '_deepstack_process', None)
-            if not callable(origin):
-                return False
-            if getattr(module, '_twinkle_sp_mm_patched', False):
-                return False
-
-            def _deepstack_process(_self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor,
-                                   visual_embeds: torch.Tensor):
-                world_size = sequence_parallel.world_size
-                if world_size and world_size > 1 and visual_pos_masks is not None:
-                    visual_pos_masks, visual_embeds = sequence_parallel.pad_and_split_mm_tokens(
-                        visual_pos_masks, visual_embeds)
-                if visual_pos_masks is None:
-                    return hidden_states + visual_embeds.mean() * 0
-                visual_pos_masks = visual_pos_masks.to(hidden_states.device)
-                visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-                if hidden_states.ndim == 3 and visual_pos_masks.ndim == 3:
-                    visual_pos_masks = visual_pos_masks[..., 0]
-                local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
-                hidden_states[visual_pos_masks, :] = local_this
-                return hidden_states
-
-            module._deepstack_process = MethodType(_deepstack_process, module)
-            module._twinkle_sp_mm_patched = True
-            return True
-
-        for submodule in base_model.modules():
-            _patch_deepstack_process(submodule)
-        _patch_deepstack_process(base_model)
+        apply_patch(base_model, Qwen3VLDeepstackSPPatch, sequence_parallel=self)
 
     @staticmethod
     def _is_qwen35_model(model: torch.nn.Module) -> bool:

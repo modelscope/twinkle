@@ -357,3 +357,31 @@ def split_cp_inputs(inputs: 'torch.Tensor', cu_seqlens: Optional['torch.Tensor']
         view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
         new_inputs.append(val.view(view_shape))
     return torch.cat(new_inputs, dim=dim)
+
+
+def first_tensor(obj):
+    """Extract the first tensor from a model output (tensor, tuple, NamedTuple, dict).
+
+    Useful when consuming heterogeneous outputs from ``get_image_features`` and similar
+    methods across different model architectures.  Tries common HF output attributes
+    (``pooler_output``, ``last_hidden_state``) first, then falls back to iterating.
+    """
+    import torch
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if hasattr(obj, 'pooler_output') and obj.pooler_output is not None:
+        t = obj.pooler_output
+        if isinstance(t, list):
+            return torch.cat(t, dim=0) if t else None
+        return t
+    if hasattr(obj, 'last_hidden_state') and obj.last_hidden_state is not None:
+        return obj.last_hidden_state
+    if isinstance(obj, (tuple, list)) and obj:
+        for item in obj:
+            if isinstance(item, torch.Tensor):
+                return item
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, torch.Tensor):
+                return v
+    return None

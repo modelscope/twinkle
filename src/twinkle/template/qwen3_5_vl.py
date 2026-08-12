@@ -1,7 +1,11 @@
 import inspect
 import numpy as np
+import os
+import tempfile
 import torch
+from contextlib import contextmanager
 from copy import copy
+from io import BytesIO
 from PIL import Image
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -9,8 +13,39 @@ from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
 from twinkle.template.base import ImageInput, Template, VideoInput
 from twinkle.template.utils import get_inputs_embeds_hf
+from twinkle.utils import load_mm_file
 
 _ROPE_INDEX_CACHE: Dict[str, Callable] = {}
+
+
+@contextmanager
+def _as_local_video_path(video: str):
+    """Yield a path ``qwen_vl_utils.fetch_video`` can read, materializing base64 to a temp file.
+
+    The video reader backends (torchvision / decord / torchcodec) all document support for local
+    paths, ``file://`` and ``http(s)://`` -- but not base64, which ``fetch_image`` does accept. So
+    only base64 needs handling here; everything else is passed through untouched.
+
+    A temp file (rather than the ``BytesIO`` that ``load_mm_file`` returns) is required because
+    ``fetch_video`` dispatches on ``isinstance(ele['video'], str)`` and treats any non-str as a list
+    of frames.
+    """
+    if not (isinstance(video, str) and video.strip().startswith('data:')):
+        yield video
+        return
+    data = load_mm_file(video)
+    payload = data.getvalue() if isinstance(data, BytesIO) else data
+    # Suffix-less is fine: all three backends sniff the container rather than trust the extension.
+    tmp = tempfile.NamedTemporaryFile(prefix='twinkle_video_', delete=False)
+    try:
+        tmp.write(payload)
+        tmp.close()
+        yield tmp.name
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def _build_rope_index_func(config) -> Callable:
@@ -38,8 +73,56 @@ class Qwen3_5Template(Template):
     so post_encode just passes through inputs unchanged.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self,
+                 *args,
+                 image_min_pixels: Optional[int] = None,
+                 image_max_pixels: Optional[int] = None,
+                 video_min_pixels: Optional[int] = None,
+                 video_max_pixels: Optional[int] = None,
+                 video_total_pixels: Optional[int] = None,
+                 fps: Optional[float] = None,
+                 video_min_frames: Optional[int] = None,
+                 video_max_frames: Optional[int] = None,
+                 nframes: Optional[int] = None,
+                 **kwargs):
+        """Qwen-VL template.
+
+        The media arguments tune ``qwen_vl_utils`` preprocessing (resolution budget and video frame
+        sampling). They are forwarded per call inside the element dict that ``fetch_image`` /
+        ``fetch_video`` accept, so each template instance keeps its own settings -- unlike writing
+        the ``vision_process`` module globals, which every instance in the process would share.
+        Leaving one as ``None`` defers to the ``qwen_vl_utils`` default.
+
+        Args:
+            image_min_pixels / image_max_pixels: per-image resolution budget, in pixels.
+            video_min_pixels / video_max_pixels: per-frame resolution budget, in pixels.
+            video_total_pixels: budget across all sampled frames of one video.
+            fps: frame sampling rate. Mutually exclusive with ``nframes``.
+            video_min_frames / video_max_frames: clamp the frame count ``fps`` produces.
+            nframes: exact frame count to sample. Mutually exclusive with ``fps``.
+        """
+        assert fps is None or nframes is None, 'Pass either `fps` or `nframes`, not both.'
         super().__init__(*args, **kwargs)
+        # Only non-None entries, so absent keys fall through to the qwen_vl_utils defaults.
+        self._image_kwargs = {
+            k: v
+            for k, v in {
+                'min_pixels': image_min_pixels,
+                'max_pixels': image_max_pixels,
+            }.items() if v is not None
+        }
+        self._video_kwargs = {
+            k: v
+            for k, v in {
+                'min_pixels': video_min_pixels,
+                'max_pixels': video_max_pixels,
+                'total_pixels': video_total_pixels,
+                'fps': fps,
+                'min_frames': video_min_frames,
+                'max_frames': video_max_frames,
+                'nframes': nframes,
+            }.items() if v is not None
+        }
         # Fix upstream Qwen3 chat_template parse bugs (orphan </think> handling).
         # Deferred import to avoid cycles; idempotent across Ray actor re-init.
         from twinkle.patch import apply_patch
@@ -99,6 +182,7 @@ class Qwen3_5Template(Template):
             return super().preprocess_image(image)
 
         # Use qwen_vl_utils with correct patch_size
+        image_input.update(self._image_kwargs)
         return fetch_image(image_input, image_patch_size=self.patch_size)
 
     def preprocess_video(self, video: VideoInput) -> Union[List[Image.Image], torch.Tensor]:
@@ -106,8 +190,10 @@ class Qwen3_5Template(Template):
         from qwen_vl_utils.vision_process import fetch_video
 
         if isinstance(video, str):
-            video_input = {'video': video}
-            result = fetch_video(video_input, image_patch_size=self.patch_size, return_video_sample_fps=False)
+            # Base64 has to become a real file first: the reader backends only take paths/URLs.
+            with _as_local_video_path(video) as video_path:
+                video_input = {'video': video_path, **self._video_kwargs}
+                result = fetch_video(video_input, image_patch_size=self.patch_size, return_video_sample_fps=False)
             return result
         elif isinstance(video, list):
             return [self.preprocess_image(frame) for frame in video]

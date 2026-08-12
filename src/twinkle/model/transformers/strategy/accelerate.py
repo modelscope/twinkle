@@ -31,6 +31,13 @@ class AccelerateStrategy:
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._memory_efficient_init = memory_efficient_init
+        # Tensor parallelism state. The actual sharding is done by transformers at load time
+        # (see `init_kwargs`); here we only record the degree and reject mesh shapes
+        # the current transformers version cannot honor.
+        self._tp_size = device_mesh.get_dim_size('tp') if (device_mesh is not None and device_mesh.has_dim('tp')) else 1
+        self._tp_enabled = self._tp_size > 1
+        if self._tp_enabled:
+            self._validate_tp_device_mesh(device_mesh)
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
         fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
@@ -52,6 +59,62 @@ class AccelerateStrategy:
 
     def pretrained_load_context(self):
         return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
+
+    def init_kwargs(self) -> Dict[str, Any]:
+        """Extra kwargs the model construction call needs for this strategy.
+
+        For TP this is what makes transformers shard the model at load time. accelerate does not
+        apply TP itself: `Accelerator.prepare` only checks that the model was already sharded
+        (`model.tp_size == parallelism_config.tp_size`) and replicates whatever is left on its own
+        device mesh. We also hand transformers accelerate's own device mesh so both sides operate on
+        a single mesh -- otherwise the sharded and the replicated params end up on different meshes
+        and forward fails with a cross-mesh DTensor error.
+        """
+        if not self._tp_enabled:
+            return {}
+        load_kwargs = self._tp_load_config(self._tp_size)
+        device_mesh = self.accelerator.torch_device_mesh
+        if device_mesh is not None:
+            load_kwargs['device_mesh'] = device_mesh
+        return load_kwargs
+
+    @staticmethod
+    def _tp_load_config(tp_size: int) -> Dict[str, Any]:
+        """Version-adaptive native-TP entry for `from_pretrained`.
+
+        transformers >=5.16 shards via `DistributedConfig(tp_size=...)`; <=5.12 via `tp_plan="auto"`
+        plus `tp_size`. Tell them apart by whether `DistributedConfig` carries a `tp_size` field.
+        """
+        try:
+            from transformers.distributed import DistributedConfig
+            if 'tp_size' in getattr(DistributedConfig, '__dataclass_fields__', {}):
+                return {'distributed_config': DistributedConfig(tp_size=tp_size)}
+        except ImportError:
+            pass
+        return {'tp_plan': 'auto', 'tp_size': tp_size}
+
+    @staticmethod
+    def _validate_tp_device_mesh(device_mesh) -> None:
+        """Fail fast on TP mesh shapes this integration does not yet support.
+
+        v1 of transformers-backend TP handles pure tensor parallelism only (`tp_size ==
+        world_size`); composing TP with FSDP/DP is not validated yet. So a TP mesh must not carry
+        any other non-trivial parallel dimension.
+        """
+        offending = {}
+        for name in (device_mesh.mesh_dim_names or ()):
+            if name == 'tp':
+                continue
+            if device_mesh.get_dim_size(name) > 1:
+                offending[name] = device_mesh.get_dim_size(name)
+        if offending:
+            raise ValueError('Tensor parallelism in the transformers backend currently supports pure TP only '
+                             '(composing TP with FSDP/DP is not validated yet), but the device mesh also has '
+                             f'non-trivial dimensions {offending}. Use a mesh where only `tp` > 1.')
+        tp_size = device_mesh.get_dim_size('tp')
+        if tp_size != device_mesh.world_size:
+            raise ValueError(f'Pure TP requires tp_size ({tp_size}) to equal the mesh world size '
+                             f'({device_mesh.world_size}).')
 
     def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
         return

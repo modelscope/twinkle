@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import concurrent.futures
+import hashlib
 import os
 import tempfile
 from concurrent.futures import Future
@@ -8,7 +9,8 @@ from pathlib import Path
 from requests.exceptions import HTTPError
 from typing import Dict, List, Literal, Optional, Union
 
-from ..utils import requires
+from twinkle.utils import requires
+from twinkle.utils.parallel import processing_lock
 from .model_alias import resolve_model_id_alias
 
 _executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
@@ -211,39 +213,80 @@ class HubOperation:
         if os.path.exists(model_id_or_path):
             return model_id_or_path
         hub = cls._get_hub_class(model_id_or_path)
-        return hub.download_model(
-            model_id_or_path=cls.remove_source_type(model_id_or_path),
-            revision=revision,
-            ignore_patterns=ignore_patterns,
-            token=token,
-            **kwargs)
+        # Every rank of a group reaches this on its own, so without ordering they would all pull the
+        # same repo into the same cache dir at once. The key covers the patterns too, so a partial
+        # fetch (weightless, or a single file) never satisfies a caller that wants more. md5 rather
+        # than hash(), which is salted per process and would give every rank a different key.
+        scope = str(sorted(ignore_patterns or [])) + str(kwargs.get('allow_patterns') or '')
+        scope = hashlib.md5(scope.encode('utf-8')).hexdigest()[:8]
+        with processing_lock(f'download_model:{model_id_or_path}:{scope}', sticky=True):
+            return hub.download_model(
+                model_id_or_path=cls.remove_source_type(model_id_or_path),
+                revision=revision,
+                ignore_patterns=ignore_patterns,
+                token=token,
+                **kwargs)
+
+    @classmethod
+    def download_dataset(cls,
+                         dataset_id: str,
+                         revision: Optional[str] = None,
+                         allow_patterns: Optional[Union[List[str], str]] = None,
+                         ignore_patterns: Optional[Union[List[str], str]] = None,
+                         token: Optional[str] = None,
+                         **kwargs) -> str:
+        """Download a dataset repo from the hub, without loading it
+
+        Use this to place the files; use `load_dataset` to get an actual dataset object.
+
+        Args:
+            dataset_id: The dataset id, or a local path, which is returned untouched
+            revision: The dataset revision
+            allow_patterns: Only fetch files matching these patterns
+            ignore_patterns: Skip files matching these patterns
+            token: The hub token
+        Returns:
+            The local dir
+        """
+        if os.path.exists(dataset_id):
+            return dataset_id
+        hub = cls._get_hub_class(dataset_id)
+        with processing_lock(f'download_dataset:{dataset_id}', sticky=True):
+            return hub.download_dataset(
+                dataset_id=cls.remove_source_type(dataset_id),
+                revision=revision,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                token=token,
+                **kwargs)
 
     @classmethod
     def download_file(cls,
                       repo_id: str,
-                      repo_type: str = 'model',
+                      repo_type: Literal['model', 'tokenizer', 'dataset'] = 'model',
                       allow_patterns: Optional[Union[List[str], str]] = None,
                       token: Optional[str] = None,
                       **kwargs) -> str:
-        """Download specific files from the hub
+        """Download a repo, or part of one, letting repo_type pick the right hub API
+
+        Callers holding nothing but a type string can use this instead of choosing between
+        `download_model` and `download_dataset` themselves.
 
         Args:
-            repo_id: The repository id
-            repo_type: The type of repository, default is 'model'
-            allow_patterns: Patterns to filter which files to download
+            repo_id: The repository id, or a local path, which is returned untouched
+            repo_type: 'model' for a full model repo, 'tokenizer' for the same repo without its
+                weights, 'dataset' for a dataset repo
+            allow_patterns: Only fetch files matching these patterns
             token: The hub token
             **kwargs: Additional arguments passed to the download function
 
         Returns:
             The local directory path containing downloaded files
         """
-        hub = cls._get_hub_class(repo_id)
-        return hub.download_file(
-            repo_id=cls.remove_source_type(repo_id),
-            repo_type=repo_type,
-            allow_patterns=allow_patterns,
-            token=token,
-            **kwargs)
+        if repo_type == 'dataset':
+            return cls.download_dataset(repo_id, allow_patterns=allow_patterns, token=token, **kwargs)
+        return cls.download_model(
+            repo_id, ignore_model=(repo_type == 'tokenizer'), allow_patterns=allow_patterns, token=token, **kwargs)
 
 
 class MSHub(HubOperation):
@@ -454,42 +497,24 @@ class MSHub(HubOperation):
         return snapshot_download(**download_kwargs)
 
     @classmethod
-    def download_file(cls,
-                      repo_id: str,
-                      repo_type: str = 'model',
-                      allow_patterns: Optional[Union[List[str], str]] = None,
-                      token: Optional[str] = None,
-                      **kwargs) -> str:
-        """Download specific files from ModelScope hub
-
-        Args:
-            repo_id: The repository id
-            repo_type: The type of repository, default is 'model'
-            allow_patterns: Patterns to filter which files to download
-            token: The hub token
-            **kwargs: Additional arguments passed to _snapshot_download
-
-        Returns:
-            The local directory path containing downloaded files
-        """
+    def download_dataset(cls,
+                         dataset_id: str,
+                         revision: Optional[str] = None,
+                         allow_patterns: Optional[Union[List[str], str]] = None,
+                         ignore_patterns: Optional[Union[List[str], str]] = None,
+                         token: Optional[str] = None,
+                         **kwargs) -> str:
         requires('modelscope')
         cls.try_login(token)
-        import inspect
-        from modelscope.hub.snapshot_download import _snapshot_download
-
-        # Build download arguments
-        download_kwargs = {'repo_id': repo_id, 'repo_type': repo_type, 'allow_patterns': allow_patterns, **kwargs}
-
-        # Add token parameter only if supported by the function signature
-        if token is not None:
-            sig = inspect.signature(_snapshot_download)
-            if 'token' in sig.parameters:
-                download_kwargs['token'] = token
-            else:
-                print('Token parameter is not supported by current modelscope version. '
-                      'Please upgrade to modelscope >= 1.34.0 for token-based authentication.')
-
-        return _snapshot_download(**download_kwargs)
+        if revision is None or revision == 'main':
+            revision = 'master'
+        from modelscope import dataset_snapshot_download
+        return dataset_snapshot_download(
+            dataset_id=dataset_id,
+            revision=revision,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            **kwargs)
 
     @staticmethod
     def add_patterns_to_file(repo,
@@ -633,25 +658,22 @@ class HFHub(HubOperation):
             **kwargs)
 
     @classmethod
-    def download_file(cls,
-                      repo_id: str,
-                      repo_type: str = 'model',
-                      allow_patterns: Optional[Union[List[str], str]] = None,
-                      token: Optional[str] = None,
-                      **kwargs) -> str:
-        """Download specific files from HuggingFace hub
-
-        Args:
-            repo_id: The repository id
-            repo_type: The type of repository, default is 'model'
-            allow_patterns: Patterns to filter which files to download
-            token: The hub token
-            **kwargs: Additional arguments passed to snapshot_download
-
-        Returns:
-            The local directory path containing downloaded files
-        """
+    def download_dataset(cls,
+                         dataset_id: str,
+                         revision: Optional[str] = None,
+                         allow_patterns: Optional[Union[List[str], str]] = None,
+                         ignore_patterns: Optional[Union[List[str], str]] = None,
+                         token: Optional[str] = None,
+                         **kwargs) -> str:
         requires('huggingface_hub')
+        if revision is None or revision == 'master':
+            revision = 'main'
         from huggingface_hub import snapshot_download
         return snapshot_download(
-            repo_id=repo_id, repo_type=repo_type, allow_patterns=allow_patterns, token=token, **kwargs)
+            repo_id=dataset_id,
+            repo_type='dataset',
+            revision=revision,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            token=token,
+            **kwargs)

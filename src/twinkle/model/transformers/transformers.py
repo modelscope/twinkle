@@ -49,25 +49,63 @@ from twinkle.utils.transformers_utils import filter_from_config_kwargs
 logger = get_logger()
 
 
-def _resolve_task_context(model, task):
+def _resolve_task_context(model, task, template=None):
     """Return a context manager that applies the right per-forward Patch for ``task``.
 
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
     ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
+    last-valid-token reduction is deferred to ``postprocess_tensor_sp`` too. The plain
+    'reranker' task needs NO patch: it rides a real ``num_labels=1`` classification head
+    built at model construction, which already returns ``[B, 1]``.
     """
-    if task in (None, 'causal_lm'):
+    if task in (None, 'causal_lm', 'reranker', 'seq_cls'):
         return contextlib.nullcontext()
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
+    if task == 'generative_reranker':
+        from twinkle.patch.transformers_reranker import TransformersGenerativeRerankerPatch
+        pos_id, neg_id = _resolve_generative_reranker_token_ids(template)
+        return apply_context(model, TransformersGenerativeRerankerPatch(pos_id, neg_id))
     if task == 'fused_lm_ce':
         # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
         # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
         from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
         return apply_context(model, TransformersFusedCEPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce.')
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, reranker, seq_cls, '
+                     'generative_reranker, fused_lm_ce.')
+
+
+def _resolve_mm_graph_context(model, template):
+    """Return a context manager that patches the model for multimodal uneven-graph protection.
+
+    Only activates when the template is multimodal and the model exposes ``get_image_features``;
+    otherwise returns a no-op context.  The patch ensures vision-tower params receive gradients
+    even on ranks that get pure-text batches, preventing DDP/FSDP hangs.
+    """
+    if template is not None and getattr(template, 'is_mm', False) and hasattr(model, 'get_image_features'):
+        from twinkle.patch.transformers_uneven_mm_graph import MultimodalUnevenGraphPatch
+        return apply_context(model, MultimodalUnevenGraphPatch(template))
+    return contextlib.nullcontext()
+
+
+def _resolve_generative_reranker_token_ids(template):
+    """Resolve the positive/negative token ids for a generative reranker from the template tokenizer.
+
+    Token strings default to ``yes`` / ``no`` and are overridable via the same env vars legacy swift
+    uses (``GENERATIVE_RERANKER_POSITIVE_TOKEN`` / ``_NEGATIVE_TOKEN``), so a checkpoint trained here
+    scores identically under legacy inference.
+    """
+    import os
+    assert template is not None and getattr(template, 'processor', None) is not None, (
+        'generative_reranker needs a template with a tokenizer; call set_template before forwarding.')
+    tokenizer = template.processor
+    pos_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
+    neg_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
+    return tokenizer.convert_tokens_to_ids(pos_token), tokenizer.convert_tokens_to_ids(neg_token)
 
 
 @dataclass
@@ -222,9 +260,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         elif self._should_init_empty_pretrained_model_on_this_rank():
             self.model = self._init_empty_model_from_config(model_cls, **kwargs)
         else:
-            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
+            load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
             with self.strategy.pretrained_load_context():
-                self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
+                self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **load_kwargs)
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -488,7 +526,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
                                                router_replay_manual_cleanup)
 
-        with _resolve_task_context(self.model, task):
+        with _resolve_task_context(self.model, task, template=optimizer_config.template), \
+                _resolve_mm_graph_context(self.model, optimizer_config.template):
             outputs = self.model(**inputs)
 
         recorded_routing = rr_cleanup()
@@ -582,7 +621,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lora_ctx = (
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-            with _resolve_task_context(self.model, task), lora_ctx:
+            with _resolve_task_context(self.model, task, template=optimizer_config.template), lora_ctx:
                 outputs = self.model(**inputs)
 
             recorded_routing = rr_cleanup()

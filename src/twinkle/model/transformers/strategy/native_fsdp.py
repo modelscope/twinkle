@@ -46,6 +46,10 @@ class NativeFSDPStrategy:
         # ranks in from_pretrained barriers.
         return fsdp_pretrained_load_context(False)
 
+    def init_kwargs(self) -> Dict[str, Any]:
+        # Sharding happens in wrap_model(), so model construction needs nothing extra.
+        return {}
+
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
 

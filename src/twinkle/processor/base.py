@@ -161,6 +161,8 @@ class InputProcessor:
         task = kwargs.get('task', 'causal_lm')
         if task == 'embedding':
             return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
+        if task == 'generative_reranker':
+            return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
         if self.framework == 'transformers' and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
         return inputs, outputs
@@ -190,6 +192,48 @@ class InputProcessor:
         assert features is not None, (
             "outputs['features'] missing; ensure TransformersEmbeddingPatch is applied for task='embedding'.")
 
+        pooled, is_packed = self._pool_last_valid_token(features, inputs, sp_strategy=sp_strategy)
+
+        # Normalize after pool+reduce so swapping pooling strategy (last/mean/CLS) stays mathematically correct.
+        embeddings = F.normalize(pooled, p=2, dim=-1)
+
+        outputs = copy(outputs)
+        outputs.pop('features', None)
+        outputs['embeddings'] = embeddings.contiguous()
+        return inputs, outputs
+
+    def _postprocess_generative_reranker(self,
+                                         inputs: Dict[str, Any],
+                                         outputs: Dict[str, Any],
+                                         sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Reduce per-token generative-reranker scores ``[B, T, 1]`` to ``[n_seqs, 1]``.
+
+        Symmetric with embedding pooling (same last-valid-token gather, SP/packed-aware), but the
+        source is ``outputs['logits']`` -- the yes-minus-no score TransformersGenerativeRerankerPatch
+        writes per token -- and there is NO L2 normalize: a relevance score is a scalar, not a
+        direction. Mirrors legacy RerankerTrainer, which reads ``logits[batch, last_valid]``.
+        """
+        logits = outputs.get('logits')
+        assert logits is not None, (
+            "outputs['logits'] missing; ensure TransformersGenerativeRerankerPatch is applied and the "
+            'reranker loss sets require_logits=True.')
+        pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
+        outputs = copy(outputs)
+        outputs['logits'] = pooled.contiguous()
+        return inputs, outputs
+
+    def _pool_last_valid_token(self,
+                               features: torch.Tensor,
+                               inputs: Dict[str, Any],
+                               sp_strategy=None) -> tuple[torch.Tensor, bool]:
+        """Gather the last valid token per sequence from ``[B, T, C]`` -> ``[n_seqs, C]``.
+
+        Build a one-hot end-token mask in the un-padded global frame, route it
+        through the same pad+split as ``input_ids`` so it aligns with local
+        features, pool locally, then ``all_reduce`` only the ``[n_seqs, C]``
+        tensor across SP × RP. No feature gather; uniform across
+        DP / Ulysses / zigzag-ring / padding-free. Returns ``(pooled, is_packed)``.
+        """
         sp_enabled = (
             self.framework == 'transformers' and sp_strategy is not None and getattr(sp_strategy, 'enabled', False)
             and getattr(sp_strategy, 'world_size', 1) > 1)
@@ -254,22 +298,16 @@ class InputProcessor:
             f'mask seq-dim {mask.shape[1]} != features seq-dim {features.shape[1]}; '
             'sp_strategy.split contract broken or T_real mismatched.')
 
-        embeddings = torch.einsum('bth,btn->bnh', features, mask)
-        embeddings = embeddings.squeeze(0) if is_packed else embeddings.squeeze(1)
+        pooled = torch.einsum('bth,btn->bnh', features, mask)
+        pooled = pooled.squeeze(0) if is_packed else pooled.squeeze(1)
 
         if sp_enabled and dist.is_available() and dist.is_initialized():
             for grp_attr, size_attr in (('_sp_group', 'sp_world_size'), ('_rp_group', 'rp_world_size')):
                 grp = getattr(sp_strategy, grp_attr, None)
                 if grp is not None and getattr(sp_strategy, size_attr, 1) > 1:
-                    dist.all_reduce(embeddings, op=dist.ReduceOp.SUM, group=grp)
+                    dist.all_reduce(pooled, op=dist.ReduceOp.SUM, group=grp)
 
-        # Normalize after pool+reduce so swapping pooling strategy (last/mean/CLS) stays mathematically correct.
-        embeddings = F.normalize(embeddings, p=2, dim=-1)
-
-        outputs = copy(outputs)
-        outputs.pop('features', None)
-        outputs['embeddings'] = embeddings.contiguous()
-        return inputs, outputs
+        return pooled, is_packed
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
@@ -608,9 +646,10 @@ class InputProcessor:
         Keys that are ``None`` are silently skipped.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
-        by ``postprocess_tensor_sp``, so this is a no-op.
+        by ``postprocess_tensor_sp``, so this is a no-op. Same for
+        ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``.
         """
-        if task == 'embedding':
+        if task in ('embedding', 'generative_reranker'):
             return inputs, outputs
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')
@@ -822,6 +861,16 @@ class InputProcessor:
 
         from twinkle.utils.torch_utils import gather_cp_load_balanced
         return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
+
+    @staticmethod
+    def _last_valid_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+        """Last valid (non-pad) index per row, direction-agnostic. Ports swift.get_last_valid_indices.
+
+        flip + argmax finds the first 1 from the right, i.e. the last valid token, so left/right/no
+        padding all resolve correctly within one batch.
+        """
+        seq_len = attention_mask.shape[1]
+        return seq_len - 1 - torch.fliplr(attention_mask).argmax(dim=1)
 
     def align_routed_experts(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
 

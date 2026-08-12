@@ -813,6 +813,33 @@ class Template:
     def batch_decode(self, token_ids: List[List[int]], **kwargs) -> List[str]:
         return [self.processor.decode(_ids, **kwargs) for _ids in token_ids]
 
+    def dummy_mm_inputs(self, device=None, dtype=None) -> Dict[str, Any]:
+        """Generate minimal dummy multimodal inputs suitable for `model.get_image_features(**result)`.
+
+        Uses the same image_processor that real data passes through, so the output kwargs
+        (pixel_values, image_grid_thw, image_position_ids, ...) naturally match whatever
+        the model's `get_image_features` signature expects.
+
+        The dummy image is a 32x32 black RGB, the smallest that any processor accepts without
+        error.  Results are moved to ``device``/``dtype`` when specified.
+        """
+        from PIL import Image as PILImage
+        img = PILImage.new('RGB', (32, 32), (0, 0, 0))
+        image_proc = getattr(self.processor, 'image_processor', None)
+        if image_proc is None:
+            raise RuntimeError('Template.dummy_mm_inputs requires a processor with an image_processor attribute.')
+        out = image_proc(images=[img], return_tensors='pt')
+        import torch
+        result = {}
+        for k, v in out.items():
+            if isinstance(v, torch.Tensor):
+                if dtype is not None and v.is_floating_point():
+                    v = v.to(dtype=dtype)
+                if device is not None:
+                    v = v.to(device=device)
+            result[k] = v
+        return result
+
     def _get_vision_token_id(self) -> Optional[int]:
         if self.config is not None:
             return getattr(self.config, 'image_token_id', None)

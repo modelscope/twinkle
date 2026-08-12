@@ -50,13 +50,20 @@ def _resolve_task_context(model, task):
     'embedding' installs :class:`MegatronEmbeddingPatch` which swaps the
     ``output_layer`` for identity (with TP/SP gather) and registers a hook that
     handles CP gather + last-token pooling, returning ``[n_seqs, hidden]``.
+
+    'seq_cls' / 'reranker' / 'generative_reranker' need NO patch: mcore-bridge already builds the
+    right head for them (a ``num_labels`` OutputLayerLinear for seq_cls/reranker, the yes/no-diff
+    vocab head for generative_reranker) from ``config.task_type`` -- reranker is built as the
+    seq_cls head with num_labels=1. The per-sequence pooling they still require is done later in
+    ``forward_step`` (CP reconstruct + last-valid-token pick), not by a patch.
     """
-    if task in (None, 'causal_lm'):
+    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker'):
         return contextlib.nullcontext()
     if task == 'embedding':
         from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
         return apply_context(model, MegatronEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, seq_cls, reranker, '
+                     'generative_reranker.')
 
 
 @dataclass
@@ -133,6 +140,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # mcore_bridge pulls in megatron.core/TE too early on NPU.
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
+        # Route batched pipeline P2P through the WORLD group to avoid subgroup-P2P PP hangs.
+        from twinkle.patch.megatron_p2p import MegatronBatchedP2PGroupPatch
+        apply_patch(None, MegatronBatchedP2PGroupPatch())
+        # Parallelize torch DCP checkpoint reads (mcore optimizer/RNG resume) for faster loading.
+        from twinkle.patch.torch_dcp_reader import TorchDCPParallelReaderPatch
+        apply_patch(None, TorchDCPParallelReaderPatch())
+        # Skip slow, redundant torch DCP shard validation during mcore checkpoint save/load.
+        from twinkle.patch.torch_dcp_validation import MegatronDCPValidationPatch
+        apply_patch(None, MegatronDCPValidationPatch())
 
         kwargs.update({
             'recompute_granularity': recompute_granularity,
@@ -421,6 +437,31 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
                     if is_last_pp:
                         embeddings = output_tensor
+                elif task in ('seq_cls', 'reranker', 'generative_reranker'):
+                    # mcore-bridge emits per-token head output ([b, s, num_labels] for seq_cls/reranker,
+                    # [b, s, 1] for generative_reranker) with labels=None, so pool the last valid
+                    # token per sequence here -- mirroring legacy's get_last_tokens in the trainer.
+                    # These losses read logits (require_logps=False), so no selective_log_softmax.
+                    if is_last_pp and labels is not None:
+                        _packed = batch.get('packed_seq_params')
+                        # CP reconstruct first (like the causal_lm branch), then take the last token.
+                        cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                        output_tensor = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
+                        if _packed is None:
+                            _am = batch.get('attention_mask')
+                            if _am is None:
+                                _am = batch.get('attention_mask_2d')
+                            # attention_mask_2d compatibility: a 4D mask collapses to per-row validity.
+                            if _am is not None and _am.dim() > 2:
+                                _am = (~_am).sum(dim=(1, 2)) > 0
+                            _last_idx = processor._last_valid_indices(_am.long())
+                            unpacked_logits = output_tensor[
+                                torch.arange(output_tensor.shape[0], device=output_tensor.device), _last_idx]
+                        else:
+                            # Packed: one row [1, total, C]; each segment ends at cu_seqlens_q[i]+seq_lens[i]-1.
+                            _n = _packed.seq_lens.shape[0]
+                            _last_idx = _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1
+                            unpacked_logits = output_tensor[0, _last_idx]
                 elif labels is not None and is_last_pp:
                     _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
                     _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)
@@ -775,6 +816,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 - clip_grad: Gradient clipping threshold (default: 1.0)
                 - bf16 / fp16: precision flags (default: derived from self.mixed_precision)
                 - adam_beta1, adam_beta2, adam_eps: Adam parameters
+                - config_overrides: Optional mcore ``{ParamKey: ParamGroupOverride}`` mapping for
+                    per-parameter-group overrides (e.g. differential LR for vision / aligner params).
+                    twinkle stays model-agnostic and forwards this verbatim to Megatron, so callers
+                    describe their own parameter grouping (name globs / predicates) and per-group
+                    ``max_lr`` / ``min_lr`` / ``wd_mult`` instead of relying on any hardcoded naming.
 
         Returns:
             MegatronOptimizer instance.
@@ -784,6 +830,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
         self.use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
+        # Pop before building OptimizerConfig: this is a get_megatron_optimizer arg, not a config field.
+        config_overrides = kwargs.pop('config_overrides', None)
 
         opt_config = OptimizerConfig(
             optimizer='adam',
@@ -809,6 +857,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
+            config_overrides=config_overrides,
         )
         return optimizer
 
@@ -1110,7 +1159,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             optim_sd_kwargs={'metadata': sharded_sd_metadata},
         )
 
+        # Parallelize torch_dist shard writes; mcore's native default is single-threaded (thread_count=1).
+        # thread_count is stored on the strategy and only read at save time, so setting it post-construction
+        # is safe and avoids monkey-patching. Non-torch_dist backends won't expose it and are skipped.
+        thread_count = kwargs.pop('thread_count', 2)
         save_strategy = get_default_save_sharded_strategy()
+        if hasattr(save_strategy, 'thread_count'):
+            save_strategy.thread_count = thread_count
         if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
@@ -1280,6 +1335,36 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     if isinstance(module, (LoraParallelLinear, LoraLinear)):
                         module.unmerge()
 
+    def _export_hf_config(self):
+        """Return a copy of ``hf_config`` finalized for HF-format export.
+
+        The mcore->HF weight conversion done by ``bridge.save_weights`` writes only
+        tensors, so two config-level fixups are applied here on a copy (the live
+        ``self.hf_config`` is kept untouched for continued training):
+
+        * sync the MTP layer count from the mcore model config, so an exported MTP
+          model reloads with the right ``num_nextn_predict_layers``;
+        * drop any stale ``quantization_config`` -- exported safetensors are plain
+          bf16/fp16 weights, so a leftover quant config would mislead the loader.
+        """
+        from copy import deepcopy
+        hf_config = deepcopy(self.hf_config)
+        mtp_num_layers = getattr(self.strategy.config, 'mtp_num_layers', None)
+        if mtp_num_layers:
+            text_config = hf_config.get_text_config()
+            for key in ('num_nextn_predict_layers', 'mtp_num_hidden_layers'):
+                if hasattr(text_config, key):
+                    setattr(text_config, key, mtp_num_layers)
+                    break
+            else:
+                text_config.num_nextn_predict_layers = mtp_num_layers
+        if getattr(hf_config, 'quantization_config', None) is not None:
+            try:
+                delattr(hf_config, 'quantization_config')
+            except AttributeError:
+                hf_config.quantization_config = None
+        return hf_config
+
     def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in HuggingFace format using bridge adapter.
 
@@ -1309,7 +1394,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Save config on global rank 0 only (avoid concurrent writers).
         if is_global_zero:
-            self.hf_config.save_pretrained(output_dir)
+            self._export_hf_config().save_pretrained(output_dir)
             if isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
                 target_modules = config.target_modules
