@@ -1,6 +1,5 @@
 #!/bin/sh
-# Generate the allocation from pretrained spectra, then train the selected FFT/LoRA modules.
-# Reuse an offline allocation with: --spectral-config ./output/spectral_hybrid_lora/config.json
+# Reuse the configured allocation, or compute and persist it when the file does not exist.
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   torchrun --nproc_per_node=4 spectral_hybrid_lora.py \
@@ -16,6 +15,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
     --gradient-accumulation-steps 4 \
     --log-interval 1 \
     --output-dir ./output/spectral_hybrid_lora \
+    --spectral-config ./output/spectral_hybrid_lora/config.json \
     --adapter-name default \
     --lora-r 64 \
     --scheduler-cls CosineWarmupScheduler \

@@ -117,9 +117,20 @@ def _spectrum_cache_path(
     return cache_dir / f'spectrum-{digest}.pt'
 
 
+def resolve_spectral_config_path(
+    config_value: Optional[str],
+    output_dir: Path,
+) -> Tuple[Path, bool]:
+    """Return the allocation path and whether an explicitly configured file can be reused."""
+    if config_value:
+        config_path = Path(config_value).expanduser()
+        return config_path, config_path.is_file()
+    return Path(output_dir).expanduser() / 'spectral_hybrid_lora_config.json', False
+
+
 @torch.no_grad()
 def compute_spectral_scores(
-    model: nn.Module,
+    model: Optional[nn.Module],
     config: LoraConfig,
     r: int,
     *,
@@ -127,16 +138,19 @@ def compute_spectral_scores(
     cache_key: str = '',
     epsilon: float = 1e-12,
     log_interval: int = 20,
+    broadcast: bool = True,
 ) -> SpectralScores:
     """Score pretrained modules from singular-value spectra for data-free allocation."""
-    targets = select_spectral_targets(model, config)
-    names = sorted(targets)
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
     scores: Dict[str, float] = {}
     metrics_by_module: Dict[str, Dict[str, float]] = {}
 
     if rank == 0:
+        if model is None:
+            raise ValueError('Spectral scoring requires a model on rank 0.')
+        targets = select_spectral_targets(model, config)
+        names = sorted(targets)
         if log_interval > 0:
             logger.info(f'Spectral Hybrid LoRA scoring: {len(names)} modules, LoRA rank={r}')
         for index, name in enumerate(names, start=1):
@@ -175,7 +189,7 @@ def compute_spectral_scores(
                             f'effective_rank={metrics["effective_rank"]:.1f}, '
                             f'rank_coverage={metrics["rank_coverage"]:.4f})')
 
-    if distributed:
+    if distributed and broadcast:
         payload = [(scores, metrics_by_module) if rank == 0 else None]
         dist.broadcast_object_list(payload, src=0)
         scores, metrics_by_module = payload[0]

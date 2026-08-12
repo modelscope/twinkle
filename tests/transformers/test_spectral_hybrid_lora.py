@@ -11,6 +11,7 @@ from twinkle.model.transformers.spectral_hybrid_lora import (
     build_spectral_param_groups,
     compute_spectral_scores,
     compute_spectral_metrics,
+    resolve_spectral_config_path,
     select_spectral_targets,
 )
 
@@ -38,6 +39,27 @@ class TinyDecoder(nn.Module):
             hidden = layer.self_attn.q_proj(inputs)
             inputs = layer.mlp.down_proj(layer.mlp.up_proj(hidden))
         return inputs
+
+
+@pytest.mark.parametrize('bind_device,expects_device_id', [(None, True), (lambda _backend: False, False)])
+def test_initialize_process_group_preserves_backend_device_binding(monkeypatch, bind_device, expects_device_id):
+    import torch.distributed as dist
+    from twinkle import Platform, torch_util
+    from twinkle.model.base import initialize_process_group
+
+    calls = []
+    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
+    monkeypatch.setattr(dist, 'init_process_group', lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(Platform, 'get_world_size', lambda: 2)
+    monkeypatch.setattr(Platform, 'get_rank', lambda: 0)
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: 'cpu')
+    monkeypatch.setattr(Platform, 'device_backend', lambda: 'nccl')
+    monkeypatch.setattr(torch_util, 'set_device', lambda: None)
+
+    initialize_process_group(bind_device)
+
+    assert len(calls) == 1
+    assert ('device_id' in calls[0]) is expects_device_id
 
 
 def test_spectral_metrics_match_weighted_formula():
@@ -103,6 +125,51 @@ def test_scores_cache_pretrained_singular_values(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert len(list(tmp_path.glob('spectrum-*.pt'))) == 2
     assert all('effective_rank' in scores.metrics[name] for name in scores)
+
+
+def test_spectral_scores_can_skip_distributed_broadcast(monkeypatch):
+    from twinkle.model.transformers import spectral_hybrid_lora
+
+    model = TinyDecoder(num_layers=1)
+    config = LoraConfig(r=2, target_modules=['q_proj'])
+    monkeypatch.setattr(spectral_hybrid_lora.dist, 'is_available', lambda: True)
+    monkeypatch.setattr(spectral_hybrid_lora.dist, 'is_initialized', lambda: True)
+    monkeypatch.setattr(spectral_hybrid_lora.dist, 'get_rank', lambda: 0)
+    monkeypatch.setattr(
+        spectral_hybrid_lora.dist,
+        'broadcast_object_list',
+        lambda *_args, **_kwargs: pytest.fail('broadcast should be disabled'),
+    )
+
+    scores = compute_spectral_scores(model, config, r=2, log_interval=0, broadcast=False)
+
+    assert set(scores) == {'layers.0.self_attn.q_proj'}
+
+
+def test_config_path_reuses_an_existing_explicit_config(tmp_path):
+    config_path = tmp_path / 'allocation.json'
+    config_path.write_text('{}', encoding='utf-8')
+
+    resolved, should_load = resolve_spectral_config_path(str(config_path), tmp_path / 'output')
+
+    assert resolved == config_path
+    assert should_load is True
+
+
+def test_config_path_computes_when_explicit_config_is_missing(tmp_path):
+    config_path = tmp_path / 'missing.json'
+
+    resolved, should_load = resolve_spectral_config_path(str(config_path), tmp_path / 'output')
+
+    assert resolved == config_path
+    assert should_load is False
+
+
+def test_config_path_computes_to_default_when_not_configured(tmp_path):
+    resolved, should_load = resolve_spectral_config_path(None, tmp_path)
+
+    assert resolved == tmp_path / 'spectral_hybrid_lora_config.json'
+    assert should_load is False
 
 
 def test_allocation_prioritizes_high_scores_within_budget():

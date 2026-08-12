@@ -1,19 +1,24 @@
 import json
+import os
 from pathlib import Path
 
+import torch.distributed as dist
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
+from twinkle.model.base import initialize_process_group
 from twinkle.model.transformers.spectral_hybrid_lora import (
+    CANDIDATE_TYPES,
     allocate_spectral_modules,
     build_spectral_lora_config,
     build_spectral_param_groups,
     compute_spectral_scores,
+    resolve_spectral_config_path,
     select_spectral_targets,
 )
 
@@ -37,11 +42,8 @@ def build_dataset(data_slice) -> Dataset:
     return dataset
 
 
-def load_spectral_config(config_value: str) -> LoraConfig:
-    """Load an allocation produced by scripts/compute_spectral_hybrid_lora_config.py."""
-    config_path = Path(config_value).expanduser()
-    if not config_path.is_file():
-        raise FileNotFoundError(f'Spectral config JSON file not found: {config_path}')
+def load_spectral_config(config_path: Path) -> LoraConfig:
+    """Load an existing Spectral Hybrid LoRA allocation."""
     with config_path.open(encoding='utf-8') as handle:
         raw_config = json.load(handle)
     if not isinstance(raw_config, dict):
@@ -76,8 +78,8 @@ def load_spectral_config(config_value: str) -> LoraConfig:
     )
 
 
-def compute_allocation() -> LoraConfig:
-    """Allocate full fine-tuning and LoRA modules from pretrained spectra."""
+def compute_allocation(config_path: Path) -> None:
+    """Compute and persist a data-free spectral allocation on the master rank."""
     r = int(args.extra.get('spectral_r', args.lora.lora_r))
     lora_alpha = int(args.extra.get('spectral_alpha', r * 2))
     fft_ratio = float(args.extra.get('spectral_fft_ratio', 0.1))
@@ -85,14 +87,22 @@ def compute_allocation() -> LoraConfig:
 
     logger.info(f'Spectral Hybrid LoRA allocation: loading pretrained model '
                 f'(r={r}, alpha={lora_alpha}, FFT budget={fft_ratio:.1%})')
-    base_model = TransformersModel(model_id=args.model.model_id)
+    analysis_mesh = DeviceMesh.from_sizes(world_size=1, dp_size=1)
+    base_model = TransformersModel(model_id=args.model.model_id, device_mesh=analysis_mesh)
     if base_model._memory_efficient_init:
         raise ValueError('Spectral scoring requires materialized weights; '
                          'disable memory_efficient_init.')
-    target_config = LoraConfig(**args.get_lora_args())
+    target_modules = args.lora.lora_target_modules or list(CANDIDATE_TYPES.values())
+    target_config = LoraConfig(
+        r=r,
+        lora_alpha=lora_alpha,
+        lora_dropout=0.0,
+        target_modules=target_modules,
+    )
     targets = select_spectral_targets(base_model.model, target_config)
     param_counts = {name: module.weight.numel() for name, module in targets.items()}
-    cache_dir = Path(args.training.output_dir) / 'spectral-spectrum-cache'
+    cache_dir = Path(args.extra.get(
+        'spectral_cache_dir', Path(args.training.output_dir) / 'spectral-spectrum-cache')).expanduser()
     scores = compute_spectral_scores(
         base_model.model,
         target_config,
@@ -101,34 +111,72 @@ def compute_allocation() -> LoraConfig:
         cache_key=str(args.model.model_id),
         epsilon=epsilon,
         log_interval=args.training.log_interval,
+        broadcast=False,
     )
     s_fft, s_lora = allocate_spectral_modules(scores, param_counts, fft_ratio=fft_ratio)
-    ranked = sorted(scores, key=lambda name: (-scores[name], name))
-    logger.info('Spectral Hybrid LoRA top-10 modules: ' + ', '.join(
-        f'{name}=score:{scores[name]:.4f},effective_rank:{scores.metrics[name]["effective_rank"]:.1f},'
-        f'coverage:{scores.metrics[name]["rank_coverage"]:.4f},'
-        f'condition:{scores.metrics[name]["condition_number"]:.2e},'
-        f'decay:{scores.metrics[name]["decay"]:.4e}'
-        for name in ranked[:10]))
     fft_params = sum(param_counts[name] for name in s_fft)
     total_params = sum(param_counts.values())
+    realized_fft_param_ratio = fft_params / total_params
     logger.info(f'Spectral Hybrid LoRA allocation: {len(s_fft)} FFT modules, {len(s_lora)} LoRA modules '
-                f'({fft_params / total_params:.1%} of candidate params to FFT; cache={cache_dir})')
+                f'({realized_fft_param_ratio:.1%} of candidate params to FFT; cache={cache_dir})')
     logger.info(f'Spectral FFT modules: {", ".join(s_fft) if s_fft else "(none)"}')
+
+    raw_config = {
+        'method': 'spectral_hybrid_lora',
+        'model_id': args.model.model_id,
+        's_fft': s_fft,
+        's_lora': s_lora,
+        'r': r,
+        'lora_alpha': lora_alpha,
+        'lora_dropout': 0.0,
+        'fft_ratio': fft_ratio,
+        'realized_fft_param_ratio': realized_fft_param_ratio,
+        'spectral_epsilon': epsilon,
+        'metrics': {
+            name: {
+                **scores.metrics[name],
+                'score': scores[name],
+            }
+            for name in sorted(scores)
+        },
+    }
+    if Platform.is_master():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = config_path.with_suffix(f'{config_path.suffix}.tmp')
+        with temporary_path.open('w', encoding='utf-8') as handle:
+            json.dump(raw_config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write('\n')
+        os.replace(temporary_path, config_path)
+        logger.info(f'Spectral config written to {config_path}')
+
     del base_model
-    return build_spectral_lora_config(s_lora, s_fft, r=r, lora_alpha=lora_alpha)
+
+
+def resolve_spectral_config() -> LoraConfig:
+    config_value = args.extra.get('spectral_config')
+    config_path, should_load = resolve_spectral_config_path(config_value, Path(args.training.output_dir))
+    if should_load:
+        spectral_config = load_spectral_config(config_path)
+        logger.info(f'Using existing spectral config {config_path}; skipping spectral scoring '
+                    f'({len(spectral_config.modules_to_save or [])} FFT modules, '
+                    f'{len(spectral_config.target_modules or [])} LoRA modules)')
+        return spectral_config
+    if config_value:
+        logger.info(f'Spectral config {config_path} does not exist; computing it from model weights')
+    else:
+        logger.info(f'No spectral config supplied; computing allocation and writing {config_path}')
+
+    initialize_process_group()
+    if Platform.is_master():
+        compute_allocation(config_path)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    return load_spectral_config(config_path)
 
 
 def train() -> None:
     train_samples = args.training.train_samples or 1000
-    config_value = args.extra.get('spectral_config')
-    if config_value:
-        spectral_config = load_spectral_config(config_value)
-        logger.info(f'Using supplied spectral config; skipping spectral scoring '
-                    f'({len(spectral_config.modules_to_save or [])} FFT modules, '
-                    f'{len(spectral_config.target_modules or [])} LoRA modules)')
-    else:
-        spectral_config = compute_allocation()
+    spectral_config = resolve_spectral_config()
 
     dataset = build_dataset(range(train_samples))
     dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)

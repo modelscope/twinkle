@@ -18,6 +18,37 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import LRScheduler
 
 
+def initialize_process_group(should_bind_device_id: Optional[Callable[[str], bool]] = None) -> None:
+    """Initialize Twinkle's default distributed process group when launched with multiple ranks."""
+    import torch
+    import torch.distributed as dist
+    if dist.is_initialized() or Platform.get_world_size() <= 1:
+        return
+
+    torch_util.set_device()
+    backend = Platform.device_backend()
+    if backend == 'hccl':
+        # Keep training-side HCCL sockets on a per-job port layout to avoid collisions.
+        from twinkle.utils.platforms import ensure_hccl_socket_env
+        master_port = int(os.environ.get('MASTER_PORT', '29500'))
+        ensure_hccl_socket_env(master_port)
+    init_kwargs = {
+        'backend': backend,
+        'init_method': 'env://',
+        'rank': Platform.get_rank(),
+        'world_size': Platform.get_world_size(),
+    }
+    bind_device = should_bind_device_id(backend) if should_bind_device_id else backend in ('nccl', 'hccl')
+    if bind_device:
+        init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+    dist.init_process_group(**init_kwargs)
+    if backend == 'hccl':
+        # A bound HCCL default group can leak its device into later Gloo metric groups.
+        default_pg = dist.distributed_c10d._get_default_group()
+        if getattr(default_pg, 'bound_device_id', None) is not None:
+            default_pg.bound_device_id = None
+
+
 class TwinkleModel(ABC):
 
     _checkpoint_engine = None
@@ -146,33 +177,4 @@ class TwinkleModel(ABC):
         return backend in ('nccl', 'hccl')
 
     def _try_init_process_group(self):
-        import torch
-        import torch.distributed as dist
-        if not dist.is_initialized() and Platform.get_world_size() > 1:
-            torch_util.set_device()
-            backend = Platform.device_backend()
-            if backend == 'hccl':
-                # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
-                # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
-                # Keep training-side HCCL sockets on a per-job port layout to
-                # avoid collisions with other jobs on the same host.
-                from twinkle.utils.platforms import ensure_hccl_socket_env
-                master_port = int(os.environ.get('MASTER_PORT', '29500'))
-                ensure_hccl_socket_env(master_port)
-            init_kwargs = {
-                'backend': backend,
-                'init_method': 'env://',
-                'rank': Platform.get_rank(),
-                'world_size': Platform.get_world_size(),
-            }
-            if self._should_bind_device_id_for_process_group(backend):
-                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
-            dist.init_process_group(**init_kwargs)
-            if backend == 'hccl':
-                default_pg = dist.distributed_c10d._get_default_group()
-                if getattr(default_pg, 'bound_device_id', None) is not None:
-                    # If the default HCCL PG keeps a bound device id, PyTorch may
-                    # propagate that binding into later Gloo subgroup creation. That
-                    # breaks the metrics/object-gather path on NPU, so clear it
-                    # before Megatron creates its Gloo DP groups.
-                    default_pg.bound_device_id = None
+        initialize_process_group(self._should_bind_device_id_for_process_group)
