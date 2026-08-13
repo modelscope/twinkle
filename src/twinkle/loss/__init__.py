@@ -7,6 +7,7 @@ from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .infonce import ContrastiveLoss, CosineSimilarityLoss, EmbeddingLoss, InfonceLoss, OnlineContrastiveLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+from .liger_fused_linear_grpo import LigerFusedLinearGRPOLoss
 from .mse import MSELoss
 from .reranker import ListwiseRerankerLoss, PointwiseRerankerLoss
 from .seq_cls import SeqClsLoss
@@ -16,6 +17,7 @@ torch_loss_mapping = {
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
     'cross_entropy': CrossEntropyLoss,
     'liger_fused_linear_cross_entropy': LigerFusedLinearCrossEntropyLoss,
+    'liger_fused_linear_grpo': LigerFusedLinearGRPOLoss,
     # KD losses
     'gkd': GKDLoss,
     # RL losses
