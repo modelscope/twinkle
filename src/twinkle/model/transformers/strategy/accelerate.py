@@ -161,6 +161,16 @@ class AccelerateStrategy:
             broadcast_from_rank0=getattr(fsdp_plugin.state_dict_config, 'rank0_only', False),
         )
 
+    @staticmethod
+    def _prepare_full_optimizer_state_dict_options(*, for_load: bool):
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+        return StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=not for_load,
+            broadcast_from_rank0=for_load,
+        )
+
     def needs_wrapped_optimizer_state(self) -> bool:
         fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
@@ -171,7 +181,11 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-            optim_state = get_optimizer_state_dict(model, optimizer, options=self._prepare_fsdp2_sd_options())
+            optim_state = get_optimizer_state_dict(
+                model,
+                optimizer,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=False),
+            )
             if self.accelerator.process_index == 0:
                 torch.save(optim_state, output_path)
             return
@@ -185,11 +199,15 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
-            optim_state = None
-            rank0_only = getattr(fsdp_plugin.optim_state_dict_config, 'rank0_only', False)
-            if self.accelerator.process_index == 0 or not rank0_only:
-                optim_state = torch.load(input_path, weights_only=True)
-            set_optimizer_state_dict(model, optimizer, optim_state, options=self._prepare_fsdp2_sd_options())
+            optim_state = {}
+            if self.accelerator.process_index == 0:
+                optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+            set_optimizer_state_dict(
+                model,
+                optimizer,
+                optim_state,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=True),
+            )
             return
 
         optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
@@ -197,10 +215,21 @@ class AccelerateStrategy:
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict."""
         from twinkle.utils import torch_util
+        fsdp_plugin = self._get_fsdp_plugin()
+        if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            # A merged checkpoint is a deployment artifact, so it must always
+            # materialize global, CPU-offloaded parameters on rank 0 regardless
+            # of the training plugin's normal sharded checkpoint preference.
+            return get_model_state_dict(
+                model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
         unwrapped = self.unwrap_model(model)
         state_dict = {}
-        for name, param in unwrapped.named_parameters():
-            local = torch_util.to_local_tensor(param)
+        for name, value in unwrapped.state_dict().items():
+            local = torch_util.to_local_tensor(value)
             state_dict[name] = local.cpu()
             del local
         return state_dict

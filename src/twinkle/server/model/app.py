@@ -35,8 +35,11 @@ def _make_mock_model(kw: dict[str, Any]) -> Any:
 
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
-    from .backends.transformers_model import TwinkleCompatTransformersModel
+    from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
+                                              TwinkleCompatTransformersModel)
 
+    if kw.get('hybrid'):
+        return TwinkleCompatSpectralHybridTransformersModel(**kw)
     return TwinkleCompatTransformersModel(**kw)
 
 

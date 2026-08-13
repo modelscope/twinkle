@@ -12,16 +12,15 @@ from typing import List, Union
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
-from twinkle.model import MultiLoraTransformersModel
+from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
 from twinkle.utils.nccl_safe import nccl_safe
 
 
-@remote_class()
-class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatModelBase):
-    """Unified wrapper around MultiLoraTransformersModel.
+class _TwinkleCompatTransformersMixin:
+    """Tinker and Twinkle API compatibility shared by Transformers backends.
 
     Handles both:
     - Tinker-compat I/O (Datum / TensorData) via /tinker/* endpoints.
@@ -110,3 +109,16 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True
+
+
+@remote_class()
+class TwinkleCompatTransformersModel(_TwinkleCompatTransformersMixin, MultiLoraTransformersModel,
+                                     TwinkleCompatModelBase):
+    """Unified API wrapper for the pure MultiLoRA Transformers model."""
+
+
+@remote_class()
+class TwinkleCompatSpectralHybridTransformersModel(_TwinkleCompatTransformersMixin,
+                                                   SpectralHybridTransformersModel,
+                                                   TwinkleCompatModelBase):
+    """Unified API wrapper for the Spectral Hybrid Transformers model."""

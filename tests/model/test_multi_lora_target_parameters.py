@@ -9,6 +9,7 @@ from torch import nn
 
 print(f"sys.path: {sys.path}")
 
+
 class FakePackedExperts(nn.Module):
 
     def __init__(self, num_experts=2, hidden=4, intermediate=6, *, is_transposed=False):
@@ -133,7 +134,7 @@ def test_multilora_releases_target_parameter_slot_to_initial_weights():
             else:
                 assert torch.count_nonzero(param.detach()) == 0
 
-# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support 
+# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support
 # installing multiple LoRA slots on target parameters.
 # def test_target_parameter_state_dict_loads_with_peft():
 #     from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
@@ -260,10 +261,31 @@ def test_multilora_transformers_installs_target_parameters_once():
     else:
         raise AssertionError("different target_parameters should be rejected")
 
-# Run in the local environment.
-if __name__ == "__main__":
-    assert test_peft_target_parameter_key_shapes_for_3d_experts() == True
-    assert test_target_parameter_multi_lora_updates_only_active_adapter() == True
-    assert test_multilora_releases_target_parameter_slot_to_initial_weights() == True
-    assert test_multilora_state_dict_round_trips_target_parameters() == True
-    assert test_multilora_transformers_installs_target_parameters_once() == True
+
+def test_multilora_transformers_optimizer_includes_target_parameter_slots():
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+
+    model = FakeModel()
+    manager = _make_multilora_for_target_parameters(model)
+    manager.acquire_lora("adapter_a", _make_target_cfg(r=2))
+
+    instance = object.__new__(MultiLoraTransformersModel)
+    instance.multi_adapter = manager
+    instance.strategy = type("Strategy", (), {"unwrap_model": lambda _self, inner: inner})()
+    instance.__dict__["model"] = model
+
+    selected = instance._get_trainable_parameters("adapter_a")
+    expected = dict(manager.target_parameter_manager.named_slot_parameters("adapter_a"))
+
+    assert expected
+    assert set(selected) == set(expected)
+    assert {id(value) for value in selected.values()} == {id(value) for value in expected.values()}
+
+
+def test_target_parameter_only_adapter_does_not_require_linear_targets():
+    from twinkle.model.multi_lora import MultiLora
+
+    manager = MultiLora(max_loras=1, max_r=4)
+    manager.module = FakeModel()
+
+    manager.validate_tenant_target_modules([], target_parameters=_make_target_cfg().target_parameters)

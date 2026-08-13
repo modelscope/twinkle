@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import hashlib
+import json
 import os
 import re
 import torch
@@ -26,6 +27,30 @@ CANDIDATE_TYPES: Dict[str, str] = {
 }
 _CANDIDATE_SUFFIXES = frozenset(CANDIDATE_TYPES.values())
 _LAYER_RE = re.compile(r'\blayers\.(\d+)\.')
+
+
+def load_spectral_allocation(config_path: str | Path) -> List[str]:
+    """Load the server-owned FFT module allocation."""
+    path = Path(config_path).expanduser()
+    if not path.is_file():
+        raise ValueError(f'Spectral Hybrid allocation file does not exist: {path}')
+    with path.open(encoding='utf-8') as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError('Spectral Hybrid allocation JSON must contain an object.')
+
+    def _modules(keys: Tuple[str, ...]) -> List[str]:
+        value = next((raw[key] for key in keys if key in raw), [])
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)) or not all(isinstance(item, str) for item in value):
+            raise ValueError('Spectral Hybrid s_fft must be a list of module names.')
+        return sorted(value)
+
+    s_fft = _modules(('s_fft', 'S_FFT', 'modules_to_save'))
+    if not s_fft:
+        raise ValueError('Spectral Hybrid allocation requires at least one S_FFT module.')
+    return s_fft
 
 
 class SpectralScores(dict[str, float]):

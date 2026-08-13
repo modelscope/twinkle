@@ -11,7 +11,8 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import math
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Any, Literal
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
@@ -41,6 +42,21 @@ class HttpOptions(BaseModel):
 # ---------- per-deployment args schemas ------------------------------------ #
 
 
+class SpectralHybridArgs(_ArgsBase):
+    """Strict server-owned Spectral Hybrid allocation and optimizer defaults."""
+
+    allocation_path: str = Field(min_length=1)
+    default_lr_lora: float = Field(default=2.5e-5, gt=0)
+    default_lr_fft: float = Field(default=1.0e-6, gt=0)
+
+    @field_validator('default_lr_lora', 'default_lr_fft')
+    @classmethod
+    def _finite_learning_rate(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError('learning rate must be finite')
+        return value
+
+
 class ModelArgs(_ArgsBase):
     """Args for the ``model`` deployment.
 
@@ -57,7 +73,16 @@ class ModelArgs(_ArgsBase):
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
+    max_r: int = Field(default=32, gt=0)
     max_length: int | None = None
+    preallocated_lora_modules: str | list[str] = 'all-linear'
+    hybrid: SpectralHybridArgs | None = None
+
+    @model_validator(mode='after')
+    def _validate_spectral_backend(self):
+        if self.hybrid is not None and self.backend != 'transformers':
+            raise ValueError('hybrid is only supported by the transformers backend')
+        return self
 
 
 class SamplerArgs(_ArgsBase):

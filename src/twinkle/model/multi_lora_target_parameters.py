@@ -364,19 +364,25 @@ class TargetParameterLoraManager:
         return parameters
 
     def named_slot_parameters(self, tenant_adapter_name: str) -> Iterator[tuple[str, nn.Parameter]]:
-        slot_name = self.tenant_to_slot[tenant_adapter_name]
+        slot_name = self.tenant_to_slot.get(tenant_adapter_name)
+        if slot_name is None:
+            return
         for wrapper in self.wrappers:
             yield from wrapper.named_slot_parameters(slot_name)
 
     def get_state_dict(self, tenant_adapter_name: str) -> dict[str, torch.Tensor]:
-        slot_name = self.tenant_to_slot[tenant_adapter_name]
+        slot_name = self.tenant_to_slot.get(tenant_adapter_name)
+        if slot_name is None:
+            return {}
         state_dict = {}
         for wrapper in self.wrappers:
             state_dict.update(wrapper.get_state_dict(slot_name))
         return state_dict
 
     def set_state_dict(self, tenant_adapter_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
-        slot_name = self.tenant_to_slot[tenant_adapter_name]
+        slot_name = self.tenant_to_slot.get(tenant_adapter_name)
+        if slot_name is None:
+            return set()
         consumed_keys = set()
         for wrapper in self.wrappers:
             consumed_keys.update(wrapper.set_state_dict(slot_name, state_dict))
