@@ -18,6 +18,7 @@ class HybridFftSlots:
     """
 
     def __init__(self, multi_lora: MultiLora, s_fft: List[str]) -> None:
+        """Bind the shared LoRA manager to its server-owned FFT allocation."""
         if not s_fft:
             raise ValueError('Hybrid requires at least one S_FFT module.')
         if len(set(s_fft)) != len(s_fft):
@@ -33,10 +34,12 @@ class HybridFftSlots:
 
     @property
     def module(self):
+        """Return the PEFT model that owns the FFT wrappers."""
         return self.multi_lora.module
 
     @staticmethod
     def _canonical_module_name(name: str) -> str:
+        """Remove the module name prefix introduced by PEFT."""
         prefix = 'base_model.model.'
         return name[len(prefix):] if name.startswith(prefix) else name
 
@@ -60,6 +63,7 @@ class HybridFftSlots:
                 raise ValueError(
                     f'Hybrid S_FFT aliases resolve to the same layer {layer_name!r}.')
             resolved_layer_names.add(layer_name)
+
             if isinstance(layer, LoraLayer):
                 original_module = layer.base_layer
                 wrapper_name = f'{layer_name}.base_layer'
@@ -84,32 +88,41 @@ class HybridFftSlots:
             self.allocated_to_wrapper_name[allocated_name] = wrapper_name
 
     def is_hybrid(self, adapter_name: str) -> bool:
+        """Return whether an adapter owns an FFT slot."""
         return adapter_name in self.hybrid_adapters
 
     def register_adapter(self, adapter_name: str) -> None:
+        """Mark an existing LoRA tenant as a Hybrid tenant."""
         self.hybrid_adapters.add(adapter_name)
 
     def unregister_adapter(self, adapter_name: str) -> None:
+        """Remove Hybrid ownership before releasing a tenant slot."""
         self.hybrid_adapters.discard(adapter_name)
 
     def _tenant(self, adapter_name: str):
+        """Look up the LoRA tenant that determines the FFT slot index."""
         return self.multi_lora.find_lora_by_tenant(adapter_name)
 
     def _fft_adapter_name(self, adapter_name: str) -> str:
+        """Map a tenant's LoRA slot index to its PEFT FFT adapter name."""
         return f'fft_{self._tenant(adapter_name).index}'
 
     def _get_fft_wrapper(self, allocated_name: str) -> ModulesToSaveWrapper:
+        """Resolve one allocated module to its installed PEFT wrapper."""
         return self.module.get_submodule(self.allocated_to_wrapper_name[allocated_name])
 
     def _iter_fft_wrappers(self):
+        """Return all wrappers in stable allocation order."""
         return [self._get_fft_wrapper(name) for name in self.s_fft]
 
     def activate_fft_slot(self, adapter_name: str) -> None:
+        """Activate this tenant's FFT copies, or disable FFT for regular LoRA."""
         fft_adapter_name = self._fft_adapter_name(adapter_name) if self.is_hybrid(adapter_name) else None
         for wrapper in self._iter_fft_wrappers():
             wrapper.set_adapter(fft_adapter_name if fft_adapter_name is not None else [])
 
     def deactivate_fft_slots(self) -> None:
+        """Disable every FFT wrapper after a model operation."""
         for wrapper in self._iter_fft_wrappers():
             wrapper.set_adapter([])
 
@@ -127,6 +140,7 @@ class HybridFftSlots:
         return sorted(name for name in selected if name not in fft_layers)
 
     def _tenant_lora_layer_names(self, adapter_name: str) -> List[str]:
+        """Return this Hybrid tenant's LoRA layers, excluding its FFT layers."""
         tenant = self._tenant(adapter_name)
         fft_layers = set(self.allocated_to_layer_name.values())
         return [
@@ -137,12 +151,14 @@ class HybridFftSlots:
 
     @staticmethod
     def _iter_module_tensors(module: nn.Module):
+        """Yield a module's parameters and buffers with their persistence kind."""
         for name, parameter in module.named_parameters():
             yield name, parameter, True
         for name, buffer in module.named_buffers():
             yield name, buffer, False
 
     def _iter_fft_slot_tensors(self, adapter_name: str):
+        """Yield all tensors belonging to one tenant's FFT module copies."""
         fft_adapter_name = self._fft_adapter_name(adapter_name)
         for allocated_name in self.s_fft:
             wrapper_name = self.allocated_to_wrapper_name[allocated_name]
@@ -151,6 +167,7 @@ class HybridFftSlots:
                 yield allocated_name, wrapper_name, fft_adapter_name, tensor_name, tensor, is_parameter
 
     def reset_adapter_slot(self, adapter_name: str) -> None:
+        """Restore this tenant's FFT copies from the frozen original modules."""
         for allocated_name, _, _, tensor_name, target, _ in self._iter_fft_slot_tensors(adapter_name):
             wrapper = self._get_fft_wrapper(allocated_name)
             original_tensors = {
@@ -162,9 +179,11 @@ class HybridFftSlots:
 
     @staticmethod
     def _checkpoint_key(allocated_name: str, parameter_name: str) -> str:
+        """Build the plain Transformers checkpoint key for an FFT tensor."""
         return f'base_model.model.{allocated_name}.{parameter_name}'
 
     def get_fft_state_dict(self, adapter_name: str) -> Dict[str, torch.Tensor]:
+        """Return an independent snapshot of one tenant's FFT state."""
         if not self.is_hybrid(adapter_name):
             return {}
         state = {}
@@ -174,6 +193,7 @@ class HybridFftSlots:
         return state
 
     def set_fft_state_dict(self, adapter_name: str, state_dict: Dict[str, torch.Tensor]) -> None:
+        """Restore one tenant's FFT copies from lossless training state."""
         if not self.is_hybrid(adapter_name):
             return
         for allocated_name, _, _, tensor_name, tensor, _ in self._iter_fft_slot_tensors(adapter_name):
@@ -183,6 +203,7 @@ class HybridFftSlots:
             self.multi_lora._write_param_tensor(tensor, state_dict[key])
 
     def named_fft_parameters(self, adapter_name: str):
+        """Return trainable FFT parameters with their PEFT state-dict names."""
         if not self.is_hybrid(adapter_name):
             return []
         result = []
@@ -194,6 +215,7 @@ class HybridFftSlots:
 
     @staticmethod
     def _normalize_base_state_key(name: str) -> str:
+        """Convert a PEFT base-module key to its plain Transformers key."""
         prefix = 'base_model.model.'
         if name.startswith(prefix):
             name = name[len(prefix):]
@@ -246,6 +268,7 @@ class HybridFftSlots:
             yield output_name, replacements.get(name, value).detach().cpu()
 
     def build_merged_state_dict(self, adapter_name: str, full_state_dict: Dict[str, torch.Tensor]):
+        """Materialize the merged state dict for deployment-oriented saving."""
         return dict(self.iter_merged_state_dict(adapter_name, full_state_dict))
 
     def build_training_state_dict(self, adapter_name: str, full_state_dict: Dict[str, torch.Tensor]):
