@@ -75,7 +75,7 @@ class ModelArgs(_ArgsBase):
     max_loras: int = 5
     max_r: int = Field(default=32, gt=0)
     max_length: int | None = None
-    preallocated_lora_modules: str | list[str] = 'all-linear'
+    target_modules: str | list[str] = 'all-linear'
     hybrid: SpectralHybridArgs | None = None
 
     @model_validator(mode='after')

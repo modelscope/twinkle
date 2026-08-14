@@ -2,7 +2,6 @@ import json
 import os
 from pathlib import Path
 
-import torch.distributed as dist
 from peft import LoraConfig
 
 import twinkle
@@ -11,7 +10,6 @@ from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
-from twinkle.model.base import initialize_process_group
 from twinkle.model.transformers.spectral_hybrid_lora import (
     CANDIDATE_TYPES,
     allocate_spectral_modules,
@@ -166,11 +164,11 @@ def resolve_spectral_config() -> LoraConfig:
     else:
         logger.info(f'No spectral config supplied; computing allocation and writing {config_path}')
 
-    initialize_process_group()
-    if Platform.is_master():
-        compute_allocation(config_path)
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    if Platform.get_world_size() > 1:
+        raise ValueError(
+            'Spectral allocation must be generated before multi-process training. '
+            'Run this cookbook once with a single process, then reuse the generated config.')
+    compute_allocation(config_path)
     return load_spectral_config(config_path)
 
 

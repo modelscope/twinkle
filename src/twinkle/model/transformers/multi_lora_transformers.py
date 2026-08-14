@@ -41,7 +41,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_r: int = 32,
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
-            preallocated_lora_modules: Optional[Union[List[str], str]] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -84,9 +83,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        if preallocated_lora_modules is not None:
-            target_modules = preallocated_lora_modules
-        self.preallocated_lora_modules = target_modules
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)

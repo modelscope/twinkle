@@ -77,27 +77,6 @@ def _register_hybrid(manager, hybrid, adapter_name, config):
     hybrid.register_adapter(adapter_name)
 
 
-@pytest.mark.parametrize('bind_device,expects_device_id', [(None, True), (lambda _backend: False, False)])
-def test_initialize_process_group_preserves_backend_device_binding(monkeypatch, bind_device, expects_device_id):
-    import torch.distributed as dist
-    from twinkle import Platform, torch_util
-    from twinkle.model.base import initialize_process_group
-
-    calls = []
-    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
-    monkeypatch.setattr(dist, 'init_process_group', lambda **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(Platform, 'get_world_size', lambda: 2)
-    monkeypatch.setattr(Platform, 'get_rank', lambda: 0)
-    monkeypatch.setattr(Platform, 'get_local_device', lambda: 'cpu')
-    monkeypatch.setattr(Platform, 'device_backend', lambda: 'nccl')
-    monkeypatch.setattr(torch_util, 'set_device', lambda: None)
-
-    initialize_process_group(bind_device)
-
-    assert len(calls) == 1
-    assert ('device_id' in calls[0]) is expects_device_id
-
-
 def test_spectral_metrics_match_weighted_formula():
     singular_values = torch.tensor([4.0, 2.0, 1.0, 0.5], dtype=torch.float64)
     metrics = compute_spectral_metrics(singular_values, r=1)
