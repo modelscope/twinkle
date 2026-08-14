@@ -1,8 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""DeepSeek-V4 SAS/LI op registration: three forward-level replacements gated
-by the ``TWINKLE_NPU_DSV4_SAS`` env var.
+"""DeepSeek-V4 SAS/LI op registration: three forward-level replacements.
 
-When enabled, the full patch set is applied:
+No env var gate: the op registration is lazy (only loaded when
+``kernelize`` resolves the ``KernelChoice``), the C++ extension is
+JIT-compiled on first use, and the SAS/LI forward has ``try/except``
+fallback to standard attention if the ACLNN kernel is unavailable.
+
+The full patch set is applied:
 
   - ``DeepseekV4Attention.forward``     → NPU sparse attention (SAS)
   - ``DeepseekV4Indexer.forward``       → Lightning Indexer (LI)
@@ -16,20 +20,7 @@ replacement** rather than a wrapper (see ``npu.py`` docstring for details).
 """
 from __future__ import annotations
 
-import os
-
 from ...registry import KernelImpl, is_npu_available, lazy_import, register_op
-
-
-def _dsv4_sas_available() -> tuple[bool, str | None]:
-    env = os.environ.get('TWINKLE_NPU_DSV4_SAS', '').lower().strip()
-    if not env or env in ('0', 'false', 'off', 'no'):
-        return False, 'TWINKLE_NPU_DSV4_SAS not enabled'
-    ok, reason = is_npu_available()
-    if not ok:
-        return ok, reason
-    return True, None
-
 
 _DSV4_BASE = 'twinkle.kernel.ops.dsv4_sas_li.npu'
 
@@ -38,7 +29,7 @@ register_op(
     implementations={
         'npu': KernelImpl(
             load=lazy_import(f'{_DSV4_BASE}:npu_dsv4_attention_forward'),
-            available=_dsv4_sas_available,
+            available=is_npu_available,
         ),
     },
 )
@@ -48,7 +39,7 @@ register_op(
     implementations={
         'npu': KernelImpl(
             load=lazy_import(f'{_DSV4_BASE}:npu_dsv4_indexer_forward'),
-            available=_dsv4_sas_available,
+            available=is_npu_available,
         ),
     },
 )
@@ -56,10 +47,9 @@ register_op(
 register_op(
     'dsv4_csa_compressor',
     implementations={
-        'npu':
-        KernelImpl(
+        'npu': KernelImpl(
             load=lazy_import(f'{_DSV4_BASE}:npu_dsv4_csa_compressor_forward'),
-            available=_dsv4_sas_available,
+            available=is_npu_available,
         ),
     },
 )

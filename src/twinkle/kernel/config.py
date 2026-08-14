@@ -112,7 +112,7 @@ def _build() -> dict[Any, Any]:
     cfg['sdpa'] = KernelChoice(op='sdpa_attention', backends=('npu', ))
     cfg['fla'] = KernelChoice(op='fla', backends=('npu', ))
 
-    # DeepSeek-V4 SAS + LI (env-gated by TWINKLE_NPU_DSV4_SAS, npu only)
+    # DeepSeek-V4 SAS + LI (lazy: op registration + C++ JIT + try/except fallback)
     _dsv4 = 'transformers.models.deepseek_v4.modeling_deepseek_v4'
     cfg[f'{_dsv4}.DeepseekV4Attention.forward'] = KernelChoice(op='dsv4_attention', backends=('npu', ))
     cfg[f'{_dsv4}.DeepseekV4Indexer.forward'] = KernelChoice(op='dsv4_indexer', backends=('npu', ))
