@@ -42,7 +42,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
 
         async def _create_adapter():
             _model_id = None
-            _adapter_name = None
             try:
                 # Validate lora_config against the deployment's train_mode up front.
                 if self.is_full_mode and body.lora_config:
@@ -65,7 +64,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 _model_id = await self.state.register_model(
                     body.model_dump(), token=token, replica_id=self.replica_id, session_id=body.session_id)
                 adapter_name = self.get_adapter_name(adapter_name=_model_id)
-                _adapter_name = adapter_name
                 model_adapter = self.resolve_model_adapter_name(adapter_name)
                 # Select template based on model type
                 template = get_template_for_model(self.base_model)
@@ -301,8 +299,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=True)
                 logger.info(f'Saving weights to {save_dir}')
                 self.model.save(
-                    name='latest', output_dir=save_dir,
-                    adapter_name=self.resolve_model_adapter_name(adapter_name), save_optimizer=False)
+                    name='latest',
+                    output_dir=save_dir,
+                    adapter_name=self.resolve_model_adapter_name(adapter_name),
+                    save_optimizer=False)
                 payload = body.model_dump()
                 payload['model_path'] = tinker_path
                 metadata = await self.state.get_model_metadata(body.model_id) or {}
@@ -342,8 +342,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_resource_exists(adapter_name)
                 self.model.tinker_load(
-                    checkpoint_dir=body.path, load_optimizer=body.optimizer,
-                    adapter_name=self.resolve_model_adapter_name(adapter_name), token=token)
+                    checkpoint_dir=body.path,
+                    load_optimizer=body.optimizer,
+                    adapter_name=self.resolve_model_adapter_name(adapter_name),
+                    token=token)
                 self.set_resource_state(adapter_name, 'grad_ready', False)
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')
             except Exception:

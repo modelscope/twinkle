@@ -102,6 +102,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
             if body.adapter_uri:
                 import os
+
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
@@ -235,6 +236,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         if body.adapter_uri:
             import os
+
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)

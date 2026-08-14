@@ -176,7 +176,8 @@ def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
                 weight_map = json.load(f)['weight_map']
             shards = sorted(set(weight_map.values()))
             for shard in shards:
-                state_dict.update(torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
+                state_dict.update(
+                    torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
         else:
             state_dict.update(torch.load(bin_single, map_location='cpu', weights_only=True))
     else:

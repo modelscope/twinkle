@@ -106,7 +106,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             inputs = _parse_inputs(body.inputs)
-            ret = self.model.forward(inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = self.model.forward(
+                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -136,7 +137,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             inputs = _parse_inputs(body.inputs)
-            ret = self.model.forward_only(inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = self.model.forward_only(
+                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -204,7 +206,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 for key in inputs:
                     if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
                         inputs[key] = torch.tensor(inputs[key])
-            ret = self.model.forward_backward(inputs=all_inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = self.model.forward_backward(
+                inputs=all_inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -309,7 +312,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.get_train_configs(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = self.model.get_train_configs(
+                adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         return await run_task(
@@ -323,7 +327,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_loss(body.loss_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.set_loss(
+                body.loss_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_loss'))
 
@@ -339,7 +344,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_optimizer(body.optimizer_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.set_optimizer(
+                body.optimizer_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_optimizer'))
@@ -356,7 +362,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_lr_scheduler(body.scheduler_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.set_lr_scheduler(
+                body.scheduler_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_lr_scheduler'))
@@ -520,8 +527,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                     '(do not send a LoraConfig).')
             if (not self.is_full_mode) and config is None:
                 raise HTTPException(
-                    status_code=400,
-                    detail='This deployment runs in LoRA mode; a LoraConfig is required.')
+                    status_code=400, detail='This deployment runs in LoRA mode; a LoraConfig is required.')
 
             # In full mode ensure the exclusive deployment is free before touching state.
             if self.is_full_mode:
@@ -575,7 +581,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             patch_cls = deserialize_object(body.patch_cls)
-            self.model.apply_patch(patch_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.apply_patch(
+                patch_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='apply_patch'))
 
@@ -592,7 +599,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             metric_cls = deserialize_object(body.metric_cls)
-            self.model.add_metric(metric_cls, is_training=body.is_training, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.add_metric(
+                metric_cls,
+                is_training=body.is_training,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='add_metric'))
 
@@ -608,7 +619,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_template(body.template_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.set_template(
+                body.template_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_template'))
 
@@ -624,7 +636,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_processor(body.processor_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            self.model.set_processor(
+                body.processor_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_processor'))
@@ -641,7 +654,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.calculate_metric(is_training=body.is_training, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = self.model.calculate_metric(
+                is_training=body.is_training,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         return await run_task(

@@ -186,8 +186,7 @@ class ApplicationSpec(BaseModel):
             num_replicas = dep.get('num_replicas')
             max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
             if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
-                raise ValueError(
-                    f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
-                    'mode and requires a single replica; set num_replicas/autoscaling_config.'
-                    'max_replicas to 1.')
+                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
+                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
+                                 'max_replicas to 1.')
         return self
