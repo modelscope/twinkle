@@ -17,6 +17,31 @@ class RayHelper:
     _remote_components: Dict[str, Any] = {}
 
     @staticmethod
+    def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
+        """Return custom accelerator resources needed for local Ray startup.
+
+        Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
+        NPUs, need to be registered as Ray custom resources so that placement
+        groups can request them.
+        """
+        device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
+
+        # ResourceManager supports one accelerator type per run.  Only NPU
+        # currently needs an explicit Ray custom-resource registration.
+        if device_types != {'NPU'}:
+            return {}
+
+        try:
+            import torch
+
+            npu = getattr(torch, 'npu', None)
+            npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
+        except (ImportError, AttributeError, RuntimeError):
+            return {}
+
+        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+
+    @staticmethod
     def init_registry():
         if RayHelper._registry is not None:
             return
@@ -71,7 +96,8 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init(ignore_reinit_error=True)
+            resources = RayHelper._get_ray_custom_resources(device_groups)
+            ray.init(ignore_reinit_error=True, resources=resources or None)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.

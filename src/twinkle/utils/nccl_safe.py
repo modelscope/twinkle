@@ -78,6 +78,7 @@ class SafeLossWrapper(Loss):
         self.require_logps = getattr(loss_instance, 'require_logps', True)
         self.require_entropy = getattr(loss_instance, 'require_entropy', False)
         self.require_logits = getattr(loss_instance, 'require_logits', False)
+        self.require_values = getattr(loss_instance, 'require_values', False)
         self.reduction = getattr(loss_instance, 'reduction', 'mean')
         self._nccl_safe_wrapped = True
 
@@ -102,7 +103,7 @@ def _zero_loss(outputs) -> 'LossOutput':
     """
     import torch
     if isinstance(outputs, dict):
-        for key in ('logps', 'logits', 'loss'):
+        for key in ('logps', 'values', 'logits', 'loss'):
             t = outputs.get(key)
             if t is not None and isinstance(t, torch.Tensor) and t.requires_grad:
                 return LossOutput(loss=(t.flatten()[:1] * 0).sum(), num_tokens=0)
@@ -232,7 +233,7 @@ def _force_zero_backward(model, og, adapter_name, kwargs):
     # Find a graph-connected tensor for zero loss
     zero_loss = None
     if outputs is not None and isinstance(outputs, dict):
-        for key in ('logps', 'logits', 'loss'):
+        for key in ('logps', 'values', 'logits', 'loss'):
             t = outputs.get(key)
             if t is not None and isinstance(t, torch.Tensor) and t.requires_grad:
                 zero_loss = (t.flatten()[:1] * 0).sum()

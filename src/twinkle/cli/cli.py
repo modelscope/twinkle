@@ -135,6 +135,7 @@ class LossArgs:
     beta: float = 0.1
     sft_weight: float = 1.0
     entropy_coef: float = 0.0
+    value_clip: float = 0.2
     ignore_index: int = -100
 
 
@@ -170,6 +171,7 @@ class InfraArgs:
     model_gpus: int | None = None
     sampler_gpus: int | None = None
     ref_model_gpus: int | None = None
+    critic_model_gpus: int | None = None
     world_size: int | None = None
     dp_size: int | None = None
     fsdp_size: int | None = None
@@ -206,6 +208,11 @@ class RLArgs:
     gkd_temperature: float = 1.0
     gkd_topk: int = 64
     router_replay_mode: Literal['disabled', 'R2', 'R3'] = 'disabled'
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+    kl_coef: float = 0.0
+    normalize_advantages: bool = True
+    critic_learning_rate: float = 1e-5
 
 
 @dataclass
