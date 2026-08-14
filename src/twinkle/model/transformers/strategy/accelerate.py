@@ -203,8 +203,8 @@ class AccelerateStrategy:
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
         state_dict = {}
-        for name, value in unwrapped.state_dict().items():
-            local = torch_util.to_local_tensor(value)
+        for name, param in unwrapped.named_parameters():
+            local = torch_util.to_local_tensor(param)
             state_dict[name] = local.cpu()
             del local
         return state_dict

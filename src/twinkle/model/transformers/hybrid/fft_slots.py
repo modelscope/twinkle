@@ -149,33 +149,22 @@ class HybridFftSlots:
             and self.multi_lora.match_target_modules(name, tenant.tenant_config.target_modules)
         ]
 
-    @staticmethod
-    def _iter_module_tensors(module: nn.Module):
-        """Yield a module's parameters and buffers with their persistence kind."""
-        for name, parameter in module.named_parameters():
-            yield name, parameter, True
-        for name, buffer in module.named_buffers():
-            yield name, buffer, False
-
-    def _iter_fft_slot_tensors(self, adapter_name: str):
-        """Yield all tensors belonging to one tenant's FFT module copies."""
+    def _iter_fft_slot_parameters(self, adapter_name: str):
+        """Yield all parameters belonging to one tenant's FFT module copies."""
         fft_adapter_name = self._fft_adapter_name(adapter_name)
         for allocated_name in self.s_fft:
             wrapper_name = self.allocated_to_wrapper_name[allocated_name]
             slot_module = self._get_fft_wrapper(allocated_name).modules_to_save[fft_adapter_name]
-            for tensor_name, tensor, is_parameter in self._iter_module_tensors(slot_module):
-                yield allocated_name, wrapper_name, fft_adapter_name, tensor_name, tensor, is_parameter
+            for parameter_name, parameter in slot_module.named_parameters():
+                yield allocated_name, wrapper_name, fft_adapter_name, parameter_name, parameter
 
     def reset_adapter_slot(self, adapter_name: str) -> None:
         """Restore this tenant's FFT copies from the frozen original modules."""
-        for allocated_name, _, _, tensor_name, target, _ in self._iter_fft_slot_tensors(adapter_name):
+        for allocated_name, _, _, parameter_name, target in self._iter_fft_slot_parameters(adapter_name):
             wrapper = self._get_fft_wrapper(allocated_name)
-            original_tensors = {
-                name: tensor
-                for name, tensor, _ in self._iter_module_tensors(wrapper.original_module)
-            }
+            original_parameters = dict(wrapper.original_module.named_parameters())
             self.multi_lora._write_param_tensor(
-                target, self.multi_lora._read_param_tensor(original_tensors[tensor_name]))
+                target, self.multi_lora._read_param_tensor(original_parameters[parameter_name]))
 
     @staticmethod
     def _checkpoint_key(allocated_name: str, parameter_name: str) -> str:
@@ -187,31 +176,30 @@ class HybridFftSlots:
         if not self.is_hybrid(adapter_name):
             return {}
         state = {}
-        for allocated_name, _, _, tensor_name, tensor, _ in self._iter_fft_slot_tensors(adapter_name):
-            state[self._checkpoint_key(allocated_name, tensor_name)] = (
-                self.multi_lora._read_param_tensor(tensor).detach().clone())
+        for allocated_name, _, _, parameter_name, parameter in self._iter_fft_slot_parameters(adapter_name):
+            state[self._checkpoint_key(allocated_name, parameter_name)] = (
+                self.multi_lora._read_param_tensor(parameter).detach().clone())
         return state
 
     def set_fft_state_dict(self, adapter_name: str, state_dict: Dict[str, torch.Tensor]) -> None:
         """Restore one tenant's FFT copies from lossless training state."""
         if not self.is_hybrid(adapter_name):
             return
-        for allocated_name, _, _, tensor_name, tensor, _ in self._iter_fft_slot_tensors(adapter_name):
-            key = self._checkpoint_key(allocated_name, tensor_name)
+        for allocated_name, _, _, parameter_name, parameter in self._iter_fft_slot_parameters(adapter_name):
+            key = self._checkpoint_key(allocated_name, parameter_name)
             if key not in state_dict:
                 raise ValueError(f'Hybrid training state is missing {key!r}.')
-            self.multi_lora._write_param_tensor(tensor, state_dict[key])
+            self.multi_lora._write_param_tensor(parameter, state_dict[key])
 
     def named_fft_parameters(self, adapter_name: str):
         """Return trainable FFT parameters with their PEFT state-dict names."""
         if not self.is_hybrid(adapter_name):
             return []
-        result = []
-        for _, wrapper_name, fft_adapter_name, tensor_name, tensor, is_parameter in self._iter_fft_slot_tensors(
-                adapter_name):
-            if is_parameter:
-                result.append((f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{tensor_name}', tensor))
-        return result
+        return [
+            (f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{parameter_name}', parameter)
+            for _, wrapper_name, fft_adapter_name, parameter_name, parameter
+            in self._iter_fft_slot_parameters(adapter_name)
+        ]
 
     @staticmethod
     def _normalize_base_state_key(name: str) -> str:
@@ -248,10 +236,10 @@ class HybridFftSlots:
                 delta = delta.transpose(0, 1)
             replacements[base_key] = base + delta.to(dtype=base.dtype) * scaling
 
-        for allocated_name, wrapper_name, fft_adapter_name, tensor_name, _, _ in self._iter_fft_slot_tensors(
+        for allocated_name, wrapper_name, fft_adapter_name, parameter_name, _ in self._iter_fft_slot_parameters(
                 adapter_name):
-            base_key = f'{wrapper_name}.original_module.{tensor_name}'
-            fft_key = f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{tensor_name}'
+            base_key = f'{wrapper_name}.original_module.{parameter_name}'
+            fft_key = f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{parameter_name}'
             if base_key not in full_state_dict or fft_key not in full_state_dict:
                 raise ValueError(f'Cannot export Hybrid FFT layer {allocated_name!r}.')
             replacements[base_key] = full_state_dict[fft_key]
@@ -285,10 +273,10 @@ class HybridFftSlots:
                 value = self.multi_lora._slice_rank_tensor(
                     source, full_state_dict[source], tenant.tenant_config.r)
                 state[source.replace(f'.{tenant.adapter_name}.', '.')] = value.detach().cpu()
-        for allocated_name, wrapper_name, fft_adapter_name, tensor_name, _, _ in self._iter_fft_slot_tensors(
+        for allocated_name, wrapper_name, fft_adapter_name, parameter_name, _ in self._iter_fft_slot_parameters(
                 adapter_name):
-            source = f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{tensor_name}'
+            source = f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{parameter_name}'
             if source not in full_state_dict:
                 raise ValueError(f'Hybrid training state is missing {source!r}.')
-            state[self._checkpoint_key(allocated_name, tensor_name)] = full_state_dict[source].detach().cpu()
+            state[self._checkpoint_key(allocated_name, parameter_name)] = full_state_dict[source].detach().cpu()
         return state

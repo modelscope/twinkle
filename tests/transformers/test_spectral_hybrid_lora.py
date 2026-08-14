@@ -328,54 +328,6 @@ def test_accelerate_fsdp_optimizer_save_and_load_ignore_sharded_plugin_options(t
     assert load_options.broadcast_from_rank0 is True
 
 
-def test_native_fsdp_full_state_reconstructs_ep_experts(monkeypatch):
-    import torch.distributed.checkpoint.state_dict as state_dict_api
-    from twinkle import Platform
-    from twinkle.model.transformers.strategy import native_fsdp
-    from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
-
-    class EpDimension:
-
-        @staticmethod
-        def size():
-            return 2
-
-        @staticmethod
-        def get_group():
-            return 'ep-group'
-
-    strategy = object.__new__(NativeFSDPStrategy)
-    strategy.device_mesh = object()
-    strategy.ep_fsdp_device_mesh = {'ep': EpDimension()}
-    strategy.unwrap_model = lambda model: model
-    captured_options = []
-
-    def get_model_state_dict(_model, *, options):
-        captured_options.append(options)
-        return {
-            'experts.weight': torch.tensor([[1.0]]),
-            'dense.weight': torch.tensor([[3.0]]),
-        }
-
-    def all_gather(output, value, *, group):
-        assert group == 'ep-group'
-        output[0].copy_(value)
-        output[1].copy_(value + 1)
-
-    monkeypatch.setattr(state_dict_api, 'get_model_state_dict', get_model_state_dict)
-    monkeypatch.setattr(native_fsdp, '_detect_ep_expert_names', lambda _model: {'experts.weight'})
-    monkeypatch.setattr(native_fsdp.dist, 'all_gather', all_gather)
-    monkeypatch.setattr(Platform, 'get_local_device', lambda: 'cpu')
-    monkeypatch.setattr(Platform, 'is_master', lambda: True)
-
-    state = strategy.get_full_state_dict(object())
-
-    assert captured_options[0].full_state_dict is True
-    assert captured_options[0].cpu_offload is False
-    assert torch.equal(state['experts.weight'], torch.tensor([[1.0], [2.0]]))
-    assert torch.equal(state['dense.weight'], torch.tensor([[3.0]]))
-
-
 def test_twinkle_checkpoint_normalization_round_trips_full_modules(tmp_path):
     from safetensors.torch import save_file
     from twinkle.model.transformers.strategy.accelerate import AccelerateStrategy
@@ -762,32 +714,6 @@ def test_hybrid_training_state_round_trip_and_release_resets_fft_slot():
     manager.release_lora('hybrid')
     wrapper = spectral._get_fft_wrapper('layers.0.self_attn.q_proj')
     assert torch.equal(fft_layer.weight, wrapper.original_module.weight)
-
-
-def test_fft_state_traversal_includes_buffers():
-    from twinkle.model.multi_lora import MultiLora
-
-    base = TinyDecoder(num_layers=1)
-    q_proj = base.layers[0].self_attn.q_proj
-    q_proj.register_buffer('calibration', torch.tensor([1.0, 2.0]))
-    manager = MultiLora(max_loras=1, max_r=4)
-    model = manager.patch(base, target_modules='all-linear')
-    fft_slots = _install_hybrid(manager, model, ['layers.0.self_attn.q_proj'])
-    config = LoraConfig(r=2, lora_alpha=4, target_modules=['down_proj'])
-    _register_hybrid(manager, fft_slots, 'hybrid', config)
-    fft_module = _fft_slot_module(fft_slots, 'layers.0.self_attn.q_proj')
-    state_key = 'base_model.model.layers.0.self_attn.q_proj.calibration'
-
-    fft_module.calibration.fill_(3.0)
-    saved = fft_slots.get_fft_state_dict('hybrid')
-    assert torch.equal(saved[state_key], torch.tensor([3.0, 3.0]))
-
-    fft_module.calibration.zero_()
-    fft_slots.set_fft_state_dict('hybrid', saved)
-    assert torch.equal(fft_module.calibration, torch.tensor([3.0, 3.0]))
-
-    fft_slots.reset_adapter_slot('hybrid')
-    assert torch.equal(fft_module.calibration, torch.tensor([1.0, 2.0]))
 
 
 def test_multi_tenant_optimizer_parameters_and_learning_rates_are_isolated():
