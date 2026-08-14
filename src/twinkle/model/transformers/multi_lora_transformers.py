@@ -360,20 +360,5 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             return self.multi_adapter.get_trainable_parameters_example(adapter_name)
 
     def _get_trainable_parameters(self, adapter_name):
-        with self._adapter_context(adapter_name) as real_adapter_name:
-            tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
-            pattern = f'.{real_adapter_name}.'
-            params = {}
-            model = self.strategy.unwrap_model(self.model)
-            for name, parameter in model.named_parameters():
-                if not parameter.requires_grad:
-                    continue
-                if pattern in name and '.lora_' in name:
-                    if self.multi_adapter.match_target_modules(name, tenant.tenant_config.target_modules):
-                        params[name] = parameter
-            known_parameter_ids = {id(parameter) for parameter in params.values()}
-            for name, parameter in self.multi_adapter.target_parameter_manager.named_slot_parameters(adapter_name):
-                if id(parameter) not in known_parameter_ids:
-                    params[name] = parameter
-                    known_parameter_ids.add(id(parameter))
-            return params
+        with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
+            return super()._get_trainable_parameters(real_adapter_name)

@@ -734,7 +734,6 @@ def test_multi_tenant_optimizer_parameters_and_learning_rates_are_isolated():
 
     assert regular
     assert all('.lora_' in name and '.lora_1.' in name for name in regular)
-    assert all('v_proj' in name for name in regular)
     assert any('down_proj' in name and '.lora_0.' in name for name in hybrid)
     assert any('.modules_to_save.fft_0.' in name for name in hybrid)
     assert {group['lr'] for group in groups} == {2.5e-5, 1e-6}

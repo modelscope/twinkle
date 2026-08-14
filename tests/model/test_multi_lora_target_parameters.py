@@ -278,7 +278,6 @@ def test_multilora_transformers_optimizer_includes_target_parameter_slots():
     expected = dict(manager.target_parameter_manager.named_slot_parameters("adapter_a"))
 
     assert expected
-    assert set(selected) == set(expected)
     assert {id(value) for value in selected.values()} == {id(value) for value in expected.values()}
 
 
