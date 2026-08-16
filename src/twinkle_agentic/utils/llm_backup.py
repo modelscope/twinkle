@@ -16,6 +16,7 @@ class EvalRecord:
     student_result: Any
     teacher_result: Any
     match: bool
+    trajectory: Any = None
 
 
 @dataclass
@@ -50,14 +51,19 @@ class DistillationRegistry:
             state.call_count += 1
             return state.call_count
 
-    def add_record(self, key: str, student_result: Any, teacher_result: Any, match: bool):
+    def add_record(self, key: str, student_result: Any, teacher_result: Any, match: bool,
+                   trajectory: Any = None):
         with self._lock:
             state = self._states[key]
             state.dataset.append(EvalRecord(
                 student_result=student_result,
                 teacher_result=teacher_result,
                 match=match,
+                trajectory=trajectory,
             ))
+        # File IO deliberately outside the registry lock so a slow disk never
+        # stalls confidence bookkeeping for other keys.
+        _maybe_dump(key, trajectory, student_result, teacher_result, match)
 
     def refresh_confidence(self, key: str) -> float:
         with self._lock:
@@ -82,6 +88,37 @@ class DistillationRegistry:
 _registry = DistillationRegistry()
 _teacher_api = None
 _teacher_lock = threading.Lock()
+_dump_lock = threading.Lock()
+
+
+def _maybe_dump(key: str, trajectory: Any, student_result: Any,
+                teacher_result: Any, match: bool) -> None:
+    """Append one raw (input -> teacher output) record as JSONL when the env var
+    ``LLM_BACKUP_DUMP_PATH`` is set. Off by default: no path -> nothing written,
+    behaviour is identical to before.
+
+    The ``trajectory`` (the exact model input) is stored verbatim so the dump is
+    directly reshapeable into SFT pairs downstream; ``student``/``teacher``/
+    ``match`` are kept too so nothing is thrown away (target selection is decided
+    by the consumer, not here).
+    """
+    path = os.environ.get('LLM_BACKUP_DUMP_PATH')
+    if not path:
+        return
+    rec = {
+        'key': key,
+        'trajectory': trajectory,
+        'student': student_result,
+        'teacher': teacher_result,
+        'match': match,
+    }
+    try:
+        line = json.dumps(rec, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return
+    with _dump_lock:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
 
 
 def _get_teacher_api():
@@ -239,7 +276,7 @@ def llm_backup(
                 if random.random() < sample_rate:
                     teacher_result = _call_teacher(trajectory, sampling_params)
                     match = comparator(result, teacher_result)
-                    _registry.add_record(key, result, teacher_result, match)
+                    _registry.add_record(key, result, teacher_result, match, trajectory=trajectory)
                     if not match:
                         result = teacher_result
             else:
@@ -247,7 +284,7 @@ def llm_backup(
                 teacher_result = _call_teacher(trajectory, sampling_params)
                 student_result = fn(*args, **kwargs)
                 match = comparator(student_result, teacher_result)
-                _registry.add_record(key, student_result, teacher_result, match)
+                _registry.add_record(key, student_result, teacher_result, match, trajectory=trajectory)
                 result = teacher_result
 
             call_count = _registry.increment_call(key)
@@ -298,14 +335,14 @@ def llm_backup_async(
                 if random.random() < sample_rate:
                     teacher_result = _call_teacher(trajectory, sampling_params)
                     match = comparator(result, teacher_result)
-                    _registry.add_record(key, result, teacher_result, match)
+                    _registry.add_record(key, result, teacher_result, match, trajectory=trajectory)
                     if not match:
                         result = teacher_result
             else:
                 teacher_result = _call_teacher(trajectory, sampling_params)
                 student_result = await fn(*args, **kwargs)
                 match = comparator(student_result, teacher_result)
-                _registry.add_record(key, student_result, teacher_result, match)
+                _registry.add_record(key, student_result, teacher_result, match, trajectory=trajectory)
                 result = teacher_result
 
             call_count = _registry.increment_call(key)
