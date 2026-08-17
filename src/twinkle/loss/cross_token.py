@@ -219,20 +219,10 @@ class CrossTokenLoss(Loss):
         with self._build_lock:
             if self._projection_matrices_built:
                 return
-            import time
-            start_time = time.perf_counter()
-
-            print('[CrossToken] Generating projection cache key ...', flush=True)
-            cache_start = time.perf_counter()
             cache_key = self._generate_cache_key()
             self._cache_key = cache_key
-            print(
-                f'[CrossToken] Cache key generated in '
-                f'{time.perf_counter() - cache_start:.2f}s',
-                flush=True,
-            )
+
             if cache_key in _PROJECTION_MATRIX_CACHE:
-                print('[CrossToken] Using cached projection matrices', flush=True)
                 cached = _PROJECTION_MATRIX_CACHE[cache_key]
                 self.projection_student_indices_list = [
                     t.to(self.device) if self.device is not None else t.clone()
@@ -255,13 +245,8 @@ class CrossTokenLoss(Loss):
                     set() for _ in range(self.num_teachers)
                 ]
                 for i, teacher_tok in enumerate(self.teacher_tokenizer_group):
-                    teacher_start = time.perf_counter()
                     self._build_projection_matrix_for_teacher(teacher_tok, i)
-                    print(
-                        f'[CrossToken] Teacher {i} projection built in '
-                        f'{time.perf_counter() - teacher_start:.2f}s',
-                        flush=True,
-                    )
+
                 _PROJECTION_MATRIX_CACHE[cache_key] = {
                     'student_indices': self.projection_student_indices_list,
                     'teacher_indices': self.projection_teacher_indices_list,
@@ -275,8 +260,6 @@ class CrossTokenLoss(Loss):
             if self.loss_type == 'hkl':
                 self._build_exact_token_maps()
 
-            elapsed = time.perf_counter() - start_time
-            print(f"[CrossToken] Projection matrices built in {elapsed:.2f}s", flush=True)
             self._projection_matrices_built = True
 
     def _ensure_student_texts(self) -> None:
@@ -289,19 +272,12 @@ class CrossTokenLoss(Loss):
         """
         if self._student_texts:
             return
-        import time
-        _start = time.perf_counter()
         self._student_texts = [
             self.student_tokenizer.decode(
                 [sid], skip_special_tokens=False
             )
             for sid in range(self.student_vocab_size)
         ]
-        print(
-            f'[CrossToken] student vocab decoded in '
-            f'{time.perf_counter() - _start:.2f}s',
-            flush=True,
-        )
 
     def _ensure_teacher_text_maps(self, teacher_index: int) -> None:
         """Decode one teacher vocab once; cache exact/stripped text->id maps.
@@ -313,8 +289,6 @@ class CrossTokenLoss(Loss):
         """
         if self._teacher_text_maps_list[teacher_index] is not None:
             return
-        import time
-        _start = time.perf_counter()
         teacher_tok = self.teacher_tokenizer_group[teacher_index]
         teacher_exact_text_to_id = {}
         teacher_stripped_text_to_id = {}
@@ -327,11 +301,7 @@ class CrossTokenLoss(Loss):
         self._teacher_text_maps_list[teacher_index] = (
             teacher_exact_text_to_id, teacher_stripped_text_to_id
         )
-        print(
-            f'[CrossToken] teacher {teacher_index} vocab decoded in '
-            f'{time.perf_counter() - _start:.2f}s',
-            flush=True,
-        )
+
 
     def _build_exact_token_maps(self):
         """Build common/uncommon token partitions for H-KL mode.
@@ -345,14 +315,12 @@ class CrossTokenLoss(Loss):
         缓存命中路径)。这里只剩 dict 查找 + 张量转换,构建耗时从分钟级
         降到秒级,内存峰值也大幅下降。
         """
-        import time
-        _maps_start = time.perf_counter()
+
 
         # 进程内缓存:同一 tokenizer 组合的 common/uncommon 分区可跨
         # CrossTokenLoss 实例复用(与投影矩阵缓存同 key 同模式)。
         cache_key = getattr(self, '_cache_key', None) or self._generate_cache_key()
         if cache_key in _EXACT_TOKEN_MAP_CACHE:
-            print('[CrossToken] Using cached exact token maps', flush=True)
             cached = _EXACT_TOKEN_MAP_CACHE[cache_key]
             (
                 self._common_student_indices_list,
@@ -376,19 +344,12 @@ class CrossTokenLoss(Loss):
         student_texts = self._student_texts
 
         for i, teacher_tok in enumerate(self.teacher_tokenizer_group):
-            teacher_start = time.perf_counter()
             self._ensure_teacher_text_maps(i)
             teacher_exact_text_to_id, teacher_stripped_text_to_id = (
                 self._teacher_text_maps_list[i]
             )
 
-            def _progress(idx: int, total: int, phase: str) -> None:
-                if idx % 20000 == 0 or idx == total:
-                    print(
-                        f"[CrossToken]  [exact maps] {phase} {idx}/{total} "
-                        f"({time.perf_counter() - _maps_start:.1f}s)",
-                        flush=True,
-                    )
+
 
             # Find common tokens
             common_s = []
@@ -411,8 +372,7 @@ class CrossTokenLoss(Loss):
                 elif v_ == cur[0] and t_ < cur[1]:
                     proj_row_max[s_] = (v_, t_)  # 同权 → 最低教师 index
             for s_id in range(self.student_vocab_size):
-                _progress(s_id + 1, self.student_vocab_size,
-                          f'teacher {i} common scan')
+
                 s_text = student_texts[s_id]
                 teacher_id = teacher_exact_text_to_id.get(s_text)
                 if teacher_id is None:
@@ -452,20 +412,12 @@ class CrossTokenLoss(Loss):
             n_common = len(common_s)
             n_uncommon_s = len(uncommon_s)
             n_uncommon_t = len(uncommon_t)
-            print(f"[CrossToken] Teacher {i}: {n_common} common tokens, "
-                  f"{n_uncommon_s} uncommon student, {n_uncommon_t} uncommon teacher "
-                  f"({time.perf_counter() - teacher_start:.2f}s)")
 
         _EXACT_TOKEN_MAP_CACHE[cache_key] = (
             self._common_student_indices_list,
             self._common_teacher_indices_list,
             self._uncommon_student_indices_list,
             self._uncommon_teacher_indices_list,
-        )
-        print(
-            f"[CrossToken] Exact token maps built in "
-            f"{time.perf_counter() - _maps_start:.2f}s",
-            flush=True,
         )
 
     def _generate_cache_key(self) -> str:
@@ -504,23 +456,7 @@ class CrossTokenLoss(Loss):
         故恢复原始单向投影——对齐正确时精确匹配权重 1.0 直接命中教师
         的预测目标。
         """
-        import time
-        _build_start = time.perf_counter()
         teacher_vocab_size = len(teacher_tokenizer)
-        print(
-            f"[CrossToken]  [teacher {teacher_index}] building projection "
-            f"matrix (student vocab {self.student_vocab_size}, teacher vocab "
-            f"{teacher_vocab_size})",
-            flush=True,
-        )
-
-        def _progress(phase: str, i: int, total: int) -> None:
-            if i % 20000 == 0 or i == total:
-                print(
-                    f"[CrossToken]  [teacher {teacher_index}] {phase} "
-                    f"{i}/{total} ({time.perf_counter() - _build_start:.1f}s)",
-                    flush=True,
-                )
 
         student_indices = []
         teacher_indices = []
@@ -542,7 +478,6 @@ class CrossTokenLoss(Loss):
             )
             teacher_exact_text_to_id[token_text] = token_id
             teacher_stripped_text_to_id[token_text.strip()] = token_id
-            _progress('phase1: teacher decode', token_id + 1, teacher_vocab_size)
         if self.loss_type == 'hkl' and self._teacher_text_maps_list[teacher_index] is None:
             self._teacher_text_maps_list[teacher_index] = (
                 teacher_exact_text_to_id, teacher_stripped_text_to_id
@@ -574,10 +509,7 @@ class CrossTokenLoss(Loss):
                 teacher_indices.append(teacher_id)
                 values.append(1.0)
                 matched_student_ids.add(student_id)
-            _progress(
-                'phase2: student exact match',
-                student_id + 1, self.student_vocab_size,
-            )
+
         # H-KL 时存下学生 id→文本列表,供 _build_exact_token_maps 复用
         if self.loss_type == 'hkl' and not self._student_texts:
             self._student_texts = student_texts
@@ -586,16 +518,8 @@ class CrossTokenLoss(Loss):
         # 解码文本含 U+FFFD 的 token 跳过(字节回退 token 无法文本匹配)
         for student_id, text in enumerate(student_texts):
             if student_id in matched_student_ids:
-                _progress(
-                    'phase3: multi-token match',
-                    student_id + 1, self.student_vocab_size,
-                )
                 continue
             if not text or not text.strip() or '\ufffd' in text:
-                _progress(
-                    'phase3: multi-token match',
-                    student_id + 1, self.student_vocab_size,
-                )
                 continue
             teacher_token_ids = teacher_tokenizer.encode(text, add_special_tokens=False)
             seq_length = len(teacher_token_ids)
@@ -605,19 +529,10 @@ class CrossTokenLoss(Loss):
                     student_indices.append(student_id)
                     teacher_indices.append(t_id)
                     values.append(weight)
-            _progress(
-                'phase3: multi-token match',
-                student_id + 1, self.student_vocab_size,
-            )
 
         # 精确匹配学生集合(统计/日志判定用)
         self._exact_matched_student_ids[teacher_index] = set(matched_student_ids)
 
-        print(
-            f"[CrossToken]  [teacher {teacher_index}] converting "
-            f"{len(student_indices)} mappings to tensors on {self.device} ...",
-            flush=True,
-        )
         student_tensor = torch.tensor(student_indices, dtype=torch.long, device=self.device)
         teacher_tensor = torch.tensor(teacher_indices, dtype=torch.long, device=self.device)
         values_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
@@ -625,12 +540,6 @@ class CrossTokenLoss(Loss):
         self.projection_student_indices_list.append(student_tensor)
         self.projection_teacher_indices_list.append(teacher_tensor)
         self.projection_values_list.append(values_tensor)
-
-        print(
-            f"[CrossToken] Teacher {teacher_index}: {len(student_indices)} mappings "
-            f"({time.perf_counter() - _build_start:.1f}s)",
-            flush=True,
-        )
 
     # ------------------------------------------------------------------
     # Loss computation
@@ -763,32 +672,6 @@ class CrossTokenLoss(Loss):
         loss_mask = (labels != -100).float()
         num_tokens = loss_mask.sum().clamp(min=1)
 
-        # Print metrics (XTOKEN_DEBUG_LOSS=1 时每步打印,默认关闭)
-        if os.environ.get('XTOKEN_DEBUG_LOSS', '0') == '1':
-            print(f"\n=== CrossTokenLoss (type={self.loss_type}) ===")
-            print(f"  KD loss: {total_kd.item():.6f}  CE loss: {ce_loss.item():.6f}")
-            print(f"  Total loss: {loss.item():.6f}  num_tokens: {int(num_tokens)}")
-            for m in teacher_metrics:
-                idx = m['index']
-                print(f"  Teacher {idx} (w={m['weight']:.3f}): kd={m['kd_loss']:.6f}")
-                if 'proj_accuracy' in m:
-                    print(f"    proj_acc={m['proj_accuracy']:.4f}")
-                if 'kl_common' in m:
-                    print(f"    H-KL: common_kl={m['kl_common']:.4f}  "
-                          f"l1_uncommon={m['l1_uncommon']:.4f}  "
-                          f"uld={m.get('uld_loss', 0.0):.4f}")
-                if 'proj_mass_min' in m:
-                    print(
-                        f"    proj_mass: min={m['proj_mass_min']:.4f}  "
-                        f"mean={m['proj_mass_mean']:.4f}"
-                    )
-                if 'teacher_topk_cov' in m:
-                    print(f"    teacher_topk_cov={m['teacher_topk_cov']:.4f}")
-                if 'kl_common' in m:
-                    print(f"    kl_common={m['kl_common']:.6f}  "
-                          f"l1_uncommon={m.get('l1_uncommon', 0):.6f}  "
-                          f"uld={m.get('uld_loss', 0):.6f}")
-            print("=" * 50)
         return LossOutput(loss=loss, num_tokens=num_tokens)
 
     def _topk_to_full(self, topk_logprobs_group, topk_indices_group):
@@ -903,8 +786,6 @@ class CrossTokenLoss(Loss):
             shift_student_logits = shift_student_logits[:, :min_len, :]
             shift_teacher = shift_teacher[:, :min_len, :]
             shift_labels = shift_labels[:, :min_len]
-            s_clen = min_len
-            t_clen = min_len
 
         # ── Build loss mask ──────────────────────────────────────────────
         loss_mask = (shift_labels != -100).float()  # [B, min_len]
@@ -1059,221 +940,6 @@ class CrossTokenLoss(Loss):
                     n_out = n_diag - n_in_topk
                     mean_mass = float(
                         (proj_argmass * diag_valid).sum().item() / n_diag
-                    )
-                    print(
-                        f"[CrossToken]  [diag] student proj argmax: valid={n_diag}, "
-                        f"in_topk={n_in_topk} ({n_in_topk / n_diag:.1%}), "
-                        f"in_topk&q>1e-4={n_q_ok} ({n_q_ok / n_diag:.1%}), "
-                        f"in_topk&q<=1e-4={n_q_low}, out_topk={n_out} "
-                        f"({n_out / n_diag:.1%}), mean_argmax_mass={mean_mass:.3f}",
-                        flush=True,
-                    )
-
-        # ── DEBUG: KL 异常位置(散度值最大的 top-N + 阈值统计) ────────────
-        # 打印逐位置 KL 最大的 top-N 位置及阈值统计,每行附带与 trainer
-        # 映射表一致的模型输出信息(位置、学生/教师 tokenId+文本、匹配关系、
-        # 四列概率)。配置:XTOKEN_DEBUG_KL_TOPN(默认 0=关闭,调试设 20)、
-        # XTOKEN_DEBUG_KL_THRESHOLD(默认 10.0)。
-        with torch.no_grad():
-            valid_kl = per_pos_kl * valid_f  # [B, C|S],无效位置为 0
-            num_valid = int(valid_f.sum().item())
-            top_n = int(os.environ.get('XTOKEN_DEBUG_KL_TOPN', '0'))
-            if num_valid > 0 and top_n > 0:
-                thresh = float(
-                    os.environ.get('XTOKEN_DEBUG_KL_THRESHOLD', '10.0')
-                )
-                # 全词表教师 log-probs 仅在 debug 需要显示教师自身 token
-                # 概率时延迟计算(正式训练 top_n=0 不分配 ~2.1GB 张量)
-                tkr_teacher_log_probs = torch.log_softmax(
-                    teacher_logits_approx / T, dim=-1
-                )  # [B, T_t, V_t]
-
-                max_kl = valid_kl.max().item()
-                n_over = int((valid_kl > thresh).sum().item())
-
-                # top-N 位置索引 (b, c)
-                flat = valid_kl.flatten()
-                top_kl, top_flat_idx = flat.topk(min(top_n, num_valid))
-                b_ids = (top_flat_idx // valid_kl.shape[1]).tolist()
-                c_ids = (top_flat_idx % valid_kl.shape[1]).tolist()
-
-                # 投影矩阵 → {学生 tokenid: [(教师 tokenid, weight), ...]}
-                # (懒缓存,避免每步重建)
-                if not hasattr(self, '_debug_proj_maps'):
-                    self._debug_proj_maps = [None] * self.num_teachers
-                if self._debug_proj_maps[teacher_index] is None:
-                    s_p = self.projection_student_indices_list[
-                        teacher_index].cpu()
-                    t_p = self.projection_teacher_indices_list[
-                        teacher_index].cpu()
-                    v_p = self.projection_values_list[
-                        teacher_index].cpu().float()
-                    proj_map = {}
-                    for s_, t_, v_ in zip(
-                            s_p.tolist(), t_p.tolist(), v_p.tolist()
-                    ):
-                        proj_map.setdefault(s_, []).append((t_, v_))
-                    self._debug_proj_maps[teacher_index] = proj_map
-                proj_map = self._debug_proj_maps[teacher_index]
-
-                stu_tok = self.student_tokenizer
-                tea_tok = self.teacher_tokenizer_group[teacher_index]
-
-                print(f"\n=== KL ANOMALIES (teacher={teacher_index}, "
-                      f"valid={num_valid}, mean={masked_kl.item():.4f}, "
-                      f"max={max_kl:.4f}, >{thresh:.1f}: {n_over}, "
-                      f"T={T:.2f}, kd={kd_loss.item():.4f}) ===")
-                print('  KL | 位置 | 学生投影前 → 学生投影后 → 教师概率 → '
-                      '教师对学生tokenid的概率 | 学生tokenId(学生文本) → '
-                      '教师tokenId(教师文本) [匹配关系]'
-                      ' | p_k(投影目标) q_k(投影目标) t_n(教师位置数)')
-
-                def _fmt_prob(v):
-                    """Format a probability; use scientific notation below 1e-4."""
-                    if v is None:
-                        return '-'
-                    if v >= 1e-4:
-                        return f'{v:.4f}'
-                    return f'{v:.2e}'
-
-                for kl_val, b_i, c_i in zip(top_kl.tolist(), b_ids, c_ids):
-                    s_token = int(shift_labels[b_i, c_i])
-                    if s_token == -100:
-                        continue
-                    s_text = stu_tok.decode(
-                        [s_token], skip_special_tokens=False
-                    )
-                    p_before = float(
-                        student_probs[b_i, c_i, s_token].item()
-                    )
-
-                    # 投影映射:行内最大权重判定 精确(≥0.5) / 多token / 未匹配
-                    # (归一化后权重不再是 1.0,精确匹配行通常权重最大)
-                    entries = proj_map.get(s_token, [])
-                    if entries:
-                        t_star, w_star = max(entries, key=lambda e: e[1])
-                        match_type = '精确' if w_star >= 0.5 else '多token'
-                        p_after = float(projected[b_i, c_i, t_star].item())
-                    else:
-                        t_star = None
-                        match_type = '未匹配'
-                        p_after = None
-
-                    # top-k 重归一化空间中投影目标 token 的学生质量 p_k 与
-                    # 教师概率 q_k(验证 KL 触底机制:学生质量点对教师 q≈0);
-                    # 目标不在教师 top-k 子集内时按 0 计
-                    if t_star is not None:
-                        in_k = (topk_idx == t_star).nonzero()
-                        if in_k.numel() > 0:
-                            pos_k = int(in_k.flatten()[0])
-                            p_k = float(
-                                log_projected_k[b_i, c_i, pos_k].exp().item()
-                            )
-                            q_k = float(
-                                teacher_log_probs_k[
-                                    b_i, c_i, pos_k].exp().item()
-                            )
-                        else:
-                            p_k = 0.0
-                            q_k = 0.0
-                    else:
-                        p_k = None
-                        q_k = None
-                    # 该 chunk 内教师位置数(chunk 平均的样本量)
-                    t_n = (
-                        int(t_sizes[b_i, c_i].item())
-                        if use_chunk_alignment else None
-                    )
-
-                    # 教师对齐位置(chunk 模式:该 chunk 的首个教师位置)
-                    if use_chunk_alignment:
-                        t_positions = (
-                                teacher_chunk_id[b_i] == c_i
-                        ).nonzero(as_tuple=True)[0]
-                        t_pos = (
-                            int(t_positions[0].item())
-                            if t_positions.numel() > 0 else None
-                        )
-                    else:
-                        t_pos = c_i
-
-                    if t_pos is not None:
-                        if use_chunk_alignment:
-                            t_own = int(teacher_input_ids[b_i, t_pos + 1])
-                            t_own_text = tea_tok.decode(
-                                [t_own], skip_special_tokens=False
-                            )
-                            p_teacher_own = float(
-                                tkr_teacher_log_probs[
-                                    b_i, t_pos, t_own].exp().item()
-                            )
-                        else:
-                            # fallback 模式无教师 ids,无法取教师自身 token
-                            t_own_text = None
-                            p_teacher_own = None
-                        if s_token < tkr_vocab_size:
-                            p_teacher_student = float(
-                                tkr_teacher_log_probs[
-                                    b_i, t_pos, s_token].exp().item()
-                            )
-                        else:
-                            p_teacher_student = None
-                    else:
-                        t_own_text = None
-                        p_teacher_own = None
-                        p_teacher_student = None
-
-                    p_after_s = (
-                        f'{p_after:.4f}' if p_after is not None else '-'
-                    )
-                    p_own_s = (
-                        f'{p_teacher_own:.4f}'
-                        if p_teacher_own is not None else '-'
-                    )
-                    # 教师概率列附带教师预测目标文本:验证 chunk 内学生/教师
-                    # 预测的是否同一内容(如学生预测'动物'、教师预测'的' → 错位)
-                    t_own_s = (
-                        f'({t_own_text})' if t_own_text is not None else ''
-                    )
-                    p_stu_s = (
-                        f'{p_teacher_student:.4f}'
-                        if p_teacher_student is not None else '-'
-                    )
-                    if t_star is not None:
-                        t_star_text = tea_tok.decode(
-                            [t_star], skip_special_tokens=False
-                        )
-                        t_pair = f'{t_star}({t_star_text})'
-                    else:
-                        t_pair = '-'
-                    print(
-                        f'  {kl_val:.4f} | b={b_i},pos={c_i} | '
-                        f'{p_before:.4f} → {p_after_s} → {p_own_s}{t_own_s} → '
-                        f'{p_stu_s} | {s_token}({s_text}) → '
-                        f'{t_pair} [{match_type}]'
-                        f' | p_k={_fmt_prob(p_k)} q_k={_fmt_prob(q_k)} '
-                        f't_n={t_n if t_n is not None else "-"}'
-                    )
-                    # KL 构成:该位置 KL 的 top-5 贡献分量(定位 p_k≈1 但
-                    # KL 远大于 p·ln(p/q_k) 的数值矛盾——学生质量点是否
-                    # 真的集中在投影目标上)
-                    contrib = (
-                            log_projected_k[b_i, c_i].exp()
-                            * (log_projected_k[b_i, c_i] - log_teacher_k[b_i, c_i])
-                    )
-                    top_contrib, top_cidx = contrib.topk(5)
-                    parts = []
-                    for cv, ci in zip(top_contrib.tolist(), top_cidx.tolist()):
-                        tid = int(topk_idx[ci])
-                        ttext = tea_tok.decode([tid], skip_special_tokens=False)
-                        pp = float(log_projected_k[b_i, c_i, ci].exp().item())
-                        qq = float(log_teacher_k[b_i, c_i, ci].exp().item())
-                        parts.append(
-                            f"{ttext!r}(p={pp:.4f},q={qq:.2e},+{cv:.2f})"
-                        )
-                    print(
-                        f"    KL构成: " + " ".join(parts),
-                        flush=True,
                     )
 
         # ── Diagnostic: teacher top-k coverage ───────────────────────────
@@ -1689,20 +1355,12 @@ class CrossTokenLoss(Loss):
 
     def get_mapping_statistics(self, teacher_index: int = 0) -> Dict:
         """Return statistics about the projection matrix."""
-        print(
-            '[CrossToken] get_mapping_statistics: '
-            'ensuring projection matrices ...', flush=True,
-        )
         self._ensure_projection_matrices_built()
-        print(
-            '[CrossToken] projection matrices ready, '
-            'computing statistics ...', flush=True,
-        )
         if teacher_index >= len(self.projection_student_indices_list):
             raise ValueError(f"No projection matrix for teacher {teacher_index}")
 
         student_indices = self.projection_student_indices_list[teacher_index]
-        values = self.projection_values_list[teacher_index].float()
+        self.projection_values_list[teacher_index].float()
 
         nnz = student_indices.numel()
         total_elements = self.student_vocab_size * self.teacher_vocab_sizes[teacher_index]
