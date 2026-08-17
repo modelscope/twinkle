@@ -8,7 +8,7 @@ from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .infonce import InfonceLoss
 from .mse import MSELoss
 from .gold import GOLDLoss
-from .ctkd import CTKDLoss
+from .cross_token import CrossTokenLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -31,5 +31,5 @@ torch_loss_mapping = {
     # Embedding / contrastive losses
     'infonce': InfonceLoss,
     'gold': GOLDLoss,
-    'ctkd': CTKDLoss,
+    'cross_token': CrossTokenLoss
 }
