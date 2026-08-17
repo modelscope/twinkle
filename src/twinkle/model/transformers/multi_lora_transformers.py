@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from contextlib import contextmanager
-from copy import deepcopy
 import torch.distributed as dist
 import transformers
+from contextlib import contextmanager
+from copy import deepcopy
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -232,8 +232,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config = self._copy_lora_config(config_or_dir)
         if config.modules_to_save:
             raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
-        self.multi_adapter.validate_tenant_target_modules(
-            config.target_modules, getattr(config, 'target_parameters', None))
+        self.multi_adapter.validate_tenant_target_modules(config.target_modules,
+                                                          getattr(config, 'target_parameters', None))
         self._register_adapter(adapter_name, config, **kwargs)
 
     @staticmethod

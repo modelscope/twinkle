@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, List
-
 import torch
 from peft.tuners.lora import LoraLayer
 from peft.utils import ModulesToSaveWrapper
 from torch import nn
+from typing import Dict, List
 
 from twinkle.model.multi_lora import MultiLora
 
@@ -52,16 +51,13 @@ class HybridFftSlots:
         for allocated_name in self.s_fft:
             matches = [
                 (name, layer) for name, layer in named_modules.items()
-                if self._canonical_module_name(name) == allocated_name
-                and isinstance(layer, (LoraLayer, nn.Linear))
+                if self._canonical_module_name(name) == allocated_name and isinstance(layer, (LoraLayer, nn.Linear))
             ]
             if len(matches) != 1:
-                raise ValueError(
-                    f'Hybrid S_FFT module {allocated_name!r} resolved to {len(matches)} layers.')
+                raise ValueError(f'Hybrid S_FFT module {allocated_name!r} resolved to {len(matches)} layers.')
             layer_name, layer = matches[0]
             if layer_name in resolved_layer_names:
-                raise ValueError(
-                    f'Hybrid S_FFT aliases resolve to the same layer {layer_name!r}.')
+                raise ValueError(f'Hybrid S_FFT aliases resolve to the same layer {layer_name!r}.')
             resolved_layer_names.add(layer_name)
 
             if isinstance(layer, LoraLayer):
@@ -133,10 +129,7 @@ class HybridFftSlots:
         if target_modules is None:
             selected = lora_layers
         else:
-            selected = [
-                name for name in lora_layers
-                if self.multi_lora.match_target_modules(name, target_modules)
-            ]
+            selected = [name for name in lora_layers if self.multi_lora.match_target_modules(name, target_modules)]
         return sorted(name for name in selected if name not in fft_layers)
 
     def _tenant_lora_layer_names(self, adapter_name: str) -> List[str]:
@@ -144,8 +137,7 @@ class HybridFftSlots:
         tenant = self._tenant(adapter_name)
         fft_layers = set(self.allocated_to_layer_name.values())
         return [
-            name for name in self.multi_lora.lora_layer_names
-            if name not in fft_layers
+            name for name in self.multi_lora.lora_layer_names if name not in fft_layers
             and self.multi_lora.match_target_modules(name, tenant.tenant_config.target_modules)
         ]
 
@@ -163,8 +155,8 @@ class HybridFftSlots:
         for allocated_name, _, _, parameter_name, target in self._iter_fft_slot_parameters(adapter_name):
             wrapper = self._get_fft_wrapper(allocated_name)
             original_parameters = dict(wrapper.original_module.named_parameters())
-            self.multi_lora._write_param_tensor(
-                target, self.multi_lora._read_param_tensor(original_parameters[parameter_name]))
+            self.multi_lora._write_param_tensor(target,
+                                                self.multi_lora._read_param_tensor(original_parameters[parameter_name]))
 
     @staticmethod
     def _checkpoint_key(allocated_name: str, parameter_name: str) -> str:
@@ -195,11 +187,8 @@ class HybridFftSlots:
         """Return trainable FFT parameters with their PEFT state-dict names."""
         if not self.is_hybrid(adapter_name):
             return []
-        return [
-            (f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{parameter_name}', parameter)
-            for _, wrapper_name, fft_adapter_name, parameter_name, parameter
-            in self._iter_fft_slot_parameters(adapter_name)
-        ]
+        return [(f'{wrapper_name}.modules_to_save.{fft_adapter_name}.{parameter_name}', parameter) for _, wrapper_name,
+                fft_adapter_name, parameter_name, parameter in self._iter_fft_slot_parameters(adapter_name)]
 
     @staticmethod
     def _normalize_base_state_key(name: str) -> str:
@@ -229,8 +218,7 @@ class HybridFftSlots:
             rank = tenant.tenant_config.r
             a = full_state_dict[a_key][:rank, :]
             b = full_state_dict[b_key][:, :rank]
-            scaling = tenant.tenant_config.lora_alpha / (
-                rank**0.5 if tenant.tenant_config.use_rslora else rank)
+            scaling = tenant.tenant_config.lora_alpha / (rank**0.5 if tenant.tenant_config.use_rslora else rank)
             delta = b.to(torch.float32) @ a.to(torch.float32)
             if getattr(tenant.tenant_config, 'fan_in_fan_out', False):
                 delta = delta.transpose(0, 1)
@@ -270,8 +258,7 @@ class HybridFftSlots:
                 source = f'{layer_name}.lora_{kind}.{tenant.adapter_name}.weight'
                 if source not in full_state_dict:
                     raise ValueError(f'Hybrid training state is missing {source!r}.')
-                value = self.multi_lora._slice_rank_tensor(
-                    source, full_state_dict[source], tenant.tenant_config.r)
+                value = self.multi_lora._slice_rank_tensor(source, full_state_dict[source], tenant.tenant_config.r)
                 state[source.replace(f'.{tenant.adapter_name}.', '.')] = value.detach().cpu()
         for allocated_name, wrapper_name, fft_adapter_name, parameter_name, _ in self._iter_fft_slot_parameters(
                 adapter_name):

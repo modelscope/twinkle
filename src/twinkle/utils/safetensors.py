@@ -1,7 +1,7 @@
 import json
 import os
-from pathlib import Path
 from functools import partial
+from pathlib import Path
 from typing import Literal
 
 from .device_mesh import is_last_rank, is_master

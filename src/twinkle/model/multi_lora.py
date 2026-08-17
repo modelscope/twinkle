@@ -261,8 +261,8 @@ class MultiLora:
         if not target_modules and target_parameters:
             return
         layers = [name for name, layer in self.module.named_modules() if isinstance(layer, LoraLayer)]
-        if target_modules == 'all-linear' or (
-                isinstance(target_modules, (list, set)) and 'all-linear' in target_modules):
+        if target_modules == 'all-linear' or (isinstance(target_modules,
+                                                         (list, set)) and 'all-linear' in target_modules):
             return
         if isinstance(target_modules, (list, set)):
             missing = [target for target in target_modules if not any(name.endswith(target) for name in layers)]
@@ -574,10 +574,7 @@ class MultiLora:
 
         self.module = module
         if not isinstance(module, list):
-            self.lora_layer_names = [
-                name for name, layer in module.named_modules()
-                if isinstance(layer, Linear)
-            ]
+            self.lora_layer_names = [name for name, layer in module.named_modules() if isinstance(layer, Linear)]
         return module
 
     def save_initial_weights(self):

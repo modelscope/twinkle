@@ -2,22 +2,19 @@
 import json
 import os
 import shutil
-from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Type, Union
-
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
 from peft import PeftConfig
 from safetensors.torch import load_file, save_file
 from torch.optim import Optimizer
+from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import Platform, remote_class, remote_function
 from twinkle.utils.safetensors import StreamingSafetensorSaver
-
 from ..multi_lora_transformers import MultiLoraTransformersModel
 from .fft_slots import HybridFftSlots
 from .spectral_allocation import load_spectral_allocation
-
 
 _HYBRID_CONFIG_FIELDS = (
     'r',
@@ -73,8 +70,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         if adapter_mode == 'lora':
             return super().add_adapter_to_model(adapter_name, config_or_dir, **kwargs)
         if adapter_mode != HYBRID_ADAPTER_MODE:
-            raise ValueError(
-                f'Unsupported adapter_mode {adapter_mode!r}; expected "lora" or {HYBRID_ADAPTER_MODE!r}.')
+            raise ValueError(f'Unsupported adapter_mode {adapter_mode!r}; expected "lora" or {HYBRID_ADAPTER_MODE!r}.')
         config = self._copy_lora_config(config_or_dir)
         if config.modules_to_save:
             raise ValueError('Hybrid modules_to_save is controlled by the server allocation.')
@@ -87,8 +83,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
 
     def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
         if not self.fft_slots.is_hybrid(adapter_name):
-            return super()._create_param_group(
-                adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
+            return super()._create_param_group(adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
         params = self._get_trainable_parameters(adapter_name)
         fft_token = '.modules_to_save.fft_'
         lora_names = [name for name in params if fft_token not in name]
@@ -159,15 +154,13 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                     'Spectral Hybrid lossless checkpoints require optimizer param_names for every parameter.')
         train_status = optimizer_group.train_status
         if train_status.loss_value is not None or train_status.num_tokens != 0:
-            raise ValueError(
-                'Spectral Hybrid training state can only be saved after the optimizer step and zero_grad.')
+            raise ValueError('Spectral Hybrid training state can only be saved after the optimizer step and zero_grad.')
         if any(parameter.grad is not None for parameter in self._get_trainable_parameters(adapter_name).values()):
             raise ValueError(
                 'Spectral Hybrid training state can only be saved after zero_grad cleared accumulated gradients.')
         if (optimizer_group.cur_step > 0 and optimizer_group.gradient_accumulation_steps > 1
                 and not optimizer_group.do_grad_sync()):
-            raise ValueError(
-                'Spectral Hybrid training state cannot be saved in the middle of gradient accumulation.')
+            raise ValueError('Spectral Hybrid training state cannot be saved in the middle of gradient accumulation.')
 
     @staticmethod
     def _class_identity(instance) -> Optional[str]:
@@ -298,7 +291,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                     json.dump(adapter_config, handle, ensure_ascii=False, indent=2, sort_keys=True)
                     handle.write('\n')
                 save_file(
-                    {key: value.contiguous() for key, value in adapter_state.items()},
+                    {
+                        key: value.contiguous()
+                        for key, value in adapter_state.items()
+                    },
                     os.path.join(training_dir, 'adapter_model.safetensors'),
                 )
             if dist.is_initialized():
@@ -331,9 +327,8 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         adapter_path = os.path.join(training_dir, 'adapter_model.safetensors')
         trainer_state_path = os.path.join(training_dir, 'trainer_state.json')
         if not os.path.isfile(adapter_path) or not os.path.isfile(trainer_state_path):
-            raise ValueError(
-                'Cannot resume Spectral Hybrid training from a merged-only checkpoint. '
-                'Save the checkpoint with save_optimizer=True to create twinkle_training_state.')
+            raise ValueError('Cannot resume Spectral Hybrid training from a merged-only checkpoint. '
+                             'Save the checkpoint with save_optimizer=True to create twinkle_training_state.')
         adapter_config_path = os.path.join(training_dir, 'adapter_config.json')
         if not os.path.isfile(adapter_config_path):
             raise ValueError('Spectral Hybrid training state is missing adapter_config.json.')
@@ -369,8 +364,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         adapter_name = kwargs.get('adapter_name', '')
         self._check_adapter_valid(adapter_name)
         if not self.fft_slots.is_hybrid(adapter_name):
-            return super().resume_from_checkpoint(
-                checkpoint_dir, resume_only_model=resume_only_model, **kwargs)
+            return super().resume_from_checkpoint(checkpoint_dir, resume_only_model=resume_only_model, **kwargs)
         result = self._resume_spectral_hybrid(checkpoint_dir, adapter_name, resume_only_model)
         if dist.is_initialized():
             dist.barrier()
