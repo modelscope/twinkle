@@ -10,7 +10,7 @@ from safetensors.torch import load_file, save_file
 from torch.optim import Optimizer
 from typing import Any, Dict, List, Optional, Type, Union
 
-from twinkle import Platform, remote_class, remote_function
+from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.utils.safetensors import StreamingSafetensorSaver
 from ..multi_lora_transformers import MultiLoraTransformersModel
 from .fft_slots import HybridFftSlots
@@ -36,7 +36,11 @@ HYBRID_ADAPTER_MODE = 'hybrid'
 class SpectralHybridTransformersModel(MultiLoraTransformersModel):
     """Transformers MultiLoRA service extended with server-owned FFT slots."""
 
-    def __init__(self, hybrid: Dict[str, Any], memory_efficient_init: bool = False, **kwargs):
+    def __init__(self,
+                 hybrid: Dict[str, Any],
+                 memory_efficient_init: bool = False,
+                 device_mesh: Optional[DeviceMesh] = None,
+                 **kwargs):
         if memory_efficient_init:
             raise ValueError(
                 'Spectral Hybrid does not support memory_efficient_init because FFT slots require materialized '
@@ -48,7 +52,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         s_fft = load_spectral_allocation(allocation_path)
         self.default_lr_lora = float(config.get('default_lr_lora', 2.5e-5))
         self.default_lr_fft = float(config.get('default_lr_fft', 1e-6))
-        super().__init__(memory_efficient_init=False, **kwargs)
+        super().__init__(memory_efficient_init=False, device_mesh=device_mesh, **kwargs)
         self.fft_slots = HybridFftSlots(self.multi_adapter, s_fft)
         self.fft_slots.install_fft_slots()
 
@@ -313,10 +317,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
 
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
-        adapter_name = kwargs.get('adapter_name')
+        adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
         if not self.fft_slots.is_hybrid(adapter_name):
-            return super().save(name, output_dir, interval, **kwargs)
+            return super().save(name, output_dir, interval, adapter_name=adapter_name, **kwargs)
         checkpoint_dir = self._save_spectral_hybrid(name, output_dir, interval, adapter_name, **kwargs)
         if dist.is_initialized():
             dist.barrier()

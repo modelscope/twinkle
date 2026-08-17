@@ -473,6 +473,38 @@ def test_transformers_server_selects_hybrid_model_only_when_configured(monkeypat
     })) is Hybrid
 
 
+def test_hybrid_server_model_exposes_device_mesh_to_remote_class():
+    from twinkle.infra import _get_device_mesh_param_name
+    from twinkle.server.model.backends.transformers_model import TwinkleCompatSpectralHybridTransformersModel
+
+    assert _get_device_mesh_param_name(TwinkleCompatSpectralHybridTransformersModel.__init__) == 'device_mesh'
+
+
+def test_hybrid_save_passes_adapter_name_once(monkeypatch):
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    wrapper = object.__new__(SpectralHybridTransformersModel)
+    wrapper.optimizer_group = {'hybrid': object()}
+    wrapper.fft_slots = type('FftSlots', (), {'is_hybrid': staticmethod(lambda adapter_name: True)})()
+    received = {}
+
+    def fake_save(_self, name, output_dir, interval, adapter_name, **kwargs):
+        received.update(adapter_name=adapter_name, kwargs=kwargs)
+        return 'checkpoint-dir'
+
+    monkeypatch.setattr(SpectralHybridTransformersModel, '_save_spectral_hybrid', fake_save)
+
+    result = SpectralHybridTransformersModel.save.__wrapped__(
+        wrapper,
+        'checkpoint',
+        adapter_name='hybrid',
+        save_optimizer=True,
+    )
+
+    assert result == 'checkpoint-dir'
+    assert received == {'adapter_name': 'hybrid', 'kwargs': {'save_optimizer': True}}
+
+
 def test_allocation_rejects_duplicate_modules():
     from twinkle.model.multi_lora import MultiLora
 
@@ -528,6 +560,19 @@ def test_fft_modules_do_not_need_lora_preallocation():
     deployed = TinyDecoder(num_layers=1)
     deployed.load_state_dict(merged_state)
     assert torch.allclose(deployed(inputs), expected, atol=1e-5)
+
+
+def test_fft_slots_use_fp32_with_bf16_base():
+    from twinkle.model.multi_lora import MultiLora
+
+    manager = MultiLora(max_loras=2, max_r=4)
+    model = manager.patch(TinyDecoder(num_layers=1).to(torch.bfloat16), target_modules='all-linear')
+    hybrid = _install_hybrid(manager, model, ['layers.0.self_attn.q_proj'])
+
+    wrapper = hybrid._get_fft_wrapper('layers.0.self_attn.q_proj')
+    assert {parameter.dtype for parameter in wrapper.original_module.parameters()} == {torch.bfloat16}
+    assert {parameter.dtype for parameter in wrapper.modules_to_save.parameters()} == {torch.float32}
+    assert {parameter.dtype for parameter in model.parameters() if parameter.requires_grad} == {torch.float32}
 
 
 def test_hybrid_lora_targets_follow_tenant_config_but_exclude_fft():

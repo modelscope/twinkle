@@ -71,6 +71,8 @@ class HybridFftSlots:
             wrapper = ModulesToSaveWrapper(original_module, 'fft_0')
             for slot in range(1, self.multi_lora.max_loras):
                 wrapper.update(f'fft_{slot}')
+            # Match PEFT's FP32 LoRA weights so FSDP sees one trainable dtype.
+            wrapper.modules_to_save.to(dtype=torch.float32)
             wrapper.set_adapter([])
             for parameter in wrapper.modules_to_save.parameters():
                 parameter.requires_grad_(True)
