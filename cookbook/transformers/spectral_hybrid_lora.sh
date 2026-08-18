@@ -1,16 +1,15 @@
 #!/bin/sh
-# Reuse the configured allocation, or compute and persist it when the file does not exist.
+# Train from an allocation generated with --generate-allocation-only.
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   torchrun --nproc_per_node=4 spectral_hybrid_lora.py \
     --model-id ms://Qwen/Qwen3.5-9B \
-    --dataset-id data/financial_sft/processed/finqa_tatqa_train_messages.jsonl \
+    --dataset-id ms://swift/self-cognition \
     --template-cls Qwen3_5Template \
     --fsdp-size 4 \
     --dp-size 1 \
     --batch-size 16 \
     --optimizer-cls AdamW \
-    --lr 2.5e-5 \
     --weight-decay 0.01 \
     --gradient-accumulation-steps 4 \
     --log-interval 1 \

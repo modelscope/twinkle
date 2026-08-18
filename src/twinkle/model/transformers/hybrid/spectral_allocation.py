@@ -162,7 +162,7 @@ def compute_spectral_scores(
     cache_dir: Optional[Path] = None,
     cache_key: str = '',
     epsilon: float = 1e-12,
-    log_interval: int = 20,
+    log_interval: int = 1,
     broadcast: bool = True,
 ) -> SpectralScores:
     """Score pretrained modules from singular-value spectra for data-free allocation."""
