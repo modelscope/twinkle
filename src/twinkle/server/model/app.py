@@ -15,6 +15,7 @@ from typing import Any
 from twinkle import DeviceGroup
 from twinkle.server.common.router import StickyLoraRequestRouter
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle.server.exceptions import FullModeBusyError
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
@@ -27,25 +28,48 @@ from .twinkle_handlers import _register_twinkle_routes
 
 logger = get_logger()
 
+# ``FullModeBusyError`` lives in ``twinkle.server.exceptions``; re-exported here
+# for backwards compatibility with callers importing it from this module.
+__all__ = ['FullModeBusyError', 'ModelManagement', 'build_model_app']
+
+# Ctor kwargs consumed by the MultiLora wrappers' signatures but unknown to the
+# plain (full-parameter) model classes, where **kwargs flows into HF
+# ``from_pretrained``. Dropped when constructing a full-mode backend.
+_LORA_ONLY_CTOR_KWARGS = ('max_loras', 'max_r', 'max_length', 'target_modules', 'lora_config')
+
 
 def _make_mock_model(kw: dict[str, Any]) -> Any:
     from .backends.mock_model import TwinkleCompatMockModel
 
+    kw.pop('train_mode', None)  # mock backend behaves the same for lora/full
     return TwinkleCompatMockModel(**kw)
 
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
+    train_mode = kw.pop('train_mode', 'lora')
+    if train_mode == 'full':
+        if kw.get('hybrid') is not None:
+            raise ValueError('Spectral Hybrid is only supported with train_mode="lora".')
+        from .backends.transformers_model import TwinkleCompatFullTransformersModel
+        for key in _LORA_ONLY_CTOR_KWARGS:
+            kw.pop(key, None)
+        return TwinkleCompatFullTransformersModel(**kw)
     from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
                                               TwinkleCompatTransformersModel)
 
-    if kw.get('hybrid'):
+    if kw.get('hybrid') is not None:
         return TwinkleCompatSpectralHybridTransformersModel(**kw)
     return TwinkleCompatTransformersModel(**kw)
 
 
 def _make_megatron_model(kw: dict[str, Any]) -> Any:
+    train_mode = kw.pop('train_mode', 'lora')
+    if train_mode == 'full':
+        from .backends.megatron_model import TwinkleCompatFullMegatronModel
+        for key in _LORA_ONLY_CTOR_KWARGS:
+            kw.pop(key, None)
+        return TwinkleCompatFullMegatronModel(**kw)
     from .backends.megatron_model import TwinkleCompatMegatronModel
-
     return TwinkleCompatMegatronModel(**kw)
 
 
@@ -91,11 +115,17 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self.replica_id = serve.get_replica_context().replica_id.unique_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
+        # ``train_mode`` selects LoRA multi-tenant (default) or exclusive
+        # full-parameter training. Popped here so the underlying model
+        # constructor never receives it; re-injected into ctor_kwargs so the
+        # backend builder can pick the full vs LoRA wrapper class.
+        self.train_mode = kwargs.pop('train_mode', 'lora')
 
         ctor_kwargs: dict[str, Any] = {
             'model_id': model_id,
             'remote_group': self.device_group.name,
             'instance_id': self.replica_id,
+            'train_mode': self.train_mode,
             **kwargs,
         }
         if self.device_mesh is not None:
@@ -168,9 +198,45 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):
             self.clear_resource_state(adapter_name)
-            self.model.remove_adapter(adapter_name)
+            if self.train_mode == 'full':
+                # No PEFT adapter to remove; restore clean base weights so the
+                # next tenant does not inherit this tenant's trained weights.
+                self.model.reload_initial_weights()
+            else:
+                self.model.remove_adapter(adapter_name)
             self.unregister_resource(adapter_name)
             await self.state.unload_model(adapter_name)
+
+    @property
+    def is_full_mode(self) -> bool:
+        """True when this deployment runs exclusive full-parameter training."""
+        return self.train_mode == 'full'
+
+    def resolve_model_adapter_name(self, adapter_name: str | None) -> str | None:
+        """Map a per-tenant adapter name to the name the model expects.
+
+        In full-parameter mode every request targets the empty-string default
+        optimizer group; in LoRA mode the per-tenant adapter name is used as-is.
+        """
+        if self.is_full_mode:
+            return ''
+        return adapter_name
+
+    def assert_full_mode_available(self, adapter_name: str | None = None) -> None:
+        """In full mode, ensure no other tenant currently holds this deployment.
+
+        Call before registering any state so a rejected request leaves nothing
+        behind. ``adapter_name`` (when given) is excluded from the check so a
+        tenant re-issuing against its own resource is not blocked.
+
+        Raises:
+            FullModeBusyError: another (non-expiring) tenant already holds it.
+        """
+        if not self.is_full_mode:
+            return
+        for rid, info in self._resource_records.items():
+            if rid != adapter_name and not info.get('expiring'):
+                raise FullModeBusyError(rid)
 
     async def _on_adapter_expired(self, adapter_name: str) -> None:
         self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')

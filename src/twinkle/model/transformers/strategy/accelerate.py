@@ -209,6 +209,24 @@ class AccelerateStrategy:
             del local
         return state_dict
 
+    def load_full_state_dict(self, model, state_dict) -> None:
+        """Load a full (non-sharded) state dict into the model in-place.
+
+        Used by full-parameter training to (re)load base weights, e.g. after a
+        tenant releases an exclusive full-parameter deployment.
+        """
+        fsdp_plugin = self._get_fsdp_plugin()
+        if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
+            from torch.distributed.checkpoint.state_dict import set_model_state_dict
+            set_model_state_dict(
+                model,
+                state_dict,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=True),
+            )
+            return
+        unwrapped = self.unwrap_model(model)
+        unwrapped.load_state_dict(state_dict, strict=False)
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect LoRA parameters and fully trained PEFT modules."""
         from twinkle.utils import torch_util
