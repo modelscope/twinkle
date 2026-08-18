@@ -48,8 +48,6 @@ def _make_mock_model(kw: dict[str, Any]) -> Any:
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
     if train_mode == 'full':
-        if kw.get('hybrid') is not None:
-            raise ValueError('Spectral Hybrid is only supported with train_mode="lora".')
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
@@ -57,7 +55,7 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
     from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
                                               TwinkleCompatTransformersModel)
 
-    if kw.get('hybrid') is not None:
+    if train_mode == 'hybrid':
         return TwinkleCompatSpectralHybridTransformersModel(**kw)
     return TwinkleCompatTransformersModel(**kw)
 

@@ -70,7 +70,7 @@ class ModelArgs(_ArgsBase):
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
-    train_mode: Literal['lora', 'full'] = 'lora'
+    train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
@@ -84,8 +84,8 @@ class ModelArgs(_ArgsBase):
         if self.hybrid is not None:
             if self.backend != 'transformers':
                 raise ValueError('hybrid is only supported by the transformers backend')
-            if self.train_mode != 'lora':
-                raise ValueError('hybrid is only supported with train_mode="lora"')
+            if self.train_mode == 'full':
+                raise ValueError('hybrid is not supported with train_mode="full"')
         return self
 
 

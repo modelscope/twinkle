@@ -31,11 +31,12 @@ applications:
             env_vars:
               TWINKLE_FAIL_FAST: "0"
 
-  - name: models-Qwen3.5-9B-hybrid
+  - name: models-Qwen3.5-9B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-9B
     import_path: model
     args:
       backend: transformers
+      train_mode: hybrid
       model_id: "ms://Qwen/Qwen3.5-9B"
       max_length: 10240
       nproc_per_node: 4
