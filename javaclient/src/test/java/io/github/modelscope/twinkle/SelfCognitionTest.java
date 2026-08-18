@@ -27,10 +27,10 @@ public final class SelfCognitionTest {
     /** Starts an end-to-end remote LoRA training run. */
     public static void main(String[] args) {
         // Step 1: Configure the server, model, dataset, and training hyperparameters.
-        String baseUrl = "http://55.110.209.20:30092";
-        String token = "123456zxc123";
+        String baseUrl = "************";
+        String token = "************";
         String modelId = "Qwen/Qwen3.6-27B";
-        String datasetId = "/model/twinkle_client_uat/httpserver/models/DG051C901E80020002/messages.jsonl";
+        String datasetId = "************";
         String template = "Qwen3_5Template";
         int batchSize = 4;
         int epochs = 1;

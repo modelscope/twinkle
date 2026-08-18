@@ -29,10 +29,10 @@ public final class MultiModalTrainingTest {
     public static void main(String[] args) {
 
         // Step 1: Configure the server, model, dataset, and training hyperparameters.
-        String baseUrl = "http://55.110.209.20:30092";
-        String token = "08176666666";
+        String baseUrl = "************";
+        String token = "************";
         String modelId = "Qwen/Qwen3.5-4B";
-        String datasetId = "/nas/disk6/twinkle-main-0623/image_dataset.jsonl";
+        String datasetId = "/************";
         String template = "Qwen3_5Template";
 
         int sampleLimit = 20;
