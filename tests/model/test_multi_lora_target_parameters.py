@@ -186,6 +186,46 @@ def _make_multilora_for_target_parameters(model):
     return multi_lora
 
 
+def _make_dense_multilora_without_target_parameters():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    config = LoraConfig(r=2, lora_alpha=4, target_modules=['weight'])
+    multi_lora = MultiLora(max_loras=1, max_r=4)
+    multi_lora.module = nn.Linear(4, 4)
+    multi_lora.loras = [
+        LoraTenant(
+            index=0,
+            adapter_name='lora_0',
+            config=config,
+            tenant_adapter_name='dense',
+            tenant_config=config,
+        )
+    ]
+
+    class RejectTargetParameterState:
+
+        def get_state_dict(self, tenant_adapter_name):
+            raise KeyError(tenant_adapter_name)
+
+        def set_state_dict(self, tenant_adapter_name, state_dict):
+            raise KeyError(tenant_adapter_name)
+
+    multi_lora.target_parameter_manager = RejectTargetParameterState()
+    return multi_lora
+
+
+def test_dense_multilora_get_state_dict_skips_target_parameter_manager():
+    multi_lora = _make_dense_multilora_without_target_parameters()
+
+    assert multi_lora.get_state_dict('dense') == {}
+
+
+def test_dense_multilora_set_state_dict_skips_target_parameter_manager():
+    multi_lora = _make_dense_multilora_without_target_parameters()
+
+    multi_lora.set_state_dict('dense', {})
+
+
 def test_multilora_state_dict_round_trips_target_parameters():
     torch.manual_seed(0)
     model = FakeModel()

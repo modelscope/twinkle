@@ -125,8 +125,7 @@ class TwinkleCompatTransformersModel(_TransformersTinkerCompatMixin, MultiLoraTr
 
 
 @remote_class()
-class TwinkleCompatSpectralHybridTransformersModel(_TransformersTinkerCompatMixin,
-                                                   SpectralHybridTransformersModel):
+class TwinkleCompatSpectralHybridTransformersModel(_TransformersTinkerCompatMixin, SpectralHybridTransformersModel):
     """Unified API wrapper for the Spectral Hybrid Transformers model."""
 
 
