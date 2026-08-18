@@ -451,7 +451,7 @@ def test_hybrid_rejects_client_owned_fft_and_target_parameter_config():
         model.add_adapter_to_model('tenant', target_parameters, adapter_mode='hybrid')
 
 
-def test_transformers_server_selects_hybrid_model_only_when_configured(monkeypatch):
+def test_transformers_server_selects_hybrid_model_only_for_hybrid_train_mode(monkeypatch):
     from twinkle.server.model import app
     from twinkle.server.model.backends import transformers_model
 
@@ -469,6 +469,11 @@ def test_transformers_server_selects_hybrid_model_only_when_configured(monkeypat
     assert type(app._make_transformers_model({'model_id': 'tiny'})) is Regular
     assert type(app._make_transformers_model({
         'model_id': 'tiny',
+        'hybrid': {'allocation_path': '/shared/allocation.json'},
+    })) is Regular
+    assert type(app._make_transformers_model({
+        'model_id': 'tiny',
+        'train_mode': 'hybrid',
         'hybrid': {'allocation_path': '/shared/allocation.json'},
     })) is Hybrid
 
