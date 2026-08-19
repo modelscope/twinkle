@@ -1,3 +1,34 @@
+"""MOPD (Model-Oriented Policy Distillation) Training on NPU with GOLDLoss.
+
+GOLD (Generalized Offline-to-Online Language Model Distillation) combines:
+- Cross-entropy loss on student labels
+- ULD (Universal Logit Distillation) for knowledge transfer from teacher
+
+Pipeline:
+    1. DataLoader supplies full-text batches (prompt + response).
+    2. Teacher model computes logits on the sequences.
+    3. Student model runs forward_backward() with GOLDLoss.
+
+Architecture (NPU):
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ Driver (CPU)                                                    │
+    │  dataloader ──► full-text batch (prompt + response)             │
+    │  teacher_sampler.sample() ──► teacher logits                    │
+    │  student_model.forward_backward(teacher_output=...) ──► GOLD    │
+    └─────────────────────────────────────────────────────────────────┘
+                        │
+         vLLMSampler + TransformersModel
+          (teacher)       (student)
+
+Environment variables (all optional):
+    STUDENT_MODEL_ID  – (default: /model/Qwen3-0.6B)
+    TEACHER_MODEL_ID  – (default: /model/Qwen3-8B)
+    BATCH_SIZE        – global batch size             (default: 8)
+    MAX_STEPS         – total optimisation steps      (default: 1000)
+    LR                – learning rate                 (default: 1e-4)
+    GKD_TEMPERATURE   – distillation temperature      (default: 1.0)
+"""
+
 import os
 from typing import List
 
@@ -18,7 +49,7 @@ logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
-TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen/qwen2.5-0.5b-instruct')
+TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen3.5-4B')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 1))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 1))
@@ -50,6 +81,8 @@ def setup_npu_env():
         f"{os.environ.get('LD_LIBRARY_PATH', '')}:"
         f"{os.environ['ASCEND_AICPU_PATH']}/lib64"
     )
+
+# ── Utility ───────────────────────────────────────────────────────────────────
 
 def convert_topk_prompt_logprobs(
     topk_prompt_logprobs_batch: List,
@@ -117,6 +150,8 @@ def convert_topk_prompt_logprobs(
         'teacher_topk_indices': torch.roll(torch.tensor(batch_indices, dtype=torch.long), shifts=-1, dims=1),
     }
 
+
+# ── Training ──────────────────────────────────────────────────────────────────
 
 def train():
     """Main training function for MOPD with GOLDLoss on NPU."""
@@ -201,7 +236,7 @@ def train():
     # ── DataLoader (full-text: prompt + response) ──────────────────────────────
     dataset = Dataset(
         dataset_meta=DatasetMeta(
-            'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji',
+            '/model/liujihui/twinkle_client_st/httpserver/models/DG04F8511A00100002/messages.jsonl',
             data_slice=range(1000)
         )
     )
@@ -230,11 +265,19 @@ def train():
         # 1. Teacher computes logits on the full sequences
         # max_tokens=0: don't generate new content, just compute logits on input
         # Use prompt_logprobs to get teacher logprobs for distillation
+        # Note: We need to re-encode with teacher tokenizer because student and teacher
+        # may have different vocabularies. Using student's input_ids directly would cause
+        # index out of bounds errors when teacher's vocab size is smaller.
 
         teacher_inputs = []
         for item in batch:
+            # Decode student tokens back to text, then re-encode with teacher tokenizer
             text = student_tokenizer.decode(item['input_ids'], skip_special_tokens=False)
-            teacher_inputs.append({'messages': [{'role': 'user', 'content': text}]})
+            teacher_encoded = teacher_tokenizer.encode(text, add_special_tokens=False)
+            teacher_inputs.append({
+                'input_ids': teacher_encoded,
+                'labels': item.get('labels', [-100] * len(teacher_encoded)),
+            })
 
         teacher_response = teacher_sampler.sample(
             teacher_inputs,
@@ -252,6 +295,7 @@ def train():
         topk_data = convert_topk_prompt_logprobs(
             [resp.topk_prompt_logprobs for resp in teacher_response]
         )
+
 
         # Get teacher input_ids and labels from input_data
         # Convert lists to tensors first
