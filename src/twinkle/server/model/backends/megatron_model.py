@@ -1,6 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Megatron backend model for the unified model deployment.
+Megatron backend models for the unified model deployment.
+
+Contains the shared Tinker/Twinkle compatibility mixin and two concrete
+wrappers:
+- TwinkleCompatMegatronModel: multi-LoRA training (default), wraps
+  MultiLoraMegatronModel.
+- TwinkleCompatFullMegatronModel: exclusive full-parameter training, wraps the
+  plain MegatronModel (no PEFT/MultiLora).
 """
 import torch
 from tinker import types
@@ -9,18 +16,20 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
-from twinkle.model.megatron import MultiLoraMegatronModel
+from twinkle.model.megatron import MegatronModel, MultiLoraMegatronModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
 from twinkle.utils.nccl_safe import nccl_safe_megatron
 
 
-@remote_class(execute='all')
-class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase):
-    """Compatibility wrapper around MultiLoraMegatronModel for Twinkle/Tinker.
+class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
+    """Tinker/Twinkle-compat methods shared by LoRA and full-parameter wrappers.
 
-    Moved from tinker/common/megatron_model.py — logic unchanged.
+    Method bodies only call ``super()`` so they work against either
+    ``MultiLoraMegatronModel`` (LoRA) or ``MegatronModel`` (full) as the next
+    class in the MRO. For full-parameter training the ``adapter_name`` is the
+    empty-string default optimizer group.
     """
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
@@ -65,6 +74,9 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
             if hasattr(opt, 'chained_optimizers'):
                 for chained_opt in opt.chained_optimizers:
                     if hasattr(chained_opt, 'config'):
+                        # ``config.*`` only seeds param_groups at optimizer-construction
+                        # time; keep it in sync for clip_grad (read from config at step
+                        # time) and for _get_lr fallbacks.
                         chained_opt.config.lr = adam_params.learning_rate
                         chained_opt.config.adam_eps = adam_params.eps
                         chained_opt.config.adam_beta1 = adam_params.beta1
@@ -73,7 +85,16 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
                         if adam_params.grad_clip_norm > 0:
                             chained_opt.config.clip_grad = adam_params.grad_clip_norm
 
-        super().step(**kwargs)
+        # The inner Adam reads lr/eps/betas from ``param_groups`` at step time, so
+        # AdamParams must be applied there via optim_params (mirrors the
+        # transformers backend); updating ``config.lr`` alone has no effect.
+        optim_params = {
+            'lr': adam_params.learning_rate,
+            'eps': adam_params.eps,
+            'betas': (adam_params.beta1, adam_params.beta2),
+            'weight_decay': adam_params.weight_decay,
+        }
+        super().step(optim_params=optim_params, **kwargs)
         super().zero_grad(**kwargs)
 
     @remote_function(collect='last_pp_first', lazy_collect=False)
@@ -131,3 +152,18 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True
+
+
+@remote_class(execute='all')
+class TwinkleCompatMegatronModel(_MegatronTinkerCompatMixin, MultiLoraMegatronModel):
+    """Compatibility wrapper around MultiLoraMegatronModel for Twinkle/Tinker."""
+
+
+@remote_class(execute='all')
+class TwinkleCompatFullMegatronModel(_MegatronTinkerCompatMixin, MegatronModel):
+    """Full-parameter (non-LoRA) wrapper around the plain MegatronModel.
+
+    Used by exclusive full-parameter server deployments. All training operations
+    target the empty-string default optimizer group created by
+    ``MegatronModel.__init__``.
+    """

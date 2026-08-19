@@ -6,6 +6,8 @@ Twinkle 支持任何兼容 HuggingFace Transformers 或 Megatron-LM 的模型。
 
 | 模型系列 | 模型 ID | 参数量 | 特性 |
 |:---------|:--------|:-------|:-----|
+| Qwen 3.8 | `Qwen/Qwen3.8-27B` | 27B | 思考模式 |
+| Qwen 3.6 | `Qwen/Qwen3.6-27B`, `Qwen/Qwen3.6-35B-A3B` | 27B、35B-A3B | MoE、思考模式 |
 | Qwen 3.5 | `Qwen/Qwen3.5-0.6B` ~ `Qwen/Qwen3.5-235B-A22B` | 0.6B–235B | MoE、思考模式 |
 | Qwen 2.5 | `Qwen/Qwen2.5-0.5B` ~ `Qwen/Qwen2.5-72B` | 0.5B–72B | Dense |
 | DeepSeek V4 | `deepseek-ai/DeepSeek-V4` | 685B MoE | 自定义 DSML 编码 |

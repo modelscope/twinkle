@@ -1,18 +1,63 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import hashlib
+import importlib.util
 import json
+import os
 import re
+import sys
 import torch
+from functools import lru_cache
 from transformers import AutoConfig, PreTrainedTokenizerFast
+from types import ModuleType
 from typing import Any, Dict, List, Literal, Optional
 
 from twinkle.hub import HubOperation
+from . import deepseek_v4_encoding as bundled_encoding
 from .base import Template
-from .deepseek_v4_encoding import (dsml_token, encode_messages, eos_token, parse_message_from_completion_text,
-                                   tool_calls_block_name)
+
+_ENCODING_RELATIVE_PATH = os.path.join('encoding', 'encoding_dsv4.py')
+_REQUIRED_ENCODING_ATTRIBUTES = (
+    'dsml_token',
+    'encode_messages',
+    'eos_token',
+    'parse_message_from_completion_text',
+    'tool_calls_block_name',
+)
 
 
-def get_deepseek_v4_tokenizer(tokenizer):
+@lru_cache(maxsize=None)
+def load_deepseek_v4_encoding(model_dir: str) -> ModuleType:
+    """Load the encoding implementation shipped with a DeepSeek-V4 model.
+
+    The bundled implementation is retained as a compatibility fallback for
+    older/local model directories that do not contain ``encoding/encoding_dsv4.py``.
+    """
+    encoding_path = os.path.join(model_dir, _ENCODING_RELATIVE_PATH)
+    if not os.path.isfile(encoding_path):
+        return bundled_encoding
+
+    digest = hashlib.sha256(os.path.realpath(encoding_path).encode()).hexdigest()[:16]
+    module_name = f'twinkle_deepseek_v4_encoding_{digest}'
+    spec = importlib.util.spec_from_file_location(module_name, encoding_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot create an import spec for DeepSeek-V4 encoding: {encoding_path}')
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+
+    missing = [name for name in _REQUIRED_ENCODING_ATTRIBUTES if not hasattr(module, name)]
+    if missing:
+        raise ImportError(f'DeepSeek-V4 encoding {encoding_path} is missing required attributes: {missing}')
+    return module
+
+
+def get_deepseek_v4_tokenizer(tokenizer, encoding_model_dir: Optional[str] = None):
     """Wrap a HF tokenizer with DeepSeek V4's custom chat-template encoder."""
     dsv4_tokenizer = copy.copy(tokenizer)
 
@@ -40,10 +85,11 @@ def get_deepseek_v4_tokenizer(tokenizer):
                 messages[0]['tools'] = tools
 
             reasoning_effort = kwargs.get('reasoning_effort')
-            if reasoning_effort not in ('max', 'high'):
+            if reasoning_effort not in ('low', 'high', 'max'):
                 reasoning_effort = None
 
-            prompt_str = encode_messages(
+            encoding = load_deepseek_v4_encoding(encoding_model_dir) if encoding_model_dir else bundled_encoding
+            prompt_str = encoding.encode_messages(
                 messages,
                 thinking_mode=thinking_mode,
                 drop_thinking=kwargs.get('drop_thinking', True),
@@ -102,8 +148,21 @@ def get_deepseek_v4_tokenizer(tokenizer):
 
 class DeepseekV4Template(Template):
 
-    _TOOL_CALLS_START = f'<{dsml_token}{tool_calls_block_name}>'
-    _TOOL_CALLS_END = f'</{dsml_token}{tool_calls_block_name}>'
+    _encoding_model_dir: Optional[str] = None
+
+    @property
+    def _encoding(self) -> ModuleType:
+        if self._encoding_model_dir is None:
+            return bundled_encoding
+        return load_deepseek_v4_encoding(self._encoding_model_dir)
+
+    @property
+    def _tool_calls_start(self) -> str:
+        return f'<{self._encoding.dsml_token}{self._encoding.tool_calls_block_name}>'
+
+    @property
+    def _tool_calls_end(self) -> str:
+        return f'</{self._encoding.dsml_token}{self._encoding.tool_calls_block_name}>'
 
     def __init__(
         self,
@@ -117,8 +176,11 @@ class DeepseekV4Template(Template):
     ):
         self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
+        self._encoding_model_dir = model_id
+        # Load eagerly so an invalid model-provided encoding fails during initialization.
+        load_deepseek_v4_encoding(model_id)
         base_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, **kwargs)
-        self.processor = get_deepseek_v4_tokenizer(base_tokenizer)
+        self.processor = get_deepseek_v4_tokenizer(base_tokenizer, model_id)
         self.config = AutoConfig.from_pretrained(model_id, **kwargs)
 
         self.use_chat_template = use_chat_template
@@ -131,22 +193,22 @@ class DeepseekV4Template(Template):
 
     def parse(self, decoded: str) -> List[Dict[str, Any]]:
         text = decoded or ''
-        if DeepseekV4Template._TOOL_CALLS_START not in text:
+        if self._tool_calls_start not in text:
             return []
 
         parse_text = re.sub(
-            r'\s*' + re.escape(DeepseekV4Template._TOOL_CALLS_START),
-            '\n\n' + DeepseekV4Template._TOOL_CALLS_START,
+            r'\s*' + re.escape(self._tool_calls_start),
+            '\n\n' + self._tool_calls_start,
             text,
             count=1,
         )
-        if eos_token not in parse_text:
-            parse_text += eos_token
+        if self._encoding.eos_token not in parse_text:
+            parse_text += self._encoding.eos_token
 
         for thinking_mode in ('chat', 'thinking'):
             try:
-                message = parse_message_from_completion_text(parse_text, thinking_mode=thinking_mode)
-            except ValueError:
+                message = self._encoding.parse_message_from_completion_text(parse_text, thinking_mode=thinking_mode)
+            except (AssertionError, ValueError):
                 continue
             tool_calls = message.get('tool_calls', []) or []
             for tool_call in tool_calls:
@@ -164,25 +226,25 @@ class DeepseekV4Template(Template):
     def clean(self, decoded: str) -> str:
         text = decoded or ''
         while True:
-            start = text.find(DeepseekV4Template._TOOL_CALLS_START)
+            start = text.find(self._tool_calls_start)
             if start < 0:
                 return text.rstrip()
 
             end = text.find(
-                DeepseekV4Template._TOOL_CALLS_END,
-                start + len(DeepseekV4Template._TOOL_CALLS_START),
+                self._tool_calls_end,
+                start + len(self._tool_calls_start),
             )
             if end < 0:
                 text = text[:start]
                 continue
 
-            end += len(DeepseekV4Template._TOOL_CALLS_END)
+            end += len(self._tool_calls_end)
             text = text[:start] + text[end:]
 
     def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
         """Prefer DeepSeek's DSML tool-call format; fall back to ToolCallRegistry parsers."""
         text = decoded or ''
-        if DeepseekV4Template._TOOL_CALLS_START in text:
+        if self._tool_calls_start in text:
             result = self.parse(text)
             if result:
                 return result
@@ -191,6 +253,6 @@ class DeepseekV4Template(Template):
     def clean_tool_call(self, decoded: str) -> str:
         """Prefer DeepSeek's DSML tool-call format; fall back to ToolCallRegistry parsers."""
         text = decoded or ''
-        if DeepseekV4Template._TOOL_CALLS_START in text:
+        if self._tool_calls_start in text:
             return self.clean(text)
         return super().clean_tool_call(decoded)

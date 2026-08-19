@@ -12,7 +12,7 @@ rms_norm, rotary, geglu, moe, sdpa_attention, fla) into
 references + availability checks only, no optional-dependency imports).
 """
 # Trigger built-in op registration (must happen before the first kernelize() call)
-from . import fla, geglu, moe, rms_norm, rotary, sdpa_attention, swiglu  # noqa: F401,E402
+from . import dsv4_sas_li, fla, geglu, moe, rms_norm, rotary, sdpa_attention, swiglu  # noqa: F401,E402
 from .ep import EpExpertsGmm, ep_forward
 
 __all__ = [

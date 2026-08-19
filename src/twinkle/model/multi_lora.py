@@ -479,9 +479,12 @@ class MultiLora:
               target_modules='all-linear',
               *args,
               **kwargs):
-        module_device = getattr(module, 'device', None)
+        # ``module`` may be a list of model chunks (Megatron); probe the first
+        # chunk for the device in that case.
+        first_module = module[0] if isinstance(module, (list, tuple)) else module
+        module_device = getattr(first_module, 'device', None)
         if module_device is None:
-            module_device = next(module.parameters())[1].device
+            module_device = next(first_module.parameters()).device
         low_cpu_mem_usage = module_device.type == 'meta'
 
         for i in range(self.max_loras):

@@ -171,6 +171,11 @@ class MockSampler:
         return None
 
     @remote_function()
+    def load_full_weights_from_path(self, path: str, *args: Any, **kwargs: Any) -> int:
+        """No-op full-weight load for the mock full-parameter sampling path."""
+        return 0
+
+    @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
         self.template = template_cls
 
