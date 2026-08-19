@@ -30,7 +30,7 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: maven
-          cache-dependency-path: javaclients/pom.xml
+          cache-dependency-path: javaclient/pom.xml
 
       - name: Run Formatting and Build Verification
-        run: mvn -B -f javaclients/pom.xml verify
+        run: mvn -B -f javaclient/pom.xml verify

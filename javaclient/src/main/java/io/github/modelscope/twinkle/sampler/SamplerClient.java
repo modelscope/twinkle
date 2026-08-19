@@ -56,7 +56,8 @@ public final class SamplerClient {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("inputs", request.inputs().stream().map(JsonValue::new).toList());
         data.put("sampling_params", request.samplingParams());
-        data.put("adapter_name", request.adapterName().isBlank() ? adapterName : request.adapterName());
+        String effectiveAdapterName = request.adapterName().isBlank() ? adapterName : request.adapterName();
+        data.put("adapter_name", effectiveAdapterName == null ? "" : effectiveAdapterName);
         data.put("num_samples", request.numSamples());
         if (request.adapterUri() != null) {
             data.put("adapter_uri", request.adapterUri());
