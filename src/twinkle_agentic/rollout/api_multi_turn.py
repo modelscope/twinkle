@@ -1,14 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
-from twinkle_agentic.protocol.openai import OpenAI
+from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import Rollout
-from .multi_turn import MultiTurnRollout
 
 # Termination reasons surfaced via ``trajectory['stop_reason']``.
 _STOP_NO_TOOL = 'stop'
@@ -34,7 +32,8 @@ class APIMultiTurnRollout(Rollout):
 
     Constructor and per-call override semantics intentionally mirror
     :class:`MultiTurnRollout`: ``tool_manager`` may be a single instance
-    (broadcast) or a list aligned 1:1 with trajectories.
+    (broadcast) or a list aligned 1:1 with trajectories, and it is optional --
+    a challenger inventing tasks has nothing to execute.
 
     Tool schema source: ``trajectory['tools']`` if present, else
     ``tool_manager.tool_infos()`` of the trajectory's manager. Caller is
@@ -50,8 +49,8 @@ class APIMultiTurnRollout(Rollout):
 
     def __init__(
         self,
-        api: OpenAI,
-        tool_manager: ToolManager,
+        api: API,
+        tool_manager: Optional[ToolManager] = None,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         concurrency: int = 8,
@@ -62,28 +61,19 @@ class APIMultiTurnRollout(Rollout):
     ):
         super().__init__()
         if api is None:
-            raise ValueError('APIMultiTurnRollout requires an OpenAI client')
-        if tool_manager is None:
-            raise ValueError('APIMultiTurnRollout requires a ToolManager')
-        if max_turns < 1:
-            raise ValueError(f'max_turns must be >= 1, got {max_turns}')
+            raise ValueError('APIMultiTurnRollout requires an API client')
         if concurrency < 1:
             raise ValueError(f'concurrency must be >= 1, got {concurrency}')
-        sp = sampling_params or SamplingParams()
-        if sp.num_samples != 1:
-            raise ValueError(f'APIMultiTurnRollout supports num_samples=1 only, '
-                             f'got {sp.num_samples}')
+        self._init_common(
+            max_turns=max_turns,
+            sampling_params=sampling_params,
+            trace_dir=trace_dir,
+            trace_callback=trace_callback,
+            success_callback=success_callback)
         self.api = api
         self.tool_manager = tool_manager
-        self.sampling_params = sp
-        self.max_turns = max_turns
         self.concurrency = concurrency
         self.extra_body = dict(extra_body or {})
-        self.trace_dir = trace_dir
-        self.trace_callback = trace_callback
-        self.success_callback = success_callback
-        if self.trace_dir:
-            os.makedirs(self.trace_dir, exist_ok=True)
 
     def __call__(
         self,
@@ -99,7 +89,7 @@ class APIMultiTurnRollout(Rollout):
             return []
 
         sampling_params: SamplingParams = kwargs.get('sampling_params', self.sampling_params)
-        tool_managers = MultiTurnRollout._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
+        tool_managers = self._broadcast(kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager')
         extra_body = dict(self.extra_body)
         if 'extra_body' in kwargs and kwargs['extra_body']:
             extra_body.update(kwargs['extra_body'])
@@ -119,7 +109,7 @@ class APIMultiTurnRollout(Rollout):
 
         result_outs: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
         if self.trace_dir:
-            self._write_traces(result_outs, kwargs.get('global_step'))
+            self._write_rollout_traces(result_outs, global_step=kwargs.get('global_step'))
         return result_outs
 
     # ------------------------------------------------------------------ private
@@ -127,7 +117,7 @@ class APIMultiTurnRollout(Rollout):
     def _run_one(
         self,
         trajectory: Trajectory,
-        tool_manager: ToolManager,
+        tool_manager: Optional[ToolManager],
         sampling_params: SamplingParams,
         extra_body: Dict[str, Any],
     ) -> Trajectory:
@@ -139,7 +129,7 @@ class APIMultiTurnRollout(Rollout):
         """
         messages: List[Dict[str, Any]] = list(trajectory.get('messages') or [])
         tools = trajectory.get('tools')
-        if tools is None:
+        if tools is None and tool_manager is not None:
             tools = tool_manager.tool_infos() or None
 
         turn = 0
@@ -180,6 +170,15 @@ class APIMultiTurnRollout(Rollout):
             if turn >= self.max_turns:
                 truncated = True
                 stop_reason = _STOP_MAX_TURNS
+                break
+
+            if tool_manager is None:
+                # Nothing can run the call, so the conversation cannot continue:
+                # say why rather than looping on an unanswered tool turn.
+                stop_reason = _STOP_API_ERROR
+                error = ('model emitted tool_calls but this rollout has no ToolManager; '
+                         'pass one at construction time or as a per-call kwarg')
+                truncated = True
                 break
 
             try:
@@ -242,48 +241,21 @@ class APIMultiTurnRollout(Rollout):
             msg['reasoning_content'] = reasoning
         return msg
 
-    def _write_traces(
+    def _build_trace_record(
         self,
-        outs: List[Trajectory],
-        global_step: Optional[int],
-    ) -> None:
-        """Per-trajectory JSON dump. Mirrors :meth:`MultiTurnRollout.
-        _write_rollout_traces` but reuses its static helpers — failures
-        on a single trajectory never abort the batch."""
-        import json
-        import os
-        for idx, traj in enumerate(outs):
-            try:
-                should_store = True
-                if self.trace_callback is not None:
-                    try:
-                        should_store = bool(self.trace_callback(traj))
-                    except Exception:
-                        should_store = False
-                if not should_store:
-                    continue
-                success = False
-                if self.success_callback is not None:
-                    try:
-                        success = bool(self.success_callback(traj))
-                    except Exception:
-                        success = False
-                record = {
-                    'trajectory': MultiTurnRollout._serialize_for_trace(traj),
-                    'ground_truth': MultiTurnRollout._extract_ground_truth(traj),
-                    'stop_reason': traj.get('stop_reason'),
-                    'truncated': bool(traj.get('truncated')),
-                    'turns': traj.get('turns'),
-                    'success': success,
-                }
-                if traj.get('error'):
-                    record['error'] = traj['error']
-                prefix = 'ok' if success else 'fail'
-                step_tag = (f'step{int(global_step):06d}-' if global_step is not None else '')
-                fname = (f'{step_tag}{prefix}-'
-                         f'{MultiTurnRollout._resolve_traj_id(traj, idx)}.json')
-                path = os.path.join(self.trace_dir, fname)
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(record, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                pass
+        traj: Dict[str, Any],
+        *,
+        idx: int,
+        success: bool,
+    ) -> Dict[str, Any]:
+        """The shared record, plus the two fields only this loop produces.
+
+        ``turns`` counts API round-trips and ``error`` carries the exception
+        text behind ``stop_reason='api_error'`` -- without it a trace of a
+        failed batch shows an empty conversation and no reason.
+        """
+        record = super()._build_trace_record(traj, idx=idx, success=success)
+        record['turns'] = traj.get('turns')
+        if traj.get('error'):
+            record['error'] = traj['error']
+        return record

@@ -33,7 +33,8 @@ adapter is added, so all weights are trained and CheckpointEngineManager ships t
 whole model to vLLM each step. RSI-specific paths come from env vars so the standard
 CLI (model/infra/rl knobs) stays identical to the reference:
 
-    RSI_STD_FLOWS   standard_flows.jsonl from rsi_refine.py (default output/rsi/standard_flows.jsonl)
+    RSI_STD_FLOWS   flows jsonl, as written by cookbook/rsi/code/challenge.py --out-flows
+                    (default output/rsi/standard_flows.jsonl)
     RSI_TEMPLATE    template name, must match the model (default Template, for text-only Qwen3-4B)
     RSI_TESTS       jsonl with {id, test_list, test_setup_code} to score code rounds
                     by execution (empty = code rounds are not trained)
@@ -99,10 +100,13 @@ args = CLI.from_args()
 # ── RSI-specific paths (env) ───────────────────────────────────────────────
 STD_FLOWS = os.environ.get('RSI_STD_FLOWS', 'output/rsi/standard_flows.jsonl')
 TEMPLATE = os.environ.get('RSI_TEMPLATE', 'Template')  # base text template for Qwen3-4B (text-only)
-REWARD_TOOL_RESULT = 'tool_result'  # matches rsi_refine.attach_reward_method
+# Round-level reward labels a flow may carry. The challenger writes 'rubric' on
+# its code rounds; 'tool_result' is for flows whose tool rounds are scored
+# against a recorded result.
+REWARD_TOOL_RESULT = 'tool_result'
 REWARD_RUBRIC = 'rubric'
-# Tests for code rounds, keyed by the flow's id (rsi_refine passes the id through
-# from the step-1 subset, which carries the dataset's own tests).
+# Tests for code rounds, keyed by the flow's id (the challenger writes both files
+# with the same ids; --out-tests here, --out-flows above).
 TESTS_PATH = os.environ.get('RSI_TESTS', '')
 TEST_TIMEOUT = int(os.environ.get('RSI_TEST_TIMEOUT', 30))
 JUDGE_WORKERS = int(os.environ.get('RSI_JUDGE_WORKERS', max(24, min(96, (os.cpu_count() or 24) // 2))))
@@ -123,8 +127,9 @@ RUN_NAME = os.environ.get('RSI_RUN_NAME', '')
 # one jsonl line (step, kind, ref/gen call, completion head, score, judge reason).
 # Pure observability; the reward and training path are untouched.
 REWARD_DUMP = os.environ.get('RSI_REWARD_DUMP', '')
-# Raw step-1 conversations (before rsi_refine). rsi_refine's flow schema keeps
-# only the FIRST user message (as `query`) plus the tool rounds, so any parameter
+# Raw conversations behind the flows, when the flows were derived from a dataset
+# rather than invented. A flow keeps only the FIRST user message (as `query`)
+# plus the tool rounds, so any parameter
 # the user stated in a LATER user turn is missing from a round's prompt and the
 # model is asked to produce a call it cannot possibly know. When this points at
 # the raw file, each round's prompt is rebuilt to splice those dropped user (and
@@ -693,8 +698,8 @@ def _intervening_turns(raw_msgs: List[Dict[str, Any]], lo: int, hi: int) -> List
 
     Assistant tool-call messages (content starting with ``[``) and tool results
     are dropped here because the structured prior rounds already carry the call
-    and its result; what is recovered is exactly the conversational turns
-    rsi_refine did not keep.
+    and its result; what is recovered is exactly the conversational turns the
+    flow did not keep.
     """
     out: List[Dict[str, Any]] = []
     for j in range(lo + 1, hi):
@@ -719,7 +724,7 @@ def build_round_trajectories(records: List[Dict[str, Any]],
     what its reward executes; otherwise it stays context-only.
 
     When ``raw_by_query`` is given, the round prompt is rebuilt from the raw
-    conversation so the user turns that rsi_refine dropped (e.g. the turn that
+    conversation so the user turns the flow dropped (e.g. the turn that
     states the call's arguments) are spliced back in at their real positions;
     flows whose raw conversation cannot be located fall back to the flow-only
     prompt (system + first query + prior rounds).

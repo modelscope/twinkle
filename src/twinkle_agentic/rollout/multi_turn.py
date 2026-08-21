@@ -1,13 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
-import os
-import re
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from twinkle.data_format import Trajectory, user_data_get
+from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
@@ -95,27 +91,20 @@ class MultiTurnRollout(Rollout):
         super().__init__()
         if template is None:
             raise ValueError('MultiTurnRollout requires a local Template instance')
-        if max_turns < 1:
-            raise ValueError(f'max_turns must be >= 1, got {max_turns}')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
                              f'{max_trajectory_tokens}')
+        self._init_common(
+            max_turns=max_turns,
+            sampling_params=sampling_params,
+            trace_dir=trace_dir,
+            trace_callback=trace_callback,
+            success_callback=success_callback)
         self.sampler = sampler
         self.template = template
         self.tool_manager = tool_manager
         self.harness = harness
-        self.sampling_params = sampling_params or SamplingParams()
-        self.max_turns = max_turns
         self.max_trajectory_tokens = max_trajectory_tokens
-        self.trace_dir = trace_dir
-        self.trace_callback = trace_callback
-        self.success_callback = success_callback
-        if self.trace_dir:
-            os.makedirs(self.trace_dir, exist_ok=True)
-
-        if self.sampling_params.num_samples != 1:
-            raise ValueError(f'MultiTurnRollout currently supports num_samples=1 only, '
-                             f'got {self.sampling_params.num_samples}')
         assert self.template.truncation_strategy != 'split', (
             "MultiTurnRollout does not support truncation_strategy='split'; "
             'use left/right/delete/raise on the template.')
@@ -131,8 +120,9 @@ class MultiTurnRollout(Rollout):
             return []
 
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
-        tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
-        harnesses = self._resolve_harnesses(kwargs.get('harness', self.harness), n)
+        tool_managers = self._broadcast(
+            kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager', required=True)
+        harnesses = self._broadcast(kwargs.get('harness', self.harness), n, name='harness')
         lives: List[Optional[Trajectory]] = [
             dict(trajectories[i]) if harnesses[i] is not None else None for i in range(n)
         ]
@@ -311,30 +301,6 @@ class MultiTurnRollout(Rollout):
 
     # ------------------------------------------------------------------ private
 
-    @staticmethod
-    def _resolve_tool_managers(arg, n: int) -> List[ToolManager]:
-        """Broadcast a single ``ToolManager`` or validate a per-trajectory list."""
-        if arg is None:
-            raise ValueError('tool_manager is required but was not provided. '
-                             'Pass it at construction time or as a per-call kwarg.')
-        if isinstance(arg, list):
-            if len(arg) != n:
-                raise ValueError(f'per-call tool_manager list length ({len(arg)}) does '
-                                 f'not match number of trajectories ({n})')
-            return list(arg)
-        return [arg] * n
-
-    @staticmethod
-    def _resolve_harnesses(arg, n: int) -> List[Optional[AgentHarness]]:
-        if arg is None:
-            return [None] * n
-        if isinstance(arg, list):
-            if len(arg) != n:
-                raise ValueError(f'per-call harness list length ({len(arg)}) does '
-                                 f'not match number of trajectories ({n})')
-            return list(arg)
-        return [arg] * n
-
     def _harness_before_generate(
         self,
         pif: Dict[str, Any],
@@ -443,120 +409,6 @@ class MultiTurnRollout(Rollout):
         if not delta:
             return fallback, live
         return delta, live
-
-    _TRACE_SKIP_KEYS = (
-        'input_ids',
-        'labels',
-        'attention_mask',
-        'position_ids',
-        'logprobs',
-        'pixel_values',
-        'image_grid_thw',
-        'mm_token_type_ids',
-    )
-
-    @classmethod
-    def _serialize_for_trace(cls, traj: Dict[str, Any]) -> Dict[str, Any]:
-        """Drop tensor-like / oversized fields; keep messages + metadata.
-
-        Trace files are for human forensics; raw token ids, labels and
-        image buffers would bloat the file by orders of magnitude without
-        adding diagnostic value (the chat-template rendering of
-        ``messages`` already captures the textual content).
-        """
-        slim = {k: v for k, v in traj.items() if k not in cls._TRACE_SKIP_KEYS}
-        return _to_plain(slim)
-
-    @staticmethod
-    def _extract_ground_truth(traj: Dict[str, Any]) -> str:
-        """Pull ``ground_truth`` out of packed ``user_data``."""
-        return user_data_get(traj.get('user_data'), 'ground_truth', '') or ''
-
-    @staticmethod
-    def _resolve_traj_id(traj: Dict[str, Any], fallback_idx: int) -> str:
-        """Stable-ish trajectory id for filenames.
-
-        Prefers an explicit ``id`` / ``prompt_id`` key in ``user_data``
-        (sanitised for filesystem safety); else falls back to
-        ``{timestamp_ms}-{fallback_idx}`` so concurrent rollouts do not
-        overwrite each other's files.
-        """
-        for key in ('id', 'prompt_id'):
-            val = user_data_get(traj.get('user_data'), key)
-            if val not in (None, ''):
-                safe = re.sub(r'[^A-Za-z0-9_\-.]+', '_', str(val))[:64]
-                if safe:
-                    return safe
-        return f'{int(time.time() * 1000)}-{fallback_idx}'
-
-    def _build_trace_record(
-        self,
-        traj: Dict[str, Any],
-        *,
-        idx: int,
-        success: bool,
-    ) -> Dict[str, Any]:
-        """Assemble one trace record. Subclasses override to add fields.
-
-        ``idx`` is the trajectory's position in the rollout output list,
-        so subclasses can correlate the record with any per-call state
-        they stashed on ``self`` during ``__call__``.
-        """
-        return {
-            'trajectory': self._serialize_for_trace(traj),
-            'ground_truth': self._extract_ground_truth(traj),
-            'stop_reason': traj.get('stop_reason'),
-            'truncated': bool(traj.get('truncated')),
-            'success': success,
-        }
-
-    def _write_rollout_traces(
-        self,
-        outs: List[Dict[str, Any]],
-        *,
-        global_step: Optional[int] = None,
-    ) -> None:
-        """Dump one pretty-printed JSON file per selected trajectory.
-
-        ``trace_callback`` (if set) decides WHETHER to store;
-        ``success_callback`` (if set) decides the filename prefix
-        (``ok-`` vs ``fail-``). Defaults: store-all / mark-fail.
-
-        Observability must never break training -- any I/O or encoding
-        problem on a single trajectory is swallowed so the remaining
-        dumps and the optimisation loop continue unaffected.
-        """
-        if not self.trace_dir:
-            return
-        for idx, traj in enumerate(outs):
-            try:
-                should_store = True
-                if self.trace_callback is not None:
-                    try:
-                        should_store = bool(self.trace_callback(traj))
-                    except Exception:
-                        should_store = False
-                if not should_store:
-                    continue
-
-                success = False
-                if self.success_callback is not None:
-                    try:
-                        success = bool(self.success_callback(traj))
-                    except Exception:
-                        success = False
-
-                record = self._build_trace_record(traj, idx=idx, success=success)
-                prefix = 'ok' if success else 'fail'
-                # global_step prefix lets file listings sort by training step.
-                step_tag = f'step{int(global_step):06d}-' if global_step is not None else ''
-                fname = f'{step_tag}{prefix}-{self._resolve_traj_id(traj, idx)}.json'
-                path = os.path.join(self.trace_dir, fname)
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(record, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                # Per-trajectory failure never aborts the loop.
-                pass
 
     @staticmethod
     def _unwrap_response_list(resps, expected: int) -> List[SampleResponse]:

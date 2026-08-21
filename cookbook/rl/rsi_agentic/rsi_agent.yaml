@@ -1,16 +1,15 @@
 # ms-agent config for agentic RSI training.
 #
-# This file is the framework-specific half on purpose: the system prompt, the
-# tool line-up and the sandbox settings live here in cookbook, while
-# src/twinkle_agentic stays generic. Point RSI_AGENT_CONFIG at a copy of this
-# to change the agent without touching the trainer.
+# Read by both halves of the setup, which is the point:
 #
-# The entry script deletes the `llm:` section before preparing the agent.
-# Omitting it here is not enough: ms-agent merges this file over its own
-# ms_agent/agent/agent.yaml, which does declare one, and FileSystemTool builds
-# an LLM client whenever config.llm exists -- which then asserts on a missing
-# modelscope_api_key. Generation comes from twinkle's vLLM sampler, so no
-# second model should be reachable from here at all.
+#   * the training host loads it to build a MsAgentHarness for message shaping
+#     only -- the entry script drops `llm:` and `tools:` from the merged config
+#     first, so no tool is ever constructed next to the trainer;
+#   * remote_tool_env.py uploads this same file into each sandbox, where
+#     sandbox_server/tool_server.py loads it and does construct the tools.
+#
+# So the tool line-up below describes what runs in the microVM. Editing it takes
+# effect on the next episode; no image rebuild is involved.
 
 prompt:
   # Unset -> ms-agent's built-in agent prompt, which is also what serving uses.
@@ -31,9 +30,10 @@ max_chat_round: 9999
 interactive: false
 permission_mode: auto
 
-# Overwritten per trajectory by the entry script. Both file_system and
-# code_executor root themselves here, so this is what isolates episodes.
-output_dir: output/rsi_agentic/workspace
+# Path *inside the sandbox*. One microVM per episode already isolates
+# trajectories from each other, so this is a fixed path rather than a per-slot
+# directory; the entry script overrides it only to match --workspace.
+output_dir: /workspace
 
 callbacks: []
 
@@ -48,8 +48,10 @@ tools:
       - glob
   code_executor:
     mcp: false
-    # python_env runs on the host; switch to the docker implementation for
-    # untrusted code, at the cost of a container per episode.
+    # python_env means "run in this process's machine", and that machine is the
+    # microVM -- the sandbox boundary is the VM itself, not this setting. Do not
+    # switch to the docker implementation: it would nest a container inside the
+    # VM for no extra isolation.
     implementation: python_env
     include:
       - shell_executor
@@ -62,3 +64,12 @@ tools:
 # fetch_page (retrieve a known URL); a real query-a-search-engine tool needs
 # EXA_API_KEY / SERPAPI_API_KEY and is wired separately from the plain tool
 # list. Add it here once that is decided; until then no task should need it.
+
+# No `llm:` section on purpose, and note that omitting it is not the same as
+# disabling it: ms-agent merges this file over its own ms_agent/agent/agent.yaml,
+# which declares `service: modelscope`. The tool server treats a section with no
+# credentials as absent, drops it, and then withdraws the one argument that
+# needed it (read_file's `abbreviate`, an LLM-written file summary) from the
+# advertised schema -- so the model is never offered a tool argument that cannot
+# work. Put a real `llm:` here, with a key reachable from the sandbox, to get
+# that argument back.
