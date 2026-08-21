@@ -4,12 +4,15 @@ import numpy as np
 import os
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
+from twinkle_agentic.harness.base import AgentHarness
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import Rollout
 
@@ -36,6 +39,41 @@ def _to_plain(obj: Any) -> Any:
     return obj
 
 
+def _append_only_delta(
+    old_messages: List[Dict[str, Any]],
+    new_messages: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Return newly appended messages, or None if ``new`` rewrote history."""
+    old = list(old_messages or [])
+    new = list(new_messages or [])
+    if len(new) < len(old):
+        return None
+    for a, b in zip(old, new):
+        if a != b:
+            return None
+    return new[len(old):]
+
+
+def _default_tool_messages(
+    tool_calls: List[Dict[str, Any]],
+    observations: List[str],
+) -> List[Dict[str, Any]]:
+    msgs: List[Dict[str, Any]] = []
+    for i, obs in enumerate(observations):
+        msg: Dict[str, Any] = {'role': 'tool', 'content': '' if obs is None else str(obs)}
+        if i < len(tool_calls) and isinstance(tool_calls[i], dict):
+            tc = tool_calls[i]
+            fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+            tid = tc.get('id') or tc.get('tool_call_id')
+            name = fn.get('name') or tc.get('name') or tc.get('tool_name')
+            if tid:
+                msg['tool_call_id'] = tid
+            if name:
+                msg['name'] = name
+        msgs.append(msg)
+    return msgs
+
+
 @remote_class()
 class MultiTurnRollout(Rollout):
     """Agentic multi-turn rollout with tool use (batched).
@@ -46,31 +84,21 @@ class MultiTurnRollout(Rollout):
     so vLLM can run all live trajectories in parallel; finished trajectories
     are parked and excluded from subsequent batches.
 
-    Per-trajectory loop:
-        1. Encode the initial trajectory into an ``InputFeature`` with a
-           generation prompt at the tail.
-        2. Call ``sampler.sample(pifs)`` (batched). The sampler internally
-           invokes ``template.concat_input_feature`` to append the freshly
-           sampled assistant tokens; we pick up ``seq.new_input_feature`` as
-           the new running ``pif``.
-        3. If ``stop_reason == 'length'`` or the decoded assistant output has
-           no tool calls, mark the trajectory as done.
-        4. Otherwise, invoke the tools via ``ToolManager`` and append each
-           tool response as a ``{'role':'tool', 'content': ...}`` message.
-           Compute "bridge" tokens (tool turns + next ``<|im_start|>assistant``
-           header) with ``labels = -100`` and extend the pif.
-        5. Repeat until all trajectories are done or ``max_turns`` is hit.
+    Per-trajectory loop::
+
+        harness.before_generate     # append-only after the first encode
+        sampler.sample(batch)       # keep seq.new_input_feature
+        harness.after_generate
+        ToolManager.call_many       # Env.step_batch when tools share an Env
+        harness.after_tools         # format observations as tool messages
+        _extend_with_bridge         # labels=-100; never decode-reencode history
 
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: shared :class:`SamplingParams` for the batch.
-        * ``tool_manager``: either a single :class:`ToolManager` (applied to
-          every trajectory) or a list of ``ToolManager`` aligned 1:1 with
-          ``trajectories`` (used by :class:`MultiTurnCondenseRollout` to
-          attach a trajectory-bound ``ExtractCondensed``).
-
-    The class intentionally has no knowledge of condensers/chunkers; they are
-    applied upstream (on the trajectory before rollout) or downstream
-    (on the returned messages).
+        * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
+        * ``harness``: a single :class:`AgentHarness` or a 1:1 list. Framework
+          specifics (ms-agent system/memory/tool-message shape) live in the
+          harness subclass, not here.
     """
 
     def __init__(
@@ -84,6 +112,7 @@ class MultiTurnRollout(Rollout):
         trace_dir: Optional[str] = None,
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        harness: Optional[AgentHarness] = None,
     ):
         super().__init__()
         if template is None:
@@ -96,6 +125,7 @@ class MultiTurnRollout(Rollout):
         self.sampler = sampler
         self.template = template
         self.tool_manager = tool_manager
+        self.harness = harness
         self.sampling_params = sampling_params or SamplingParams()
         self.max_turns = max_turns
         self.max_trajectory_tokens = max_trajectory_tokens
@@ -124,15 +154,36 @@ class MultiTurnRollout(Rollout):
 
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
         tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
+        harnesses = self._resolve_harnesses(kwargs.get('harness', self.harness), n)
+        lives: List[Optional[Trajectory]] = [
+            dict(trajectories[i]) if harnesses[i] is not None else None for i in range(n)
+        ]
+        for live in lives:
+            if live is not None:
+                live['messages'] = list(live.get('messages') or [])
 
-        # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
-        #    state for trajectory ``i``.
+        # 1. First before_generate happens *before* encode so memory/system
+        #    injection is in the initial prefix (not a later rewrite).
+        encode_trajs: List[Trajectory] = []
+        for i, traj in enumerate(trajectories):
+            h, live = harnesses[i], lives[i]
+            if h is not None and live is not None:
+                lives[i] = h.before_generate(live)
+                live = lives[i]
+                traj = dict(traj)
+                traj['messages'] = list(live.get('messages') or [])
+                if live.get('tools'):
+                    traj['tools'] = list(live['tools'])
+            encode_trajs.append(traj)
+
         pifs: List[Dict[str, Any]] = []
-        for traj in trajectories:
+        for i, traj in enumerate(encode_trajs):
             pif = self.template.encode(traj, add_generation_prompt=True)
             pif = _to_plain(pif)
             pif.setdefault('messages', list(traj.get('messages', [])))
             pifs.append(pif)
+            if lives[i] is not None:
+                lives[i]['messages'] = list(pifs[i].get('messages') or [])
 
         all_logprobs: List[List[Any]] = [[] for _ in range(n)]
         stop_reasons: List[Optional[str]] = [None] * n
@@ -140,10 +191,23 @@ class MultiTurnRollout(Rollout):
         truncated: List[bool] = [False] * n
         done: List[bool] = [False] * n
 
+        first_turn = True
         for _ in range(self.max_turns):
             active = [i for i in range(n) if not done[i]]
             if not active:
                 break
+
+            if not first_turn:
+                for global_idx in active:
+                    pifs[global_idx], lives[global_idx], dropped = self._harness_before_generate(
+                        pifs[global_idx], lives[global_idx], harnesses[global_idx])
+                    if dropped:
+                        truncated[global_idx] = True
+                        done[global_idx] = True
+                active = [i for i in range(n) if not done[i]]
+                if not active:
+                    break
+            first_turn = False
 
             # 2. One batched sample call for all currently-live trajectories.
             batch_pifs = [pifs[i] for i in active]
@@ -155,7 +219,7 @@ class MultiTurnRollout(Rollout):
             resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
             resps = self._unwrap_response_list(resps, len(batch_pifs))[:actual]
 
-            pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
+            pending_tools: List[tuple] = []  # (global_idx, tool_calls)
             for local_idx, global_idx in enumerate(active):
                 turns[global_idx] += 1
                 seq = resps[local_idx].sequences[0]
@@ -176,6 +240,19 @@ class MultiTurnRollout(Rollout):
                     all_logprobs[global_idx].extend(seq.logprobs)
                 stop_reasons[global_idx] = seq.stop_reason
 
+                _msgs = pifs[global_idx].get('messages') or []
+                _last_msg = _msgs[-1] if _msgs else None
+                tool_calls = (_last_msg.get('tool_calls') if isinstance(_last_msg, dict) else None)
+                if not tool_calls:
+                    tool_calls = self.template.parse_tool_call(seq.decoded or '')
+
+                if lives[global_idx] is not None:
+                    lives[global_idx]['messages'] = list(_msgs)
+                if harnesses[global_idx] is not None and lives[global_idx] is not None:
+                    lives[global_idx] = harnesses[global_idx].after_generate(
+                        lives[global_idx], seq.decoded or '', tool_calls or [])
+                    self._merge_assistant_metadata(pifs[global_idx], lives[global_idx])
+
                 # 3. Termination conditions
                 if seq.stop_reason == 'length':
                     done[global_idx] = True
@@ -188,11 +265,6 @@ class MultiTurnRollout(Rollout):
                     done[global_idx] = True
                     continue
 
-                _msgs = pifs[global_idx].get('messages') or []
-                _last_msg = _msgs[-1] if _msgs else None
-                tool_calls = (_last_msg.get('tool_calls') if isinstance(_last_msg, dict) else None)
-                if not tool_calls:
-                    tool_calls = self.template.parse_tool_call(seq.decoded or '')
                 if not tool_calls:
                     done[global_idx] = True
                     continue
@@ -202,25 +274,25 @@ class MultiTurnRollout(Rollout):
                     done[global_idx] = True
                     continue
 
-                # 4. Dispatch tools per trajectory (uses this trajectory's
-                #    tool_manager, which may be a trajectory-bound clone).
-                tool_messages = [{
-                    'role': 'tool',
-                    'content': tool_managers[global_idx](tc),
-                } for tc in tool_calls]
-                pending_bridges.append((global_idx, tool_messages))
+                pending_tools.append((global_idx, list(tool_calls)))
 
-            # Extend pif with bridge tokens for every trajectory that has
-            # outstanding tool turns. Done serially: bridge computation is
-            # a cheap decode-diff-encode on python strings / token lists.
-            for global_idx, tool_messages in pending_bridges:
-                extended = self._extend_with_bridge(pifs[global_idx], tool_messages)
-                if extended is None:
-                    # Trajectory exceeded max_length, mark as done (deleted)
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                else:
-                    pifs[global_idx] = extended
+            # 4. Parallel tool dispatch across the live batch, then harness
+            #    formats observations into tool messages (append-only bridge).
+            if pending_tools:
+                obs_by_traj = self._dispatch_tools(tool_managers, pending_tools)
+                for global_idx, tool_calls in pending_tools:
+                    observations = obs_by_traj.get(global_idx) or [''] * len(tool_calls)
+                    tool_messages, lives[global_idx] = self._tool_messages_after(
+                        pifs[global_idx], lives[global_idx], harnesses[global_idx],
+                        observations, tool_calls)
+                    extended = self._extend_with_bridge(pifs[global_idx], tool_messages)
+                    if extended is None:
+                        truncated[global_idx] = True
+                        done[global_idx] = True
+                    else:
+                        pifs[global_idx] = extended
+                        if lives[global_idx] is not None:
+                            lives[global_idx]['messages'] = list(extended.get('messages') or [])
 
         for i in range(n):
             if not all_logprobs[i]:
@@ -270,6 +342,126 @@ class MultiTurnRollout(Rollout):
                                  f'not match number of trajectories ({n})')
             return list(arg)
         return [arg] * n
+
+    @staticmethod
+    def _resolve_harnesses(arg, n: int) -> List[Optional[AgentHarness]]:
+        if arg is None:
+            return [None] * n
+        if isinstance(arg, list):
+            if len(arg) != n:
+                raise ValueError(f'per-call harness list length ({len(arg)}) does '
+                                 f'not match number of trajectories ({n})')
+            return list(arg)
+        return [arg] * n
+
+    def _harness_before_generate(
+        self,
+        pif: Dict[str, Any],
+        live: Optional[Trajectory],
+        harness: Optional[AgentHarness],
+    ) -> Tuple[Dict[str, Any], Optional[Trajectory], bool]:
+        """Run before_generate; bridge append-only deltas. ``dropped`` if encode fails."""
+        if harness is None or live is None:
+            return pif, live, False
+        live['messages'] = list(pif.get('messages') or [])
+        live = harness.before_generate(live)
+        delta = _append_only_delta(pif.get('messages') or [], live.get('messages') or [])
+        if not delta:
+            return pif, live, False
+        extended = self._extend_with_bridge(pif, delta)
+        if extended is None:
+            return pif, live, True
+        live['messages'] = list(extended.get('messages') or [])
+        return extended, live, False
+
+    @staticmethod
+    def _merge_assistant_metadata(pif: Dict[str, Any], live: Trajectory) -> None:
+        """Copy tool_calls / reasoning onto the sampled assistant message.
+
+        Content is left untouched so the token-id chain stays valid.
+        """
+        pif_msgs = pif.get('messages') or []
+        if not pif_msgs or pif_msgs[-1].get('role') != 'assistant':
+            return
+        last_asst = None
+        for m in reversed(live.get('messages') or []):
+            if m.get('role') == 'assistant':
+                last_asst = m
+                break
+        if last_asst is None:
+            return
+        dst = pif_msgs[-1]
+        for key in ('tool_calls', 'reasoning_content', 'name'):
+            if last_asst.get(key) and not dst.get(key):
+                dst[key] = last_asst[key]
+
+    def _dispatch_tools(
+        self,
+        tool_managers: List[ToolManager],
+        pending: List[Tuple[int, List[Dict[str, Any]]]],
+    ) -> Dict[int, List[str]]:
+        """Run tool calls for the live batch, grouped by ToolManager.
+
+        Trajectories that share a manager (and therefore often one Env) go
+        through ``call_many`` / ``Env.step_batch``. Distinct managers run
+        concurrently so remote sandboxes are not serialized on generate.
+        """
+        obs: Dict[int, List[str]] = {
+            gi: [''] * len(tcs) for gi, tcs in pending
+        }
+        groups: Dict[int, List[Tuple[int, int, Dict[str, Any]]]] = defaultdict(list)
+        mgr_by_id: Dict[int, ToolManager] = {}
+        for gi, tcs in pending:
+            mid = id(tool_managers[gi])
+            mgr_by_id[mid] = tool_managers[gi]
+            for ci, tc in enumerate(tcs):
+                groups[mid].append((gi, ci, tc))
+
+        def _run_group(items: List[Tuple[int, int, Dict[str, Any]]], mgr: ToolManager):
+            tcs = [tc for _, _, tc in items]
+            if hasattr(mgr, 'call_many'):
+                contents = mgr.call_many(tcs)
+            else:
+                contents = [mgr(tc) for tc in tcs]
+            return list(zip(items, contents))
+
+        group_items = list(groups.items())
+        if len(group_items) == 1:
+            mid, items = group_items[0]
+            finished = [_run_group(items, mgr_by_id[mid])]
+        else:
+            finished = []
+            with ThreadPoolExecutor(max_workers=min(32, len(group_items))) as pool:
+                futs = [
+                    pool.submit(_run_group, items, mgr_by_id[mid])
+                    for mid, items in group_items
+                ]
+                for fut in as_completed(futs):
+                    finished.append(fut.result())
+
+        for group_result in finished:
+            for (gi, ci, _tc), content in group_result:
+                obs[gi][ci] = '' if content is None else str(content)
+        return obs
+
+    def _tool_messages_after(
+        self,
+        pif: Dict[str, Any],
+        live: Optional[Trajectory],
+        harness: Optional[AgentHarness],
+        observations: List[str],
+        tool_calls: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Optional[Trajectory]]:
+        fallback = _default_tool_messages(tool_calls, observations)
+        if harness is None or live is None:
+            return fallback, live
+        old = list(pif.get('messages') or [])
+        live['messages'] = list(old)
+        live = harness.after_tools(live, observations, tool_calls)
+        delta = _append_only_delta(old, live.get('messages') or [])
+        if not delta:
+            return fallback, live
+        return delta, live
 
     _TRACE_SKIP_KEYS = (
         'input_ids',

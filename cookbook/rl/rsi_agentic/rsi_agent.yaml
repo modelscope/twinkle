@@ -1,0 +1,64 @@
+# ms-agent config for agentic RSI training.
+#
+# This file is the framework-specific half on purpose: the system prompt, the
+# tool line-up and the sandbox settings live here in cookbook, while
+# src/twinkle_agentic stays generic. Point RSI_AGENT_CONFIG at a copy of this
+# to change the agent without touching the trainer.
+#
+# The entry script deletes the `llm:` section before preparing the agent.
+# Omitting it here is not enough: ms-agent merges this file over its own
+# ms_agent/agent/agent.yaml, which does declare one, and FileSystemTool builds
+# an LLM client whenever config.llm exists -- which then asserts on a missing
+# modelscope_api_key. Generation comes from twinkle's vLLM sampler, so no
+# second model should be reachable from here at all.
+
+prompt:
+  # Unset -> ms-agent's built-in agent prompt, which is also what serving uses.
+  # Set a string here only if training should see a different system prompt
+  # than production, and know that you are breaking train/serve parity.
+  system:
+
+personalization:
+  # Off: SOUL/AGENTS/PROFILE.md from the developer's own workspace would leak
+  # machine-specific context into every training prompt.
+  enabled: false
+
+# One turn == one sampler call. MultiTurnRollout's max_turns is the real limit;
+# this only stops ms-agent from imposing a lower one.
+max_chat_round: 9999
+
+# Never wait on a human: training runs unattended.
+interactive: false
+permission_mode: auto
+
+# Overwritten per trajectory by the entry script. Both file_system and
+# code_executor root themselves here, so this is what isolates episodes.
+output_dir: output/rsi_agentic/workspace
+
+callbacks: []
+
+tools:
+  file_system:
+    mcp: false
+    include:
+      - write_file
+      - read_file
+      - edit_file
+      - grep
+      - glob
+  code_executor:
+    mcp: false
+    # python_env runs on the host; switch to the docker implementation for
+    # untrusted code, at the cost of a container per episode.
+    implementation: python_env
+    include:
+      - shell_executor
+      - python_executor
+      - notebook_executor
+  todo_list:
+    mcp: false
+
+# Web search is deliberately absent. ms-agent's `web_search` key only provides
+# fetch_page (retrieve a known URL); a real query-a-search-engine tool needs
+# EXA_API_KEY / SERPAPI_API_KEY and is wired separately from the plain tool
+# list. Add it here once that is decided; until then no task should need it.

@@ -136,7 +136,7 @@ class Qwen3_5Template(Template):
             value = _input[key]
             if isinstance(value, np.ndarray):
                 value = torch.from_numpy(value)
-            elif isinstance(value, list) and isinstance(value[0], (int, float, np.number)):
+            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                 value = torch.tensor(value)
             _input[key] = value
         return _input

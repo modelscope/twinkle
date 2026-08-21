@@ -201,7 +201,19 @@ class MessageNormalizer(Preprocessor):
 
     Multimodal list-shaped content passes through every stage untouched.
     This is a mapper — it never drops rows.
+
+    Args:
+        normalize_tool_calls: Whether to run the tool-call rewrite pass. Turn it
+            off for pure code data (e.g. MBPP), where an assistant turn holds a
+            markdown code block and no tool call at all: the bracket-DSL parser
+            is a marker-less fallback that matches ``[name(``, which is also the
+            shape of a python list comprehension (``[abs(b - a) for ...]``) or a
+            call-indexed subscript (``count[ord(i)]``), so the rewrite would
+            delete real code from the content.
     """
+
+    def __init__(self, normalize_tool_calls: bool = True):
+        self.normalize_tool_calls = normalize_tool_calls
 
     def __call__(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
@@ -210,7 +222,8 @@ class MessageNormalizer(Preprocessor):
             if not isinstance(msgs, list) or not msgs:
                 continue
             msgs = _strip_heartbeat(msgs)
-            msgs = _normalize_tool_calls(msgs)
+            if self.normalize_tool_calls:
+                msgs = _normalize_tool_calls(msgs)
             msgs = _merge_consecutive(msgs)
             row['messages'] = msgs
         return rows, []

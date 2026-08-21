@@ -90,7 +90,7 @@ class GSM8KBrevityReward(Reward):
 def create_gsm8k_dataset():
     dataset = Dataset()
     dataset.add_dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -153,7 +153,7 @@ def main():
 
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor, padding_free=True)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+    model.set_template('Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -167,7 +167,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+    sampler.set_template('Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

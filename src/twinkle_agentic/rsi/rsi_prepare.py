@@ -52,8 +52,12 @@ def build_pipeline():
     DedupFilter is deliberately excluded (see module docstring); it is applied
     separately on the full materialized dataset.
     """
+    # RSI_NORMALIZE_TOOL_CALLS=0 for pure code data (e.g. MBPP): the bracket-DSL
+    # parser is a marker-less fallback matching ``[name(``, which is also what a
+    # python list comprehension or a call-indexed subscript looks like, so the
+    # rewrite silently deletes real code from the assistant turn.
     steps = [
-        MessageNormalizer(),     # strip heartbeats, rewrite tool calls, merge consecutive roles
+        MessageNormalizer(normalize_tool_calls=_env_flag('RSI_NORMALIZE_TOOL_CALLS', '1')),
         MessageSanityFilter(),   # role order / tool-id matching / content integrity / sensitive words
         RefuseFilter(),          # drop assistant self-referential refusals
         DeadLoopFilter(),        # drop degenerate / stuck (hesitation, cascade, ngram repeat)
