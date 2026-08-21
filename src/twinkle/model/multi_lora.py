@@ -780,6 +780,25 @@ class MultiLora:
         else:
             _load_initial_weights(self.module)
 
+    @staticmethod
+    def _active_lora_numel(name, parameter, r: int) -> int:
+        """Count the active LoRA rank from shape without slicing the tensor."""
+        shape = parameter.shape
+        if len(shape) != 2:
+            return parameter.numel()
+        if 'embedding_A' in name:
+            rank_dim = 1
+        elif 'embedding_B' in name or '_A' in name:
+            rank_dim = 0
+        elif '_B' in name:
+            rank_dim = 1
+        else:
+            return parameter.numel()
+
+        dims = [int(shape[0]), int(shape[1])]
+        dims[rank_dim] = min(r, dims[rank_dim])
+        return dims[0] * dims[1]
+
     def get_nb_trainable_parameters(self, tenant_adapter_name) -> tuple[int, int]:
         r"""
         Returns the number of trainable parameters and the number of all parameters in the model.
@@ -800,16 +819,9 @@ class MultiLora:
                     continue
 
                 if pattern.search(name):
-                    if 'embedding_A' in name:
-                        param = param[:, :_lora.tenant_config.r]
-                    elif 'embedding_B' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_A' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_B' in name:
-                        param = param[:, :_lora.tenant_config.r]
-
-                num_params = param.numel()
+                    num_params = self._active_lora_numel(name, param, _lora.tenant_config.r)
+                else:
+                    num_params = param.numel()
                 if num_params == 0 and hasattr(param, 'ds_numel'):
                     num_params = param.ds_numel
 

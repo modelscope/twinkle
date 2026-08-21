@@ -131,6 +131,13 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         params = super()._get_trainable_parameters(adapter_name)
         if not self.fft_slots.is_hybrid(adapter_name):
             return params
+        target_modules = self.multi_adapter.find_lora_by_tenant(adapter_name).tenant_config.target_modules
+        # MultiLoRA 会预分配整套 LoRA 槽；Hybrid optimizer 只收集本租户真正启用的 S_LORA。
+        params = {
+            name: parameter
+            for name, parameter in params.items()
+            if self.multi_adapter.match_target_modules(name, target_modules)
+        }
         known_parameter_ids = {id(parameter) for parameter in params.values()}
         for name, parameter in self.fft_slots.named_fft_parameters(adapter_name):
             if id(parameter) not in known_parameter_ids:
@@ -199,7 +206,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             trainer_state = json.load(handle)
         trainer_state.update({
             'checkpoint_boundary': 'optimizer_step',
-            'optimizer_class': self._class_identity(optimizer_group.optimizer),
             'optimizer_param_names': self._optimizer_param_names(optimizer_group.optimizer),
             'scheduler_class': self._class_identity(optimizer_group.lr_scheduler),
             'has_scaler': optimizer_group.scaler is not None,
@@ -226,8 +232,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         optimizer_path = os.path.join(training_dir, 'optimizer.pt')
         if not os.path.isfile(optimizer_path):
             raise ValueError('Spectral Hybrid training state is missing optimizer.pt.')
-        if trainer_state.get('optimizer_class') != self._class_identity(optimizer_group.optimizer):
-            raise ValueError('Spectral Hybrid optimizer class does not match the checkpoint.')
         if trainer_state.get('optimizer_param_names') != self._optimizer_param_names(optimizer_group.optimizer):
             raise ValueError('Spectral Hybrid optimizer parameter groups do not match the checkpoint.')
         saved_scheduler = trainer_state.get('scheduler_class')
@@ -247,42 +251,53 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
 
     def _save_spectral_hybrid(self, name, output_dir: Optional[str], interval: int, adapter_name: str, **kwargs):
         optimizer_group = self.optimizer_group[adapter_name]
+        save_optimizer = kwargs.get('save_optimizer', False)
+        save_only_training_state = kwargs.get('save_only_training_state', False)
+        if save_only_training_state and not save_optimizer:
+            raise ValueError('save_only_training_state=True requires save_optimizer=True.')
         if name is None:
             name = f'checkpoint-step-{optimizer_group.cur_step}'
         output_dir = output_dir or 'output'
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_group.cur_step % interval != 0:
             return None
-        if kwargs.get('save_optimizer', False):
+        if save_optimizer:
             self._validate_hybrid_training_checkpoint_boundary(adapter_name)
         training_dir = os.path.join(checkpoint_dir, 'twinkle_training_state')
         if Platform.is_master() and os.path.isdir(training_dir):
             shutil.rmtree(training_dir)
 
-        full_state = self.strategy.get_full_state_dict(self.model)
-        saver = StreamingSafetensorSaver(
-            checkpoint_dir,
-            max_shard_size=kwargs.get('max_shard_size', '5GB'),
-            save_rank='master',
-        )
-        if Platform.is_master():
-            for key, value in self.fft_slots.iter_merged_state_dict(adapter_name, full_state):
-                saver.add_tensor(key, value)
-        saver.finalize()
+        full_state = None
+        if not save_only_training_state:
+            full_state = self.strategy.get_full_state_dict(self.model)
+            saver = StreamingSafetensorSaver(
+                checkpoint_dir,
+                max_shard_size=kwargs.get('max_shard_size', '5GB'),
+                save_rank='master',
+            )
+            if Platform.is_master():
+                for key, value in self.fft_slots.iter_merged_state_dict(adapter_name, full_state):
+                    saver.add_tensor(key, value)
+            saver.finalize()
 
-        model = self.strategy.unwrap_model(self.model)
-        if Platform.is_master():
-            self.hf_config.save_pretrained(checkpoint_dir)
-            generation_config = getattr(model, 'generation_config', None)
-            if generation_config is not None:
-                generation_config.save_pretrained(checkpoint_dir)
-            else:
-                generation_config_path = os.path.join(checkpoint_dir, 'generation_config.json')
-                if os.path.exists(generation_config_path):
-                    os.unlink(generation_config_path)
-        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            model = self.strategy.unwrap_model(self.model)
+            if Platform.is_master():
+                self.hf_config.save_pretrained(checkpoint_dir)
+                generation_config = getattr(model, 'generation_config', None)
+                if generation_config is not None:
+                    generation_config.save_pretrained(checkpoint_dir)
+                else:
+                    generation_config_path = os.path.join(checkpoint_dir, 'generation_config.json')
+                    if os.path.exists(generation_config_path):
+                        os.unlink(generation_config_path)
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
-        if kwargs.get('save_optimizer', False):
+        if save_optimizer:
+            if save_only_training_state:
+                tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
+                full_state = self.strategy.get_adapter_state_dict(self.model, tenant.adapter_name)
+                full_state.update(
+                    self.strategy.get_adapter_state_dict(self.model, f'fft_{tenant.index}'))
             if Platform.is_master():
                 adapter_state = self.fft_slots.build_training_state_dict(adapter_name, full_state)
                 os.makedirs(training_dir, exist_ok=True)
@@ -350,12 +365,12 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             if current_config != checkpoint_config:
                 raise ValueError('Spectral Hybrid adapter config does not match checkpoint.')
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
         adapter_state = load_file(adapter_path, device='cpu')
         self.multi_adapter.set_state_dict(adapter_name, adapter_state)
         self.fft_slots.set_fft_state_dict(adapter_name, adapter_state)
         if not resume_only_model:
             trainer_state = self._restore_training_state(training_dir, adapter_name=adapter_name)
-            rank = dist.get_rank() if dist.is_initialized() else 0
             self._load_rng_state(os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
         return {
             'cur_step': trainer_state['cur_step'],

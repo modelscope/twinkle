@@ -71,6 +71,7 @@ class ModelArgs(_ArgsBase):
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
     train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
+    strategy: Literal['accelerate', 'native_fsdp'] | None = None
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
@@ -81,6 +82,8 @@ class ModelArgs(_ArgsBase):
 
     @model_validator(mode='after')
     def _validate_spectral_backend(self):
+        if self.strategy is not None and self.backend != 'transformers':
+            raise ValueError('strategy is only supported by the transformers backend')
         if self.hybrid is not None:
             if self.backend != 'transformers':
                 raise ValueError('hybrid is only supported by the transformers backend')
