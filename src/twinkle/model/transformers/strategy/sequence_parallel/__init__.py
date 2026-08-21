@@ -997,6 +997,27 @@ class SequenceParallelStrategy:
             return inputs, outputs
         labels = inputs.get('labels')
         logps = outputs.get('logps')
+        # Fused-linear-CE path: the model forward skipped the lm_head GEMM and
+        # stashed the lm_head module under ``outputs['lm_head']`` (see
+        # ``TransformersFusedCEPatch``), so ``outputs['logps']`` is absent and
+        # ``outputs['logits']`` holds the last hidden state (a per-rank seq
+        # shard under SP). Gather hidden states + labels across the sequence
+        # group so every rank computes the same full loss — mirrors the logps
+        # gather below. The hidden tensor ([B, T_local, H]) is tiny vs logits,
+        # and the fused loss still chunks the GEMM internally, so the memory
+        # win is preserved.
+        if (logps is None and labels is not None and 'lm_head' in outputs and torch.is_tensor(outputs.get('logits'))
+                and outputs['logits'].dim() >= 2):
+            hidden = outputs['logits']
+            inputs = copy(inputs)
+            outputs = copy(outputs)
+            real_position_ids = sequence_parallel.real_position_ids
+            gathered_hidden, gathered_labels = GatherLoss.apply(hidden, labels, 1, real_position_ids)
+            gathered_hidden = self._trim_gathered_sequence_padding(gathered_hidden, real_position_ids)
+            gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
+            outputs['logits'] = gathered_hidden
+            inputs['labels'] = gathered_labels
+            return inputs, outputs
         if labels is None or logps is None:
             return inputs, outputs
         if not torch.is_tensor(logps) or logps.dim() < 2:

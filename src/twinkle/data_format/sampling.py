@@ -174,6 +174,7 @@ class SampledSequence:
     logprobs: Optional[List[List[Tuple[int, float]]]] = None
     decoded: str = None
     new_input_feature: InputFeature = None
+    routed_experts: Optional[Any] = None
 
 
 @dataclass

@@ -1,11 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Rollout
+from .bridge import extend_with_bridge
 from .multi_turn import MultiTurnRollout
 
 __all__ = [
     'APIMultiTurnRollout',
     'MultiTurnRollout',
     'Rollout',
+    'extend_with_bridge',
 ]
 
 

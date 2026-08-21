@@ -106,6 +106,62 @@ for step, batch in enumerate(dataloader):
 
 ---
 
+## 通过 Twinkle Client 训练
+
+除了直接使用裸库 `TransformersModel`，你也可以通过 `twinkle_client` 的 `MultiLoraTransformersModel` 以 HTTP 方式驱动服务端完成 Embedding 训练。用法与裸库一致，只需按正确顺序调用现有方法。
+
+### 完整调用顺序
+
+client 化的 Embedding 训练遵循与裸库一致的调用顺序：
+
+```
+set_processor('InputProcessor')
+  -> set_loss('InfonceLoss', ...)
+  -> add_metric('EmbeddingMetric', is_training=True)
+  -> loop: forward_backward(inputs=mb, task='embedding') + clip_grad_and_step(...)
+  -> calculate_metric(is_training=True)
+```
+
+与裸库不同的是，client 侧传入的是**类名字符串**（如 `'InfonceLoss'`、`'EmbeddingMetric'`、`'InputProcessor'`），由服务端解析为对应的核心库类。
+
+### 示例
+
+```python
+from peft import LoraConfig
+from twinkle_client import init_twinkle_client
+from twinkle_client.model import MultiLoraTransformersModel
+
+# --- Connect to the running Twinkle server ---
+init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+
+# --- Build the client model with a LoRA adapter for embedding ---
+model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model.add_adapter_to_model('emb_adapter', LoraConfig(target_modules='all-linear'))
+model.set_template('Qwen3_5Template')
+
+# --- Configure the embedding-training pipeline (order matters) ---
+# NOTE: pass class names as strings; the server resolves them to core-lib classes.
+model.set_processor('InputProcessor')
+model.set_loss('InfonceLoss', temperature=0.07, use_batch=True, hard_negatives=None)
+model.add_metric('EmbeddingMetric', is_training=True)
+
+# --- Training loop ---
+for step, mb in enumerate(minibatches):
+    # `task='embedding'` is forwarded through the /twinkle/* protocol as an extra
+    # kwarg and selects the embedding pooling + InfoNCE loss path on the server.
+    model.forward_backward(inputs=mb, task='embedding')
+    model.clip_grad_and_step(max_grad_norm=1.0)
+
+# --- Read back embedding metrics (pos_sim / neg_sim / loss) ---
+metric = model.calculate_metric(is_training=True)
+```
+
+**无需手动 apply_patch。** 只要在 `forward_backward`（或 `forward_only`）中传入 `task='embedding'`，服务端就会在这一次 `forward` 期间自动切换到 embedding 模式、并在结束后自动回滚——你**不需要**显式调用 `apply_patch(...)`。因此同一个 adapter 在 `forward_backward(task='embedding')` 之后，再调用不带 `task` 的 `forward_only` 仍会返回正常的词表维度 `logits`，互不影响。
+
+client 侧真正需要显式配置的只有三步：`set_processor('InputProcessor')`、`set_loss('InfonceLoss', ...)`、`add_metric('EmbeddingMetric', is_training=True)`；各参数含义与取值建议见上文「关键参数」，返回指标见下文「监控指标」。
+
+---
+
 ## 监控指标
 
 `EmbeddingMetric` 报告关键训练信号：

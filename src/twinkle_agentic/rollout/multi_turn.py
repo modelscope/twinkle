@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
-import numpy as np
 import os
 import re
 import time
@@ -15,28 +14,7 @@ from twinkle.template.base import Template
 from twinkle_agentic.harness.base import AgentHarness
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import Rollout
-
-
-def _to_plain(obj: Any) -> Any:
-    """Recursively convert numpy arrays/scalars to plain Python lists/numbers.
-
-    Mirrors ``vllm_sampler._convert_ndarray_to_list`` but lives locally so we
-    do not depend on a private symbol.
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, dict):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        conv = [_to_plain(x) for x in obj]
-        return type(obj)(conv) if isinstance(obj, tuple) else conv
-    return obj
+from .bridge import _to_plain, extend_with_bridge
 
 
 def _append_only_delta(
@@ -91,7 +69,7 @@ class MultiTurnRollout(Rollout):
         harness.after_generate
         ToolManager.call_many       # Env.step_batch when tools share an Env
         harness.after_tools         # format observations as tool messages
-        _extend_with_bridge         # labels=-100; never decode-reencode history
+        extend_with_bridge          # labels=-100; never decode-reencode history
 
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: shared :class:`SamplingParams` for the batch.
@@ -278,6 +256,8 @@ class MultiTurnRollout(Rollout):
 
             # 4. Parallel tool dispatch across the live batch, then harness
             #    formats observations into tool messages (append-only bridge).
+            #    The bridge itself is computed serially: it is a cheap
+            #    decode-diff-encode on python strings / token lists.
             if pending_tools:
                 obs_by_traj = self._dispatch_tools(tool_managers, pending_tools)
                 for global_idx, tool_calls in pending_tools:
@@ -285,8 +265,9 @@ class MultiTurnRollout(Rollout):
                     tool_messages, lives[global_idx] = self._tool_messages_after(
                         pifs[global_idx], lives[global_idx], harnesses[global_idx],
                         observations, tool_calls)
-                    extended = self._extend_with_bridge(pifs[global_idx], tool_messages)
+                    extended = extend_with_bridge(pifs[global_idx], tool_messages, self.template)
                     if extended is None:
+                        # Trajectory exceeded max_length, mark as done (deleted)
                         truncated[global_idx] = True
                         done[global_idx] = True
                     else:
@@ -368,7 +349,7 @@ class MultiTurnRollout(Rollout):
         delta = _append_only_delta(pif.get('messages') or [], live.get('messages') or [])
         if not delta:
             return pif, live, False
-        extended = self._extend_with_bridge(pif, delta)
+        extended = extend_with_bridge(pif, delta, self.template)
         if extended is None:
             return pif, live, True
         live['messages'] = list(extended.get('messages') or [])
@@ -595,114 +576,3 @@ class MultiTurnRollout(Rollout):
             if not r.sequences:
                 raise RuntimeError(f'SampleResponse at batch index {i} has no sequences')
         return resps
-
-    def _extend_with_bridge(
-        self,
-        pif: Dict[str, Any],
-        tool_messages: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Append tool messages and the next generation prompt as -100 bridge.
-
-        Strategy: compute the bridge ENTIRELY in template space. Render
-        ``messages_before`` and ``messages_before + tool_messages`` with the
-        same chat template and take ``s_after[len(s_before):]`` as the delta.
-
-        We deliberately do NOT diff against ``tokenizer.decode(pif.input_ids)``
-        because raw vLLM output and canonical template rendering differ in
-        whitespace (e.g. Qwen inserts ``\\n\\n`` between assistant content and
-        a ``<tool_call>`` block, while the model generates only ``\\n``). Such
-        cosmetic divergences would break a ``startswith`` alignment but do not
-        affect training correctness: history tokens stay in ``pif.input_ids``
-        verbatim; only the newly appended bridge is tokenized from the
-        canonical template output.
-        """
-        tokenizer = self.template.tokenizer
-
-        messages_before = list(pif.get('messages') or [])
-        messages_after = messages_before + list(tool_messages)
-
-        enable_thinking = getattr(self.template, 'enable_thinking', False)
-        s_before = tokenizer.apply_chat_template(
-            messages_before, tokenize=False, add_generation_prompt=False, enable_thinking=enable_thinking)
-        s_after = tokenizer.apply_chat_template(
-            messages_after, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
-
-        if not s_after.startswith(s_before):
-            raise RuntimeError('Canonical chat_template output for messages_after is not a '
-                               'prefix-extension of messages_before; cannot compute bridge '
-                               'delta. This indicates the template is non-monotonic in the '
-                               'message list (e.g. reorders / rewrites earlier turns).\n'
-                               f's_before tail: {s_before[-80:]!r}\n'
-                               f's_after at same offset: '
-                               f'{s_after[max(0, len(s_before) - 80):len(s_before) + 80]!r}')
-        bridge_text = s_after[len(s_before):]
-        if not bridge_text:
-            raise RuntimeError('Bridge text computation returned empty string; '
-                               'tool turn would add no tokens (template misconfiguration?).')
-
-        bridge_ids = tokenizer.encode(bridge_text, add_special_tokens=False)
-        if not bridge_ids:
-            raise RuntimeError(f'Bridge text tokenised to empty id list: {bridge_text!r}')
-
-        new_pif = self._append_bridge_tokens(pif, bridge_ids)
-        if new_pif is None:
-            # Trajectory exceeds max_length and strategy is 'delete'
-            return None
-        new_pif['messages'] = messages_after
-        return new_pif
-
-    def _append_bridge_tokens(
-        self,
-        pif: Dict[str, Any],
-        bridge_ids: List[int],
-    ) -> Dict[str, Any]:
-        """Append bridge tokens with labels = -100.
-
-        Mirrors the unroll-append-reroll pattern of
-        :meth:`Template.concat_input_feature` so that ``labels`` semantics
-        stay consistent with the sampler-produced pif.
-
-        Shallow copy is deliberately used: every mutation below is a
-        top-level key reassignment, never an in-place change to nested
-        tensors. Multimodal payloads (``images``, ``pixel_values``,
-        ``image_grid_thw`` ...) are shared by reference so we avoid
-        re-copying image buffers every turn.
-        """
-        result = dict(pif)
-
-        input_ids = list(result['input_ids'])
-        labels = list(result.get('labels') or [])
-        # labels arrive in output/shifted order (post _roll_labels). Unroll by
-        # one position (shift right by 1) to get back to input order.
-        if labels:
-            if len(labels) != len(input_ids):
-                raise RuntimeError(f'labels length ({len(labels)}) != input_ids length '
-                                   f'({len(input_ids)}); cannot safely append bridge tokens.')
-            labels = labels[-1:] + labels[:-1]
-        else:
-            labels = [-100] * len(input_ids)
-
-        input_ids = input_ids + list(bridge_ids)
-        labels = labels + [-100] * len(bridge_ids)
-
-        result['input_ids'] = input_ids
-        result['labels'] = labels
-
-        if 'mm_token_type_ids' in result:
-            import torch
-            mm = result['mm_token_type_ids']
-            if not isinstance(mm, torch.Tensor):
-                mm = torch.as_tensor(mm)
-            # Pad along the last (sequence) dim — handles 1D [T] and 2D [1, T] uniformly.
-            leading_shape = mm.shape[:-1]
-            pad = torch.zeros((*leading_shape, len(bridge_ids)), dtype=mm.dtype, device=mm.device)
-            result['mm_token_type_ids'] = torch.cat([mm, pad], dim=-1)
-
-        # Replay the post pipeline: refresh attention_mask / position_ids /
-        # length and re-roll labels back into output/shifted order.
-        refreshed_list = self.template._invoke_post_pipeline([result])
-        if not refreshed_list:
-            # truncation_strategy='delete': trajectory exceeds max_length
-            return None
-        result.update(refreshed_list[0])
-        return _to_plain(result)

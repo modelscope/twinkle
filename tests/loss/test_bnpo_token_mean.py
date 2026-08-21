@@ -74,16 +74,6 @@ def test_micro_matches_verl_equal_weighted_micro_means():
     assert abs(split - 0.625) > 1e-3
 
 
-def test_seam_defaults_to_micro_like_verl():
-    from twinkle.loss.grpo import SEAMBNPOLoss
-    seam = SEAMBNPOLoss(epsilon=0.2, beta=0.001)
-    assert seam.token_mean_scope == 'micro'
-    assert seam.reduction == 'mean'                      # display layer must not divide again
-    ptl, mask = _fixture()
-    split = _combine(seam, ptl, mask, [[0], [1]])
-    assert abs(split - 0.75) < 1e-6
-
-
 def test_global_reports_sum_reduction_for_display():
     """'global' returns a token SUM, so LossMetric must be told reduction='sum' or the
     logged loss is inflated by the token count."""
@@ -93,6 +83,5 @@ def test_global_reports_sum_reduction_for_display():
 if __name__ == '__main__':
     test_global_is_split_invariant()
     test_micro_matches_verl_equal_weighted_micro_means()
-    test_seam_defaults_to_micro_like_verl()
     test_global_reports_sum_reduction_for_display()
     print('OK: micro (default) == verl equal-weighted micro-means; global is split-invariant')

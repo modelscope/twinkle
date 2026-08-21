@@ -54,6 +54,7 @@ class ModelArgs(_ArgsBase):
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
+    train_mode: Literal['lora', 'full'] = 'lora'
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
@@ -169,3 +170,23 @@ class ApplicationSpec(BaseModel):
         # ``schema.model_validate`` rejects a non-dict itself with a clean
         # error, so no separate non-dict guard is needed here.
         return {**data, 'args': schema.model_validate(raw_args)}
+
+    @model_validator(mode='after')
+    def _validate_full_mode_single_replica(self) -> ApplicationSpec:
+        """``train_mode: full`` requires exactly one replica.
+
+        The exclusive-tenant lock lives in per-replica memory
+        (``ModelManagement._resource_records``), so more than one replica would
+        silently allow one full-parameter tenant per replica, each rewriting
+        its own copy of the base weights. Reject that at config-load time.
+        """
+        if not (isinstance(self.args, ModelArgs) and self.args.train_mode == 'full'):
+            return self
+        for dep in self.deployments:
+            num_replicas = dep.get('num_replicas')
+            max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
+            if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
+                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
+                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
+                                 'max_replicas to 1.')
+        return self

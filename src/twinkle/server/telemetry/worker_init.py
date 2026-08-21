@@ -79,7 +79,7 @@ def flush_telemetry_safely() -> None:
     worker deployment's FastAPI lifespan shutdown so buffered OTLP batches
     (traces / metrics / logs) flush on graceful termination. A
     telemetry-shutdown failure MUST NOT mask the user-facing shutdown path,
-    so every error here is swallowed (Requirement 21.3).
+    so every error here is swallowed.
     """
     try:
         from twinkle.server.telemetry import shutdown_telemetry

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
@@ -329,6 +329,39 @@ class GRPOLoss(Loss):
         return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
 
+class PPOLoss(GRPOLoss):
+    """PPO clipped policy loss.
+
+    PPO and GRPO share the same clipped policy objective. The algorithms differ
+    in how advantages are produced, so this class provides the PPO-facing name
+    while using PPO-specific loss aggregation.
+
+    Args:
+        loss_agg_mode: ``'token-mean'`` averages over every valid response
+            token. ``'seq-mean-token-mean'`` averages tokens within each
+            sequence and then averages the sequences.
+    """
+
+    _LOSS_AGG_MODES = {'token-mean', 'seq-mean-token-mean'}
+
+    def __init__(self, loss_agg_mode: Literal['token-mean', 'seq-mean-token-mean'] = 'token-mean', **kwargs):
+        super().__init__(**kwargs)
+        if loss_agg_mode not in self._LOSS_AGG_MODES:
+            raise ValueError(f'Unsupported PPO loss_agg_mode: {loss_agg_mode}. '
+                             f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
+        self.loss_agg_mode = loss_agg_mode
+
+    def _aggregate_loss(
+        self,
+        per_token_loss: 'torch.Tensor',
+        loss_mask: 'torch.Tensor',
+        **kwargs,
+    ) -> 'torch.Tensor':
+        if self.loss_agg_mode == 'token-mean':
+            return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+        return super()._aggregate_loss(per_token_loss, loss_mask, **kwargs)
+
+
 class GSPOLoss(GRPOLoss):
     """
     GRPO with sequence-level importance sampling.
@@ -476,105 +509,6 @@ class BNPOLoss(GRPOLoss):
         if self.token_mean_scope == 'global':
             return loss_mask.sum().clamp(min=1.0)
         return 0
-
-
-class SEAMBNPOLoss(BNPOLoss):
-    """BNPO token-mean loss with verl/SEAM policy-loss clipping semantics."""
-
-    def __init__(
-        self,
-        epsilon: float = 0.2,
-        epsilon_high: Optional[float] = None,
-        beta: float = 0.0,
-        entropy_coef: float = 0.0,
-        clip_ratio_c: float = 3.0,
-        ignore_index: int = -100,
-        **kwargs,
-    ):
-        super().__init__(epsilon=epsilon, epsilon_high=epsilon_high, beta=beta,
-                         entropy_coef=entropy_coef, ignore_index=ignore_index, **kwargs)
-        self.clip_ratio_c = clip_ratio_c
-
-    def _compute_log_importance_weights(
-        self,
-        per_token_logps: 'torch.Tensor',
-        per_token_old_logps: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Match verl.core_algos.compute_policy_loss clamp range."""
-        import torch
-        return torch.clamp(per_token_logps - per_token_old_logps, min=-20.0, max=20.0)
-
-    def _compute_per_token_loss(
-        self,
-        ratio: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        per_token_logps: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Match verl.core_algos.compute_policy_loss for PPO clipped policy loss."""
-        import torch
-        pg_losses1 = -advantages * ratio
-        pg_losses2 = -advantages * torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
-        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-        pg_losses3 = -advantages * self.clip_ratio_c
-        clip_pg_losses2 = torch.minimum(pg_losses3, clip_pg_losses1)
-        return torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-
-    def __call__(
-        self,
-        inputs: Dict,
-        outputs: Dict,
-        *,
-        old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        ref_logps: Optional['torch.Tensor'] = None,
-        advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
-        **kwargs,
-    ):
-        """Same as GRPOLoss.__call__, but with verl low_var_kl clipping for the KL loss."""
-        import torch
-        labels = inputs.get('labels')
-        assert labels is not None, "inputs must contain 'labels'"
-        if not torch.is_tensor(labels):
-            labels = torch.as_tensor(labels)
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)
-
-        logps = outputs.get('logps')
-        loss_mask = (labels != self.ignore_index).bool()
-        if logps is None:
-            logits = outputs.get('logits')
-            if logits.shape[1] != labels.shape[1]:
-                logits = logits[:, -labels.shape[1]:]
-            masked_labels = labels.clone()
-            masked_labels[~loss_mask] = 0
-            logps = selective_log_softmax(logits, masked_labels)
-
-        device = logps.device
-        old_logps = logps.detach() if old_logps is None else self._pad_and_align_to_batch(
-            old_logps, loss_mask, device, logps.dtype)
-        if ref_logps is not None:
-            ref_logps = self._pad_and_align_to_batch(ref_logps, loss_mask, device, logps.dtype)
-        if advantages is None:
-            return LossOutput(loss=logps.sum() * 0.0, num_tokens=0)
-        advantages = self._pad_and_align_to_batch(advantages, loss_mask, device, logps.dtype)
-
-        log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
-        ratio = torch.exp(log_importance_weights)
-        per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
-
-        if self.beta > 0.0 and ref_logps is not None:
-            kl = torch.clamp(ref_logps - logps, min=-20.0, max=20.0)
-            per_token_kl = torch.clamp(torch.exp(kl) - kl - 1, min=-10.0, max=10.0)
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        if self.entropy_coef > 0.0:
-            entropies = outputs.get('entropies')
-            assert entropies is not None, ('entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
-                                           "loss instance's require_entropy flag was set before the forward call.")
-            per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
-
-        loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
-        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
 
 class DRGRPOLoss(GRPOLoss):

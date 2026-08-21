@@ -60,7 +60,12 @@ def _resolve_task_context(model, task):
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
+    if task == 'fused_lm_ce':
+        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
+        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
+        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
+        return apply_context(model, TransformersFusedCEPatch())
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce.')
 
 
 @dataclass
@@ -141,6 +146,45 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
 
 
+def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+    """Read a full HuggingFace checkpoint directory into a CPU state dict.
+
+    Supports both single-file and sharded ``safetensors`` layouts, falling back
+    to ``pytorch_model.bin`` variants. Returns tensors on CPU.
+    """
+    import json
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    st_index = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+    st_single = os.path.join(checkpoint_dir, 'model.safetensors')
+    bin_index = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+    bin_single = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+    if os.path.exists(st_index) or os.path.exists(st_single):
+        from safetensors.torch import load_file
+        if os.path.exists(st_index):
+            with open(st_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(load_file(os.path.join(checkpoint_dir, shard), device='cpu'))
+        else:
+            state_dict.update(load_file(st_single, device='cpu'))
+    elif os.path.exists(bin_index) or os.path.exists(bin_single):
+        if os.path.exists(bin_index):
+            with open(bin_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(
+                    torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
+        else:
+            state_dict.update(torch.load(bin_single, map_location='cpu', weights_only=True))
+    else:
+        raise FileNotFoundError(f'No safetensors/bin weights found in {checkpoint_dir}')
+    return state_dict
+
+
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
@@ -196,6 +240,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
+        self._router_replay_applied = False
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
@@ -372,6 +418,48 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         self._expert_parallel_applied = True
 
+    def _maybe_apply_router_replay(self):
+        """Lazily register MoE blocks and (for EP=1) wrap their forwards."""
+        if not self._router_replay_enabled or self._router_replay_applied:
+            return
+        model = self.strategy.unwrap_model(self.model)
+        from .moe.router_replay import apply_router_replay_patch
+        apply_router_replay_patch(model)
+        self._router_replay_applied = True
+
+    def _router_replay_setup(self, router_replay_action, routed_experts=None, batch_size=1, manual_cleanup=False):
+        """Set up routing replay before a model forward.
+
+        Returns ``cleanup_fn``.
+        Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
+        """
+        if not getattr(self, '_router_replay_enabled', False):
+            return lambda: None
+
+        self._maybe_apply_router_replay()
+
+        if router_replay_action is None:
+            return lambda: None
+
+        from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
+                                        get_router_replay_data, set_global_router_replay_action, set_router_replay_data)
+        unwrapped = self.strategy.unwrap_model(self.model)
+        set_global_router_replay_action(router_replay_action)
+        if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+            assert routed_experts is not None, 'routed_experts must be not None'
+            set_router_replay_data(routed_experts, unwrapped)
+
+        def cleanup():
+            recorded = None
+            if router_replay_action == RouterReplayAction.RECORD:
+                recorded = get_router_replay_data(unwrapped, batch_size)
+            if not manual_cleanup:
+                clear_global_router_replay_action()
+                clear_global_indices()
+            return recorded
+
+        return cleanup
+
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():
             if not isinstance(optimizer_group, OptimizerGroup):
@@ -422,6 +510,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -432,8 +521,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
+
+        # Routing replay: respects router_replay_action regardless of caller
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
+        routed_experts = inputs.pop('routed_experts', None)
+        batch_size = labels.shape[0] if labels is not None else (
+            inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
+        rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
+                                               router_replay_manual_cleanup)
+
         with _resolve_task_context(self.model, task):
             outputs = self.model(**inputs)
+
+        recorded_routing = rr_cleanup()
+
         inputs['labels'] = labels
         if task != 'embedding' and labels is not None and loss_require_logps:
             loss_mask = (labels != -100).bool()
@@ -447,6 +549,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
+        if loss_require_values:
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -459,6 +564,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return_outputs = copy(outputs)
         if not return_logits:
             return_outputs['logits'] = None
+        if recorded_routing is not None:
+            return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -498,6 +605,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_require_logits = getattr(loss_instance, 'require_logits', False)
             loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -508,11 +616,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
+
+            # Routing replay: handle any action generically
+            router_replay_action = kwargs.pop('router_replay_action', None)
+            router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
+            routed_experts = inputs.pop('routed_experts', None)
+            batch_size = labels.shape[0] if labels is not None else (
+                inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
+            rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
+                                                   router_replay_manual_cleanup)
+
             lora_ctx = (
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             with _resolve_task_context(self.model, task), lora_ctx:
                 outputs = self.model(**inputs)
+
+            recorded_routing = rr_cleanup()
+
             inputs['labels'] = labels
             if task != 'embedding' and labels is not None and loss_require_logps:
                 loss_mask = (labels != -100).bool()
@@ -526,6 +647,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 else:
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
+            if loss_require_values:
+                values = outputs['logits']
+                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
@@ -538,6 +662,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return_outputs = copy(outputs)
             if not return_logits:
                 return_outputs['logits'] = None
+            if recorded_routing is not None:
+                return_outputs['routed_experts'] = recorded_routing
             return return_outputs
 
     @remote_function(collect='mean')
@@ -617,11 +743,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not should_sync and hasattr(self.model, 'no_sync'):
             no_sync_ctx = self.model.no_sync()
 
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        rr_cleanup = None
+        if router_replay_action is not None:
+            from .moe.router_replay import RouterReplayAction
+            rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
+
         with no_sync_ctx:
             if scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
+
+        if rr_cleanup is not None:
+            rr_cleanup()
 
         optimizer_config.train_status.loss_value = None
 
@@ -639,7 +774,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             The output of the model forward.
         """
-        outputs = self.forward(inputs=inputs, **kwargs)
+        outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss
         self.backward(**kwargs)
@@ -773,7 +908,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optim_params = kwargs.pop('optim_params', {})
         if optim_params:
-            assert isinstance(optimizer, (AdamW, Adam))
+            # After _lazy_wrap_model the optimizer may be wrapped (e.g.
+            # accelerate's AcceleratedOptimizer); check the inner instance.
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            assert isinstance(inner_optimizer, (AdamW, Adam)), \
+                f'optim_params is only supported for Adam/AdamW, got {type(inner_optimizer).__name__}'
             for group in optimizer.param_groups:
                 group['lr'] = optim_params['lr']
                 if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
@@ -856,6 +995,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metric copies the dp group at construction, and OptimizerGroup builds metrics before
+        # dist init -- so rebuild here (first path that runs post-init on every backend) to get
+        # dp-wide token-weighted logging. Logging only; gradients are unaffected.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
@@ -878,7 +1021,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
+        # parameters to be missed by the optimizer.
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -1052,10 +1197,30 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
             self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
-            raise NotImplementedError
+            # Full-parameter model: load a plain HF checkpoint in-place.
+            state_dict = _read_hf_state_dict(checkpoint_dir)
+            self.strategy.load_full_state_dict(self.model, state_dict)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+
+    @remote_function()
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from ``self.model_id``.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        if not self.model_id:
+            logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
+            return
+        state_dict = _read_hf_state_dict(self.model_id)
+        self.strategy.load_full_state_dict(self.model, state_dict)
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        for param in self.model.parameters():
+            param.grad = None
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)

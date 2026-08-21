@@ -3,7 +3,7 @@
 
 Pins constraint enforcement, default-value defaulting, and ``extra='forbid'``
 behavior. The class is constructed directly from validated YAML by
-``ApplicationSpec`` (typed end-to-end after Task 27), so there is no
+``ApplicationSpec`` (typed end-to-end), so there is no
 ``from_dict`` revival path to exercise.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ DEFAULTS = {
     'max_input_tokens': 16000,
 }
 
-# ---------- Property 16: constraint enforcement ----------------------------- #
+# ---------- constraint enforcement ----------------------------------------- #
 
 _CONSTRAINED_GE0_FLOATS = ['rps_limit', 'tps_limit', 'queue_timeout', 'token_cleanup_interval']
 
@@ -36,7 +36,7 @@ _CONSTRAINED_GE0_FLOATS = ['rps_limit', 'tps_limit', 'queue_timeout', 'token_cle
     field=st.sampled_from(_CONSTRAINED_GE0_FLOATS),
     bad_value=st.floats(max_value=-1e-6, min_value=-1e6, allow_nan=False, allow_infinity=False),
 )
-def test_property_16_ge0_floats_reject_negative(field: str, bad_value: float) -> None:
+def test_ge0_floats_reject_negative(field: str, bad_value: float) -> None:
     """Non-negative float fields reject any negative input."""
     with pytest.raises(ValidationError) as exc:
         TaskQueueConfig(**{field: bad_value})
@@ -45,7 +45,7 @@ def test_property_16_ge0_floats_reject_negative(field: str, bad_value: float) ->
 
 @settings(max_examples=100)
 @given(bad_value=st.floats(max_value=0.0, min_value=-1e6, allow_nan=False, allow_infinity=False))
-def test_property_16_window_seconds_rejects_zero_and_negative(bad_value: float) -> None:
+def test_window_seconds_rejects_zero_and_negative(bad_value: float) -> None:
     """``window_seconds`` must be strictly > 0."""
     with pytest.raises(ValidationError) as exc:
         TaskQueueConfig(window_seconds=bad_value)
@@ -54,7 +54,7 @@ def test_property_16_window_seconds_rejects_zero_and_negative(bad_value: float) 
 
 @settings(max_examples=100)
 @given(bad_value=st.integers(max_value=0, min_value=-1_000_000))
-def test_property_16_max_input_tokens_rejects_lt_1(bad_value: int) -> None:
+def test_max_input_tokens_rejects_lt_1(bad_value: int) -> None:
     """``max_input_tokens`` must be an integer ≥ 1."""
     with pytest.raises(ValidationError) as exc:
         TaskQueueConfig(max_input_tokens=bad_value)
@@ -70,8 +70,8 @@ def test_property_16_max_input_tokens_rejects_lt_1(bad_value: int) -> None:
     cleanup=st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
     mit=st.integers(min_value=1, max_value=10_000_000),
 )
-def test_property_16_valid_values_accepted(rps: float, tps: float, win: float, qt: float, cleanup: float,
-                                           mit: int) -> None:
+def test_valid_values_accepted(rps: float, tps: float, win: float, qt: float, cleanup: float,
+                               mit: int) -> None:
     """Any value satisfying the constraints constructs successfully."""
     cfg = TaskQueueConfig(
         rps_limit=rps,

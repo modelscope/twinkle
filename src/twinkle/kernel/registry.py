@@ -1,183 +1,175 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""Operator implementation registry: lazy loading and availability of each
+backend's impl per op, plus KernelChoice resolution and fallback.
+
+Only "implementations" are registered here, never "targets" — targets live in
+config.py's default mapping and in user mappings.
+"""
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import logging
+import torch.nn as nn
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable
 
 from twinkle import get_logger
-from .base import DeviceType, ModeType, is_kernels_available
-
-if TYPE_CHECKING:
-    from kernels.layer.func import FuncRepositoryProtocol
+from twinkle.utils.device_mesh import Platform
+from twinkle.utils.import_utils import exists
 
 logger = get_logger()
 
+__all__ = [
+    'KernelImpl',
+    'OpDefinition',
+    'KernelChoice',
+    'Installer',
+    'register_op',
+    'get_op',
+    'resolve_impl',
+    'lazy_import',
+    'is_npu_available',
+    'is_liger_available',
+    'exists',
+]
 
-class LayerRegistry:
-    """Manages kernel registrations and syncs to HF kernels."""
-
-    def __init__(self):
-        self._registry: Dict[str, Dict[DeviceType, Dict[Any, Any]]] = {}
-        self._synced = False
-
-    def register(self, kernel_name: str, repo_spec: Any, device: DeviceType = 'cuda', mode: Any = None) -> None:
-        if kernel_name not in self._registry:
-            self._registry[kernel_name] = {}
-        if device not in self._registry[kernel_name]:
-            self._registry[kernel_name][device] = {}
-        self._registry[kernel_name][device][mode] = repo_spec
-        self._synced = False
-
-    def get(self, kernel_name: str, device: Optional[DeviceType] = None, mode: Any = None) -> Optional[Any]:
-        if kernel_name not in self._registry:
-            return None
-        devices = self._registry[kernel_name]
-        if device is None:
-            device = next(iter(devices.keys()), None)
-            if device is None:
-                return None
-        modes = devices.get(device)
-        if modes is None:
-            return None
-        if mode is None:
-            return next(iter(modes.values()), None)
-        return modes.get(mode)
-
-    def has(self, kernel_name: str, device: Optional[DeviceType] = None, mode: Any = None) -> bool:
-        if kernel_name not in self._registry:
-            return False
-        devices = self._registry[kernel_name]
-        if device is None:
-            return True
-        if device not in devices:
-            return False
-        if mode is None:
-            return True
-        return mode in devices[device]
-
-    def list_kernel_names(self) -> List[str]:
-        return list(self._registry.keys())
-
-    def sync_to_hf_kernels(self) -> None:
-        if self._synced or not self._registry:
-            return
-
-        if not is_kernels_available():
-            return
-
-        from kernels import register_kernel_mapping as hf_register_kernel_mapping
-
-        hf_register_kernel_mapping({}, inherit_mapping=False)
-        for kernel_name, device_dict in self._registry.items():
-            hf_mapping = {kernel_name: device_dict}
-            hf_register_kernel_mapping(hf_mapping, inherit_mapping=True)
-
-        self._synced = True
-
-    def _clear(self) -> None:
-        self._registry.clear()
-        self._synced = False
-
-
-_global_layer_registry = LayerRegistry()
-
-
-class ExternalLayerRegistry:
-    """Maps layer classes to kernel names."""
-
-    def __init__(self):
-        self._map: Dict[Type, str] = {}
-
-    def register(self, layer_class: Type, kernel_name: str) -> None:
-        self._map[layer_class] = kernel_name
-
-    def get(self, layer_class: Type) -> Optional[str]:
-        return self._map.get(layer_class)
-
-    def has(self, layer_class: Type) -> bool:
-        return layer_class in self._map
-
-    def list_mappings(self) -> List[Tuple[Type, str]]:
-        return list(self._map.items())
-
-    def _clear(self) -> None:
-        self._map.clear()
-
-
-_global_external_layer_registry = ExternalLayerRegistry()
+# ── Data structures ───────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class FunctionKernelSpec:
-    func_name: str
-    target_module: str
-    func_impl: Optional[Callable]
-    repo: Optional['FuncRepositoryProtocol']
-    repo_id: Optional[str]
-    revision: Optional[str]
-    version: Optional[str]
-    device: Optional[str]
-    mode: Optional[ModeType]
+class KernelImpl:
+    """One backend's implementation of one op.
+
+    ``load``: lazily loads and returns the final class or function; impls
+    must not import optional deps (``torch_npu`` / ``liger_kernel`` ...) at
+    registration time. Receives the mapping target (dotted-path string or
+    class object) so a backend can specialize per target family (e.g. liger's
+    RMSNorm dispatches gemma/qwen3_5 variants); factories that don't care
+    simply ignore it (see ``lazy_import``).
+    ``available``: whether the current platform/deps/hardware permit this
+    impl; ``(True, None)`` = usable, ``(False, reason)`` = not usable, fall
+    through to the next backend.
+    """
+    load: Callable[[Any], Any]
+    available: Callable[[], tuple[bool, str | None]]
 
 
-class FunctionRegistry:
-    """Manages function-level kernel registrations."""
-
-    def __init__(self) -> None:
-        self._registry: List[FunctionKernelSpec] = []
-
-    def register(self, spec: FunctionKernelSpec) -> None:
-        if spec in self._registry:
-            return
-        self._registry.append(spec)
-
-    def list_specs(self) -> List[FunctionKernelSpec]:
-        return list(self._registry)
-
-    def _clear(self) -> None:
-        self._registry.clear()
+Installer = Callable[[nn.Module | None, Any, Any], None]  # (model, target, impl) -> None
 
 
-_global_function_registry = FunctionRegistry()
+@dataclass(frozen=True)
+class OpDefinition:
+    """All backend implementations of one op, plus its default installer."""
+    name: str  # 'swiglu' | 'rms_norm' | 'sdpa_attention' | ...
+    implementations: dict[str, KernelImpl]  # backend name -> impl
+    installer: Installer | None = None  # None = use the generic installer
 
 
-def register_layer(kernel_name: str, repo_spec: Any, device: DeviceType = 'cuda', mode: Any = None) -> None:
-    _global_layer_registry.register(kernel_name, repo_spec, device, mode)
+@dataclass(frozen=True)
+class KernelChoice:
+    """Selection descriptor in a mapping: which op to use and the backend priority."""
+    op: str  # references a registered OpDefinition
+    backends: tuple[str, ...]  # priority-ordered, at least one element
+    installer: Installer | None = None  # advanced override; usually None
 
 
-def get_layer_spec(kernel_name: str, device: Optional[DeviceType] = None, mode: Any = None) -> Optional[Any]:
-    return _global_layer_registry.get(kernel_name, device, mode)
+# installer priority: KernelChoice.installer -> OpDefinition.installer -> default_installer
+
+# ── Registry ──────────────────────────────────────────────────────────────
+
+_OPS: dict[str, OpDefinition] = {}
 
 
-def list_kernel_names() -> List[str]:
-    return _global_layer_registry.list_kernel_names()
+def register_op(
+    name: str,
+    *,
+    implementations: dict[str, KernelImpl],
+    installer: Installer | None = None,
+) -> None:
+    """Register an op. Duplicate name / empty implementations -> ValueError."""
+    if name in _OPS:
+        raise ValueError(f'op {name!r} is already registered')
+    if not implementations:
+        raise ValueError(f'op {name!r} has no implementations')
+    _OPS[name] = OpDefinition(name=name, implementations=dict(implementations), installer=installer)
 
 
-def has_kernel(kernel_name: str, device: Optional[DeviceType] = None, mode: Any = None) -> bool:
-    return _global_layer_registry.has(kernel_name, device, mode)
+def get_op(name: str) -> OpDefinition:
+    """Fetch an op definition; unregistered -> ValueError (includes the op name)."""
+    try:
+        return _OPS[name]
+    except KeyError:
+        raise ValueError(f'op {name!r} is not registered') from None
 
 
-def register_external_layer(layer_class: Type, kernel_name: str) -> None:
-    _global_external_layer_registry.register(layer_class, kernel_name)
+def resolve_impl(
+    op: OpDefinition,
+    backends: tuple[str, ...],
+    *,
+    warn: bool,
+    target: Any = None,
+) -> tuple[Any, str | None]:
+    """Pick the first available impl in ``backends`` order.
 
-    if is_kernels_available():
-        from kernels import replace_kernel_forward_from_hub
-        replace_kernel_forward_from_hub(layer_class, kernel_name)
-        logger.info(f'Registered {layer_class.__name__} -> kernel: {kernel_name}')
-    else:
-        logger.warning(f'HF kernels not available. {layer_class.__name__} mapping registered '
-                       f'but kernel replacement will not work without kernels package.')
+    In turn: backend not registered -> log and skip; available() False ->
+    log (with reason) and skip; load() raises -> log (with the exception)
+    and skip; first success -> (impl, backend_name). All failed ->
+    (None, None): no installer call, original implementation kept.
+
+    warn=True (explicit mapping) -> fallback/failure logs at WARNING;
+    warn=False (default config path) -> all DEBUG.
+    ``target`` is passed verbatim to KernelImpl.load() for family-specialized
+    dispatch.
+    """
+    level = logging.WARNING if warn else logging.DEBUG
+    for backend in backends:
+        impl_entry = op.implementations.get(backend)
+        if impl_entry is None:
+            logger.log(level, "[kernelize] op '%s': backend '%s' not registered, skipping", op.name, backend)
+            continue
+        ok, reason = impl_entry.available()
+        if not ok:
+            logger.log(level, "[kernelize] op '%s': backend '%s' unavailable (%s), skipping", op.name, backend, reason)
+            continue
+        try:
+            return impl_entry.load(target), backend
+        except Exception as e:
+            logger.log(level, "[kernelize] op '%s': backend '%s' failed to load (%r), skipping", op.name, backend, e)
+    return None, None
 
 
-def get_external_kernel_name(layer_class: Type) -> Optional[str]:
-    return _global_external_layer_registry.get(layer_class)
+# ── Lazy references and availability helpers (shared by ops/*/__init__.py) ─
 
 
-def get_global_layer_registry() -> LayerRegistry:
-    return _global_layer_registry
+def lazy_import(spec: str) -> Callable[[Any], Any]:
+    """'pkg.mod:attr' -> lazy-load factory; imports the module and getattr
+    only when called.
+
+    Missing module / attribute -> raises ImportError/AttributeError, caught
+    by resolve_impl's load() exception branch (falls through).
+    The factory accepts (and ignores) the mapping target argument, matching
+    the KernelImpl.load signature.
+    """
+    module_path, _, attr = spec.partition(':')
+
+    def _load(_target: Any = None) -> Any:
+        return getattr(importlib.import_module(module_path), attr)
+
+    return _load
 
 
-def get_global_external_layer_registry() -> ExternalLayerRegistry:
-    return _global_external_layer_registry
+def is_npu_available() -> tuple[bool, str | None]:
+    """Platform is npu and torch_npu is importable."""
+    if Platform.device_prefix() != 'npu':
+        return False, f"platform is '{Platform.device_prefix()}', not 'npu'"
+    if importlib.util.find_spec('torch_npu') is None:
+        return False, 'torch_npu not installed'
+    return True, None
 
 
-def get_global_function_registry() -> FunctionRegistry:
-    return _global_function_registry
+def is_liger_available() -> tuple[bool, str | None]:
+    """liger_kernel is importable (find_spec only, no real import)."""
+    if importlib.util.find_spec('liger_kernel') is None:
+        return False, 'liger_kernel not installed'
+    return True, None

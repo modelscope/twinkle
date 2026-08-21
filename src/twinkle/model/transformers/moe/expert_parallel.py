@@ -4,11 +4,11 @@ from __future__ import annotations
 import inspect
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from dataclasses import dataclass
 from torch import nn
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from twinkle.kernel.ops import ep_forward
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
 
@@ -63,9 +63,9 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for _, block in find_moe_blocks_with_names(model):
+    for block_name, block in find_moe_blocks_with_names(model):
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
-        patch_forward(block, ep_group, ep_world_size, cfg)
+        patch_forward(block, ep_group, ep_world_size, cfg, block_name)
         specs.append(spec)
 
     return specs
@@ -142,6 +142,17 @@ def shard_experts(
     block._ep_tensor_experts = is_tensor_experts
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
 
+    # Duplicate EP metadata on block.experts as a defensive measure —
+    # this ensures the experts module has all needed context even if accessed separately.
+    block.experts._ep_num_experts = num_experts
+    block.experts._ep_experts_per_rank = experts_per_rank
+    block.experts._ep_local_start = local_start
+    block.experts._ep_local_end = local_end
+    block.experts._ep_rank = ep_rank
+    block.experts._ep_world_size = ep_world_size
+    block.experts._ep_tensor_experts = is_tensor_experts
+    block.experts._ep_ignore_shared_experts = cfg.ignore_shared_experts
+
     return ExpertShardingSpec(
         block=block,
         experts_module=block.experts,
@@ -160,6 +171,7 @@ def patch_forward(
     ep_group: dist.ProcessGroup,
     ep_world_size: int,
     cfg: ExpertParallelConfig,
+    block_name: str,
 ) -> None:
     """Replace the MoE block forward with EP-aware communication flow.
 
@@ -222,12 +234,17 @@ def patch_forward(
         else:
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
+        # R2 / R3 routing replay: pass block-level replay state
+        from .router_replay import get_replay_state
+        replay_state = get_replay_state(block_name)
+
         router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
             hidden_states=hidden_states_2d,
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
-            norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            norm_topk_prob=_get_norm_topk_prob(block),
+            replay_state=replay_state,
             **kwargs,
         )
         # Keep routing weights in activation dtype before unpermute weighting.
@@ -313,53 +330,6 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
     if getattr(experts_mod, '_ep_forward_installed', False):
         return
 
-    def ep_forward(
-        self,
-        permuted_tokens: torch.Tensor,
-        num_global_sum_tokens_per_local_expert: torch.Tensor,
-        experts_per_rank: int,
-    ) -> torch.Tensor:
-        if permuted_tokens.numel() == 0:
-            # Preserve the autograd edge to token_pre_all2all. Returning a new
-            # empty tensor can make this rank skip the matching backward
-            # all-to-all, causing EP collective order divergence.
-            return permuted_tokens
-
-        input_dtype = permuted_tokens.dtype
-
-        cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
-        for i in range(experts_per_rank):
-            cumsum[i + 1] = cumsum[i] + int(num_global_sum_tokens_per_local_expert[i].item())
-
-        output_chunks = []
-        for i in range(experts_per_rank):
-            start = int(cumsum[i].item())
-            end = int(cumsum[i + 1].item())
-            expert_in = permuted_tokens[start:end]
-            if expert_in.numel() == 0:
-                output_chunks.append(expert_in)
-                continue
-
-            gate_up = self.gate_up_proj[i]
-            down = self.down_proj[i]
-            compute_dtype = gate_up.dtype
-            if expert_in.dtype != compute_dtype:
-                expert_in = expert_in.to(compute_dtype)
-            gate_up_out = F.linear(expert_in, gate_up)
-            if hasattr(self, '_apply_gate'):
-                out = self._apply_gate(gate_up_out)
-            else:
-                gate, up = gate_up_out.chunk(2, dim=-1)
-                out = self.act_fn(gate) * up
-            out = F.linear(out, down)
-
-            if out.dtype != input_dtype:
-                out = out.to(input_dtype)
-            output_chunks.append(out)
-
-        return torch.cat(
-            output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(0, permuted_tokens.size(-1))
-
     import types
     experts_mod.forward = types.MethodType(ep_forward, experts_mod)
     experts_mod._ep_forward_installed = True
@@ -401,6 +371,17 @@ def _get_top_k(block: nn.Module) -> int | None:
     return None
 
 
+def _get_norm_topk_prob(block: nn.Module) -> bool:
+    value = getattr(block, 'norm_topk_prob', None)
+    if value is None:
+        # fix: Attempt to fetch from the gate if block does not exist
+        gate = _get_gate(block)
+        value = getattr(gate, 'norm_topk_prob', None)
+    # Default return True.
+    # For Qwen3-5MoE, the `norm_topk_prob` attribute does not exist, and normalization is performed by default.
+    return bool(value) if value is not None else True
+
+
 def _get_router_dtype(router_dtype: str, default_dtype: torch.dtype) -> torch.dtype:
     if router_dtype == 'fp32':
         return torch.float32
@@ -428,9 +409,23 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
 
 
 def _is_moe_experts(experts: Any) -> bool:
-    if isinstance(experts, nn.ModuleList):
+    unwrapped = experts
+    # Look through PEFT / LoRA wrappers that may wrap the experts module
+    # or its parameters (e.g. LoraLayer, ParamWrapper).
+    while True:
+        previous = unwrapped
+        if hasattr(unwrapped, 'base_layer'):
+            unwrapped = unwrapped.base_layer
+        elif hasattr(unwrapped, 'module'):
+            unwrapped = unwrapped.module
+        elif hasattr(unwrapped, '_fsdp_wrapped_module'):
+            unwrapped = unwrapped._fsdp_wrapped_module
+        if unwrapped is previous:
+            break
+
+    if isinstance(unwrapped, nn.ModuleList):
         return True
-    if hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'):
+    if hasattr(unwrapped, 'gate_up_proj') and hasattr(unwrapped, 'down_proj'):
         return True
     return False
 
@@ -440,6 +435,15 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
     experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
     if hasattr(experts, 'num_experts'):
         experts.num_experts = end - start
+
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraWrapper
+    for mod_name, target_param_wrapper in experts.named_children():
+        if not isinstance(target_param_wrapper, TargetParameterLoraWrapper):
+            continue
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_A.items():
+            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+        for tenant_name, tenant_tensor in target_param_wrapper.lora_B.items():
+            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
 
 
 def _run_local_experts(
@@ -512,21 +516,46 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
+    replay_state: Any = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_kwargs = {}
     if 'input_ids' in kwargs and _module_forward_accepts_kwarg(gate, 'input_ids'):
         gate_kwargs['input_ids'] = kwargs['input_ids']
     gate_out = gate(hidden_states, **gate_kwargs)
+
+    # Resolve router_logits once — needed by both REPLAY and normal paths.
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
-        router_logits, routing_weights, selected_experts = gate_out[:3]
+        router_logits = gate_out[0]
+    else:
+        router_logits = gate_out
+
+    # Lazy import to avoid circular dependency with router_replay.py
+    from .router_replay import RouterReplayAction
+
+    # --- REPLAY_FORWARD: use injected selected_experts ---
+    if (replay_state is not None and replay_state.action != RouterReplayAction.RECORD
+            and replay_state.target_indices is not None):
+        selected_experts = replay_state.target_indices
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+        routing_weights = routing_weights.gather(-1, selected_experts)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         return router_logits, routing_weights, selected_experts
 
-    router_logits = gate_out
-    routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    if norm_topk_prob:
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    # --- Normal path: compute routing_weights and selected_experts ---
+    if isinstance(gate_out, tuple) and len(gate_out) >= 3:
+        _, routing_weights, selected_experts = gate_out[:3]
+    else:
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+    # --- RECORD: save selected_experts after computing them ---
+    if (replay_state is not None and replay_state.action == RouterReplayAction.RECORD):
+        replay_state.recorded_indices = selected_experts.detach().clone()
+
     return router_logits, routing_weights, selected_experts
 
 
