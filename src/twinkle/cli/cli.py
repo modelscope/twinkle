@@ -17,7 +17,7 @@ class ModelArgs:
     model_cls: str | None = None
     tokenizer_id: str | None = None
     mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16'
-    strategy: Literal['accelerate', 'native_fsdp'] = field(
+    strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'] = field(
         default='accelerate', metadata={'aliases': ('use_megatron', )})
     memory_efficient_init: bool = False
     gradient_checkpointing: bool = True
@@ -33,6 +33,7 @@ class ModelArgs:
     variable_seq_lengths: bool = True
     ddp_config: dict[str, Any] | None = None
     fsdp_config: dict[str, Any] | None = None
+    deepspeed_config: dict[str, Any] | None = None
     grad_scaler_config: dict[str, Any] | None = None
     # Liger Kernel toggle: gates the fused-linear-CE loss in the cookbooks.
     # Off by default — opt in with --enable-liger / TWINKLE_ENABLE_LIGER.
