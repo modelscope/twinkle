@@ -1,14 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json as _json
 import os.path
-import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datasets import DatasetDict, IterableDataset, concatenate_datasets, interleave_datasets, load_dataset
-from queue import Queue
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import IterableDataset as TorchIterableDataset
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, Optional, Type, Union
 
 import twinkle
 from twinkle import preprocessor
@@ -17,7 +14,7 @@ from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, processing_lock
-from twinkle.utils.parallel import PosixFileLock
+from .writer import AsyncRowWriter, DatasetWriter
 
 try:
     import multiprocess
@@ -77,17 +74,46 @@ class Dataset(TorchDataset):
 
     def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
         self.template = None
+        # `_mixed` records that mixing was REQUESTED; `_merged` holds the materialized merge (None
+        # until `mix_dataset` runs it). They differ in `LazyDataset`, which defers the merge and so
+        # is `_mixed` with `_merged is None`.
         self._mixed = False
+        self._merged = None
+        self.datasets = {}
         if dataset_meta is None:
-            self.datasets = {}
-            self.dataset = None
             return
         trust_remote_code = bool(os.environ.get('TWINKLE_TRUST_REMOTE_CODE', '1'))
         if not trust_remote_code:
             kwargs['trust_remote_code'] = False
-        dataset = self._load_dataset(dataset_meta, **kwargs)
-        self.datasets = {dataset_meta.get_id(): dataset}
-        self.dataset = dataset
+        self.datasets = {dataset_meta.get_id(): self._load_dataset(dataset_meta, **kwargs)}
+
+    @property
+    def dataset(self):
+        """The active view over :attr:`datasets`, derived rather than stored.
+
+        Returns the merged dataset once ``mix_dataset()`` has run, otherwise the first loaded one
+        (with multiple datasets and no mix, only the first is reachable -- a long-standing contract
+        that ``LazyDataset.__len__`` also follows).
+
+        This is a property so that it cannot drift out of sync with :attr:`datasets`: every
+        transform writes through the setter below, which puts the result back where this getter
+        reads it from.
+        """
+        if self._merged is not None:
+            return self._merged
+        if not self.datasets:
+            return None
+        return next(iter(self.datasets.values()))
+
+    @dataset.setter
+    def dataset(self, value):
+        """Route an in-place transform result back to whatever the getter reads."""
+        if self._merged is not None:
+            self._merged = value
+            return
+        if not self.datasets:
+            raise ValueError('No dataset loaded; pass a `dataset_meta` or call `add_dataset()` first.')
+        self.datasets[next(iter(self.datasets.keys()))] = value
 
     @remote_function()
     def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
@@ -237,8 +263,8 @@ class Dataset(TorchDataset):
         from datasets import Image as ImageFeature
         for key in list(self.datasets.keys()):
             self.datasets[key] = self.datasets[key].cast_column(column, ImageFeature(decode=decode))
-        if len(self.datasets) == 1:
-            self.dataset = self.datasets[next(iter(self.datasets.keys()))]
+        if self._merged is not None:
+            self._merged = self._merged.cast_column(column, ImageFeature(decode=decode))
 
     @remote_function()
     def map(self,
@@ -269,8 +295,6 @@ class Dataset(TorchDataset):
             with processing_lock(key):
                 kw = self._normalize_cache_kwargs(self.datasets[key], kwargs)
                 self.datasets[key] = self.datasets[key].map(preprocess_func, **kw)
-            if len(self.datasets) == 1:
-                self.dataset = self.datasets[key]
 
     @remote_function()
     def filter(self,
@@ -300,8 +324,6 @@ class Dataset(TorchDataset):
             kwargs['batched'] = False
             with processing_lock(key):
                 self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
-            if len(self.datasets) == 1:
-                self.dataset = self.datasets[key]
 
     @remote_function()
     def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
@@ -315,8 +337,6 @@ class Dataset(TorchDataset):
             kwargs['trust_remote_code'] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets[dataset_meta.get_id()] = dataset
-        if len(self.datasets) == 1:
-            self.dataset = dataset
 
     @remote_function()
     def mix_dataset(self, interleave=True):
@@ -326,7 +346,10 @@ class Dataset(TorchDataset):
             interleave: Whether to interleave the dataset, or concatenate the dataset.
         """
         if len(self.datasets) > 1:
-            dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
+            # fix: iterate values, not keys -- `for ds in self.datasets` yields the id strings, so
+            # the streaming check below never fired and a mixed streaming/non-streaming set fell
+            # through to interleave_datasets to fail with an opaque pyarrow error.
+            dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets.values()]
             assert all(
                 dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
             if not any(dataset_types):
@@ -341,10 +364,12 @@ class Dataset(TorchDataset):
                     aligned.append(ds)
             else:
                 aligned = list(self.datasets.values())
+            # Assign `_merged` directly: the `dataset` setter would route to datasets[first_key]
+            # while `_merged` is still None, overwriting a sub-dataset instead of storing the merge.
             if interleave:
-                self.dataset = interleave_datasets(aligned)
+                self._merged = interleave_datasets(aligned)
             else:
-                self.dataset = concatenate_datasets(aligned)
+                self._merged = concatenate_datasets(aligned)
             self._mixed = True
 
     @remote_function()
@@ -369,21 +394,21 @@ class Dataset(TorchDataset):
         if len(self.datasets) > 1 and not self._mixed:
             raise ValueError('Call mix_dataset() before save_as() when multiple datasets are loaded.')
 
-        fmt = format or self._infer_format(output_path)
-        if fmt not in ('jsonl', 'json', 'csv', 'parquet'):
+        fmt = format or DatasetWriter.infer_format(output_path)
+        if fmt not in DatasetWriter.SUPPORTED_FORMATS:
             raise ValueError(f"Unsupported format: '{fmt}'. Use jsonl/json/csv/parquet.")
 
         dir_path = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(dir_path, exist_ok=True)
 
         if mode == 'training':
-            self._save_state = _SaveState(output_path, fmt, batch_size)
+            self._save_state = AsyncRowWriter(output_path, fmt, batch_size)
             return
 
         if self._should_materialize():
-            self._save_incremental(output_path, fmt, batch_size)
+            DatasetWriter.write_incremental(self._row_iterator(), output_path, fmt, batch_size)
         else:
-            self._save_bulk(output_path, fmt, **kwargs)
+            DatasetWriter.write_bulk(self.dataset, output_path, fmt, **kwargs)
 
     @remote_function()
     def flush_save(self) -> None:
@@ -400,18 +425,8 @@ class Dataset(TorchDataset):
             state.write(row)
         return row
 
-    @staticmethod
-    def _infer_format(path: str) -> str:
-        ext = os.path.splitext(path)[1].lstrip('.').lower()
-        return {
-            'jsonl': 'jsonl',
-            'json': 'jsonl',
-            'csv': 'csv',
-            'parquet': 'parquet',
-            'pq': 'parquet'
-        }.get(ext, 'jsonl')
-
     def _should_materialize(self) -> bool:
+        """Must rows be produced one by one (rather than exported by the HF dataset itself)?"""
         if isinstance(self.dataset, IterableDataset):
             return True
         if hasattr(self, 'do_encode') and self.do_encode:
@@ -420,71 +435,12 @@ class Dataset(TorchDataset):
             return True
         return False
 
-    def _save_bulk(self, path: str, fmt: str, **kwargs) -> None:
-        if fmt in ('jsonl', 'json'):
-            self.dataset.to_json(path, **kwargs)
-        elif fmt == 'csv':
-            self.dataset.to_csv(path, **kwargs)
-        elif fmt == 'parquet':
-            self.dataset.to_parquet(path, **kwargs)
-
-    def _save_incremental(self, path: str, fmt: str, batch_size: int) -> None:
-        iterator = self._row_iterator()
-        if fmt in ('jsonl', 'json'):
-            self._write_jsonl(path, iterator)
-        elif fmt == 'csv':
-            self._write_csv(path, iterator, batch_size)
-        elif fmt == 'parquet':
-            self._write_parquet(path, iterator, batch_size)
-
     def _row_iterator(self):
         if isinstance(self.dataset, IterableDataset):
             yield from self.dataset
         else:
             for i in range(len(self)):
                 yield self[i]
-
-    @staticmethod
-    def _write_jsonl(path: str, iterator) -> None:
-        with open(path, 'w', encoding='utf-8') as f:
-            for row in iterator:
-                f.write(_json.dumps(row, ensure_ascii=False, default=_default_serializer) + '\n')
-
-    @staticmethod
-    def _write_csv(path: str, iterator, batch_size: int) -> None:
-        import pandas as pd
-        first = True
-        batch: List[Dict] = []
-        for row in iterator:
-            batch.append(row)
-            if len(batch) >= batch_size:
-                pd.DataFrame(batch).to_csv(path, mode='a', header=first, index=False)
-                first = False
-                batch = []
-        if batch:
-            pd.DataFrame(batch).to_csv(path, mode='a', header=first, index=False)
-
-    @staticmethod
-    def _write_parquet(path: str, iterator, batch_size: int) -> None:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        writer = None
-        batch: List[Dict] = []
-        for row in iterator:
-            batch.append(row)
-            if len(batch) >= batch_size:
-                table = pa.Table.from_pylist(batch)
-                if writer is None:
-                    writer = pq.ParquetWriter(path, table.schema)
-                writer.write_table(table)
-                batch = []
-        if batch:
-            table = pa.Table.from_pylist(batch)
-            if writer is None:
-                writer = pq.ParquetWriter(path, table.schema)
-            writer.write_table(table)
-        if writer:
-            writer.close()
 
     @remote_function()
     def __getitem__(self, idx):
@@ -495,148 +451,3 @@ class Dataset(TorchDataset):
     @remote_function()
     def __len__(self):
         return len(self.dataset)
-
-
-def _default_serializer(obj):
-    """Handle numpy types in JSON serialization."""
-    import numpy as np
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
-
-
-_SENTINEL = object()
-
-
-class _SaveState:
-    """Async persistent writer for training-mode save_as.
-
-    Writes happen on a background daemon thread so the training loop is never blocked.
-    Uses fcntl file-lock for cross-process safety when multiple ranks write one file.
-    """
-
-    def __init__(self, path: str, fmt: str, batch_size: int):
-
-        self._path = path
-        self._fmt = fmt
-        self._batch_size = batch_size
-        self._queue: Queue = Queue(maxsize=batch_size * 4)
-        self._lock = PosixFileLock(path + '.lock')
-        self._error = None
-
-        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
-        self._thread.start()
-
-    def write(self, row: Dict) -> None:
-        self._queue.put(row)
-
-    def close(self) -> None:
-        self._queue.put(_SENTINEL)
-        self._thread.join()
-        self._lock.close()
-        if self._error:
-            raise self._error
-
-    def _writer_loop(self) -> None:
-        try:
-            if self._fmt in ('jsonl', 'json'):
-                self._loop_jsonl()
-            elif self._fmt == 'csv':
-                self._loop_csv()
-            elif self._fmt == 'parquet':
-                self._loop_parquet()
-        except Exception as e:
-            self._error = e
-
-    def _acquire_lock(self):
-        self._lock.acquire()
-
-    def _release_lock(self):
-        self._lock.release()
-
-    def _loop_jsonl(self) -> None:
-        buffer: List[str] = []
-
-        def _flush(f):
-            if not buffer:
-                return
-            payload = ''.join(buffer)
-            self._acquire_lock()
-            try:
-                f.write(payload)
-                f.flush()
-            finally:
-                self._release_lock()
-            buffer.clear()
-
-        with open(self._path, 'a', encoding='utf-8') as f:
-            while True:
-                item = self._queue.get()
-                if item is _SENTINEL:
-                    _flush(f)
-                    return
-                buffer.append(_json.dumps(item, ensure_ascii=False, default=_default_serializer) + '\n')
-                if len(buffer) >= self._batch_size:
-                    _flush(f)
-
-    def _loop_csv(self) -> None:
-        import pandas as pd
-        header_written = False
-        buffer: List[Dict] = []
-        while True:
-            item = self._queue.get()
-            if item is _SENTINEL:
-                if buffer:
-                    self._acquire_lock()
-                    try:
-                        pd.DataFrame(buffer).to_csv(self._path, mode='a', header=not header_written, index=False)
-                    finally:
-                        self._release_lock()
-                return
-            buffer.append(item)
-            if len(buffer) >= self._batch_size:
-                self._acquire_lock()
-                try:
-                    pd.DataFrame(buffer).to_csv(self._path, mode='a', header=not header_written, index=False)
-                    header_written = True
-                finally:
-                    self._release_lock()
-                buffer = []
-
-    def _loop_parquet(self) -> None:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        writer = None
-        buffer: List[Dict] = []
-        try:
-            while True:
-                item = self._queue.get()
-                if item is _SENTINEL:
-                    if buffer:
-                        table = pa.Table.from_pylist(buffer)
-                        if writer is None:
-                            writer = pq.ParquetWriter(self._path, table.schema)
-                        self._acquire_lock()
-                        try:
-                            writer.write_table(table)
-                        finally:
-                            self._release_lock()
-                    return
-                buffer.append(item)
-                if len(buffer) >= self._batch_size:
-                    table = pa.Table.from_pylist(buffer)
-                    if writer is None:
-                        writer = pq.ParquetWriter(self._path, table.schema)
-                    self._acquire_lock()
-                    try:
-                        writer.write_table(table)
-                    finally:
-                        self._release_lock()
-                    buffer = []
-        finally:
-            if writer:
-                writer.close()

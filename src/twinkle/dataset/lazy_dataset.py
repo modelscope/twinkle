@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import twinkle
 from twinkle import remote_class, remote_function
 from twinkle.preprocessor import DataFilter, Preprocessor
-from twinkle.utils import construct_class
+from twinkle.utils import construct_class, processing_lock
 from .base import Dataset, DatasetMeta
 
 
@@ -38,8 +38,10 @@ class LazyDataset(Dataset):
         # Global lazy map ops (applied after mix): [(func, kwargs), ...]
         self._global_map_ops: List[Tuple[Callable, Dict]] = []
 
-        # Mix state
-        self._is_mixed = False
+        # Mix state. `_mixed` is the base class's flag and is reused verbatim -- a second field for
+        # the same concept would have to be kept in sync with it by hand, and inherited methods that
+        # read `_mixed` would silently see the wrong value.
+        self._mixed = False
         self._mix_interleave = True
         self._length_cache: Optional[int] = None
 
@@ -50,6 +52,16 @@ class LazyDataset(Dataset):
     def _get_dataset_info(self) -> List[Tuple[str, int]]:
         """Get list of (dataset_key, length) tuples."""
         return [(key, len(ds)) for key, ds in self.datasets.items()]
+
+    def _target_keys(self, dataset_meta: DatasetMeta = None) -> List[str]:
+        """Sub-datasets an op applies to: the named one, or every loaded one.
+
+        Lazy ops are always recorded against ``self.datasets`` keys (never against the merged view),
+        because mixing is deferred and ``__getitem__`` resolves indices back to the sub-datasets.
+        """
+        if dataset_meta is not None:
+            return [dataset_meta.get_id()]
+        return list(self.datasets.keys())
 
     @remote_function()
     def map(self,
@@ -69,18 +81,11 @@ class LazyDataset(Dataset):
         init_args = init_args or {}
         func = construct_class(preprocess_func, Preprocessor, twinkle.preprocessor, **init_args)
 
-        if self._is_mixed:
+        if self._mixed:
             self._global_map_ops.append((func, kwargs))
-        elif dataset_meta is not None:
-            key = dataset_meta.get_id()
+            return
+        for key in self._target_keys(dataset_meta):
             self._lazy_map_ops.setdefault(key, []).append((func, kwargs))
-        elif len(self.datasets) == 1:
-            key = next(iter(self.datasets.keys()))
-            self._lazy_map_ops.setdefault(key, []).append((func, kwargs))
-        else:
-            # Multiple datasets, no target specified - apply to all
-            for key in self.datasets:
-                self._lazy_map_ops.setdefault(key, []).append((func, kwargs))
 
     @remote_function()
     def filter(self,
@@ -88,8 +93,19 @@ class LazyDataset(Dataset):
                dataset_meta: DatasetMeta = None,
                init_args: Dict[str, Any] = None,
                **kwargs) -> None:
-        """Execute filter eagerly (index mapping requires knowing valid indices)."""
-        super().filter(filter_func, dataset_meta, init_args, **kwargs)
+        """Execute filter eagerly (index mapping requires knowing valid indices).
+
+        Not delegated to ``Dataset.filter``: that one filters the merged ``self.dataset`` once
+        mixing has happened, but lazy mixing never materializes a merged view, so it would filter
+        only the first sub-dataset while ``__getitem__`` keeps reading all of them. Filtering each
+        sub-dataset here matches how ``map`` targets them and keeps ``_resolve_index`` correct.
+        """
+        init_args = init_args or {}
+        filter_func = construct_class(filter_func, DataFilter, twinkle.preprocessor, **init_args)
+        kwargs['batched'] = False
+        for key in self._target_keys(dataset_meta):
+            with processing_lock(key):
+                self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
         self._invalidate_length_cache()
 
     @remote_function()
@@ -102,11 +118,14 @@ class LazyDataset(Dataset):
     def mix_dataset(self, interleave=True):
         """Record mix strategy for lazy execution.
 
+        Only the flag is set: unlike the base class this does NOT build a merged dataset, so
+        ``_merged`` stays None and ``_resolve_index`` maps global indices onto the sub-datasets.
+
         Args:
             interleave: True for round-robin interleaving, False for concatenation.
         """
         if len(self.datasets) > 1:
-            self._is_mixed = True
+            self._mixed = True
             self._mix_interleave = interleave
             self._invalidate_length_cache()
 
@@ -130,7 +149,7 @@ class LazyDataset(Dataset):
         """Resolve global index to (dataset_key, local_index)."""
         dataset_info = self._get_dataset_info()
 
-        if not self._is_mixed or len(dataset_info) == 1:
+        if not self._mixed or len(dataset_info) == 1:
             return dataset_info[0][0], idx
 
         if self._mix_interleave:
@@ -161,6 +180,17 @@ class LazyDataset(Dataset):
         columnar = {k: [v] for k, v in item.items()}
         result = func(columnar)
         return {k: v[0] for k, v in result.items()}
+
+    def _should_materialize(self) -> bool:
+        """Lazy mixing has no merged dataset to bulk-export, so rows must be produced one by one.
+
+        Without this, ``save_as`` on a mixed LazyDataset would take the bulk path and hand
+        ``self.dataset`` -- the FIRST sub-dataset -- to ``to_json``, silently writing a fraction of
+        the data.
+        """
+        if self._mixed:
+            return True
+        return super()._should_materialize()
 
     @remote_function()
     def __getitem__(self, idx):
@@ -196,7 +226,7 @@ class LazyDataset(Dataset):
 
         dataset_info = self._get_dataset_info()
 
-        if not self._is_mixed:
+        if not self._mixed:
             # Not mixed: only first dataset is accessible (matches base Dataset behavior)
             self._length_cache = dataset_info[0][1]
         elif self._mix_interleave:
