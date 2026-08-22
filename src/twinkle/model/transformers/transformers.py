@@ -36,7 +36,7 @@ from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
-from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
+from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import GaLoreConfig, create_galore_param_groups
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
@@ -220,11 +220,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
             mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
-            strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+            strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'] = 'accelerate',
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
+            deepspeed_config: Dict[str, Any] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -238,7 +239,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
-        self._decide_strategy(strategy)
+        self._decide_strategy(strategy, deepspeed_config=deepspeed_config)
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
@@ -294,32 +295,41 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             model.tie_weights()
         return model
 
-    def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
+    def _decide_strategy(self,
+                         strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'],
+                         deepspeed_config: Dict[str, Any] = None):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)
         self._expert_parallel_applied = False
 
-        use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
-        if use_native_fsdp:
-            ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
-            if ep_size is None and self.device_mesh is not None:
-                ep_size = getattr(self.device_mesh, 'ep_size', None)
-            self.strategy = NativeFSDPStrategy(
+        if strategy == 'deepspeed':
+            self.strategy = DeepSpeedStrategy(
                 mixed_precision=self.mixed_precision,
-                fsdp_config=self._fsdp_config,
+                deepspeed_config=deepspeed_config,
                 device_mesh=self.device_mesh,
-                memory_efficient_init=self._memory_efficient_init,
-                enable_ep=self._enable_expert_parallel,
-                ep_size=ep_size,
             )
         else:
-            self.strategy = AccelerateStrategy(
-                mixed_precision=self.mixed_precision,
-                ddp_config=self._ddp_config,
-                fsdp_config=self._fsdp_config,
-                device_mesh=self.device_mesh,
-                memory_efficient_init=self._memory_efficient_init)
+            use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
+            if use_native_fsdp:
+                ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
+                if ep_size is None and self.device_mesh is not None:
+                    ep_size = getattr(self.device_mesh, 'ep_size', None)
+                self.strategy = NativeFSDPStrategy(
+                    mixed_precision=self.mixed_precision,
+                    fsdp_config=self._fsdp_config,
+                    device_mesh=self.device_mesh,
+                    memory_efficient_init=self._memory_efficient_init,
+                    enable_ep=self._enable_expert_parallel,
+                    ep_size=ep_size,
+                )
+            else:
+                self.strategy = AccelerateStrategy(
+                    mixed_precision=self.mixed_precision,
+                    ddp_config=self._ddp_config,
+                    fsdp_config=self._fsdp_config,
+                    device_mesh=self.device_mesh,
+                    memory_efficient_init=self._memory_efficient_init)
 
         # Sequence parallel ("ulysses") is derived from dp/fsdp ranks; it does not change world size.
         # We construct `sp_strategy` after the underlying HF model is initialized (see __init__).
