@@ -152,6 +152,45 @@ def test_tool_manager_call_many_uses_env_step_batch():
     assert out[1].startswith('lookup:')
 
 
+def _run_wrapped(source: str):
+    """exec the wrapper the way ms-agent's python_executor does: split dicts."""
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from twinkle_agentic.harness.ms_agent import single_namespace_source
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        exec(single_namespace_source(source), {'__builtins__': __builtins__}, {})
+    return out.getvalue(), err.getvalue()
+
+
+@pytest.mark.parametrize(
+    'source, expect_err',
+    [
+        # A comprehension seeing a top-level name: broken under split dicts.
+        ('xs = [1, 2]\nlim = 3\nassert all(x <= lim for x in xs)\nprint("ok")', False),
+        ('import os\npaths = []\nassert all(os.path.exists(p) for p in paths)\nprint("ok")', False),
+        # sys.exit must fail this call only -- never reach the caller's loop.
+        ('print("ok")\nimport sys\nsys.exit(3)', True),
+        ('print("ok")\nimport sys\nsys.exit(0)', False),
+        ('print("ok")\nimport sys\nsys.exit()', False),
+    ],
+)
+def test_single_namespace_source(source, expect_err):
+    stdout, stderr = _run_wrapped(source)
+    assert 'ok' in stdout
+    assert bool(stderr) is expect_err
+    if expect_err:
+        assert 'SystemExit: 3' in stderr
+
+
+def test_single_namespace_source_keeps_real_errors():
+    """The patch must not turn a failing check into a passing one."""
+    with pytest.raises(AssertionError):
+        _run_wrapped('assert 1 == 2, "counts differ"')
+
+
 def test_ms_agent_harness_start_system_and_user():
     import sys
     from pathlib import Path

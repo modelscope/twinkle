@@ -211,6 +211,7 @@ class MsAgentHarness(AgentHarness):
 
     def _apply_rl_stubs(self) -> None:
         """Non-interactive: never block on TUI / permission prompts / stdin."""
+        patch_ms_agent_python_executor()
         try:
             from omegaconf import open_dict
             with open_dict(self.agent.config):
@@ -382,6 +383,93 @@ def _ms_calls_to_openai(tool_calls: List[Any]) -> List[Dict[str, Any]]:
             },
         })
     return out
+
+
+_SINGLE_NS_FLAG = '_twinkle_single_namespace'
+
+
+def single_namespace_source(code: str) -> str:
+    """Wrap ``code`` so it runs in one namespace and cannot exit the process.
+
+    Two things happen here, both of them repairs (see
+    :func:`patch_ms_agent_python_executor`):
+
+    * the inner ``exec`` passes one dict twice, which is what ordinary module
+      execution does, so nested scopes see top-level names;
+    * ``SystemExit`` / ``KeyboardInterrupt`` are caught and turned into stderr
+      output, so a ``sys.exit(3)`` in a script fails that one call instead of
+      escaping into the caller's event loop.
+
+    A non-zero status is reported the way any other failure is -- text on
+    stderr, which is what ms-agent turns into ``success: false`` -- so stdout
+    written before the exit survives. ``sys.exit()`` and ``sys.exit(0)`` stay
+    successes: that is a script saying it is done.
+
+    The wrapper only assigns and reads at top level, which works under split
+    globals/locals. ``repr`` handles all quoting, so the original source
+    survives byte for byte.
+    """
+    return ('import builtins as _tw_builtins\n'
+            'import sys as _tw_sys\n'
+            '_tw_src = ' + repr(code) + '\n'
+            "_tw_ns = {'__name__': '__main__', '__builtins__': _tw_builtins}\n"
+            'try:\n'
+            "    exec(compile(_tw_src, '<tool>', 'exec'), _tw_ns, _tw_ns)\n"
+            'except (SystemExit, KeyboardInterrupt) as _tw_exit:\n'
+            "    _tw_status = getattr(_tw_exit, 'code', 1)\n"
+            '    if _tw_status not in (0, None):\n'
+            "        _tw_sys.stderr.write('%s: %s\\n' % (type(_tw_exit).__name__, _tw_status))\n")
+
+
+def patch_ms_agent_python_executor() -> bool:
+    """Give ms-agent's local ``python_executor`` ordinary module semantics.
+
+    ``LocalCodeExecutionTool.python_executor`` calls
+    ``exec(code, globals_dict, locals_dict)`` with two *different* dicts
+    (ms_agent/tools/code/local_code_executor.py:670). Python then runs the
+    submitted code the way it runs a class body: top-level assignments land in
+    ``locals_dict``, but every nested scope -- a function body, a generator
+    expression -- resolves free names against ``globals_dict`` alone. So::
+
+        import os
+        paths = ['a.txt']
+        assert all(os.path.exists(p) for p in paths)
+
+    raises ``NameError: name 'os' is not defined``, which reads as if the model
+    wrote broken code. For RSI that is worse than noise: the check script *is*
+    the reward's ground truth, so this scores a correct check as a failure.
+
+    The same method catches only ``Exception`` around the ``exec``, so a script
+    calling ``sys.exit(3)`` raises ``SystemExit`` out of the ``asyncio.to_thread``
+    call. ``asyncio.Task`` re-raises that one after storing it, which unwinds
+    whatever loop is driving the tool: with a long-lived loop (the RSI sandbox
+    server keeps one, so notebook and MCP state survive across turns) the loop
+    thread dies and every later tool call in the run hangs. One model-written
+    ``sys.exit`` would take out the rest of the episode.
+
+    Temporary local fix pending an upstream PR. It wraps the source instead of
+    reimplementing the method, so ms-agent keeps owning timeouts, output capture
+    and the JSON result shape.
+
+    Idempotent. Returns True when it patched, False when ms-agent is missing or
+    the patch is already in place.
+    """
+    try:
+        from ms_agent.tools.code.local_code_executor import LocalCodeExecutionTool
+    except Exception:  # noqa -- ms-agent is optional for most of twinkle
+        return False
+
+    original = LocalCodeExecutionTool.python_executor
+    if getattr(original, _SINGLE_NS_FLAG, False):
+        return False
+
+    async def python_executor(self, code: str, description: str = '', timeout=None):
+        return await original(self, single_namespace_source(code),
+                              description=description, timeout=timeout)
+
+    setattr(python_executor, _SINGLE_NS_FLAG, True)
+    LocalCodeExecutionTool.python_executor = python_executor
+    return True
 
 
 def _ms_tools_to_openai(raw: Union[Dict[str, Any], List[Any], None]) -> List[Dict[str, Any]]:

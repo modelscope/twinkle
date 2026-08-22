@@ -41,8 +41,13 @@ import sys, traceback
 try:
 {body}
 except SystemExit as _e:
-    print('{mark}:%d' % (_e.code or 0))
-    sys.exit(0)
+    # Print the status and stop -- do NOT re-raise. SystemExit inherits from
+    # BaseException, so ms-agent's `except Exception` around the exec does not
+    # catch it; letting it escape kills the whole tool server process, and the
+    # sandbox is shared by every task in the run. `else` is already skipped
+    # because the exception was handled, so nothing further is needed.
+    _c = _e.code
+    print('{mark}:%d' % (0 if _c is None else _c if isinstance(_c, int) else 1))
 except BaseException:
     traceback.print_exc()
     print('{mark}:1')
@@ -281,7 +286,10 @@ class RemoteMsAgentToolEnv(Env):
         # ``e2b_[0-9a-f]+`` before sending anything. This is the SDK's own
         # opt-out for deployments that do not mint e2b-format keys.
         os.environ.setdefault('E2B_VALIDATE_API_KEY', 'false')
-        return Sandbox(template=self._template, timeout=self._sandbox_timeout)
+        # ``Sandbox.create``, not ``Sandbox(...)``: since e2b 2.x the constructor
+        # takes connection options for an *existing* sandbox and rejects
+        # ``template``, while the classmethod is what provisions a new one.
+        return Sandbox.create(template=self._template, timeout=self._sandbox_timeout)
 
     def _upload(self) -> None:
         """Push the yaml and the server script into the sandbox.

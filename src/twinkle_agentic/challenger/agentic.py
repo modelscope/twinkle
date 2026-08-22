@@ -102,6 +102,30 @@ def _trajectory_summary(trajectory: Trajectory) -> str:
     return '\n'.join(parts)
 
 
+# The fields a local rollout splices into a trajectory, and the only ones a
+# later GRPO step needs: ``labels`` marks which of ``input_ids`` are trainable
+# (-100 elsewhere) and ``logprobs`` holds one entry per trainable token, taken
+# from the policy that actually generated it.
+_TRAINABLE_KEYS = ('input_ids', 'labels', 'logprobs')
+
+
+def _propose_round(stage: str, trajectory: Trajectory) -> Dict[str, Any]:
+    """One proposing round, reduced to what a later training step would read.
+
+    ``messages`` comes along for reading by humans; it is redundant with
+    ``input_ids`` and is not what a trainer should encode from.
+    """
+    record: Dict[str, Any] = {
+        'stage': stage,
+        'messages': [dict(m) for m in trajectory.get('messages') or []],
+    }
+    for key in _TRAINABLE_KEYS:
+        value = trajectory.get(key)
+        if value is not None:
+            record[key] = value
+    return record
+
+
 # ── prompts ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -192,6 +216,16 @@ class AgenticChallenger(Challenger):
         min_batch: smallest batch worth sending to the explorer.
         problem_max_chars: reject problem statements longer than this.
         reject_sink: called with a dict for every rejected proposal.
+        propose_sink: called once per proposal attempt -- kept, rejected while
+            building, or dropped by the difficulty band alike -- with the
+            token-level record of the rounds that produced it. This is the only
+            way the proposing rounds survive: they are generation like any
+            other, so they carry ``input_ids`` / ``labels`` / ``logprobs`` and
+            could later be trained on, but nothing downstream of ``build``
+            looks at them and without a sink they are dropped on the floor.
+            Rejects are included on purpose: they are the zero-reward half of a
+            GRPO group, so a set of kept-only records has no variance to learn
+            from. Requires a local sampler -- an API explorer returns text only.
     """
 
     def __init__(
@@ -216,6 +250,7 @@ class AgenticChallenger(Challenger):
         min_batch: int = 1,
         problem_max_chars: int = 8192,
         reject_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        propose_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         **challenger_kwargs: Any,
     ):
         super().__init__(explorer, system=prompts.system, **challenger_kwargs)
@@ -246,6 +281,7 @@ class AgenticChallenger(Challenger):
         self.min_batch = max(1, min_batch)
         self.problem_max_chars = problem_max_chars
         self.reject_sink = reject_sink
+        self.propose_sink = propose_sink
         if self.seeds:
             prompts.require('from_seed')
             if self.store is not None:
@@ -309,6 +345,12 @@ class AgenticChallenger(Challenger):
         """
         summary = _trajectory_summary(explored)
         snapshot = self.workspace_snapshot_fn() if self.workspace_snapshot_fn else summary
+        keywords = user_data_get(explored.get('user_data'), 'keywords', [])
+        seeded = user_data_get(explored.get('user_data'), 'seeded', False)
+        # Every round this proposal generates, in order. Handed to propose_sink
+        # with whatever verdict the proposal ends up with, so a rejected attempt
+        # is recorded as fully as a kept one.
+        rounds = [_propose_round('explore', explored)]
 
         # Round 2a: write check script
         # NOTE: This goes through the same explorer (with tool schemas visible).
@@ -323,10 +365,12 @@ class AgenticChallenger(Challenger):
             ],
         }
         check_reply = self.explore([check_prompt])
+        rounds.append(_propose_round('check', check_reply[0]))
         script = parse_check_script(assistant_text(check_reply[0]))
         if script is None:
             self.stats['check_parse_fail'] += 1
             self._reject_record(explored, 'check_parse_fail')
+            self._emit_propose(rounds, 'check_parse_fail', keywords=keywords, seeded=seeded)
             return None
 
         # Verify: run check script in current sandbox state (must pass)
@@ -335,6 +379,7 @@ class AgenticChallenger(Challenger):
             self.stats['check_run_fail'] += 1
             self._reject_record(explored, 'check_run_fail',
                                 detail=f'exit {exit_code}: {output[-200:]}')
+            self._emit_propose(rounds, 'check_run_fail', keywords=keywords, seeded=seeded)
             return None
 
         # Round 2b: write problem statement
@@ -346,25 +391,29 @@ class AgenticChallenger(Challenger):
             ],
         }
         problem_reply = self.explore([problem_prompt])
+        rounds.append(_propose_round('problem', problem_reply[0]))
         statement = parse_problem_statement(assistant_text(problem_reply[0]))
         if statement is None:
             self.stats['problem_parse_fail'] += 1
             self._reject_record(explored, 'problem_parse_fail')
+            self._emit_propose(rounds, 'problem_parse_fail', keywords=keywords, seeded=seeded)
             return None
         if len(statement) > self.problem_max_chars:
             self.stats['too_long'] += 1
             self._reject_record(explored, 'too_long')
+            self._emit_propose(rounds, 'too_long', keywords=keywords, seeded=seeded)
             return None
 
         self.stats['parsed'] += 1
         task: Trajectory = {
             'messages': [{'role': 'user', 'content': statement}],
         }
-        return attach_user_data(
-            task,
-            check_script=script,
-            keywords=user_data_get(explored.get('user_data'), 'keywords', []),
-            seeded=user_data_get(explored.get('user_data'), 'seeded', False))
+        task = attach_user_data(task, check_script=script, keywords=keywords, seeded=seeded)
+        # Carried, not emitted: the verdict this proposal earns depends on the
+        # difficulty measurement, which has not run yet. A plain top-level key
+        # rather than user_data, which json-encodes every value on each update.
+        task['propose_rounds'] = rounds
+        return task
 
     def _reject_record(self, traj: Trajectory, reason: str, detail: str = '') -> None:
         if self.reject_sink is not None:
@@ -373,6 +422,37 @@ class AgenticChallenger(Challenger):
                 payload['detail'] = detail
             payload['last_assistant'] = assistant_text(traj)[:500]
             self.reject_sink(payload)
+
+    def _emit_propose(self, rounds: Optional[List[Dict[str, Any]]], outcome: str, *,
+                      keywords: Any = (), seeded: bool = False,
+                      n_pass: Optional[int] = None) -> None:
+        """Hand one proposal attempt's rounds to ``propose_sink``.
+
+        ``pass_rate`` is the raw fraction of solver attempts that succeeded. It
+        is left as the measurement rather than mapped onto a difficulty score:
+        the target rate and its tolerance are training decisions, and baking a
+        guess at them into the dump would make it look like they had been
+        settled.
+        """
+        if self.propose_sink is None or not rounds:
+            return
+        rollouts = self.solver_rollouts or None
+        self.propose_sink({
+            'outcome': outcome,
+            'n_pass': n_pass,
+            'n_rollouts': rollouts,
+            'pass_rate': (n_pass / rollouts) if (n_pass is not None and rollouts) else None,
+            'keywords': list(keywords or ()),
+            'seeded': bool(seeded),
+            'rounds': rounds,
+        })
+
+    def _take_rounds(self, task: Trajectory) -> Optional[List[Dict[str, Any]]]:
+        """Detach a task's proposing rounds. Popped even with no sink attached:
+        token ids for a whole agentic episode are large, and a kept task is held
+        until the caller's batch is full.
+        """
+        return task.pop('propose_rounds', None)
 
     # ------------------------------------------------------------ revised _round
 
@@ -398,6 +478,12 @@ class AgenticChallenger(Challenger):
                 usable.append(task)
 
         kept = self._filter_difficulty(usable) if self.solver_rollouts else usable
+        if not self.solver_rollouts:
+            # No difficulty stage, so the verdict is final as soon as it is built.
+            for task in usable:
+                self._emit_propose(self._take_rounds(task), 'kept',
+                                   keywords=user_data_get(task.get('user_data'), 'keywords', []),
+                                   seeded=user_data_get(task.get('user_data'), 'seeded', False))
         self.n_proposed += len(proposals)
         self.n_kept += len(kept)
         band = (f', in difficulty band {len(kept)}' if self.solver_rollouts else '')
@@ -427,7 +513,18 @@ class AgenticChallenger(Challenger):
         ]
         self.on_difficulty_measured(measured)
         high = self.solver_rollouts - self.keep_max_pass_margin
-        return [t for t, n in zip(measured, passes) if self.keep_min_pass <= n <= high]
+        in_band = [self.keep_min_pass <= n <= high for n in passes]
+        # Emit here, not in _round: this is where a proposal's verdict is
+        # decided, and both sides of the band are worth keeping -- a task nobody
+        # solved and one everybody solved are the two failure modes the
+        # proposer would need to learn to avoid.
+        for task, n, kept_flag in zip(measured, passes, in_band):
+            self._emit_propose(self._take_rounds(task),
+                               'kept' if kept_flag else 'outside_band',
+                               keywords=user_data_get(task.get('user_data'), 'keywords', []),
+                               seeded=user_data_get(task.get('user_data'), 'seeded', False),
+                               n_pass=n)
+        return [t for t, kept_flag in zip(measured, in_band) if kept_flag]
 
     def solver_prompt(self, task: Trajectory) -> Trajectory:
         """The task statement, nothing else -- the solver's own harness adds the system."""

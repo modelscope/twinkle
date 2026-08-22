@@ -20,13 +20,14 @@ The two halves are split by where they run, not by what they know:
 
 Usage:
     AENV_API_URL=http://127.0.0.1:8000 \\
-    RSI_TASKS=cookbook/rl/rsi_agentic/tasks.example.jsonl \\
-        python cookbook/rl/rsi_agentic/rsi_agentic_grpo.py
+    RSI_TASKS=cookbook/rsi/agentic/tasks.example.jsonl \\
+        python cookbook/rsi/agentic/rl.py
 
 See README.md for building the template and starting the sandbox server.
 
-Task file: one JSON object per line, with ``id``, ``query`` and ``checks``
-(see tasks.example.jsonl and twinkle_agentic.verifier.result_check.Check).
+Task file: one JSON object per line, with ``id``, ``query`` and either
+``check_script`` (a python script, from ``challenge.py``) or ``checks``
+(structured, see twinkle_agentic.verifier.result_check.Check).
 """
 import json
 import os
@@ -84,8 +85,8 @@ LORA_RANK = args.lora.lora_r or 16
 MAX_TRAJECTORY_TOKENS = int(os.environ.get('RSI_MAX_TRAJ_TOKENS', 32768))
 MAX_TURNS = int(os.environ.get('RSI_MAX_TURNS', 20))
 
-TASKS_PATH = os.environ.get('RSI_TASKS', 'cookbook/rl/rsi_agentic/tasks.example.jsonl')
-AGENT_CONFIG = os.environ.get('RSI_AGENT_CONFIG', 'cookbook/rl/rsi_agentic/rsi_agent.yaml')
+TASKS_PATH = os.environ.get('RSI_TASKS', 'cookbook/rsi/agentic/tasks.example.jsonl')
+AGENT_CONFIG = os.environ.get('RSI_AGENT_CONFIG', 'cookbook/rsi/agentic/rsi_agent.yaml')
 RUN_DIR = os.environ.get('RSI_RUN_DIR', 'output/rsi_agentic/run')
 
 # Sandbox backend. The template is built by sandbox_server/install.sh.

@@ -18,7 +18,7 @@ _REPO = os.path.join(os.path.dirname(__file__), '..', '..')
 sys.path.insert(0, os.path.join(_REPO, 'src'))
 # The RSI wiring lives in cookbook, not in the framework: it is one deployment's
 # choice of sandbox backend, and the tests follow it there.
-_COOKBOOK = os.path.join(_REPO, 'cookbook', 'rl', 'rsi_agentic')
+_COOKBOOK = os.path.join(_REPO, 'cookbook', 'rsi', 'agentic')
 sys.path.insert(0, _COOKBOOK)
 sys.path.insert(0, os.path.join(_COOKBOOK, 'sandbox_server'))
 

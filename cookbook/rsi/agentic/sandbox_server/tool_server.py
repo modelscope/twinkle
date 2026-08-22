@@ -41,15 +41,86 @@ DEFAULT_PORT = 8900
 # it is also removed from the advertised schema -- see `_usable_llm`.
 _LLM_BACKED_ARGS = {'file_system---read_file': ('abbreviate', )}
 
+_SINGLE_NS_FLAG = '_twinkle_single_namespace'
+
+
+def _single_namespace_source(code: str) -> str:
+    """Wrap ``code`` so it runs in one namespace and cannot exit the process.
+
+    The inner ``exec`` passes one dict twice, which is what ordinary module
+    execution does, so nested scopes see top-level names; and ``SystemExit`` /
+    ``KeyboardInterrupt`` are turned into stderr text -- which is what ms-agent
+    reads as ``success: false`` -- instead of escaping into this server's event
+    loop. Stdout written before the exit survives, and ``sys.exit(0)`` stays a
+    success. ``repr`` handles the quoting, so the original source survives byte
+    for byte.
+    """
+    return ('import builtins as _tw_builtins\n'
+            'import sys as _tw_sys\n'
+            '_tw_src = ' + repr(code) + '\n'
+            "_tw_ns = {'__name__': '__main__', '__builtins__': _tw_builtins}\n"
+            'try:\n'
+            "    exec(compile(_tw_src, '<tool>', 'exec'), _tw_ns, _tw_ns)\n"
+            'except (SystemExit, KeyboardInterrupt) as _tw_exit:\n'
+            "    _tw_status = getattr(_tw_exit, 'code', 1)\n"
+            '    if _tw_status not in (0, None):\n'
+            "        _tw_sys.stderr.write('%s: %s\\n' % (type(_tw_exit).__name__, _tw_status))\n")
+
+
+def _patch_python_executor() -> bool:
+    """Give ms-agent's local ``python_executor`` ordinary module semantics.
+
+    ``LocalCodeExecutionTool.python_executor`` calls
+    ``exec(code, globals_dict, locals_dict)`` with two *different* dicts
+    (ms_agent/tools/code/local_code_executor.py:670). Python then runs the code
+    the way it runs a class body: top-level assignments land in ``locals_dict``,
+    but every nested scope -- a function body, a generator expression --
+    resolves free names against ``globals_dict`` alone. So::
+
+        import os
+        paths = ['a.txt']
+        assert all(os.path.exists(p) for p in paths)
+
+    raises ``NameError: name 'os' is not defined``, which reads as if the model
+    wrote broken code. Here it is worse than noise: check scripts arrive through
+    this tool and are the reward's ground truth, so a correct check scores as a
+    failure.
+
+    The same method catches only ``Exception``, so ``sys.exit(3)`` in a script
+    raises ``SystemExit`` out of its ``asyncio.to_thread`` call. ``asyncio.Task``
+    re-raises that one after storing it, so it unwinds ``run_forever`` and kills
+    :class:`_LoopThread` -- after which every later tool call in the sandbox
+    waits for a loop that is gone. Verified: without this, a ``sys.exit(3)``
+    call is followed by timeouts on scripts that passed moments earlier.
+
+    Duplicated from ``twinkle_agentic.harness.ms_agent`` on purpose -- this file
+    is uploaded into a sandbox that has ms-agent and nothing else. Temporary,
+    pending an upstream PR.
+    """
+    from ms_agent.tools.code.local_code_executor import LocalCodeExecutionTool
+
+    original = LocalCodeExecutionTool.python_executor
+    if getattr(original, _SINGLE_NS_FLAG, False):
+        return False
+
+    async def python_executor(self, code, description='', timeout=None):
+        return await original(self, _single_namespace_source(code),
+                              description=description, timeout=timeout)
+
+    setattr(python_executor, _SINGLE_NS_FLAG, True)
+    LocalCodeExecutionTool.python_executor = python_executor
+    return True
+
 
 def _usable_llm(cfg) -> bool:
     """Whether the declared ``llm`` section can actually serve a request.
 
-    ms-agent merges its own ``agent.yaml`` underneath the user's, and that
-    default declares ``service: modelscope``. So an absent ``llm:`` section in
-    rsi_agent.yaml does not mean "no LLM" -- it means "modelscope, with no
-    credentials", which asserts as soon as FileSystemTool is constructed. The
-    presence of a key is what decides it.
+    Call this on the config *after* ``LLMAgent`` construction. ms-agent merges
+    its own ``agent.yaml`` underneath the user's, and that default declares
+    ``service: modelscope``. So an absent ``llm:`` section in rsi_agent.yaml does
+    not mean "no LLM" -- it means "modelscope, with no credentials", which
+    asserts as soon as FileSystemTool is constructed. The presence of a key is
+    what decides it.
     """
     llm = getattr(cfg, 'llm', None)
     if llm is None:
@@ -57,6 +128,35 @@ def _usable_llm(cfg) -> bool:
     service = str(getattr(llm, 'service', '') or '')
     key_fields = (f'{service}_api_key', 'api_key', 'openai_api_key')
     return any(getattr(llm, f, None) or os.environ.get(f.upper()) for f in key_fields)
+
+
+def _to_openai(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert one ms-agent tool schema to the OpenAI shape.
+
+    ``ToolManager.get_tools`` yields ms-agent's own flat form --
+    ``{tool_name, server_name, description, parameters}`` -- but the schemas
+    served here go into the policy's prompt and are also what
+    ``RemoteMsAgentToolEnv.tool_names`` reads, and both speak OpenAI's nested
+    ``{type: function, function: {...}}``. Converting at this boundary keeps
+    ``/tools`` in the one shape every consumer expects.
+
+    This mirrors ``twinkle_agentic.harness.ms_agent._ms_tools_to_openai``, which
+    cannot be imported: this file is uploaded into a sandbox that has ms-agent
+    and nothing else.
+    """
+    if schema.get('type') == 'function' and isinstance(schema.get('function'), dict):
+        return schema
+    name = schema.get('tool_name') or schema.get('name')
+    if not name:
+        return schema
+    return {
+        'type': 'function',
+        'function': {
+            'name': name,
+            'description': schema.get('description', ''),
+            'parameters': schema.get('parameters') or {'type': 'object', 'properties': {}},
+        },
+    }
 
 
 def _without_llm_args(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -108,6 +208,10 @@ class ToolRuntime:
 
         from ms_agent.agent.llm_agent import LLMAgent
 
+        # Before any tool is constructed: the patch replaces a method on
+        # LocalCodeExecutionTool, and prepare_tools() instantiates it.
+        _patch_python_executor()
+
         cfg = OmegaConf.load(config_path)
         with open_dict(cfg):
             cfg.output_dir = workspace
@@ -116,13 +220,21 @@ class ToolRuntime:
             # blocking on stdin would hang the episode until the sandbox timeout.
             cfg.interactive = False
             cfg.permission_mode = 'auto'
-            self.has_llm = _usable_llm(cfg)
+        self.agent = LLMAgent(cfg)
+        # The llm decision has to be made on the *merged* config, after LLMAgent
+        # has layered ms-agent's own agent.yaml underneath ours. Popping `llm`
+        # from the pre-merge config only removes our section and lets the
+        # default's `service: modelscope` show through, which asserts on the
+        # missing key as soon as FileSystemTool is constructed. This mirrors
+        # MsAgentHarness._apply_rl_stubs, which mutates agent.config for the same
+        # reason.
+        with open_dict(self.agent.config):
+            self.has_llm = _usable_llm(self.agent.config)
             if not self.has_llm:
                 # Leaving an unusable section in place is not an option:
                 # FileSystemTool builds a client from it eagerly and asserts on
                 # the missing key, so no tool at all would come up.
-                cfg.pop('llm', None)
-        self.agent = LLMAgent(cfg)
+                self.agent.config.pop('llm', None)
         self.agent._interactive = False
         self.agent._event_sink = None
         self.agent._input_source = None
@@ -151,7 +263,8 @@ class ToolRuntime:
                 flat.extend(value if isinstance(value, list) else [value])
         else:
             flat = list(raw or [])
-        return [t if self.has_llm else _without_llm_args(t) for t in flat if isinstance(t, dict)]
+        schemas = [_to_openai(t) for t in flat if isinstance(t, dict)]
+        return [t if self.has_llm else _without_llm_args(t) for t in schemas]
 
     def call(self, calls: List[Dict[str, Any]], timeout: Optional[float]) -> List[Dict[str, Any]]:
         """Dispatch a turn's tool calls, mirroring how ms-agent itself does it.
@@ -250,7 +363,7 @@ def main() -> None:
     # Threading, because a turn's tool calls arrive as one request but the
     # health poll must stay answerable while a long shell command runs.
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
-    names = [t.get('function', {}).get('name') for t in runtime.tools()]
+    names = [(t.get('function') or {}).get('name') for t in runtime.tools()]
     llm_note = 'llm configured' if runtime.has_llm else 'no llm (read_file.abbreviate withdrawn)'
     sys.stderr.write(f'[tool_server] ready on {args.host}:{args.port}, {llm_note}, '
                      f'{len(names)} tools: {names}\n')

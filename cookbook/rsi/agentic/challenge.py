@@ -24,6 +24,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.data_format import SamplingParams, user_data_get
@@ -35,6 +36,7 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import CATEGORIES, CATEGORY_DESC, agentic_prompts  # noqa: E402
+from remote_tool_env import RemoteMsAgentToolEnv  # noqa: E402
 
 logger = get_logger()
 
@@ -94,7 +96,7 @@ def parse_args():
                    help='AgentENV/e2b template name (required)')
     p.add_argument('--sandbox-api-url', default='',
                    help='AgentENV server URL (or AENV_API_URL env var)')
-    p.add_argument('--agent-config', default='cookbook/rl/rsi_agentic/rsi_agent.yaml',
+    p.add_argument('--agent-config', default='cookbook/rsi/agentic/rsi_agent.yaml',
                    help='ms-agent yaml for the sandbox tool server')
     p.add_argument('--sandbox-timeout', type=int, default=900)
     p.add_argument('--workspace', default='/workspace',
@@ -104,16 +106,16 @@ def parse_args():
     p.add_argument('--random-seed', type=int, default=0)
     p.add_argument('--out-flows', default='output/rsi_agentic/challenge_flows.jsonl')
     p.add_argument('--dump-rejected', default='output/rsi_agentic/challenge_rejected.jsonl')
+    p.add_argument('--dump-propose-traj', default='output/rsi_agentic/propose_traj',
+                   help='directory for the proposing rounds (token ids + logprobs, one npz '
+                        'per attempt plus index.jsonl). Empty string turns it off; keeping '
+                        'it is what leaves the door open to training the challenger itself.')
     p.add_argument('--no-sort-by-difficulty', action='store_true')
     return p.parse_args()
 
 
 def build_env(args):
     """Create the long-lived sandbox environment."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     '..', '..', 'rl', 'rsi_agentic'))
-    from remote_tool_env import RemoteMsAgentToolEnv  # noqa: E402
-
     template = args.sandbox_template or os.environ.get('AENV_TEMPLATE', '')
     api_url = args.sandbox_api_url or os.environ.get('AENV_API_URL', '')
     if not template:
@@ -177,9 +179,36 @@ def main():
     # the marker protocol, so we don't rely on string matching.
     runner = env.runner()
 
+    # Cleared through the python tool, not `rm -rf`: ms-agent's safety policy
+    # rejects `rm -rf` outright ("Blocked by safety rule"), and it rejects globs
+    # in write operations, which rules out `find -delete` too. The script asserts
+    # the directory really is empty so a future policy change surfaces as a
+    # failed reset instead of tasks quietly inheriting the previous workspace.
+    _CLEAR = '''
+import os, shutil
+root = {workspace!r}
+os.makedirs(root, exist_ok=True)
+for name in os.listdir(root):
+    path = os.path.join(root, name)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        os.remove(path)
+leftover = os.listdir(root)
+assert not leftover, 'workspace not empty after clear: %r' % (leftover,)
+'''
+
     def reset_fn():
-        """Clear the sandbox workspace between episodes."""
-        runner(f'rm -rf {args.workspace}/* {args.workspace}/.* 2>/dev/null; true', 'shell')
+        """Empty the sandbox workspace before an episode.
+
+        Raises rather than returning: every caller depends on a clean start, and
+        a silent no-op here means a task inherits the previous task's files --
+        which lets a solver pass without doing anything and makes the difficulty
+        numbers meaningless.
+        """
+        exit_code, output = runner(_CLEAR.format(workspace=args.workspace), 'python')
+        if exit_code != 0:
+            raise RuntimeError(f'workspace reset failed (exit {exit_code}): {output[-400:]}')
 
     def run_check_fn(script: str):
         """Run a python check script in the sandbox; returns (exit_code, output)."""
@@ -215,6 +244,8 @@ def main():
         if rejected is not None:
             rejected.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
 
+    propose_writer = ProposeTrajWriter(args.dump_propose_traj)
+
     # Build challenger
     prompts = agentic_prompts()
     challenger = AgenticChallenger(
@@ -239,6 +270,7 @@ def main():
         min_batch=args.sampler_gpus,
         problem_max_chars=args.problem_max_chars,
         reject_sink=_reject,
+        propose_sink=propose_writer.write,
         max_proposals_per_round=args.max_proposals_per_round,
         solver_rollouts=args.solver_rollouts,
         keep_min_pass=args.keep_min_pass,
@@ -257,6 +289,7 @@ def main():
                     f'stats {challenger.stats}')
     if rejected is not None:
         rejected.close()
+    propose_writer.close()
 
     if store is not None:
         challenger.expand_hard_keywords()
@@ -277,6 +310,80 @@ def main():
     logger.info(f'[challenge] pass-count distribution: {dict(sorted(dist.items()))}')
 
     env.close()
+
+
+class ProposeTrajWriter:
+    """Persist the proposing rounds so the challenger could be trained later.
+
+    One ``.npz`` per proposal attempt holds the arrays, and one line per attempt
+    in ``index.jsonl`` holds everything a human reads plus the outcome. Splitting
+    them is what keeps this affordable: a 20-turn agentic episode is tens of
+    thousands of token ids, which as JSON is an order of magnitude larger than
+    the same numbers as int32.
+
+    ``logprobs`` arrive as ``[[(token_id, logprob)]]`` and are flattened to the
+    logprob column alone -- that is the shape GRPO's ``old_logps`` wants, and the
+    token each one belongs to is already in ``labels``.
+
+    Rejected attempts are written too. Their outcome is the reward's zero, and a
+    dump of kept-only attempts would have nothing to contrast against.
+    """
+
+    def __init__(self, out_dir: str):
+        self.dir = out_dir
+        self.index = None
+        self.n = 0
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        self.index = open(os.path.join(out_dir, 'index.jsonl'), 'w', encoding='utf-8')
+
+    def write(self, record):
+        if self.index is None:
+            return
+        trace_id = f'p{self.n:06d}'
+        self.n += 1
+        arrays, meta = {}, []
+        for i, rnd in enumerate(record.get('rounds') or []):
+            labels = rnd.get('labels') or []
+            logprobs = rnd.get('logprobs') or []
+            if rnd.get('input_ids'):
+                arrays[f'r{i}_input_ids'] = np.asarray(rnd['input_ids'], dtype=np.int32)
+            if labels:
+                arrays[f'r{i}_labels'] = np.asarray(labels, dtype=np.int32)
+            if logprobs:
+                arrays[f'r{i}_logprobs'] = np.asarray(
+                    [lp[0][1] for lp in logprobs], dtype=np.float32)
+            meta.append({
+                'stage': rnd.get('stage'),
+                'messages': rnd.get('messages') or [],
+                'n_tokens': len(rnd.get('input_ids') or []),
+                'n_trainable': sum(1 for label in labels if label != -100),
+                'n_logprobs': len(logprobs),
+            })
+        # No arrays means the explorer was text-only (an API rollout), so there
+        # is nothing trainable to store -- record the attempt without an npz
+        # rather than leaving thousands of empty archives behind.
+        npz_name = f'{trace_id}.npz' if arrays else None
+        if arrays:
+            np.savez_compressed(os.path.join(self.dir, npz_name), **arrays)
+        line = {
+            'trace_id': trace_id,
+            'npz': npz_name,
+            'outcome': record.get('outcome'),
+            'n_pass': record.get('n_pass'),
+            'n_rollouts': record.get('n_rollouts'),
+            'pass_rate': record.get('pass_rate'),
+            'keywords': record.get('keywords'),
+            'seeded': record.get('seeded'),
+            'rounds': meta,
+        }
+        self.index.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
+
+    def close(self):
+        if self.index is not None:
+            self.index.close()
+            logger.info(f'[challenge] wrote {self.n} propose traces -> {self.dir}')
 
 
 def write_flows(kept, args):
