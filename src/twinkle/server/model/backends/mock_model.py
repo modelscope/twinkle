@@ -251,7 +251,7 @@ def _to_tinker_loss_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any
     lists here. Imported lazily so the module stays importable when the
     optional ``tinker`` package is absent.
     """
-    from tinker.types import TensorData  # noqa: WPS433 (lazy on purpose)
+    from tinker.types import TensorData  # lazy on purpose
 
     out: list[dict[str, Any]] = []
     for rec in records:

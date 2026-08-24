@@ -47,7 +47,7 @@ class MPS(Platform):
         if hasattr(torch, 'mps') and hasattr(torch.mps, 'get_rng_state'):
             try:
                 return torch.mps.get_rng_state()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return None
         return None
 
@@ -57,5 +57,5 @@ class MPS(Platform):
         if hasattr(torch, 'mps') and hasattr(torch.mps, 'set_rng_state'):
             try:
                 torch.mps.set_rng_state(state)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass

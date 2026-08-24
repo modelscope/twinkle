@@ -88,7 +88,7 @@ class MetricsRegistry:
     def _make_gauge_callback(self, name: str):
         """Build the sync OTEL callback that reads ``_resource_cache[name]``."""
 
-        def _callback(options):  # noqa: ARG001 -- OTEL signature
+        def _callback(options):  # OTEL signature
             return [Observation(self._resource_cache.get(name, 0))]
 
         return _callback

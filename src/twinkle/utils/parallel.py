@@ -77,7 +77,7 @@ def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> 
         os.makedirs(_LOCK_DIR, exist_ok=True)
         path = os.path.join(_LOCK_DIR, f'{namespace}_{digest}.once')
         return _try_create_claim(path, session, payload)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return True
 
 
@@ -100,7 +100,7 @@ def _try_create_claim(path: str, session: str, payload: str) -> bool:
                 os.unlink(path)  # stale from prior run → evict
             except FileNotFoundError:
                 continue  # another process evicted, retry
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return False
     return True
 
@@ -202,7 +202,7 @@ def _get_store():
             is_master=(rank == 0),
             timeout=_COORD_TIMEOUT,
             wait_for_workers=False)
-    except Exception:  # noqa: BLE001
+    except Exception:
         # Port taken, torch too old, no network -- degrade to the file lock rather than fail a run
         # over a coordination detail.
         _store_failed = True

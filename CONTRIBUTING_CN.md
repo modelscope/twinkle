@@ -48,14 +48,26 @@ twinkle有约定俗成的变量命名方式和开发方式。在开发中请尽�
 2. 所有的python缩进都是四个空格取代一个tab
 3. 选用知名的开源库，避免使用闭源库或不稳定的开源库，避免重复造轮子
 
+twinkle使用 [ruff](https://docs.astral.sh/ruff/) 同时进行代码检查和格式化。ruff 配置位于 `pyproject.toml` 的 `[tool.ruff]` 段。主要配置：
+
+- **行宽限制**：120
+- **目标版本**：Python 3.11
+- **检查规则**：`B`、`E`、`F`、`W`、`I`、`UP`、`T`（bugbear、pycodestyle、pyflakes、isort、pyupgrade、flake8-print）
+- **格式化风格**：双引号（`quote-style = "double"`）
+- **排除路径**：`examples/`、`cookbook/`、`client_tools/`、`src/twinkle_client/`、`tests/`、`docs/src`
+
 twinkle在PR提交后会进行两类测试：
 
-- Code Lint测试 对代码进行静态规范走查的测试，为保证改测试通过，请保证本地预先进行了Code lint。方法是：
+- Code Lint测试 对代码进行静态规范走查的测试，为保证该测试通过，请保证本地预先进行了Code lint。方法是：
 
   ```shell
-  pip install pre-commit
+  pip install pre-commit ruff
   pre-commit run --all-files
-  # 对pre-commit报的错误进行修改，直到所有的检查都是成功状态
+  # 或直接使用ruff：
+  ruff check .              # 检查lint问题（只读，不修改文件）
+  ruff check --fix .        # 检查并自动修复lint问题
+  ruff format --check .     # 检查代码格式（只读，不修改文件）
+  ruff format .             # 格式化代码
   ```
 
 - CI Tests 冒烟测试和单元测试，请查看下一章节

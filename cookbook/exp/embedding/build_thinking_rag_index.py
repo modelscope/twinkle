@@ -410,7 +410,7 @@ def _api_compress(api: OpenAIClient, messages: List[Dict[str, str]]) -> Optional
     sp = TwinkleSamplingParams(temperature=COMPRESS_TEMPERATURE, max_tokens=CONDENSE_MAX_TOKENS)
     try:
         reply = api({'messages': messages}, sp, extra_body={'enable_thinking': False})
-    except Exception as exc:  # noqa: BLE001 — broad catch is intentional
+    except Exception:  # broad catch is intentional
         sys.stderr.write(f'[api_fallback] error: {exc}\n')
         return None
     content = (reply.get('content') or '').strip()
@@ -535,7 +535,7 @@ def _existing_ids(table) -> set:
     try:
         col = table.to_pandas(columns=['id'])
         return set(col['id'].astype(str).tolist())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return set()
 
 
@@ -732,7 +732,7 @@ def build_index(args: argparse.Namespace,
                 index_type='IVF_PQ',
                 replace=True,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             sys.stderr.write(f'[build] index build failed: {exc} '
                              '(table is still queryable via brute-force scan)\n')
     sys.stderr.write(f'[build] done. table rows={tbl.count_rows()}\n')

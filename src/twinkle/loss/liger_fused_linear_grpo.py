@@ -231,7 +231,7 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
             try:
                 return self._fused_call(
                     inputs, outputs, lm_head, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
-            except Exception as e:  # noqa: BLE001 — defensive, device-agnostic
+            except Exception as e:  # defensive, device-agnostic
                 if not self._warned:
                     self._warned = True
                     logger.warning(
