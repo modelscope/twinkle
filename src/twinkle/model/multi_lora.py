@@ -292,7 +292,7 @@ class MultiLora:
         # we must not crash the entire service just because we try to import megatron modules.
         try:
             from mcore_bridge import LoraParallelLinear as _LoraParallelLinear
-        except Exception:  # noqa: broad-except
+        except Exception:  # broad-except
             _LoraParallelLinear = ()
 
         if isinstance(base_layer, Linear):

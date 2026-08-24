@@ -32,7 +32,7 @@ def _chunks(specs: list[dict[str, Any]]) -> Chunks:
 class _Stub(MultiTurnCondenseRollout):
     """Bypass ``__init__`` to exercise only ``_build_trace_record``."""
 
-    def __init__(self, block_chunks):  # noqa: D401 -- minimal stub
+    def __init__(self, block_chunks):  # minimal stub
         self._trace_block_chunks = block_chunks
 
 

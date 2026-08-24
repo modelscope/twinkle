@@ -48,14 +48,26 @@ twinkle has established conventions for variable naming and development practice
 2. All Python indentation uses four spaces instead of one tab
 3. Use well-known open-source libraries; avoid closed-source or unstable open-source libraries; avoid reinventing the wheel
 
+twinkle uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting. The ruff configuration lives in `pyproject.toml` under `[tool.ruff]`. Key settings:
+
+- **Line length**: 120
+- **Target version**: Python 3.11
+- **Lint rules**: `B`, `E`, `F`, `W`, `I`, `UP`, `T` (bugbear, pycodestyle, pyflakes, isort, pyupgrade, flake8-print)
+- **Format style**: double quotes (`quote-style = "double"`)
+- **Excluded paths**: `examples/`, `cookbook/`, `client_tools/`, `src/twinkle_client/`, `tests/`, `docs/src`
+
 twinkle runs two types of tests after a PR is submitted:
 
 - Code Lint Tests: Static code analysis tests. To ensure this test passes, please run Code lint locally beforehand. Here's how:
 
   ```shell
-  pip install pre-commit
+  pip install pre-commit ruff
   pre-commit run --all-files
-  # Fix any errors reported by pre-commit until all checks pass
+  # Or run ruff directly:
+  ruff check .              # Check lint issues (read-only)
+  ruff check --fix .        # Check and auto-fix lint issues
+  ruff format --check .     # Check formatting (read-only)
+  ruff format .             # Format code
   ```
 
 - CI Tests: Smoke tests and unit tests. Please refer to the next section
