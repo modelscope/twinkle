@@ -168,9 +168,12 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
+            # PyTorch 需要调用原生 optimizer.step() 初始化 Adam 状态；
+            # AcceleratedOptimizer.step() 可能因 sync_gradients=False 跳过这一步。
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
             optim_state = get_optimizer_state_dict(
                 model,
-                optimizer,
+                inner_optimizer,
                 options=self._prepare_full_optimizer_state_dict_options(for_load=False),
             )
             if self.accelerator.process_index == 0:
@@ -190,13 +193,14 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
             optim_state = {}
             if self.accelerator.process_index == 0:
                 optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
                 remap_optimizer_state_names(optim_state, param_name_mapping or {})
             set_optimizer_state_dict(
                 model,
-                optimizer,
+                inner_optimizer,
                 optim_state,
                 options=self._prepare_full_optimizer_state_dict_options(for_load=True),
             )
