@@ -14,6 +14,7 @@ Twinkle DOCUMENTATION
    使用指引/服务端和客户端/index.rst
    使用指引/NPU的支持.md
    使用指引/训练服务.md
+   使用指引/Agentic RL部署与训练.md
    使用指引/Qwen3.5最佳实践.md
    使用指引/Embedding训练.md
 
@@ -39,7 +40,7 @@ Twinkle DOCUMENTATION
    组件/LRScheduler/index.rst
    组件/补丁/index.rst
    组件/组件化/index.rst
-   组件/Kernel/index.rst
+   组件/内核/index.rst
    组件/训练中间件/index.rst
    组件/CLI/index.rst
    组件/通知器/index.rst

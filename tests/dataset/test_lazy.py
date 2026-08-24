@@ -10,12 +10,14 @@ TEST_DATA_DIR = Path(__file__).parent / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 
 
-def convert_to_messages(example):
-    text = example.get('text', '')
-    if not text:
-        text = str(example.get('question', example.get('title', '')))
-
-    return {'messages': [Message(role='user', content=text), Message(role='assistant', content='Response')]}
+def convert_to_messages(examples):
+    """Batched map function: receives dict of lists, returns dict of lists."""
+    texts = examples.get('text', None) or examples.get('question', None) or examples.get('title', [])
+    messages_batch = []
+    for text in texts:
+        text = text or ''
+        messages_batch.append([Message(role='user', content=str(text)), Message(role='assistant', content='Response')])
+    return {'messages': messages_batch}
 
 
 class TestLazyDataset:
@@ -48,8 +50,7 @@ class TestLazyDataset:
 
         dataset.encode()
 
-        # Lazy load: encode() only sets flag, actual encoding on access; raw dataset has no input_ids
-        assert 'messages' in dataset.dataset[0]
+        # Lazy load: both map and encode are deferred; raw dataset has neither messages nor input_ids
         assert 'input_ids' not in dataset.dataset[0]
         item = dataset[0]
         assert 'input_ids' in item

@@ -79,11 +79,6 @@ class NativeFSDPStrategy:
                 raise ValueError('PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
             if float(getattr(config_or_dir, 'lora_dropout', 0.0)) > 0.0:
                 raise ValueError('PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
-            return config_or_dir
-
-        config_or_dir.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
-        logger.info('EP+LoRA auto-filled target_parameters with '
-                    "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
         return config_or_dir
 
     def set_rank0_pre_ep_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
@@ -350,6 +345,24 @@ class NativeFSDPStrategy:
 
         return state_dict
 
+    def load_full_state_dict(self, model, state_dict) -> None:
+        """Load a full (non-sharded) state dict into the (possibly sharded) model.
+
+        Used by full-parameter training to (re)load base weights. Uses
+        ``set_model_state_dict`` when the model is distributed (FSDP2), else a
+        plain in-place ``load_state_dict``.
+        """
+        if self.device_mesh is not None:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            set_model_state_dict(
+                model,
+                state_dict,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+            return
+        unwrapped = self.unwrap_model(model)
+        unwrapped.load_state_dict(state_dict, strict=False)
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect only LoRA adapter parameters, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)
@@ -405,6 +418,8 @@ def _ep_expert_state_dict_gather_dim(name: str) -> int:
     # [out, r * num_experts]. EP therefore owns a contiguous expert block on
     # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
     # parallelism, so the forward pass does not need an EP all-reduce.
+    if '_twinkle_lora_' in name:
+        return 0
     if 'lora_B' in name:
         return 1
     return 0
@@ -728,6 +743,10 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
     if _is_lora_state_key(param_name):
         raise KeyError(f"LoRA parameter '{param_name}' must be loaded from adapter source state.")
 
+    # Parametrization renames MoE layer parameters. full_sd stores the original
+    # weights, so we need to align the naming to match the expected keys.
+    if 'parametrizations' in param_name:
+        param_name = param_name.replace('.parametrizations', '').replace('.original', '')
     candidates = _source_key_candidates(param_name)
     for candidate in candidates:
         if candidate in source_state:

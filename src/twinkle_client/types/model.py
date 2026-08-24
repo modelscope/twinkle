@@ -109,7 +109,9 @@ class ResumeFromCheckpointRequest(BaseModel):
 
 class AddAdapterRequest(BaseModel):
     adapter_name: str
-    config: str
+    # ``config`` is None for full-parameter training (no LoRA adapter) and a
+    # serialized LoraConfig string for LoRA training.
+    config: Optional[str] = None
     save_dir: Optional[str] = None
 
     class Config:

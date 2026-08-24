@@ -30,9 +30,12 @@ TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 
 
-def convert_to_messages(example):
-    text = example.get('text', '')
-    return {'messages': [Message(role='user', content=text), Message(role='assistant', content='Response')]}
+def convert_to_messages(examples):
+    """Batched map function: receives dict of lists, returns dict of lists."""
+    messages_batch = []
+    for text in examples.get('text', []):
+        messages_batch.append([Message(role='user', content=text), Message(role='assistant', content='Response')])
+    return {'messages': messages_batch}
 
 
 def _build_resume_rows():

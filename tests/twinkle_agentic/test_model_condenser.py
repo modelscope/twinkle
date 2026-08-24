@@ -69,7 +69,7 @@ class _MockSampler:
         for traj in inputs_list:
             user_msg = next(m for m in traj['messages'] if m['role'] == 'user')
             prompt = user_msg['content']
-            marker = 'Passage:\n'
+            marker = '## Passage\n'
             idx = prompt.rfind(marker)
             passage = prompt[idx + len(marker):] if idx >= 0 else prompt
             decoded = self._responder(passage)
@@ -281,10 +281,8 @@ def test_skip_roles_default_preserves_system_tool_assistant():
         assert out[i]['content'] == LONG_PASSAGE
         assert (out[i].get('raw') or {}).get('condensed') is not True
     assert out[3]['raw']['condensed'] is True
-    # Only one real compression job (the user chunk); the batch is padded
-    # up to ``batch_size`` with duplicates of that job to keep distributed
-    # samplers happy, and the extra responses are then discarded.
-    assert len(sampler.calls) == cond.batch_size
+    # Only one real compression job (the user chunk).
+    assert len(sampler.calls) == 1
 
 
 def test_custom_skip_roles_empty_tuple():
@@ -359,10 +357,9 @@ def test_batching_respects_batch_size():
     assert len(out) == 5
     for c in out:
         assert c['raw']['condensed'] is True
-    # 5 real jobs dispatched in batches of ``batch_size=2`` with the last
-    # batch padded to full size: 2 + 2 + 2 = 6 sampler calls, of which
-    # only 5 correspond to real work (the 6th is a duplicate discarded).
-    assert len(sampler.calls) == 6
+    # 5 real jobs dispatched in batches of ``batch_size=2``:
+    # 2 + 2 + 1 = 5 sampler calls total.
+    assert len(sampler.calls) == 5
 
 
 def test_order_preserved_with_mixed_chunks():
@@ -389,7 +386,7 @@ def test_order_preserved_with_mixed_chunks():
 def test_braces_in_text_do_not_break_prompt_formatting():
     sampler = _MockSampler(_well_formed_markdown)
     cond = ModelCondenser(sampler, compression_ratio=4.0, min_chars=50)
-    text = ('The JSON config was {"model": "Qwen", "temperature": 0.7}. ' * 5)
+    text = ('The JSON config was {"model": "Qwen", "temperature": 0.7}. ' * 7)
     out = cond(_wrap(_user_chunk(text))).chunks[0]
     assert out['raw']['condensed'] is True
     # Prompt contained the raw text verbatim.
@@ -490,8 +487,8 @@ def test_rounds_filter_only_compresses_first_user_turn():
         _round_chunk(LONG_PASSAGE, 1),
         _round_chunk(LONG_PASSAGE + ' extra.', 2),
     )).chunks
-    # One real compression job (round 1) padded up to ``batch_size``.
-    assert len(sampler.calls) == cond.batch_size
+    # One real compression job (round 1).
+    assert len(sampler.calls) == 1
     # Round 1 compressed.
     assert out[0]['raw']['condensed'] is True
     # Round 2 untouched.
@@ -514,5 +511,5 @@ def test_rounds_filter_default_none_preserves_legacy_behavior():
     cond = ModelCondenser(sampler, compression_ratio=4.0, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
     assert out['raw']['condensed'] is True
-    # One real job, padded up to ``batch_size``.
-    assert len(sampler.calls) == cond.batch_size
+    # One real job.
+    assert len(sampler.calls) == 1

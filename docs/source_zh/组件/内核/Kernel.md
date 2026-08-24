@@ -1,307 +1,183 @@
 # Twinkle Kernel 模块
 
-Twinkle Kernel 模块提供了两条内核替换路径，用于加速训练和推理：
+`twinkle.kernel` 提供一个 mapping 驱动的内核替换接口，把"用一种实现替换模型里的另一种实现"压缩为一次 `kernelize(model, mapping)` 调用。三件事被彻底拆开：**替换什么**（mapping 的 key）、**选什么实现**（`KernelChoice`）、**怎么安装**（installer）。
 
-* **层级 Kernelize（Layer-level kernelize）**
-  使用优化内核替换完整的 `nn.Module` 实现。
-* **函数级 Kernelize（Function-level kernelize）**
-  对 Python 模块中的特定函数进行 monkey-patch。
+公开符号只有四个：
 
-这两种方式可以独立使用，也可以通过统一入口组合使用。
+| 符号 | 作用 |
+| --- | --- |
+| `kernelize(model, mapping=None)` | 在 `model` 上应用 `mapping`，原地修改后返回。省略 `mapping` 时应用内置的 `DEFAULT_KERNEL_CONFIG` |
+| `KernelChoice(op, backends, installer=None)` | mapping value：本次替换用哪个 op、按什么优先级选 backend |
+| `DEFAULT_KERNEL_CONFIG` | 内置默认 mapping（target → `KernelChoice`），复制/合并/覆盖即可自定义 |
+| `hub(ref, *, revision=None, version=None, backend=None)` | 构造一个 `HubRef`，用作 mapping value；真实下载推迟到 `kernelize` 执行 |
 
----
+## Mapping 语义
 
-## 概览：两条 Kernelize 路径
+**key（target）两种形态**，与 value 自由组合：
 
-| 路径 | 粒度 | 典型场景 |
-| --- | --- | --- |
-| 层级替换 | 整个 `nn.Module` | Linear / Conv / MLP / Attention |
-| 函数级替换 | 单个函数 | 热点路径、数学算子、激活函数 |
+- `type[nn.Module]` 子类：替换模型里**所有**该精确类型的实例（`m.__class__ = impl_class`，**不包含**子类）
+- `str` 点路径：`'pkg.mod.ClassName'`（解析为 `nn.Module` 子类 → 等价类替换）、`'pkg.mod.ClassName.forward'`（类方法 → `setattr`）、`'pkg.mod.attr'`（模块函数 → `setattr`）。`transformers.*` 家族未安装时 DEBUG 静默跳过（家族缺失 = 常态）
 
----
+**value 三种形式**：
 
-## 层级内核替换（Layer-Level）
+- 直接 impl（类或函数）：不执行 backend 选择，直接用通用 installer 安装。impl 类**不会被 `__init__` 调用**，必须只依赖原 instance 已有的 attribute 正确工作
+- `KernelChoice(op='rms_norm', backends=('npu', 'liger'))`：按 `backends` 顺序挑第一个可用实现——backend 未注册 / `available()` 不通过（含原因）/ 加载异常都自动顺延；全部不可用则保留原始实现
+- `HubRef`：通过 `hub(...)` 构造的 Hub 引用，延迟加载
 
-### 适用场景
-
-* 你已经有完整的层内核实现
-* 希望在模型中批量替换某类 `nn.Module`
-* 同时适用于训练与推理
-
----
-
-### 示例 1：本地 Kernel 仓库
-
-适用于：
-
-* 内核实现位于本地仓库
-* 希望替换 HuggingFace 或自定义模型中的层
+## 默认配置与自定义
 
 ```python
-from twinkle.kernel import (
-    kernelize_model,
-    register_layer_kernel,
-    register_external_layer,
-)
-from transformers import Qwen2Config, Qwen2ForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
-
-# 1) 从本地仓库注册层内核
-register_layer_kernel(
-    kernel_name="MyAwesomeMLP",
-    repo_path="/path/to/local/repo",
-    package_name="my_kernels",
-    layer_name="Qwen2MLPTrainingKernel",
-    device="cuda",
-    mode="train",
-)
-
-# 2) 绑定外部层与内核名
-register_external_layer(Qwen2MLP, "MyAwesomeMLP")
-
-# 3) 构建模型并应用内核替换
-config = Qwen2Config(
-    hidden_size=128,
-    num_hidden_layers=1,
-    num_attention_heads=4,
-    num_key_value_heads=4,
-    intermediate_size=256,
-    use_cache=False,
-)
-model = Qwen2ForCausalLM(config)
-model = kernelize_model(model, mode="train", device="cuda", use_fallback=True)
+model = kernelize(model)
+# 等价于
+model = kernelize(model, DEFAULT_KERNEL_CONFIG)
 ```
 
----
+`DEFAULT_KERNEL_CONFIG` 覆盖：Qwen2 / Qwen3 / Qwen3-MoE / Qwen2.5-VL / Qwen3.5 / Qwen3.5-MoE 的 RMSNorm / RoPE / SwiGLU / MoE（链 `('npu', 'liger')`，NPU 上 CANN 优先）；llama 系 8 族、gemma 系 4 族（链 `('liger',)`）；以及逻辑 target `'sdpa'`（全局 SDPA 安装）与 `'fla'`（Qwen3.5 Flash Linear Attention 逐实例 patch）。
 
-### 示例 2：Hub Kernel 仓库
-
-适用于：
-
-* 内核托管在 Hub 上
+**mapping 是全量替换默认配置而非增量**——只传自己那几条就意味着默认条目全部不应用。在默认基础上微调用复制合并：
 
 ```python
-import torch
-import torch.nn as nn
-from twinkle.kernel import (
-    kernelize_model,
-    register_layer_kernel,
-    register_external_layer,
-)
+from twinkle.kernel import DEFAULT_KERNEL_CONFIG, KernelChoice, kernelize
 
-# 1) 定义自定义层
-class SiluAndMul(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return nn.functional.silu(x1) * x2
-
-# 2) 注册 Hub 内核并绑定层
-register_layer_kernel(
-    kernel_name="SiluAndMulKernel",
-    repo_id="kernels-community/activation",
-    layer_name="SiluAndMul",
-    device="cuda",
-    mode="train",
-)
-register_external_layer(SiluAndMul, "SiluAndMulKernel")
-
-# 3) 应用到模型
-class SimpleModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.activation = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.activation(x)
-
-model = SimpleModel()
-model = kernelize_model(model, mode="train", device="cuda", use_fallback=True)
+model = kernelize(model, {**DEFAULT_KERNEL_CONFIG,
+    # rms_norm 改成 liger 优先（liger 不可用自动退 npu）
+    'transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm':
+        KernelChoice(op='rms_norm', backends=('liger', 'npu')),
+})
 ```
 
----
+`DEFAULT_KERNEL_CONFIG` 本身不应在运行时原地修改。
 
-## 本地 Kernel 仓库（最小结构）
-
-本地 kernel 仓库本质上是一个普通 Python 包。
-最少只需要一个 `layers.py` 来放层级内核实现。
+**日志分级**：`mapping=None`（默认配置路径）时，回退/失败日志全部是 DEBUG（CUDA 机器、家族缺失是常态）；显式传入 mapping（哪怕是默认配置的复制合并）则升为 WARNING——明确表达了意图，没生效必须告知。每次成功安装有一条 INFO：
 
 ```text
-# 仓库结构：
-my_kernels/                  # 本地 kernel 仓库（Python 包）
-├── __init__.py              # 包入口
-└── layers.py                # 层级 kernel 实现
+[kernelize] target=...Qwen3MLP.forward op=swiglu backend=npu installer=default
+[kernelize] target=sdpa op=sdpa_attention backend=npu installer=install_sdpa
 ```
 
+**CUDA 行为**：默认配置跨平台统一。CUDA 上 `('npu', 'liger')` 链中 npu 的 `available()` 为 False 自动落到 liger；liger 未装则整链失败（默认配置下 DEBUG 跳过 ≈ no-op）。
+
+## 场景示例
+
+### 按算子点名选实现（带替补顺序）
+
 ```python
-# my_kernels/__init__.py
-from . import layers
-__all__ = ["layers"]
-
-# my_kernels/layers.py
-import torch
-import torch.nn as nn
-
-class Qwen2MLPTrainingKernel(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        return self.down_proj(self.act_fn(gate) * up)
+model = kernelize(model, {**DEFAULT_KERNEL_CONFIG,
+    'transformers.models.qwen3.modeling_qwen3.Qwen3MLP.forward':
+        KernelChoice(op='swiglu', backends=('liger', 'npu')),   # 首选 liger，不行退 npu
+})
 ```
 
----
-
-## 函数级内核替换（Function-Level）
-
-### 适用场景
-
-* 只需要加速少量热点函数
-* 不适合或不需要替换整个层
-* 常用于数学算子、激活函数、工具函数
-
----
-
-### 示例 1：批量注册（简单场景）
+### 字符串 key + 直接 impl（绕过选择）
 
 ```python
-from twinkle.kernel import register_kernels, kernelize_model
+from twinkle.kernel import kernelize
+from twinkle.kernel.ops.rotary.npu import npu_apply_rotary_pos_emb
 
-# 1) 注册函数内核
-config = {
-    "functions": {
-        "add": {
-            "target_module": "my_pkg.math_ops",
-            "func_impl": lambda x, y: x + y + 1,
-            "device": "cuda",
-            "mode": "inference",
-        },
+model = kernelize(model, {
+    'transformers.models.qwen2.modeling_qwen2.apply_rotary_pos_emb':
+        npu_apply_rotary_pos_emb,
+})
+```
+
+### 自定义类替换
+
+```python
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+model = kernelize(model, {Qwen2RMSNorm: MyRMSNorm})
+```
+
+### Hub Kernel（HF Hub 格式）
+
+```python
+from twinkle.kernel import hub, kernelize
+
+model = kernelize(model, {
+    SiluAndMul: hub('kernels-community/activation:SiluAndMul', version=1),
+})
+```
+
+`revision` 与 `version` 二选一必传。`hub(...)` 触发 `kernels` 包的延迟 import，未安装时会提示 `pip install kernels`。
+
+### GMM（grouped matmul）opt-in
+
+默认配置**不包含** `transformers.integrations.moe._grouped_mm` 的 NPU 替换（没有 Expert Parallelism 时约 8x 开销）。需要时显式加入（注意：直接 impl 无平台门控，仅在确认 NPU 环境时使用）：
+
+```python
+from twinkle.kernel.ops.moe.npu import npu_grouped_mm
+
+model = kernelize(model, {**DEFAULT_KERNEL_CONFIG,
+    'transformers.integrations.moe._grouped_mm': npu_grouped_mm,
+})
+```
+
+## op 注册机制（如何新增 op / backend）
+
+内置实现按算子组织在 `twinkle/kernel/ops/<op>/` 下：`__init__.py` 负责注册（只含惰性引用与轻量可用性检查，**不得直接 import 可选依赖**），`<backend>.py` 是实现本体。注册 = 登记"某 backend 能给某 op 提供实现"：
+
+```python
+# twinkle/kernel/ops/swiglu/__init__.py
+from ...registry import KernelImpl, is_liger_available, is_npu_available, lazy_import, register_op
+
+register_op(
+    'swiglu',
+    implementations={
+        'npu': KernelImpl(
+            load=lazy_import('twinkle.kernel.ops.swiglu.npu:npu_swiglu_forward'),
+            available=is_npu_available,
+        ),
+        'liger': KernelImpl(
+            load=lazy_import('twinkle.kernel.ops.swiglu.liger:liger_swiglu_forward'),
+            available=is_liger_available,
+        ),
     },
-}
-register_kernels(config)
-
-# 2) 应用（仅函数替换时 model 可为 None）
-kernelize_model(model=None, mode="inference", device="cuda", use_fallback=True)
+)
 ```
 
----
+- `KernelImpl.load(target)`：惰性加载工厂，仅在实现被选中时调用；接收 mapping target，可按目标家族特化（如 liger 的 RMSNorm 按 gemma / qwen3_5 变体分派）
+- `KernelImpl.available()`：返回 `(True, None)` 可用 / `(False, reason)` 不可用并顺延；平台与依赖判断都收在这里
+- 同名 op 重复注册、空 implementations → `ValueError`
+- **vendor 规范**：impl 引入外部 kernel 时，文件 docstring 必须注明来源仓库@commit、本地改动清单，以及 re-sync 提醒
 
-### 示例 2：高级函数来源（完整控制）
+### 自定义 installer
 
-适用于：
-
-* 不同函数来自不同来源（impl / repo / hub），或需要 compile/backward 等标志。
+普通 class / attr 替换之外的安装方式，由 op 自带 installer（签名 `(model, target, impl)`）。优先级：`KernelChoice.installer` → `OpDefinition.installer` → 通用 installer。例子——SDPA 写入 transformers 全局 attention 注册表：
 
 ```python
-from twinkle.kernel.function import (
-    register_function_kernel,
-    apply_function_kernel,
-)
-import torch.nn as nn
-from twinkle.kernel import kernelize_model
+def install_sdpa(model, target, impl) -> None:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
+    AttentionInterface._global_mapping['sdpa'] = impl
+    ALL_ATTENTION_FUNCTIONS['sdpa'] = impl
 
-TARGET_MODULE = "my_pkg.math_ops"
-
-# 1) 直接传入实现
-def fast_add(x, y):
-    return x + y + 1
-
-register_function_kernel(
-    func_name="add",
-    target_module=TARGET_MODULE,
-    func_impl=fast_add,
-    device="cuda",
-    mode="inference",
-)
-
-# 2) Repo 对象（FuncRepositoryProtocol）
-class MyFuncRepo:
-    def load(self):
-        return MyKernelFunc
-
-class MyKernelFunc(nn.Module):
-    def forward(self, x, y):
-        return x * y
-
-register_function_kernel(
-    func_name="mul",
-    target_module=TARGET_MODULE,
-    repo=MyFuncRepo(),
-    device="cuda",
-    mode="compile",
-)
-
-# 3) Hub 仓库
-register_function_kernel(
-    func_name="silu_and_mul",
-    target_module="my_pkg.activations",
-    repo_id="kernels-community/activation",
-    revision="main",  # 或 version="0.1.0"
-    device="cuda",
-    mode="inference",
-)
-
-# 4) 应用函数内核
-applied = apply_function_kernel(
-    target_module=TARGET_MODULE,
-    device="cuda",
-    mode="inference",
-    strict=False,
-)
-print("patched:", applied)
-
-# 5) 可选：通过 kernelize_model 统一应用
-model = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
-kernelize_model(model=model, mode="inference", device="cuda", use_fallback=True)
+register_op('sdpa_attention', implementations={...}, installer=install_sdpa)
 ```
 
----
+默认配置用逻辑 target 引用这类 op（`'sdpa': KernelChoice(op='sdpa_attention', backends=('npu',))`）；逻辑 target 仅作标识传给 installer，不由通用替换器解析。installer 执行失败会上抛异常——不让模型处于用户不知情的半安装状态。
 
-## 层级 + 函数级统一批量注册
+## 迁移指南（旧接口 → 新写法）
 
-### 适用场景
+| 旧用法 | 新写法 |
+| --- | --- |
+| `kernelize(model, npu_builtin(model))` | `kernelize(model)`（默认配置 NPU 上 CANN 优先） |
+| `kernelize(model, liger_builtin(model))` | 自建全 liger mapping，或 `{**DEFAULT_KERNEL_CONFIG, ...}` 把想改的 target 链写成 `('liger', ...)` |
+| `{**npu_builtin(m), **liger_builtin(m)}` 手动合并 | `{**DEFAULT_KERNEL_CONFIG, ...}` 按 target 覆盖 |
+| `{Qwen3RMSNorm: {'npu': NpuRMSNorm}}`（设备条件 dict） | `{Qwen3RMSNorm: NpuRMSNorm}` 或 `KernelChoice(op='rms_norm', backends=('npu',))` |
+| `from twinkle.kernel.npu_impls.x import ...` | `from twinkle.kernel.ops.<op>.npu import ...` |
+| `from twinkle.kernel.liger_impls.x import ...` | `from twinkle.kernel.ops.<op>.liger import ...` |
 
-* 需要框架级统一集成
-* 希望通过单一配置入口管理
-* 同时管理层和函数两类内核
+`npu_builtin()` / `liger_builtin()` / 设备条件 dict（`{'npu': impl}`）已删除，无兼容层；平台判断收进 `KernelImpl.available()`。NPU 上 `kernelize(model)` 的默认替换结果与旧版一致；CUDA 上从 no-op 变为应用默认配置（liger 可用即生效，未装 ≈ no-op）。
 
-```python
-from twinkle.kernel import register_kernels, kernelize_model
-import torch.nn as nn
+## 环境变量
 
-# 1) 注册层级 + 函数级内核
-config = {
-    "layers": {
-        "linear": {
-            "repo_id": "kernels-community/linear",
-            "layer_name": "Linear",
-            "version": "0.1.0",
-            "device": "cuda",
-            "mode": "train",
-        },
-        "conv2d": {
-            "repo_path": "/path/to/local/repo",
-            "package_name": "my_kernels",
-            "layer_name": "Conv2d",
-            "device": "cuda",
-        },
-    },
-    "functions": {
-        "add": {
-            "target_module": "my_pkg.math_ops",
-            "func_impl": lambda x, y: x + y + 1,
-            "device": "cuda",
-            "mode": "inference",
-        },
-        "relu": {
-            "target_module": "my_pkg.activations",
-            "repo_id": "kernels-community/activation",
-            "revision": "main",
-            "device": "cuda",
-        },
-    },
-}
-register_kernels(config)
+只有两个保留：
 
-# 2) 通过 kernelize_model 应用
-model = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
-kernelize_model(model=model, mode="train", device="cuda", use_fallback=True)
-```
+- `TWINKLE_NPU_FLA`：Qwen3.5 FLA 开关（默认开，设为 `0`/`false` 关闭）
+- `TWINKLE_NPU_GATED_RMSNorm_FP32`：将 Gated RMSNorm 强制升到 FP32 计算（默认关）
+
+## 注意事项
+
+- `m.__class__ = impl_cls` 是 Python class 替换魔法。impl 类**必须**只覆盖 `forward`（以及辅助方法），不能定义 `__init__`，否则原 instance 的 attribute 会与 impl 的预期错位
+- 精确匹配：`type(m) is target_cls`。继承自 `target_cls` 的子类不会被替换；如需替换，把子类也放进 mapping
+- 调用 `kernelize` 多次是幂等的（`__class__` 已是 impl 时再设一次无害）
+- 没有 `unkernelize`——替换是单向的

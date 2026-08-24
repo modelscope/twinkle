@@ -143,25 +143,26 @@ rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
 
 ## Using OpenEnv Environments
 
-Connect to a remote OpenEnv WebSocket server:
+Connect to a running OpenEnv server (each client instance maps to one server-side session):
 
 ```python
-from twinkle_agentic.envs.openenv import OpenEnv
+from twinkle_agentic.envs.openenv import OpenEnvClient
 from twinkle_agentic.envs.env_tool import EnvTool
 
-env = OpenEnv(
+env = OpenEnvClient(
+    env_name='coding_env',
     base_url='http://localhost:8000',
-    env_cls='coding_env.CodingEnv',
-    tool_schema=[{
+    tools=[{
         'type': 'function',
         'function': {
-            'name': 'submit',
-            'description': 'Submit code solution.',
+            'name': 'run_python',
+            'description': 'Execute Python code in the remote interpreter.',
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'code': {'type': 'string'},
                 },
+                'required': ['code'],
             },
         },
     }],
@@ -171,6 +172,8 @@ env.reset()
 env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 ```
+
+To run the environment inside the training process instead (no isolation, zero network overhead), swap `OpenEnvClient` for `OpenEnv(env_name=..., env_kwargs=...)`. See [Environments](./Envs.md) for a full comparison of the two modes.
 
 ## Per-Trajectory Tool Managers
 

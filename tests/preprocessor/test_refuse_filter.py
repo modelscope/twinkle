@@ -21,7 +21,8 @@ def _row(messages):
 
 
 def _fil(rows, **kw):
-    return RefuseFilter(**kw)(rows)
+    kept, _dropped = RefuseFilter(**kw)(rows)
+    return kept
 
 
 # ── _is_refusal: English ────────────────────────────────────────────────────

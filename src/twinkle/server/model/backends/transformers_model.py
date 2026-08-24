@@ -2,9 +2,15 @@
 """
 Backend model implementations for the unified model deployment.
 
-Contains one unified class:
-- TwinkleCompatTransformersModel: handles both tinker (Datum-based I/O) via /tinker/*
-  endpoints and twinkle-native (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
+Contains the shared Tinker/Twinkle compatibility mixin and two concrete
+wrappers:
+- TwinkleCompatTransformersModel: multi-LoRA training (default), wraps
+  MultiLoraTransformersModel.
+- TwinkleCompatFullTransformersModel: exclusive full-parameter training, wraps
+  the plain TransformersModel (no PEFT/MultiLora).
+
+Both handle tinker (Datum-based I/O) via /tinker/* endpoints and twinkle-native
+(InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
 from tinker import types
 from typing import List, Union
@@ -13,19 +19,20 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
+from twinkle.model.transformers import TransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
 from twinkle.utils.nccl_safe import nccl_safe
 
 
-@remote_class()
-class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatModelBase):
-    """Unified wrapper around MultiLoraTransformersModel.
+class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
+    """Tinker/Twinkle-compat methods shared by LoRA and full-parameter wrappers.
 
-    Handles both:
-    - Tinker-compat I/O (Datum / TensorData) via /tinker/* endpoints.
-    - Twinkle-native I/O (InputFeature / Trajectory) via /twinkle/* endpoints.
+    Method bodies only call ``super()``, so they work against either
+    ``MultiLoraTransformersModel`` (LoRA) or ``TransformersModel`` (full) as the
+    next class in the MRO. For full-parameter training the ``adapter_name`` is
+    the empty-string default optimizer group.
     """
 
     # ------------------------------------------------------------------
@@ -110,3 +117,18 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True
+
+
+@remote_class()
+class TwinkleCompatTransformersModel(_TransformersTinkerCompatMixin, MultiLoraTransformersModel):
+    """Unified multi-LoRA wrapper around MultiLoraTransformersModel."""
+
+
+@remote_class()
+class TwinkleCompatFullTransformersModel(_TransformersTinkerCompatMixin, TransformersModel):
+    """Full-parameter (non-LoRA) wrapper around the plain TransformersModel.
+
+    Used by exclusive full-parameter server deployments. All training operations
+    target the empty-string default optimizer group created by
+    ``TransformersModel.__init__``.
+    """

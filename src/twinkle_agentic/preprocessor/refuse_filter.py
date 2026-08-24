@@ -116,7 +116,7 @@ def _text(content: Any) -> str:
     return content if isinstance(content, str) else ''
 
 
-def _is_refusal(text: str, check_window: int) -> bool:
+def _is_refusal(text: str, check_window: int = 600) -> bool:
     """Return True if the text contains a self-referential refusal signal."""
     window = text[:check_window]
     return any(p.search(window) for p in _ALL_PATTERNS)

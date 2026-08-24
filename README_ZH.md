@@ -86,32 +86,33 @@ sh INSTALL_MEGATRON.sh
 | pp/tp/cp 微调                       | megatron              | [脚本](cookbook/megatron/tp.py)                        |
 | pp/tp/cp MoE 微调                   | megatron              | [脚本](cookbook/megatron/tp_moe.py)                    |
 | 多模态 FSDP 微调                    | transformers          | [脚本](cookbook/mm/fsdp2.py)                           |
-| GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo.py)                            |
-| GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo_mm.py)                         |
-| GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/short_math_grpo.py)                 |
-| DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo_full.py)                        |
-| DPO LoRA 训练                       | transformers          | [脚本](cookbook/rl/dpo_lora.py)                        |
-| DPO 多 LoRA 训练                    | transformers          | [脚本](cookbook/rl/dpo_multi_lora.py)                  |
-| GKD 在线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_on_policy.py)                   |
-| GKD 离线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_off_policy.py)                  |
-| Tinker 客户端微调（自部署）         | transformers          | [脚本](cookbook/server_mode/tinker/self_host)               |
-| Tinker 客户端微调（ModelScope）      | transformers          | [脚本](cookbook/server_mode/tinker/modelscope)              |
-| Twinkle 客户端微调（自部署）        | transformers          | [脚本](cookbook/server_mode/twinkle/self_host)              |
-| Twinkle 客户端微调（ModelScope）     | transformers          | [脚本](cookbook/server_mode/twinkle/modelscope)             |
-| 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/server_mode/server)                         |
+| GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo/grpo.py)                            |
+| PPO 强化学习训练                     | transformers          | [脚本](cookbook/rl/ppo/ppo.py)                              |
+| GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo/grpo_mm.py)                         |
+| GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/grpo/short_math_grpo.py)                 |
+| DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo/dpo_full.py)                        |
+| DPO LoRA 训练                       | transformers          | [脚本](cookbook/rl/dpo/dpo_lora.py)                        |
+| DPO 多 LoRA 训练                    | transformers          | [脚本](cookbook/rl/dpo/dpo_multi_lora.py)                  |
+| GKD 在线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd/gkd_on_policy.py)                   |
+| GKD 离线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd/gkd_off_policy.py)                  |
+| Tinker 客户端微调                   | transformers          | [脚本](cookbook/client/tinker)                         |
+| Twinkle 客户端微调                  | transformers          | [脚本](cookbook/client/twinkle)                        |
+| 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/client/server)                         |
 
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)
 
 ## 更新日志
+- 🎉2026-08-12 ModelScope的训练服务部署为[Qwen/Qwen3.8-27B](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B)。
+- 🎉2026-08-04 支持沙箱环境下的多轮RL训练：模型生成的代码可在隔离的 [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVM 或 OpenEnv 服务中执行，两个后端共用同一份 `train.py`。参考 [cookbook](cookbook/rl/envs) 和[部署文档](docs/source_zh/使用指引/Agentic%20RL部署与训练.md)。
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
 - 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用`from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout`进行多轮rollout。
 - 🎉2026-05-20 支持训练任务失败后的IM消息告警, 使用方式: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`。
 - 🎉2026-04-27 支持sft/dpo/grpo/gkd的padding_free方法, 使用`set_processor('InputProcessor', padding_free=True)`来开启训练。
 - 🎉2026-04-22 ModelScope的训练服务部署为[Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)，并发布了0.2.1版本。
 - 🎉2026-04-16 ModelScope的训练服务部署为[Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B)，并发布了0.2.0版本。
-- 🎉2026-03-28 支持 DPO 训练，同时支持 Transformers 和 Megatron 后端。参考 [dpo_full.py](cookbook/rl/dpo_full.py) 和 [dpo_lora.py](cookbook/rl/dpo_lora.py)。
+- 🎉2026-03-28 支持 DPO 训练，同时支持 Transformers 和 Megatron 后端。参考 [dpo_full.py](cookbook/rl/dpo/dpo_full.py) 和 [dpo_lora.py](cookbook/rl/dpo/dpo_lora.py)。
 - 🎉2026-03-24 Twinkle 站点上线，访问地址 https://modelscope.github.io/twinkle-web/
-- 🎉2026-03-19 支持 GKD 蒸馏能力，参考 [cookbook](cookbook/rl/gkd_on_policy.py)。
+- 🎉2026-03-19 支持 GKD 蒸馏能力，参考 [cookbook](cookbook/rl/gkd/gkd_on_policy.py)。
 - 🎉2026-02-13 Twinkle✨ 初始版本发布，支持文本模型的SFT/PT/RL训练。我们还通过兼容Tinker的API，在魔搭社区上提供了无服务器训练功能。
 
 ## ModelScope 的训练服务
@@ -132,13 +133,16 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 随着新模型的发布，我们将添加对更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。
 
 >[!Note]
-> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.6-27B](https://modelscope.cn/models/Qwen/Qwen3.6-27B)。
+> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.8-27B](https://modelscope.cn/models/Qwen/Qwen3.8-27B)。
 
 | Model Type          | Model ID 举例                                                                                                     |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
 | qwen3 全系列           | [Qwen/Qwen3-14B-Base](https://modelscope.cn/models/Qwen/Qwen3-14B-Base)                                         |           0.6B/1.7B/4B/8B/14B           | transformers>=4.51   |        ✔         |                     [Qwen/Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base)                     |
 |                     | [Qwen/Qwen3-32B](https://modelscope.cn/models/Qwen/Qwen3-32B)                                                   |         0.6B/1.7B/4B/8B/14B/32B         | transformers>=4.51   |        ✔         |                          [Qwen/Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B)                          |
 | qwen3_moe 全系列       | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                 |       30B-A3B/A3B-Base，235B-A22B        | transformers>=4.51   |        ✔         |                 [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                 |
+| qwen3.8 全系列 | [Qwen/Qwen3.8-27B](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B) | 27B | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) |
+| qwen3.6 moe 全系列 | [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) | 35B-A3B, etc. | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) |
+| qwen3.6 全系列 | [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) | 4B ~ 27B | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) |
 | qwen3.5 moe 全系列     | [Qwen/Qwen3.5-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)                                   |         35B-A3B,122B-A10B, etc.         | transformers>=5.2.0   |        ✔         |                    [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)                    |
 | qwen3.5 全系列         | [Qwen/Qwen3.5-9B](https://www.modelscope.cn/models/Qwen/Qwen3.5-9B)                                             |                2B ~ 27B                 | transformers>=5.2.0   |        ✔         |                         [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)                         |
 | qwen2 全系列           | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct)                               |            0.5B/1.5B/7B/72B             | transformers>=4.37   |        ✔         |                [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)                |
@@ -243,7 +247,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.6-27B'
+base_model = 'ms://Qwen/Qwen3.8-27B'
 base_url='your-base-url'
 api_key='your-api-key'
 

@@ -106,6 +106,62 @@ for step, batch in enumerate(dataloader):
 
 ---
 
+## Train via Twinkle Client
+
+Besides using the bare-library `TransformersModel` directly, you can also drive embedding training on the server over HTTP through `twinkle_client`'s `MultiLoraTransformersModel`. Usage is identical to the bare library — you just call the existing methods in the correct order.
+
+### Call Order
+
+Client-side embedding training follows the same call order as the bare library:
+
+```
+set_processor('InputProcessor')
+  -> set_loss('InfonceLoss', ...)
+  -> add_metric('EmbeddingMetric', is_training=True)
+  -> loop: forward_backward(inputs=mb, task='embedding') + clip_grad_and_step(...)
+  -> calculate_metric(is_training=True)
+```
+
+The difference from the bare library is that the client passes **class-name strings** (e.g. `'InfonceLoss'`, `'EmbeddingMetric'`, `'InputProcessor'`), which the server resolves to the corresponding core-lib classes.
+
+### Example
+
+```python
+from peft import LoraConfig
+from twinkle_client import init_twinkle_client
+from twinkle_client.model import MultiLoraTransformersModel
+
+# --- Connect to the running Twinkle server ---
+init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+
+# --- Build the client model with a LoRA adapter for embedding ---
+model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model.add_adapter_to_model('emb_adapter', LoraConfig(target_modules='all-linear'))
+model.set_template('Qwen3_5Template')
+
+# --- Configure the embedding-training pipeline (order matters) ---
+# NOTE: pass class names as strings; the server resolves them to core-lib classes.
+model.set_processor('InputProcessor')
+model.set_loss('InfonceLoss', temperature=0.07, use_batch=True, hard_negatives=None)
+model.add_metric('EmbeddingMetric', is_training=True)
+
+# --- Training loop ---
+for step, mb in enumerate(minibatches):
+    # `task='embedding'` is forwarded through the /twinkle/* protocol as an extra
+    # kwarg and selects the embedding pooling + InfoNCE loss path on the server.
+    model.forward_backward(inputs=mb, task='embedding')
+    model.clip_grad_and_step(max_grad_norm=1.0)
+
+# --- Read back embedding metrics (pos_sim / neg_sim / loss) ---
+metric = model.calculate_metric(is_training=True)
+```
+
+**No manual apply_patch needed.** As long as you pass `task='embedding'` to `forward_backward` (or `forward_only`), the server automatically switches to embedding mode for that single `forward` call and rolls back afterwards — you do **not** need to call `apply_patch(...)` explicitly. So after a `forward_backward(task='embedding')`, calling `forward_only` without `task` on the same adapter still returns normal vocab-dimension `logits`, unaffected.
+
+The only three explicit setup steps on the client side are: `set_processor('InputProcessor')`, `set_loss('InfonceLoss', ...)`, `add_metric('EmbeddingMetric', is_training=True)`. Parameter meanings and recommended values are in "Key Parameters" above; returned metrics are in "Monitoring" below.
+
+---
+
 ## Monitoring
 
 The `EmbeddingMetric` reports key training signals:

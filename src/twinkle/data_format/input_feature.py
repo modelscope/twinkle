@@ -36,3 +36,4 @@ class InputFeature(TypedDict, total=False):
     labels: InputType
     completion_mask: InputType
     length: int
+    routed_experts: InputType

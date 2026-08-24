@@ -372,6 +372,15 @@
           ]
         }
       },
+      "/twinkle/healthz/deep": {
+        "GET": {
+          "operationId": "healthz_deep_twinkle_healthz_deep_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
       "/twinkle/session_heartbeat": {
         "POST": {
           "operationId": "session_heartbeat_twinkle_session_heartbeat_post",
@@ -525,6 +534,15 @@
   },
   "model": {
     "paths": {
+      "/healthz": {
+        "GET": {
+          "operationId": "healthz_healthz_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
       "/tinker/create_model": {
         "POST": {
           "operationId": "create_model_tinker_create_model_post",

@@ -198,7 +198,7 @@ def test_out_of_range_block_returns_short_range_error():
     out = tool(TOOL_NAME, {'block': 99})
     assert out.startswith('Error:')
     assert 'block 99 not found' in out
-    assert '1..2' in out
+    assert '[1, 2]' in out
     # Defensive: the verbose legacy listing must not leak back.
     assert 'Available blocks: 1, 2' not in out
 

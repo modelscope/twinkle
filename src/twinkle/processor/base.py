@@ -43,6 +43,7 @@ class InputProcessor:
         'video_grid_thw': 0,
         'input_features': 0.0,
         'feature_attention_mask': 0,
+        'routed_experts': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch
@@ -70,6 +71,7 @@ class InputProcessor:
         self.process_pipeline = [
             self.prepare_inputs,
             self.pad_cp,
+            self.align_routed_experts,
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
@@ -100,7 +102,6 @@ class InputProcessor:
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
 
         def to_tensor(_input):
-            import torch
             for key in list(_input.keys()):
                 value = _input[key]
                 # Ray/pyarrow can return numpy or list scalars; normalize to tensors.
@@ -114,7 +115,7 @@ class InputProcessor:
                     if value is None:
                         continue
                     value = torch.tensor(value)
-                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids'):
+                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids', 'routed_experts'):
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
@@ -192,7 +193,24 @@ class InputProcessor:
             self.framework == 'transformers' and sp_strategy is not None and getattr(sp_strategy, 'enabled', False)
             and getattr(sp_strategy, 'world_size', 1) > 1)
 
-        ref_pos = sp_strategy.real_position_ids if sp_enabled else inputs['position_ids']
+        if sp_enabled:
+            ref_pos = sp_strategy.real_position_ids
+        elif inputs.get('position_ids') is not None:
+            ref_pos = inputs['position_ids']
+        else:
+            # Standard padded batch: HF omits position_ids (it derives them internally).
+            # Rebuild a position_ids-like reference (valid token -> its index, padding -> -1)
+            # so the last-valid-token pooling below, which keys off ``ref_pos >= 0`` for
+            # validity and a single ``== 0`` per row for packing detection, still works.
+            T = features.shape[1]
+            arange = torch.arange(T, device=features.device)
+            am = inputs.get('attention_mask')
+            if am is None:
+                ref_pos = arange.expand(features.shape[0], T)
+            else:
+                if am.dim() >= 3:
+                    am = am.reshape(am.shape[0], -1)[:, :T]
+                ref_pos = torch.where(am.bool(), arange, arange.new_tensor(-1))
         if ref_pos.dim() == 3:
             ref_pos = ref_pos[0]
         # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
@@ -447,13 +465,13 @@ class InputProcessor:
         return inputs
 
     @staticmethod
-    def _pad_sequence(sequences, padding_value, padding_side):
+    def _pad_sequence(sequences, padding_value, padding_side, concat=None):
         if padding_side == 'right':
             from twinkle.utils import pad_and_stack_tensors
-            return pad_and_stack_tensors(sequences, pad_value=padding_value, concat=sequences[0].dim() >= 2)
+            return pad_and_stack_tensors(
+                sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
-            import torch
             max_len = max([s.shape[0] for s in sequences])
 
             padded_sequences = []
@@ -466,7 +484,6 @@ class InputProcessor:
 
     @staticmethod
     def _create_4d_attention_mask(attention_mask):
-        import torch
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
         device = attention_mask[0].device
@@ -604,7 +621,7 @@ class InputProcessor:
 
         # Collect output keys to unpack: (key, pad_value)
         output_keys = []
-        for key, pad_val in [('logps', 0), ('entropies', 0), ('logits', 0)]:
+        for key, pad_val in [('logps', 0), ('values', 0), ('entropies', 0), ('logits', 0)]:
             if outputs and outputs.get(key) is not None:
                 output_keys.append((key, pad_val))
 
@@ -632,7 +649,6 @@ class InputProcessor:
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        import torch
         results = []
         for _input in inputs:
             output = {}
@@ -650,6 +666,9 @@ class InputProcessor:
                 'max_length_q',
                 'max_length_k',
                 'packed_seq_params',
+                'routed_experts',
+                'mm_token_type_ids',
+                'second_per_grid_ts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key not in _keys:
@@ -662,13 +681,43 @@ class InputProcessor:
             results.append(InputFeature(**output))
         return results
 
-    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
-        import torch
+    # when training on mixed text + multimodal data, some fields (e.g. mm_token_type_ids)
+    # only exist on multimodal samples. We pad those fields for the missing samples instead of
+    # letting collate blow up with a KeyError.
+    def _fill_optional_sequence_fields(self, batch: List[InputFeature]) -> None:
+        if len(batch) < 2:
+            return
+        seq_fields = set(self.padding_map) - set(self.VLM_CONCAT_FIELDS)
+        present = {k for feat in batch for k in feat if k in seq_fields}
+        for key in present:
+            missing = [feat for feat in batch if feat.get(key) is None]
+            if not missing or len(missing) == len(batch):
+                continue  # all-present (no gap) or all-absent (nothing to align to) -> leave as is
+            pad_value = self.padding_map[key]
+            for feat in missing:
+                input_ids = feat.get('input_ids')
+                if input_ids is None:
+                    continue
+                # Match the row's device/dtype: prepare_inputs may already have moved rows to the
+                # accelerator, and a CPU fill would break the cat inside the collate below.
+                reference = input_ids if isinstance(input_ids, torch.Tensor) else None
+                length = reference.shape[-1] if reference is not None else len(input_ids)
+                feat[key] = torch.full((length, ),
+                                       pad_value,
+                                       dtype=torch.long,
+                                       device=reference.device if reference is not None else None)
 
+    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+        # Work on local copies so squeezing doesn't mutate the caller's original samples.
+        squeezed = []
         for _input in inputs:
+            _input = dict(_input)
             for key in list(_input.keys()):
                 if isinstance(_input[key], torch.Tensor):
                     _input[key] = _input[key].squeeze()
+            squeezed.append(_input)
+        inputs = squeezed
+        self._fill_optional_sequence_fields(inputs)
 
         vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
         text_inputs = []
@@ -716,7 +765,9 @@ class InputProcessor:
                     num_axes = values[0].shape[0]
                     result[key] = result[key].reshape(len(values), num_axes, -1).permute(1, 0, 2).contiguous()
                 elif isinstance(values[0], torch.Tensor):
-                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                    concat = False if (key == 'routed_experts') else None
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map.get(key, 0), self.padding_side,
+                                                               concat)
                     if result[key].dim() == 1:
                         result[key] = result[key].unsqueeze(0)
                 else:
@@ -799,3 +850,27 @@ class InputProcessor:
 
         from twinkle.utils.torch_utils import gather_cp_load_balanced
         return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
+
+    def align_routed_experts(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
+
+        def align_to(_input):
+            routed_experts = _input.get('routed_experts', None)
+            input_ids = _input.get('input_ids', None)
+            input_seq_len = input_ids.shape[-1] if input_ids is not None else 0
+            if routed_experts is not None:
+                # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
+                # This gap of 1 is expected
+                # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
+                experts_seq_len = routed_experts.shape[0]
+                # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
+                padding_routed_experts = routed_experts
+                padding_len = input_seq_len - experts_seq_len
+                if padding_len > 0:
+                    padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
+                                                                     'constant',
+                                                                     self.padding_map.get('routed_experts', 0))
+                _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+
+            return _input
+
+        return [align_to(_input) for _input in inputs]
