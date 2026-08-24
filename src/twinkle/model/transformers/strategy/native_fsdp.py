@@ -249,6 +249,7 @@ class NativeFSDPStrategy:
 
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+
         from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             if Platform.is_master():
@@ -270,6 +271,7 @@ class NativeFSDPStrategy:
 
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+
         from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=False)

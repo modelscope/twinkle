@@ -293,7 +293,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
-        """将当前租户的物理 LoRA 槽位名转换成标准 PEFT ``default`` 名称。"""
+        """Map the tenant's physical LoRA slot to the PEFT ``default`` name."""
         tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
         physical_token = f'.{tenant.adapter_name}.'
         checkpoint_token = f'.{CHECKPOINT_ADAPTER_NAME}.'

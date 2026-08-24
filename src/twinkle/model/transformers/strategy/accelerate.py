@@ -163,13 +163,14 @@ class AccelerateStrategy:
 
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+
         from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-            # PyTorch 需要调用原生 optimizer.step() 初始化 Adam 状态；
-            # AcceleratedOptimizer.step() 可能因 sync_gradients=False 跳过这一步。
+            # PyTorch initializes Adam state through the native optimizer step.
+            # AcceleratedOptimizer may skip that step when gradients are not synchronized.
             inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
             optim_state = get_optimizer_state_dict(
                 model,
@@ -188,6 +189,7 @@ class AccelerateStrategy:
 
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+
         from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:

@@ -132,11 +132,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         if not self.fft_slots.is_hybrid(adapter_name):
             return params
         target_modules = self.multi_adapter.find_lora_by_tenant(adapter_name).tenant_config.target_modules
-        # MultiLoRA 会预分配整套 LoRA 槽；Hybrid optimizer 只收集本租户真正启用的 S_LORA。
+        # MultiLoRA preallocates every slot; only collect S_LORA targets enabled for this tenant.
         params = {
             name: parameter
-            for name, parameter in params.items()
-            if self.multi_adapter.match_target_modules(name, target_modules)
+            for name, parameter in params.items() if self.multi_adapter.match_target_modules(name, target_modules)
         }
         known_parameter_ids = {id(parameter) for parameter in params.values()}
         for name, parameter in self.fft_slots.named_fft_parameters(adapter_name):
@@ -146,7 +145,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         return params
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
-        """在普通 LoRA 映射上，将 Hybrid FFT 槽位也转换成 ``default``。"""
+        """Extend the LoRA mapping with the Hybrid FFT ``default`` slot."""
         mapping = super()._optimizer_param_name_mapping(adapter_name, optimizer)
         tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
         physical_token = f'.modules_to_save.fft_{tenant.index}.'
@@ -302,8 +301,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             if save_only_training_state:
                 tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
                 full_state = self.strategy.get_adapter_state_dict(self.model, tenant.adapter_name)
-                full_state.update(
-                    self.strategy.get_adapter_state_dict(self.model, f'fft_{tenant.index}'))
+                full_state.update(self.strategy.get_adapter_state_dict(self.model, f'fft_{tenant.index}'))
             if Platform.is_master():
                 adapter_state = self.fft_slots.build_training_state_dict(adapter_name, full_state)
                 os.makedirs(training_dir, exist_ok=True)

@@ -1119,7 +1119,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return processed_state_dict
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
-        """返回 optimizer 物理参数名到 checkpoint 逻辑参数名的映射。"""
+        """Map runtime optimizer parameter names to checkpoint names."""
         return {}
 
     def _save_optimizer(self, output_dir, **kwargs):

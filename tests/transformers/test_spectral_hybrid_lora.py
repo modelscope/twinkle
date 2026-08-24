@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 
 import pytest
@@ -285,26 +286,80 @@ def test_accelerate_fsdp_optimizer_save_and_load_ignore_sharded_plugin_options(t
     strategy.accelerator = SimpleNamespace(process_index=0)
     strategy._get_fsdp_plugin = lambda: SimpleNamespace(fsdp_version=2)
     calls = {}
+    raw_optimizer = object()
+    wrapped_optimizer = SimpleNamespace(optimizer=raw_optimizer)
+    saved_name = 'model.layers.0.lora_A.lora_1.weight'
+    logical_name = 'model.layers.0.lora_A.default.weight'
+    current_name = 'model.layers.0.lora_A.lora_0.weight'
 
     def fake_get(_model, _optimizer, *, options):
-        calls['save'] = options
-        return {'state': {}, 'param_groups': []}
+        calls['save'] = (_optimizer, options)
+        return {
+            'state': {saved_name: {'step': torch.tensor(1)}},
+            'param_groups': [{'params': [saved_name], 'param_names': [saved_name]}],
+        }
 
     def fake_set(_model, _optimizer, state, *, options):
-        calls['load'] = (state, options)
+        calls['load'] = (_optimizer, state, options)
 
     monkeypatch.setattr(state_dict_api, 'get_optimizer_state_dict', fake_get)
     monkeypatch.setattr(state_dict_api, 'set_optimizer_state_dict', fake_set)
     checkpoint = tmp_path / 'optimizer.pt'
-    strategy.save_optimizer_checkpoint(object(), object(), str(checkpoint))
-    strategy.load_optimizer_checkpoint(object(), object(), str(checkpoint))
+    strategy.save_optimizer_checkpoint(
+        object(), wrapped_optimizer, str(checkpoint), param_name_mapping={saved_name: logical_name})
+    saved_state = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    assert list(saved_state['state']) == [logical_name]
+    strategy.load_optimizer_checkpoint(
+        object(), wrapped_optimizer, str(checkpoint), param_name_mapping={logical_name: current_name})
 
-    assert calls['save'].full_state_dict is True
-    assert calls['save'].cpu_offload is True
-    loaded_state, load_options = calls['load']
-    assert loaded_state == {'state': {}, 'param_groups': []}
+    saved_optimizer, save_options = calls['save']
+    assert saved_optimizer is raw_optimizer
+    assert save_options.full_state_dict is True
+    assert save_options.cpu_offload is True
+    loaded_optimizer, loaded_state, load_options = calls['load']
+    assert loaded_optimizer is raw_optimizer
+    assert list(loaded_state['state']) == [current_name]
+    assert loaded_state['param_groups'][0]['params'] == [current_name]
+    assert loaded_state['param_groups'][0]['param_names'] == [current_name]
     assert load_options.full_state_dict is True
     assert load_options.broadcast_from_rank0 is True
+
+
+def test_native_fsdp_optimizer_remaps_logical_slot_to_current_slot(tmp_path, monkeypatch):
+    from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
+    from twinkle.utils.platforms import Platform
+    import torch.distributed.checkpoint.state_dict as state_dict_api
+
+    strategy = object.__new__(NativeFSDPStrategy)
+    strategy.device_mesh = object()
+    calls = {}
+    saved_name = 'model.layers.0.lora_A.lora_2.weight'
+    logical_name = 'model.layers.0.lora_A.default.weight'
+    current_name = 'model.layers.0.lora_A.lora_0.weight'
+
+    def fake_get(_model, _optimizer, *, options):
+        return {
+            'state': {saved_name: {'step': torch.tensor(1)}},
+            'param_groups': [{'params': [saved_name], 'param_names': [saved_name]}],
+        }
+
+    def fake_set(_model, _optimizer, state, *, options):
+        calls['load'] = state
+
+    monkeypatch.setattr(Platform, 'is_master', lambda: True)
+    monkeypatch.setattr(state_dict_api, 'get_optimizer_state_dict', fake_get)
+    monkeypatch.setattr(state_dict_api, 'set_optimizer_state_dict', fake_set)
+    checkpoint = tmp_path / 'optimizer.pt'
+
+    strategy.save_optimizer_checkpoint(
+        object(), object(), str(checkpoint), param_name_mapping={saved_name: logical_name})
+    saved_state = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    assert list(saved_state['state']) == [logical_name]
+
+    strategy.load_optimizer_checkpoint(
+        object(), object(), str(checkpoint), param_name_mapping={logical_name: current_name})
+    assert list(calls['load']['state']) == [current_name]
+    assert calls['load']['param_groups'][0]['params'] == [current_name]
 
 
 def test_twinkle_checkpoint_normalization_round_trips_full_modules(tmp_path):
@@ -644,7 +699,7 @@ def test_regular_lora_can_still_train_an_fft_allocated_layer():
     assert hybrid._get_fft_wrapper('layers.0.self_attn.q_proj').active_adapters == []
 
 
-def _make_multi_tenant_hybrid():
+def _make_multi_tenant_hybrid(hybrid_first=True):
     from twinkle.model.multi_lora import MultiLora
 
     torch.manual_seed(42)
@@ -666,8 +721,12 @@ def _make_multi_tenant_hybrid():
         target_modules=['layers.0.self_attn.v_proj'],
         init_lora_weights=False,
     )
-    _register_hybrid(manager, spectral, 'hybrid', hybrid_config)
-    manager.acquire_lora('regular', regular_config)
+    if hybrid_first:
+        _register_hybrid(manager, spectral, 'hybrid', hybrid_config)
+        manager.acquire_lora('regular', regular_config)
+    else:
+        manager.acquire_lora('regular', regular_config)
+        _register_hybrid(manager, spectral, 'hybrid', hybrid_config)
     return base, model, manager, spectral
 
 
@@ -763,7 +822,10 @@ def test_multi_tenant_optimizer_parameters_and_learning_rates_are_isolated():
 
     assert regular
     assert all('.lora_' in name and '.lora_1.' in name for name in regular)
-    assert any('down_proj' in name and '.lora_0.' in name for name in hybrid)
+    hybrid_lora_names = [name for name in hybrid if '.lora_0.' in name]
+    assert hybrid_lora_names
+    assert all('down_proj' in name for name in hybrid_lora_names)
+    assert not any('q_proj' in name for name in hybrid_lora_names)
     assert any('.modules_to_save.fft_0.' in name for name in hybrid)
     assert {group['lr'] for group in groups} == {2.5e-5, 1e-6}
     assert {id(param) for group in groups for param in group['params']} == {id(param) for param in hybrid.values()}
@@ -828,16 +890,31 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
             return {name: value.detach().cpu().clone() for name, value in inner.named_parameters()}
 
         @staticmethod
+        def get_adapter_state_dict(inner, adapter_name):
+            adapter_token = f'.{adapter_name}.'
+            return {
+                name: value.detach().cpu().clone()
+                for name, value in inner.named_parameters()
+                if adapter_token in name
+            }
+
+        @staticmethod
         def needs_wrapped_optimizer_state():
             return False
 
         @staticmethod
-        def save_optimizer_checkpoint(_model, optimizer, output_path):
-            torch.save(optimizer.state_dict(), output_path)
+        def save_optimizer_checkpoint(_model, optimizer, output_path, *, param_name_mapping=None):
+            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            state = optimizer.state_dict()
+            remap_optimizer_state_names(state, param_name_mapping or {})
+            torch.save(state, output_path)
 
         @staticmethod
-        def load_optimizer_checkpoint(_model, optimizer, input_path):
-            optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+        def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
+            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            state = torch.load(input_path, map_location='cpu', weights_only=False)
+            remap_optimizer_state_names(state, param_name_mapping or {})
+            optimizer.load_state_dict(state)
 
     trainable = {}
     for name, parameter in model.named_parameters():
@@ -887,6 +964,8 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     assert (training_dir / 'optimizer.pt').is_file()
     assert (training_dir / 'trainer_state.json').is_file()
     assert (training_dir / 'rng_state_rank_0.pt').is_file()
+    trainer_state = json.loads((training_dir / 'trainer_state.json').read_text())
+    assert 'optimizer_class' not in trainer_state
 
     expected_fft = fft_layer.weight.detach().clone()
     with torch.no_grad():
@@ -906,6 +985,21 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     assert torch.equal(fft_layer.weight, unchanged)
 
     hybrid.tenant_config.lora_alpha -= 1
+    training_only = wrapper._save_spectral_hybrid(
+        'training-only',
+        str(tmp_path),
+        1,
+        'hybrid',
+        save_optimizer=True,
+        save_only_training_state=True,
+        consumed_train_samples=17,
+    )
+    training_only_dir = tmp_path / 'training-only'
+    assert training_only == str(training_only_dir)
+    assert (training_only_dir / 'twinkle_training_state' / 'optimizer.pt').is_file()
+    assert not (training_only_dir / 'model.safetensors').exists()
+    assert not (training_only_dir / 'config.json').exists()
+
     wrapper._save_spectral_hybrid('checkpoint-3', str(tmp_path), 1, 'hybrid', save_optimizer=False)
     assert not training_dir.exists()
 
@@ -930,15 +1024,21 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
             return False
 
         @staticmethod
-        def save_optimizer_checkpoint(_model, optimizer, output_path):
-            torch.save(optimizer.state_dict(), output_path)
+        def save_optimizer_checkpoint(_model, optimizer, output_path, *, param_name_mapping=None):
+            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            state = optimizer.state_dict()
+            remap_optimizer_state_names(state, param_name_mapping or {})
+            torch.save(state, output_path)
 
         @staticmethod
-        def load_optimizer_checkpoint(_model, optimizer, input_path):
-            optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+        def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
+            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            state = torch.load(input_path, map_location='cpu', weights_only=False)
+            remap_optimizer_state_names(state, param_name_mapping or {})
+            optimizer.load_state_dict(state)
 
-    def build_wrapper():
-        _, model, manager, spectral = _make_multi_tenant_hybrid()
+    def build_wrapper(*, hybrid_first):
+        _, model, manager, spectral = _make_multi_tenant_hybrid(hybrid_first=hybrid_first)
         wrapper = object.__new__(SpectralHybridTransformersModel)
         wrapper.multi_adapter = manager
         wrapper.fft_slots = spectral
@@ -974,12 +1074,32 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
         group.optimizer.zero_grad(set_to_none=True)
         group.cur_step += 1
 
-    uninterrupted = build_wrapper()
+    # The Hybrid adapter moves from slot 1 to slot 0 in the resumed session.
+    uninterrupted = build_wrapper(hybrid_first=False)
+    assert uninterrupted.multi_adapter.find_lora_by_tenant('hybrid').index == 1
     train_step(uninterrupted, torch.full((2, 8), 0.25))
     checkpoint = uninterrupted._save_spectral_hybrid(
         'resume', str(tmp_path), 1, 'hybrid', save_optimizer=True, consumed_train_samples=2)
+    trainer_state = json.loads(
+        (tmp_path / 'resume' / 'twinkle_training_state' / 'trainer_state.json').read_text())
+    assert trainer_state['checkpoint_version'] == 1
+    assert 'optimizer_param_names' not in trainer_state
+    optimizer_state = torch.load(
+        tmp_path / 'resume' / 'twinkle_training_state' / 'optimizer.pt',
+        map_location='cpu',
+        weights_only=False,
+    )
+    saved_names = [
+        name
+        for group in optimizer_state['param_groups']
+        for name in group.get('param_names', group['params'])
+    ]
+    assert all('lora_1' not in name and 'fft_1' not in name for name in saved_names)
+    assert any('.lora_A.default.' in name for name in saved_names)
+    assert any('.modules_to_save.default.' in name for name in saved_names)
 
-    resumed = build_wrapper()
+    resumed = build_wrapper(hybrid_first=True)
+    assert resumed.multi_adapter.find_lora_by_tenant('hybrid').index == 0
     progress = resumed._resume_spectral_hybrid(checkpoint, 'hybrid', resume_only_model=False)
     assert progress['cur_step'] == 1
 
@@ -995,6 +1115,17 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
 
     uninterrupted_optimizer = uninterrupted.optimizer_group['hybrid'].optimizer.state_dict()
     resumed_optimizer = resumed.optimizer_group['hybrid'].optimizer.state_dict()
+    # Normalized optimizer groups must match despite different runtime slots.
+    from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+    remap_optimizer_state_names(
+        uninterrupted_optimizer,
+        uninterrupted._optimizer_param_name_mapping(
+            'hybrid', uninterrupted.optimizer_group['hybrid'].optimizer),
+    )
+    remap_optimizer_state_names(
+        resumed_optimizer,
+        resumed._optimizer_param_name_mapping('hybrid', resumed.optimizer_group['hybrid'].optimizer),
+    )
     assert uninterrupted_optimizer['param_groups'] == resumed_optimizer['param_groups']
     for parameter_id, state in uninterrupted_optimizer['state'].items():
         for state_name, value in state.items():
