@@ -46,6 +46,8 @@ from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
+CHECKPOINT_ADAPTER_NAME = 'default'
+
 
 def _resolve_task_context(model, task):
     """Return a context manager that applies the right per-forward Patch for ``task``.
@@ -1116,6 +1118,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             processed_state_dict[normalized] = value
         return processed_state_dict
 
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """返回 optimizer 物理参数名到 checkpoint 逻辑参数名的映射。"""
+        return {}
+
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1124,7 +1130,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if optimizer is not None:
             optimizer_path = os.path.join(output_dir, 'optimizer.pt')
-            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
+            name_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            self.strategy.save_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=name_mapping,
+            )
         if Platform.is_master():
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
@@ -1239,7 +1251,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
-            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
+            optimizer = optimizer_config.optimizer
+            save_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            load_mapping = {logical_name: physical_name for physical_name, logical_name in save_mapping.items()}
+            self.strategy.load_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=load_mapping,
+            )
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)

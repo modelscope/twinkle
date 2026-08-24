@@ -247,11 +247,14 @@ class NativeFSDPStrategy:
     def needs_wrapped_optimizer_state(self) -> bool:
         return self.device_mesh is not None
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+        from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             if Platform.is_master():
-                torch.save(optimizer.state_dict(), output_path)
+                optim_state = optimizer.state_dict()
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
+                torch.save(optim_state, output_path)
             return
 
         from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -262,12 +265,16 @@ class NativeFSDPStrategy:
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
         if Platform.is_master():
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+        from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
-            optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+            optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            optimizer.load_state_dict(optim_state)
             return
 
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
@@ -275,6 +282,7 @@ class NativeFSDPStrategy:
         optim_state = {}
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
         set_optimizer_state_dict(
             model,
             optimizer,

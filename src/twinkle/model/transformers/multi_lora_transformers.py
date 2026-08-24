@@ -18,7 +18,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
-from .transformers import OptimizerGroup, TransformersModel
+from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
 
 
 @remote_class()
@@ -291,6 +291,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
         return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
+
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """将当前租户的物理 LoRA 槽位名转换成标准 PEFT ``default`` 名称。"""
+        tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
+        physical_token = f'.{tenant.adapter_name}.'
+        checkpoint_token = f'.{CHECKPOINT_ADAPTER_NAME}.'
+        mapping = {}
+        for group in optimizer.param_groups:
+            for name in group.get('param_names', []):
+                checkpoint_name = name.replace(physical_token, checkpoint_token)
+                if checkpoint_name != name:
+                    mapping[name] = checkpoint_name
+        return mapping
 
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):

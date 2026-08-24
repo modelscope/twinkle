@@ -1047,10 +1047,16 @@ class SequenceParallelStrategy:
     def needs_wrapped_optimizer_state(self) -> bool:
         return False
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         from twinkle.utils.platforms import Platform
+        from ..optimizer_state import remap_optimizer_state_names
         if Platform.is_master():
-            torch.save(optimizer.state_dict(), output_path)
+            optim_state = optimizer.state_dict()
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
-        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
+        from ..optimizer_state import remap_optimizer_state_names
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        optimizer.load_state_dict(optim_state)

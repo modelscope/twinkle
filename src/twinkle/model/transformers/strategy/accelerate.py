@@ -161,8 +161,9 @@ class AccelerateStrategy:
         fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+        from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -173,14 +174,18 @@ class AccelerateStrategy:
                 options=self._prepare_full_optimizer_state_dict_options(for_load=False),
             )
             if self.accelerator.process_index == 0:
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
                 torch.save(optim_state, output_path)
             return
 
         if self.accelerator.process_index == 0:
-            torch.save(optimizer.state_dict(), output_path)
+            optim_state = optimizer.state_dict()
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+        from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
@@ -188,6 +193,7 @@ class AccelerateStrategy:
             optim_state = {}
             if self.accelerator.process_index == 0:
                 optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
             set_optimizer_state_dict(
                 model,
                 optimizer,
@@ -196,7 +202,9 @@ class AccelerateStrategy:
             )
             return
 
-        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        optimizer.load_state_dict(optim_state)
 
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict."""

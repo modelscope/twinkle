@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from peft import PeftConfig
 from safetensors.torch import load_file, save_file
 from torch.optim import Optimizer
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, Optional, Type, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.utils.safetensors import StreamingSafetensorSaver
@@ -145,6 +145,19 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                 known_parameter_ids.add(id(parameter))
         return params
 
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """在普通 LoRA 映射上，将 Hybrid FFT 槽位也转换成 ``default``。"""
+        mapping = super()._optimizer_param_name_mapping(adapter_name, optimizer)
+        tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
+        physical_token = f'.modules_to_save.fft_{tenant.index}.'
+        checkpoint_token = '.modules_to_save.default.'
+        for group in optimizer.param_groups:
+            for name in group.get('param_names', []):
+                checkpoint_name = name.replace(physical_token, checkpoint_token)
+                if checkpoint_name != name:
+                    mapping[name] = checkpoint_name
+        return mapping
+
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         adapter_name = kwargs.get('adapter_name')
@@ -193,10 +206,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             normalized[field] = value
         return normalized
 
-    @staticmethod
-    def _optimizer_param_names(optimizer) -> List[List[str]]:
-        return [list(group.get('param_names', [])) for group in optimizer.param_groups]
-
     def _write_hybrid_training_manifest(self, training_dir: str, adapter_name: str) -> None:
         if not Platform.is_master():
             return
@@ -206,7 +215,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             trainer_state = json.load(handle)
         trainer_state.update({
             'checkpoint_boundary': 'optimizer_step',
-            'optimizer_param_names': self._optimizer_param_names(optimizer_group.optimizer),
             'scheduler_class': self._class_identity(optimizer_group.lr_scheduler),
             'has_scaler': optimizer_group.scaler is not None,
         })
@@ -232,8 +240,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         optimizer_path = os.path.join(training_dir, 'optimizer.pt')
         if not os.path.isfile(optimizer_path):
             raise ValueError('Spectral Hybrid training state is missing optimizer.pt.')
-        if trainer_state.get('optimizer_param_names') != self._optimizer_param_names(optimizer_group.optimizer):
-            raise ValueError('Spectral Hybrid optimizer parameter groups do not match the checkpoint.')
         saved_scheduler = trainer_state.get('scheduler_class')
         if saved_scheduler != self._class_identity(optimizer_group.lr_scheduler):
             raise ValueError('Spectral Hybrid scheduler configuration does not match the checkpoint.')
