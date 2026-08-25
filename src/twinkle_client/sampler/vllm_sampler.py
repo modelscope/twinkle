@@ -1,8 +1,9 @@
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
-from twinkle.data_format import Trajectory, InputFeature
+from twinkle.data_format import Trajectory, InputFeature, SamplingParams
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -68,7 +69,7 @@ class vLLMSampler:
     def sample(
         self,
         inputs: Union[List[Trajectory], List[InputFeature]],
-        sampling_params: Optional[Dict[str, Any]] = None,
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
@@ -77,7 +78,7 @@ class vLLMSampler:
 
         Args:
             inputs: List of Trajectory or InputFeature to sample from.
-            sampling_params: Sampling parameters dict.
+            sampling_params: Sampling parameters mapping or Twinkle ``SamplingParams``.
             adapter_name: Adapter name for LoRA inference.
             adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference.
             num_samples: Number of completions to generate per prompt.
@@ -85,11 +86,21 @@ class vLLMSampler:
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
+        if isinstance(sampling_params, SamplingParams):
+            sampling_params = asdict(sampling_params)
+        elif sampling_params is not None:
+            sampling_params = dict(sampling_params)
+        if num_samples != 1:
+            if sampling_params is None:
+                sampling_params = {'num_samples': num_samples}
+            elif sampling_params.get('num_samples', num_samples) != num_samples:
+                raise ValueError('num_samples conflicts with sampling_params.num_samples')
+            else:
+                sampling_params['num_samples'] = num_samples
         json_data = {
             'inputs': _json_safe(inputs),
-            'sampling_params': sampling_params,
+            'sampling_params': _json_safe(sampling_params),
             'adapter_name': adapter_name,
-            'num_samples': num_samples,
         }
         if adapter_uri is not None:
             json_data['adapter_uri'] = adapter_uri

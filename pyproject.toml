@@ -25,6 +25,7 @@ twinkle-server = "twinkle.server.cli:main"
 twinkle-auto = "twinkle_client.auto:main"
 
 [project.optional-dependencies]
+eval = ["evalscope>=1.11,<1.12"]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]
 data = ["py-data-juicer"]
 rl = [
