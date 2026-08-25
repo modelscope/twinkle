@@ -103,7 +103,6 @@ class InputProcessor:
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
 
         def to_tensor(_input):
-            import torch
             for key in list(_input.keys()):
                 value = _input[key]
                 # Ray/pyarrow can return numpy or list scalars; normalize to tensors.
@@ -481,7 +480,6 @@ class InputProcessor:
                 sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
-            import torch
             max_len = max([s.shape[0] for s in sequences])
 
             padded_sequences = []
@@ -494,7 +492,6 @@ class InputProcessor:
 
     @staticmethod
     def _create_4d_attention_mask(attention_mask):
-        import torch
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
         device = attention_mask[0].device
@@ -660,7 +657,6 @@ class InputProcessor:
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        import torch
         results = []
         for _input in inputs:
             output = {}
@@ -679,6 +675,8 @@ class InputProcessor:
                 'max_length_k',
                 'packed_seq_params',
                 'routed_experts',
+                'mm_token_type_ids',
+                'second_per_grid_ts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key not in _keys:
@@ -691,13 +689,43 @@ class InputProcessor:
             results.append(InputFeature(**output))
         return results
 
-    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
-        import torch
+    # when training on mixed text + multimodal data, some fields (e.g. mm_token_type_ids)
+    # only exist on multimodal samples. We pad those fields for the missing samples instead of
+    # letting collate blow up with a KeyError.
+    def _fill_optional_sequence_fields(self, batch: List[InputFeature]) -> None:
+        if len(batch) < 2:
+            return
+        seq_fields = set(self.padding_map) - set(self.VLM_CONCAT_FIELDS)
+        present = {k for feat in batch for k in feat if k in seq_fields}
+        for key in present:
+            missing = [feat for feat in batch if feat.get(key) is None]
+            if not missing or len(missing) == len(batch):
+                continue  # all-present (no gap) or all-absent (nothing to align to) -> leave as is
+            pad_value = self.padding_map[key]
+            for feat in missing:
+                input_ids = feat.get('input_ids')
+                if input_ids is None:
+                    continue
+                # Match the row's device/dtype: prepare_inputs may already have moved rows to the
+                # accelerator, and a CPU fill would break the cat inside the collate below.
+                reference = input_ids if isinstance(input_ids, torch.Tensor) else None
+                length = reference.shape[-1] if reference is not None else len(input_ids)
+                feat[key] = torch.full((length, ),
+                                       pad_value,
+                                       dtype=torch.long,
+                                       device=reference.device if reference is not None else None)
 
+    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+        # Work on local copies so squeezing doesn't mutate the caller's original samples.
+        squeezed = []
         for _input in inputs:
+            _input = dict(_input)
             for key in list(_input.keys()):
                 if isinstance(_input[key], torch.Tensor):
                     _input[key] = _input[key].squeeze()
+            squeezed.append(_input)
+        inputs = squeezed
+        self._fill_optional_sequence_fields(inputs)
 
         vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
         text_inputs = []

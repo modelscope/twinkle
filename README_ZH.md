@@ -102,6 +102,7 @@ sh INSTALL_MEGATRON.sh
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)
 
 ## 更新日志
+- 🎉2026-08-12 ModelScope的训练服务部署为[Qwen/Qwen3.8-27B](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B)。
 - 🎉2026-08-04 支持沙箱环境下的多轮RL训练：模型生成的代码可在隔离的 [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVM 或 OpenEnv 服务中执行，两个后端共用同一份 `train.py`。参考 [cookbook](cookbook/rl/envs) 和[部署文档](docs/source_zh/使用指引/Agentic%20RL部署与训练.md)。
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
 - 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用`from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout`进行多轮rollout。
@@ -132,13 +133,16 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 随着新模型的发布，我们将添加对更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。
 
 >[!Note]
-> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.6-27B](https://modelscope.cn/models/Qwen/Qwen3.6-27B)。
+> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.8-27B](https://modelscope.cn/models/Qwen/Qwen3.8-27B)。
 
 | Model Type          | Model ID 举例                                                                                                     |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
 | qwen3 全系列           | [Qwen/Qwen3-14B-Base](https://modelscope.cn/models/Qwen/Qwen3-14B-Base)                                         |           0.6B/1.7B/4B/8B/14B           | transformers>=4.51   |        ✔         |                     [Qwen/Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base)                     |
 |                     | [Qwen/Qwen3-32B](https://modelscope.cn/models/Qwen/Qwen3-32B)                                                   |         0.6B/1.7B/4B/8B/14B/32B         | transformers>=4.51   |        ✔         |                          [Qwen/Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B)                          |
 | qwen3_moe 全系列       | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                 |       30B-A3B/A3B-Base，235B-A22B        | transformers>=4.51   |        ✔         |                 [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                 |
+| qwen3.8 全系列 | [Qwen/Qwen3.8-27B](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B) | 27B | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) |
+| qwen3.6 moe 全系列 | [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) | 35B-A3B, etc. | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) |
+| qwen3.6 全系列 | [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) | 4B ~ 27B | transformers>=5.2.0 | ✔ | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) |
 | qwen3.5 moe 全系列     | [Qwen/Qwen3.5-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)                                   |         35B-A3B,122B-A10B, etc.         | transformers>=5.2.0   |        ✔         |                    [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)                    |
 | qwen3.5 全系列         | [Qwen/Qwen3.5-9B](https://www.modelscope.cn/models/Qwen/Qwen3.5-9B)                                             |                2B ~ 27B                 | transformers>=5.2.0   |        ✔         |                         [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)                         |
 | qwen2 全系列           | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct)                               |            0.5B/1.5B/7B/72B             | transformers>=4.37   |        ✔         |                [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)                |
@@ -243,7 +247,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.6-27B'
+base_model = 'ms://Qwen/Qwen3.8-27B'
 base_url='your-base-url'
 api_key='your-api-key'
 

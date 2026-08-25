@@ -80,3 +80,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "twinkle_client.skills.bundled" = ["*.md"]
+"twinkle.kernel.ops.dsv4_sas_li.aclnn" = ["*.h", "*.cpp", "**/*.cpp"]

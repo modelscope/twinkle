@@ -37,8 +37,13 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
 
-    def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs) -> None:
-        """Add a new adapter to the model."""
+    def add_adapter_to_model(self, adapter_name: str, config: Optional[Dict[str, Any]] = None, **kwargs) -> None:
+        """Add a new adapter to the model.
+
+        Pass a peft ``LoraConfig`` (or its dict form) for LoRA training against a
+        LoRA-mode deployment. Pass ``config=None`` for full-parameter training
+        against a ``train_mode: full`` deployment.
+        """
         save_dir = kwargs.get('save_dir')
         if save_dir:
             kwargs['save_dir'] = Path(save_dir).expanduser().resolve().as_posix()
