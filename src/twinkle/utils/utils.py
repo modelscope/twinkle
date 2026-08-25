@@ -107,7 +107,7 @@ def get_runtime_meta() -> str:
     ip = 'unknown'
     try:
         hostname = socket.gethostname()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -117,10 +117,10 @@ def get_runtime_meta() -> str:
             ip = s.getsockname()[0]
         finally:
             s.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         try:
             ip = socket.gethostbyname(hostname)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     rank = os.environ.get('RANK', '?')
     world_size = os.environ.get('WORLD_SIZE', '?')

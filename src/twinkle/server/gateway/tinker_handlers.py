@@ -63,7 +63,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.post('/session_heartbeat')
     async def session_heartbeat(
         request: Request, body: types.SessionHeartbeatRequest, self: GatewayServer = Depends(self_fn)
-    ) -> types.SessionHeartbeatResponse:  # noqa: E125
+    ) -> types.SessionHeartbeatResponse:
         alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise HTTPException(status_code=404, detail='Unknown session')
@@ -72,7 +72,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.post('/create_sampling_session')
     async def create_sampling_session(
         request: Request, body: types.CreateSamplingSessionRequest, self: GatewayServer = Depends(self_fn)
-    ) -> types.CreateSamplingSessionResponse:  # noqa: E125
+    ) -> types.CreateSamplingSessionResponse:
         sampling_session_id = await self.state.create_sampling_session(body.model_dump())
         return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 

@@ -80,3 +80,22 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "twinkle_client.skills.bundled" = ["*.md"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["docs/src", "*.pyi", ".git", "peft.py", "examples", "cookbook", "client_tools", "src/twinkle_client", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "W", "I", "UP", "T"]
+ignore = ["F401", "F403", "F405", "F821", "E251"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["twinkle"]
+known-third-party = ["json", "yaml"]
+extra-standard-library = ["setuptools"]
+no-lines-before = ["standard-library", "local-folder"]
+default-section = "third-party"
+
+[tool.ruff.format]
+quote-style = "double"

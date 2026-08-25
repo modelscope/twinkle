@@ -31,7 +31,7 @@ _OTLP_TRANSPORT_LOGGER_PREFIXES = ('opentelemetry', 'grpc', 'urllib3')
 class _OTLPTransportFilter(logging.Filter):
     """Drop log records emitted by the OTLP transport stack (feedback-loop guard)."""
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - logging API
+    def filter(self, record: logging.LogRecord) -> bool:  # logging API
         name = record.name or ''
         for prefix in _OTLP_TRANSPORT_LOGGER_PREFIXES:
             if name == prefix or name.startswith(prefix + '.'):

@@ -525,7 +525,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
             try:
                 _maybe_load_worker_notifier()
                 _new_init_body(self, _caller, *args, **kwargs)
-            except Exception as _e:  # noqa: BLE001
+            except Exception as _e:
                 _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
@@ -818,7 +818,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     raise NotImplementedError(f'Unsupported mode {_mode}')
             except StopIteration:
                 raise
-            except Exception as _e:  # noqa: BLE001
+            except Exception as _e:
                 _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
