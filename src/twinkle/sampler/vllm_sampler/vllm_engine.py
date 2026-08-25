@@ -49,8 +49,61 @@ def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[Sampl
             raise RuntimeError('vLLM output is missing sampling mask while sampling replay is enabled')
         return None
 
-    token_ids = [int(token_id) for token_id in mask.token_ids]
-    offsets = [int(offset) for offset in mask.offsets]
+    def to_list(value):
+        if hasattr(value, 'tolist'):
+            value = value.tolist()
+        return value
+
+    def flatten_ints(values):
+        values = to_list(values)
+        if isinstance(values, (list, tuple)):
+            flattened = []
+            for value in values:
+                flattened.extend(flatten_ints(value))
+            return flattened
+        return [int(values)]
+
+    raw_token_ids = to_list(mask.token_ids)
+    token_ids = flatten_ints(raw_token_ids)
+
+    raw_offsets = to_list(getattr(mask, 'offsets', None))
+    if raw_offsets is None:
+        # Newer vLLM sampling-mask variants expose one token-id list per
+        # generated token instead of a separate CSR offsets field. Preserve
+        # those row boundaries while converting to Twinkle's CSR format.
+        if not isinstance(raw_token_ids, (list, tuple)) or len(raw_token_ids) != num_tokens \
+                or any(not isinstance(to_list(row), (list, tuple)) for row in raw_token_ids):
+            raise RuntimeError('vLLM sampling mask without offsets must provide one token-id row '
+                               'per sampled token')
+        offsets = [0]
+        for row in raw_token_ids:
+            offsets.append(offsets[-1] + len(flatten_ints(row)))
+    else:
+        offsets = flatten_ints(raw_offsets)
+
+    def is_global_csr(candidate_offsets):
+        return (len(candidate_offsets) == num_tokens + 1 and candidate_offsets[0] == 0
+                and candidate_offsets[-1] == len(token_ids)
+                and all(start < end for start, end in zip(candidate_offsets, candidate_offsets[1:])))
+
+    # Some vLLM builds preserve per-step/per-chunk tensors as nested lists in
+    # RequestOutput. A nested offsets field then contains a local CSR per chunk
+    # (each starts at zero), so compose those local layouts into one global CSR.
+    if raw_offsets is not None and not is_global_csr(offsets) \
+            and isinstance(raw_token_ids, (list, tuple)) \
+            and isinstance(raw_offsets, (list, tuple)) and len(raw_token_ids) == len(raw_offsets) \
+            and any(isinstance(to_list(offset), (list, tuple)) for offset in raw_offsets):
+        token_chunks = [flatten_ints(chunk) for chunk in raw_token_ids]
+        offset_chunks = [flatten_ints(chunk) for chunk in raw_offsets]
+        composed_offsets = [0]
+        for chunk_idx, (token_chunk, offset_chunk) in enumerate(zip(token_chunks, offset_chunks)):
+            if (not offset_chunk or offset_chunk[0] != 0 or offset_chunk[-1] != len(token_chunk)
+                    or any(start >= end for start, end in zip(offset_chunk, offset_chunk[1:]))):
+                raise RuntimeError(f'vLLM sampling mask chunk {chunk_idx} has invalid CSR offsets')
+            base_offset = composed_offsets[-1]
+            composed_offsets.extend(base_offset + offset for offset in offset_chunk[1:])
+        offsets = composed_offsets
+
     num_rows = len(offsets) - 1
     if num_rows != num_tokens:
         raise RuntimeError(f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
@@ -67,6 +120,50 @@ def _set_sampling_replay_output_kind(vllm_params, enable_sampling_replay: bool) 
         return
     from vllm.sampling_params import RequestOutputKind
     vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
+
+
+def _validate_sampling_replay_params(sampling_params, extra_kwargs: Dict[str, Any]) -> None:
+    """Reject score-changing logits processors that a support mask cannot replay."""
+    neutral_values = {
+        'repetition_penalty': 1.0,
+        'presence_penalty': 0.0,
+        'frequency_penalty': 0.0,
+        'logit_bias': None,
+        'logits_processor': None,
+        'logits_processors': None,
+    }
+    incompatible = []
+    for name, neutral in neutral_values.items():
+        values = []
+        if isinstance(sampling_params, dict):
+            if name in sampling_params:
+                values.append(sampling_params[name])
+        elif hasattr(sampling_params, name):
+            values.append(getattr(sampling_params, name))
+        if name in extra_kwargs:
+            values.append(extra_kwargs[name])
+
+        if neutral is None:
+            enabled = any(bool(value) for value in values)
+        else:
+            enabled = any(value is not None and value != neutral for value in values)
+        if enabled:
+            incompatible.append(name)
+
+    if incompatible:
+        names = ', '.join(incompatible)
+        raise ValueError('sampling replay does not support score-changing logits processors; '
+                         f'disable these options: {names}')
+
+    if 'top_k' in extra_kwargs:
+        top_k = extra_kwargs['top_k']
+    elif isinstance(sampling_params, dict):
+        top_k = sampling_params.get('top_k')
+    else:
+        top_k = getattr(sampling_params, 'top_k', None)
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError('sampling distribution replay requires top_k > 0 to bound sampling mask size, '
+                         'reduce transfer overhead, and avoid potential OOMs')
 
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
@@ -289,6 +386,8 @@ class VLLMEngine(BaseSamplerEngine):
         from vllm.inputs import TextPrompt, TokensPrompt
 
         # Convert to vLLM params
+        if self.enable_sampling_replay:
+            _validate_sampling_replay_params(sampling_params, kwargs)
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0

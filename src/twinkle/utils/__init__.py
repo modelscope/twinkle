@@ -11,8 +11,8 @@ from .parallel import processing_lock
 from .platforms import GPU, NPU, Platform, ensure_hccl_socket_env, ensure_npu_backend
 from .safetensors import LazyTensor, SafetensorLazyLoader, StreamingSafetensorSaver
 from .torch_utils import (clone_state_dict_to_cpu, pad_and_stack_tensors, pad_sequence_to_length,
-                          replayed_selective_log_softmax, selective_log_softmax, split_cp_inputs,
-                          stateless_init_process_group, to_device)
+                          prepare_replayed_selective_log_softmax, replayed_selective_log_softmax, selective_log_softmax,
+                          split_cp_inputs, stateless_init_process_group, to_device)
 from .transformers_utils import find_all_linears, find_layers, get_modules_to_not_convert
 from .unsafe import check_unsafe, trust_remote_code
 from .utils import copy_files_by_pattern, deep_getattr, get_runtime_meta
