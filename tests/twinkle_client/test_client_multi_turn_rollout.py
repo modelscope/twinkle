@@ -428,6 +428,31 @@ def test_max_turns_one_forces_truncation(logprobs_flags):
         assert out['turns'] == 1
 
 
+@settings(deadline=None, max_examples=60)
+@given(logprobs_flags=st.lists(st.booleans(), min_size=1, max_size=5))
+def test_length_stop_marks_truncated(logprobs_flags):
+    """A reply cut off at the generation budget is ``truncated=True``.
+
+    Same flag as the ``max_turns`` edge above: a consumer that filters on
+    ``truncated`` to separate trajectories that concluded from ones that ran out
+    of room would otherwise treat a cut-off reply as a finished one.
+    """
+    # Terminal turn ends on 'length' with no tool-call turns before it, so the
+    # very first generation is the one that gets cut.
+    scripts_spec = [{'num_tools': 0, 'terminal': 'length', 'logprobs': lp} for lp in logprobs_flags]
+    trajectories, sampler, template = _build_from_scripts(scripts_spec)
+    rollout = ClientMultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=4)
+
+    outs = rollout(copy.deepcopy(trajectories))
+
+    assert len(outs) == len(trajectories)
+    for out in outs:
+        assert out['stop_reason'] == 'length'
+        assert out['truncated'] is True
+        assert out['turns'] == 1
+
+
 # =============================================================================
 # Deterministic unit tests: exception paths & dependency reuse (non-hypothesis)
 #

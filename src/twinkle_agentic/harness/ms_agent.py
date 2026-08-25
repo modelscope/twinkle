@@ -27,6 +27,7 @@ the same :class:`~twinkle_agentic.envs.base.Env` backend. This class must
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
@@ -451,6 +452,16 @@ def patch_ms_agent_python_executor() -> bool:
     reimplementing the method, so ms-agent keeps owning timeouts, output capture
     and the JSON result shape.
 
+    It also chdirs into the tool's own workspace before each call. That ``exec``
+    runs in the host process, so a relative path in model code resolves against
+    whatever directory the process happens to be in, while ``shell_executor`` and
+    every ``file_system`` tool pass ``cwd=self._ws.root``. Measured in the RSI
+    sandbox before the fix: ``write_file 'a.txt'`` answered "Save file
+    successfully" and the next python call got ``[Errno 2] No such file or
+    directory: 'a.txt'``, because the file was in the workspace and python was
+    looking in ``/``; it accounted for 41 of one run's 58 such failures, and files
+    python wrote landed outside the directory an episode's end state is read from.
+
     Idempotent. Returns True when it patched, False when ms-agent is missing or
     the patch is already in place.
     """
@@ -464,6 +475,10 @@ def patch_ms_agent_python_executor() -> bool:
         return False
 
     async def python_executor(self, code: str, description: str = '', timeout=None):
+        root = getattr(self, 'output_dir', None) or getattr(getattr(self, '_ws', None), 'root', None)
+        if root:
+            os.makedirs(root, exist_ok=True)
+            os.chdir(root)
         return await original(self, single_namespace_source(code),
                               description=description, timeout=timeout)
 

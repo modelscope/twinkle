@@ -12,6 +12,15 @@ class SamplingParams:
     max_tokens: Optional[int] = None
     seed: Optional[int] = None
     stop: Union[str, Sequence[str], Sequence[int], None] = None
+    # Whether what ``stop`` matched stays in the output. vLLM drops it by
+    # default -- both the string form and the token-id form, since v1's
+    # detokenizer excludes the final token whenever a stop terminated the
+    # request -- which is wrong for a stop that is part of the syntax being
+    # generated. Stopping a tool-using agent at '</tool_call>' so it reads one
+    # observation before deciding the next call is exactly that case: without
+    # this, every turn the policy is trained on ends on an unclosed
+    # '<tool_call>' block.
+    include_stop_str_in_output: bool = False
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
@@ -95,6 +104,8 @@ class SamplingParams:
                 kwargs['stop_token_ids'] = list(self.stop)
             else:
                 kwargs['stop'] = list(self.stop)
+            if self.include_stop_str_in_output:
+                kwargs['include_stop_str_in_output'] = True
 
         if self.logprobs is not None:
             kwargs['logprobs'] = self.logprobs

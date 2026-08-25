@@ -84,6 +84,40 @@ BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-slim sh sandbox_server/insta
 image comes through it. Substitute your own Aliyun accelerator address
 (`<id>.mirror.aliyuncs.com`) if you would rather not depend on one.
 
+#### When the template build is too slow to use
+
+On 2026-08-23 three `aenv build` runs on our host failed or ran for hours, and
+the cause was download speed rather than the Dockerfile. Measured within one
+minute, from inside a sandbox: `deb.debian.org` 33 KB/s, `mirrors.aliyun.com`
+5.4 MB/s, and for comparison the host itself 12 MB/s and sandbox disk writes
+639 MB/s. apt's package index alone is 9.6MB, so the build sat two hours with no
+output -- and since the server logs `template build started` and then nothing
+until the build ends, slow is indistinguishable from hung. The Dockerfile now
+rewrites `deb.debian.org` to the Aliyun mirror, which should remove the cause.
+
+The path that is verified end to end installs inside a live sandbox and
+snapshots it, which needs no template builder and takes about six minutes:
+
+```bash
+sh sandbox_server/build_via_sandbox.sh                     # name: twinkle-rsi-msagent
+NAME=twinkle-rsi-msagent-v2 sh sandbox_server/build_via_sandbox.sh   # verify first
+```
+
+Three things to know about a snapshot:
+
+* it shows up in `aenv snapshot list`, **not** `aenv template list`, but the name
+  lives in the same namespace -- `--sandbox-template twinkle-rsi-msagent`
+  resolves to it unchanged;
+* it keeps the filesystem, not the image config, so the Dockerfile's `ENV
+  PYTHONUNBUFFERED=1`, `ENV PIP_INDEX_URL=...` and `WORKDIR /workspace` are gone.
+  `build_via_sandbox.sh` writes `/etc/pip.conf` and `/workspace` instead, and
+  `remote_tool_env` starts the runtime with `python -u`;
+* aenv refuses to rebind an existing name, so replacing an image means deleting
+  the old one first. Build under a second name and verify before you do that --
+  deleting first cost us four hours with no usable sandbox.
+
+Verify either one from the training host with the boot check below.
+
 The Dockerfile also pins `PIP_INDEX_URL` to an Aliyun mirror for the same
 reason -- edit those two lines if your host reaches pypi.org directly.
 
@@ -165,7 +199,7 @@ ssh -N -L 8000:127.0.0.1:8000 root@<env-host-ip>
 | Variable | Default | |
 |---|---|---|
 | `AENV_API_URL` | `http://127.0.0.1:8000` | AgentENV server |
-| `AENV_TEMPLATE` | `twinkle-rsi-msagent` | template built by `install.sh` |
+| `AENV_TEMPLATE` | `twinkle-rsi-msagent` | template or snapshot name to boot from |
 | `RSI_TASKS` | `tasks.example.jsonl` | task file |
 | `RSI_AGENT_CONFIG` | `rsi_agent.yaml` | uploaded into every sandbox |
 | `RSI_SANDBOX_TIMEOUT` | `900` | must outlast an episode plus its checks |
@@ -191,8 +225,9 @@ accordingly.
 | `remote_tool_env.py` | training-side Env: forwards tool calls, copies files back |
 | `rsi_agent.yaml` | ms-agent config -- read by *both* halves |
 | `sandbox_server/tool_server.py` | in-sandbox HTTP server owning the ToolManager |
-| `sandbox_server/Dockerfile` | template image: ms-agent, ripgrep, ipykernel |
+| `sandbox_server/Dockerfile` | template image: ms-agent, ripgrep, ffmpeg, imagemagick, openpyxl/reportlab/pdfplumber |
 | `sandbox_server/install.sh` | install AgentENV + build the template |
+| `sandbox_server/build_via_sandbox.sh` | build the image as a snapshot of a live sandbox instead |
 | `sandbox_server/serve.sh` | start the AgentENV server |
 | `tasks.example.jsonl` | hand-written tasks in the structured `checks` format |
 

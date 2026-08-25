@@ -51,6 +51,28 @@ def _unpack_tool_call(tool_call: Any) -> Tuple[Optional[str], Dict[str, Any], Op
                       f'got {type(raw_args).__name__}.')
 
 
+def _suggest(name: str, available: Iterable[str]) -> Optional[str]:
+    """The registered tool ``name`` was probably meant to be, if there is one.
+
+    Only one mistake is guessed at: a name given without its namespace, or under
+    the wrong one. Agent frameworks hand out qualified names -- ms-agent's are
+    ``{server}---{tool}`` -- and a model that has seen the bare verb in a
+    docstring writes ``shell_executor``, or files it under the server it was last
+    using. Measured over 5793 calls: 201 bare ``shell_executor`` and 30
+    ``file_system---shell_executor``, all for one tool that does exist.
+
+    Deliberately only a suggestion: the call is still refused. Resolving it
+    silently would train the policy to emit a name that no serving deployment
+    accepts, and the unqualified form is ambiguous the moment two servers export
+    the same verb -- which is why a suffix shared by several tools yields nothing.
+    """
+    wanted = name.rsplit('---', 1)[-1]
+    if not wanted:
+        return None
+    matches = [n for n in available if n != name and n.rsplit('---', 1)[-1] == wanted]
+    return matches[0] if len(matches) == 1 else None
+
+
 class ToolManager:
 
     def __init__(
@@ -102,7 +124,11 @@ class ToolManager:
             return err
         if (tool := self._tools.get(name)) is None:
             available = ', '.join(sorted(self._tools)) or '(none)'
-            return f'Error: unknown tool {name!r}. Available: {available}.'
+            hint = ''
+            if (suggestion := _suggest(name, self._tools)) is not None:
+                hint = (f' Did you mean {suggestion!r}? Tool names must be given in '
+                        f'full, including the part before "---".')
+            return f'Error: unknown tool {name!r}.{hint} Available: {available}.'
         try:
             return str(tool(name, args))
         except Exception as e:  # noqa
@@ -117,9 +143,19 @@ class ToolManager:
 
         ``tool_calls`` are the OpenAI-shaped dicts produced by
         :meth:`~twinkle.template.base.Template.parse_tool_call`. This method
-        unpacks them to ``(name, arguments)`` and, when every tool wraps the
-        same :class:`~twinkle_agentic.envs.base.Env`, dispatches through
+        unpacks them to ``(name, arguments)`` and, when the tools wrap the same
+        :class:`~twinkle_agentic.envs.base.Env`, dispatches through
         ``Env.step_batch``. Otherwise a thread pool of :meth:`__call__`.
+
+        A call this manager can answer by itself -- an unknown name, a malformed
+        payload -- is answered here and *excluded* from the batch rather than
+        disqualifying it. It used to disqualify it: one bare ``shell_executor``
+        in a turn of five sent the whole turn down the thread pool, and
+        concurrent dispatch is where the environment is least likely to be safe.
+        It was not: in ex4's episode 8 four calls fired at once and all four came
+        back with the same glob listing, so the model was told its python had run
+        when it never did. Nothing in that turn needed concurrency -- the reason
+        it was used was a tool name the host could have refused on the spot.
         """
         calls = list(tool_calls)
         if not calls:
@@ -129,19 +165,25 @@ class ToolManager:
 
         unpacked = [_unpack_tool_call(tc) for tc in calls]
         env = self._shared_env()
-        can_batch = env is not None and all(
-            err is None and name in self._tools for name, _args, err in unpacked)
-        if can_batch:
+        if env is not None:
+            out: List[Optional[str]] = [None] * len(calls)
+            batched: List[Tuple[int, str, Dict[str, Any]]] = []
+            for i, (name, args, err) in enumerate(unpacked):
+                if err is None and name in self._tools:
+                    batched.append((i, name, args))
+                else:
+                    out[i] = self(calls[i])
             try:
-                results = env.step_batch([(name, args) for name, args, _err in unpacked])
-                return [
-                    r.observation if hasattr(r, 'observation') else str(r) for r in results
-                ]
+                results = env.step_batch([(name, args) for _i, name, args in batched])
             except Exception:
-                pass
+                results = None
+            if results is not None and len(results) == len(batched):
+                for (i, _name, _args), r in zip(batched, results):
+                    out[i] = r.observation if hasattr(r, 'observation') else str(r)
+                return ['' if x is None else x for x in out]
 
         workers = max_workers or min(32, len(calls))
-        out: List[Optional[str]] = [None] * len(calls)
+        out = [None] * len(calls)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(self, tc): i for i, tc in enumerate(calls)}
             for fut in as_completed(futs):

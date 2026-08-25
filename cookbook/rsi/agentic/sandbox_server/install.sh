@@ -1,6 +1,11 @@
 #!/bin/sh
 # Install AgentENV and build the sandbox template for agentic RSI.
 #
+# If a build stalls with no output, read build_via_sandbox.sh before waiting it
+# out: on our host the builder's VM downloaded at 33 KB/s against a sandbox's
+# 5.4 MB/s, and that script installs inside a live sandbox and snapshots it
+# instead -- six minutes, and no template builder involved.
+#
 # Usage:
 #     sh install.sh                  # install AgentENV + build the template
 #     sh install.sh --rebuild        # delete the old template and rebuild

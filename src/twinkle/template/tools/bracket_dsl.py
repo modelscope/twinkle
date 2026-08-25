@@ -20,6 +20,18 @@ class BracketDslParser(ToolCallParser):
     parentheses (list arguments), so the call list is located by scanning with a
     depth counter rather than by a bracket-free regex. Argument values are read
     as python literals, falling back to the raw text when they are not literals.
+
+    Fenced code blocks are excluded, and so is anything the model wrote inside
+    ``<think>``: this format has no markup of its own, so a python expression is
+    otherwise indistinguishable from a call list. Two further rules keep code out:
+    a block only counts as a call list when every argument in it is a keyword
+    argument (``name=value``), which no comprehension is, and a reply cut off
+    mid-thought leaves ``<think>`` unterminated, so that region runs to the end of
+    the text.
+
+    Getting this wrong is expensive and quiet: ``[int(v) for v in raw]`` in a
+    reply parses as a call to ``int`` with no arguments, the tool the model
+    actually meant to call never runs, and the episode ends having done nothing.
     """
 
     name = 'bracket_dsl'
@@ -33,9 +45,59 @@ class BracketDslParser(ToolCallParser):
     _DETECT_RE = re.compile(r"\[\s*[A-Za-z_][\w.\-' ]*?\s*\(")
     # Split an argument body on top-level commas only (values may hold commas).
     _ARG_NAME_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*(.*)$', re.DOTALL)
+    # A fence runs to its closing delimiter, or to the end of a truncated reply.
+    _FENCE_RE = re.compile(r'```.*?(?:```|\Z)', re.DOTALL)
+    # So does a thinking block: a reply truncated inside one never closes it.
+    _THINK_RE = re.compile(r'<think>.*?(?:</think>|\Z)', re.DOTALL)
+
+    @staticmethod
+    def _fenced_spans(text: str) -> List[Tuple[int, int]]:
+        return [m.span() for m in BracketDslParser._FENCE_RE.finditer(text or '')]
+
+    @staticmethod
+    def _skip_spans(text: str) -> List[Tuple[int, int]]:
+        """Regions where a call list is quoted code or private thought, not a call."""
+        text = text or ''
+        return (BracketDslParser._fenced_spans(text)
+                + [m.span() for m in BracketDslParser._THINK_RE.finditer(text)])
+
+    @staticmethod
+    def _in_spans(index: int, spans: List[Tuple[int, int]]) -> bool:
+        return any(start <= index < end for start, end in spans)
+
+    @classmethod
+    def _is_keyword_body(cls, body: str) -> bool:
+        """Is every argument in this body a ``name=value`` pair?
+
+        An empty body qualifies -- ``[get_time()]`` is a call list. A positional
+        argument does not: that is what a comprehension or a nested expression
+        looks like.
+        """
+        chunks = [c for c in cls._split_top_level(body) if c.strip()]
+        return all(cls._ARG_NAME_RE.match(c) for c in chunks)
+
+    @classmethod
+    def _looks_like_call_list(cls, block: str) -> bool:
+        """Does ``[...]`` hold calls with keyword arguments, and nothing else?"""
+        pos, seen = 1, 0
+        while pos < len(block):
+            m = cls._CALL_START_RE.search(block, pos)
+            if not m:
+                break
+            close = cls._match_paren(block, m.end() - 1)
+            if close is None:
+                return False
+            if not cls._is_keyword_body(block[m.end():close]):
+                return False
+            seen += 1
+            pos = close + 1
+        return seen > 0
 
     def detect(self, text: str) -> bool:
-        return bool(self._DETECT_RE.search(text or ''))
+        # Via _find_blocks, so that detect and parse cannot disagree: a parser
+        # that claims a reply and then finds nothing in it denies the remaining
+        # parsers their turn.
+        return bool(self._find_blocks(text or ''))
 
     @staticmethod
     def _find_blocks(text: str) -> List[Tuple[int, int]]:
@@ -47,9 +109,10 @@ class BracketDslParser(ToolCallParser):
         ("Get Today's Prices") does not start a string.
         """
         spans: List[Tuple[int, int]] = []
+        skip = BracketDslParser._skip_spans(text)
         i, n = 0, len(text or '')
         while i < n:
-            if text[i] != '[':
+            if text[i] != '[' or BracketDslParser._in_spans(i, skip):
                 i += 1
                 continue
             if not BracketDslParser._DETECT_RE.match(text, i):
@@ -75,7 +138,8 @@ class BracketDslParser(ToolCallParser):
                 elif ch == ']':
                     depth -= 1
                     if depth == 0:
-                        spans.append((i, j + 1))
+                        if BracketDslParser._looks_like_call_list(text[i:j + 1]):
+                            spans.append((i, j + 1))
                         break
                 j += 1
             i = (spans[-1][1] if spans and spans[-1][0] == i else i + 1)

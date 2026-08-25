@@ -74,7 +74,7 @@ Each output trajectory dict includes:
 | `labels` | `List[int]` | Training labels (`-100` for non-trainable tokens). |
 | `turns` | `int` | Number of turns performed. |
 | `stop_reason` | `str` | `'stop'` / `'length'` |
-| `truncated` | `bool` | Whether the trajectory was truncated. |
+| `truncated` | `bool` | Whether the trajectory was cut off rather than concluding on its own: generation hit `max_tokens` (`stop_reason='length'`), the turn limit was reached, or a length cap dropped it. |
 | `logprobs` | `List` | Per-token log probabilities (if available). |
 
 ### Ray Remote Support

@@ -14,6 +14,10 @@ _STOP_LENGTH = 'length'
 _STOP_MAX_TURNS = 'max_turns'
 _STOP_API_ERROR = 'api_error'
 
+# Runaway guard: a ``followup_fn`` is expected to return None eventually. This
+# only bounds a callback that never does, so one bad hook cannot spin forever.
+_MAX_FOLLOWUPS = 20
+
 
 class APIMultiTurnRollout(Rollout):
     """Multi-turn rollout over an OpenAI-compatible chat-completions API.
@@ -29,6 +33,13 @@ class APIMultiTurnRollout(Rollout):
       5. ``finish_reason='length'`` => terminate with ``stop_reason='length'``.
       6. ``turn >= max_turns`` => terminate with ``stop_reason='max_turns'``
          (and ``truncated=True``).
+
+    After the tool loop ends, if a ``followup_fn`` was passed (per call or at
+    construction), it is invoked exactly as in :class:`MultiTurnRollout`: it may
+    append one more user message and buy one more generation whose reply is an
+    answer, not a tool turn (tools are withdrawn for it), repeating until the
+    callback returns None. This is what lets a challenger append its check-script
+    and problem-statement stages onto the same conversation.
 
     Constructor and per-call override semantics intentionally mirror
     :class:`MultiTurnRollout`: ``tool_manager`` may be a single instance
@@ -93,6 +104,7 @@ class APIMultiTurnRollout(Rollout):
         extra_body = dict(self.extra_body)
         if 'extra_body' in kwargs and kwargs['extra_body']:
             extra_body.update(kwargs['extra_body'])
+        followup_fn = kwargs.get('followup_fn')
 
         # Per-trajectory thread pool. OpenAI ``/chat/completions`` is
         # one-conversation-per-call; concurrency only buys us network
@@ -100,7 +112,7 @@ class APIMultiTurnRollout(Rollout):
         outs: List[Optional[Trajectory]] = [None] * n
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = {
-                pool.submit(self._run_one, trajectories[i], tool_managers[i], sampling_params, extra_body): i
+                pool.submit(self._run_one, trajectories[i], tool_managers[i], sampling_params, extra_body, followup_fn): i
                 for i in range(n)
             }
             for fut in as_completed(futures):
@@ -120,6 +132,7 @@ class APIMultiTurnRollout(Rollout):
         tool_manager: Optional[ToolManager],
         sampling_params: SamplingParams,
         extra_body: Dict[str, Any],
+        followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
     ) -> Trajectory:
         """Drive the API turn loop for a single trajectory.
 
@@ -199,11 +212,51 @@ class APIMultiTurnRollout(Rollout):
             truncated = True
             stop_reason = _STOP_MAX_TURNS
 
+        # Follow-up stages (check script, problem statement, ...). Each one
+        # appends a user message and takes one generation whose reply is an
+        # answer: tools are withdrawn so the model writes rather than calls.
+        # Skipped entirely on an API error -- the conversation is already broken.
+        followups = 0
+        if followup_fn is not None and stop_reason != _STOP_API_ERROR:
+            while followups < _MAX_FOLLOWUPS:
+                view = dict(trajectory)
+                view['messages'] = messages
+                view['turns'] = turn
+                view['stop_reason'] = stop_reason
+                view['truncated'] = truncated
+                view['followups'] = followups
+                followup = followup_fn(view, followups)
+                if followup is None:
+                    break
+                text, next_params = (followup if isinstance(followup, tuple)
+                                     else (followup, None))
+                messages.append({'role': 'user', 'content': text})
+                followups += 1
+                fu_params = next_params if next_params is not None else sampling_params
+                try:
+                    reply = (self.api(  # tools omitted on purpose: this is an answer
+                        {'messages': messages}, fu_params, extra_body=extra_body)
+                        if extra_body else self.api({'messages': messages}, fu_params))
+                except Exception as exc:
+                    stop_reason = _STOP_API_ERROR
+                    error = f'{type(exc).__name__}: {exc}'
+                    truncated = True
+                    break
+                assistant_msg = self._normalise_assistant(reply, turn + followups)
+                messages.append(assistant_msg)
+                # A follow-up that stopped cleanly means the episode was not cut
+                # off after all, even if the tool phase had hit its turn cap.
+                if assistant_msg.get('finish_reason') == 'length':
+                    truncated = True
+                elif stop_reason == _STOP_MAX_TURNS:
+                    stop_reason = _STOP_NO_TOOL
+
         out = dict(trajectory)
         out['messages'] = messages
         out['turns'] = turn
         out['stop_reason'] = stop_reason
         out['truncated'] = truncated
+        out['followups'] = followups
         if error is not None:
             out['error'] = error
         return out

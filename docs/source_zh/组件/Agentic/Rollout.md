@@ -74,7 +74,7 @@ results = rollout(trajectories)
 | `labels` | `List[int]` | 训练标签（非可训练 token 为 `-100`）。 |
 | `turns` | `int` | 执行的轮次数。 |
 | `stop_reason` | `str` | `'stop'` / `'length'` |
-| `truncated` | `bool` | 轨迹是否被截断。 |
+| `truncated` | `bool` | 轨迹是否被截断（而非自行结束）：生成触及 `max_tokens`（`stop_reason='length'`）、达到轮次上限，或被长度上限丢弃。 |
 | `logprobs` | `List` | 每 token 的对数概率（如有）。 |
 
 ### Ray 远程支持

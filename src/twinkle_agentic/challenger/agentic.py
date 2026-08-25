@@ -2,35 +2,47 @@
 """Agentic challenger: invent tasks by doing them first.
 
 The approach mirrors how the code challenger works, adapted to tool-using
-agents. Instead of writing a problem statement and hoping it is achievable,
-the model first *does* something interesting in a sandbox (round 1), then a
-second call writes check assertions that verify the end state, and a third
-call writes the problem statement someone else would need to reproduce it.
+agents. Instead of writing a problem statement and hoping it is achievable, the
+model first *does* something in a sandbox, then -- in the same conversation --
+writes the check script that verifies the end state it just produced, then the
+problem statement someone else would need to reproduce it.
 
 Steps for one candidate:
 
     1. Choose direction + keywords. Optionally start from a seed trajectory.
-    2. Round 1 (explore, multi-turn with tools): model acts in a clean sandbox,
-       producing a tool-call chain and a final workspace state.
-    3. Round 2a (explore, single-turn): model sees the trajectory and writes a
-       python check script that asserts properties of the end state.
+    2. Explore (multi-turn with tools): model acts in a clean sandbox, producing
+       a tool-call chain and a final workspace state, and stops calling tools.
+    3. A user message is appended to that same conversation carrying the
+       workspace listing, asking for a python check script. Tools are no longer
+       dispatched from here on.
     4. Verify: run the check script in the sandbox (must pass).
-    5. Round 2b (explore, single-turn): model sees trajectory + checks and
-       writes a problem statement.
+    5. A second user message is appended asking for the problem statement.
     6. Difficulty filter: reset workspace, let the solver do the task N times,
        run checks, keep only "sometimes pass" tasks.
 
-Because every round-1 episode needs a clean workspace and because episodes
-share a single long-lived sandbox, round 1 is **serial** -- one proposal at a
-time with a workspace reset in between. Rounds 2a/2b are text-only generation
-and can be batched.
+Steps 3 and 5 are appended to the episode rather than sent as fresh calls, so
+every assistant turn in the chain keeps its ``labels`` and ``logprobs`` and the
+whole proposal -- acting, checking, describing -- is one trainable sample. The
+follow-up messages come back from :meth:`AgenticChallenger._followup`, which the
+rollout calls at the moment the model stops calling tools; that is where the
+sandbox work (snapshot, running the check) happens, because only the caller can
+do it.
+
+Because every episode needs a clean workspace and because episodes share a
+single long-lived sandbox, proposing is **serial** -- one proposal at a time with
+a workspace reset in between.
 
 Prompt text is not here. Every string the model sees arrives in
 :class:`AgenticPrompts`, built by whoever runs the challenger -- see
 ``cookbook/rsi/agentic/prompts.py``.
 """
+import ast
+import json
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import SamplingParams, Trajectory, user_data_get
@@ -48,6 +60,11 @@ __all__ = [
 ]
 
 _FENCE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.S)
+# A fence around the *whole* reply, which is packaging rather than content.
+_WHOLE_FENCE_RE = re.compile(r'```[\w+-]*\s*\n?(.*?)```', re.S)
+# The JSON body of a tool call: the proposing episode uses tools, so at the check
+# stage a 4B model often keeps calling one instead of writing a fenced block.
+_TOOLCALL_RE = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.S)
 
 
 # ── parsing ───────────────────────────────────────────────────────────────
@@ -55,7 +72,12 @@ _FENCE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.S)
 def parse_check_script(text: str) -> Optional[str]:
     """Extract a python check script from the model's reply.
 
-    Looks for the last fenced python code block after ``</think>``.
+    Prefers the last fenced python block after ``</think>``. When the reply has
+    no fence at all, falls back to reading the tail as bare code: 8 of
+    armA2shellV6's 11 check_parse_fail rejections were a complete, parseable
+    check script that the model simply did not wrap in backticks, and throwing
+    the task away over the packaging loses a task that was ready.
+
     Returns ``None`` when nothing usable is found.
     """
     body = text or ''
@@ -63,43 +85,187 @@ def parse_check_script(text: str) -> Optional[str]:
     if idx >= 0:
         body = body[idx + len('</think>'):]
     blocks = _FENCE_RE.findall(body)
-    if not blocks:
+    if blocks:
+        script = blocks[-1].strip()
+        return script if script else None
+    bare = _bare_check_script(body)
+    if bare:
+        return bare
+    return _toolcall_check_script(body)
+
+
+def _bare_check_script(body: str) -> Optional[str]:
+    """Read an unfenced reply as code, or None.
+
+    Advances the start line until the rest parses, which drops whatever prose
+    came first (the "ALSO CORRECT:" line, a sentence introducing the script)
+    without needing to recognise it. Requires an ``assert`` so that a one-line
+    reply of prose -- which can be a syntactically valid expression -- is not
+    mistaken for a check.
+    """
+    lines = body.strip().split('\n')
+    for start in range(len(lines)):
+        cand = '\n'.join(lines[start:]).strip()
+        if 'assert' not in cand:
+            break  # no assert left in the tail; nothing further can qualify
+        try:
+            ast.parse(cand)
+        except SyntaxError:
+            continue
+        return cand
+    return None
+
+
+def _toolcall_check_script(body: str) -> Optional[str]:
+    """Recover a check script the model put inside a tool call, or None.
+
+    The proposing episode uses tools, and at the check stage a 4B model often
+    keeps calling one -- it emits ``python_executor(code="...assert...")`` (or a
+    shell command, or ``write_file(content=...)``) instead of a fenced block.
+    The script is right there in the call's ``code``/``command``/``content``
+    argument, so pull it out rather than lose the task: measured on run_clean1,
+    most first-round check_parse_fail rejections were tool-call wrapped.
+
+    Only code that parses and actually asserts is accepted, so a shell
+    ``command`` that merely runs a file -- which has no assert of its own --
+    does not slip through as a check.
+    """
+    blobs = _TOOLCALL_RE.findall(body)
+    for blob in reversed(blobs):
+        code = None
+        try:
+            obj = json.loads(blob)
+            args = obj.get('arguments') if isinstance(obj, dict) else None
+            if isinstance(args, dict):
+                code = args.get('code') or args.get('command') or args.get('content')
+        except (ValueError, AttributeError):
+            m = re.search(r'"(?:code|command|content)"\s*:\s*"(.*?)"\s*\}', blob,
+                          re.S)
+            if m:
+                try:
+                    code = m.group(1).encode().decode('unicode_escape')
+                except (UnicodeDecodeError, ValueError):
+                    code = None
+        if not code or 'assert' not in code:
+            continue
+        try:
+            ast.parse(code)
+        except SyntaxError:
+            continue
+        return code.strip()
+    return None
+
+
+
+# Two rules CHECK_FOLLOWUP already states -- no equality on a script's source
+# text, no byte count or checksum on a binary -- were broken by 9 and 8 of 41
+# measured tasks respectively, so stating them a third time is not the fix. A
+# check that pins the exact source of a .py rejects every equivalent solution,
+# and one that pins a .png's byte count rejects every matplotlib version; both
+# make a task nobody but the author can pass.
+_SIZE_OR_HASH_NAMES = ('getsize', 'st_size', 'sha256', 'sha1', 'md5', 'hexdigest',
+                       'digest')
+# What makes a string python rather than data. Checked instead of "is it long and
+# multi-line", because the contents of a csv or a json file are legitimately
+# asserted verbatim -- the statement handed those to the solver -- while the text
+# of a script never is.
+_LOOKS_LIKE_PYTHON = ('import ', 'def ', 'print(', 'with open(', 'if __name__')
+
+
+def brittle_check_reason(script: str) -> Optional[str]:
+    """Why this check script would reject a correct solution, or None.
+
+    Returned text goes back to the model through the same retry path a failing
+    assertion uses, because the defect is the same kind: an assertion that does
+    not hold for solutions other than the one in front of it.
+
+    Read off the syntax tree rather than matched as text. Both defects survive
+    patterns easily: source equality reads the file into a name first
+    (``c = f.read()``, then ``assert c == '...'``) so nothing sits between
+    ``open()`` and ``==``, and a size check can put the call either around the
+    name (``getsize("a.png")``) or after it.
+    """
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        # Unparseable means it cannot run either, so let the sandbox report it.
         return None
-    script = blocks[-1].strip()
-    return script if script else None
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare)
+                and any(isinstance(o, ast.Eq) for o in node.ops)):
+            continue
+        for side in [node.left] + list(node.comparators):
+            if not (isinstance(side, ast.Constant) and isinstance(side.value, str)):
+                continue
+            if any(m in side.value for m in _LOOKS_LIKE_PYTHON):
+                return ('AssertionError: this check compares a file against the '
+                        'full text of a python script with ==, which only the '
+                        'exact script you wrote can pass. Assert what running '
+                        'that script produces instead.')
+    # A byte count or a checksum compared for equality. Not restricted to
+    # binary suffixes: CHECK_FOLLOWUP says "NEVER assert a file size in bytes"
+    # about any file, and keying on a suffix list let
+    # ``getsize('data.mat') == 264`` through. Only equality against a literal is
+    # a defect -- ``getsize(f) > 0`` is a fine way to say "not empty".
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare)
+                and any(isinstance(o, ast.Eq) for o in node.ops)):
+            continue
+        sides = [node.left] + list(node.comparators)
+        has_literal = any(isinstance(s, ast.Constant)
+                          and isinstance(s.value, (int, float, str))
+                          and not isinstance(s.value, bool) for s in sides)
+        if not has_literal:
+            continue
+        for side in sides:
+            names = {n.attr for n in ast.walk(side) if isinstance(n, ast.Attribute)}
+            names |= {n.id for n in ast.walk(side) if isinstance(n, ast.Name)}
+            hit = names & set(_SIZE_OR_HASH_NAMES)
+            if hit:
+                what = ('a checksum' if hit - {'getsize', 'st_size'}
+                        else 'a byte count')
+                return (f'AssertionError: this check pins {what} of a file, and '
+                        'correct solutions differ there. Assert what can be read '
+                        'out of the file instead -- its structure, or the values '
+                        'inside it.')
+    # Comparing raw bytes of a file: same defect, different spelling.
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare)
+                and any(isinstance(o, ast.Eq) for o in node.ops)):
+            continue
+        for side in [node.left] + list(node.comparators):
+            if isinstance(side, ast.Constant) and isinstance(side.value, bytes):
+                return ('AssertionError: this check compares the raw bytes of a '
+                        'file, and correct solutions differ there. Assert what '
+                        'can be read out of it instead.')
+    return None
+
 
 
 def parse_problem_statement(text: str) -> Optional[str]:
     """Extract a problem statement from the model's reply.
 
-    The model is asked to return the problem in prose (not code). We take
-    everything after ``</think>`` with code fences stripped as the statement.
+    Everything after ``</think>`` is the statement. A fence around the whole
+    reply is unwrapped; fences *inside* it are kept.
+
+    Keeping them matters more than it sounds: a statement that says what a file
+    must contain puts the content in a fence, and stripping every fence left
+    "1. `data.json` containing:" with nothing after it. 7 of ex11's 16 measured
+    statements had a fence, and 5 of those 7 were solved 0 times out of 8 --
+    against 1 of the 9 statements that had no fence to lose. The tasks were not
+    hard, they were unanswerable.
+
     Returns ``None`` when the result is empty.
     """
     body = text or ''
     idx = body.rfind('</think>')
     if idx >= 0:
         body = body[idx + len('</think>'):]
-    # Strip any fenced blocks (those are code, not prose)
-    body = _FENCE_RE.sub('', body).strip()
-    # Strip json fences too
-    body = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', body, flags=re.I).strip()
+    body = body.strip()
+    whole = _WHOLE_FENCE_RE.fullmatch(body)
+    if whole:
+        body = whole.group(1).strip()
     return body if body else None
-
-
-def _trajectory_summary(trajectory: Trajectory) -> str:
-    """A compact text representation of a trajectory for prompting.
-
-    Shows each message as role: content (truncated for tool results).
-    """
-    parts = []
-    for msg in trajectory.get('messages') or []:
-        role = msg.get('role', '?')
-        content = msg.get('content') or ''
-        if role == 'tool' and len(content) > 500:
-            content = content[:500] + '...[truncated]'
-        parts.append(f'[{role}] {content}')
-    return '\n'.join(parts)
 
 
 # The fields a local rollout splices into a trajectory, and the only ones a
@@ -136,20 +302,24 @@ class AgenticPrompts:
     Placeholder validation happens at construction time.
     """
 
-    # Round 1: model acts in sandbox
+    # Explore: model acts in sandbox
     system: str
     from_scratch: str
     from_seed: str = ''
     from_keywords: str = ''
     from_seed_keywords: str = ''
 
-    # Round 2a: write check script
-    check_system: str = ''
-    check_user: str = ''
-
-    # Round 2b: write problem statement
-    problem_system: str = ''
-    problem_user: str = ''
+    # Appended to the same conversation once the model stops calling tools:
+    # first "write the check script" (which carries the workspace listing), then
+    # "write the problem statement". Each has to repeat the rules that used to
+    # live in a system message of its own, because there is no second system
+    # message in a single conversation.
+    check_followup: str = ''
+    # Sent instead of the statement stage when the check script does not pass, so
+    # the model can fix it from the traceback. Required only when the challenger
+    # is built with ``check_retries`` above 0.
+    check_retry_followup: str = ''
+    problem_followup: str = ''
 
     # Keyword generation (same structure as code side)
     keyword_system: str = ''
@@ -160,15 +330,14 @@ class AgenticPrompts:
         'from_seed': ('seed',),
         'from_keywords': ('keywords',),
         'from_seed_keywords': ('seed', 'keywords'),
-        'check_user': ('trajectory', 'final_state'),
-        'problem_user': ('trajectory', 'checks'),
+        'check_followup': ('final_state',),
+        'check_retry_followup': ('error', 'final_state'),
         'keyword_user': ('k', 'desc'),
         'keyword_expand_user': ('kw', 'm'),
     }
 
     def __post_init__(self):
-        for name in ('system', 'from_scratch', 'check_system', 'check_user',
-                     'problem_system', 'problem_user'):
+        for name in ('system', 'from_scratch', 'check_followup', 'problem_followup'):
             if not getattr(self, name).strip():
                 raise ValueError(f'AgenticPrompts.{name} is required')
         for name, placeholders in self._REQUIRED_FIELDS.items():
@@ -208,24 +377,80 @@ class AgenticChallenger(Challenger):
         workspace_snapshot_fn: after round 1, return a text summary of the
             workspace state (e.g. ``find . -type f``). If None, a default
             that lists messages is used.
+        tool_schemas: the executor's tool schemas, in the OpenAI shape the
+            template renders. Attached to the trajectories that are *meant* to
+            call tools -- the exploring episode and each solve attempt. Without
+            this the model is never told the tool names, so it writes code in
+            prose instead of calling anything: the workspace stays empty, every
+            check fails, and the difficulty numbers describe a model that had no
+            tools rather than a hard task. The check-writing and
+            problem-writing stages sit in the same conversation and so see the
+            same list, which is why the rollout stops dispatching calls once a
+            follow-up has been appended -- a python block written as an *answer*
+            parses as a call list, and 41 of 146 such replies in a measured run
+            edited the very workspace the answer was about.
         combo_arity: ``'triple'`` or ``'mix'``, as in :class:`.CodeChallenger`.
         arity_weights: weights for the ``'mix'`` subset size.
         single_kw_prob: chance of using one category in ``'triple'`` mode.
         keyword_refill_target / keyword_gen_calls / keyword_refill_tries /
         keyword_params: keyword bank refill parameters.
+        check_params / problem_params: sampling params for the two appended
+            stages. ``None`` keeps whatever the episode was already using, which
+            is sized for one agent turn; the check-writing stage reads the whole
+            episode plus the end state and reasons at length before answering,
+            and one that runs out of budget mid-thought never emits its code
+            block and is thrown away as unparseable.
+        followup_api: optional OpenAI-compatible API client (e.g. qwen3-max). When
+            given, exploration still runs on the local explorer -- so its turns keep
+            their ``labels`` and ``logprobs`` and remain trainable -- but the
+            check-script (success judgement) and problem-statement stages are
+            generated by this API instead of the local model, and are appended
+            neither to the trainable trajectory nor to its token stream. This is
+            the "explore locally, judge and describe over an API, train only the
+            exploration" split. ``None`` keeps the single-model behaviour where the
+            local model writes those two stages in the same conversation.
+        followup_extra_body: extra request body forwarded on every ``followup_api``
+            call (e.g. ``{'thinking_budget': N}`` to cap qwen3-max reasoning).
+            ``None`` sends the request unmodified. Ignored when ``followup_api`` is
+            ``None``.
+        keyword_explorer: explorer used to brainstorm keywords. Should have no
+            tools wired to it: a list is a text answer, and a bracketed list in
+            a reply is exactly what the sandbox explorer would try to dispatch as
+            a call. ``None`` reuses the main explorer, which for a sandbox setup
+            means its tools are live there too.
         min_batch: smallest batch worth sending to the explorer.
         problem_max_chars: reject problem statements longer than this.
+        check_retries: how many times a check script that did not pass is handed
+            back, with the traceback and the workspace listing, for a rewrite
+            before the proposal is rejected. 0 restores the old behaviour of
+            rejecting on the first failure. Measured in ex12: 36 of 72 proposals
+            died on the check, and 29 of those were a single assertion naming a
+            value the model had not read -- a row count, a content string that
+            was nearly right, a timestamp -- over a workspace state that was
+            perfectly good. Each retry costs one more sampling call for that
+            episode and nothing for the ones that pass first time.
         reject_sink: called with a dict for every rejected proposal.
         propose_sink: called once per proposal attempt -- kept, rejected while
             building, or dropped by the difficulty band alike -- with the
-            token-level record of the rounds that produced it. This is the only
-            way the proposing rounds survive: they are generation like any
-            other, so they carry ``input_ids`` / ``labels`` / ``logprobs`` and
+            token-level record of the episode that produced it. This is the only
+            way the proposing episode survives: it is generation like any
+            other, so it carries ``input_ids`` / ``labels`` / ``logprobs`` and
             could later be trained on, but nothing downstream of ``build``
-            looks at them and without a sink they are dropped on the floor.
+            looks at it and without a sink it is dropped on the floor.
             Rejects are included on purpose: they are the zero-reward half of a
             GRPO group, so a set of kept-only records has no variance to learn
             from. Requires a local sampler -- an API explorer returns text only.
+        solver_sink: called once per solver attempt in the difficulty stage, with
+            the statement, the check script, the attempt, the workspace it left
+            and the check's verdict. ``n_pass`` alone cannot distinguish a task
+            that is impossible from one whose statement withholds a value its
+            check demands, and both look like a hard task worth keeping.
+        keyword_sink: called once per keyword-generation call, with the prompt,
+            the raw reply and what ``parse_keyword_list`` made of it. A bank that
+            refuses to fill is invisible otherwise -- proposals fall back to the
+            no-keyword prompt and the run carries on looking normal -- and a count
+            of zero does not say whether the model broke the format or the parser
+            rejected output that was fine.
     """
 
     def __init__(
@@ -237,20 +462,35 @@ class AgenticChallenger(Challenger):
         keyword_store: Optional[KeywordStore] = None,
         category_desc: Optional[Dict[str, str]] = None,
         seed_mix_prob: float = 0.5,
-        reset_fn: Callable[[], None],
-        run_check_fn: Callable[[str], Tuple[int, str]],
-        workspace_snapshot_fn: Optional[Callable[[], str]] = None,
+        reset_fn: Callable[..., None],
+        run_check_fn: Callable[..., Tuple[int, str]],
+        workspace_snapshot_fn: Optional[Callable[..., str]] = None,
+        tool_schemas: Optional[Sequence[Dict[str, Any]]] = None,
+        episode_concurrency: int = 1,
+        episode_tool_managers: Optional[Sequence[Any]] = None,
         combo_arity: str = 'triple',
         arity_weights: Optional[Sequence[float]] = None,
         single_kw_prob: float = 0.1,
         keyword_refill_target: int = 128,
         keyword_gen_calls: int = 8,
+        keyword_refill_concurrency: int = 1,
         keyword_refill_tries: int = 2,
         keyword_params: Optional[SamplingParams] = None,
+        check_params: Optional[SamplingParams] = None,
+        problem_params: Optional[SamplingParams] = None,
+        followup_api: Optional[Any] = None,
+        followup_extra_body: Optional[Dict[str, Any]] = None,
+        keyword_explorer: Optional[Explorer] = None,
         min_batch: int = 1,
         problem_max_chars: int = 8192,
+        max_proposals_total: int = 0,
+        setup_script_fn: Optional[Callable[..., str]] = None,
+        solver_prompt_fn: Optional[Callable[[str], Trajectory]] = None,
+        check_retries: int = 1,
         reject_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         propose_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        solver_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        keyword_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         **challenger_kwargs: Any,
     ):
         super().__init__(explorer, system=prompts.system, **challenger_kwargs)
@@ -271,25 +511,120 @@ class AgenticChallenger(Challenger):
         self.reset_fn = reset_fn
         self.run_check_fn = run_check_fn
         self.workspace_snapshot_fn = workspace_snapshot_fn
+        self.tool_schemas = list(tool_schemas) if tool_schemas else None
+        # More than one episode at a time needs more than one sandbox: an episode
+        # owns its workspace from the reset until its check has run. The three
+        # sandbox callables above are then called with ``slot=i`` to say which one,
+        # and ``episode_tool_managers[i]`` must dispatch tool calls into that same
+        # sandbox -- an episode acting in one workspace and checking another
+        # produces a task whose check nobody can pass.
+        if episode_concurrency < 1:
+            raise ValueError(f'episode_concurrency must be >= 1, got {episode_concurrency}')
+        if episode_concurrency > 1:
+            if not episode_tool_managers or len(episode_tool_managers) != episode_concurrency:
+                raise ValueError(
+                    f'episode_concurrency={episode_concurrency} needs exactly that many '
+                    f'episode_tool_managers, one per sandbox; got '
+                    f'{len(episode_tool_managers) if episode_tool_managers else 0}.')
+        self.episode_concurrency = episode_concurrency
+        self.episode_tool_managers = (list(episode_tool_managers)
+                                      if episode_tool_managers else None)
+        # Held while writing to the dump files and while bumping ``stats``: with
+        # concurrent episodes those are the only shared mutable things the
+        # follow-up callback touches, and a half-written json line is unreadable.
+        self._sink_lock = threading.Lock()
+        # Separate from the sink lock: the keyword path holds this while it draws
+        # from the shared rng and bumps the prompt nonce, and it must not be held
+        # while a sink write is waiting on disk.
+        self._kw_lock = threading.Lock()
         self.combo_arity = combo_arity
         self.arity_weights = list(arity_weights) if arity_weights else None
         self.single_kw_prob = single_kw_prob
         self.keyword_refill_target = keyword_refill_target
         self.keyword_gen_calls = keyword_gen_calls
+        # How many of a refill's generating calls go out together. At 1 each call
+        # is told what the ones before it produced, which is the point; raising it
+        # is what the first round of arm measurements ran with, where a whole
+        # first refill went out at once with nothing yet to avoid and came back
+        # with synonyms. Kept configurable so the two can be compared on one build
+        # rather than across two versions of this file.
+        if keyword_refill_concurrency < 1:
+            raise ValueError('keyword_refill_concurrency must be >= 1, got '
+                             f'{keyword_refill_concurrency}')
+        self.keyword_refill_concurrency = keyword_refill_concurrency
         self.keyword_refill_tries = keyword_refill_tries
         self.keyword_params = keyword_params
+        self.check_params = check_params
+        self.problem_params = problem_params
+        # When set, exploration runs on the (trainable) local explorer as before,
+        # but the check-script and problem-statement stages are generated by this
+        # OpenAI-compatible API (e.g. qwen3-max) instead of the local model. The
+        # two stages then contribute nothing to the trainable trajectory: the API
+        # returns text only, so the episode's ``input_ids`` / ``labels`` /
+        # ``logprobs`` stay exactly the exploration turns the local sampler
+        # produced -- which is what "train only the exploration part" means. The
+        # generated check script and statement are used solely to build the task.
+        self.followup_api = followup_api
+        # extra_body sent on every followup API call (e.g. {'thinking_budget': N}
+        # to cap qwen3-max reasoning). None sends the request unmodified.
+        self.followup_extra_body = dict(followup_extra_body) if followup_extra_body else None
+        self.keyword_explorer = keyword_explorer
         self.min_batch = max(1, min_batch)
         self.problem_max_chars = problem_max_chars
+        # A budget in proposals rather than in kept tasks, for runs whose purpose
+        # is to measure what the current configuration produces: with a keep-rate
+        # near 6% a keep-target of 8 is 128 proposals, and comparing two
+        # configurations means giving them the same number of tries, not the same
+        # output. 0 leaves the run governed by its keep-target.
+        self.max_proposals_total = max_proposals_total
+        # Arm B. Returns a python script that recreates this episode's input files,
+        # captured while the workspace still holds them, and replayed before every
+        # solver attempt. None leaves the solver starting from an empty directory.
+        self.setup_script_fn = setup_script_fn
+        # How a task statement becomes the solver's opening conversation. Without
+        # one, the solver is handed the statement as a bare user message and no
+        # system message at all -- nothing says it is working in a sandbox, that it
+        # may take many turns, or that a reply carries one tool call. Measured on
+        # arm B: 71 of 80 attempts used 2-3 turns, writing 8-12k characters into a
+        # single python_executor argument and truncating there, so ``n_pass`` was
+        # reporting that omission rather than the task. Passing the same function
+        # the eval script uses is what keeps the two measuring the same thing.
+        self.solver_prompt_fn = solver_prompt_fn
+        if check_retries < 0:
+            raise ValueError(f'check_retries must be >= 0, got {check_retries}')
+        self.check_retries = check_retries
+        if check_retries:
+            prompts.require('check_retry_followup')
         self.reject_sink = reject_sink
         self.propose_sink = propose_sink
+        self.solver_sink = solver_sink
+        self.keyword_sink = keyword_sink
         if self.seeds:
             prompts.require('from_seed')
             if self.store is not None:
                 prompts.require('from_seed_keywords')
         self._nonce = 0
         self.stats: Dict[str, int] = {
-            'round1_done': 0, 'check_parse_fail': 0, 'check_run_fail': 0,
+            'explore_done': 0, 'check_parse_fail': 0, 'check_run_fail': 0,
+            'empty_workspace': 0, 'solver_truncated': 0,
             'problem_parse_fail': 0, 'too_long': 0, 'parsed': 0,
+            # How often a check that failed was handed back for a rewrite, and
+            # how often the rewrite passed. The two together say whether the
+            # retry earns its extra sampling call.
+            'check_retry': 0, 'check_retry_pass': 0,
+            # The episode ended before the appended stages could run or finish:
+            # it used up ``max_turns``, hit the trajectory token cap, or left no
+            # room for the follow-up message. Distinct from every other reason
+            # here, which is the model producing something unusable.
+            'episode_cut_short': 0,
+            # Arm B only. ``setup_capture_fail``: the episode's input files could
+            # not be read back, so the task was dropped. ``setup_replay_fail``: a
+            # solver attempt was skipped because putting those files back failed,
+            # which would otherwise have scored as the task being too hard.
+            'setup_capture_fail': 0, 'setup_replay_fail': 0,
+            # followup_api mode only: a check or statement API call failed. The
+            # conversation is then unusable and the proposal is rejected.
+            'followup_api_error': 0,
         }
         self._hard: List[Tuple[str, str]] = []
 
@@ -302,6 +637,8 @@ class AgenticChallenger(Challenger):
         run these multi-turn in the sandbox.
         """
         proposals: List[Trajectory] = []
+        directions: List[str] = []
+        metas: List[Tuple[List[Tuple[str, str]], bool, str]] = []
         for _ in range(count):
             picks = self._draw_keywords()
             body = '\n'.join(f'- {c}: {t}' for c, t in picks)
@@ -316,99 +653,352 @@ class AgenticChallenger(Challenger):
                 user = self.prompts.from_keywords.format(keywords=body)
             else:
                 user = self.prompts.from_scratch
+            directions.append(user)
+            metas.append((picks, use_seed, body))
+
+        for user, (picks, use_seed, body) in zip(directions, metas):
             proposal: Trajectory = {
                 'messages': [{'role': 'system', 'content': self.prompts.system},
                              {'role': 'user', 'content': user}],
             }
+            if self.tool_schemas:
+                proposal['tools'] = self.tool_schemas
             proposals.append(attach_user_data(
                 proposal, keywords=picks, seeded=use_seed, keyword_block=body))
         return proposals
+
 
     # ------------------------------------------------------------- building
 
     def build(self, explored: List[Trajectory]) -> List[Optional[Trajectory]]:
         """Satisfy the abstract method; not usable outside ``_round``.
 
-        ``_build_one`` requires the sandbox to hold the episode's workspace state,
-        which is only guaranteed inside the serial ``_round`` loop. Calling this
-        method directly will produce wrong results because the sandbox state does
-        not match the trajectory being processed.
+        Building happens inside the episode now: :meth:`_followup` runs while the
+        model is still generating and needs the sandbox to hold that episode's
+        workspace state, which is only guaranteed inside the serial ``_round``
+        loop.
         """
         raise RuntimeError(
             f'{type(self).__name__}.build() must not be called directly; '
-            f'the serial _round() loop calls _build_one() per episode instead.')
+            f'the serial _round() loop drives one episode at a time instead.')
 
-    def _build_one(self, explored: Trajectory) -> Optional[Trajectory]:
-        """Process one round-1 result: write checks, verify, write problem.
+    def _followup(self, state: Dict[str, Any], trajectory: Trajectory,
+                  n_before: int) -> Optional[Tuple[str, Optional[SamplingParams]]]:
+        """What to say next when the model stops calling tools; ``None`` to stop.
 
-        Called while the sandbox still holds this episode's workspace state.
+        The rollout calls this once per stage, handing over the episode as it
+        stands. ``state`` is this episode's scratchpad, read afterwards by
+        :meth:`_finish_episode`: the workspace listing and the check script are
+        produced here, and anything that goes wrong before a statement exists is
+        left in ``state['reject']``.
+
+        The sandbox work has to happen at this moment and nowhere else -- the
+        workspace holds this episode's end state right now, and the next
+        episode's reset wipes it. ``state['slot']`` says which sandbox that is;
+        with concurrent episodes several of these run at once, each against its
+        own.
         """
-        summary = _trajectory_summary(explored)
-        snapshot = self.workspace_snapshot_fn() if self.workspace_snapshot_fn else summary
+        slot = state.get('slot', 0)
+        if n_before == 0:
+            snapshot = self.workspace_snapshot_fn(slot=slot) if self.workspace_snapshot_fn else ''
+            state['snapshot'] = snapshot
+            # An episode that left nothing behind has no end state to write checks
+            # about, and asking for them anyway is worse than useless: the only
+            # true thing to assert is that the directory is empty, which every
+            # solver passes by doing nothing. Five of run5's ten verified tasks
+            # were that task. Reject here instead.
+            if not snapshot.strip():
+                self._bump('empty_workspace')
+                state['reject'] = ('empty_workspace', '')
+                return None
+            return (self.prompts.check_followup.format(final_state=snapshot),
+                    self.check_params)
+
+        # Every follow-up from here until a check passes is a check-script reply:
+        # the first one, plus up to ``check_retries`` rewrites.
+        if not state.get('checked'):
+            attempt = state.get('check_attempts', 0) + 1
+            state['check_attempts'] = attempt
+            reply = assistant_text(trajectory)
+            script = parse_check_script(reply)
+            if script is None:
+                # Same one-rewrite budget a run failure gets: hand the parse
+                # failure back and let it regenerate, rather than dropping a task
+                # whose only fault was packaging. Shares the check_attempts
+                # count, so parse and run failures together get check_retries
+                # extra tries, not one each.
+                if attempt <= self.check_retries:
+                    self._bump('check_retry')
+                    err = ('Could not read a check script from your reply: it was '
+                           'not a fenced python code block. Do not wrap it in a '
+                           'tool call and do not add prose -- return ONLY a fenced '
+                           'python code block.')
+                    return (self.prompts.check_retry_followup.format(
+                        error=err, final_state=state.get('snapshot') or ''),
+                        self.check_params)
+                self._bump('check_parse_fail')
+                # The whole reply, not a tail: this stage fails either because the
+                # model declared the state untestable (it says so) or because it
+                # ran out of tokens while thinking, and a record that cannot tell
+                # them apart sends the next reader back to re-run the batch.
+                state['reject'] = ('check_parse_fail', reply)
+                return None
+            state['script'] = script
+            brittle = brittle_check_reason(script)
+            if brittle is not None:
+                # Same bookkeeping as a check that ran and failed: the script is
+                # rejected before it can pass on the author's own state, because
+                # passing there is exactly what hides the defect.
+                exit_code, output = 1, brittle
+            else:
+                exit_code, output = self.run_check_fn(script, slot=slot)
+            if exit_code == 0:
+                state['checked'] = True
+                if attempt > 1:
+                    self._bump('check_retry_pass')
+                # Capture the inputs now, at the one moment the workspace holds
+                # exactly the state this check just passed on. A capture after the
+                # statement stage would be the same bytes only by luck.
+                if self.setup_script_fn is not None:
+                    setup = self.setup_script_fn(slot=slot)
+                    if not setup:
+                        self._bump('setup_capture_fail')
+                        state['reject'] = (
+                            'setup_capture_fail',
+                            'no input files to hand the solver, or their bytes '
+                            'could not be read back')
+                        return None
+                    state['setup_script'] = setup
+                return (self.prompts.problem_followup, self.problem_params)
+            # Snapshot again, after the failure. A check that asserts only
+            # paths from the snapshot it was shown and still fails leaves two
+            # very different bugs indistinguishable -- the model asserted
+            # something untrue, or the workspace changed under it -- and the
+            # difference is visible only in the state at the moment the check
+            # ran. It is also what the rewrite gets to read.
+            after = self.workspace_snapshot_fn(slot=slot) if self.workspace_snapshot_fn else ''
+            state.setdefault('attempts', []).append(
+                f'--- attempt {attempt}: exit {exit_code} ---\n{output}\n'
+                f'--- check script ---\n{script}')
+            if attempt <= self.check_retries:
+                self._bump('check_retry')
+                return (self.prompts.check_retry_followup.format(
+                    error=output, final_state=after or state.get('snapshot') or ''),
+                    self.check_params)
+            self._bump('check_run_fail')
+            state['reject'] = (
+                'check_run_fail',
+                '\n'.join(state['attempts'])
+                + f"\n--- state before check ---\n{state.get('snapshot') or ''}\n"
+                + f'--- state after check ---\n{after}')
+            return None
+
+        return None
+
+    def _api_reply(self, messages: List[Dict[str, Any]], user_text: str,
+                   params: Optional[SamplingParams]) -> Optional[str]:
+        """Append ``user_text`` and one ``followup_api`` reply to ``messages``.
+
+        ``messages`` is a throwaway copy owned by :meth:`_run_followup_api`, never
+        the trainable trajectory, so mutating it in place costs the model nothing.
+        Returns the assistant text, or ``None`` when the API call raised -- the
+        caller then rejects rather than building a task on a broken conversation.
+
+        Tools are withdrawn for these stages on purpose (they are answers, not
+        actions), so only the text is kept; any structured ``tool_calls`` the API
+        returned are dropped.
+        """
+        messages.append({'role': 'user', 'content': user_text})
+        request: Trajectory = {'messages': messages}
+        try:
+            if self.followup_extra_body:
+                reply = self.followup_api(request, params, extra_body=self.followup_extra_body)
+            else:
+                reply = self.followup_api(request, params)
+        except Exception as exc:  # noqa: BLE001 -- one bad call must not kill the round
+            logger.warning(f'[{type(self).__name__}] followup API call failed: '
+                           f'{type(exc).__name__}: {exc}')
+            return None
+        if isinstance(reply, list):
+            reply = reply[0] if reply else {}
+        content = (reply.get('content') if isinstance(reply, dict) else None) or ''
+        messages.append({'role': 'assistant', 'content': content})
+        return content
+
+    def _run_followup_api(self, state: Dict[str, Any], explored: Trajectory) -> None:
+        """Generate the check script and problem statement over ``followup_api``.
+
+        The API-only counterpart of :meth:`_followup`: the same stages, the same
+        sandbox work (snapshot, run the check, capture inputs) and the same retry
+        budget, but driven imperatively here instead of turn-by-turn by the
+        rollout, and answered by the API rather than the local model. Results land
+        in ``state`` for :meth:`_finish_episode`:
+
+          * ``state['script']`` / ``state['checked']`` -- the check that passed,
+          * ``state['setup_script']`` -- captured inputs (Arm B),
+          * ``state['statement']`` -- the problem-statement text,
+          * ``state['reject']`` -- ``(reason, detail)`` when a stage fails.
+
+        Nothing here touches ``explored``'s ``input_ids`` / ``labels`` /
+        ``logprobs``: the messages the API sees are a private copy, so the
+        trainable trajectory stays exactly the exploration turns the local sampler
+        produced.
+        """
+        slot = state.get('slot', 0)
+        messages: List[Dict[str, Any]] = [dict(m) for m in explored.get('messages') or []]
+
+        snapshot = self.workspace_snapshot_fn(slot=slot) if self.workspace_snapshot_fn else ''
+        state['snapshot'] = snapshot
+        # An episode that left nothing behind has no end state to write checks
+        # about; rejecting here mirrors the n_before==0 branch of _followup.
+        if not snapshot.strip():
+            self._bump('empty_workspace')
+            state['reject'] = ('empty_workspace', '')
+            return
+
+        # Check-script stage: the first ask plus up to ``check_retries`` rewrites,
+        # sharing one attempt counter across parse and run failures exactly as the
+        # single-model path does.
+        user_text = self.prompts.check_followup.format(final_state=snapshot)
+        attempt = 0
+        while True:
+            attempt += 1
+            state['check_attempts'] = attempt
+            reply = self._api_reply(messages, user_text, self.check_params)
+            if reply is None:
+                self._bump('followup_api_error')
+                state['reject'] = ('followup_api_error', 'check-script API call failed')
+                return
+            script = parse_check_script(reply)
+            if script is None:
+                if attempt <= self.check_retries:
+                    self._bump('check_retry')
+                    err = ('Could not read a check script from your reply: it was '
+                           'not a fenced python code block. Do not wrap it in a '
+                           'tool call and do not add prose -- return ONLY a fenced '
+                           'python code block.')
+                    user_text = self.prompts.check_retry_followup.format(
+                        error=err, final_state=snapshot)
+                    continue
+                self._bump('check_parse_fail')
+                state['reject'] = ('check_parse_fail', reply)
+                return
+            state['script'] = script
+            brittle = brittle_check_reason(script)
+            if brittle is not None:
+                # Rejected before it can pass on the author's own state, since
+                # passing there is exactly what hides the defect.
+                exit_code, output = 1, brittle
+            else:
+                exit_code, output = self.run_check_fn(script, slot=slot)
+            if exit_code == 0:
+                state['checked'] = True
+                if attempt > 1:
+                    self._bump('check_retry_pass')
+                # Capture inputs now, while the workspace still holds the state
+                # this check just passed on.
+                if self.setup_script_fn is not None:
+                    setup = self.setup_script_fn(slot=slot)
+                    if not setup:
+                        self._bump('setup_capture_fail')
+                        state['reject'] = (
+                            'setup_capture_fail',
+                            'no input files to hand the solver, or their bytes '
+                            'could not be read back')
+                        return
+                    state['setup_script'] = setup
+                break
+            after = self.workspace_snapshot_fn(slot=slot) if self.workspace_snapshot_fn else ''
+            state.setdefault('attempts', []).append(
+                f'--- attempt {attempt}: exit {exit_code} ---\n{output}\n'
+                f'--- check script ---\n{script}')
+            if attempt <= self.check_retries:
+                self._bump('check_retry')
+                user_text = self.prompts.check_retry_followup.format(
+                    error=output, final_state=after or snapshot)
+                continue
+            self._bump('check_run_fail')
+            state['reject'] = (
+                'check_run_fail',
+                '\n'.join(state['attempts'])
+                + f"\n--- state before check ---\n{state.get('snapshot') or ''}\n"
+                + f'--- state after check ---\n{after}')
+            return
+
+        # Problem-statement stage: one API reply, kept as the task's statement.
+        reply = self._api_reply(messages, self.prompts.problem_followup, self.problem_params)
+        if reply is None:
+            self._bump('followup_api_error')
+            state['reject'] = ('followup_api_error', 'problem-statement API call failed')
+            return
+        state['statement'] = reply
+
+    def _finish_episode(self, state: Dict[str, Any],
+                        explored: Trajectory) -> Optional[Trajectory]:
+        """Turn a finished episode into a task, or record why it is not one.
+
+        Everything the model wrote is in ``explored``: the tool-using turns, the
+        check script, and the problem statement as the last assistant message.
+        ``state`` carries what only the sandbox could say -- the end state, and
+        whether the check passed on it.
+        """
         keywords = user_data_get(explored.get('user_data'), 'keywords', [])
         seeded = user_data_get(explored.get('user_data'), 'seeded', False)
-        # Every round this proposal generates, in order. Handed to propose_sink
-        # with whatever verdict the proposal ends up with, so a rejected attempt
-        # is recorded as fully as a kept one.
-        rounds = [_propose_round('explore', explored)]
+        # The episode as one record: a single conversation, so a single set of
+        # token ids and logprobs. Handed to propose_sink with whatever verdict the
+        # proposal ends up with, so a rejected attempt is recorded as fully as a
+        # kept one.
+        rounds = [_propose_round('episode', explored)]
 
-        # Round 2a: write check script
-        # NOTE: This goes through the same explorer (with tool schemas visible).
-        # The prompt must clearly instruct the model to output ONLY a code block
-        # and not call tools, otherwise tool calls would corrupt the sandbox state
-        # before verification. The check_system prompt enforces this.
-        check_prompt: Trajectory = {
-            'messages': [
-                {'role': 'system', 'content': self.prompts.check_system},
-                {'role': 'user', 'content': self.prompts.check_user.format(
-                    trajectory=summary, final_state=snapshot)},
-            ],
-        }
-        check_reply = self.explore([check_prompt])
-        rounds.append(_propose_round('check', check_reply[0]))
-        script = parse_check_script(assistant_text(check_reply[0]))
-        if script is None:
-            self.stats['check_parse_fail'] += 1
-            self._reject_record(explored, 'check_parse_fail')
-            self._emit_propose(rounds, 'check_parse_fail', keywords=keywords, seeded=seeded)
+        def reject(reason: str, detail: str = '') -> None:
+            self._reject_record(explored, reason, detail=detail)
+            self._emit_propose(rounds, reason, keywords=keywords, seeded=seeded)
+
+        if state.get('reject'):
+            reason, detail = state['reject']
+            reject(reason, detail)
             return None
 
-        # Verify: run check script in current sandbox state (must pass)
-        exit_code, output = self.run_check_fn(script)
-        if exit_code != 0:
-            self.stats['check_run_fail'] += 1
-            self._reject_record(explored, 'check_run_fail',
-                                detail=f'exit {exit_code}: {output[-200:]}')
-            self._emit_propose(rounds, 'check_run_fail', keywords=keywords, seeded=seeded)
+        if not state.get('checked'):
+            # The stages never ran, or the check-writing one never got a reply:
+            # the episode used up its turns, hit the trajectory token cap, or left
+            # no room to append the next message. The model produced nothing
+            # wrong here, so this is not one of the other reasons. Keyed on the
+            # check having *passed* rather than on a script existing: a rewrite
+            # that never came back leaves the failed script in ``state``, and
+            # building a task on it would ship a check nobody can pass.
+            self._bump('episode_cut_short')
+            reject('episode_cut_short',
+                   detail=f"stop_reason={explored.get('stop_reason')} "
+                          f"truncated={bool(explored.get('truncated'))} "
+                          f"turns={explored.get('turns')} "
+                          f"followups={explored.get('followups')}")
             return None
 
-        # Round 2b: write problem statement
-        problem_prompt: Trajectory = {
-            'messages': [
-                {'role': 'system', 'content': self.prompts.problem_system},
-                {'role': 'user', 'content': self.prompts.problem_user.format(
-                    trajectory=summary, checks=script)},
-            ],
-        }
-        problem_reply = self.explore([problem_prompt])
-        rounds.append(_propose_round('problem', problem_reply[0]))
-        statement = parse_problem_statement(assistant_text(problem_reply[0]))
+        script = state['script']
+        # In followup_api mode the statement was written by the API and is not in
+        # ``explored`` (whose last assistant turn is the final exploration reply);
+        # it lives in ``state``. The single-model path keeps it as the last
+        # assistant message of the episode.
+        if self.followup_api is not None:
+            statement = parse_problem_statement(state.get('statement') or '')
+        else:
+            statement = parse_problem_statement(assistant_text(explored))
         if statement is None:
-            self.stats['problem_parse_fail'] += 1
-            self._reject_record(explored, 'problem_parse_fail')
-            self._emit_propose(rounds, 'problem_parse_fail', keywords=keywords, seeded=seeded)
+            self._bump('problem_parse_fail')
+            reject('problem_parse_fail')
             return None
         if len(statement) > self.problem_max_chars:
-            self.stats['too_long'] += 1
-            self._reject_record(explored, 'too_long')
-            self._emit_propose(rounds, 'too_long', keywords=keywords, seeded=seeded)
+            self._bump('too_long')
+            reject('too_long')
             return None
 
-        self.stats['parsed'] += 1
+        self._bump('parsed')
         task: Trajectory = {
             'messages': [{'role': 'user', 'content': statement}],
         }
-        task = attach_user_data(task, check_script=script, keywords=keywords, seeded=seeded)
+        task = attach_user_data(task, check_script=script, keywords=keywords, seeded=seeded,
+                                setup_script=state.get('setup_script', ''))
         # Carried, not emitted: the verdict this proposal earns depends on the
         # difficulty measurement, which has not run yet. A plain top-level key
         # rather than user_data, which json-encodes every value on each update.
@@ -416,11 +1006,30 @@ class AgenticChallenger(Challenger):
         return task
 
     def _reject_record(self, traj: Trajectory, reason: str, detail: str = '') -> None:
-        if self.reject_sink is not None:
-            payload: Dict[str, Any] = {'reason': reason}
-            if detail:
-                payload['detail'] = detail
-            payload['last_assistant'] = assistant_text(traj)[:500]
+        """Record a rejected proposal, with enough of the episode to tell why.
+
+        The reason alone is not diagnosable. Nine ``empty_workspace`` rejections in
+        one run all looked like the model refusing to act; the messages showed a
+        single assistant turn each, and the question of whether it had run out of
+        tokens or simply emitted no call could not be answered from the record --
+        the fields that answered it were on the trajectory and were dropped. So
+        how the episode ended travels with the reason.
+        """
+        if self.reject_sink is None:
+            return
+        messages = traj.get('messages') or []
+        payload: Dict[str, Any] = {'reason': reason}
+        if detail:
+            payload['detail'] = detail
+        payload['stop_reason'] = traj.get('stop_reason')
+        payload['truncated'] = bool(traj.get('truncated'))
+        payload['turns'] = traj.get('turns')
+        payload['n_assistant'] = sum(1 for m in messages
+                                     if isinstance(m, dict) and m.get('role') == 'assistant')
+        payload['n_tool_calls'] = sum(len(m.get('tool_calls') or []) for m in messages
+                                      if isinstance(m, dict))
+        payload['last_assistant'] = assistant_text(traj)
+        with self._sink_lock:
             self.reject_sink(payload)
 
     def _emit_propose(self, rounds: Optional[List[Dict[str, Any]]], outcome: str, *,
@@ -437,7 +1046,7 @@ class AgenticChallenger(Challenger):
         if self.propose_sink is None or not rounds:
             return
         rollouts = self.solver_rollouts or None
-        self.propose_sink({
+        payload = {
             'outcome': outcome,
             'n_pass': n_pass,
             'n_rollouts': rollouts,
@@ -445,7 +1054,9 @@ class AgenticChallenger(Challenger):
             'keywords': list(keywords or ()),
             'seeded': bool(seeded),
             'rounds': rounds,
-        })
+        }
+        with self._sink_lock:
+            self.propose_sink(payload)
 
     def _take_rounds(self, task: Trajectory) -> Optional[List[Dict[str, Any]]]:
         """Detach a task's proposing rounds. Popped even with no sink attached:
@@ -456,26 +1067,115 @@ class AgenticChallenger(Challenger):
 
     # ------------------------------------------------------------ revised _round
 
+    def _bump(self, key: str, n: int = 1) -> None:
+        """Thread-safe stats increment."""
+        with self._sink_lock:
+            self.stats[key] += n
+
+    def _parallel(self, fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
+        """Map ``fn`` over ``items`` at once, results in input order.
+
+        Every use of this is waiting on a sandbox, not computing, so the thread
+        pool is the point. One item runs inline: a pool for a single sandbox call
+        only adds a thread, and it keeps the serial configuration on exactly the
+        same code path it had before.
+        """
+        items = list(items)
+        if len(items) <= 1:
+            return [fn(item) for item in items]
+        out: List[Any] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=len(items)) as pool:
+            futures = {pool.submit(fn, item): i for i, item in enumerate(items)}
+            for fut in as_completed(futures):
+                out[futures[fut]] = fut.result()
+        return out
+
+    def _run_episode(self, proposal: Trajectory, slot: int) -> Optional[Trajectory]:
+        """One episode top-to-bottom, using sandbox slot ``slot``."""
+        self.reset_fn(slot=slot)
+        state: Dict[str, Any] = {'slot': slot}
+        tm = self.episode_tool_managers[slot] if self.episode_tool_managers else None
+        if self.followup_api is not None:
+            # Split path: explore on the local (trainable) model with NO
+            # followup_fn, so the rollout ends the moment the model stops calling
+            # tools and the returned trajectory carries only the exploration
+            # turns' input_ids/labels/logprobs. The check-script and
+            # problem-statement stages then run over the API against the same end
+            # state, appended to a throwaway copy of the messages -- never to the
+            # trainable trajectory.
+            kwargs: Dict[str, Any] = {}
+            if tm is not None:
+                kwargs['tool_manager'] = tm
+            result = self.explore([proposal], **kwargs)
+            if not result:
+                return None
+            explored = result[0]
+            self._bump('explore_done')
+            # A reply cut off at the token budget never finished its thought, so
+            # continuing the conversation over the API would build a check on a
+            # half-written turn. Leave ``state`` untouched and let
+            # ``_finish_episode`` record it as ``episode_cut_short``, matching the
+            # single-model path which does not run the stages after a length cut.
+            if explored.get('stop_reason') != 'length':
+                self._run_followup_api(state, explored)
+            return self._finish_episode(state, explored)
+        kwargs = {'followup_fn': partial(self._followup, state)}
+        if tm is not None:
+            kwargs['tool_manager'] = tm
+        result = self.explore([proposal], **kwargs)
+        if not result:
+            return None
+        explored = result[0]
+        self._bump('explore_done')
+        return self._finish_episode(state, explored)
+
     def _round(self, missing: int) -> Optional[List[Trajectory]]:
-        """One cycle: serial round-1 episodes, inline build, then difficulty filter."""
+        """One cycle: episodes in parallel across sandbox slots, then difficulty."""
         count = min(self._estimate(missing), self.max_proposals_per_round)
+        if self.max_proposals_total > 0:
+            left = self.max_proposals_total - self.n_proposed
+            if left <= 0:
+                # Budget spent. None is the 'source exhausted' answer the batching
+                # loop already knows how to stop on, so the run ends after this
+                # round's keepers are handed back rather than mid-episode.
+                logger.info(f'[{type(self).__name__}] proposal budget spent '
+                            f'({self.n_proposed}/{self.max_proposals_total}); stopping')
+                return None
+            count = min(count, left)
         proposals = self.propose(count)
         if not proposals:
             return None
 
         usable: List[Trajectory] = []
-        for proposal in proposals:
-            # Reset workspace, run round 1
-            self.reset_fn()
-            result = self.explore([proposal])
-            if not result:
-                continue
-            explored = result[0]
-            self.stats['round1_done'] += 1
-            # Workspace still holds this episode's state → build inline
-            task = self._build_one(explored)
-            if task is not None:
-                usable.append(task)
+        n_slots = self.episode_concurrency
+
+        if n_slots <= 1 or len(proposals) <= 1:
+            # Serial fallback (original path).
+            for proposal in proposals:
+                task = self._run_episode(proposal, slot=0)
+                if task is not None:
+                    usable.append(task)
+        else:
+            # One worker per sandbox slot, each draining its own share serially.
+            # A slot is a single sandbox and cannot host two episodes at once, so
+            # the split is by slot, never round-robin into a shared pool where two
+            # tasks could land on the same slot concurrently.
+            buckets: List[List[Trajectory]] = [[] for _ in range(n_slots)]
+            for i, proposal in enumerate(proposals):
+                buckets[i % n_slots].append(proposal)
+
+            def _drain(slot: int) -> List[Trajectory]:
+                out: List[Trajectory] = []
+                for proposal in buckets[slot]:
+                    task = self._run_episode(proposal, slot=slot)
+                    if task is not None:
+                        out.append(task)
+                return out
+
+            with ThreadPoolExecutor(max_workers=n_slots) as pool:
+                futures = [pool.submit(_drain, s) for s in range(n_slots) if buckets[s]]
+                for fut in as_completed(futures):
+                    usable.extend(fut.result())
 
         kept = self._filter_difficulty(usable) if self.solver_rollouts else usable
         if not self.solver_rollouts:
@@ -494,18 +1194,86 @@ class AgenticChallenger(Challenger):
     # ------------------------------------------------------------ difficulty
 
     def _filter_difficulty(self, tasks: List[Trajectory]) -> List[Trajectory]:
-        """Override: each solver attempt needs a clean workspace, so run serially."""
+        """Override: every solver attempt needs its own clean workspace.
+
+        Attempts are run in waves of ``episode_concurrency``, attempt k of a wave
+        in sandbox slot k. Within a wave all attempts go out in one explorer call,
+        so the sampler generates them as one batch instead of leaving the GPUs
+        waiting on a single sequence, and the wave's clears, input replays and
+        checks all run at the same time too -- they are sandbox round-trips, not
+        compute.
+
+        The slot is what keeps this honest: a wave's attempts each clear, act in
+        and get checked against their own sandbox. Sharing one would let attempt A
+        pass on files attempt B wrote, and ``n_pass`` would stop being a
+        difficulty measurement.
+
+        An attempt cut off at the generation budget is counted in
+        ``stats['solver_truncated']`` but still counts as a failure, because
+        deciding otherwise decides which tasks are kept. Watch that number: when
+        it is a large share of ``solver_rollouts`` times the task count, ``n_pass``
+        is reporting the token budget rather than the difficulty. It was 15 of 50
+        on one run, and one task lost all four attempts that way and was discarded
+        as too hard without a solver ever touching the workspace. Raising
+        ``solver_params.max_tokens`` took it to 0 of 20.
+        """
         if not tasks:
             return []
         passes = [0] * len(tasks)
-        for i, task in enumerate(tasks):
-            prompt = self.solver_prompt(task)
-            for _ in range(self.solver_rollouts):
-                self.reset_fn()
-                attempts = self._solver_explore(
-                    [dict(prompt)], sampling_params=self.solver_params)
-                if attempts and self.judge_attempt(task, attempts[0]):
-                    passes[i] += 1
+        n_slots = max(1, self.episode_concurrency)
+        # Which task each attempt belongs to, flattened, so a wave is a fixed
+        # number of sandboxes no matter how attempts distribute over tasks.
+        plan = [i for i in range(len(tasks)) for _ in range(self.solver_rollouts)]
+
+        for start in range(0, len(plan), n_slots):
+            wave = plan[start:start + n_slots]
+            slots = list(range(len(wave)))
+            setups = [user_data_get(tasks[i].get('user_data'), 'setup_script', '')
+                      for i in wave]
+
+            def _prepare(k: int) -> bool:
+                """Clear slot k, then put back the inputs this task hands out."""
+                self.reset_fn(slot=k)
+                if not setups[k]:
+                    return True
+                exit_code, output = self.run_check_fn(setups[k], slot=k)
+                if exit_code != 0:
+                    # Measuring this attempt against a workspace missing its
+                    # inputs would score the task as harder than it is, so the
+                    # attempt is skipped and counted rather than run.
+                    logger.warning(f'[{type(self).__name__}] input setup failed in '
+                                   f'slot {k} (exit {exit_code}): {output[-200:]}')
+                    return False
+                return True
+
+            ready = self._parallel(_prepare, slots)
+            live = [k for k in slots if ready[k]]
+            self._bump('setup_replay_fail', len(slots) - len(live))
+            if not live:
+                continue
+            prompts = [dict(self.solver_prompt(tasks[wave[k]])) for k in live]
+            kwargs: Dict[str, Any] = {}
+            if self.episode_tool_managers:
+                kwargs['tool_manager'] = [self.episode_tool_managers[k] for k in live]
+            attempts = self._solver_explore(prompts, sampling_params=self.solver_params,
+                                            **kwargs)
+            if len(attempts) != len(prompts):
+                # Counting a partial return would silently understate every
+                # affected task's pass count, i.e. report tasks as harder than
+                # they are.
+                raise RuntimeError(f'explorer returned {len(attempts)} attempts for '
+                                   f'{len(prompts)} solver prompts; expected one per prompt.')
+            for attempt in attempts:
+                if attempt is not None and attempt.get('truncated'):
+                    self._bump('solver_truncated')
+            verdicts = self._parallel(
+                lambda j: (attempts[j] is not None
+                           and self.judge_attempt(tasks[wave[live[j]]], attempts[j],
+                                                  slot=live[j])),
+                list(range(len(live))))
+            for j, passed in enumerate(verdicts):
+                if passed:
+                    passes[wave[live[j]]] += 1
 
         measured = [
             attach_user_data(task, n_pass=passes[i], n_rollouts=self.solver_rollouts)
@@ -527,15 +1295,65 @@ class AgenticChallenger(Challenger):
         return [t for t, kept_flag in zip(measured, in_band) if kept_flag]
 
     def solver_prompt(self, task: Trajectory) -> Trajectory:
-        """The task statement, nothing else -- the solver's own harness adds the system."""
-        return {'messages': [dict(m) for m in task.get('messages') or []]}
+        """The statement as the solver first sees it: system message, query, tools.
 
-    def judge_attempt(self, task: Trajectory, attempt: Trajectory) -> bool:
-        """Run the check script against the sandbox's current state."""
+        ``solver_prompt_fn`` is how the surrounding script hands over the same
+        opening the eval script builds, so a task kept at n_pass=4 here is a task
+        the eval measures the same way. Without one this falls back to the bare
+        statement, which is what it used to be.
+
+        The schemas travel with the prompt for the same reason they do in round 1:
+        a solver that cannot see the tool names cannot use them, and would score
+        zero on every task regardless of difficulty.
+        """
+        if self.solver_prompt_fn is not None:
+            messages = task.get('messages') or []
+            query = next((m.get('content', '') for m in messages
+                          if m.get('role') == 'user'), '')
+            prompt = self.solver_prompt_fn(query)
+            if not prompt.get('tools') and self.tool_schemas:
+                prompt['tools'] = self.tool_schemas
+            return prompt
+        prompt: Trajectory = {'messages': [dict(m) for m in task.get('messages') or []]}
+        if self.tool_schemas:
+            prompt['tools'] = self.tool_schemas
+        return prompt
+
+    def judge_attempt(self, task: Trajectory, attempt: Trajectory,
+                      slot: int = 0) -> bool:
+        """Run the check script against sandbox ``slot``'s current state.
+
+        Also hands the whole attempt to ``solver_sink`` when one is given. The
+        difficulty stage otherwise reports a single number per task, and
+        ``n_pass=0`` reads the same whether the task is impossible, the statement
+        withholds something the check demands, or the solver merely gave up --
+        which are three different things to fix. The evidence that separates them
+        is the attempt itself and the state it left, so both are recorded here
+        rather than reconstructed later.
+        """
         script = user_data_get(task.get('user_data'), 'check_script', '')
         if not script:
             return False
-        exit_code, _ = self.run_check_fn(script)
+        exit_code, output = self.run_check_fn(script, slot=slot)
+        if self.solver_sink is not None:
+            messages = task.get('messages') or [{}]
+            record = {
+                'statement': messages[0].get('content', ''),
+                'check_script': script,
+                'passed': exit_code == 0,
+                'check_exit': exit_code,
+                'check_output': output,
+                # Whether the reply was cut off at the generation budget. The
+                # difficulty stage drops such an attempt from its denominator, so
+                # the flag has to travel with the record for the dropped count to
+                # be reproducible from the dump.
+                'truncated': bool((attempt or {}).get('truncated')),
+                'attempt': attempt,
+                'end_state': (self.workspace_snapshot_fn(slot=slot)
+                              if self.workspace_snapshot_fn else ''),
+            }
+            with self._sink_lock:
+                self.solver_sink(record)
         return exit_code == 0
 
     def on_difficulty_measured(self, candidates: List[Trajectory]) -> None:
@@ -573,22 +1391,44 @@ class AgenticChallenger(Challenger):
         else:
             cats = list(categories)
         picks: List[Tuple[str, str]] = []
+        # Refill every dry category at once rather than as each one is reached: the
+        # three refills are independent model calls that used to run one after
+        # another (20s each at the start of a run), and they touch separate
+        # entries of the bank.
+        dry = [c for c in cats if not self.store.unused(c)]
+        if dry:
+            self._parallel(self._refill, dry)
         for c in cats:
-            if not self.store.unused(c):
-                self._refill(c)
             text = self.store.take(c, self.rng)
             if text is not None:
                 picks.append((c, text))
         return picks
 
     def _refill(self, category: str) -> None:
-        """Ask the model for more keywords in ``category``."""
+        """Ask the model for more keywords in ``category``.
+
+        Says so when it comes back empty. A silent no-op here is the worst
+        outcome available: ``_draw_keywords`` then hands out no keywords, every
+        proposal quietly falls back to the from-scratch prompt, and the run looks
+        normal while producing one identical prompt over and over. That is exactly
+        what happened for whole runs when the prompt asked for one keyword per
+        line and the parser wanted a JSON array.
+        """
         tries = 0
         while not self.store.unused(category):
             new = self._generate_keywords(category, self.keyword_refill_target)
             added = self.store.add(category, new, source='gen')
             tries += 1
-            if added == 0 and tries >= self.keyword_refill_tries:
+            if added:
+                logger.info(f'[AgenticChallenger] keyword category {category!r} '
+                            f'refilled +{added} (try {tries})')
+                continue
+            logger.warning(
+                f'[AgenticChallenger] keyword refill for {category!r} produced '
+                f'nothing on try {tries}: {len(new)} parsed, 0 new. Proposals will '
+                f'run without keywords unless this recovers -- pass keyword_sink '
+                f'to see the replies.')
+            if tries >= self.keyword_refill_tries:
                 if self.store.items[category]:
                     self.store.recycle(category)
                     logger.info(f'[AgenticChallenger] keyword category {category!r} '
@@ -596,34 +1436,103 @@ class AgenticChallenger(Challenger):
                 break
 
     def _generate_keywords(self, category: str, n_want: int) -> List[str]:
-        """Up to ``n_want`` keywords the bank does not already hold."""
+        """Up to ``n_want`` keywords the bank does not already hold.
+
+        Runs on ``keyword_explorer`` when there is one: brainstorming a list is a
+        text round, and putting it through the sandbox-tool explorer both wastes
+        turns and lets a bracketed list in the reply be taken for a tool call.
+        """
         if n_want <= 0:
             return []
         known = self.store.texts(category)
         n_calls = max(self.keyword_gen_calls, self.min_batch)
         per_call = max(1, -(-n_want // n_calls) + 4)
-        avoid_note = ''
-        if known:
-            shown = known if len(known) <= 40 else self.rng.sample(known, 40)
-            avoid_note = ('\nDo NOT repeat any of these already-used topics: '
-                          + ', '.join(shown))
-        base = self.prompts.keyword_user.format(
-            k=per_call, desc=self.category_desc[category]) + avoid_note
-        self._nonce += 1
-        prompts = [{
-            'messages': [{'role': 'system', 'content': self.prompts.keyword_system},
-                         {'role': 'user', 'content': f'{base}\n(batch {self._nonce}-{i})'}],
-        } for i in range(n_calls)]
         seen = {t.strip().lower() for t in known}
         out: List[str] = []
-        for reply in self.explore(prompts, sampling_params=self.keyword_params):
-            for kw in parse_keyword_list(assistant_text(reply)):
-                key = kw.lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(kw)
-        self.rng.shuffle(out)
+        explorer = self.keyword_explorer or self.explorer
+        for start in range(0, n_calls, self.keyword_refill_concurrency):
+            group = range(start, min(start + self.keyword_refill_concurrency, n_calls))
+            # Every call in a group is built before any of them runs, so they all
+            # carry the same avoid list -- which is exactly the batched behaviour,
+            # and why a group of one is what lets call k+1 see call k.
+            users = [(self.prompts.keyword_user.format(
+                k=per_call, desc=self.category_desc[category])
+                + self._avoid_note(known, out,
+                                   '\nDo NOT repeat any of these already-used topics: ')
+                + f'\n(batch {self._next_nonce()}-{i})') for i in group]
+            prompts = [{
+                'messages': [{'role': 'system', 'content': self.prompts.keyword_system},
+                             {'role': 'user', 'content': u}],
+            } for u in users]
+            for user, reply in zip(users, explorer(prompts,
+                                                  sampling_params=self.keyword_params)):
+                text = assistant_text(reply)
+                parsed = parse_keyword_list(text)
+                fresh = []
+                for kw in parsed:
+                    key = kw.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        fresh.append(kw)
+                out.extend(fresh)
+                if self.keyword_sink is not None:
+                    # Full text, both sides. The one question this dump exists to
+                    # answer -- did the model disobey the format, or does the parser
+                    # reject what it produced -- cannot be answered from a count.
+                    record = {
+                        'category': category,
+                        'prompt': user,
+                        'reply': text,
+                        'stop_reason': reply.get('stop_reason'),
+                        'truncated': bool(reply.get('truncated')),
+                        'parsed': parsed,
+                        'n_parsed': len(parsed),
+                        'n_new': len(fresh),
+                    }
+                    with self._sink_lock:
+                        self.keyword_sink(record)
+        with self._kw_lock:
+            self.rng.shuffle(out)
         return out[:n_want]
+
+    # How many phrases the 'do not repeat these' line may quote in total. There
+    # has to be a ceiling in both directions: too few and a serial refill stops
+    # seeing what it just said, too many and the model runs out of room to obey.
+    # Measured on armA2ser, where this refill's own output went in uncapped: with
+    # 130 quoted the eighth call was still answering normally, with 150 it started
+    # inventing -- 'îRAPIÓN holistic replace', 'ซะ subspace cutter map limit', 10
+    # of 480 phrases that run. 100 sits below where that began.
+    _AVOID_TOTAL = 100
+
+    def _next_nonce(self) -> int:
+        """A number no other call gets, so two prompts are never byte-identical.
+
+        Shared across categories, which refill at the same time: two threads
+        reading the counter together would send the same prompt twice and halve
+        the diversity with nothing to show that it happened.
+        """
+        with self._kw_lock:
+            self._nonce += 1
+            return self._nonce
+
+    def _avoid_note(self, older: List[str], fresh: List[str], lead: str) -> str:
+        """The 'do not repeat these' line, newest first, capped at ``_AVOID_TOTAL``.
+
+        What this refill has just produced comes first and evicts older entries
+        rather than the reverse -- the calls run one at a time so that each can
+        avoid what the ones before it said, and dropping those would undo it. Past
+        the cap the oldest of *this refill's* phrases are what falls off, which is
+        also the least costly thing to drop: the model has already moved away from
+        them.
+        """
+        fresh_shown = list(fresh)[-self._AVOID_TOTAL:]
+        room = max(0, self._AVOID_TOTAL - len(fresh_shown))
+        with self._kw_lock:
+            shown = older if len(older) <= room else self.rng.sample(older, room)
+        avoid = fresh_shown + list(shown)
+        return lead + ', '.join(avoid) if avoid else ''
+
+
 
     # ------------------------------------------------------------ feedback
 
@@ -647,10 +1556,19 @@ class AgenticChallenger(Challenger):
             ],
         } for i, (_c, kw) in enumerate(reqs)]
         added = 0
-        for (cat, kw), reply in zip(reqs, self.explore(prompts,
-                                                       sampling_params=self.keyword_params)):
-            added += self.store.add(cat, parse_keyword_list(assistant_text(reply)),
-                                    source='expand', parent=kw)
+        explorer = self.keyword_explorer or self.explorer
+        for (cat, kw), reply in zip(reqs, explorer(prompts,
+                                                   sampling_params=self.keyword_params)):
+            text = assistant_text(reply)
+            parsed = parse_keyword_list(text)
+            added += self.store.add(cat, parsed, source='expand', parent=kw)
+            if self.keyword_sink is not None:
+                self.keyword_sink({
+                    'category': cat, 'parent': kw, 'reply': text,
+                    'stop_reason': reply.get('stop_reason'),
+                    'truncated': bool(reply.get('truncated')),
+                    'parsed': parsed, 'n_parsed': len(parsed),
+                })
         logger.info(f'[AgenticChallenger] expanded {len(hard)} hard keyword(s) -> '
                     f'+{added} same-domain topics')
         return added

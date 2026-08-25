@@ -92,6 +92,9 @@ class ClientMultiTurnRollout:
             * tool_calls produced with no ``tool_manager`` -> ValueError.
             * ``max_turns == 1`` with a first-round tool call -> the trajectory is
               marked ``truncated=True, stop_reason='max_turns'`` and sampling stops.
+            * ``stop_reason == 'length'`` -> the trajectory is marked
+              ``truncated=True`` and sampling stops without dispatching any tool
+              call the cut reply contains.
         """
         if isinstance(trajectories, dict):
             raise TypeError('ClientMultiTurnRollout.__call__ expects a List[Trajectory]; '
@@ -170,7 +173,12 @@ class ClientMultiTurnRollout:
                 stop_reasons[global_idx] = seq.stop_reason
 
                 # 3. Termination conditions.
+                # Cut off at ``max_tokens``: truncated, same as the max_turns and
+                # length-cap cases below, and same as ``MultiTurnRollout`` and
+                # ``ApiMultiTurnRollout``. Tool calls in the cut reply are still
+                # not dispatched.
                 if seq.stop_reason == 'length':
+                    truncated[global_idx] = True
                     done[global_idx] = True
                     continue
 

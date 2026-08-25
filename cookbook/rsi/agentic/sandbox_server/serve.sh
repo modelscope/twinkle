@@ -5,6 +5,7 @@
 #     sh serve.sh                       # foreground, binds 127.0.0.1:8000
 #     API_ADDR=0.0.0.0:8000 sh serve.sh # listen on all interfaces
 #     NOHUP=1 sh serve.sh               # background, logs to /tmp/aenv-server.log
+#     RUST_LOG=agentenv=debug sh serve.sh   # verbose, to watch a template build
 #     STOP_ONLY=1 sh serve.sh           # shut down without starting again
 set -eu
 REPO_ROOT="${REPO_ROOT:-$HOME/AgentENV}"
@@ -31,6 +32,13 @@ AENV_CONFIG_PATH="${AENV_CONFIG_PATH:-/var/lib/aenv/config/config.toml}"
 # state directory instead; home_path in config.toml points at the same place.
 AENV_HOME_PATH="${AENV_HOME_PATH:-/var/lib/aenv}"
 AENV_RUNTIME_PATH="${AENV_RUNTIME_PATH:-/run/aenv}"
+
+# Passed through explicitly because `sudo env` below resets the environment. At
+# the default level a template build logs "template build started" and then
+# nothing at all until it succeeds or fails -- a build that is merely slow reads
+# exactly like a hung one, which cost hours of guessing on 2026-08-23. Restart
+# with RUST_LOG=agentenv=debug before a build you need to watch.
+RUST_LOG="${RUST_LOG:-agentenv=info,envd=info,uvm_ublk=info}"
 
 if [ ! -r "$AENV_CONFIG_PATH" ]; then
     echo "Config not readable: $AENV_CONFIG_PATH" >&2
@@ -95,7 +103,7 @@ cd "$REPO_ROOT"
 #
 # AENV_RUN_USER must be explicit: the script otherwise falls back through
 # SUDO_USER -> repo owner -> aenv -> root, and running as root is not supported.
-E="AENV_RUN_USER=aenv HOME=$AENV_HOME API_ADDR=$API_ADDR AENV_CONFIG_PATH=$AENV_CONFIG_PATH AENV_HOME_PATH=$AENV_HOME_PATH AENV_RUNTIME_PATH=$AENV_RUNTIME_PATH"
+E="AENV_RUN_USER=aenv HOME=$AENV_HOME API_ADDR=$API_ADDR AENV_CONFIG_PATH=$AENV_CONFIG_PATH AENV_HOME_PATH=$AENV_HOME_PATH AENV_RUNTIME_PATH=$AENV_RUNTIME_PATH RUST_LOG=$RUST_LOG"
 
 if [ "$NOHUP" = "1" ]; then
     # setsid, not just nohup: the wrapper ends in `exec setpriv`, which replaces

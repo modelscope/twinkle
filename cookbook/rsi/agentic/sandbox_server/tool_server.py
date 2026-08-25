@@ -26,13 +26,15 @@ Run inside the sandbox::
 import argparse
 import asyncio
 import copy
+import inspect
 import json
 import os
 import sys
 import threading
 import traceback
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 DEFAULT_PORT = 8900
 
@@ -42,6 +44,27 @@ DEFAULT_PORT = 8900
 _LLM_BACKED_ARGS = {'file_system---read_file': ('abbreviate', )}
 
 _SINGLE_NS_FLAG = '_twinkle_single_namespace'
+
+# ms-agent namespaces every tool as ``{server}---{tool}``.
+_TOOL_SPLIT = '---'
+
+# Arguments that belong to ms-agent's plumbing rather than to any one tool, and
+# that it invites the model to pass without every tool accepting one. Its own
+# timeout message says to "set numeric field 'timeout' in the tool arguments"
+# (tool_manager.py:687), but only the code_executor trio has a ``timeout``
+# parameter, so following that advice on write_file raises TypeError;
+# ``description`` is documentation that two of those three declare and the third
+# does not; the call id is injected by the host. For a tool whose signature has
+# no room for one of these, it is dropped -- the alternative is failing a call
+# ms-agent itself asked for. Measured over 5793 calls: 11 ``timeout`` on
+# file_system tools, 2 ``description`` on shell_executor.
+_FRAMEWORK_ARGS = ('timeout', 'description', 'call_id', '__call_id')
+
+# Withdrawn from the advertised schema whatever ms-agent declares: ``__call_id``
+# is a correlation id the host injects ("injected by host when supported",
+# local_code_executor.py:494). Advertising it puts an internal handle in the
+# prompt and invites the model to invent values for it.
+_INTERNAL_ARGS = ('__call_id', )
 
 
 def _single_namespace_source(code: str) -> str:
@@ -93,6 +116,27 @@ def _patch_python_executor() -> bool:
     waits for a loop that is gone. Verified: without this, a ``sys.exit(3)``
     call is followed by timeouts on scripts that passed moments earlier.
 
+    And because that ``exec`` runs in *this* process, a relative path in model
+    code resolves against this process's cwd -- not against the workspace that
+    every other tool uses (``shell_executor`` and ``file_system`` both pass
+    ``cwd=self._ws.root`` explicitly). Measured in a live sandbox before this
+    chdir: ``write_file 'a.txt'`` answered "Save file successfully", the next
+    python call got ``[Errno 2] No such file or directory: 'a.txt'``, and the file
+    was in ``/workspace`` while python looked in ``/``. It cost 41 of ex7's 58
+    such failures, and files python did write landed outside the directory the
+    end-of-episode snapshot lists, so they were invisible to whoever writes the
+    check script. The chdir is per call rather than once at startup so that this
+    holds however the server was launched; it is the same directory every time,
+    so concurrent calls in one turn cannot pull each other around.
+
+    The chdir alone does not let ``import`` find a module the model wrote:
+    ``import`` searches ``sys.path``, which holds the server's launch dir
+    (``/opt/rsi``), not the workspace and not ``''``. Measured in a live sandbox:
+    after ``write_file 'mymod.py'``, ``open('rel.txt')`` read fine but
+    ``import mymod`` raised ``ModuleNotFoundError``, so the natural "write a
+    helper .py then import and run it" loop failed every time. So the workspace
+    is put on ``sys.path`` too, kept as the first entry and never duplicated.
+
     Duplicated from ``twinkle_agentic.harness.ms_agent`` on purpose -- this file
     is uploaded into a sandbox that has ms-agent and nothing else. Temporary,
     pending an upstream PR.
@@ -104,6 +148,19 @@ def _patch_python_executor() -> bool:
         return False
 
     async def python_executor(self, code, description='', timeout=None):
+        root = getattr(self, 'output_dir', None) or getattr(getattr(self, '_ws', None), 'root', None)
+        if root:
+            os.makedirs(root, exist_ok=True)
+            os.chdir(root)
+            # So ``import`` finds a module the model just wrote here. chdir moves
+            # cwd but not the import search path, and the workspace is not on it.
+            # Must be a str: the import machinery's path finders ignore a
+            # PathLike entry on sys.path, and ``root`` arrives as a PosixPath.
+            root_str = os.fspath(root)
+            if sys.path[:1] != [root_str]:
+                if root_str in sys.path:
+                    sys.path.remove(root_str)
+                sys.path.insert(0, root_str)
         return await original(self, _single_namespace_source(code),
                               description=description, timeout=timeout)
 
@@ -177,6 +234,27 @@ def _without_llm_args(schema: Dict[str, Any]) -> Dict[str, Any]:
     return schema
 
 
+def _without_internal_args(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop arguments the host owns from a tool schema.
+
+    Unlike :func:`_without_llm_args` this does not depend on the deployment:
+    ``__call_id`` is never something the model should be choosing, however the
+    sandbox is configured.
+    """
+    fn = schema.get('function') or {}
+    parameters = fn.get('parameters') or {}
+    properties = parameters.get('properties') or {}
+    if not any(arg in properties for arg in _INTERNAL_ARGS):
+        return schema
+    schema = copy.deepcopy(schema)
+    parameters = schema['function']['parameters']
+    for arg in _INTERNAL_ARGS:
+        parameters['properties'].pop(arg, None)
+        if isinstance(parameters.get('required'), list) and arg in parameters['required']:
+            parameters['required'].remove(arg)
+    return schema
+
+
 class _LoopThread:
     """A single long-lived asyncio loop, owned by a background thread.
 
@@ -241,6 +319,9 @@ class ToolRuntime:
         self.workspace = workspace
         self._loop = _LoopThread()
         self._loop.run(self._prepare())
+        # Only after prepare_tools(): a contract can only be read off a tool that
+        # exists.
+        self._contracts = self._build_contracts()
 
     async def _prepare(self) -> None:
         self.agent.prepare_runtime()
@@ -264,28 +345,215 @@ class ToolRuntime:
         else:
             flat = list(raw or [])
         schemas = [_to_openai(t) for t in flat if isinstance(t, dict)]
+        schemas = [_without_internal_args(t) for t in schemas]
         return [t if self.has_llm else _without_llm_args(t) for t in schemas]
+
+    def _build_contracts(self) -> Dict[str, Tuple[Set[str], Optional[Set[str]]]]:
+        """Per tool: the arguments advertised, and the ones the code will take.
+
+        Both halves are needed because ms-agent lets them disagree, and every
+        disagreement is a call the model was invited to make and cannot. The
+        advertised half comes from :meth:`tools`, so it is the exact contract the
+        prompt carries; the other from the signature of the method
+        ``call_tool`` will ``getattr`` and splat the arguments into
+        (filesystem_tool.py:387, local_code_executor.py:583). ``None`` means the
+        method takes ``**kwargs`` or could not be introspected -- then nothing is
+        assumed and nothing is removed.
+
+        Drift is reported at startup rather than waited for: the last one
+        (``shell_executor`` advertising nothing about ``description`` while its
+        siblings declare it) cost two calls in 239 before anyone noticed, and it
+        was found by reading a trajectory.
+        """
+        contracts: Dict[str, Tuple[Set[str], Optional[Set[str]]]] = {}
+        for schema in self.tools():
+            fn = schema.get('function') or {}
+            name = fn.get('name')
+            if not name:
+                continue
+            declared = set((fn.get('parameters') or {}).get('properties') or {})
+            contracts[name] = (declared, self._accepted_args(name))
+        drift = {
+            name: sorted(declared - accepted)
+            for name, (declared, accepted) in contracts.items()
+            if accepted is not None and declared - accepted
+        }
+        if drift:
+            sys.stderr.write('[tool_server] WARNING advertised arguments the implementation '
+                             'rejects (dropped at dispatch, fix upstream): %s\n' % (drift, ))
+            sys.stderr.flush()
+        return contracts
+
+    def _accepted_args(self, name: str) -> Optional[Set[str]]:
+        """Keyword names the implementation behind ``name`` accepts, or None."""
+        try:
+            tool_ins = self._tm._tool_index[name][0]
+            method = getattr(tool_ins, name.split(_TOOL_SPLIT)[-1])
+            sig = inspect.signature(method)
+        except Exception:  # noqa -- an un-introspectable tool just gets no repairs
+            return None
+        if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+            return None
+        return {
+            n
+            for n, p in sig.parameters.items()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+
+    def _reconcile(self, name: str, args: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Repair what ms-agent's contract breaks; refuse the rest, precisely.
+
+        Two different failures arrive as the same TypeError, and they do not
+        deserve the same treatment:
+
+        * an argument ms-agent asked for and cannot take -- its own plumbing
+          (:data:`_FRAMEWORK_ARGS`) or a schema that overstates the code -- is
+          removed. The model followed the contract it was given; failing the call
+          would only teach it to distrust a correct one.
+        * an argument the model invented is refused, with the accepted list and
+          the tool those arguments actually belong to. Measured over 5793 calls,
+          259 ``write_file`` calls carried ``old_string``/``new_string``, which
+          are ``edit_file``'s. Rewriting those into a ``content=`` write would
+          hide a mistake the model should be trained out of, and would teach it a
+          call shape that fails outside this sandbox.
+
+        Returns ``(arguments, error)``; ``error`` is not None when the call must
+        not run.
+        """
+        contract = self._contracts.get(name)
+        if contract is None:
+            return args, None
+        declared, accepted = contract
+        args = dict(args)
+        for arg in list(args):
+            if accepted is None or arg in accepted:
+                continue
+            if arg in _FRAMEWORK_ARGS or arg in declared:
+                args.pop(arg)
+        # glob's own default for ``path`` is '' (filesystem_tool.py:392 advertises
+        # it as optional), but ms-agent's safety guard rejects an empty file path
+        # before dispatch, so a model that spells the default out loud gets
+        # "Blocked by safety policy: Empty file path" -- 66 times in 5793 calls.
+        # '.' is what '' resolves to once inside the tool.
+        if name.split(_TOOL_SPLIT)[-1] == 'glob' and 'path' in args \
+                and not str(args.get('path') or '').strip():
+            args['path'] = '.'
+        unknown = sorted(set(args) - declared)
+        if unknown:
+            return args, self._argument_error(name, unknown, declared)
+        return args, None
+
+    def _argument_error(self, name: str, unknown: List[str], declared: Set[str]) -> str:
+        """Say what was rejected, what is accepted, and who owns the rest.
+
+        The last part is the useful one and it costs nothing: the arguments of
+        every other advertised tool are already known here, so an argument
+        belonging to a sibling can be named as such instead of leaving the model
+        to guess which of eleven tools it meant.
+        """
+        owners: Dict[str, List[str]] = {}
+        for other, (other_declared, _accepted) in self._contracts.items():
+            if other == name:
+                continue
+            for arg in unknown:
+                if arg in other_declared:
+                    owners.setdefault(arg, []).append(other)
+        quoted = ', '.join(repr(a) for a in unknown)
+        parts = ['Error: %s has no argument %s.' % (name, quoted),
+                 'It accepts: %s.' % (', '.join(sorted(declared)) or '(none)')]
+        for arg, tools in sorted(owners.items()):
+            parts.append('%r belongs to %s.' % (arg, ' or '.join(sorted(tools))))
+        parts.append('Re-issue the call with this tool\'s arguments, or call the tool '
+                     'the arguments belong to.')
+        return ' '.join(parts)
 
     def call(self, calls: List[Dict[str, Any]], timeout: Optional[float]) -> List[Dict[str, Any]]:
         """Dispatch a turn's tool calls, mirroring how ms-agent itself does it.
 
         A single call goes through ``single_call_tool`` and a batch through
         ``parallel_call_tool``, matching LLMAgent, so concurrency-sensitive
-        tools behave in training exactly as they do in production.
+        tools behave in training exactly as they do in production. Each call is
+        put through :meth:`_reconcile` first, and one that cannot run is answered
+        from here without reaching ms-agent -- so a batch keeps its shape and
+        result *i* still answers call *i*.
         """
-        payload = [{'tool_name': c.get('tool_name'), 'arguments': c.get('arguments') or {}} for c in calls]
-        try:
-            if len(payload) == 1:
-                results = [self._loop.run(self._tm.single_call_tool(payload[0]), timeout)]
+        out: List[Optional[Dict[str, Any]]] = [None] * len(calls)
+        prepared: List[Tuple[int, Dict[str, Any]]] = []
+        for i, c in enumerate(calls):
+            name = c.get('tool_name')
+            args = c.get('arguments')
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args or '{}')
+                except ValueError:
+                    # ms-agent has its own message for unparseable arguments, and
+                    # it names the offending text; leave the call to it.
+                    prepared.append((i, {'tool_name': name, 'arguments': c.get('arguments')}))
+                    continue
+            if not isinstance(args, dict):
+                args = {}
+            args, error = self._reconcile(name, args)
+            if error:
+                out[i] = {'observation': error, 'ok': False}
             else:
-                results = self._loop.run(self._tm.parallel_call_tool(payload), timeout)
-        except Exception as e:  # noqa
-            # One failing tool must not take down the server: the episode can
-            # still recover, and a dead server would fail every later step of
-            # every trajectory sharing this sandbox.
-            detail = f'{type(e).__name__}: {e}'
-            return [{'observation': f'Tool call failed. {detail}', 'ok': False} for _ in payload]
-        return [{'observation': _as_text(r), 'ok': True} for r in list(results)]
+                prepared.append((i, {'tool_name': name, 'arguments': args}))
+        if prepared:
+            payload = [p for _i, p in prepared]
+            try:
+                if len(payload) == 1:
+                    results = [self._loop.run(self._tm.single_call_tool(payload[0]), timeout)]
+                else:
+                    results = self._loop.run(self._tm.parallel_call_tool(payload), timeout)
+            except Exception as e:  # noqa
+                # One failing tool must not take down the server: the episode can
+                # still recover, and a dead server would fail every later step of
+                # every trajectory sharing this sandbox.
+                #
+                # A timeout is spelled out rather than reported as its exception
+                # name. `concurrent.futures.TimeoutError` carries no message at
+                # all, so the model used to read "Tool call failed. TimeoutError:"
+                # -- which says nothing about what to do differently. What it
+                # needs to know is that the call was abandoned rather than
+                # rejected, that whatever it started may still be running (this
+                # cannot cancel a subprocess ms-agent has already spawned), and
+                # that a long-running command has somewhere else to go. ex8's
+                # episode 23 started an HTTP server in the foreground and stalled
+                # the whole turn.
+                if isinstance(e, (FuturesTimeoutError, asyncio.TimeoutError)):
+                    detail = (f'Timed out: this turn\'s tool calls did not finish within '
+                              f'{timeout}s and were abandoned. Whatever they started may '
+                              f'still be running. A command that does not return on its own '
+                              f'-- a server, a watcher, an interactive program -- has to be '
+                              f'started with run_in_background=true, or given an explicit '
+                              f'time limit inside the command itself.')
+                else:
+                    detail = f'Tool call failed. {type(e).__name__}: {e}'
+                for i, _p in prepared:
+                    out[i] = {'observation': detail, 'ok': False}
+            else:
+                for (i, _p), r in zip(prepared, list(results)):
+                    out[i] = {'observation': _with_timeout_advice(_as_text(r)), 'ok': True}
+        return [o if o is not None else {'observation': '', 'ok': False} for o in out]
+
+
+# ms-agent's own words when its per-call wait runs out (tool_manager.py:687).
+_MS_TIMEOUT_MARK = 'Tool call timed out after'
+# Appended to it, not substituted for it. Its message offers exactly one remedy --
+# raise the `timeout` argument -- which is the wrong one for a command that never
+# returns at all: ex8's episode 23 started `python -m http.server` in the
+# foreground, and no limit up to the 600s ceiling would have helped. shell_executor
+# already advertises `run_in_background`, so this names the argument the model
+# already has rather than teaching it anything new.
+_TIMEOUT_ADVICE = (
+    ' A command that does not return on its own -- a server, a watcher, an '
+    'interactive program -- will time out at any limit; start it with '
+    'run_in_background=true instead, or bound it inside the command itself.')
+
+
+def _with_timeout_advice(observation: str) -> str:
+    if _MS_TIMEOUT_MARK in observation and 'run_in_background' not in observation:
+        return observation + _TIMEOUT_ADVICE
+    return observation
 
 
 def _as_text(result: Any) -> str:

@@ -266,34 +266,43 @@ class Challenger(ABC):
         self,
         trajectories: List[Trajectory],
         sampling_params: Optional[SamplingParams] = None,
+        **kwargs: Any,
     ) -> List[Trajectory]:
         """Run the explorer over a batch, optionally overriding its sampling params.
 
         The override is only forwarded when asked for, so a plain callable
         explorer keeps working; both rollouts in
-        :mod:`twinkle_agentic.rollout` accept it.
+        :mod:`twinkle_agentic.rollout` accept it. Anything else in ``kwargs`` is
+        passed straight through for the same reason -- a caller that needs a
+        rollout-specific hook (``followup_fn``) says so per call, and an explorer
+        that does not take it fails loudly instead of silently ignoring it.
         """
         if not trajectories:
             return []
-        if sampling_params is None:
+        if sampling_params is not None:
+            kwargs['sampling_params'] = sampling_params
+        if not kwargs:
             return self.explorer(trajectories)
-        return self.explorer(trajectories, sampling_params=sampling_params)
+        return self.explorer(trajectories, **kwargs)
 
     def _solver_explore(
         self,
         trajectories: List[Trajectory],
         sampling_params: Optional[SamplingParams] = None,
+        **kwargs: Any,
     ) -> List[Trajectory]:
         """Run solver attempts through the solver explorer, or fall back to the main one.
 
         Subclasses that need per-attempt isolation (e.g. sandbox workspace reset)
-        override this rather than the whole difficulty filter.
+        override this rather than the whole difficulty filter. Extra kwargs are
+        forwarded, which is how such a subclass says which sandbox each attempt
+        runs in (``tool_manager`` as a list, one entry per trajectory).
         """
         if self.solver_explorer is not None:
             if sampling_params is None:
-                return self.solver_explorer(trajectories)
-            return self.solver_explorer(trajectories, sampling_params=sampling_params)
-        return self.explore(trajectories, sampling_params=sampling_params)
+                return self.solver_explorer(trajectories, **kwargs)
+            return self.solver_explorer(trajectories, sampling_params=sampling_params, **kwargs)
+        return self.explore(trajectories, sampling_params=sampling_params, **kwargs)
 
     def _filter_difficulty(self, tasks: List[Trajectory]) -> List[Trajectory]:
         """Attempt each task ``solver_rollouts`` times; keep the ones in the band.

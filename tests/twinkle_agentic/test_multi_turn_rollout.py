@@ -156,6 +156,10 @@ class FakeTemplate:
             })
         return results
 
+    def clean_tool_call(self, decoded: str) -> str:
+        """Strip the call blocks, as the real template does before storing."""
+        return re.sub(r'<tool_call>[\s\S]*?</tool_call>', '', decoded or '')
+
     # --- Used by the fake sampler to mirror real concat_input_feature -------
     def concat_input_feature(self, pif: dict[str, Any], new_tokens: list[int]) -> dict[str, Any]:
         result = copy.deepcopy(pif)
@@ -171,10 +175,20 @@ class FakeTemplate:
         result['input_ids'] = input_ids
         result['labels'] = labels
         result = self._invoke_post_pipeline([result])[0]
-        # Append assistant message with the decoded response (no special toks)
+        # Append assistant message with the decoded response (no special toks).
+        # A reply that parses as a call is stored with the call text removed and
+        # the calls in their own field, which is what the real template does --
+        # and the reason a stage reply has to be put back afterwards.
         response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         messages = list(result.get('messages') or [])
-        messages.append({'role': 'assistant', 'content': response_text})
+        parsed = self.parse_tool_call(response_text)
+        msg: dict[str, Any] = {
+            'role': 'assistant',
+            'content': self.clean_tool_call(response_text) if parsed else response_text,
+        }
+        if parsed:
+            msg['tool_calls'] = parsed
+        messages.append(msg)
         result['messages'] = messages
         return result
 
@@ -186,6 +200,9 @@ class FakeSampler:
         self.template = template
         self._queue: list[dict[str, Any]] = []
         self.sample_calls = 0
+        # One entry per sample() call, so a test can assert which budget each
+        # stage was sampled under.
+        self.params_seen: list[Any] = []
 
     def queue(
         self,
@@ -214,6 +231,7 @@ class FakeSampler:
         if isinstance(pifs, dict):
             pifs = [pifs]
         assert isinstance(pifs, list), (f'FakeSampler.sample expects a list, got {type(pifs).__name__}')
+        self.params_seen.append(sampling_params)
         responses: list[SampleResponse] = []
         for pif in pifs:
             assert self._queue, 'FakeSampler queue exhausted — scripted turns'
@@ -251,6 +269,32 @@ class EchoTool(Tool):
         }
 
 
+class FailTool(Tool):
+    """Answers in the two shapes a real failure arrives in.
+
+    ``kind='envelope'`` is ms-agent wrapping a failure; ``kind='bare'`` is a
+    dispatch that never reached a tool. Both copied from a recorded run.
+    """
+
+    def __init__(self, name: str = 'grep', kind: str = 'envelope'):
+        self._name = name
+        self._kind = kind
+
+    def __call__(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        if self._kind == 'bare':
+            return (f"Error: unknown tool '{tool_name}'. "
+                    f'Available: code_executor---shell_executor')
+        return ('{\n  "success": false,\n  "output": "",\n'
+                '  "error": "[Errno 2] No such file or directory"\n}')
+
+    def tool_info(self):
+        return {
+            'type': 'function',
+            'function': {'name': self._name, 'description': 'always fails',
+                         'parameters': {}},
+        }
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -273,19 +317,23 @@ def sampler(template):
 def tool_manager():
     mgr = ToolManager({})
     mgr.register(EchoTool('search'))
+    mgr.register(FailTool('grep'))
+    mgr.register(FailTool('badname', kind='bare'))
     return mgr
 
 
 @pytest.fixture
 def make_rollout(sampler, template, tool_manager):
 
-    def _make(max_turns: int = 4, sampling_params: SamplingParams | None = None):
+    def _make(max_turns: int = 4, sampling_params: SamplingParams | None = None,
+              stop_after_stuck_turns: int = 0):
         return MultiTurnRollout(
             sampler=sampler,
             template=template,
             tool_manager=tool_manager,
             sampling_params=sampling_params or SamplingParams(),
             max_turns=max_turns,
+            stop_after_stuck_turns=stop_after_stuck_turns,
         )
 
     return _make
@@ -340,7 +388,10 @@ def test_single_turn_length_stop(make_rollout, sampler):
     # short-circuit BEFORE we parse / dispatch tools.
     assert out['turns'] == 1
     assert out['stop_reason'] == 'length'
-    assert out['truncated'] is False
+    # Running out of generation budget is a truncation, like the max_turns and
+    # max_trajectory_tokens cases: a consumer filtering on this flag must not see
+    # a cut-off trajectory as one that reached its own conclusion.
+    assert out['truncated'] is True
     assert sampler.sample_calls == 1
     # No tool message should have been appended.
     roles = [m['role'] for m in out['messages']]
@@ -409,6 +460,153 @@ def test_max_turns_natural_stop_at_ceiling(make_rollout, sampler):
     assert out['turns'] == 2
     assert out['stop_reason'] == 'stop'
     assert out['truncated'] is False
+
+
+def test_max_turns_one_dispatches_no_tool(make_rollout, sampler):
+    """A one-turn rollout never runs a tool, even when the reply asks for one.
+
+    This is what a caller relies on to get a text-only round out of a rollout that
+    requires a tool manager at construction: the challenger's check-writing round
+    must not be able to touch the workspace its script is about to be verified
+    against, and a reply containing python parses as a tool call whether or not
+    the model meant one.
+    """
+    sampler.queue(_tool_call_text('search', {'q': 'x'}), stop_reason='stop')
+    rollout = make_rollout(max_turns=1)
+    out = rollout([_user_traj()])[0]
+
+    assert out['turns'] == 1
+    assert [m['role'] for m in out['messages']].count('tool') == 0
+    # The fake tool echoes what it was called with, so its absence anywhere in
+    # the transcript is proof it never ran.
+    assert 'echo[' not in ''.join(m.get('content') or '' for m in out['messages'])
+
+
+# =============================================================================
+# Tests: stuck-episode early stop
+#
+# Measured on 12 recorded sandbox episodes: 131 of 239 tool calls were
+# byte-identical repeats of an earlier call, and the two worst episodes burned 54
+# and 84 calls to leave behind a single script that could not run. Stopping on
+# errors alone would have caught 1 of the 12 -- the offenders interleave a failing
+# call with a glob that succeeds -- so a turn also counts as stuck when every call
+# in it repeats one already made.
+# =============================================================================
+def test_stuck_stop_off_by_default(make_rollout, sampler):
+    """Two failing turns run on when the limit is 0: existing callers see no change."""
+    sampler.queue(_tool_call_text('grep', {'p': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('grep', {'p': 2}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    out = make_rollout(max_turns=4)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is False
+    assert out['turns'] == 3
+
+
+def test_two_all_error_turns_stop_the_episode(make_rollout, sampler):
+    sampler.queue(_tool_call_text('grep', {'p': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('grep', {'p': 2}), stop_reason='stop')
+    # Would have been a third turn; the stop means it is never sampled.
+    sampler.queue(_tool_call_text('search', {'q': 'x'}), stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is True
+    assert out['truncated'] is True
+    assert out['turns'] == 2
+    assert sampler.sample_calls == 2
+    # The failures that ended it are in the transcript the caller reads, so the
+    # reason is visible without re-running anything.
+    assert [m['role'] for m in out['messages']].count('tool') == 2
+
+
+def test_bare_error_string_counts_as_a_failure(make_rollout, sampler):
+    """An unknown tool name never reaches a tool; that is still a failed turn."""
+    sampler.queue(_tool_call_text('badname', {'a': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('badname', {'a': 2}), stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is True
+    assert out['turns'] == 2
+
+
+def test_two_verbatim_repeat_turns_stop_the_episode(make_rollout, sampler):
+    """Repeating a *successful* call is stuck too -- it cannot produce new state."""
+    sampler.queue(_tool_call_text('search', {'q': 'a'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'a'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'a'}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is True
+    assert out['turns'] == 3
+
+
+def test_changed_arguments_are_not_a_repeat(make_rollout, sampler):
+    sampler.queue(_tool_call_text('search', {'q': 'a'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'b'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'c'}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is False
+    assert out['turns'] == 4
+
+
+def test_one_success_in_a_turn_resets_the_count(make_rollout, sampler):
+    """The case that decided the rule: a failing call next to a useful one.
+
+    Counting these as stuck would stop at turn 2 -- and in the recorded run the
+    files worth writing a check about were created after that point.
+    """
+    for i in range(3):
+        sampler.queue(_tool_call_text('grep', {'p': i})
+                      + _tool_call_text('search', {'q': i}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is False
+    assert out['turns'] == 4
+
+
+def test_a_good_turn_between_two_bad_ones_resets_the_count(make_rollout, sampler):
+    sampler.queue(_tool_call_text('grep', {'p': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'new'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('grep', {'p': 2}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    out = make_rollout(max_turns=6, stop_after_stuck_turns=2)([_user_traj()])[0]
+
+    assert out['stuck_stop'] is False
+    assert out['turns'] == 4
+
+
+def test_stuck_stop_is_per_trajectory_in_a_batch(make_rollout, sampler, template):
+    """One stuck episode must not end its batch mates."""
+    good = ToolManager({})
+    good.register(EchoTool('search'))
+    bad = ToolManager({})
+    bad.register(FailTool('search'))
+
+    sampler.queue(_tool_call_text('search', {'q': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 1}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 2}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 3}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=[good, bad],
+        sampling_params=SamplingParams(), max_turns=6, stop_after_stuck_turns=2)
+    outs = rollout([_user_traj('a'), _user_traj('b')])
+
+    assert outs[1]['stuck_stop'] is True
+    assert outs[0]['stuck_stop'] is False
+    assert outs[0]['turns'] > outs[1]['turns']
+
+
+def test_rejects_negative_stuck_limit(sampler, template, tool_manager):
+    with pytest.raises(ValueError, match='stop_after_stuck_turns'):
+        MultiTurnRollout(sampler=sampler, template=template,
+                         tool_manager=tool_manager, stop_after_stuck_turns=-1)
 
 
 # =============================================================================
@@ -869,3 +1067,238 @@ def test_trace_dir_uses_user_data_id_in_filename(tmp_path, sampler, template, to
     # Slashes are sanitised away; the id still drives the filename.
     assert 'hotpotqa_42' in files[0]
     assert files[0].startswith('fail-')
+
+
+# =============================================================================
+# followup_fn: several stages, one trajectory
+# =============================================================================
+def test_followup_appends_a_user_turn_and_keeps_generating(sampler, template, tool_manager):
+    """A stage that ends without tool calls continues when the callback says so."""
+    asked = []
+
+    def followup(traj, n_before):
+        asked.append((n_before, len(traj['messages'])))
+        return ['write the checks', 'write the statement'][n_before] if n_before < 2 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(), max_turns=8, followup_fn=followup)
+    sampler.queue(_tool_call_text('search', {'q': 'x'}), stop_reason='stop')
+    sampler.queue('Done.', stop_reason='stop')
+    sampler.queue('```python\nassert True\n```', stop_reason='stop')
+    sampler.queue('The statement.', stop_reason='stop')
+
+    out = rollout([_user_traj()])[0]
+
+    assert [n for n, _ in asked] == [0, 1, 2]
+    assert out['followups'] == 2
+    roles = [m['role'] for m in out['messages']]
+    # user, assistant(tool call), tool, assistant(Done.), user, assistant(checks),
+    # user, assistant(statement)
+    assert roles == ['user', 'assistant', 'tool', 'assistant', 'user', 'assistant',
+                     'user', 'assistant']
+    assert out['messages'][4]['content'] == 'write the checks'
+    assert out['messages'][6]['content'] == 'write the statement'
+
+
+def test_every_assistant_stage_stays_trainable(sampler, template, tool_manager):
+    """The whole chain trains: no stage is demoted to prompt by the follow-ups.
+
+    This is the reason follow-ups are appended inside one rollout instead of
+    starting a second one on the finished conversation: a second rollout encodes
+    the history as its prompt, which sets labels to -100 for every earlier
+    assistant turn and leaves only the last stage trainable.
+    """
+    def followup(traj, n_before):
+        return 'next stage' if n_before < 2 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(), max_turns=8, followup_fn=followup)
+    replies = [_tool_call_text('search', {'q': 'x'}), 'Done.', 'CHECKS', 'STATEMENT']
+    for i, text in enumerate(replies):
+        sampler.queue(text, stop_reason='stop', logprobs=[-0.5] * len(
+            template.tokenizer.encode(text + '<|im_end|>', add_special_tokens=False)))
+
+    out = rollout([_user_traj()])[0]
+
+    trainable = _count_trainable(out['labels'])
+    expected = sum(len(template.tokenizer.encode(text + '<|im_end|>', add_special_tokens=False))
+                   for text in replies)
+    assert trainable == expected
+    # The alignment invariant GRPO depends on: one logprob per trainable label.
+    assert len(out['logprobs']) == trainable
+
+
+def test_followup_stage_can_use_its_own_sampling_params(sampler, template, tool_manager):
+    """``(text, params)`` gives that stage its own budget, without touching others."""
+    small = SamplingParams(max_tokens=17)
+
+    def followup(traj, n_before):
+        return ('write the checks', small) if n_before == 0 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(max_tokens=99), max_turns=6, followup_fn=followup)
+    sampler.queue('Done.', stop_reason='stop')
+    sampler.queue('CHECKS', stop_reason='stop')
+
+    rollout([_user_traj()])
+
+    assert [p.max_tokens for p in sampler.params_seen] == [99, 17]
+
+
+def test_tool_calls_are_not_dispatched_after_a_followup(sampler, template, tool_manager):
+    """Python in a check script parses as a call list; it must not run."""
+    def followup(traj, n_before):
+        return 'write the checks' if n_before == 0 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(), max_turns=6, followup_fn=followup)
+    sampler.queue('Done.', stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'should not run'}), stop_reason='stop')
+
+    out = rollout([_user_traj()])[0]
+
+    assert not any(m['role'] == 'tool' for m in out['messages'])
+    assert out['followups'] == 1
+
+
+# =============================================================================
+# Appending a user turn under a template that moves reasoning blocks around
+# =============================================================================
+class ThinkAwareTokenizer(FakeTokenizer):
+    """Renders like Qwen3: reasoning is kept only after the last user turn.
+
+    Two rules, both measured on Qwen3-4B's own template: an assistant turn that
+    precedes the last user message loses its ``<think>`` block, and the trailing
+    assistant turn gains an empty one when it has none. Together they mean that
+    appending a user message rewrites earlier text, so the plain
+    "render before, render after, take the difference" bridge cannot be used.
+    """
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **_):
+        last_user = max((i for i, m in enumerate(messages) if m['role'] == 'user'), default=-1)
+        s = ''
+        for i, m in enumerate(messages):
+            content = m['content']
+            if m['role'] == 'assistant':
+                if i < last_user:
+                    content = re.sub(r'<think>[\s\S]*?</think>\n*', '', content)
+                elif '<think>' not in content:
+                    content = '<think>\n\n</think>\n\n' + content
+            s += f"<|im_start|>{m['role']}\n{content}<|im_end|>\n"
+        if add_generation_prompt:
+            s += '<|im_start|>assistant\n'
+        return self.encode(s) if tokenize else s
+
+
+def test_appending_a_user_turn_keeps_the_history_ids_and_adds_only_the_new_block():
+    """The delta is the new user block plus the generation prompt, nothing else."""
+    from twinkle_agentic.rollout.bridge import extend_with_bridge
+
+    template = FakeTemplate(ThinkAwareTokenizer())
+    messages = [{'role': 'user', 'content': 'do work'},
+                {'role': 'assistant', 'content': '<think>reasoning</think>Done.'}]
+    pif = template.encode({'messages': messages})
+    pif['labels'] = [7] * len(pif['input_ids'])  # stand-in for "these were sampled"
+    before_ids = list(pif['input_ids'])
+
+    out = extend_with_bridge(pif, [{'role': 'user', 'content': 'write the checks'}], template)
+
+    # History untouched: the reasoning the policy produced is still in the ids.
+    assert out['input_ids'][:len(before_ids)] == before_ids
+    added = template.tokenizer.decode(out['input_ids'][len(before_ids):])
+    assert added == ('<|im_start|>user\nwrite the checks<|im_end|>\n'
+                     '<|im_start|>assistant\n'), added
+    # And the appended block is not trained on.
+    assert set(out['labels'][len(before_ids):-1]) == {-100}
+
+
+def test_a_template_that_really_reorders_history_still_raises():
+    """The fallback must not paper over a template that rewrites message blocks."""
+    from twinkle_agentic.rollout.bridge import extend_with_bridge
+
+    class ReorderingTokenizer(FakeTokenizer):
+        """Puts the message count up front, so every append rewrites the start."""
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **_):
+            s = f'[{len(messages)} messages]'
+            for m in messages:
+                s += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            if add_generation_prompt:
+                s += '<|im_start|>assistant\n'
+            return self.encode(s) if tokenize else s
+
+    template = FakeTemplate(ReorderingTokenizer())
+    pif = template.encode({'messages': [{'role': 'user', 'content': 'a'},
+                                        {'role': 'assistant', 'content': 'b'}]})
+    with pytest.raises(RuntimeError, match='non-monotonic'):
+        extend_with_bridge(pif, [{'role': 'user', 'content': 'c'}], template)
+
+
+def test_running_out_of_tool_turns_still_reaches_the_follow_up_stages(sampler, template, tool_manager):
+    """An episode that spends its whole turn budget is not thrown away.
+
+    Before, hitting ``max_turns`` ended the trajectory outright -- and with the
+    stages living inside the episode that would throw away the sandbox run that
+    produced the state they are about.
+    """
+    asked = []
+
+    def followup(traj, n_before):
+        asked.append(n_before)
+        return 'write the checks' if n_before == 0 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(), max_turns=2, followup_fn=followup)
+    # Two turns of tool calls: the second one hits the limit.
+    sampler.queue(_tool_call_text('search', {'q': 'a'}), stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'b'}), stop_reason='stop')
+    sampler.queue('assert True', stop_reason='stop')
+
+    out = rollout([{'messages': [{'role': 'user', 'content': 'go'}]}])[0]
+
+    assert asked == [0, 1]
+    assert out['tool_stop'] == 'max_turns'
+    # The stage ran, so nothing was cut off.
+    assert out['truncated'] is False
+    assert out['messages'][-2:] == [{'role': 'user', 'content': 'write the checks'},
+                                    {'role': 'assistant', 'content': 'assert True'}]
+
+
+def test_a_stage_reply_that_looks_like_a_tool_call_is_kept_whole(sampler, template, tool_manager):
+    """The stage reply the caller reads is what the model wrote.
+
+    The template stores a reply that parses as a call with the call text removed,
+    which is right for a turn whose calls get dispatched and wrong for a stage
+    whose reply *is* the answer. It bit for real: one of the tool-call formats is
+    XML-shaped, so a check script asserting the content of an .xml file parsed as
+    calls, and 5 of ex12's 72 scripts arrived with that content deleted -- three
+    then asserted `content == ''` against a file that had text in it.
+    """
+
+    def followup(traj, n_before):
+        return 'write the checks' if n_before == 0 else None
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        sampling_params=SamplingParams(), max_turns=4, followup_fn=followup)
+    sampler.queue('done exploring', stop_reason='stop')
+    script = ('```python\n' + _tool_call_text('data', {'number': '75'})
+              + "\nassert open('a.xml').read() == 'x'\n```")
+    sampler.queue(script, stop_reason='stop')
+
+    out = rollout([{'messages': [{'role': 'user', 'content': 'go'}]}])[0]
+
+    last = out['messages'][-1]
+    assert last['content'] == script
+    assert 'tool_calls' not in last
+    # Whole, but still without the special tokens: the sampled ids end with
+    # <|im_end|> and ``seq.decoded`` may keep it. ex13 shipped 7 of 7 problem
+    # statements ending in a literal '<|im_end|>' that way.
+    assert '<|im_end|>' not in last['content']
+    # And it was not dispatched: a dispatch appends a tool message.
+    assert [m['role'] for m in out['messages'] if m['role'] == 'tool'] == []

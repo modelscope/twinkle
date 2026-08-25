@@ -152,6 +152,40 @@ def test_tool_manager_call_many_uses_env_step_batch():
     assert out[1].startswith('lookup:')
 
 
+def test_unknown_name_does_not_push_the_turn_off_the_batch():
+    """One name the manager can refuse must not make the rest run concurrently.
+
+    The thread pool is the fallback for tools that share no Env, and dispatching
+    a sandbox turn through it is how four calls in one ex4 episode came back with
+    a single tool's answer. A refusable name is answered here, and the calls that
+    can run still go as one ordered batch.
+    """
+    env = BatchEnv()
+    mgr = ToolManager(EnvTool.from_env(env))
+    calls = [
+        {'type': 'function', 'function': {'name': 'search', 'arguments': {'q': 'a'}}},
+        {'type': 'function', 'function': {'name': 'no_such_tool', 'arguments': {}}},
+        {'type': 'function', 'function': {'name': 'lookup', 'arguments': {'k': 'b'}}},
+    ]
+    out = mgr.call_many(calls)
+    assert env.batch_calls == 1
+    assert env.step_calls == 2
+    assert out[0].startswith('search:')
+    assert out[1].startswith("Error: unknown tool 'no_such_tool'")
+    assert out[2].startswith('lookup:')
+
+
+def test_call_many_all_names_unknown_never_reaches_the_env():
+    env = BatchEnv()
+    mgr = ToolManager(EnvTool.from_env(env))
+    out = mgr.call_many([
+        {'type': 'function', 'function': {'name': 'nope', 'arguments': {}}},
+        {'type': 'function', 'function': {'name': 'also_nope', 'arguments': {}}},
+    ])
+    assert env.step_calls == 0
+    assert all(o.startswith('Error: unknown tool') for o in out)
+
+
 def _run_wrapped(source: str):
     """exec the wrapper the way ms-agent's python_executor does: split dicts."""
     import io

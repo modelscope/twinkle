@@ -12,10 +12,18 @@ The logic was lifted verbatim from ``MultiTurnRollout._extend_with_bridge`` and
 rewritten to use the ``template`` parameter. No Ray decorators
 (``@remote_function`` / ``@remote_class``) are applied here.
 """
+
+
 import numpy as np
 from typing import Any, Dict, List, Optional
 
 from twinkle.template.base import Template
+
+# Stand-in history for the fallback delta computation in
+# :func:`extend_with_bridge`. A single user turn, because what precedes the
+# appended message must itself render the same way with and without it: a user
+# turn has no reasoning block for the template to move or drop.
+_ANCHOR = [{'role': 'user', 'content': 'x'}]
 
 
 def _to_plain(obj: Any) -> Any:
@@ -75,13 +83,40 @@ def extend_with_bridge(
         messages_after, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
 
     if not s_after.startswith(s_before):
-        raise RuntimeError('Canonical chat_template output for messages_after is not a '
-                           'prefix-extension of messages_before; cannot compute bridge '
-                           'delta. This indicates the template is non-monotonic in the '
-                           'message list (e.g. reorders / rewrites earlier turns).\n'
-                           f's_before tail: {s_before[-80:]!r}\n'
-                           f's_after at same offset: '
-                           f'{s_after[max(0, len(s_before) - 80):len(s_before) + 80]!r}')
+        # Appending a *user* message moves where Qwen3's template thinks the
+        # conversation's last question is, and it renders assistant turns either
+        # side of that point differently: the turn before it loses its <think>
+        # block, and the turn after it gains an empty one when it had none.
+        # Measured on Qwen3-4B with three messages -- rendered alone, the
+        # assistant turn reads '<think>\nthinking hard\n</think>\n\nAll tasks are
+        # complete.'; rendered with a user turn after it, just 'All tasks are
+        # complete.'. Tool messages do not move that point, which is why
+        # appending tool observations has always been a clean extension.
+        #
+        # So the delta is measured against a stand-in history instead: render one
+        # user turn, then the same turn plus these messages, and take the
+        # difference. That is exact as long as a message block does not depend on
+        # what precedes it, which the prefix check below still enforces.
+        #
+        # What stays on record is the history as generated, thinking included --
+        # those are the tokens the policy read back when it produced the next
+        # turn, and a later training step has to see the same.
+        s_anchor = tokenizer.apply_chat_template(
+            _ANCHOR, tokenize=False, add_generation_prompt=False,
+            enable_thinking=enable_thinking)
+        s_anchor_after = tokenizer.apply_chat_template(
+            _ANCHOR + list(tool_messages), tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking)
+        if not s_anchor_after.startswith(s_anchor):
+            raise RuntimeError('Canonical chat_template output for messages_after is not a '
+                               'prefix-extension of messages_before, and the same is true '
+                               'of a one-message stand-in history; cannot compute bridge '
+                               'delta. This indicates the template is non-monotonic in the '
+                               'message list (e.g. reorders / rewrites earlier turns).\n'
+                               f's_before tail: {s_before[-80:]!r}\n'
+                               f's_after at same offset: '
+                               f'{s_after[max(0, len(s_before) - 80):len(s_before) + 80]!r}')
+        s_before, s_after = s_anchor, s_anchor_after
     bridge_text = s_after[len(s_before):]
     if not bridge_text:
         raise RuntimeError('Bridge text computation returned empty string; '

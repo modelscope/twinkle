@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import json
+import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -26,6 +28,47 @@ def _append_only_delta(
         if a != b:
             return None
     return new[len(old):]
+
+
+def is_error_observation(observation: str) -> bool:
+    """Did a tool come back with a failure rather than a result?
+
+    Only the two shapes tools actually produce are matched, taken from a dump of
+    239 real calls: ms-agent wraps a failure as ``{"success": false, ...}``, and
+    a dispatch that never reached a tool (unknown name, a file the tool refuses
+    to touch) comes back as a bare line starting with ``Error:``. Plus the two
+    messages an unreachable sandbox produces.
+
+    Deliberately narrow. Matching on words like ``failed`` or ``not found``
+    anywhere in the text also matches a *successful* read of a file that happens
+    to contain them, and this decides whether an episode is cut short.
+    """
+    text = (observation or '').strip()
+    if not text:
+        return False
+    if text.startswith('Error:'):
+        return True
+    if text.startswith(('Tool runtime unreachable:', 'Tool runtime returned no result')):
+        return True
+    return bool(re.search(r'"success"\s*:\s*false', text))
+
+
+def _call_key(tool_call: Dict[str, Any]) -> str:
+    """A stable identity for a tool call: its name plus its arguments verbatim.
+
+    Byte-identical is the point. A model that changes one path and tries again is
+    making progress; one that reissues the same call with the same arguments is
+    not, whatever the tool answered.
+    """
+    fn = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
+    name = fn.get('name') or tool_call.get('name') or tool_call.get('tool_name') or ''
+    args = fn.get('arguments', tool_call.get('arguments'))
+    if not isinstance(args, str):
+        try:
+            args = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args = repr(args)
+    return f'{name}\x00{args}'
 
 
 def _default_tool_messages(
@@ -73,6 +116,7 @@ class MultiTurnRollout(Rollout):
         * ``harness``: a single :class:`AgentHarness` or a 1:1 list. Framework
           specifics (ms-agent system/memory/tool-message shape) live in the
           harness subclass, not here.
+        * ``followup_fn``: see ``__init__``.
     """
 
     def __init__(
@@ -87,6 +131,9 @@ class MultiTurnRollout(Rollout):
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         harness: Optional[AgentHarness] = None,
+        adapter_path: Optional[str] = None,
+        stop_after_stuck_turns: int = 0,
+        followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
     ):
         super().__init__()
         if template is None:
@@ -104,7 +151,58 @@ class MultiTurnRollout(Rollout):
         self.template = template
         self.tool_manager = tool_manager
         self.harness = harness
+        # A LoRA directory on disk, forwarded to every sample call. Training syncs
+        # its adapter into the sampler directly, but evaluating a saved one has no
+        # such channel: without this, an eval script would silently measure the
+        # base model and report it as the trained one.
+        self.adapter_path = adapter_path
         self.max_trajectory_tokens = max_trajectory_tokens
+        # How many stuck turns in a row end the episode; 0 runs to ``max_turns``
+        # regardless. A turn is stuck when it made no progress at all, which is
+        # either of:
+        #   * every call in it came back an error, or
+        #   * every call in it was byte-identical to one already made in this
+        #     episode, whatever it answered.
+        # One useful call in a turn resets the count, so probing for something
+        # and then creating it is untouched.
+        #
+        # Both halves are needed, measured by replaying 12 recorded episodes:
+        # errors alone stop 1 of 12 and save 9 of 239 calls, because the worst
+        # offenders interleave a failing call with a glob that succeeds. Adding
+        # the repeat rule stops 3 of 12 and saves 63 calls, and the three are
+        # exactly the ones that spent 54, 84 and 17 calls to leave behind a
+        # script that could not run. Nothing an episode kept was written after
+        # its stop point except those broken scripts.
+        if stop_after_stuck_turns < 0:
+            raise ValueError(f'stop_after_stuck_turns must be >= 0, got '
+                             f'{stop_after_stuck_turns}')
+        self.stop_after_stuck_turns = stop_after_stuck_turns
+        # Called with (trajectory, how many follow-ups it has had already) at the
+        # moment an episode would end: because the model stopped calling tools,
+        # because it used up ``max_turns``, or because it was stopped for being
+        # stuck. Returning a string appends it as a user message and the episode
+        # keeps going; returning None ends it. May also return
+        # ``(text, SamplingParams)`` to give that stage its own budget.
+        #
+        # It is asked in the ran-out-of-budget cases too, not only when the model
+        # says it is done, because what those stages read is the state the episode
+        # left behind -- which exists either way. An episode dropped for hitting
+        # the turn limit costs its whole sandbox run and produces nothing.
+        #
+        # This is what keeps a multi-stage episode in ONE trajectory. The
+        # alternative -- ending here and starting a second rollout whose prompt is
+        # this conversation -- re-encodes the history as prompt, so every earlier
+        # assistant turn comes back with labels == -100 and only the last stage is
+        # trainable. Appending goes through the same append-only bridge the tool
+        # observations use, so labels and logprobs of the earlier turns survive and
+        # the whole chain can be trained as one sample.
+        #
+        # Tool calls are no longer dispatched once a follow-up has been appended:
+        # the stages that come after the tool-using one are meant to produce text
+        # about the state as it is, and a python block in a reply parses as a call
+        # list -- 41 of 146 such replies dispatched something in a measured run --
+        # which would rewrite the very state the text is about.
+        self.followup_fn = followup_fn
         assert self.template.truncation_strategy != 'split', (
             "MultiTurnRollout does not support truncation_strategy='split'; "
             'use left/right/delete/raise on the template.')
@@ -120,6 +218,10 @@ class MultiTurnRollout(Rollout):
             return []
 
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
+        adapter_path = kwargs.get('adapter_path', self.adapter_path)
+        # Left out entirely when unset, so a sampler without LoRA enabled sees the
+        # same call it always did.
+        adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
         tool_managers = self._broadcast(
             kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager', required=True)
         harnesses = self._broadcast(kwargs.get('harness', self.harness), n, name='harness')
@@ -158,9 +260,66 @@ class MultiTurnRollout(Rollout):
         turns: List[int] = [0] * n
         truncated: List[bool] = [False] * n
         done: List[bool] = [False] * n
+        # Consecutive turns that made no progress, the calls already issued in
+        # each episode, and whether being stuck is what ended it. All three stay
+        # at their initial value when ``stop_after_stuck_turns`` is 0.
+        stuck_turns: List[int] = [0] * n
+        seen_calls: List[set] = [set() for _ in range(n)]
+        stuck_stop: List[bool] = [False] * n
+        # Follow-up bookkeeping (all no-ops when ``followup_fn`` is None):
+        # how many follow-ups each trajectory has had, and the params its next
+        # turn should use. A trajectory that has had one stops dispatching tools.
+        followups: List[int] = [0] * n
+        params_for: List[Any] = [sampling_params] * n
+        followup_fn = kwargs.get('followup_fn', self.followup_fn)
+        # Why the tool-calling part of each episode ended, when it was not the
+        # model's own choice: 'max_turns' or 'stuck'. Reported separately from
+        # ``truncated`` because an episode can hit the turn limit and still go on
+        # to answer the follow-up stages, in which case nothing was cut off.
+        tool_stop: List[Optional[str]] = [None] * n
 
+        def append_followup(global_idx: int) -> bool:
+            """Ask for one more stage; True when the episode carries on.
+
+            Sets ``truncated`` itself in the one case where the answer is "there
+            is no room for another stage", which is a cut trajectory rather than
+            a caller that had nothing more to ask.
+            """
+            nonlocal iterations
+            if followup_fn is None:
+                return False
+            followup = followup_fn(
+                self._as_trajectory(trajectories[global_idx], pifs[global_idx],
+                                    all_logprobs[global_idx], turns[global_idx],
+                                    stop_reasons[global_idx], truncated[global_idx]),
+                followups[global_idx])
+            if followup is None:
+                return False
+            text, next_params = followup if isinstance(followup, tuple) else (followup, None)
+            extended = extend_with_bridge(
+                pifs[global_idx], [{'role': 'user', 'content': text}], self.template)
+            if extended is None:
+                truncated[global_idx] = True
+                return False
+            pifs[global_idx] = extended
+            if lives[global_idx] is not None:
+                lives[global_idx]['messages'] = list(extended.get('messages') or [])
+            followups[global_idx] += 1
+            iterations += 1
+            if next_params is not None:
+                params_for[global_idx] = next_params
+            return True
+
+        # The loop counts generations, and each granted follow-up buys the one
+        # extra generation it asked for. Paying for the follow-up stages out of
+        # ``max_turns`` would mean an episode that spent its whole tool budget
+        # never reaches the stages that read what it built, and a short one
+        # silently gets more tool turns than a long one.
+        iterations = self.max_turns
+        done_iterations = 0
         first_turn = True
-        for _ in range(self.max_turns):
+        while done_iterations < iterations:
+            done_iterations += 1
             active = [i for i in range(n) if not done[i]]
             if not active:
                 break
@@ -177,26 +336,47 @@ class MultiTurnRollout(Rollout):
                     break
             first_turn = False
 
-            # 2. One batched sample call for all currently-live trajectories.
-            batch_pifs = [pifs[i] for i in active]
-            actual = len(batch_pifs)
+            # 2. One batched sample call per distinct SamplingParams among the
+            #    live trajectories -- normally exactly one, since only a
+            #    follow-up stage asks for its own budget. Grouping rather than
+            #    taking the first is what keeps a mixed batch honest: sampling one
+            #    trajectory under another's token limit would silently truncate or
+            #    over-spend, and the two are indistinguishable afterwards.
+            groups: List[List[int]] = []
+            group_params: List[Any] = []
+            for global_idx in active:
+                for slot, params in enumerate(group_params):
+                    if params is params_for[global_idx]:
+                        groups[slot].append(global_idx)
+                        break
+                else:
+                    group_params.append(params_for[global_idx])
+                    groups.append([global_idx])
+
+            resps_by_idx: Dict[int, Any] = {}
             device_mesh = getattr(self.sampler, 'device_mesh', None)
             min_batch_size = (device_mesh.data_world_size if device_mesh is not None else 1)
-            if actual < min_batch_size:
-                batch_pifs = batch_pifs + ([batch_pifs[-1]] * (min_batch_size - actual))
-            resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
-            resps = self._unwrap_response_list(resps, len(batch_pifs))[:actual]
+            for slot, group in enumerate(groups):
+                batch_pifs = [pifs[i] for i in group]
+                actual = len(batch_pifs)
+                if actual < min_batch_size:
+                    batch_pifs = batch_pifs + ([batch_pifs[-1]] * (min_batch_size - actual))
+                group_resps = self.sampler.sample(batch_pifs,
+                                                  sampling_params=group_params[slot],
+                                                  **adapter_kwargs)
+                group_resps = self._unwrap_response_list(group_resps, len(batch_pifs))[:actual]
+                for local_idx, global_idx in enumerate(group):
+                    resps_by_idx[global_idx] = group_resps[local_idx]
 
             pending_tools: List[tuple] = []  # (global_idx, tool_calls)
-            for local_idx, global_idx in enumerate(active):
+            for global_idx in active:
                 turns[global_idx] += 1
-                seq = resps[local_idx].sequences[0]
+                seq = resps_by_idx[global_idx].sequences[0]
 
                 if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
                     raise RuntimeError(f'Sampler returned a SampledSequence without '
-                                       f'new_input_feature.input_ids at batch index '
-                                       f'{local_idx} (trajectory {global_idx}); '
-                                       f'cannot continue multi-turn.')
+                                       f'new_input_feature.input_ids for trajectory '
+                                       f'{global_idx}; cannot continue multi-turn.')
 
                 pifs[global_idx] = _to_plain(dict(seq.new_input_feature))
                 if seq.logprobs is not None:
@@ -213,6 +393,34 @@ class MultiTurnRollout(Rollout):
                 tool_calls = (_last_msg.get('tool_calls') if isinstance(_last_msg, dict) else None)
                 if not tool_calls:
                     tool_calls = self.template.parse_tool_call(seq.decoded or '')
+                # After a follow-up, a parsed call is not a call: the tools were
+                # withdrawn for these stages on purpose (see ``followup_fn``), and
+                # dispatching python that the model wrote as *an answer* would edit
+                # the state the answer is about.
+                if followups[global_idx]:
+                    tool_calls = None
+                    # The parse also *rewrote* the message: when a reply parses as
+                    # a call, the template stores it with the call text removed, so
+                    # a caller reading the message gets less than the model wrote.
+                    # For these stages the reply is the deliverable, and one of the
+                    # tool-call formats is XML-shaped, so a check script asserting
+                    # the content of an .xml file matches it: 5 of ex12's 72 check
+                    # scripts came back with the XML cut out of them -- three then
+                    # ran with `content == ''` where the model had written the file's
+                    # real text, and two no longer held a code block at all.
+                    if _msgs and isinstance(_last_msg, dict):
+                        # Decoded without the special tokens, the way the
+                        # template writes a message: ``seq.decoded`` keeps the
+                        # closing ``<|im_end|>``, and putting that in the content
+                        # put it in the problem statements ex13 handed to solvers
+                        # -- 7 of 7 of them ended in a literal '<|im_end|>'.
+                        tok = getattr(self.template, 'tokenizer', None)
+                        if tok is not None and seq.tokens:
+                            _last_msg['content'] = tok.decode(
+                                seq.tokens, skip_special_tokens=True)
+                        else:
+                            _last_msg['content'] = seq.decoded or ''
+                        _last_msg.pop('tool_calls', None)
 
                 if lives[global_idx] is not None:
                     lives[global_idx]['messages'] = list(_msgs)
@@ -222,7 +430,15 @@ class MultiTurnRollout(Rollout):
                     self._merge_assistant_metadata(pifs[global_idx], lives[global_idx])
 
                 # 3. Termination conditions
+                # A reply cut off at ``max_tokens`` is truncated in exactly the
+                # sense the flag names, and consumers read the flag to tell a
+                # trajectory that finished from one that ran out of room: a
+                # difficulty measurement counting such an attempt as a genuine
+                # failure blames the task for the token budget. Tool calls the
+                # cut reply happens to contain are still not dispatched -- the
+                # turn never got to decide it was done emitting them.
                 if seq.stop_reason == 'length':
+                    truncated[global_idx] = True
                     done[global_idx] = True
                     continue
 
@@ -234,10 +450,20 @@ class MultiTurnRollout(Rollout):
                     continue
 
                 if not tool_calls:
+                    # The episode is over as far as the model is concerned. Give
+                    # the caller one chance to say otherwise -- see
+                    # ``followup_fn`` for why this is not a second rollout.
+                    if append_followup(global_idx):
+                        continue
                     done[global_idx] = True
                     continue
 
                 if turns[global_idx] >= self.max_turns:
+                    # Out of tool turns, not out of episode: the stages that read
+                    # the end state can still run on what was built.
+                    tool_stop[global_idx] = 'max_turns'
+                    if append_followup(global_idx):
+                        continue
                     truncated[global_idx] = True
                     done[global_idx] = True
                     continue
@@ -252,6 +478,17 @@ class MultiTurnRollout(Rollout):
                 obs_by_traj = self._dispatch_tools(tool_managers, pending_tools)
                 for global_idx, tool_calls in pending_tools:
                     observations = obs_by_traj.get(global_idx) or [''] * len(tool_calls)
+                    if self.stop_after_stuck_turns:
+                        keys = [_call_key(tc) for tc in tool_calls]
+                        all_repeats = bool(keys) and all(k in seen_calls[global_idx]
+                                                        for k in keys)
+                        seen_calls[global_idx].update(keys)
+                        all_errors = bool(observations) and all(
+                            is_error_observation(o) for o in observations)
+                        if all_errors or all_repeats:
+                            stuck_turns[global_idx] += 1
+                        else:
+                            stuck_turns[global_idx] = 0
                     tool_messages, lives[global_idx] = self._tool_messages_after(
                         pifs[global_idx], lives[global_idx], harnesses[global_idx],
                         observations, tool_calls)
@@ -264,6 +501,18 @@ class MultiTurnRollout(Rollout):
                         pifs[global_idx] = extended
                         if lives[global_idx] is not None:
                             lives[global_idx]['messages'] = list(extended.get('messages') or [])
+                    # Checked after the messages are appended, so the turns that
+                    # ended the episode are in the trajectory the caller reads.
+                    if (self.stop_after_stuck_turns
+                            and stuck_turns[global_idx] >= self.stop_after_stuck_turns):
+                        stuck_stop[global_idx] = True
+                        tool_stop[global_idx] = 'stuck'
+                        # Same as the turn limit: the tool phase is over, the
+                        # state it left is not, so the stages still get their turn.
+                        if not done[global_idx] and append_followup(global_idx):
+                            continue
+                        truncated[global_idx] = True
+                        done[global_idx] = True
 
         for i in range(n):
             if not all_logprobs[i]:
@@ -289,6 +538,12 @@ class MultiTurnRollout(Rollout):
             out['turns'] = turns[i]
             out['stop_reason'] = stop_reasons[i]
             out['truncated'] = truncated[i]
+            # ``truncated`` says something was cut off; these two say what ended
+            # the tool-calling part, which is a different question -- an episode
+            # can run out of turns, be handed a follow-up stage, and finish it.
+            out['stuck_stop'] = stuck_stop[i]
+            out['tool_stop'] = tool_stop[i]
+            out['followups'] = followups[i]
             outs.append(out)
 
         # Per-rollout trace dump: one JSON file per selected trajectory.
@@ -300,6 +555,25 @@ class MultiTurnRollout(Rollout):
         return outs
 
     # ------------------------------------------------------------------ private
+
+    @staticmethod
+    def _as_trajectory(traj: Trajectory, pif: Dict[str, Any], logprobs: List[Any],
+                      turns: int, stop_reason: Optional[str],
+                      truncated: bool) -> Trajectory:
+        """The episode so far, shaped like the value ``__call__`` returns.
+
+        Handed to ``followup_fn`` so the callback reads an episode the same way
+        every other consumer does -- ``messages`` complete, token fields present --
+        rather than having to know this loop's local variables.
+        """
+        out = dict(traj)
+        out.update(pif)
+        out['messages'] = list(pif.get('messages') or traj.get('messages') or [])
+        out['logprobs'] = logprobs if logprobs else None
+        out['turns'] = turns
+        out['stop_reason'] = stop_reason
+        out['truncated'] = truncated
+        return out
 
     def _harness_before_generate(
         self,
