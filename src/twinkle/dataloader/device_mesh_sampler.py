@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from collections import deque
+
 from torch.utils.data import BatchSampler
 
 from twinkle import DeviceMesh
@@ -21,10 +23,12 @@ class DeviceMeshSampler(BatchSampler):
         self.device_mesh = device_mesh
         self.min_batch_size = min_batch_size
         self.skip_samples = skip_samples
+        self.emitted_batch_sizes = deque()
         if self.min_batch_size is None and self.device_mesh is not None:
             self.min_batch_size = self.device_mesh.data_world_size
 
     def __iter__(self):
+        self.emitted_batch_sizes.clear()
         skipped = 0
         for batch in self.original_sampler:
             if skipped < self.skip_samples:
@@ -36,6 +40,7 @@ class DeviceMeshSampler(BatchSampler):
 
             if self.min_batch_size is not None and len(batch) < self.min_batch_size:
                 return
+            self.emitted_batch_sizes.append(len(batch))
             if not self.device_mesh:
                 yield batch
             else:

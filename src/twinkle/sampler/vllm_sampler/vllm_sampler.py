@@ -287,6 +287,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         *,
         return_encoded: bool = False,
         use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -299,7 +300,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
             adapter_name: Optional LoRA adapter name.
 
-            adapter_path: Optional LoRA adapter path.
+            adapter_path: Optional LoRA adapter path, applied to every input in this call.
+
+            adapter_paths: Per-input LoRA paths, one entry per input (``None`` entries sample from the
+                base model). Use this instead of ``adapter_path`` to serve several adapters
+                concurrently: vLLM keeps up to ``max_loras`` adapters resident and can mix them within
+                one running batch, so a multi-tenant server does not have to serialize by adapter.
+                Requires the engine to have been built with ``enable_lora=True``. Mutually exclusive
+                with ``adapter_path``.
 
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
@@ -312,6 +320,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             In Ray mode with multiple workers (DP > 1):
             - Data is automatically sliced by DP rank (dispatch='slice_dp')
             - Each worker receives already-sliced inputs (e.g., DP4 with 8 inputs -> 2 per worker)
+            - ``adapter_paths`` is a list too, so it is sliced in lockstep with ``inputs`` and stays
+              aligned with them on every rank.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -319,6 +329,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         inputs_list = self._normalize_inputs(inputs)
+        if adapter_paths is not None:
+            if adapter_path is not None:
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
+            if len(adapter_paths) != len(inputs_list):
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = 'input_ids' not in inputs_list[0]
@@ -342,14 +360,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         else:
             encoded_inputs = inputs_list
 
-        lora_request = None
-        if adapter_path is not None:
-            logger.info(f'Loading LoRA from {adapter_path}')
-            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
-            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
-            if lora_request is None:
-                logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '
-                               'sampling will proceed without LoRA')
+        if adapter_paths is not None:
+            lora_requests = [self._load_lora(path) for path in adapter_paths]
+        else:
+            lora_requests = [self._load_lora(adapter_path)] * len(encoded_inputs)
 
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
@@ -361,12 +375,27 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
-                ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
+                ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)
             ]
             return await asyncio.gather(*tasks)
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results
+
+    def _load_lora(self, adapter_path: Optional[str]):
+        """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.
+
+        ``_get_or_load_lora`` caches by path, so repeating the same path across a batch of per-input
+        adapters costs one ``add_lora`` RPC, not one per input.
+        """
+        if adapter_path is None:
+            return None
+        logger.info(f'Loading LoRA from {adapter_path}')
+        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
+        lora_request = self._run_in_loop(self.engine._get_or_load_lora(local_path))
+        if lora_request is None:
+            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
+        return lora_request
 
     def sample_stream(
         self,
@@ -390,10 +419,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if is_trajectory:
             feat = self.encode_trajectory_for_vllm(feat, adapter_name)
 
-        lora_request = None
-        if adapter_path is not None:
-            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
-            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
+        lora_request = self._load_lora(adapter_path)
 
         prompt = self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids']
 

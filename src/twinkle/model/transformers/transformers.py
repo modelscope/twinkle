@@ -37,7 +37,7 @@ from twinkle.model.base import TwinkleModel
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
-from twinkle.module.optimizer import GaLoreConfig, create_galore_param_groups
+from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, create_galore_param_groups, create_muon_param_groups)
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -984,18 +984,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Args:
             optimizer_cls: An optimizer class name, an optimizer plugin id, or an optimizer class type/instance.
                 Besides `torch.optim` optimizers, the GaLore optimizers (`GaLoreAdamW`, `GaLoreAdafactor`,
-                `GaLoreAdamW8bit`) in `twinkle.module.optimizer` are supported.
+                `GaLoreAdamW8bit`) and `MuonClip` in `twinkle.module.optimizer` are supported.
             **kwargs:
                 adapter_name: Lora adapter name.
                 lr: Learning rate
                 weight_decay: Weight decay
                 galore_config: A `GaLoreConfig` or a dict of its fields, enabling GaLore low-rank gradient
                     projection on the matched param groups. Only takes effect for the GaLore optimizers.
+                muon_config: A `MuonConfig` or a dict of its fields, marking which param groups take the
+                    Muon update and which are subject to QK-Clip. Only takes effect for `MuonClip`, and
+                    passing it is how `MuonClip` gets more than plain momentum SGD.
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         galore_config = kwargs.pop('galore_config', None)
+        muon_config = kwargs.pop('muon_config', None)
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
             return
@@ -1009,6 +1013,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if isinstance(galore_config, dict):
                 galore_config = GaLoreConfig(**galore_config)
             params = create_galore_param_groups(self.strategy.unwrap_model(self.model), params, galore_config)
+        if muon_config is not None:
+            if isinstance(muon_config, dict):
+                muon_config = MuonConfig(**muon_config)
+            params = create_muon_param_groups(params, muon_config)
         if hasattr(self.strategy, 'adjust_optimizer_kwargs'):
             kwargs = self.strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs)
         optimizer_config.optimizer = construct_class(

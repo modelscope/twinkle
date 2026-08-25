@@ -108,6 +108,43 @@ class SamplingParams:
             vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
         return vllm_params
 
+    def to_sglang(self, **kwargs) -> Dict[str, Any]:
+        """Convert to the dict sglang takes as its ``sampling_params``.
+
+        sglang calls the token budget ``max_new_tokens``, the seed ``sampling_seed``, and keeps stop
+        token ids separate from stop strings. ``logprobs``/``prompt_logprobs`` are deliberately absent:
+        sglang requests those per generate() call rather than through the sampling parameters, so
+        :class:`~twinkle.sampler.SGLangEngine` translates them instead.
+        """
+        params = {
+            'temperature': self.temperature,
+            'top_p': self.top_p,
+            'n': self.num_samples,
+            **kwargs,
+        }
+
+        if self.max_tokens is not None:
+            params['max_new_tokens'] = self.max_tokens
+
+        if self.seed is not None:
+            params['sampling_seed'] = self.seed
+
+        if self.top_k > 0:
+            params['top_k'] = self.top_k
+
+        if self.repetition_penalty != 1.0:
+            params['repetition_penalty'] = self.repetition_penalty
+
+        if self.stop:
+            if isinstance(self.stop, str):
+                params['stop'] = [self.stop]
+            elif isinstance(self.stop, (list, tuple)) and self.stop and isinstance(self.stop[0], int):
+                params['stop_token_ids'] = list(self.stop)
+            else:
+                params['stop'] = list(self.stop)
+
+        return params
+
     def to_transformers(self, tokenizer=None) -> Dict[str, Any]:
         """Convert to transformers generate() kwargs."""
         import torch
