@@ -52,7 +52,11 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
         return TwinkleCompatFullTransformersModel(**kw)
-    from .backends.transformers_model import TwinkleCompatTransformersModel
+    from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
+                                              TwinkleCompatTransformersModel)
+
+    if train_mode == 'hybrid':
+        return TwinkleCompatSpectralHybridTransformersModel(**kw)
     return TwinkleCompatTransformersModel(**kw)
 
 

@@ -6,6 +6,8 @@ from typing import Any, Dict, Literal, Mapping, Optional
 from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
 
+MODULES_TO_SAVE_SEGMENT = '.modules_to_save.'
+
 
 class AccelerateStrategy:
     """A training strategy that uses `accelerate` to wrap models.
@@ -145,52 +147,70 @@ class AccelerateStrategy:
         state = self.accelerator.state
         return state.fsdp_plugin if hasattr(state, 'fsdp_plugin') else None
 
-    def _prepare_fsdp2_sd_options(self):
-        fsdp_plugin = self._get_fsdp_plugin()
-        if fsdp_plugin is None or fsdp_plugin.fsdp_version != 2:
-            return None
-
+    @staticmethod
+    def _prepare_full_optimizer_state_dict_options(*, for_load: bool):
         from torch.distributed.checkpoint.state_dict import StateDictOptions
-        from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
         return StateDictOptions(
-            full_state_dict=fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT,
-            cpu_offload=getattr(fsdp_plugin.state_dict_config, 'offload_to_cpu', False),
-            broadcast_from_rank0=getattr(fsdp_plugin.state_dict_config, 'rank0_only', False),
+            full_state_dict=True,
+            cpu_offload=not for_load,
+            broadcast_from_rank0=for_load,
         )
 
     def needs_wrapped_optimizer_state(self) -> bool:
         fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+
+        from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-            optim_state = get_optimizer_state_dict(model, optimizer, options=self._prepare_fsdp2_sd_options())
+            # PyTorch initializes Adam state through the native optimizer step.
+            # AcceleratedOptimizer may skip that step when gradients are not synchronized.
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            optim_state = get_optimizer_state_dict(
+                model,
+                inner_optimizer,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=False),
+            )
             if self.accelerator.process_index == 0:
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
                 torch.save(optim_state, output_path)
             return
 
         if self.accelerator.process_index == 0:
-            torch.save(optimizer.state_dict(), output_path)
+            optim_state = optimizer.state_dict()
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+
+        from .optimizer_state import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
-            optim_state = None
-            rank0_only = getattr(fsdp_plugin.optim_state_dict_config, 'rank0_only', False)
-            if self.accelerator.process_index == 0 or not rank0_only:
-                optim_state = torch.load(input_path, weights_only=True)
-            set_optimizer_state_dict(model, optimizer, optim_state, options=self._prepare_fsdp2_sd_options())
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            optim_state = {}
+            if self.accelerator.process_index == 0:
+                optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            set_optimizer_state_dict(
+                model,
+                inner_optimizer,
+                optim_state,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=True),
+            )
             return
 
-        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        optimizer.load_state_dict(optim_state)
 
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict."""
@@ -212,19 +232,23 @@ class AccelerateStrategy:
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
-            set_model_state_dict(model, state_dict, options=self._prepare_fsdp2_sd_options())
+            set_model_state_dict(
+                model,
+                state_dict,
+                options=self._prepare_full_optimizer_state_dict_options(for_load=True),
+            )
             return
         unwrapped = self.unwrap_model(model)
         unwrapped.load_state_dict(state_dict, strict=False)
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
-        """Collect only LoRA adapter parameters."""
+        """Collect LoRA parameters and fully trained PEFT modules."""
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
         state_dict = {}
         adapter_suffix = f'.{adapter_name}.'
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not _is_saveable_adapter_key(name) or adapter_suffix not in name:
                 continue
             local = torch_util.to_local_tensor(param)
             state_dict[name] = local.cpu()
@@ -234,3 +258,7 @@ class AccelerateStrategy:
 
 def _is_lora_state_key(name: str) -> bool:
     return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+
+
+def _is_saveable_adapter_key(name: str) -> bool:
+    return _is_lora_state_key(name) or MODULES_TO_SAVE_SEGMENT in name

@@ -18,7 +18,7 @@ from typing import List, Union
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
-from twinkle.model import MultiLoraTransformersModel
+from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.model.transformers import TransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
@@ -122,6 +122,11 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
 @remote_class()
 class TwinkleCompatTransformersModel(_TransformersTinkerCompatMixin, MultiLoraTransformersModel):
     """Unified multi-LoRA wrapper around MultiLoraTransformersModel."""
+
+
+@remote_class()
+class TwinkleCompatSpectralHybridTransformersModel(_TransformersTinkerCompatMixin, SpectralHybridTransformersModel):
+    """Unified API wrapper for the Spectral Hybrid Transformers model."""
 
 
 @remote_class()

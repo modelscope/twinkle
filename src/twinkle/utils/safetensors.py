@@ -1,6 +1,7 @@
 import json
 import os
 from functools import partial
+from pathlib import Path
 from typing import Literal
 
 from .device_mesh import is_last_rank, is_master
@@ -89,11 +90,18 @@ class StreamingSafetensorSaver:
     ) -> None:
         self.save_dir = save_dir
         if isinstance(max_shard_size, str):
-            if max_shard_size.endswith('GB'):
-                max_shard_size = int(max_shard_size[:-2])
-            else:
+            import re
+            match = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)\s*', max_shard_size.upper())
+            if match is None:
                 raise ValueError(f'Invalid max_shard_size: {max_shard_size}')
-        self.max_shard_size = max_shard_size * 1000**3
+            multipliers = {'B': 1, 'KB': 1000, 'MB': 1000**2, 'GB': 1000**3}
+            max_shard_size = int(float(match.group(1)) * multipliers[match.group(2)])
+        elif isinstance(max_shard_size, int):
+            # Preserve the historical API: integer values are expressed in GB.
+            max_shard_size *= 1000**3
+        else:
+            raise TypeError('max_shard_size must be a byte count or a size string such as "5GB".')
+        self.max_shard_size = max_shard_size
         self.current_shard = {}
         self.current_shard_size = 0
         self.total_size = 0
@@ -103,6 +111,12 @@ class StreamingSafetensorSaver:
         self.is_peft_format = is_peft_format
         if self.is_save_rank:
             os.makedirs(save_dir, exist_ok=True)
+        self._previous_model_files = set()
+        if self.is_save_rank and not self.is_peft_format:
+            self._previous_model_files = set(Path(save_dir).glob('model*.safetensors'))
+            index_path = Path(save_dir) / 'model.safetensors.index.json'
+            if index_path.exists():
+                self._previous_model_files.add(index_path)
 
     def add_tensor(self, name, tensor):
         if not self.is_save_rank:
@@ -112,7 +126,9 @@ class StreamingSafetensorSaver:
                 and not self.is_peft_format):
             self._save_current_shard()
 
-        self.current_shard[name] = tensor.cpu().contiguous()
+        # Break shared storage (for example tied input/output embeddings) so a
+        # standard Transformers state dict remains valid for safetensors.
+        self.current_shard[name] = tensor.detach().cpu().contiguous().clone()
         self.current_shard_size += tensor_size
 
     def _save_current_shard(self, shard_filename: str = None):
@@ -160,6 +176,17 @@ class StreamingSafetensorSaver:
                 updated_weight_map[key] = new_filename
 
             self._save_index(updated_weight_map)
+
+        if total_shards == 1:
+            current_files = {Path(self.save_dir) / 'model.safetensors'}
+        else:
+            current_files = {
+                Path(self.save_dir) / f'model-{index:05d}-of-{total_shards:05d}.safetensors'
+                for index in range(1, total_shards + 1)
+            }
+            current_files.add(Path(self.save_dir) / 'model.safetensors.index.json')
+        for stale_path in self._previous_model_files - current_files:
+            stale_path.unlink(missing_ok=True)
 
     def _save_index(self, weight_map):
         index = {'metadata': {'total_size': self.total_size}, 'weight_map': weight_map}

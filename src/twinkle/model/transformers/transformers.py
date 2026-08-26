@@ -47,6 +47,8 @@ from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
+CHECKPOINT_ADAPTER_NAME = 'default'
+
 
 def _get_vocab_size(config: PretrainedConfig) -> int:
     """Resolve the LM vocabulary size without running a sharded model forward."""
@@ -1111,7 +1113,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         is_default = adapter_name == _default_adapter_name
         # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
         # parameters to be missed by the optimizer.
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}')
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -1199,11 +1201,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Avoid collecting the full base model for large FSDP/EP jobs.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
+        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
         processed_state_dict = {}
         for key, value in adapter_state.items():
-            normalized = key.replace(adapter_suffix, '.')
+            if modules_to_save_infix in key:
+                normalized = key.replace(modules_to_save_infix, '.')
+            else:
+                normalized = key.replace(adapter_suffix, '.')
             processed_state_dict[normalized] = value
         return processed_state_dict
+
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """Map runtime optimizer parameter names to checkpoint names."""
+        return {}
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1213,7 +1223,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if optimizer is not None:
             optimizer_path = os.path.join(output_dir, 'optimizer.pt')
-            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
+            name_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            self.strategy.save_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=name_mapping,
+            )
         if Platform.is_master():
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
@@ -1328,7 +1344,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
-            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
+            optimizer = optimizer_config.optimizer
+            save_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            load_mapping = {logical_name: physical_name for physical_name, logical_name in save_mapping.items()}
+            self.strategy.load_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=load_mapping,
+            )
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)

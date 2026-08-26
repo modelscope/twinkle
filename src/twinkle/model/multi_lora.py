@@ -38,6 +38,7 @@ class MultiLora:
         self._active_adapters = []
         self.max_length = max_length
         self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
+        self.lora_layer_names: List[str] = []
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -165,8 +166,10 @@ class MultiLora:
     @contextmanager
     def _disable_lora_context(self, tenant_adapter_name):
         self.deactivate_adapter()
-        yield
-        self.activate_adapter(tenant_adapter_name, call_enable=True)
+        try:
+            yield
+        finally:
+            self.activate_adapter(tenant_adapter_name, call_enable=True)
 
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
@@ -253,6 +256,23 @@ class MultiLora:
         else:
             raise ValueError(f'No lora found for real adapter_name {adapter_name}')
 
+    def validate_tenant_target_modules(self, target_modules, target_parameters=None) -> None:
+        """Ensure every requested target resolves inside the preallocated LoRA layers."""
+        if not target_modules and target_parameters:
+            return
+        layers = [name for name, layer in self.module.named_modules() if isinstance(layer, LoraLayer)]
+        if target_modules == 'all-linear' or (isinstance(target_modules,
+                                                         (list, set)) and 'all-linear' in target_modules):
+            return
+        if isinstance(target_modules, (list, set)):
+            missing = [target for target in target_modules if not any(name.endswith(target) for name in layers)]
+            if missing:
+                raise ValueError(f'LoRA target_modules are outside the preallocated range: {sorted(missing)}')
+            return
+        if isinstance(target_modules, str) and any(self.match_target_modules(name, target_modules) for name in layers):
+            return
+        raise ValueError(f'LoRA target_modules do not resolve inside the preallocated range: {target_modules!r}')
+
     @staticmethod
     def match_target_modules(
         module_name: str,
@@ -264,8 +284,7 @@ class MultiLora:
         if isinstance(target_modules, (list, set)) and len(target_modules) == 0:
             return False
 
-        if isinstance(target_modules,
-                      (list, set)) and len(target_modules) == 1 and next(iter(target_modules)) == 'all-linear':
+        if isinstance(target_modules, (list, set)) and 'all-linear' in target_modules:
             return True
 
         if target_modules == 'all-linear':
@@ -487,8 +506,9 @@ class MultiLora:
             module_device = next(first_module.parameters()).device
         low_cpu_mem_usage = module_device.type == 'meta'
 
+        base_config = kwargs.get('lora_config', None)
         for i in range(self.max_loras):
-            config = kwargs.get('lora_config', None)
+            config = deepcopy(base_config) if base_config is not None else None
             if config is None:
                 config = LoraConfig(
                     r=self.max_r,
@@ -556,6 +576,8 @@ class MultiLora:
             _enable_all_lora_grad(module)
 
         self.module = module
+        if not isinstance(module, list):
+            self.lora_layer_names = [name for name, layer in module.named_modules() if isinstance(layer, Linear)]
         return module
 
     def save_initial_weights(self):
@@ -699,7 +721,8 @@ class MultiLora:
                 _load_weights(_module)
         else:
             _load_weights(self.module)
-        self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
+        if getattr(_lora.tenant_config, 'target_parameters', None):
+            self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
 
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
@@ -724,11 +747,12 @@ class MultiLora:
                 state_dict.update(_get_weights(_module))
         else:
             state_dict = _get_weights(self.module)
-        target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
-        overlap = state_dict.keys() & target_state_dict.keys()
-        if overlap:
-            raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
-        state_dict.update(target_state_dict)
+        if getattr(_lora.tenant_config, 'target_parameters', None):
+            target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
+            overlap = state_dict.keys() & target_state_dict.keys()
+            if overlap:
+                raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
+            state_dict.update(target_state_dict)
         return state_dict
 
     def _load_initial_weights(self, origin_adapter_name):
@@ -756,6 +780,25 @@ class MultiLora:
         else:
             _load_initial_weights(self.module)
 
+    @staticmethod
+    def _active_lora_numel(name, parameter, r: int) -> int:
+        """Count the active LoRA rank from shape without slicing the tensor."""
+        shape = parameter.shape
+        if len(shape) != 2:
+            return parameter.numel()
+        if 'embedding_A' in name:
+            rank_dim = 1
+        elif 'embedding_B' in name or '_A' in name:
+            rank_dim = 0
+        elif '_B' in name:
+            rank_dim = 1
+        else:
+            return parameter.numel()
+
+        dims = [int(shape[0]), int(shape[1])]
+        dims[rank_dim] = min(r, dims[rank_dim])
+        return dims[0] * dims[1]
+
     def get_nb_trainable_parameters(self, tenant_adapter_name) -> tuple[int, int]:
         r"""
         Returns the number of trainable parameters and the number of all parameters in the model.
@@ -776,16 +819,9 @@ class MultiLora:
                     continue
 
                 if pattern.search(name):
-                    if 'embedding_A' in name:
-                        param = param[:, :_lora.tenant_config.r]
-                    elif 'embedding_B' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_A' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_B' in name:
-                        param = param[:, :_lora.tenant_config.r]
-
-                num_params = param.numel()
+                    num_params = self._active_lora_numel(name, param, _lora.tenant_config.r)
+                else:
+                    num_params = param.numel()
                 if num_params == 0 and hasattr(param, 'ds_numel'):
                     num_params = param.ds_numel
 
