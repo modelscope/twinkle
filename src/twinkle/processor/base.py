@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
+from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
 @dataclass
@@ -425,6 +426,13 @@ class InputProcessor:
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
+
+        hf_config = kwargs.get('hf_config')
+        attn_implementation = getattr(hf_config, '_attn_implementation', None)
+        if not is_flash_attention_implementation(attn_implementation):
+            raise RuntimeError('Transformers padding_free/packed batches require a FlashAttention backend; '
+                               f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
+                               'logical sequences after they are concatenated into one physical row.')
 
         if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
             from twinkle.patch import apply_patch

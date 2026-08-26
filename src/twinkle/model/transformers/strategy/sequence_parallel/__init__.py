@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
-from twinkle.utils.transformers_utils import get_llm_model
+from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
 from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch, _iter_qwen35_gated_delta_net_classes
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
@@ -782,7 +782,7 @@ class SequenceParallel:
             # FlashAttention2 expects a 2D padding mask (or None). Converting it to a 4D causal mask here breaks
             # the later per-rank sequence split and changes the attention contract relative to the baseline path.
             if (cache_position is None and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
-                    and self.attn_implementation != 'flash_attention_2'):
+                    and not is_flash_attention_implementation(self.attn_implementation)):
                 attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype),
                                                        local_cache_position, None, None)
         if extra_split_values is not None:
@@ -850,10 +850,10 @@ class SequenceParallel:
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         padding_free = bool(inputs.pop('padding_free', False))
-        if padding_free and self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+        if padding_free and not is_flash_attention_implementation(self.attn_implementation):
             raise RuntimeError('Transformers SequenceParallel does not support padding_free/packed inputs with '
                                f'attn_implementation={self.attn_implementation!r}. '
-                               'Use flash_attention_2 or flash_attention_3, or disable padding_free/packing. '
+                               'Use a FlashAttention backend, or disable padding_free/packing. '
                                'SDPA/eager attention cannot safely preserve packed sequence boundaries in this path.')
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:

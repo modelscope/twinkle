@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle import get_logger
-from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingMask, SamplingParams, StopReason
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
@@ -27,6 +27,156 @@ def _map_finish_reason(reason: str | None) -> StopReason:
     if reason is None:
         return 'length'
     return _FINISH_REASON_MAP.get(str(reason), 'length')
+
+
+def _filter_engine_config(
+    engine_config: Dict[str, Any],
+    valid_args,
+    enable_sampling_replay: bool,
+):
+    valid_args = set(valid_args)
+    invalid_args = set(engine_config) - valid_args
+    if enable_sampling_replay and 'enable_return_sampling_mask' in invalid_args:
+        raise RuntimeError('Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
+                           'enable_return_sampling_mask')
+    filtered_engine_config = {key: value for key, value in engine_config.items() if key in valid_args}
+    return filtered_engine_config, invalid_args
+
+
+def _to_list(value):
+    return value.tolist() if hasattr(value, 'tolist') else value
+
+
+def _as_flat_int_list(values, field_name: str) -> List[int]:
+    values = _to_list(values)
+    if not isinstance(values, (list, tuple)) or any(isinstance(_to_list(value), (list, tuple)) for value in values):
+        raise RuntimeError(f'vLLM sampling mask {field_name} must be a flat integer list')
+    return [int(value) for value in values]
+
+
+def _validate_sampling_mask_csr(token_ids: List[int], offsets: List[int], num_tokens: int) -> None:
+    num_rows = len(offsets) - 1
+    if num_rows != num_tokens:
+        raise RuntimeError(f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
+    if not offsets or offsets[0] != 0 or offsets[-1] != len(token_ids):
+        raise RuntimeError('vLLM sampling mask has invalid CSR endpoints')
+    if any(start >= end for start, end in zip(offsets, offsets[1:])):
+        raise RuntimeError('vLLM sampling mask contains an empty or invalid CSR row')
+
+
+def _parse_flat_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    return (
+        _as_flat_int_list(raw_token_ids, 'token_ids'),
+        _as_flat_int_list(raw_offsets, 'offsets'),
+    )
+
+
+def _parse_token_rows(raw_token_ids, num_tokens: int) -> tuple[List[int], List[int]]:
+    rows = _to_list(raw_token_ids)
+    if not isinstance(rows, (list, tuple)) or len(rows) != num_tokens:
+        raise RuntimeError('vLLM sampling mask without offsets must provide one token-id row '
+                           'per sampled token')
+
+    token_ids = []
+    offsets = [0]
+    for row in rows:
+        token_row = _as_flat_int_list(row, 'token-id row')
+        token_ids.extend(token_row)
+        offsets.append(offsets[-1] + len(token_row))
+    return token_ids, offsets
+
+
+def _parse_chunked_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    token_chunks = _to_list(raw_token_ids)
+    offset_chunks = _to_list(raw_offsets)
+    if not isinstance(token_chunks, (list, tuple)) or not isinstance(offset_chunks, (list, tuple)) \
+            or len(token_chunks) != len(offset_chunks):
+        raise RuntimeError('vLLM chunked sampling mask must have matching token-id and offset chunks')
+
+    token_ids = []
+    offsets = [0]
+    for chunk_idx, (token_chunk, offset_chunk) in enumerate(zip(token_chunks, offset_chunks)):
+        chunk_token_ids = _as_flat_int_list(token_chunk, f'token_ids chunk {chunk_idx}')
+        chunk_offsets = _as_flat_int_list(offset_chunk, f'offsets chunk {chunk_idx}')
+        if (not chunk_offsets or chunk_offsets[0] != 0 or chunk_offsets[-1] != len(chunk_token_ids)
+                or any(start >= end for start, end in zip(chunk_offsets, chunk_offsets[1:]))):
+            raise RuntimeError(f'vLLM sampling mask chunk {chunk_idx} has invalid CSR offsets')
+        base_offset = offsets[-1]
+        token_ids.extend(chunk_token_ids)
+        offsets.extend(base_offset + offset for offset in chunk_offsets[1:])
+    return token_ids, offsets
+
+
+def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[SamplingMask]:
+    if mask is None:
+        if required:
+            raise RuntimeError('vLLM output is missing sampling mask while sampling replay is enabled')
+        return None
+
+    raw_token_ids = _to_list(mask.token_ids)
+    raw_offsets = _to_list(getattr(mask, 'offsets', None))
+    if raw_offsets is None:
+        token_ids, offsets = _parse_token_rows(raw_token_ids, num_tokens)
+    elif any(isinstance(_to_list(offset), (list, tuple)) for offset in raw_offsets):
+        # Some vLLM builds preserve local CSR tensors for each output chunk.
+        token_ids, offsets = _parse_chunked_csr(raw_token_ids, raw_offsets)
+    else:
+        token_ids, offsets = _parse_flat_csr(raw_token_ids, raw_offsets)
+
+    _validate_sampling_mask_csr(token_ids, offsets, num_tokens)
+    return SamplingMask(token_ids=token_ids, offsets=offsets)
+
+
+def _set_sampling_replay_output_kind(vllm_params, enable_sampling_replay: bool) -> None:
+    """Use the only vLLM output mode that carries the full sampling mask."""
+    if not enable_sampling_replay:
+        return
+    from vllm.sampling_params import RequestOutputKind
+    vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
+
+
+def _validate_sampling_replay_params(sampling_params, extra_kwargs: Dict[str, Any]) -> None:
+    """Reject score-changing logits processors that a support mask cannot replay."""
+    neutral_values = {
+        'repetition_penalty': 1.0,
+        'presence_penalty': 0.0,
+        'frequency_penalty': 0.0,
+        'logit_bias': None,
+        'logits_processor': None,
+        'logits_processors': None,
+    }
+    incompatible = []
+    for name, neutral in neutral_values.items():
+        values = []
+        if isinstance(sampling_params, dict):
+            if name in sampling_params:
+                values.append(sampling_params[name])
+        elif hasattr(sampling_params, name):
+            values.append(getattr(sampling_params, name))
+        if name in extra_kwargs:
+            values.append(extra_kwargs[name])
+
+        if neutral is None:
+            enabled = any(bool(value) for value in values)
+        else:
+            enabled = any(value is not None and value != neutral for value in values)
+        if enabled:
+            incompatible.append(name)
+
+    if incompatible:
+        names = ', '.join(incompatible)
+        raise ValueError('sampling replay does not support score-changing logits processors; '
+                         f'disable these options: {names}')
+
+    if 'top_k' in extra_kwargs:
+        top_k = extra_kwargs['top_k']
+    elif isinstance(sampling_params, dict):
+        top_k = sampling_params.get('top_k')
+    else:
+        top_k = getattr(sampling_params, 'top_k', None)
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError('sampling distribution replay requires top_k > 0 to bound sampling mask size, '
+                         'reduce transfer overhead, and avoid potential OOMs')
 
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
@@ -78,6 +228,7 @@ class VLLMEngine(BaseSamplerEngine):
         quantization: Optional[str] = None,
         load_format: str = 'auto',
         logprobs_mode: Optional[str] = None,
+        enable_sampling_replay: bool = False,
         **kwargs,
     ):
         from twinkle.hub import HubOperation
@@ -97,7 +248,8 @@ class VLLMEngine(BaseSamplerEngine):
         self.dtype = dtype
         self.quantization = quantization
         self.load_format = load_format
-        self.logprobs_mode = logprobs_mode or 'processed_logprobs'
+        self.enable_sampling_replay = enable_sampling_replay
+        self.logprobs_mode = 'processed_logprobs' if enable_sampling_replay else (logprobs_mode or 'processed_logprobs')
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
@@ -130,6 +282,8 @@ class VLLMEngine(BaseSamplerEngine):
     def _create_engine(self):
         """Create and return the vLLM engine."""
         os.environ['VLLM_USE_V1'] = '1'
+        if self.enable_sampling_replay:
+            os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '1'
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -175,9 +329,15 @@ class VLLMEngine(BaseSamplerEngine):
             'twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension')
 
         engine_config.update(self.engine_kwargs)
+        if self.enable_sampling_replay:
+            engine_config['enable_return_sampling_mask'] = True
+            engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
-        filtered_engine_config = {k: v for k, v in engine_config.items() if k in valid_args}
-        invalid_args = set(engine_config.keys()) - set(valid_args)
+        filtered_engine_config, invalid_args = _filter_engine_config(
+            engine_config,
+            valid_args,
+            self.enable_sampling_replay,
+        )
         if invalid_args:
             logger.warning(f'VLLMEngine: Filtered out invalid arguments: {invalid_args}')
         # Create engine using vLLM v1 API
@@ -239,11 +399,14 @@ class VLLMEngine(BaseSamplerEngine):
         from vllm.inputs import TextPrompt, TokensPrompt
 
         # Convert to vLLM params
+        if self.enable_sampling_replay:
+            _validate_sampling_replay_params(sampling_params, kwargs)
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0
         logprobs = sampling_params.logprobs or 0
         vllm_params = sampling_params.to_vllm(**kwargs)
+        _set_sampling_replay_output_kind(vllm_params, self.enable_sampling_replay)
 
         # Build request
         if request_id is None:
@@ -291,6 +454,11 @@ class VLLMEngine(BaseSamplerEngine):
         sequences = []
         for output in result.outputs:
             token_ids = list(output.token_ids)
+            sampling_mask = _copy_sampling_mask(
+                getattr(output, 'sampling_mask', None),
+                num_tokens=len(token_ids),
+                required=self.enable_sampling_replay,
+            )
 
             # Extract logprobs
             seq_logprobs = None
@@ -319,6 +487,7 @@ class VLLMEngine(BaseSamplerEngine):
                     tokens=token_ids,
                     logprobs=seq_logprobs,
                     routed_experts=routed_experts,
+                    sampling_mask=sampling_mask,
                 ))
 
         # Extract prompt logprobs if requested
