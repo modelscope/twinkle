@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 from typing import Any
 
-from .schemas import TunnelRequest, TunnelResponse
+from twinkle.server.common.tunnel import TunnelRequest, TunnelResponse
 
 _HOP_BY_HOP_HEADERS = {
     'connection',

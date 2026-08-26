@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, Response
 
 from twinkle.server.dashserving import create_dashserving_app
 from twinkle.server.dashserving.proxy import RuntimeProxy
-from twinkle.server.dashserving.schemas import TunnelResponse
+from twinkle.server.common.tunnel import TunnelResponse
 
 
 def _build_runtime_mock() -> FastAPI:

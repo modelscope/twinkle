@@ -13,7 +13,7 @@ from typing import AsyncIterator
 
 from twinkle.utils.logger import get_logger
 from .proxy import RuntimeProxy
-from .schemas import TunnelRequest
+from twinkle.server.common.tunnel import TunnelRequest
 
 logger = get_logger()
 
