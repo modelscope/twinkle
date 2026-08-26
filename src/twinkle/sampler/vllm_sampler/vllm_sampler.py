@@ -441,15 +441,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self,
         base_sync_done: bool = False,
         peft_config: dict = None,
+        weights=None,
     ):
-        """Receive weights via NCCL broadcast and stream into vLLM.
+        """Receive weights and stream them into vLLM.
 
         Uses a **streaming pipeline** to avoid accumulating a
         full model-weight copy on GPU:
 
-        1. ``CheckpointEngine.receive_weights()`` yields tensors from
-           double-buffered NCCL buckets (async generator, GPU tensors).
-        2. The async generator is passed **directly** to
+        1. With no ``weights`` argument, ``CheckpointEngine.receive_weights()``
+           yields tensors from double-buffered NCCL/HCCL buckets.
+           Colocated callers can provide the model's synchronous weight
+           generator directly.
+        2. The weight iterator is passed **directly** to
            ``VLLMEngine.update_weights()`` which consumes it one tensor at
            a time, copying each into a GPU IPC bucket and flushing to the
            vLLM worker subprocess when the bucket is full.
@@ -460,18 +463,22 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         Args:
             base_sync_done: If True, this is a LoRA-only sync.
             peft_config: PEFT config dict for LoRA adapter loading.
+            weights: Optional synchronous/asynchronous weight iterator.  If
+                omitted, weights are received from the checkpoint engine.
 
         Returns:
             Number of weights loaded (approximate, from engine log).
         """
-        engine = self._get_or_create_checkpoint_engine()
+        if weights is None:
+            engine = self._get_or_create_checkpoint_engine()
+            weights = engine.receive_weights()
 
         async def _receive_and_load():
-            # Stream NCCL-received tensors directly into vLLM via IPC.
+            # Stream model/checkpoint-engine tensors directly into vLLM via IPC.
             # VLLMEngine.update_weights accepts an async generator and
             # handles bucket packing + ZMQ transfer internally.
             await self.engine.update_weights(
-                engine.receive_weights(),  # async generator — not materialised
+                weights,  # async/sync generator — not materialised
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
             )

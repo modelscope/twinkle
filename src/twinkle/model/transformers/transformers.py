@@ -1577,10 +1577,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     # =========================================================================
     # prepare_checkpoint_engine, init_checkpoint_process_group, and
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
-    # Only send_weights_via_checkpoint_engine is model-specific.
+    # The weight generator is shared by colocated and checkpoint-engine sync.
 
-    @remote_function(dispatch='all', lazy_collect=True)
-    def send_weights(
+    def _get_weight_generator(
         self,
         adapter_name: str = None,
         base_sync_done: bool = False,
@@ -1590,7 +1589,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
-        engine = self._get_or_create_checkpoint_engine()
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 
@@ -1614,7 +1612,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if base_sync_done and adapter_name:
             if merge_and_sync:
                 # LoRA Training and sync full model(merge_adapter)
-                # merge and skip lora weigts(already merged)
+                # merge and skip lora weights(already merged)
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
                     if isinstance(model, PeftModel):
@@ -1664,11 +1662,33 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     yield name, tensor
                 _print_weight_example(names)
 
+        return weight_generator()
+
+    @remote_function(dispatch='all', lazy_collect=True)
+    def send_weights(
+        self,
+        adapter_name: str = None,
+        base_sync_done: bool = False,
+        merge_and_sync: bool = False,
+        model_keys: List[str] = None,
+        **kwargs,
+    ):
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        engine = self._get_or_create_checkpoint_engine()
+        weight_generator = self._get_weight_generator(
+            adapter_name=adapter_name,
+            base_sync_done=base_sync_done,
+            merge_and_sync=merge_and_sync,
+            model_keys=model_keys,
+            **kwargs,
+        )
+
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
         # be occupied, and send_weights uses run_in_executor internally.
         async def _send():
-            await engine.send_weights(weight_generator())
+            await engine.send_weights(weight_generator)
 
         result_container = {'error': None}
 

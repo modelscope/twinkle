@@ -16,10 +16,12 @@ class TensorMeta(TypedDict):
 
 
 class CheckpointEngine(ABC):
-    """Abstract base class for checkpoint engines.
+    """Abstract base class for disaggregated checkpoint engines.
 
     A checkpoint engine handles weight synchronization between trainer and rollout
-    processes. The typical workflow is:
+    processes when the model and sampler are separate Ray actor groups.  Colocated
+    sync bypasses this interface and streams the model's weight generator directly
+    into the sampler.  The typical disaggregated workflow is:
 
     In trainer process (rank 0):
     >>> engine = CheckpointEngineRegistry.new('nccl', bucket_size=512<<20)

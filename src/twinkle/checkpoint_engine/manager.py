@@ -10,10 +10,12 @@ logger = get_logger()
 
 
 class CheckpointEngineManager:
-    """Weight synchronization manager for Twinkle (STANDALONE mode).
+    """Weight synchronization manager for colocated and standalone deployments.
 
-    Coordinates weight synchronization between training model and inference sampler
-    when they reside on **different GPUs** (disaggregated / standalone deployment).
+    When the model and sampler are local objects (the colocated/torchrun case),
+    weights are streamed directly to the sampler.  When both objects are Ray
+    handlers, the checkpoint engine provides the NCCL/HCCL transport between
+    disaggregated workers.
 
     Architecture (following verl's CheckpointEngineManager):
 
@@ -23,7 +25,7 @@ class CheckpointEngineManager:
         │  (Ray actors)    │                    │  (Ray actors)    │
         │        │         │                    │        │         │
         │        ▼         │                    │        ▼         │
-        │ CheckpointEngine │   NCCL broadcast   │ CheckpointEngine │
+        │ CheckpointEngine │   NCCL/HCCL        │ CheckpointEngine │
         │  send_weights()  │ ─────────────────► │ receive_weights()│
         │                  │                    │        │         │
         │                  │                    │        ▼         │
@@ -49,13 +51,17 @@ class CheckpointEngineManager:
     ) -> None:
         self.model = model
         self.sampler = sampler
-        self.backend_cls = self.decide_backend_engine(platform)
 
-        # Validate Ray actors
-        assert hasattr(model, '_actors') and model._actors, \
-            'CheckpointEngineManager requires model to be deployed as Ray actors'
-        assert hasattr(sampler, '_actors') and sampler._actors, \
-            'CheckpointEngineManager requires sampler to be deployed as Ray actors'
+        model_has_actors = bool(getattr(model, '_actors', None))
+        sampler_has_actors = bool(getattr(sampler, '_actors', None))
+        if model_has_actors != sampler_has_actors:
+            raise ValueError(
+                'CheckpointEngineManager requires model and sampler to use the same deployment mode: '
+                'both must be colocated/local objects (without _actors) or both must be Ray actor handlers.')
+
+        self._naive = not model_has_actors
+        # Do not even select/import a transport backend for colocated sync.
+        self.backend_cls = None if self._naive else self.decide_backend_engine(platform)
 
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
@@ -96,6 +102,10 @@ class CheckpointEngineManager:
         Returns:
             None
         """
+        if self._naive:
+            self._sync_weights_naive(merge_and_sync)
+            return
+
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))
         self.sampler.prepare_checkpoint_engine(False)
@@ -118,36 +128,7 @@ class CheckpointEngineManager:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
 
-        if self._model_keys is None:
-            if hasattr(self.sampler, 'get_state_keys'):
-                self._model_keys = self.sampler.get_state_keys()
-
-            if self._model_keys is None:
-                self._model_keys = []
-
-            # vLLM may have grouped params - use word boundaries to avoid substring matches
-            import re
-            _STACKED_MAPPINGS = [
-                (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
-                (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
-                (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
-                (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
-                (re.compile(r'^visual\.'), ('model.visual.', )),
-            ]
-
-            def _expand_keys(keys):
-                result = set(keys)
-                for key in keys:
-                    for pattern, individuals in _STACKED_MAPPINGS:
-                        if pattern.search(key):
-                            for ind in individuals:
-                                result.add(pattern.sub(ind, key))
-                return result
-
-            # Two passes for chain expansion (e.g., language_model.model + qkv_proj)
-            expanded = _expand_keys(self._model_keys)
-            expanded = _expand_keys(expanded)
-            self._model_keys = list(expanded)
+        self._ensure_model_keys()
 
         model_result = self.model.send_weights(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
@@ -157,6 +138,70 @@ class CheckpointEngineManager:
 
         self.model.finalize_checkpoint_engine()
         self.sampler.finalize_checkpoint_engine()
+
+        if not self.base_sync_done:
+            self.base_sync_done = True
+            if not merge_and_sync:
+                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    def _ensure_model_keys(self):
+        if self._model_keys is not None:
+            return
+
+        if hasattr(self.sampler, 'get_state_keys'):
+            self._model_keys = self.sampler.get_state_keys()
+
+        if self._model_keys is None:
+            self._model_keys = []
+
+        # vLLM may have grouped params - use word boundaries to avoid substring matches
+        import re
+        _STACKED_MAPPINGS = [
+            (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
+            (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
+            (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
+            (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
+            (re.compile(r'^visual\.'), ('model.visual.', )),
+        ]
+
+        def _expand_keys(keys):
+            result = set(keys)
+            for key in keys:
+                for pattern, individuals in _STACKED_MAPPINGS:
+                    if pattern.search(key):
+                        for ind in individuals:
+                            result.add(pattern.sub(ind, key))
+            return result
+
+        # Two passes for chain expansion (e.g., language_model.model + qkv_proj)
+        expanded = _expand_keys(self._model_keys)
+        expanded = _expand_keys(expanded)
+        self._model_keys = list(expanded)
+
+    def _sync_weights_naive(self, merge_and_sync):
+        """Stream model weights directly into a colocated sampler.
+
+        No checkpoint engine is created in this path.  ``receive_weights``
+        continues to use the sampler-to-vLLM IPC transport, but the model to
+        sampler handoff is an ordinary in-process generator.
+        """
+        peft_config = None
+        if self.base_sync_done and not merge_and_sync:
+            if self._peft_config is None:
+                self._peft_config = self.model.get_peft_config_dict()
+            peft_config = self._peft_config
+
+        self._ensure_model_keys()
+        weights = self.model._get_weight_generator(
+            base_sync_done=self.base_sync_done,
+            merge_and_sync=merge_and_sync,
+            model_keys=self._model_keys,
+        )
+        self.sampler.receive_weights(
+            weights=weights,
+            base_sync_done=self.base_sync_done,
+            peft_config=peft_config,
+        )
 
         if not self.base_sync_done:
             self.base_sync_done = True

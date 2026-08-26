@@ -1571,6 +1571,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     # prepare_checkpoint_engine, init_checkpoint_process_group, and
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     #
+    # The weight generator is shared by colocated and checkpoint-engine sync.
     # Key difference from TransformersModel: Megatron uses TP/PP, so
     # get_hf_state_dict() internally performs TP allgather and handles PP
     # layer distribution.  All model ranks MUST execute the weight generator
@@ -1578,8 +1579,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     # model_actor[0] (rank=0 in the checkpoint engine) actually broadcasts
     # via NCCL; others consume the generator silently (rank=-1).
 
-    @remote_function(dispatch='all', lazy_collect=True)
-    def send_weights(
+    def _get_weight_generator(
         self,
         adapter_name: str = None,
         base_sync_done: bool = False,
@@ -1588,7 +1588,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
-        engine = self._get_or_create_checkpoint_engine()
 
         @contextmanager
         def merge_lora():
@@ -1680,15 +1679,35 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 else:
                     yield from _raw_weights(False)
 
+        return weight_generator()
+
+    @remote_function(dispatch='all', lazy_collect=True)
+    def send_weights(
+        self,
+        adapter_name: str = None,
+        base_sync_done: bool = False,
+        merge_and_sync: bool = False,
+        model_keys: List[str] = None,
+    ):
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        engine = self._get_or_create_checkpoint_engine()
+        weight_generator = self._get_weight_generator(
+            adapter_name=adapter_name,
+            base_sync_done=base_sync_done,
+            merge_and_sync=merge_and_sync,
+            model_keys=model_keys,
+        )
+
         is_sender = (engine.rank is not None and engine.rank == 0)
 
         if not is_sender:
-            for _name, _tensor in weight_generator():
+            for _name, _tensor in weight_generator:
                 pass
             return
 
         async def _send():
-            await engine.send_weights(weight_generator())
+            await engine.send_weights(weight_generator)
 
         result_container = {'error': None}
 

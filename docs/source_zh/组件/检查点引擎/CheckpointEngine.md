@@ -2,6 +2,8 @@
 
 CheckpointEngine (检查点引擎) 是用于在训练器和推理进程之间同步模型权重的组件,主要用于 RLHF 训练中 Actor 模型和 Rollout 采样器之间的权重同步。
 
+`CheckpointEngineManager` 会根据部署形态自动选择同步路径：模型和采样器都没有 `_actors` 时（local/torchrun 同进程 colocate），直接将模型权重生成器交给采样器的 vLLM IPC 加载路径，不创建 NCCL/HCCL 检查点引擎；双方都有 `_actors` 时，使用下方的 NCCL/HCCL 引擎进行 disaggregated 同步。两侧部署形态不一致会在初始化时立即报错。
+
 ## 基本接口
 
 ```python

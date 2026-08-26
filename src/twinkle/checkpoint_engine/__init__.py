@@ -1,8 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Checkpoint Engine for weight synchronization between trainer and rollout.
 
-Provides NCCL/HCCL-based weight broadcast from training model workers to
-inference sampler workers in STANDALONE (disaggregated) deployment mode.
+In colocated/local (including torchrun) deployments,
+``CheckpointEngineManager`` streams the model's weight generator directly to
+the sampler and does not create a checkpoint engine.  When both components
+are Ray actor handlers, it provides NCCL/HCCL-based weight broadcast between
+training model workers and inference sampler workers in disaggregated mode.
 
 Reference: https://github.com/volcengine/verl/tree/main/verl/checkpoint_engine
 

@@ -2,6 +2,8 @@
 
 CheckpointEngine is a component used to synchronize model weights between trainer and inference processes, primarily used in RLHF training to synchronize weights between Actor models and Rollout samplers.
 
+`CheckpointEngineManager` selects the transport from the deployment shape. When neither the model nor sampler has `_actors` (local/torchrun colocated execution), it passes the model weight generator directly to the sampler's vLLM IPC loading path and does not create an NCCL/HCCL checkpoint engine. When both have `_actors`, it uses the NCCL/HCCL engine for disaggregated synchronization. A mixed deployment shape fails during manager initialization.
+
 ## Basic Interface
 
 ```python
