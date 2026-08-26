@@ -480,10 +480,59 @@ class TwinkleWorkerExtension:
                 return
 
             self.model_runner.model.load_weights(converted)
+            self._load_drafter_weights(converted)
             logger.info(f'Loaded {len(converted)} base weights')
 
+    def _drafter_model(self):
+        """The speculative-decoding draft model, or None when there is no weight-bearing drafter.
+
+        vLLM keeps the drafter as a *separate* ``nn.Module`` (``EagleProposer.model`` and friends,
+        built by its own ``get_model()``), and the target model's ``load_weights`` deliberately skips
+        the MTP / draft keys -- ``deepseek_v2`` bails out on ``get_spec_layer_idx_from_weight_name``,
+        ``qwen3_next`` on a ``mtp.`` prefix. So MTP weights arrive, are dropped by the target, and the
+        drafter is never touched by anything vLLM exposes: there is no ``update_weights`` for it.
+        Left alone, an RL run keeps rolling out with the draft head it started with, and the
+        acceptance rate quietly decays as the target moves away from it.
+
+        n-gram and suffix-decoding proposers have no model at all; those return None legitimately.
+        """
+        drafter = getattr(self.model_runner, 'drafter', None)
+        if drafter is None:
+            return None
+        model = getattr(drafter, 'model', None)
+        if model is None or not hasattr(model, 'load_weights'):
+            if not getattr(self, '_warned_drafter_unsyncable', False):
+                self._warned_drafter_unsyncable = True
+                logger.warning(f'Speculative decoding is enabled with {type(drafter).__name__}, which exposes no '
+                               'loadable model, so its draft weights will NOT follow the trained model. This is '
+                               'expected for n-gram/suffix proposers and a bug for any model-based one.')
+            return None
+        return model
+
+    def _load_drafter_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Feed the same weight stream to the drafter, which keeps only what it owns.
+
+        The full stream is passed rather than a filtered subset because the key -> draft-parameter
+        mapping is the drafter's business, not ours: ``Qwen3NextMTP.load_weights`` rewrites ``mtp.``
+        to ``model.``, ``DeepSeekMTP.load_weights`` filters by spec-layer index, and both also need
+        the shared embedding / lm_head that live under main-model names. This mirrors sglang, whose
+        ``EAGLEWorkerV2.update_weights_from_tensor`` hands one ``named_tensors`` to the draft runner
+        and then to the target runner.
+        """
+        drafter_model = self._drafter_model()
+        if drafter_model is None:
+            return
+        drafter_model.load_weights(weights)
+
     def get_state_keys(self):
-        return list(self.model_runner.model.state_dict().keys())
+        keys = list(self.model_runner.model.state_dict().keys())
+        drafter_model = self._drafter_model()
+        if drafter_model is not None:
+            # The union, because callers use these keys to decide how to *name* what they send
+            # (e.g. whether a LoRA base layer keeps its ``.base_layer`` suffix). Reporting only the
+            # target's keys would make those decisions wrong for every MTP weight.
+            keys.extend(drafter_model.state_dict().keys())
+        return keys
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for IPC communication."""
