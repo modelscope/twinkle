@@ -59,6 +59,29 @@ def _get_vocab_size(config: PretrainedConfig) -> int:
     return vocab_size
 
 
+def _prepare_sampling_replay(
+    labels: torch.Tensor,
+    sampling_masks,
+    temperature: float,
+    vocab_size: int,
+    allow_packed_masks: bool,
+):
+    """Build the labels and metadata shared by training and evaluation replay."""
+    if labels is None:
+        raise ValueError('labels are required when sampling replay is enabled')
+    loss_mask = (labels != -100).bool()
+    masked_labels = labels.masked_fill(~loss_mask, 0)
+    metadata = prepare_replayed_selective_log_softmax(
+        labels=labels,
+        loss_mask=loss_mask,
+        sampling_masks=sampling_masks,
+        temperature=temperature,
+        vocab_size=vocab_size,
+        allow_packed_masks=allow_packed_masks,
+    )
+    return loss_mask, masked_labels, metadata
+
+
 def _resolve_task_context(model, task):
     """Return a context manager that applies the right per-forward Patch for ``task``.
 
@@ -539,22 +562,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             enable_sp=getattr(self, '_enable_sp', False),
         )
         labels: torch.Tensor = inputs.pop('labels', None)
-        replay_metadata = None
-        replay_loss_mask = None
-        replay_masked_labels = None
+        replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
-            if labels is None:
-                raise ValueError('labels are required when sampling replay is enabled')
-            replay_loss_mask = (labels != -100).bool()
-            replay_masked_labels = labels.masked_fill(~replay_loss_mask, 0)
-            replay_metadata = prepare_replayed_selective_log_softmax(
+            replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
                 labels=labels,
-                loss_mask=replay_loss_mask,
                 sampling_masks=sampling_masks,
                 temperature=temperature,
                 vocab_size=_get_vocab_size(self.hf_config),
-                allow_packed_masks=processor.padding_free
-                or processor._is_packed_position_ids(inputs.get('position_ids')),
+                allow_packed_masks=(processor.padding_free
+                                    or processor._is_packed_position_ids(inputs.get('position_ids'))),
             )
         optimizer_config.accumulate_metrics(True)
 
@@ -631,7 +647,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
-        sampling_replay_diagnostics = bool(kwargs.pop('sampling_replay_diagnostics', False))
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -668,43 +683,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 enable_sp=getattr(self, '_enable_sp', False),
             )
             labels = inputs.pop('labels', None)
-            replay_metadata = None
-            replay_loss_mask = None
-            replay_masked_labels = None
+            replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
-                if labels is None:
-                    raise ValueError('labels are required when sampling replay is enabled')
-                replay_loss_mask = (labels != -100).bool()
-                replay_masked_labels = labels.masked_fill(~replay_loss_mask, 0)
-                replay_metadata = prepare_replayed_selective_log_softmax(
+                packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
+                replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
                     labels=labels,
-                    loss_mask=replay_loss_mask,
                     sampling_masks=sampling_masks,
                     temperature=temperature,
                     vocab_size=_get_vocab_size(self.hf_config),
-                    allow_packed_masks=processor.padding_free
-                    or processor._is_packed_position_ids(inputs.get('position_ids')),
+                    allow_packed_masks=processor.padding_free or packed_position_ids,
                 )
-                if sampling_replay_diagnostics:
-                    position_ids = inputs.get('position_ids')
-                    logger.info({
-                        'sampling_replay/rank':
-                        Platform.get_rank(),
-                        'sampling_replay/padding_free':
-                        processor.padding_free,
-                        'sampling_replay/packed_position_ids':
-                        processor._is_packed_position_ids(position_ids),
-                        'sampling_replay/logical_masks':
-                        len(sampling_masks),
-                        'sampling_replay/tensor_batch':
-                        labels.shape[0],
-                        'sampling_replay/tensor_seq_len':
-                        labels.shape[1],
-                        'sampling_replay/replay_rows':
-                        len(replay_metadata.offsets) - 1,
-                        'sampling_replay/attn_implementation':
-                        getattr(self.hf_config, '_attn_implementation', None),
-                    })
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 

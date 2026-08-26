@@ -152,11 +152,11 @@ def prepare_replayed_selective_log_softmax(
     vocab_size: int,
     allow_packed_masks: bool = False,
 ) -> ReplayedLogSoftmaxMetadata:
-    """Validate and flatten sampling masks before the model forward.
+    """Align and flatten sampling masks before the model forward.
 
     When ``allow_packed_masks`` is true, a padding-free batch may concatenate
-    multiple logical masks into one tensor row. Their CSR rows are flattened in
-    logical-sample order.
+    multiple logical masks into one tensor row. Their sampler-validated CSR
+    rows are flattened in logical-sample order.
     """
     import math
     import torch
@@ -193,11 +193,6 @@ def prepare_replayed_selective_log_softmax(
                 raise ValueError(f'sampling mask is missing for sample {batch_idx}')
             token_ids = [int(token_id) for token_id in sampling_mask.token_ids]
             offsets = [int(offset) for offset in sampling_mask.offsets]
-            if not offsets or offsets[0] != 0 or offsets[-1] != len(token_ids):
-                raise ValueError(f'sampling mask for sample {batch_idx} has invalid CSR endpoints')
-            if any(start >= end for start, end in zip(offsets, offsets[1:])):
-                raise ValueError(f'sampling mask for sample {batch_idx} contains an empty or invalid CSR row')
-
             invalid_token_id = next(
                 (token_id for token_id in token_ids if token_id < 0 or token_id >= vocab_size),
                 None,

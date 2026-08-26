@@ -43,67 +43,18 @@ def _filter_engine_config(
     return filtered_engine_config, invalid_args
 
 
-def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[SamplingMask]:
-    if mask is None:
-        if required:
-            raise RuntimeError('vLLM output is missing sampling mask while sampling replay is enabled')
-        return None
+def _to_list(value):
+    return value.tolist() if hasattr(value, 'tolist') else value
 
-    def to_list(value):
-        if hasattr(value, 'tolist'):
-            value = value.tolist()
-        return value
 
-    def flatten_ints(values):
-        values = to_list(values)
-        if isinstance(values, (list, tuple)):
-            flattened = []
-            for value in values:
-                flattened.extend(flatten_ints(value))
-            return flattened
-        return [int(values)]
+def _as_flat_int_list(values, field_name: str) -> List[int]:
+    values = _to_list(values)
+    if not isinstance(values, (list, tuple)) or any(isinstance(_to_list(value), (list, tuple)) for value in values):
+        raise RuntimeError(f'vLLM sampling mask {field_name} must be a flat integer list')
+    return [int(value) for value in values]
 
-    raw_token_ids = to_list(mask.token_ids)
-    token_ids = flatten_ints(raw_token_ids)
 
-    raw_offsets = to_list(getattr(mask, 'offsets', None))
-    if raw_offsets is None:
-        # Newer vLLM sampling-mask variants expose one token-id list per
-        # generated token instead of a separate CSR offsets field. Preserve
-        # those row boundaries while converting to Twinkle's CSR format.
-        if not isinstance(raw_token_ids, (list, tuple)) or len(raw_token_ids) != num_tokens \
-                or any(not isinstance(to_list(row), (list, tuple)) for row in raw_token_ids):
-            raise RuntimeError('vLLM sampling mask without offsets must provide one token-id row '
-                               'per sampled token')
-        offsets = [0]
-        for row in raw_token_ids:
-            offsets.append(offsets[-1] + len(flatten_ints(row)))
-    else:
-        offsets = flatten_ints(raw_offsets)
-
-    def is_global_csr(candidate_offsets):
-        return (len(candidate_offsets) == num_tokens + 1 and candidate_offsets[0] == 0
-                and candidate_offsets[-1] == len(token_ids)
-                and all(start < end for start, end in zip(candidate_offsets, candidate_offsets[1:])))
-
-    # Some vLLM builds preserve per-step/per-chunk tensors as nested lists in
-    # RequestOutput. A nested offsets field then contains a local CSR per chunk
-    # (each starts at zero), so compose those local layouts into one global CSR.
-    if raw_offsets is not None and not is_global_csr(offsets) \
-            and isinstance(raw_token_ids, (list, tuple)) \
-            and isinstance(raw_offsets, (list, tuple)) and len(raw_token_ids) == len(raw_offsets) \
-            and any(isinstance(to_list(offset), (list, tuple)) for offset in raw_offsets):
-        token_chunks = [flatten_ints(chunk) for chunk in raw_token_ids]
-        offset_chunks = [flatten_ints(chunk) for chunk in raw_offsets]
-        composed_offsets = [0]
-        for chunk_idx, (token_chunk, offset_chunk) in enumerate(zip(token_chunks, offset_chunks)):
-            if (not offset_chunk or offset_chunk[0] != 0 or offset_chunk[-1] != len(token_chunk)
-                    or any(start >= end for start, end in zip(offset_chunk, offset_chunk[1:]))):
-                raise RuntimeError(f'vLLM sampling mask chunk {chunk_idx} has invalid CSR offsets')
-            base_offset = composed_offsets[-1]
-            composed_offsets.extend(base_offset + offset for offset in offset_chunk[1:])
-        offsets = composed_offsets
-
+def _validate_sampling_mask_csr(token_ids: List[int], offsets: List[int], num_tokens: int) -> None:
     num_rows = len(offsets) - 1
     if num_rows != num_tokens:
         raise RuntimeError(f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
@@ -111,6 +62,68 @@ def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[Sampl
         raise RuntimeError('vLLM sampling mask has invalid CSR endpoints')
     if any(start >= end for start, end in zip(offsets, offsets[1:])):
         raise RuntimeError('vLLM sampling mask contains an empty or invalid CSR row')
+
+
+def _parse_flat_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    return (
+        _as_flat_int_list(raw_token_ids, 'token_ids'),
+        _as_flat_int_list(raw_offsets, 'offsets'),
+    )
+
+
+def _parse_token_rows(raw_token_ids, num_tokens: int) -> tuple[List[int], List[int]]:
+    rows = _to_list(raw_token_ids)
+    if not isinstance(rows, (list, tuple)) or len(rows) != num_tokens:
+        raise RuntimeError('vLLM sampling mask without offsets must provide one token-id row '
+                           'per sampled token')
+
+    token_ids = []
+    offsets = [0]
+    for row in rows:
+        token_row = _as_flat_int_list(row, 'token-id row')
+        token_ids.extend(token_row)
+        offsets.append(offsets[-1] + len(token_row))
+    return token_ids, offsets
+
+
+def _parse_chunked_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    token_chunks = _to_list(raw_token_ids)
+    offset_chunks = _to_list(raw_offsets)
+    if not isinstance(token_chunks, (list, tuple)) or not isinstance(offset_chunks, (list, tuple)) \
+            or len(token_chunks) != len(offset_chunks):
+        raise RuntimeError('vLLM chunked sampling mask must have matching token-id and offset chunks')
+
+    token_ids = []
+    offsets = [0]
+    for chunk_idx, (token_chunk, offset_chunk) in enumerate(zip(token_chunks, offset_chunks)):
+        chunk_token_ids = _as_flat_int_list(token_chunk, f'token_ids chunk {chunk_idx}')
+        chunk_offsets = _as_flat_int_list(offset_chunk, f'offsets chunk {chunk_idx}')
+        if (not chunk_offsets or chunk_offsets[0] != 0 or chunk_offsets[-1] != len(chunk_token_ids)
+                or any(start >= end for start, end in zip(chunk_offsets, chunk_offsets[1:]))):
+            raise RuntimeError(f'vLLM sampling mask chunk {chunk_idx} has invalid CSR offsets')
+        base_offset = offsets[-1]
+        token_ids.extend(chunk_token_ids)
+        offsets.extend(base_offset + offset for offset in chunk_offsets[1:])
+    return token_ids, offsets
+
+
+def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[SamplingMask]:
+    if mask is None:
+        if required:
+            raise RuntimeError('vLLM output is missing sampling mask while sampling replay is enabled')
+        return None
+
+    raw_token_ids = _to_list(mask.token_ids)
+    raw_offsets = _to_list(getattr(mask, 'offsets', None))
+    if raw_offsets is None:
+        token_ids, offsets = _parse_token_rows(raw_token_ids, num_tokens)
+    elif any(isinstance(_to_list(offset), (list, tuple)) for offset in raw_offsets):
+        # Some vLLM builds preserve local CSR tensors for each output chunk.
+        token_ids, offsets = _parse_chunked_csr(raw_token_ids, raw_offsets)
+    else:
+        token_ids, offsets = _parse_flat_csr(raw_token_ids, raw_offsets)
+
+    _validate_sampling_mask_csr(token_ids, offsets, num_tokens)
     return SamplingMask(token_ids=token_ids, offsets=offsets)
 
 
