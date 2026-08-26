@@ -621,8 +621,14 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                     framework_util.seed_everything(seed, bool(determinism))
                     # Ensure torch.distributed is initialized inside Ray workers.
                     if os.environ.get('WORKER_NAME'):
-                        # This will depress the warnings of megatron and reduce overhead
-                        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+                        # This will depress the warnings of megatron and reduce overhead.
+                        # setdefault, not assignment: this runs before the model is constructed, and
+                        # a sharded (FSDP) data-parallel wrapper needs this above 1 -- see
+                        # MegatronStrategy.apply_process_env, which corrects it while there is still
+                        # time (the CUDA driver latches the value when the context is created).
+                        # Cannot be delegated to the strategy from here: infra is below the model
+                        # layer and does not import it.
+                        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
                         # This will prevent the unlimited threads started by torch
                         os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
                         # Use parallelism mode of tokenizers

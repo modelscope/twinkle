@@ -53,8 +53,8 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
-        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
+        MegatronStrategy.apply_process_env(ddp_config)
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 

@@ -121,8 +121,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ):
         requires('megatron_core')
-        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        # Before torch_util.set_device() below, which creates the CUDA context: the connection-count
+        # variable MegatronStrategy sets here is only read by the driver at context creation, so this
+        # call cannot be deferred into the strategy's own __init__ (built further down).
+        MegatronStrategy.apply_process_env(ddp_config)
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -1284,11 +1286,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
         os.makedirs(iter_dir, exist_ok=True)
 
-        sharded_sd_metadata = {
-            'distrib_optim_sharding_type': 'dp_reshardable',
-            'singleton_local_shards': False,
-            'chained_optim_avoid_prefix': True,
-        }
+        # Asked of the strategy rather than spelled out here: the sharding type has to match the
+        # data-parallel wrapper the strategy chose (Megatron-FSDP stores the optimizer state as
+        # DTensors, plain DDP does not), and that decision was made at wrap time.
+        sharded_sd_metadata = self.strategy.get_sharded_sd_metadata()
 
         rng_state = self._get_rng_state()
         model = self.model
