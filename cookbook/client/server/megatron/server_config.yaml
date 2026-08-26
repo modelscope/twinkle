@@ -7,7 +7,7 @@ proxy_location: EveryNode
 # HTTP listener settings
 http_options:
   host: 0.0.0.0        # Listen on all network interfaces
-  port: 9000            # Port number for the server
+  port: 8000            # Private runtime port; ASI Adapter owns public port 9000
 
 # Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
 telemetry:

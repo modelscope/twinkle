@@ -11,7 +11,7 @@ def main() -> None:
     from .app import create_dashserving_app
 
     upstream_url = os.getenv('TWINKLE_INTERNAL_URL', 'http://127.0.0.1:8000')
-    port = int(os.getenv('PORT', '8091'))
+    port = int(os.getenv('PORT', '9000'))
     timeout_seconds = float(os.getenv('TWINKLE_DS_TIMEOUT_SECONDS', '600'))
     app = create_dashserving_app(
         upstream_url=upstream_url,

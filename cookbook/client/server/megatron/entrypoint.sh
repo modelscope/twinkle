@@ -7,13 +7,19 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="$SCRIPT_DIR/run.sh"
-TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-/dashscope/caches/application/twinkle}"
-TEMP_DIR="${TWINKLE_TEMP_DIR:-/dashscope/caches/application/ray_logs}"
-export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/dashscope/caches/application/.cache}"
+TWINKLE_RUNTIME_DIR="${TWINKLE_RUNTIME_DIR:-/twinkle/runtime}"
+TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-$TWINKLE_RUNTIME_DIR/work}"
+TEMP_DIR="${TWINKLE_TEMP_DIR:-$TWINKLE_RUNTIME_DIR/ray_logs}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-$TWINKLE_RUNTIME_DIR/.cache}"
 export FLA_TILELANG="${FLA_TILELANG:-0}"
 LOG_FILE="$TWINKLE_WORK_DIR/run.log"
-TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:9000/api/v1/healthz}"
-TWINKLE_DEEP_HEALTH_URL="${TWINKLE_DEEP_HEALTH_URL:-http://127.0.0.1:9000/api/v1/twinkle/healthz/deep}"
+TWINKLE_DASHSERVING_ADAPTER="${TWINKLE_DASHSERVING_ADAPTER:-0}"
+if [ "$TWINKLE_DASHSERVING_ADAPTER" = "1" ]; then
+    TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:${PORT:-9000}/health}"
+else
+    TWINKLE_HEALTH_URL="${TWINKLE_HEALTH_URL:-http://127.0.0.1:8000/api/v1/healthz}"
+fi
+TWINKLE_DEEP_HEALTH_URL="${TWINKLE_DEEP_HEALTH_URL:-http://127.0.0.1:8000/api/v1/twinkle/healthz/deep}"
 TWINKLE_WATCHDOG_INTERVAL_SECONDS="${TWINKLE_WATCHDOG_INTERVAL_SECONDS:-10}"
 TWINKLE_WATCHDOG_FAILURE_THRESHOLD="${TWINKLE_WATCHDOG_FAILURE_THRESHOLD:-3}"
 TWINKLE_RAY_GRACE_SECONDS="${TWINKLE_RAY_GRACE_SECONDS:-30}"
@@ -66,6 +72,14 @@ validate_entrypoint_config() {
     require_non_negative_int "TWINKLE_HEALTH_GRACE_SECONDS" "$TWINKLE_HEALTH_GRACE_SECONDS"
     require_non_negative_int "TWINKLE_DEEP_HEALTH_GRACE_SECONDS" "$TWINKLE_DEEP_HEALTH_GRACE_SECONDS"
     require_non_negative_int "TWINKLE_ENTRYPOINT_RESTART_BACKOFF_SECONDS" "$RESTART_BACKOFF_SECONDS"
+
+    case "$TWINKLE_DASHSERVING_ADAPTER" in
+        0|1) ;;
+        *)
+            print_error "TWINKLE_DASHSERVING_ADAPTER 只能是 0 或 1，当前值: $TWINKLE_DASHSERVING_ADAPTER"
+            exit 1
+            ;;
+    esac
 
     require_command timeout
     require_command ray

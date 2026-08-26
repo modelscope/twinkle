@@ -24,6 +24,7 @@ dependencies = [
 twinkle-server = "twinkle.server.cli:main"
 twinkle-auto = "twinkle_client.auto:main"
 twinkle-dashserving-adapter = "twinkle.server.dashserving.__main__:main"
+twinkle-service-mesh-gateway = "twinkle.server.mesh_gateway.__main__:main"
 
 [project.optional-dependencies]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]
