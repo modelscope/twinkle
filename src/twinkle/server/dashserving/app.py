@@ -11,9 +11,9 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from typing import AsyncIterator
 
+from twinkle.server.common.tunnel import TunnelRequest
 from twinkle.utils.logger import get_logger
 from .proxy import RuntimeProxy
-from twinkle.server.common.tunnel import TunnelRequest
 
 logger = get_logger()
 
