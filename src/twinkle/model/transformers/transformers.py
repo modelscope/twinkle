@@ -75,8 +75,14 @@ def _resolve_task_context(model, task, template=None):
         # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
         from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
         return apply_context(model, TransformersFusedCEPatch())
+    if task == 'value':
+        # PPO critic: reuse the num_labels=1 seq_cls ``score`` head but expose its PER-TOKEN output
+        # (skip the last-token pooling ``*ForSequenceClassification`` does), so forward returns a value
+        # V(s_t) at every token in ``logits`` [B, T]. Symmetric with Megatron's task='value'.
+        from twinkle.patch.transformers_value import TransformersValuePatch
+        return apply_context(model, TransformersValuePatch())
     raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, reranker, seq_cls, '
-                     'generative_reranker, fused_lm_ce.')
+                     'generative_reranker, fused_lm_ce, value.')
 
 
 def _resolve_mm_graph_context(model, template):

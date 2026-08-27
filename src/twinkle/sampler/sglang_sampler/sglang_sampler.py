@@ -396,7 +396,11 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         base_sync_done: bool = False,
         peft_config: dict = None,
     ):
-        """Receive weights via NCCL broadcast and stream them into sglang.
+        """Receive weights from the trainer and stream them into sglang.
+
+        Which transport delivers them is the checkpoint engine's business, not this method's: NCCL
+        broadcast when the trainer is on other GPUs, CUDA IPC when it shares this one, where NCCL
+        cannot be used at all.
 
         The checkpoint engine's ``receive_weights()`` async generator is handed straight to
         :meth:`SGLangEngine.update_weights`, which consumes it one tensor at a time into a bucket and

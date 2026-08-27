@@ -57,13 +57,13 @@ def _resolve_task_context(model, task):
     seq_cls head with num_labels=1. The per-sequence pooling they still require is done later in
     ``forward_step`` (CP reconstruct + last-valid-token pick), not by a patch.
     """
-    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker'):
+    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker', 'value'):
         return contextlib.nullcontext()
     if task == 'embedding':
         from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
         return apply_context(model, MegatronEmbeddingPatch())
     raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, seq_cls, reranker, '
-                     'generative_reranker.')
+                     'generative_reranker, value.')
 
 
 @dataclass
@@ -608,6 +608,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                             _n = _packed.seq_lens.shape[0]
                             _last_idx = _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1
                             unpacked_logits = output_tensor[0, _last_idx]
+                elif task == 'value':
+                    # PPO critic: the SAME num_labels=1 seq_cls head, but keep its PER-TOKEN value
+                    # V(s_t) -- skip the last-valid-token pick the seq_cls branch does. The per-token
+                    # values ride the existing logits channel ([b, s]); PPOValueLoss reads them and
+                    # masks to the response tokens. Non-packed / non-SP only (the critic runs without
+                    # them), mirroring the transformers TransformersValuePatch scope.
+                    if is_last_pp and labels is not None:
+                        _packed = batch.get('packed_seq_params')
+                        cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                        output_tensor = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
+                        # [b, s, 1] -> [b, s] (num_labels=1); already per-token, no pooling.
+                        unpacked_logits = output_tensor.squeeze(-1) if output_tensor.dim() == 3 else output_tensor
                 elif labels is not None and is_last_pp:
                     _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
                     _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)

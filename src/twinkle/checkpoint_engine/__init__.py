@@ -15,6 +15,7 @@ Usage:
 
 from .base import CheckpointEngine, TensorMeta
 from .hccl_checkpoint_engine import HCCLCheckpointEngine
+from .ipc_checkpoint_engine import IPCCheckpointEngine
 from .manager import CheckpointEngineManager
 from .mixin import CheckpointEngineMixin
 # Import backend implementations to register them
@@ -26,5 +27,6 @@ __all__ = [
     'CheckpointEngineManager',
     'NCCLCheckpointEngine',
     'HCCLCheckpointEngine',
+    'IPCCheckpointEngine',
     'TensorMeta',
 ]

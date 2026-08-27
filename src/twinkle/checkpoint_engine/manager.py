@@ -10,10 +10,12 @@ logger = get_logger()
 
 
 class CheckpointEngineManager:
-    """Weight synchronization manager for Twinkle (STANDALONE mode).
+    """Weight synchronization manager for Twinkle.
 
-    Coordinates weight synchronization between training model and inference sampler
-    when they reside on **different GPUs** (disaggregated / standalone deployment).
+    Coordinates weight synchronization between training model and inference sampler, either when they
+    reside on **different GPUs** (disaggregated / standalone deployment, the default) or when they
+    **share** one (``colocate=True``). Colocation replaces the NCCL broadcast drawn below with a CUDA
+    IPC handover per GPU -- not as an optimisation, but because NCCL refuses two ranks on one device.
 
     Architecture (following verl's CheckpointEngineManager):
 
@@ -39,6 +41,22 @@ class CheckpointEngineManager:
     Usage:
         >>> manager = CheckpointEngineManager(model=model, sampler=sampler)
         >>> manager.sync_weights()  # Call after each training step
+
+    Colocated, the caller also owns the memory schedule, because only it knows where in the loop the
+    device is free. The sampler must have its weights resident to be written into -- ``sleep(1)`` puts
+    them on the host -- and the trainer has to step aside before a rollout:
+
+        >>> manager = CheckpointEngineManager(model=model, sampler=sampler, colocate=True)
+        >>> sampler.wake_up(tags=['weights'])   # able to receive, still without a KV cache
+        >>> manager.sync_weights()
+        >>> model.offload_to_cpu()              # the trainer's turn is over
+        >>> sampler.wake_up()                   # KV cache, then generate
+        >>> ...
+        >>> sampler.sleep()                     # and back the other way
+        >>> model.reload_to_gpu()
+
+    This is deliberately not done for the caller: waking a sampler that is already awake is not a
+    no-op in vLLM, so guessing the current state here would trade one foot-gun for another.
     """
 
     def __init__(
@@ -46,16 +64,23 @@ class CheckpointEngineManager:
         model: 'CheckpointEngineMixin',
         sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
+        colocate: bool = False,
     ) -> None:
         self.model = model
         self.sampler = sampler
-        self.backend_cls = self.decide_backend_engine(platform)
+        self.colocate = colocate
+        self.backend_cls = self.decide_backend_engine(platform, colocate)
 
         # Validate Ray actors
         assert hasattr(model, '_actors') and model._actors, \
             'CheckpointEngineManager requires model to be deployed as Ray actors'
         assert hasattr(sampler, '_actors') and sampler._actors, \
             'CheckpointEngineManager requires sampler to be deployed as Ray actors'
+
+        if colocate:
+            # Each side builds its own engine inside its worker, so both have to be told which one.
+            self.model.set_checkpoint_engine_backend('ipc')
+            self.sampler.set_checkpoint_engine_backend('ipc')
 
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
@@ -66,7 +91,10 @@ class CheckpointEngineManager:
         self._model_keys: Optional[List[str]] = None
 
     @staticmethod
-    def decide_backend_engine(platform: Optional[str] = None) -> 'CheckpointEngine':
+    def decide_backend_engine(platform: Optional[str] = None, colocate: bool = False) -> 'CheckpointEngine':
+        if colocate:
+            from twinkle.checkpoint_engine import IPCCheckpointEngine
+            return IPCCheckpointEngine
         if Platform.get_platform(platform).__name__ == 'GPU':
             from twinkle.checkpoint_engine import NCCLCheckpointEngine
             return NCCLCheckpointEngine

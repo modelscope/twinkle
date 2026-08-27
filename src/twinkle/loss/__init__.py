@@ -10,7 +10,9 @@ from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .liger_fused_linear_grpo import LigerFusedLinearGRPOLoss
 from .mse import MSELoss
 from .reranker import ListwiseRerankerLoss, PointwiseRerankerLoss
+from .reward import RewardLoss
 from .seq_cls import SeqClsLoss
+from .value import PPOValueLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -32,6 +34,11 @@ torch_loss_mapping = {
     'simpo': SimPOLoss,
     'cpo': CPOLoss,
     'orpo': ORPOLoss,
+    # Reward model (pairwise Bradley-Terry)
+    'reward': RewardLoss,
+    'rm': RewardLoss,
+    # PPO critic (clipped value regression)
+    'ppo_value': PPOValueLoss,
     # Embedding / contrastive losses
     'infonce': InfonceLoss,
     'cosine_similarity': CosineSimilarityLoss,

@@ -468,13 +468,17 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         base_sync_done: bool = False,
         peft_config: dict = None,
     ):
-        """Receive weights via NCCL broadcast and stream into vLLM.
+        """Receive weights from the trainer and stream them into vLLM.
+
+        Which transport delivers them is the checkpoint engine's business, not this method's: NCCL
+        broadcast when the trainer is on other GPUs, CUDA IPC when it shares this one, where NCCL
+        cannot be used at all. Either way what arrives here is the same async generator.
 
         Uses a **streaming pipeline** to avoid accumulating a
         full model-weight copy on GPU:
 
         1. ``CheckpointEngine.receive_weights()`` yields tensors from
-           double-buffered NCCL buckets (async generator, GPU tensors).
+           the engine's buckets (async generator, GPU tensors).
         2. The async generator is passed **directly** to
            ``VLLMEngine.update_weights()`` which consumes it one tensor at
            a time, copying each into a GPU IPC bucket and flushing to the
@@ -493,7 +497,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         engine = self._get_or_create_checkpoint_engine()
 
         async def _receive_and_load():
-            # Stream NCCL-received tensors directly into vLLM via IPC.
+            # Stream the received tensors directly into vLLM via IPC.
             # VLLMEngine.update_weights accepts an async generator and
             # handles bucket packing + ZMQ transfer internally.
             await self.engine.update_weights(

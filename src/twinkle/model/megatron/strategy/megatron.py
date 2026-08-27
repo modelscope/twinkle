@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import gc
 import os
 
 import torch
@@ -487,3 +488,115 @@ class MegatronStrategy:
         model = model.to(Platform.get_local_device())
         torch_util.synchronize()
         return model
+
+    @torch.no_grad()
+    def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
+        """Release this rank's training memory so something else can use the device.
+
+        Needed for colocation, where a sampler shares the GPU with the trainer and the two do not
+        fit at once. The buffer-level work is Megatron's own ``offload_to_cpu`` -- parameters and
+        gradients live in flat per-bucket buffers, not on the modules, so freeing them means
+        emptying that storage, and Megatron already knows how.
+
+        Reversed by :meth:`reload_to_gpu`. Both read what is currently resident rather than a flag,
+        so a repeated call is a no-op.
+        """
+        # Buffers are about to have their storage freed; make sure nothing is still writing to it.
+        # Megatron's own offload_grad_buffers opens the same way.
+        torch_util.synchronize()
+        for chunk in model:
+            buffers = self._flat_buffers(chunk)
+            for buffer in buffers:
+                buffer.offload_to_cpu()
+            self._move_loose_params(chunk, buffers, 'cpu')
+        if optimizer is not None:
+            self._move_optimizer_state(optimizer, 'cpu')
+        gc.collect()
+        torch_util.empty_cache()
+
+    @torch.no_grad()
+    def reload_to_gpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
+        """Bring back what :meth:`offload_to_cpu` released."""
+        device = Platform.get_local_device()
+        for chunk in model:
+            buffers = self._flat_buffers(chunk)
+            for buffer in buffers:
+                buffer.reload_from_cpu()
+            self._move_loose_params(chunk, buffers, device)
+        if optimizer is not None:
+            self._move_optimizer_state(optimizer, device)
+        gc.collect()
+        torch_util.empty_cache()
+
+    @staticmethod
+    def _flat_buffers(chunk: nn.Module) -> List[Any]:
+        """The flat parameter/gradient buckets owning this chunk's trainable tensors, if any.
+
+        This cannot duck-type on the attribute name: ``nn.Module`` already defines a ``buffers()``
+        method, so an unwrapped chunk would hand back a bound method instead of a list.
+        """
+        from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+        from megatron.core.distributed import FullyShardedDataParallel as MegatronFSDP
+        if isinstance(chunk, MegatronDDP):
+            return [*chunk.buffers, *chunk.expert_parallel_buffers]
+        if isinstance(chunk, MegatronFSDP):
+            raise NotImplementedError(
+                'Offloading a Megatron-FSDP model is not supported: it holds its parameters in '
+                '`param_and_grad_buffer`, which is not the per-bucket structure DDP uses. Freeing '
+                'only the parts this method understands would leave most of the training memory '
+                'resident while reporting success, which defeats the purpose.')
+        return []
+
+    @staticmethod
+    def _move_loose_params(chunk: nn.Module, buffers: List[Any], device: Any) -> None:
+        """Move the parameters no flat buffer holds.
+
+        Three ways a parameter ends up outside them. It is frozen -- a LoRA base weight, which DDP
+        keeps out of its buckets because it never needs a gradient. Or the chunk was never wrapped:
+        a reference model, or any model on a single rank, where ``wrap_model`` skips DDP. Or the run
+        has no distributed optimizer, in which case Megatron allocates ``grad_data`` but leaves
+        ``param_data`` as None -- only a distributed optimizer needs parameters pooled into a flat
+        buffer, so without one they stay on the module and the buckets hold gradients alone.
+
+        That last case is why this asks the buffers what they actually hold instead of whether they
+        exist: gradient-only buckets would otherwise look like full coverage and the parameters
+        would silently stay on the device.
+        """
+        params_are_pooled = any(buffer.param_data is not None for buffer in buffers)
+        for param in chunk.parameters():
+            if params_are_pooled and param.requires_grad:
+                continue
+            param.data = param.data.to(device, non_blocking=True)
+            if param.grad is not None:
+                param.grad = param.grad.to(device, non_blocking=True)
+
+    @staticmethod
+    def _move_optimizer_state(optimizer: Any, device: Any) -> None:
+        """Move an optimizer's tensor state between host and device.
+
+        Megatron has ``MegatronOptimizer.offload_to_cpu``/``restore_from_cpu`` for this, but they
+        hardcode ``.cuda()`` and ``torch.cuda.empty_cache()``, so they cannot serve the NPU backend
+        Twinkle also supports. This is the same walk with the device left as a parameter.
+
+        Walking every tensor in ``state`` rather than naming ``exp_avg``/``exp_avg_sq`` holds for any
+        optimizer keeping its state on one device -- but not for a heterogeneous one that
+        deliberately splits its state across host and device.
+        """
+        from megatron.core.optimizer.optimizer import ChainedOptimizer
+        optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
+        for _optimizer in optimizers:
+            # Megatron wraps a plain torch optimizer; fall back to the object itself so a bare one
+            # also works. `optimizer` being None means this rank owns no parameters, which is
+            # legitimate under a custom pipeline layout.
+            inner = getattr(_optimizer, 'optimizer', _optimizer)
+            if inner is None or getattr(_optimizer, 'is_stub_optimizer', False):
+                continue
+            # The fp32 master copies of the fp16/bf16 parameters live in the inner param_groups.
+            for group in inner.param_groups:
+                for param in group['params']:
+                    if isinstance(param, torch.Tensor):
+                        param.data = param.data.to(device, non_blocking=True)
+            for state in inner.state.values():
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device, non_blocking=True)

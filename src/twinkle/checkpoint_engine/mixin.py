@@ -8,11 +8,29 @@ class CheckpointEngineMixin:
 
     _checkpoint_engine: CheckpointEngine = None
     _bucket_size: int = 3072 << 20  # 2 GB
+    # Set by CheckpointEngineManager when the roles share a GPU; see set_checkpoint_engine_backend.
+    _checkpoint_engine_backend: str = None
+
+    @remote_function(dispatch='all', lazy_collect=False)
+    def set_checkpoint_engine_backend(self, backend: str):
+        """Choose the transport for the syncs that follow.
+
+        Separate from ``prepare_checkpoint_engine`` because that one dispatches by slicing its
+        arguments across ranks, which would take a backend name apart character by character.
+        """
+        if backend != self._checkpoint_engine_backend:
+            self._checkpoint_engine_backend = backend
+            self._checkpoint_engine = None
 
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
         if self._checkpoint_engine is None:
-            if Platform.get_platform().__name__ == 'GPU':
+            if self._checkpoint_engine_backend == 'ipc':
+                # Colocated: the sampler is on this GPU, so weights are mapped, not broadcast. NCCL
+                # is not an option here -- it refuses two ranks on one device.
+                from twinkle.checkpoint_engine import IPCCheckpointEngine
+                self._checkpoint_engine = IPCCheckpointEngine()
+            elif Platform.get_platform().__name__ == 'GPU':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
                 self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
             elif Platform.get_platform().__name__ == 'NPU':

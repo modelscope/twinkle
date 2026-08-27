@@ -193,6 +193,31 @@ class AccelerateStrategy:
         )
         return fsdp_plugin
 
+    def offload_to_cpu(self, model, optimizer=None) -> None:
+        """Move parameters/buffers (and any optimizer state) to host memory for colocation.
+
+        Under colocation the trainer shares its GPU with a vLLM sampler and the two do not fit at
+        once; between a training step and a rollout the trainer steps aside, then :meth:`reload_to_gpu`
+        brings it back. Only placement changes -- nothing is discarded. The device moved off is
+        recorded so the reverse lands exactly where the params were, and re-calling either direction is
+        harmless because ``.to`` on an already-resident tensor is a no-op.
+        """
+        import torch
+        if getattr(self, '_offload_device', None) is None:
+            self._offload_device = self.accelerator.device
+        self.unwrap_model(model).to('cpu')
+        if optimizer is not None:
+            _move_optimizer_state(optimizer, torch.device('cpu'))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def reload_to_gpu(self, model, optimizer=None) -> None:
+        """Bring back what :meth:`offload_to_cpu` handed over, to the device it was moved off."""
+        device = getattr(self, '_offload_device', None) or self.accelerator.device
+        self.unwrap_model(model).to(device)
+        if optimizer is not None:
+            _move_optimizer_state(optimizer, device)
+
     def wrap_model(self, model, *args):
         return self.accelerator.prepare(model, *args)
 
@@ -283,3 +308,17 @@ class AccelerateStrategy:
 
 def _is_lora_state_key(name: str) -> bool:
     return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+
+
+def _move_optimizer_state(optimizer, device) -> None:
+    """Move an optimizer's per-parameter state tensors (Adam moments, etc.) to ``device``.
+
+    Kept separate from the param move because the optimizer holds its state as plain tensors in
+    ``optimizer.state`` rather than as module parameters, so ``model.to`` never touches them --
+    leaving them on the GPU would defeat the point of offloading during a colocated rollout.
+    """
+    import torch
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)

@@ -18,6 +18,10 @@ Not provided, deliberately: colocated weight sync. ``vLLMSampler`` mixes in ``Ch
 to receive NCCL-broadcast weights mid-training; this backend is for inference, evaluation and offline
 sampling, and a half-working ``receive_weights`` would be worse than an absent one. ``update_weights``
 on the engine covers the simple in-process refresh.
+
+And not needed, in the one case where it would otherwise be: passing ``model=<TransformersModel>``
+instead of ``model_id`` makes this a facade over a model that already exists, generating inside its
+workers. Nothing is loaded and nothing is synced, because there is only ever one set of weights.
 """
 from __future__ import annotations
 
@@ -40,20 +44,40 @@ logger = get_logger()
 class TransformersSampler(Sampler):
     """Sample with ``AutoModelForCausalLM.generate()``."""
 
-    def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
+    def __init__(self,
+                 model_id: str = None,
+                 engine_args: Dict[str, Any] = None,
+                 device_mesh: DeviceMesh = None,
+                 *,
+                 model: Any = None,
+                 **kwargs):
         """
         Args:
-            model_id: HuggingFace model id or local path.
+            model_id: HuggingFace model id or local path. Mutually exclusive with ``model``.
             engine_args: Forwarded to :class:`~twinkle.sampler.TransformersEngine` -- ``dtype``,
                 ``device_map``, ``max_model_len``, ``attn_implementation``, ``trust_remote_code``, plus
                 anything ``from_pretrained`` accepts. Also accepts ``max_batch_size`` (see below).
+                Note that its ``model`` entry is a different thing from the ``model`` argument here: it
+                is a bare ``nn.Module`` for the engine to generate with in this process, whereas ``model``
+                below is a ``TransformersModel`` whose workers do the generating. Both avoid a reload;
+                the first is what ``TransformersModel.generate`` uses internally.
             device_mesh: Data-parallel layout. Slicing is done by ``dispatch='slice_dp'`` on
                 :meth:`sample`, so each rank only ever sees its own shard.
+            model: A ``TransformersModel`` to generate from instead of loading one. Sampling is then
+                done by its workers, on the weights they already hold -- no second copy of the model,
+                and no weight sync, which is what makes this worth having during training. Construct
+                this facade on the driver without a ``remote_group``: it holds no weights itself, so it
+                needs no workers of its own, and the model's ``generate`` does the data-rank slicing.
+                ``engine_args`` and ``device_mesh`` belong to the model in this mode and are ignored.
             **kwargs: Accepted and ignored, for signature parity with the other samplers.
         """
         super().__init__()
         requires('transformers')
 
+        if (model_id is None) == (model is None):
+            raise ValueError('Pass either model_id, to load a model to sample from, or model, to sample '
+                             'from one that already exists -- not both and not neither.')
+        self.model = model
         self.model_id = model_id
         self.device_mesh = device_mesh
         engine_kwargs = dict(engine_args or {})
@@ -69,8 +93,12 @@ class TransformersSampler(Sampler):
             target=self._run_event_loop, daemon=True, name='TransformersSampler-EventLoop')
         self._async_thread.start()
 
-        from .transformers_engine import TransformersEngine
-        self.engine: TransformersEngine = TransformersEngine(model_id, **engine_kwargs)
+        if model is not None:
+            # Nothing to build: generation happens in the model's workers.
+            self.engine = None
+        else:
+            from .transformers_engine import TransformersEngine
+            self.engine: TransformersEngine = TransformersEngine(model_id, **engine_kwargs)
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
@@ -108,6 +136,18 @@ class TransformersSampler(Sampler):
 
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def set_template(self, template_cls, **kwargs):
+        """Set the template that turns messages into token ids.
+
+        Handed to the model in facade mode, because that is where encoding happens. It would not work
+        here in any case: the base implementation defaults ``model_id`` from this object, and a facade
+        has none.
+        """
+        if self.model is not None:
+            return self.model.set_template(template_cls, **kwargs)
+        return super().set_template(template_cls, **kwargs)
 
     # ------------------------------------------------------------------ sampling
 
@@ -147,6 +187,20 @@ class TransformersSampler(Sampler):
         Returns:
             One ``SampleResponse`` per input, each holding ``num_samples`` sequences.
         """
+        if self.model is not None:
+            # Everything below -- encoding, adapter grouping, chunking -- is what the model runs on its
+            # own side, so it is forwarded whole rather than half-done here. This does not double-slice:
+            # a facade owns no actors, so the decorator above runs it in place and only the model's
+            # ``generate`` dispatches.
+            return self.model.generate(
+                inputs,
+                sampling_params=sampling_params,
+                adapter_name=adapter_name,
+                adapter_path=adapter_path,
+                return_encoded=return_encoded,
+                use_base_model=use_base_model,
+                adapter_paths=adapter_paths,
+                strict=strict)
         params = self._coerce_params(sampling_params)
         inputs_list = self._normalize_inputs(inputs)
         if not inputs_list:
@@ -191,6 +245,10 @@ class TransformersSampler(Sampler):
         adapter_path: Optional[str] = None,
     ):
         """Yield ``(delta_text, finish_reason)`` tuples for a single input."""
+        if self.model is not None:
+            yield from self.model.generate_stream(
+                inputs, sampling_params=sampling_params, adapter_name=adapter_name, adapter_path=adapter_path)
+            return
         params = self._coerce_params(sampling_params)
         feat = inputs if not self._not_encoded(inputs) else self.encode_trajectory(inputs, adapter_name)
         adapter_uri = self._resolve_adapter(adapter_path, adapter_name, use_base_model=False)
@@ -200,17 +258,29 @@ class TransformersSampler(Sampler):
 
     # ------------------------------------------------------------------ engine passthrough
 
+    def _own_engine(self):
+        """The engine this sampler loaded, or a clear failure when it is a facade over a model.
+
+        A facade has no memory of its own to control, and quietly doing nothing would be worse: a caller
+        putting a sampler to sleep to free the device would believe it had.
+        """
+        if self.engine is None:
+            raise RuntimeError('This sampler generates through the model it was given, which owns those '
+                               'weights and that memory; there is no engine here to control. Call the '
+                               'corresponding method on the model instead.')
+        return self.engine
+
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def get_state_keys(self):
-        return self._run_in_loop(self.engine.get_state_keys())
+        return self._run_in_loop(self._own_engine().get_state_keys())
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:
-        self._run_in_loop(self.engine.sleep(level=level))
+        self._run_in_loop(self._own_engine().sleep(level=level))
 
     @remote_function(dispatch='all', collect='first')
     def wake_up(self, tags: List[str] = None) -> None:
-        self._run_in_loop(self.engine.wake_up(tags=tags))
+        self._run_in_loop(self._own_engine().wake_up(tags=tags))
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def add_adapter_to_sampler(self, adapter_name: str, config: Any) -> None:
