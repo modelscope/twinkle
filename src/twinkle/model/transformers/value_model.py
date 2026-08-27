@@ -9,7 +9,16 @@ from .transformers import TransformersModel
 
 @remote_class()
 class TransformersValueModel(TransformersModel):
-    """Transformers causal-LM backbone with a scalar value head."""
+    """Transformers causal-LM backbone with a scalar value head.
+
+    The implementation supports causal language models with hybrid attention.
+    In particular, Qwen3.5 alternates full-attention decoder layers
+    (``self_attn``) with GatedDeltaNet linear-attention layers
+    (``linear_attn``).  Both token mixers are treated as attention modules
+    when applying the frozen-attention critic training strategy.
+    """
+
+    _ATTENTION_ATTRIBUTES = ('self_attn', 'linear_attn', 'attn')
 
     def __init__(self, *args, device_mesh: Optional[DeviceMesh] = None, **kwargs):
         super().__init__(*args, device_mesh=device_mesh, **kwargs)
@@ -25,14 +34,22 @@ class TransformersValueModel(TransformersModel):
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def freeze_attention_for_value_training(self):
-        """Freeze decoder attention modules while leaving MLP/value head trainable."""
+        """Freeze attention/token-mixer modules while leaving feed-forward/value-head parameters trainable.
+
+        ``self_attn`` covers conventional and Qwen3.5 full-attention decoder
+        layers, ``linear_attn`` covers Qwen3.5 GatedDeltaNet layers, and
+        ``attn`` preserves compatibility with models
+        such as GPT-2 and vision backbones.
+        """
         model = self.strategy.unwrap_model(self.model)
         attention_modules = []
+        seen_attention_ids = set()
         for module in model.modules():
-            for attribute in ('self_attn', 'attn'):
+            for attribute in self._ATTENTION_ATTRIBUTES:
                 attention = getattr(module, attribute, None)
-                if isinstance(attention, nn.Module) and attention not in attention_modules:
+                if isinstance(attention, nn.Module) and id(attention) not in seen_attention_ids:
                     attention_modules.append(attention)
+                    seen_attention_ids.add(id(attention))
         if not attention_modules:
             raise ValueError(f'No decoder attention modules found for {type(model).__name__}')
         frozen = 0
