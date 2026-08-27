@@ -392,6 +392,12 @@ class AgenticChallenger(Challenger):
         combo_arity: ``'triple'`` or ``'mix'``, as in :class:`.CodeChallenger`.
         arity_weights: weights for the ``'mix'`` subset size.
         single_kw_prob: chance of using one category in ``'triple'`` mode.
+        proposals_per_group: how many proposals answer the same keyword draw and
+            the same prompt, tagged with a shared ``group_id``. This is the group
+            size the proposing side's advantage is computed over; at 1 every
+            group has one member and every advantage is zero. At a fixed
+            proposal count it does not change the compute -- it divides the
+            number of distinct keyword draws per round by the same factor.
         keyword_refill_target / keyword_gen_calls / keyword_refill_tries /
         keyword_params: keyword bank refill parameters.
         check_params / problem_params: sampling params for the two appended
@@ -465,12 +471,14 @@ class AgenticChallenger(Challenger):
         reset_fn: Callable[..., None],
         run_check_fn: Callable[..., Tuple[int, str]],
         workspace_snapshot_fn: Optional[Callable[..., str]] = None,
+        snapshot_error_fn: Optional[Callable[..., str]] = None,
         tool_schemas: Optional[Sequence[Dict[str, Any]]] = None,
         episode_concurrency: int = 1,
         episode_tool_managers: Optional[Sequence[Any]] = None,
         combo_arity: str = 'triple',
         arity_weights: Optional[Sequence[float]] = None,
         single_kw_prob: float = 0.1,
+        proposals_per_group: int = 1,
         keyword_refill_target: int = 128,
         keyword_gen_calls: int = 8,
         keyword_refill_concurrency: int = 1,
@@ -511,6 +519,13 @@ class AgenticChallenger(Challenger):
         self.reset_fn = reset_fn
         self.run_check_fn = run_check_fn
         self.workspace_snapshot_fn = workspace_snapshot_fn
+        # Asked, when a snapshot came back empty, why: the text of the failure if
+        # the listing could not be read, '' if the workspace really was empty.
+        # Without it the two are one outcome, and a sandbox the host had paused is
+        # filed as the model having built nothing -- 63 of run_clean6's 71
+        # ``empty_workspace`` rejections were the 410 "sandbox is not proxyable"
+        # error, so that reject class was 89% broken environment.
+        self.snapshot_error_fn = snapshot_error_fn
         self.tool_schemas = list(tool_schemas) if tool_schemas else None
         # More than one episode at a time needs more than one sandbox: an episode
         # owns its workspace from the reset until its check has run. The three
@@ -540,6 +555,15 @@ class AgenticChallenger(Challenger):
         self.combo_arity = combo_arity
         self.arity_weights = list(arity_weights) if arity_weights else None
         self.single_kw_prob = single_kw_prob
+        # How many proposals answer each keyword draw. Above 1 they form a GRPO
+        # group on the proposing side; see :meth:`propose`. Raising it does not
+        # cost more compute at a fixed proposal count -- it trades keyword
+        # variety for group size, since a round's proposals then come from
+        # ``count / proposals_per_group`` draws instead of ``count`` of them.
+        if proposals_per_group < 1:
+            raise ValueError(f'proposals_per_group must be >= 1, got {proposals_per_group}')
+        self.proposals_per_group = proposals_per_group
+        self._next_group_id = 0
         self.keyword_refill_target = keyword_refill_target
         self.keyword_gen_calls = keyword_gen_calls
         # How many of a refill's generating calls go out together. At 1 each call
@@ -607,6 +631,10 @@ class AgenticChallenger(Challenger):
         self.stats: Dict[str, int] = {
             'explore_done': 0, 'check_parse_fail': 0, 'check_run_fail': 0,
             'empty_workspace': 0, 'solver_truncated': 0,
+            # The workspace listing could not be read, as opposed to being empty.
+            # Kept apart from ``empty_workspace`` because it says nothing about
+            # what the model did.
+            'snapshot_unavailable': 0,
             'problem_parse_fail': 0, 'too_long': 0, 'parsed': 0,
             # How often a check that failed was handed back for a rewrite, and
             # how often the rewrite passed. The two together say whether the
@@ -635,11 +663,21 @@ class AgenticChallenger(Challenger):
 
         Each carries a direction + keywords + optional seed. The explorer will
         run these multi-turn in the sandbox.
+
+        ``proposals_per_group`` of them share one keyword draw, one seed choice
+        and one identical prompt, and are tagged with the same ``group_id``.
+        That is what makes a GRPO group on the proposing side: the advantage of
+        a proposal is its reward minus the mean over the others answering the
+        same prompt, so the members have to differ only by sampling noise. At 1
+        -- which is what this used to be, every proposal its own keyword draw --
+        every group has one member, the mean equals the reward, and every
+        advantage is zero.
         """
         proposals: List[Trajectory] = []
         directions: List[str] = []
-        metas: List[Tuple[List[Tuple[str, str]], bool, str]] = []
-        for _ in range(count):
+        metas: List[Tuple[List[Tuple[str, str]], bool, str, int]] = []
+        per_group = max(1, self.proposals_per_group)
+        while len(metas) < count:
             picks = self._draw_keywords()
             body = '\n'.join(f'- {c}: {t}' for c, t in picks)
             use_seed = bool(self.seeds) and self.rng.random() < self.seed_mix_prob
@@ -653,10 +691,21 @@ class AgenticChallenger(Challenger):
                 user = self.prompts.from_keywords.format(keywords=body)
             else:
                 user = self.prompts.from_scratch
-            directions.append(user)
-            metas.append((picks, use_seed, body))
+            # The whole group gets the same prompt, so a short final group is a
+            # group whose advantage is computed over fewer samples -- noisier,
+            # but not wrong. Truncating to a multiple of per_group instead would
+            # silently return fewer proposals than asked for.
+            #
+            # The counter is per-run, not per-call: ``propose`` runs once per
+            # round, and restarting at 0 each round would give two unrelated
+            # groups the same id in the dump.
+            gid = self._next_group_id
+            self._next_group_id += 1
+            for _ in range(min(per_group, count - len(metas))):
+                directions.append(user)
+                metas.append((picks, use_seed, body, gid))
 
-        for user, (picks, use_seed, body) in zip(directions, metas):
+        for user, (picks, use_seed, body, gid) in zip(directions, metas):
             proposal: Trajectory = {
                 'messages': [{'role': 'system', 'content': self.prompts.system},
                              {'role': 'user', 'content': user}],
@@ -664,7 +713,8 @@ class AgenticChallenger(Challenger):
             if self.tool_schemas:
                 proposal['tools'] = self.tool_schemas
             proposals.append(attach_user_data(
-                proposal, keywords=picks, seeded=use_seed, keyword_block=body))
+                proposal, keywords=picks, seeded=use_seed, keyword_block=body,
+                group_id=gid))
         return proposals
 
 
@@ -681,6 +731,23 @@ class AgenticChallenger(Challenger):
         raise RuntimeError(
             f'{type(self).__name__}.build() must not be called directly; '
             f'the serial _round() loop drives one episode at a time instead.')
+
+    def _reject_for_empty_snapshot(self, state: Dict[str, Any], slot: int) -> None:
+        """File an episode whose workspace listing came back empty.
+
+        Empty means one of two unrelated things -- the episode built nothing, or
+        the listing could not be read -- and only the first says anything about
+        the model. ``snapshot_error_fn`` is what tells them apart; with no such
+        callback every case is filed as ``empty_workspace``, which is what used
+        to happen for all of them.
+        """
+        detail = self.snapshot_error_fn(slot=slot) if self.snapshot_error_fn else ''
+        if detail:
+            self._bump('snapshot_unavailable')
+            state['reject'] = ('snapshot_unavailable', detail)
+        else:
+            self._bump('empty_workspace')
+            state['reject'] = ('empty_workspace', '')
 
     def _followup(self, state: Dict[str, Any], trajectory: Trajectory,
                   n_before: int) -> Optional[Tuple[str, Optional[SamplingParams]]]:
@@ -708,8 +775,7 @@ class AgenticChallenger(Challenger):
             # solver passes by doing nothing. Five of run5's ten verified tasks
             # were that task. Reject here instead.
             if not snapshot.strip():
-                self._bump('empty_workspace')
-                state['reject'] = ('empty_workspace', '')
+                self._reject_for_empty_snapshot(state, slot)
                 return None
             return (self.prompts.check_followup.format(final_state=snapshot),
                     self.check_params)
@@ -852,8 +918,7 @@ class AgenticChallenger(Challenger):
         # An episode that left nothing behind has no end state to write checks
         # about; rejecting here mirrors the n_before==0 branch of _followup.
         if not snapshot.strip():
-            self._bump('empty_workspace')
-            state['reject'] = ('empty_workspace', '')
+            self._reject_for_empty_snapshot(state, slot)
             return
 
         # Check-script stage: the first ask plus up to ``check_retries`` rewrites,
@@ -944,6 +1009,7 @@ class AgenticChallenger(Challenger):
         """
         keywords = user_data_get(explored.get('user_data'), 'keywords', [])
         seeded = user_data_get(explored.get('user_data'), 'seeded', False)
+        group_id = user_data_get(explored.get('user_data'), 'group_id', None)
         # The episode as one record: a single conversation, so a single set of
         # token ids and logprobs. Handed to propose_sink with whatever verdict the
         # proposal ends up with, so a rejected attempt is recorded as fully as a
@@ -952,7 +1018,8 @@ class AgenticChallenger(Challenger):
 
         def reject(reason: str, detail: str = '') -> None:
             self._reject_record(explored, reason, detail=detail)
-            self._emit_propose(rounds, reason, keywords=keywords, seeded=seeded)
+            self._emit_propose(rounds, reason, keywords=keywords, seeded=seeded,
+                               group_id=group_id)
 
         if state.get('reject'):
             reason, detail = state['reject']
@@ -1034,29 +1101,55 @@ class AgenticChallenger(Challenger):
 
     def _emit_propose(self, rounds: Optional[List[Dict[str, Any]]], outcome: str, *,
                       keywords: Any = (), seeded: bool = False,
-                      n_pass: Optional[int] = None) -> None:
+                      n_pass: Optional[int] = None,
+                      group_id: Optional[int] = None) -> None:
         """Hand one proposal attempt's rounds to ``propose_sink``.
 
-        ``pass_rate`` is the raw fraction of solver attempts that succeeded. It
-        is left as the measurement rather than mapped onto a difficulty score:
-        the target rate and its tolerance are training decisions, and baking a
-        guess at them into the dump would make it look like they had been
-        settled.
+        ``pass_rate`` is the raw fraction of solver attempts that succeeded.
+        ``challenger_reward`` is that fraction scored against a 50% target by
+        :meth:`challenger_reward`, which is the number the proposing side trains
+        on; both are written so a run can be re-scored under a different target
+        without re-solving anything.
+
+        A proposal with no ``n_pass`` never reached difficulty measurement -- it
+        was rejected before that -- and scores 0, the same as one nobody or
+        everybody solved.
         """
         if self.propose_sink is None or not rounds:
             return
         rollouts = self.solver_rollouts or None
         payload = {
             'outcome': outcome,
+            'group_id': group_id,
             'n_pass': n_pass,
             'n_rollouts': rollouts,
             'pass_rate': (n_pass / rollouts) if (n_pass is not None and rollouts) else None,
+            'challenger_reward': self.challenger_reward(n_pass),
             'keywords': list(keywords or ()),
             'seeded': bool(seeded),
             'rounds': rounds,
         }
         with self._sink_lock:
             self.propose_sink(payload)
+
+    def challenger_reward(self, n_pass: Optional[int]) -> float:
+        """Score a proposal by how close the solver came to a 50% pass rate.
+
+        ``1 - 2 * |p - 1/2|`` for ``p = n_pass / solver_rollouts``: 1.0 at half
+        the attempts passing, 0 at none or all of them. The shape is the one
+        R-Zero (arXiv 2508.05004) trains its challenger on, and the reason it is
+        peaked at a half rather than at 'hard' is that a GRPO update's size goes
+        with the reward variance within a group, which for a pass/fail solver is
+        ``p(1-p)`` -- largest exactly there.
+
+        ``None`` means the proposal never got as far as being solved, and scores
+        0. That is the floor, not a penalty: nothing here can go below 0, so a
+        failed proposal and an unsolvable one are worth the same.
+        """
+        rollouts = self.solver_rollouts or 0
+        if n_pass is None or not rollouts:
+            return 0.0
+        return 1.0 - 2.0 * abs(n_pass / rollouts - 0.5)
 
     def _take_rounds(self, task: Trajectory) -> Optional[List[Dict[str, Any]]]:
         """Detach a task's proposing rounds. Popped even with no sink attached:
@@ -1183,7 +1276,8 @@ class AgenticChallenger(Challenger):
             for task in usable:
                 self._emit_propose(self._take_rounds(task), 'kept',
                                    keywords=user_data_get(task.get('user_data'), 'keywords', []),
-                                   seeded=user_data_get(task.get('user_data'), 'seeded', False))
+                                   seeded=user_data_get(task.get('user_data'), 'seeded', False),
+                                   group_id=user_data_get(task.get('user_data'), 'group_id', None))
         self.n_proposed += len(proposals)
         self.n_kept += len(kept)
         band = (f', in difficulty band {len(kept)}' if self.solver_rollouts else '')
@@ -1291,7 +1385,8 @@ class AgenticChallenger(Challenger):
                                'kept' if kept_flag else 'outside_band',
                                keywords=user_data_get(task.get('user_data'), 'keywords', []),
                                seeded=user_data_get(task.get('user_data'), 'seeded', False),
-                               n_pass=n)
+                               n_pass=n,
+                               group_id=user_data_get(task.get('user_data'), 'group_id', None))
         return [t for t, kept_flag in zip(measured, in_band) if kept_flag]
 
     def solver_prompt(self, task: Trajectory) -> Trajectory:

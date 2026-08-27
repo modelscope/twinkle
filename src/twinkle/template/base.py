@@ -87,6 +87,16 @@ class Template:
         parser = ToolCallRegistry.detect_first(decoded or '')
         return parser.clean(decoded) if parser else (decoded or '').rstrip()
 
+    def tool_call_errors(self, decoded: str) -> List[str]:
+        """Why ``parse_tool_call`` returned fewer calls than the text asked for.
+
+        Same parser choice as ``parse_tool_call``, so the two describe one pass
+        over the reply. Empty when the reply carries no tool-call markup at all --
+        a reply that simply answered is not a failure.
+        """
+        parser = ToolCallRegistry.detect_first(decoded or '')
+        return parser.parse_errors(decoded) if parser else []
+
     @property
     def tokenizer(self):
         tokenizer = self.processor

@@ -27,6 +27,8 @@ import binascii
 import hashlib
 import os
 import sys
+import time
+from typing import Dict
 
 import numpy as np
 import twinkle
@@ -116,6 +118,12 @@ for rel, payload in FILES.items():
     with open(path, 'wb') as handle:
         handle.write(base64.b64decode(payload))
 '''
+
+# Seconds to wait before asking a sandbox for its workspace listing a second
+# time. 62 of run_clean6's 63 snapshot failures were the sandbox answering 410
+# "not proxyable", which is the host having paused it -- worth one more ask,
+# since the alternative is throwing the episode away.
+SNAPSHOT_RETRY_WAIT = 3
 
 # The ground truth the check script is written against. A listing alone is not
 # enough: three of the six rejected proposals in the first real run failed on a
@@ -229,16 +237,25 @@ def parse_args():
     # trained; the two API stages are text-only and never enter the trajectory.
     # Reuses the --challenger-api-* connection args, and is mutually exclusive with
     # --challenger-api (which sends the whole proposing side to the API).
-    p.add_argument('--followup-api', action='store_true',
+    # On by default, because leaving it off is not a milder setting but a
+    # different experiment: run_clean6 was launched without it and the local 4B
+    # wrote the check scripts, which turned 0/55 check_parse_fail (qwen3-max) into
+    # 35/171 and 1/55 check_run_fail into 25/171. Pass --no-followup-api to write
+    # both stages with the local model on purpose.
+    p.add_argument('--followup-api', action=argparse.BooleanOptionalAction,
+                   default=True,
                    help='explore locally (trainable) but generate the check script and '
                         'problem statement over --challenger-api-* (e.g. qwen3-max); '
                         'only the exploration part is trained. Not with --challenger-api.')
     # How many episodes run at once, each in its own sandbox. An episode owns its
     # workspace from the reset until its check has run, so this is also the number
-    # of sandboxes booted at startup. Default 48: episodes alternate between vLLM
-    # generation (~24 concurrent sequences fit in KV cache) and sandbox execution,
-    # so 48 keeps both the GPU cluster and the sandbox host saturated.
-    p.add_argument('--episode-concurrency', type=int, default=48,
+    # of sandboxes booted at startup. Default 96, from two measurements: on 8 vLLM
+    # workers, 96 requests in flight reached 28894 tok/s against a 33108 tok/s
+    # ceiling (87%), where 48 in flight reached only 15599 (47%); and the sandbox
+    # host booted 96 concurrent sandboxes with 0 failures at a p50 reset of 24.5s,
+    # up from 21.9s at 64. Above 96 the KV cache is the next limit -- vLLM reports
+    # room for about 24 sequences per worker, so roughly 192 in total.
+    p.add_argument('--episode-concurrency', type=int, default=96,
                    help='sandboxes to boot, and how many things run at once in both '
                         'stages: proposal episodes in flight, and solver attempts '
                         'per wave in the difficulty filter')
@@ -350,6 +367,15 @@ def parse_args():
     p.add_argument('--combo-arity', default='triple', choices=['triple', 'mix'])
     p.add_argument('--arity-weights', default='',
                    help="'w1,w2,w3' for --combo-arity mix (empty = uniform)")
+    # How many proposals answer each keyword draw. Above 1 they share one prompt
+    # and one group id, which is what the proposing side needs to have a group to
+    # compute an advantage over -- at 1 every group has one member and every
+    # advantage is zero. It does not change the compute at a fixed
+    # --max-proposals-total; it divides the number of distinct keyword draws by
+    # the same factor, so 216 proposals come from 27 draws at 8 instead of 216.
+    p.add_argument('--proposals-per-group', type=int, default=1,
+                   help='proposals sharing one keyword draw and prompt (1 = no groups, '
+                        'so no proposer advantage)')
 
     # Difficulty filter
     # 8 attempts, keeping 2-6: with 4 attempts the band was 1-3 and ex9's
@@ -661,6 +687,12 @@ def main():
         """Run a python check script in sandbox ``slot``; returns (exit_code, output)."""
         return runners[slot](script, 'python')
 
+    # Why the last snapshot for each slot came back empty: the failure text if the
+    # listing could not be read, absent if the workspace really was empty. Read by
+    # snapshot_error_fn below so a paused sandbox is not filed as the model having
+    # built nothing.
+    snapshot_errors: Dict[int, str] = {}
+
     def workspace_snapshot_fn(slot: int = 0):
         """Every file the episode left behind: ``path size`` lines, then contents.
 
@@ -674,21 +706,35 @@ def main():
         the caller -- there is no end state to write checks about -- and neither
         may be dressed up as a plausible one: a snapshot that says "empty"
         when it means "I could not look" produces tasks whose only true
-        assertion is that nothing happened.
+        assertion is that nothing happened. Which of the two it was is recorded
+        in ``snapshot_errors`` instead, for the rejection to be filed under.
         """
-        exit_code, output = runners[slot](
-            WORKSPACE_SNAPSHOT.format(workspace=args.workspace,
-                                      max_files=args.snapshot_max_files,
-                                      per_file=args.snapshot_per_file,
-                                      total_budget=args.snapshot_budget),
-            'python')
+        snapshot_errors.pop(slot, None)
+        script = WORKSPACE_SNAPSHOT.format(workspace=args.workspace,
+                                           max_files=args.snapshot_max_files,
+                                           per_file=args.snapshot_per_file,
+                                           total_budget=args.snapshot_budget)
+        exit_code, output = runners[slot](script, 'python')
         if exit_code != 0:
-            # Not fatal, but not silent either: checks written against a missing
-            # end state are the failure this whole function exists to prevent.
-            logger.warning(f'[challenge] workspace snapshot failed (exit {exit_code}): '
-                           f'{output[-200:]}')
+            # One retry: 62 of run_clean6's 63 snapshot failures were the sandbox
+            # answering 410 "not proxyable", which is the host having paused it and
+            # may be over by the time we ask again. Not fatal either way, but not
+            # silent: checks written against a missing end state are the failure
+            # this whole function exists to prevent.
+            logger.warning(f'[challenge] workspace snapshot failed (exit {exit_code}), '
+                           f'retrying in {SNAPSHOT_RETRY_WAIT}s: {output[-200:]}')
+            time.sleep(SNAPSHOT_RETRY_WAIT)
+            exit_code, output = runners[slot](script, 'python')
+        if exit_code != 0:
+            logger.warning(f'[challenge] workspace snapshot failed again (exit '
+                           f'{exit_code}): {output[-200:]}')
+            snapshot_errors[slot] = f'workspace snapshot failed (exit {exit_code}): {output[-500:]}'
             return ''
         return tool_payload(output).strip()
+
+    def snapshot_error_fn(slot: int = 0) -> str:
+        """Why the last snapshot for ``slot`` was empty; '' if it really was."""
+        return snapshot_errors.get(slot, '')
 
     # Arm B. Read at most this much per call: the executor truncates its output
     # near 8 KB, and base64 grows 3 bytes into 4, so 4 KB of file is about 5.5 KB
@@ -793,6 +839,7 @@ def main():
         reset_fn=reset_fn,
         run_check_fn=run_check_fn,
         workspace_snapshot_fn=workspace_snapshot_fn,
+        snapshot_error_fn=snapshot_error_fn,
         # The executor's own schemas, so the rounds that may call tools advertise
         # exactly what will run -- same source as the training script uses.
         tool_schemas=schemas,
@@ -802,6 +849,7 @@ def main():
         arity_weights=[float(x) for x in args.arity_weights.split(',')] if args.arity_weights
         else None,
         single_kw_prob=args.single_kw_prob,
+        proposals_per_group=max(1, args.proposals_per_group),
         keyword_refill_target=args.keywords_n,
         keyword_gen_calls=args.keyword_gen_calls,
         keyword_refill_concurrency=max(1, args.keyword_refill_concurrency),
@@ -1031,8 +1079,15 @@ class ProposeTrajWriter:
             if labels:
                 arrays[f'r{i}_labels'] = np.asarray(labels, dtype=np.int32)
             if logprobs:
+                # float64, not float32: these are the ``old_logps`` a GRPO step
+                # divides by, and the sampler hands them over as full-precision
+                # python floats (the solver-side json dump keeps all 17 digits,
+                # e.g. -0.4740769863128662). float32 would round them to about 7
+                # digits, so the ratio exp(logp - old_logp) would be off by
+                # roughly 1e-7 for reasons that have nothing to do with the
+                # policy having changed.
                 arrays[f'r{i}_logprobs'] = np.asarray(
-                    [lp[0][1] for lp in logprobs], dtype=np.float32)
+                    [lp[0][1] for lp in logprobs], dtype=np.float64)
             meta.append({
                 'stage': rnd.get('stage'),
                 'messages': rnd.get('messages') or [],

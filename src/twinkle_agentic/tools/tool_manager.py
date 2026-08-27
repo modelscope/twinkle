@@ -5,7 +5,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from twinkle.data_format import ToolCall
 from twinkle.data_format.message import Tool as ToolInfo
+from twinkle.utils import get_logger
 from twinkle_agentic.tools.base import Tool
+
+logger = get_logger()
 
 
 def _extract_name(info: Any) -> Optional[str]:
@@ -156,6 +159,11 @@ class ToolManager:
         back with the same glob listing, so the model was told its python had run
         when it never did. Nothing in that turn needed concurrency -- the reason
         it was used was a tool name the host could have refused on the spot.
+
+        Once the tools share an Env, ``step_batch`` is the only way the batch
+        runs: a raise or a short result list is reported as the result of those
+        calls, not retried down the thread pool. The thread pool is for tools
+        that have no Env in common.
         """
         calls = list(tool_calls)
         if not calls:
@@ -175,12 +183,33 @@ class ToolManager:
                     out[i] = self(calls[i])
             try:
                 results = env.step_batch([(name, args) for _i, name, args in batched])
-            except Exception:
-                results = None
-            if results is not None and len(results) == len(batched):
-                for (i, _name, _args), r in zip(batched, results):
-                    out[i] = r.observation if hasattr(r, 'observation') else str(r)
+            except Exception as e:  # noqa
+                # The exception text is the only account of why the batch did not
+                # run, and the model is what has to react to it, so it goes back
+                # as the result of every call in the batch. Retrying down the
+                # thread pool instead -- which is what this used to do, silently
+                # and without even a log line -- sends the turn along the path the
+                # docstring above exists to keep it off.
+                logger.warning(f'{type(env).__name__}.step_batch raised '
+                               f'{type(e).__name__}: {e}')
+                failure = f'Error: tool batch did not run: {type(e).__name__}: {e}'
+                for i, _name, _args in batched:
+                    out[i] = failure
                 return ['' if x is None else x for x in out]
+            if len(results) != len(batched):
+                # Same reasoning: a short result list means the calls did not all
+                # run, and pairing them up by position would report one call's
+                # result under another's name.
+                logger.warning(f'{type(env).__name__}.step_batch returned '
+                               f'{len(results)} results for {len(batched)} calls')
+                failure = (f'Error: tool batch did not run: the environment returned '
+                           f'{len(results)} results for {len(batched)} calls.')
+                for i, _name, _args in batched:
+                    out[i] = failure
+                return ['' if x is None else x for x in out]
+            for (i, _name, _args), r in zip(batched, results):
+                out[i] = r.observation if hasattr(r, 'observation') else str(r)
+            return ['' if x is None else x for x in out]
 
         workers = max_workers or min(32, len(calls))
         out = [None] * len(calls)

@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .base import ToolCallParser
 
@@ -20,7 +20,15 @@ class HermesQwenParser(ToolCallParser):
         return self.open_marker in text
 
     def parse(self, text: str) -> List[Dict[str, Any]]:
+        return self._scan(text)[0]
+
+    def parse_errors(self, text: str) -> List[str]:
+        return self._scan(text)[1]
+
+    def _scan(self, text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Calls and failures from one pass, so the two cannot disagree."""
         calls: List[Dict[str, Any]] = []
+        errors: List[str] = []
         for block_m in self._BLOCK_RE.finditer(text or ''):
             block = block_m.group(1)
             func_m = self._FUNCTION_RE.search(block)
@@ -43,10 +51,12 @@ class HermesQwenParser(ToolCallParser):
                 continue
             try:
                 data = json.loads(block)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                errors.append(str(e))
                 continue
             name = data.get('name') or data.get('tool_name', '')
             if not name:
+                errors.append('the call object has no "name" field')
                 continue
             args = data.get('arguments', {})
             if isinstance(args, str):
@@ -61,7 +71,7 @@ class HermesQwenParser(ToolCallParser):
                     'arguments': args if isinstance(args, dict) else {},
                 },
             })
-        return calls
+        return calls, errors
 
     def clean(self, text: str) -> str:
         return self._STRIP_RE.sub('', text or '').rstrip()

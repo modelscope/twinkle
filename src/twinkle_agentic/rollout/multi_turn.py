@@ -91,6 +91,24 @@ def _default_tool_messages(
     return msgs
 
 
+def _malformed_tool_message(errors: List[str]) -> Dict[str, Any]:
+    """What goes back to the model when its tool-call markup did not parse.
+
+    ``role='tool'`` because it is the outcome of the call the model just tried to
+    make. There is no ``tool_call_id`` to pair it with -- the call never became a
+    call -- which ``_default_tool_messages`` above already treats as optional.
+    """
+    reason = '; '.join(e for e in errors if e) or 'the markup could not be parsed'
+    return {
+        'role':
+        'tool',
+        'content':
+        ('Your tool call was not run: ' + reason + '. Send the call again. Inside '
+         'a JSON string a backslash has to be written as \\\\ and a line break as '
+         '\\n; a single quote needs no backslash at all.'),
+    }
+
+
 @remote_class()
 class MultiTurnRollout(Rollout):
     """Agentic multi-turn rollout with tool use (batched).
@@ -133,6 +151,7 @@ class MultiTurnRollout(Rollout):
         harness: Optional[AgentHarness] = None,
         adapter_path: Optional[str] = None,
         stop_after_stuck_turns: int = 0,
+        max_malformed_retries: int = 2,
         followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
     ):
         super().__init__()
@@ -177,6 +196,20 @@ class MultiTurnRollout(Rollout):
             raise ValueError(f'stop_after_stuck_turns must be >= 0, got '
                              f'{stop_after_stuck_turns}')
         self.stop_after_stuck_turns = stop_after_stuck_turns
+        # How many replies in a row may carry tool-call markup that does not
+        # parse before the episode ends anyway. Such a reply is not the model
+        # declining to call a tool -- it asked for one and the markup was
+        # rejected -- so it gets the parser's reason back as a tool message and
+        # another turn. Measured on one challenger run: 6 of 59 episodes ended
+        # here, each having written a whole ``<tool_call>`` block whose JSON held
+        # a Python-style ``\'`` escape or a raw newline, and each was told
+        # nothing. The cap exists because a model that cannot produce valid JSON
+        # would otherwise spend all of ``max_turns`` failing to; 0 restores the
+        # old behaviour of ending the episode on the first one.
+        if max_malformed_retries < 0:
+            raise ValueError(f'max_malformed_retries must be >= 0, got '
+                             f'{max_malformed_retries}')
+        self.max_malformed_retries = max_malformed_retries
         # Called with (trajectory, how many follow-ups it has had already) at the
         # moment an episode would end: because the model stopped calling tools,
         # because it used up ``max_turns``, or because it was stopped for being
@@ -266,6 +299,10 @@ class MultiTurnRollout(Rollout):
         stuck_turns: List[int] = [0] * n
         seen_calls: List[set] = [set() for _ in range(n)]
         stuck_stop: List[bool] = [False] * n
+        # Replies in a row whose tool-call markup did not parse. Reset by any
+        # reply that produced a call, so one bad escape in the middle of a
+        # working episode does not count against a later one.
+        malformed_turns: List[int] = [0] * n
         # Follow-up bookkeeping (all no-ops when ``followup_fn`` is None):
         # how many follow-ups each trajectory has had, and the params its next
         # turn should use. A trajectory that has had one stops dispatching tools.
@@ -356,6 +393,14 @@ class MultiTurnRollout(Rollout):
             resps_by_idx: Dict[int, Any] = {}
             device_mesh = getattr(self.sampler, 'device_mesh', None)
             min_batch_size = (device_mesh.data_world_size if device_mesh is not None else 1)
+            # A sampler that routes each request on its own accepts a batch smaller
+            # than its worker count, so the padding below is not needed. It was only
+            # ever there because slicing a batch over all workers raises when some
+            # rank gets nothing, and the duplicates it added were generated and then
+            # dropped -- with one prompt and 8 workers that is 8 generations for 1
+            # kept result.
+            if getattr(type(self.sampler).sample, '_enable_continous_work', False):
+                min_batch_size = 1
             for slot, group in enumerate(groups):
                 batch_pifs = [pifs[i] for i in group]
                 actual = len(batch_pifs)
@@ -450,6 +495,27 @@ class MultiTurnRollout(Rollout):
                     continue
 
                 if not tool_calls:
+                    # Markup that did not parse is the model asking for a tool,
+                    # not declining one -- ending here tells it nothing and throws
+                    # the turn away. Hand back the parser's own reason and let it
+                    # write the call again. Not after a follow-up: tools are
+                    # withdrawn there on purpose (see ``followup_fn``), so a reply
+                    # that looks like a call is meant to be read as text.
+                    parse_errors = ([] if followups[global_idx] else
+                                    self.template.tool_call_errors(seq.decoded or ''))
+                    if (parse_errors and malformed_turns[global_idx] < self.max_malformed_retries):
+                        malformed_turns[global_idx] += 1
+                        extended = extend_with_bridge(pifs[global_idx],
+                                                      [_malformed_tool_message(parse_errors)],
+                                                      self.template)
+                        if extended is None:
+                            truncated[global_idx] = True
+                            done[global_idx] = True
+                            continue
+                        pifs[global_idx] = extended
+                        if lives[global_idx] is not None:
+                            lives[global_idx]['messages'] = list(extended.get('messages') or [])
+                        continue
                     # The episode is over as far as the model is concerned. Give
                     # the caller one chance to say otherwise -- see
                     # ``followup_fn`` for why this is not a second rollout.
@@ -468,6 +534,7 @@ class MultiTurnRollout(Rollout):
                     done[global_idx] = True
                     continue
 
+                malformed_turns[global_idx] = 0
                 pending_tools.append((global_idx, list(tool_calls)))
 
             # 4. Parallel tool dispatch across the live batch, then harness

@@ -247,6 +247,14 @@ def main():
                            f'(need >= {MODEL_GPUS}); skipping batch')
             continue
 
+        # One optimizer step per batch, not per mini-batch. ``forward_backward``
+        # neither steps nor zeroes, so the mini-batches below simply add their
+        # gradients together; ``clip_grad_and_step`` afterwards divides by the
+        # token count accumulated across all of them, so every trajectory in the
+        # batch carries the same weight regardless of how the mini-batches split.
+        # Stepping inside the loop instead -- which is what this used to do --
+        # made each step see only MINI_BATCH_SIZE trajectories, so a group of
+        # NUM_GENERATIONS could be torn across two updates.
         for mb_start in range(0, len(inputs), MINI_BATCH_SIZE):
             mb_end = min(mb_start + MINI_BATCH_SIZE, len(inputs))
             model.forward_backward(
@@ -255,12 +263,10 @@ def main():
                 advantages=kept_adv[mb_start:mb_end],
                 micro_batch_size=MICRO_BATCH_SIZE,
             )
-            model.clip_grad_and_step()
-            optim_step += 1
-            if optim_step >= MAX_STEPS:
-                break
-            if optim_step % SAVE_STEPS == 0:
-                model.save(f'rsi-agentic-checkpoint-{optim_step}')
+        model.clip_grad_and_step()
+        optim_step += 1
+        if optim_step % SAVE_STEPS == 0:
+            model.save(f'rsi-agentic-checkpoint-{optim_step}')
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))

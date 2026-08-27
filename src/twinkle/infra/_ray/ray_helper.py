@@ -268,6 +268,7 @@ class RayHelper:
                        instance_id,
                        seed=42,
                        full_determinism=False,
+                       max_concurrency: Optional[int] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -340,6 +341,11 @@ class RayHelper:
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
                 env_vars.update(ResourceManager.noset_env())
 
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
@@ -356,6 +362,9 @@ class RayHelper:
                 else:
                     # Use custom resource key for non-GPU accelerators (e.g., NPU).
                     worker_options['resources'] = {device_type: 0.01}
+
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)
@@ -380,6 +389,11 @@ class RayHelper:
                     'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
                     **_visible_device_env
                 })
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
@@ -390,6 +404,9 @@ class RayHelper:
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
+
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)

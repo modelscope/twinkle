@@ -210,7 +210,15 @@ class BracketDslParser(ToolCallParser):
         return args
 
     def parse(self, text: str) -> List[Dict[str, Any]]:
+        return self._scan(text)[0]
+
+    def parse_errors(self, text: str) -> List[str]:
+        return self._scan(text)[1]
+
+    def _scan(self, text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Calls and failures from one pass, so the two cannot disagree."""
         calls: List[Dict[str, Any]] = []
+        errors: List[str] = []
         text = text or ''
         for start, end in self._find_blocks(text):
             block = text[start:end]
@@ -221,6 +229,8 @@ class BracketDslParser(ToolCallParser):
                     break
                 close = self._match_paren(block, m.end() - 1)
                 if close is None:
+                    errors.append(f'{m.group(1).strip()}( is never closed by a '
+                                  f'matching )')
                     break
                 name = m.group(1).strip()
                 if name:
@@ -231,8 +241,10 @@ class BracketDslParser(ToolCallParser):
                             'arguments': self._parse_args(block[m.end():close]),
                         },
                     })
+                else:
+                    errors.append('a call in the list has an empty function name')
                 pos = close + 1
-        return calls
+        return calls, errors
 
     def clean(self, text: str) -> str:
         text = text or ''
