@@ -273,7 +273,7 @@ class MultiLoraMegatronModel(MegatronModel):
             if optimizer_config.optimizer is not None and 'optimizer' in state_dict:
                 optimizer_config.optimizer.load_state_dict(state_dict['optimizer'])
                 device = Platform.get_local_device()
-                for group_state in optimizer_config.optimizer.state.values():
+                for _, group_state in optimizer_config.optimizer.state.items():
                     if not isinstance(group_state, dict):
                         continue
                     for k, v in group_state.items():
