@@ -232,6 +232,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             deepspeed_config: Dict[str, Any] = None,
+            model_loader: Optional[Any] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -251,18 +252,35 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-        if config is None:
+        if config is not None:
+            self.hf_config = config
+        elif model_loader is not None and model_id is not None:
+            # A caller-supplied loader (duck-typed: build_config/build_processor/build_model +
+            # process_* hooks -- dev's ModelLoader) owns construction. It reads the config off the
+            # downloaded dir and may rewrite it (process_config), e.g. to flip remote-code flags.
+            self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
+        else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        else:
-            self.hf_config = config
         if model_cls is None and hasattr(self.hf_config, 'architectures'):
             model_cls = self.hf_config.architectures[0]
         if model_cls is None:
             model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        if model_id is None:
+        if model_loader is not None and model_id is not None:
+            # Full takeover: the loader builds the processor, then the pretrained model (its own
+            # model_cls, trust_remote_code and dynamic-module handling), then post-processes it
+            # (process_model, e.g. submodel delegation). This bypasses the rank0-broadcast empty-init
+            # optimisation, so it is only taken for a real pretrained load (model_id set); the
+            # blank-model (model_id is None) path below is unchanged.
+            processor = model_loader.process_tokenizer(model_loader.build_processor(model_id, self.hf_config))
+            self._default_tokenizer = processor
+            load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
+            with self.strategy.pretrained_load_context():
+                model = model_loader.build_model(model_id, config=self.hf_config, processor=processor, **load_kwargs)
+            self.model = model_loader.process_model(model)
+        elif model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
         elif self._should_init_empty_pretrained_model_on_this_rank():
             self.model = self._init_empty_model_from_config(model_cls, **kwargs)
