@@ -234,7 +234,7 @@ def test_an_idle_rank_opens_no_channel_and_still_drains_its_weights():
 def test_the_manager_picks_this_engine_only_when_colocating():
     from twinkle.checkpoint_engine import CheckpointEngineManager, IPCCheckpointEngine, NCCLCheckpointEngine
 
-    assert CheckpointEngineManager.decide_backend_engine('GPU', colocate=True) is IPCCheckpointEngine
+    assert CheckpointEngineManager.decide_backend_engine('GPU', mode='colocate') is IPCCheckpointEngine
     assert CheckpointEngineManager.decide_backend_engine('GPU') is NCCLCheckpointEngine
 
 

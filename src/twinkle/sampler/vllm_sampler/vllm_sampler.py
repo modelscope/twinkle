@@ -467,19 +467,17 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self,
         base_sync_done: bool = False,
         peft_config: dict = None,
+        weights=None,
     ):
         """Receive weights from the trainer and stream them into vLLM.
-
-        Which transport delivers them is the checkpoint engine's business, not this method's: NCCL
-        broadcast when the trainer is on other GPUs, CUDA IPC when it shares this one, where NCCL
-        cannot be used at all. Either way what arrives here is the same async generator.
 
         Uses a **streaming pipeline** to avoid accumulating a
         full model-weight copy on GPU:
 
-        1. ``CheckpointEngine.receive_weights()`` yields tensors from
-           the engine's buckets (async generator, GPU tensors).
-        2. The async generator is passed **directly** to
+        1. With no ``weights`` argument, ``CheckpointEngine.receive_weights()``
+           yields tensors from NCCL/HCCL/CUDA IPC buckets. A local naive
+           caller can instead provide the model's synchronous generator.
+        2. The weight iterator is passed **directly** to
            ``VLLMEngine.update_weights()`` which consumes it one tensor at
            a time, copying each into a GPU IPC bucket and flushing to the
            vLLM worker subprocess when the bucket is full.
@@ -490,18 +488,22 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         Args:
             base_sync_done: If True, this is a LoRA-only sync.
             peft_config: PEFT config dict for LoRA adapter loading.
+            weights: Optional synchronous/asynchronous weight iterator. If
+                omitted, weights are received from the checkpoint engine.
 
         Returns:
             Number of weights loaded (approximate, from engine log).
         """
-        engine = self._get_or_create_checkpoint_engine()
+        if weights is None:
+            engine = self._get_or_create_checkpoint_engine()
+            weights = engine.receive_weights()
 
         async def _receive_and_load():
-            # Stream the received tensors directly into vLLM via IPC.
+            # Stream model/checkpoint-engine tensors directly into vLLM via IPC.
             # VLLMEngine.update_weights accepts an async generator and
             # handles bucket packing + ZMQ transfer internally.
             await self.engine.update_weights(
-                engine.receive_weights(),  # async generator — not materialised
+                weights,  # async/sync generator — not materialised
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
             )

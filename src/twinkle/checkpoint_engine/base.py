@@ -16,10 +16,12 @@ class TensorMeta(TypedDict):
 
 
 class CheckpointEngine(ABC):
-    """Abstract base class for checkpoint engines.
+    """Abstract base class for cross-process checkpoint engines.
 
     A checkpoint engine handles weight synchronization between trainer and rollout
-    processes. The typical workflow is:
+    processes. Local ``naive`` synchronization bypasses this interface and streams
+    the model's weight generator directly into the sampler. The typical cross-process
+    workflow is:
 
     In trainer process (rank 0):
     >>> engine = CheckpointEngineRegistry.new('nccl', bucket_size=512<<20)
