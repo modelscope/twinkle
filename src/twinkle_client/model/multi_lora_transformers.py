@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 import time
 from twinkle_client.http import http_get, http_post
+from twinkle_client.common.json_utils import json_safe
+from twinkle_client.types.component import DataRef
 from twinkle_client.types.model import (
     CalculateLossResponse,
     CalculateMetricResponse,
@@ -15,6 +17,16 @@ from twinkle_client.types.model import (
 )
 
 
+def _data_ref_payload(inputs: DataRef | list[DataRef]) -> dict[str, Any]:
+    """Encode one or more opaque references for a DataPlane model endpoint."""
+    refs = [inputs] if isinstance(inputs, DataRef) else list(inputs)
+    if not refs:
+        raise ValueError('at least one DataRef is required')
+    if not all(isinstance(item, DataRef) for item in refs):
+        raise TypeError('data-plane model inputs must contain only DataRef values')
+    return {'input_refs': [item.model_dump() for item in refs]}
+
+
 class MultiLoraTransformersModel:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
 
@@ -26,6 +38,7 @@ class MultiLoraTransformersModel:
         """Initialize model client."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
+        kwargs.pop('data_plane_url', None)
 
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -54,23 +67,86 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         self.adapter_name = adapter_name
 
+    def remove_adapter(self, adapter_name: str | None = None) -> None:
+        """Release one client-owned adapter from the training component."""
+        name = adapter_name or self.adapter_name
+        response = http_post(
+            url=f'{self.server_url}/remove_adapter',
+            json_data={'adapter_name': name},
+        )
+        response.raise_for_status()
+        if name == self.adapter_name:
+            self.adapter_name = None
+
     def forward(self, inputs: Any, **kwargs) -> ForwardResponse:
-        """Execute forward pass on the model."""
+        """Execute forward pass on inline model inputs."""
         response = http_post(
             url=f'{self.server_url}/forward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
         )
         response.raise_for_status()
         return ForwardResponse(**response.json())
 
     def forward_only(self, inputs: Any, **kwargs) -> ForwardResponse:
-        """Execute forward pass without gradient computation."""
+        """Execute forward pass without gradient computation on inline inputs."""
         response = http_post(
             url=f'{self.server_url}/forward_only',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
         )
         response.raise_for_status()
         return ForwardResponse(**response.json())
+
+    def forward_from_data_plane(
+        self,
+        inputs: DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardResponse:
+        """Execute forward using rows referenced from the server DataPlane."""
+        response = http_post(
+            url=f'{self.server_url}/forward_from_data_plane',
+            json_data={
+                **_data_ref_payload(inputs),
+                'adapter_name': self.adapter_name,
+                'input_field': input_field,
+                'kwarg_fields': kwarg_fields or {},
+                **json_safe(kwargs),
+            },
+        )
+        response.raise_for_status()
+        return ForwardResponse(**response.json())
+
+    def forward_only_from_data_plane(
+        self,
+        inputs: DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        output_ref: DataRef | None = None,
+        output_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardResponse | DataRef:
+        """Execute forward-only using DataPlane rows and optionally append outputs."""
+        body = {
+            **_data_ref_payload(inputs),
+            'adapter_name': self.adapter_name,
+            'input_field': input_field,
+            'kwarg_fields': kwarg_fields or {},
+            'output_ref': output_ref.model_dump() if output_ref is not None else None,
+            'output_fields': output_fields or {},
+            **json_safe(kwargs),
+        }
+        response = http_post(
+            url=f'{self.server_url}/forward_only_from_data_plane',
+            json_data=body,
+        )
+        response.raise_for_status()
+        result = ForwardResponse(**response.json())
+        if output_ref is not None:
+            return DataRef(**result.result)
+        return result
 
     def calculate_loss(self, **kwargs) -> CalculateLossResponse:
         """Calculate loss from model outputs."""
@@ -99,10 +175,32 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
 
     def forward_backward(self, inputs: Any, **kwargs) -> ForwardBackwardResponse:
-        """Execute combined forward and backward pass."""
+        """Execute combined forward and backward pass on inline inputs."""
         response = http_post(
             url=f'{self.server_url}/forward_backward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
+        )
+        response.raise_for_status()
+        return ForwardBackwardResponse(**response.json())
+
+    def forward_backward_from_data_plane(
+        self,
+        inputs: DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardBackwardResponse:
+        """Execute forward/backward using rows referenced from the server DataPlane."""
+        response = http_post(
+            url=f'{self.server_url}/forward_backward_from_data_plane',
+            json_data={
+                **_data_ref_payload(inputs),
+                'adapter_name': self.adapter_name,
+                'input_field': input_field,
+                'kwarg_fields': kwarg_fields or {},
+                **json_safe(kwargs),
+            },
         )
         response.raise_for_status()
         return ForwardBackwardResponse(**response.json())

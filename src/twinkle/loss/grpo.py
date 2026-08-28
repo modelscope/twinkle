@@ -48,6 +48,9 @@ class GRPOLoss(Loss):
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def _compute_log_importance_weights(
         self,
         per_token_logps: 'torch.Tensor',
@@ -411,6 +414,19 @@ class CISPOLoss(GRPOLoss):
     Clamps the IS weight and uses policy gradient.
     """
 
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
+
     def _compute_per_token_loss(
         self,
         ratio: 'torch.Tensor',
@@ -441,6 +457,19 @@ class BNPOLoss(GRPOLoss):
 
     Normalizes by total completion tokens across batch.
     """
+
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
 
     def _aggregate_loss(
         self,

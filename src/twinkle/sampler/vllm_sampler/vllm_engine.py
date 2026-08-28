@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import contextlib
 import inspect
 import os
@@ -253,6 +254,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
+        self._lora_load_tasks: Dict[str, asyncio.Task] = {}
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -631,12 +633,25 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             ``LoRARequest`` or ``None`` if loading fails.
         """
-        from vllm.lora.request import LoRARequest
-
-        # Fast path: return cached request for this path.
         if lora_path in self._lora_request_cache:
-            logger.info(f'Using cached LoRA request for {lora_path}')
+            logger.debug(f'Using cached LoRA request for {lora_path}')
             return self._lora_request_cache[lora_path]
+
+        load_task = self._lora_load_tasks.get(lora_path)
+        if load_task is None:
+            load_task = asyncio.create_task(self._load_lora(lora_path))
+            self._lora_load_tasks[lora_path] = load_task
+        try:
+            lora_request = await load_task
+        finally:
+            if self._lora_load_tasks.get(lora_path) is load_task:
+                self._lora_load_tasks.pop(lora_path)
+        if lora_request is not None:
+            self._lora_request_cache[lora_path] = lora_request
+        return lora_request
+
+    async def _load_lora(self, lora_path: str):
+        from vllm.lora.request import LoRARequest
 
         if not os.path.exists(lora_path):
             logger.error(f'LoRA path does not exist: {lora_path}')
@@ -656,13 +671,40 @@ class VLLMEngine(BaseSamplerEngine):
             lora_path=lora_path,
         )
 
+        logger.info(f'Loading LoRA from {lora_path}')
         try:
             await self.engine.add_lora(lora_request)
-            self._lora_request_cache[lora_path] = lora_request
             return lora_request
         except Exception as e:
             logger.error(f'Failed to load LoRA from {lora_path}: {e}')
             return None
+
+    async def unload_lora_paths(self, adapter_paths: list[str]) -> None:
+        """Evict selected LoRA requests without requiring their files to exist."""
+        for adapter_path in adapter_paths:
+            normalized = os.path.abspath(os.path.expanduser(adapter_path))
+            request = self._lora_request_cache.pop(normalized, None)
+            if request is None:
+                request = self._lora_request_cache.pop(adapter_path, None)
+            load_task = self._lora_load_tasks.pop(normalized, None)
+            if load_task is None:
+                load_task = self._lora_load_tasks.pop(adapter_path, None)
+            if load_task is not None and not load_task.done():
+                load_task.cancel()
+                await asyncio.gather(load_task, return_exceptions=True)
+            elif request is None and load_task is not None:
+                try:
+                    request = load_task.result()
+                except (asyncio.CancelledError, Exception):
+                    request = None
+            if request is None:
+                continue
+            try:
+                result = self.engine.remove_lora(request.lora_int_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
 
     async def sleep(self, level: int = 2) -> None:
         """

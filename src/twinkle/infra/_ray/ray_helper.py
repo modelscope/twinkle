@@ -351,10 +351,20 @@ class RayHelper:
                     'num_cpus': 0.01,
                 }
 
-                if device_type == 'GPU':
-                    worker_options['num_gpus'] = 0.01
-                else:
-                    # Use custom resource key for non-GPU accelerators (e.g., NPU).
+                # The placement group already reserves a GPU worker's full
+                # allocation and ``CUDA_VISIBLE_DEVICES`` above pins that actor
+                # to the ranks selected by DeviceGroup.  Do not additionally
+                # request a fractional Ray GPU resource for CUDA workers.
+                #
+                # With a fractional request, Ray translates the placement-group
+                # GPU id through the already narrowed visible-device list.  For
+                # the second GPU that becomes index 1 into ``['1']``, killing
+                # the worker in ``set_visible_accelerator_ids`` before its
+                # constructor runs.  The CPU claim and placement-group strategy
+                # are sufficient to place the actor in the GPU-owning bundle.
+                if device_type != 'GPU':
+                    # Use a custom resource key for non-GPU accelerators
+                    # (for example, NPU).
                     worker_options['resources'] = {device_type: 0.01}
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)

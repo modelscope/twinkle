@@ -95,6 +95,10 @@ class SafeLossWrapper(Loss):
                            type(e).__name__, e, traceback.format_exc())
             return _zero_loss(outputs)
 
+    def micro_batch_scale(self, inputs, indices):
+        """Preserve the wrapped loss's micro-batch reduction semantics."""
+        return self._loss_instance.micro_batch_scale(inputs, indices)
+
 
 def _zero_loss(outputs) -> 'LossOutput':
     """Create a graph-connected zero loss for FSDP compatibility.

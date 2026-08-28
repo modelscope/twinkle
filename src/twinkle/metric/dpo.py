@@ -4,6 +4,7 @@ from typing import List, Union
 
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.utils import pad_and_stack_tensors
+from twinkle.utils.rl_tensor_utils import align_per_token_values
 from .base import Metric
 
 
@@ -33,37 +34,8 @@ class DPOMetric(Metric):
 
     def _compute_sequence_logps(self, per_token_logps, labels):
         """Compute sequence-level log probs by summing valid token logps."""
-        import torch
         loss_mask = (labels != self.ignore_index).float()
         return (per_token_logps * loss_mask).sum(dim=-1)
-
-    def _align_logps(self, logps, target_shape, device, dtype):
-        """Align per-token logps to target shape by padding or truncating.
-
-        Args:
-            logps: [batch, seq_len] tensor to align
-            target_shape: Target shape (batch, target_seq_len)
-            device: Target device
-            dtype: Target dtype
-
-        Returns:
-            Aligned tensor with shape matching target_shape
-        """
-        import torch
-
-        if not torch.is_tensor(logps):
-            logps = torch.as_tensor(logps)
-        logps = logps.to(device=device, dtype=dtype)
-        batch_size, src_len = logps.shape
-        _, target_len = target_shape
-
-        if src_len == target_len:
-            return logps
-        elif src_len < target_len:
-            raise ValueError(f'ref_logps seq_len ({src_len}) < target seq_len ({target_len}). '
-                             f'This should not happen when both models process the same batch.')
-        else:
-            return logps[:, :target_len]
 
     def _split_chosen_rejected(self, tensor):
         """Split interleaved tensor into chosen and rejected.
@@ -121,7 +93,6 @@ class DPOMetric(Metric):
 
         # Split into chosen and rejected (interleaved format)
         chosen_logps, rejected_logps = self._split_chosen_rejected(seq_logps)
-        chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
 
         # Accumulate policy logps
         self.total_chosen_logps += chosen_logps.sum().item()
@@ -131,15 +102,18 @@ class DPOMetric(Metric):
         ref_outputs = kwargs.get('ref_outputs')
         if ref_outputs is not None:
             ref_logps = ref_outputs.get('logps')
-            if ref_logps is not None:
-                if isinstance(ref_logps, list):
-                    if len(ref_logps) == 0:
-                        ref_logps = None
-                    else:
-                        ref_logps = pad_and_stack_tensors(ref_logps)
+            if isinstance(ref_logps, (list, tuple)) and not ref_logps:
+                ref_logps = None
             if ref_logps is not None:
                 # Align ref_logps to match labels shape (handles different seq lengths)
-                ref_logps = self._align_logps(ref_logps, labels.shape, labels.device, logps.dtype)
+                ref_logps = align_per_token_values(
+                    ref_logps,
+                    tuple(labels.shape),
+                    device=labels.device,
+                    dtype=logps.dtype,
+                    name='ref_logps',
+                    valid_mask=labels != self.ignore_index,
+                )
 
                 ref_seq_logps = self._compute_sequence_logps(ref_logps, labels)
                 ref_chosen_logps, ref_rejected_logps = self._split_chosen_rejected(ref_seq_logps)

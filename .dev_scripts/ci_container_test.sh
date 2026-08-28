@@ -1,5 +1,5 @@
 install_twinkle_with_kernels() {
-    pip install ".[test,client,server]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[test,client,server]"
+    pip install ".[test,client,server,async-rl]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[test,client,server,async-rl]"
 }
 
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then

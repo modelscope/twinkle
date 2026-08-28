@@ -97,6 +97,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
                  backend: str,
                  adapter_config: dict[str, Any] | None = None,
                  queue_config: TaskQueueConfig | None = None,
+                 data_plane_url: str | None = None,
                  **kwargs):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
@@ -127,6 +128,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
 
         self.state: ServerState = get_server_state()
+        from twinkle.server.data_plane import DataPlaneProxy
+        self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
 
         # Initialize mixins
@@ -173,6 +176,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             await self.state.unregister_replica(self.replica_id)
         except Exception:
             pass
+        await self.data_plane.close()
 
     def check_model_health(self) -> dict:
         """Probe model actors liveness via a lightweight ping.
@@ -245,6 +249,7 @@ def build_model_app(model_id: str,
                     backend: str,
                     adapter_config: dict[str, Any] | None = None,
                     queue_config: TaskQueueConfig | None = None,
+                    data_plane_url: str | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -289,7 +294,8 @@ def build_model_app(model_id: str,
         deploy_options,
         deployment_name='ModelManagement',
         request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config),
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config,
+                   data_plane_url),
         bind_kwargs=kwargs,
     )
 

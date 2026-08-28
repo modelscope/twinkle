@@ -25,6 +25,8 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
                                        validate_user_path)
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_kwargs, resolve_data_plane_model_inputs,
+                                        select_output_rows)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object
@@ -124,6 +126,60 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 task_type='forward',
             ))
 
+    @app.post('/twinkle/forward_from_data_plane', response_model=types.ForwardResponse)
+    async def forward_from_data_plane(
+            request: Request,
+            body: types.DataPlaneForwardRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.ForwardResponse:
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            ret = self.model.forward(
+                inputs=_parse_inputs(raw_inputs),
+                adapter_name=adapter_name,
+                **kwargs,
+            )
+            return {'result': ret}
+
+        input_tokens, batch_size = data_plane_request_shape(body)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.data_world_size,
+                task_type='forward_from_data_plane',
+            ))
+
+    @app.post('/twinkle/remove_adapter')
+    async def remove_adapter(
+            request: Request,
+            body: types.AdapterRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, str]:
+        """Release a drained tenant's in-memory training adapter."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            await self._cleanup_adapter(adapter_name)
+            return {'status': 'ok'}
+
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                task_type='remove_adapter',
+            ))
+
     @app.post('/twinkle/forward_only', response_model=types.ForwardResponse)
     async def forward_only(
             request: Request,
@@ -150,6 +206,43 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 task_type='forward_only',
+            ))
+
+    @app.post('/twinkle/forward_only_from_data_plane', response_model=types.ForwardResponse)
+    async def forward_only_from_data_plane(
+            request: Request,
+            body: types.DataPlaneForwardOnlyRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.ForwardResponse:
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
+            inputs = _parse_inputs(raw_inputs)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **kwargs)
+            if body.output_ref is not None:
+                rows = select_output_rows(
+                    ret,
+                    batch_size=len(inputs),
+                    output_fields=body.output_fields,
+                )
+                output_ref = await self.data_plane.append(body.output_ref, rows)
+                return {'result': output_ref.model_dump()}
+            return {'result': ret}
+
+        input_tokens, batch_size = data_plane_request_shape(body)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.data_world_size,
+                task_type='forward_only_from_data_plane',
             ))
 
     @app.post('/twinkle/calculate_loss', response_model=types.CalculateLossResponse)
@@ -222,6 +315,38 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 batch_size=batch_size,
                 data_world_size=self.data_world_size,
                 task_type='forward_backward',
+            ))
+
+    @app.post('/twinkle/forward_backward_from_data_plane', response_model=types.ForwardBackwardResponse)
+    async def forward_backward_from_data_plane(
+            request: Request,
+            body: types.DataPlaneForwardRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.ForwardBackwardResponse:
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            ret = self.model.forward_backward(
+                inputs=_parse_inputs(raw_inputs),
+                adapter_name=adapter_name,
+                **kwargs,
+            )
+            return {'result': ret}
+
+        input_tokens, batch_size = data_plane_request_shape(body)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.data_world_size,
+                task_type='forward_backward_from_data_plane',
             ))
 
     @app.post('/twinkle/clip_grad_norm', response_model=types.ClipGradNormResponse)
