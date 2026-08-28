@@ -2,6 +2,15 @@
 
 CheckpointEngine (检查点引擎) 是用于在训练器和推理进程之间同步模型权重的组件,主要用于 RLHF 训练中 Actor 模型和 Rollout 采样器之间的权重同步。
 
+`CheckpointEngineManager` 提供四种模式：
+
+- `auto`：本地对象使用 `naive`；Ray actor handler 使用 `standalone`。
+- `naive`：模型的权重生成器直接流式传入本地 sampler，不创建 CheckpointEngine。
+- `colocate`：共享 GPU 的 Ray actors 通过 CUDA IPC 同步。
+- `standalone`：分离部署的 Ray actors 在 GPU 上使用 NCCL，在 NPU 上使用 HCCL。
+
+`auto` 不会推断 `colocate`，因为 driver 无法可靠判断 actor 的实际设备放置。
+
 ## 基本接口
 
 ```python
@@ -39,7 +48,7 @@ class CheckpointEngine(ABC):
 
 ## 可用的检查点引擎
 
-Twinkle 提供了两种检查点引擎实现:
+Twinkle 提供三种跨进程检查点引擎实现；`naive` 模式会绕过这些引擎。
 
 ### NCCLCheckpointEngine
 
@@ -61,10 +70,17 @@ Twinkle 提供了两种检查点引擎实现:
 
 详见: [HCCLCheckpointEngine](HCCLCheckpointEngine.md)
 
+### IPCCheckpointEngine
+
+适用于模型和 sampler Ray actors 被放置在同一组物理 GPU 上的 CUDA IPC 引擎。NCCL 会拒绝多个
+rank 绑定同一张 GPU，因此该拓扑必须通过 CUDA IPC 在进程间映射权重 bucket，而不是跨设备广播。
+
 ## 如何选择
 
 - **NCCLCheckpointEngine**: 适用于 GPU 环境,提供最高的传输性能
 - **HCCLCheckpointEngine**: 适用于昇腾 NPU 环境
+- **IPCCheckpointEngine**: 适用于共享物理 GPU 的 colocated Ray actors
+- **不创建引擎 (`naive`)**: 适用于同一进程内的本地 model 和 sampler
 
 > 检查点引擎是 RLHF 训练基础设施的关键组件,确保训练器和采样器使用一致的模型权重。
 > 目前的同步分为merge_and_sync=True/False两种情况，为True时将lora合并仅基模并同步，为False时仅同步lora权重。另外，多租户直接附加lora文件到vLLM上，在merge_and_sync=False，或使用多租户时，
