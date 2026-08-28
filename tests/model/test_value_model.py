@@ -74,3 +74,51 @@ def test_value_model_forward_only_returns_values():
     assert outputs['values'].shape == (1, 3)
     assert outputs.get('logps') is None
     assert not outputs['values'].requires_grad
+
+
+def test_freeze_attention_keeps_mlp_and_value_head_trainable():
+    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+    summary = model.freeze_attention_for_value_training()
+    assert summary['attention_modules'] == 1
+    backbone = model.model.transformer.h[0]
+    assert all(not parameter.requires_grad for parameter in backbone.attn.parameters())
+    assert any(parameter.requires_grad for parameter in backbone.mlp.parameters())
+    assert all(parameter.requires_grad for parameter in model.model.get_output_embeddings().parameters())
+    counts = model.trainable_parameter_summary()
+    assert counts['frozen_parameters'] == summary['frozen_parameters']
+
+
+def test_freeze_attention_supports_qwen35_hybrid_token_mixers():
+    """Qwen3.5 exposes full and linear attention under different names."""
+
+    class FullAttentionLayer(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.self_attn = torch.nn.Linear(8, 8)
+            self.mlp = torch.nn.Linear(8, 8)
+
+    class LinearAttentionLayer(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.linear_attn = torch.nn.Linear(8, 8)
+            self.mlp = torch.nn.Linear(8, 8)
+
+    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+    full_attention_layer = FullAttentionLayer()
+    linear_attention_layer = LinearAttentionLayer()
+    model.model.qwen35_hybrid_layers = torch.nn.ModuleList([
+        full_attention_layer,
+        linear_attention_layer,
+    ])
+
+    summary = model.freeze_attention_for_value_training()
+
+    # One GPT-2 ``attn`` module plus the two Qwen3.5-style token mixers.
+    assert summary['attention_modules'] == 3
+    assert all(not parameter.requires_grad for parameter in full_attention_layer.self_attn.parameters())
+    assert all(not parameter.requires_grad for parameter in linear_attention_layer.linear_attn.parameters())
+    assert all(parameter.requires_grad for parameter in full_attention_layer.mlp.parameters())
+    assert all(parameter.requires_grad for parameter in linear_attention_layer.mlp.parameters())
+    assert all(parameter.requires_grad for parameter in model.model.get_output_embeddings().parameters())

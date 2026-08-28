@@ -88,6 +88,7 @@ sh INSTALL_MEGATRON.sh
 | 多模态 FSDP 微调                    | transformers          | [脚本](cookbook/mm/fsdp2.py)                           |
 | GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo/grpo.py)                            |
 | PPO 强化学习训练                     | transformers          | [脚本](cookbook/rl/ppo/ppo.py)                              |
+| SAO 同步正确性基线                   | transformers          | [脚本](cookbook/rl/sao/sao_sync.py) / [说明](cookbook/rl/sao/README.md) |
 | GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo/grpo_mm.py)                         |
 | GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/grpo/short_math_grpo.py)                 |
 | DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo/dpo_full.py)                        |
