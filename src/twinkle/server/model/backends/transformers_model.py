@@ -110,6 +110,7 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
     @nccl_safe
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        self._normalize_ref_outputs(kwargs)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
