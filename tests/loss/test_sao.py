@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from twinkle.loss import SAOLoss, SAOValueLoss
+from twinkle.loss.policy_objective import DISPolicyObjective, PolicyObjective
 
 
 def _loss(ratios, advantages=None):
@@ -36,6 +37,29 @@ def test_sao_inside_gradient_uses_detached_ratio():
     logps, loss = _loss([2.0])
     loss.backward()
     assert logps.grad.item() == pytest.approx(-2.0)
+
+
+def test_sao_uses_reusable_dis_policy_objective():
+    loss = SAOLoss(epsilon_low=0.3, epsilon_high=5.0)
+    assert isinstance(loss.policy_objective, PolicyObjective)
+    assert isinstance(loss.policy_objective, DISPolicyObjective)
+
+
+def test_dis_policy_objective_matches_original_sao_formula():
+    logps = torch.tensor([[math.log(0.7), math.log(2.0), math.log(6.0)]], requires_grad=True)
+    ratio = torch.exp(logps)
+    advantages = torch.tensor([[1.0, -0.5, 1.0]])
+    objective = DISPolicyObjective(epsilon_low=0.3, epsilon_high=5.0)
+
+    actual = objective(ratio, advantages, logps)
+
+    trusted = (ratio > 0.7) & (ratio < 6.0)
+    weight = torch.where(trusted, ratio, torch.zeros_like(ratio)).detach()
+    expected = -weight * advantages.detach() * logps.float()
+    torch.testing.assert_close(actual, expected)
+
+    actual.sum().backward()
+    torch.testing.assert_close(logps.grad, torch.tensor([[0.0, 1.0, 0.0]]))
 
 
 def test_sao_ragged_alignment_and_token_mean_denominator():
