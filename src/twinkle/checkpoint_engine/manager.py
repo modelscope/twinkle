@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
@@ -8,14 +8,21 @@ from .mixin import CheckpointEngineMixin
 
 logger = get_logger()
 
+CheckpointEngineMode = Literal['auto', 'naive', 'colocate', 'standalone']
+_VALID_MODES = {'auto', 'naive', 'colocate', 'standalone'}
+
 
 class CheckpointEngineManager:
-    """Weight synchronization manager for Twinkle.
+    """Weight synchronization manager for local and Ray deployments.
 
-    Coordinates weight synchronization between training model and inference sampler, either when they
-    reside on **different GPUs** (disaggregated / standalone deployment, the default) or when they
-    **share** one (``colocate=True``). Colocation replaces the NCCL broadcast drawn below with a CUDA
-    IPC handover per GPU -- not as an optimisation, but because NCCL refuses two ranks on one device.
+    ``mode`` selects one of three synchronization paths:
+
+    * ``naive`` streams a local model's weight generator directly into a local sampler.
+    * ``colocate`` connects Ray model and sampler actors sharing GPUs through CUDA IPC.
+    * ``standalone`` connects disaggregated Ray actors through NCCL/HCCL.
+
+    ``auto`` resolves local objects to ``naive`` and Ray actor handlers to ``standalone``. It never
+    guesses ``colocate`` because actor placement cannot be inferred reliably from the driver.
 
     Architecture (following verl's CheckpointEngineManager):
 
@@ -25,7 +32,7 @@ class CheckpointEngineManager:
         │  (Ray actors)    │                    │  (Ray actors)    │
         │        │         │                    │        │         │
         │        ▼         │                    │        ▼         │
-        │ CheckpointEngine │   NCCL broadcast   │ CheckpointEngine │
+        │ CheckpointEngine │ NCCL/HCCL/CUDA IPC │ CheckpointEngine │
         │  send_weights()  │ ─────────────────► │ receive_weights()│
         │                  │                    │        │         │
         │                  │                    │        ▼         │
@@ -42,11 +49,11 @@ class CheckpointEngineManager:
         >>> manager = CheckpointEngineManager(model=model, sampler=sampler)
         >>> manager.sync_weights()  # Call after each training step
 
-    Colocated, the caller also owns the memory schedule, because only it knows where in the loop the
-    device is free. The sampler must have its weights resident to be written into -- ``sleep(1)`` puts
-    them on the host -- and the trainer has to step aside before a rollout:
+    With colocated Ray actors, the caller also owns the memory schedule, because only it knows where
+    in the loop the device is free. The sampler must have its weights resident to be written into --
+    ``sleep(1)`` puts them on the host -- and the trainer has to step aside before a rollout:
 
-        >>> manager = CheckpointEngineManager(model=model, sampler=sampler, colocate=True)
+        >>> manager = CheckpointEngineManager(model=model, sampler=sampler, mode='colocate')
         >>> sampler.wake_up(tags=['weights'])   # able to receive, still without a KV cache
         >>> manager.sync_weights()
         >>> model.offload_to_cpu()              # the trainer's turn is over
@@ -64,20 +71,15 @@ class CheckpointEngineManager:
         model: 'CheckpointEngineMixin',
         sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
-        colocate: bool = False,
+        mode: CheckpointEngineMode = 'auto',
     ) -> None:
         self.model = model
         self.sampler = sampler
-        self.colocate = colocate
-        self.backend_cls = self.decide_backend_engine(platform, colocate)
+        self.requested_mode = mode
+        self.mode = self._resolve_mode(mode, model, sampler)
+        self.backend_cls = self.decide_backend_engine(platform, self.mode)
 
-        # Validate Ray actors
-        assert hasattr(model, '_actors') and model._actors, \
-            'CheckpointEngineManager requires model to be deployed as Ray actors'
-        assert hasattr(sampler, '_actors') and sampler._actors, \
-            'CheckpointEngineManager requires sampler to be deployed as Ray actors'
-
-        if colocate:
+        if self.mode == 'colocate':
             # Each side builds its own engine inside its worker, so both have to be told which one.
             self.model.set_checkpoint_engine_backend('ipc')
             self.sampler.set_checkpoint_engine_backend('ipc')
@@ -91,14 +93,50 @@ class CheckpointEngineManager:
         self._model_keys: Optional[List[str]] = None
 
     @staticmethod
-    def decide_backend_engine(platform: Optional[str] = None, colocate: bool = False) -> 'CheckpointEngine':
-        if colocate:
+    def _resolve_mode(
+        mode: CheckpointEngineMode,
+        model: 'CheckpointEngineMixin',
+        sampler: 'CheckpointEngineMixin',
+    ) -> Literal['naive', 'colocate', 'standalone']:
+        if mode not in _VALID_MODES:
+            valid = ', '.join(sorted(_VALID_MODES))
+            raise ValueError(f'Unknown checkpoint engine mode {mode!r}; expected one of: {valid}.')
+
+        model_has_actors = bool(getattr(model, '_actors', None))
+        sampler_has_actors = bool(getattr(sampler, '_actors', None))
+        if model_has_actors != sampler_has_actors:
+            raise ValueError(
+                'CheckpointEngineManager requires model and sampler to use the same deployment shape: '
+                'both must be local objects or both must be Ray actor handlers.')
+
+        if mode == 'auto':
+            return 'standalone' if model_has_actors else 'naive'
+        if mode == 'naive' and model_has_actors:
+            raise ValueError("mode='naive' requires local model and sampler objects without Ray actors.")
+        if mode in ('colocate', 'standalone') and not model_has_actors:
+            raise ValueError(f"mode={mode!r} requires model and sampler to be Ray actor handlers.")
+        return mode
+
+    @staticmethod
+    def decide_backend_engine(
+        platform: Optional[str] = None,
+        mode: Literal['naive', 'colocate', 'standalone'] = 'standalone',
+    ) -> Optional['CheckpointEngine']:
+        if mode == 'naive':
+            return None
+
+        platform_name = Platform.get_platform(platform).__name__
+        if mode == 'colocate':
+            if platform_name != 'GPU':
+                raise NotImplementedError("mode='colocate' currently requires the GPU platform.")
             from twinkle.checkpoint_engine import IPCCheckpointEngine
             return IPCCheckpointEngine
-        if Platform.get_platform(platform).__name__ == 'GPU':
+        if mode != 'standalone':
+            raise ValueError(f'Cannot select a backend for unresolved mode {mode!r}.')
+        if platform_name == 'GPU':
             from twinkle.checkpoint_engine import NCCLCheckpointEngine
             return NCCLCheckpointEngine
-        elif Platform.get_platform(platform).__name__ == 'NPU':
+        elif platform_name == 'NPU':
             from twinkle.checkpoint_engine import HCCLCheckpointEngine
             return HCCLCheckpointEngine
         else:
@@ -124,8 +162,12 @@ class CheckpointEngineManager:
         Returns:
             None
         """
-        model_metadata = self.model.prepare_checkpoint_engine([True]
-                                                              + [False] * (self.model.device_mesh.world_size - 1))
+        if self.mode == 'naive':
+            self._sync_weights_naive(merge_and_sync)
+            return
+
+        is_master = [True] + [False] * (self.model.device_mesh.world_size - 1)
+        model_metadata = self.model.prepare_checkpoint_engine(is_master)
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             self.model.device_mesh.world_size,
@@ -146,36 +188,7 @@ class CheckpointEngineManager:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
 
-        if self._model_keys is None:
-            if hasattr(self.sampler, 'get_state_keys'):
-                self._model_keys = self.sampler.get_state_keys()
-
-            if self._model_keys is None:
-                self._model_keys = []
-
-            # vLLM may have grouped params - use word boundaries to avoid substring matches
-            import re
-            _STACKED_MAPPINGS = [
-                (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
-                (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
-                (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
-                (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
-                (re.compile(r'^visual\.'), ('model.visual.', )),
-            ]
-
-            def _expand_keys(keys):
-                result = set(keys)
-                for key in keys:
-                    for pattern, individuals in _STACKED_MAPPINGS:
-                        if pattern.search(key):
-                            for ind in individuals:
-                                result.add(pattern.sub(ind, key))
-                return result
-
-            # Two passes for chain expansion (e.g., language_model.model + qkv_proj)
-            expanded = _expand_keys(self._model_keys)
-            expanded = _expand_keys(expanded)
-            self._model_keys = list(expanded)
+        self._ensure_model_keys()
 
         model_result = self.model.send_weights(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
@@ -185,6 +198,65 @@ class CheckpointEngineManager:
 
         self.model.finalize_checkpoint_engine()
         self.sampler.finalize_checkpoint_engine()
+
+        if not self.base_sync_done:
+            self.base_sync_done = True
+            if not merge_and_sync:
+                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    def _ensure_model_keys(self):
+        if self._model_keys is not None:
+            return
+
+        if hasattr(self.sampler, 'get_state_keys'):
+            self._model_keys = self.sampler.get_state_keys()
+
+        if self._model_keys is None:
+            self._model_keys = []
+
+        # vLLM may have grouped params - use word boundaries to avoid substring matches
+        import re
+        _STACKED_MAPPINGS = [
+            (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
+            (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
+            (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
+            (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
+            (re.compile(r'^visual\.'), ('model.visual.', )),
+        ]
+
+        def _expand_keys(keys):
+            result = set(keys)
+            for key in keys:
+                for pattern, individuals in _STACKED_MAPPINGS:
+                    if pattern.search(key):
+                        for ind in individuals:
+                            result.add(pattern.sub(ind, key))
+            return result
+
+        # Two passes for chain expansion (e.g., language_model.model + qkv_proj)
+        expanded = _expand_keys(self._model_keys)
+        expanded = _expand_keys(expanded)
+        self._model_keys = list(expanded)
+
+    def _sync_weights_naive(self, merge_and_sync):
+        """Stream model weights directly into a local sampler."""
+        peft_config = None
+        if self.base_sync_done and not merge_and_sync:
+            if self._peft_config is None:
+                self._peft_config = self.model.get_peft_config_dict()
+            peft_config = self._peft_config
+
+        self._ensure_model_keys()
+        weights = self.model._get_weight_generator(
+            base_sync_done=self.base_sync_done,
+            merge_and_sync=merge_and_sync,
+            model_keys=self._model_keys,
+        )
+        self.sampler.receive_weights(
+            weights=weights,
+            base_sync_done=self.base_sync_done,
+            peft_config=peft_config,
+        )
 
         if not self.base_sync_done:
             self.base_sync_done = True

@@ -395,30 +395,32 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         self,
         base_sync_done: bool = False,
         peft_config: dict = None,
+        weights=None,
     ):
         """Receive weights from the trainer and stream them into sglang.
 
-        Which transport delivers them is the checkpoint engine's business, not this method's: NCCL
-        broadcast when the trainer is on other GPUs, CUDA IPC when it shares this one, where NCCL
-        cannot be used at all.
-
-        The checkpoint engine's ``receive_weights()`` async generator is handed straight to
-        :meth:`SGLangEngine.update_weights`, which consumes it one tensor at a time into a bucket and
-        forwards each full bucket to sglang. Peak extra memory is one bucket rather than a second copy
-        of the model, the same reason the vLLM path streams.
+        With no ``weights`` argument, the checkpoint engine supplies an async generator from its
+        NCCL/HCCL/CUDA IPC transport. A local naive caller can instead provide the model's synchronous
+        generator directly. Either iterator is handed straight to :meth:`SGLangEngine.update_weights`,
+        which consumes it one tensor at a time into a bucket and forwards each full bucket to sglang.
+        Peak extra memory is one bucket rather than a second copy of the model.
 
         Args:
             base_sync_done: If True, this would be a LoRA-only sync.
             peft_config: PEFT config dict for LoRA adapter loading.
+            weights: Optional synchronous/asynchronous weight iterator. If
+                omitted, weights are received from the checkpoint engine.
 
         Raises:
             NotImplementedError: For a LoRA-only sync; see the class docstring.
         """
-        engine = self._get_or_create_checkpoint_engine()
+        if weights is None:
+            engine = self._get_or_create_checkpoint_engine()
+            weights = engine.receive_weights()
 
         async def _receive_and_load():
             await self.engine.update_weights(
-                engine.receive_weights(),  # async generator — not materialised
+                weights,  # async/sync generator — not materialised
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
             )
