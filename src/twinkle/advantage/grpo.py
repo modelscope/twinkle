@@ -2,6 +2,7 @@
 from typing import TYPE_CHECKING, List, Literal, Union
 
 from .base import Advantage
+from ._utils import apply_kl_in_reward, compute_gdpo_advantages, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -12,7 +13,7 @@ class GRPOAdvantage(Advantage):
     def __call__(self,
                  rewards: Union['torch.Tensor', List[float]],
                  num_generations: int = 1,
-                 scale: Literal['group', 'batch', 'none'] = 'group',
+                 scale: Literal['group', 'batch', 'none', 'gdpo'] = 'group',
                  **kwargs) -> 'torch.Tensor':
         """
             GRPO-style advantages: subtract group mean.
@@ -39,8 +40,23 @@ class GRPOAdvantage(Advantage):
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 
-        if rewards.dim() > 1:
-            rewards = rewards.sum(dim=-1)
+        if scale == 'gdpo':
+            # Per-function group-normalize -> weighted-sum -> batch-normalize. Needs the 2D
+            # [N, n_funcs] matrix + weights, so it runs before the reward reduction below.
+            if rewards.dim() <= 1:
+                raise ValueError("scale='gdpo' requires a 2D [N, n_funcs] per-function reward matrix.")
+            return compute_gdpo_advantages(rewards, kwargs.get('reward_weights'), num_generations)
+
+        # reduce_rewards keeps the original plain-sum behavior when no reward_weights are given;
+        # apply_kl_in_reward is a no-op unless kl_in_reward is requested -- so a scalar single-reward
+        # call runs exactly the original path.
+        rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
+        rewards = apply_kl_in_reward(
+            rewards,
+            kl_in_reward=kwargs.get('kl_in_reward', False),
+            beta=kwargs.get('beta', 0.0),
+            kl_values=kwargs.get('kl_values'),
+        )
 
         if num_generations <= 0 or rewards.numel() % num_generations != 0:
             raise ValueError('Invalid')

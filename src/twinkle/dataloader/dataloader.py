@@ -47,6 +47,7 @@ class DataLoader:
                  data_seed: Optional[int] = None,
                  group_by_length: bool = False,
                  lengths: Optional[Sequence] = None,
+                 data_sharding: bool = False,
                  **kwargs):
         if isinstance(dataset, Callable):
             self.dataset: Dataset = dataset()
@@ -64,6 +65,8 @@ class DataLoader:
         self.data_seed = data_seed
         self.group_by_length = group_by_length
         self.lengths = lengths
+        self.data_sharding = data_sharding
+        self._epoch = 0
         self._epoch_sampler: Optional[EpochSampler] = None
         # Checked here rather than where the sampler is built, which does not happen until the first
         # iteration: a misconfigured dataloader should say so when it is configured, not once a run has
@@ -198,6 +201,12 @@ class DataLoader:
         self._lazy_init_dataloader()
         if self._epoch_sampler is not None:
             self._epoch_sampler.set_epoch(epoch)
+        self._epoch = epoch
+        # data_sharding derives its per-bucket permutation from the epoch on the batch sampler itself
+        # (there is no global EpochSampler order in that mode); a no-op on the default sampler.
+        batch_sampler = getattr(self.dataloader, 'batch_sampler', None)
+        if batch_sampler is not None and hasattr(batch_sampler, 'set_epoch'):
+            batch_sampler.set_epoch(epoch)
         if self._resume_pending and epoch != self._resume_epoch:
             self._resume_pending = False
             self._resume_offset = 0
@@ -297,6 +306,7 @@ class DataLoader:
         if self._resume_pending:
             if self._epoch_sampler is not None:
                 self._epoch_sampler.set_epoch(self._resume_epoch)
+            self._epoch = self._resume_epoch
             skip = self._resume_offset
             self._resume_pending = False
             self._resume_offset = 0
@@ -314,11 +324,17 @@ class DataLoader:
         the bases are kept aside rather than rewrapped in place.
         """
         if self._base_batch_sampler is not None:
-            self.dataloader.batch_sampler = DeviceMeshSampler(
+            batch_sampler = DeviceMeshSampler(
                 self._base_batch_sampler,
                 self.device_mesh,
                 self.min_batch_size,
                 skip_samples=self._skip_samples,
+                data_sharding=self.data_sharding,
+                dataset_length=len(self.dataset),
+                batch_size=self.batch_size,
+                data_seed=self.data_seed,
             )
+            batch_sampler.set_epoch(self._epoch)
+            self.dataloader.batch_sampler = batch_sampler
         elif self._base_sampler is not None:
             self.dataloader.sampler = SkipSampler(self._base_sampler, skip_samples=self._skip_samples)

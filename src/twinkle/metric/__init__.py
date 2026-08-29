@@ -4,6 +4,7 @@ from .base import Metric
 from .completion_and_reward import CompletionRewardMetric
 from .dpo import DPOMetric
 from .embedding import EmbeddingMetric
+from .generation import ExactMatch, RougeBleu, TextMetric
 from .grpo import CISPOMetric, GRPOMetric, GSPOMetric
 from .loss import LossMetric
 from .train_metric import TrainMetric

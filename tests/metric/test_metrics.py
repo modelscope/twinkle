@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tests for metric classes: Accuracy, LossMetric, TrainMetric, CompletionRewardMetric, DPOMetric, GRPOMetric, EmbeddingMetric."""
+"""Tests for metric classes: Accuracy, LossMetric, TrainMetric, CompletionRewardMetric, DPOMetric, GRPOMetric,
+EmbeddingMetric, ExactMatch, RougeBleu."""
 import time
 
 import pytest
@@ -11,10 +12,12 @@ from twinkle.metric import (
     CompletionRewardMetric,
     DPOMetric,
     EmbeddingMetric,
+    ExactMatch,
     GRPOMetric,
     GSPOMetric,
     CISPOMetric,
     LossMetric,
+    RougeBleu,
     TrainMetric,
 )
 
@@ -418,3 +421,84 @@ class TestEmbeddingMetric:
         m.accumulate({'labels': labels}, {'embeddings': embeddings})
         # No anchors → no positive similarity
         assert m.pos_count == 0
+
+
+# ---------------------------------------------------------------------------
+# ExactMatch / RougeBleu (text-level, for evaluation runs)
+# ---------------------------------------------------------------------------
+
+class TestExactMatch:
+
+    def test_all_correct(self):
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate(predictions=['a', 'b'], references=['a', 'b'])
+        assert m.calculate() == {'acc': 1.0}
+
+    def test_partial(self):
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate(predictions=['a', 'b'], references=['a', 'c'])
+        assert m.calculate() == {'acc': 0.5}
+
+    def test_is_exact_not_fuzzy(self):
+        # Whitespace and case differences count as wrong -- this is string equality, not normalized match.
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate(predictions=['A', 'b '], references=['a', 'b'])
+        assert m.calculate() == {'acc': 0.0}
+
+    def test_accumulate_is_additive(self):
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate(predictions=['a'], references=['a'])
+        m.accumulate(predictions=['b'], references=['c'])
+        assert m.calculate() == {'acc': 0.5}
+
+    def test_nothing_accumulated(self):
+        assert _no_dist_metric(ExactMatch).calculate() == {}
+
+    def test_accumulate_without_pairs_is_ignored(self):
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate()
+        m.accumulate(predictions=['a'])  # references missing
+        assert m.calculate() == {}
+
+    def test_calculate_resets(self):
+        m = _no_dist_metric(ExactMatch)
+        m.accumulate(predictions=['a'], references=['a'])
+        assert m.calculate() == {'acc': 1.0}
+        assert m.calculate() == {}
+
+    def test_mismatched_lengths_raise(self):
+        m = _no_dist_metric(ExactMatch)
+        with pytest.raises(AssertionError, match='parallel'):
+            m.accumulate(predictions=['a', 'b'], references=['a'])
+
+
+class TestRougeBleu:
+
+    def test_identical_text_scores_full_rouge(self):
+        m = _no_dist_metric(RougeBleu)
+        m.accumulate(predictions=['今天天气很好'], references=['今天天气很好'])
+        result = m.calculate()
+        assert set(result) == set(RougeBleu.keys)
+        assert result['rouge-1'] == 100.0
+        assert result['rouge-l'] == 100.0
+
+    def test_disjoint_text_scores_zero(self):
+        m = _no_dist_metric(RougeBleu)
+        m.accumulate(predictions=['苹果'], references=['火车'])
+        result = m.calculate()
+        assert result['rouge-1'] == 0.0
+
+    def test_reports_percentages(self):
+        # Half the pairs match exactly, so rouge-1 lands between the two extremes rather than at 0/1.
+        m = _no_dist_metric(RougeBleu)
+        m.accumulate(predictions=['苹果', '火车'], references=['苹果', '飞机'])
+        assert 0.0 < m.calculate()['rouge-1'] < 100.0
+
+    def test_empty_tokenization_is_skipped_not_scored_zero(self):
+        m = _no_dist_metric(RougeBleu)
+        m.accumulate(predictions=['今天天气很好', '  '], references=['今天天气很好', '火车'])
+        # The blank prediction is dropped, so the one real pair still scores full marks.
+        assert m.calculate()['rouge-1'] == 100.0
+
+    def test_nothing_accumulated(self):
+        assert _no_dist_metric(RougeBleu).calculate() == {}
