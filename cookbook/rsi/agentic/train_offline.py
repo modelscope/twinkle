@@ -55,8 +55,27 @@ TEMPLATE = os.environ.get('RSI_TEMPLATE', 'Template')
 # CLI default is never zero, so a fallback here would be dead code that reads
 # like the default.
 LEARNING_RATE = args.optimizer.learning_rate
-MINI_BATCH_SIZE = args.training.mini_batch_size or 8
-MICRO_BATCH_SIZE = args.training.micro_batch_size or 2
+# One trajectory per micro batch, because padding_free is off: a micro batch is
+# padded to its longest member, so pairing a short solver trajectory with a long
+# proposer episode pays for the long one twice. Proposer episodes are whole
+# agentic rollouts -- median 7.5k tokens, up to 15.7k -- against much shorter
+# solver attempts, and at 2 per micro batch step 7 hit a 31k-token padded batch
+# and died of CUDA OOM with activation recompute already at its most aggressive
+# setting. At 1 the peak is the longest single trajectory and no token is padding.
+#
+# Read from the environment rather than args.training: TrainingArgs defaults
+# micro_batch_size to 2, not to None, so `args.training.micro_batch_size or 1`
+# would be dead code that silently kept 2 -- which is exactly how the OOM
+# survived a first attempt at this fix.
+MICRO_BATCH_SIZE = int(os.environ.get('RSI_MICRO_BATCH_SIZE', 1))
+# forward_backward is declared dispatch='slice_dp', so a mini-batch is sliced
+# across the model's data-parallel ranks and each rank collates only its share.
+# That share has to hold at least one micro batch, so the floor is
+# MODEL_GPUS * MICRO_BATCH_SIZE: at 8 GPUs the old default of 8 left every rank
+# with a single trajectory and step 1 died in collate_fn, before any optimizer
+# step, on a full 384-trajectory dump. rl.py keeps the same floor by skipping
+# batches smaller than MODEL_GPUS.
+MINI_BATCH_SIZE = args.training.mini_batch_size or MODEL_GPUS * MICRO_BATCH_SIZE
 SAVE_STEPS = args.training.save_steps or 0
 
 RUN_DIR = os.environ.get('RSI_RUN_DIR', '')
@@ -443,14 +462,19 @@ def main():
     # checkpoint is a whole model rather than something that needs merging before
     # the next challenger round can load it.
     from twinkle.model.megatron import MegatronModel
+    # padding_free is off, so this stays off with it: both switches send collate_fn
+    # down the per-micro-batch packed path, and Megatron's TE extension then reads
+    # PackedSeqParams.pad_between_seqs, which the Megatron-LM checkout on this box
+    # does not define. Padded batches cost throughput but keep the attention path
+    # on plain padded sequences.
     model = MegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model',
-                          mixed_precision='bf16', variable_seq_lengths=True)
+                          mixed_precision='bf16', variable_seq_lengths=False)
     model.set_optimizer('default', lr=LEARNING_RATE)
     model.set_lr_scheduler('default', lr_decay_steps=max(1, n_steps), max_lr=LEARNING_RATE)
     # beta=0: no reference model here, and grpo.py:315 needs beta>0 AND ref_logps
     # for the KL term, so any beta above 0 would silently do nothing.
     model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
-    model.set_processor(InputProcessor, padding_free=True)
+    model.set_processor(InputProcessor, padding_free=False)
     model.set_template(TEMPLATE, model_id=MODEL_ID, max_length=MAX_MODEL_LEN,
                        enable_thinking=True)
     # approx_kl at the first inner step compares the sampler's logps against the
@@ -471,6 +495,17 @@ def main():
 
         for mb in range(0, len(inputs), MINI_BATCH_SIZE):
             end = min(mb + MINI_BATCH_SIZE, len(inputs))
+            # Drop a tail shorter than a whole mini batch instead of handing it
+            # over. The floor is MINI_BATCH_SIZE, not MICRO_BATCH_SIZE: dispatch
+            # 'slice_dp' splits the batch across all MODEL_GPUS ranks, so a batch
+            # that cannot give every rank its own micro batch fails before
+            # collate_fn -- _dispatch_args raises 'Batch too small for N workers,
+            # some ranks have no data'. A 6-trajectory tail against 8 ranks did
+            # exactly that. The dropped trajectories are the tail of the last step.
+            if end - mb < MINI_BATCH_SIZE:
+                logger.info(f'[offline] step {step + 1}: dropping last '
+                            f'{end - mb} traj, under mini batch {MINI_BATCH_SIZE}')
+                break
             model.forward_backward(
                 inputs=inputs[mb:end],
                 old_logps=old_logps[mb:end],

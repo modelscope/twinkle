@@ -125,6 +125,13 @@ for rel, payload in FILES.items():
 # since the alternative is throwing the episode away.
 SNAPSHOT_RETRY_WAIT = 3
 
+# Same idea for the workspace clear, which is the one sandbox call whose failure
+# is fatal to the run rather than to one episode. Longer than the snapshot wait
+# because what it waits out is different: a clear times out when ms-agent's
+# per-call limit expires with the delete still running, so the second attempt
+# wants the first one's rmtree to have drained rather than to race it.
+RESET_RETRY_WAIT = 10
+
 # The ground truth the check script is written against. A listing alone is not
 # enough: three of the six rejected proposals in the first real run failed on a
 # value the model recomputed from its own recollection ("Mean values mismatch")
@@ -669,8 +676,14 @@ def main():
         This is also the one point where losing the sandbox costs nothing, since
         the workspace is about to be emptied regardless -- so a runtime that went
         away is rebuilt here instead of ending a run that may have hours of
-        proposals behind it.
+        proposals behind it. The same reasoning covers a clear that *fails* on a
+        runtime still answering /health, which ensure_ready cannot see: run 'rsi'
+        reached iteration 7 -- six checkpoints, eight hours -- and ended on three
+        clears timing out at ms-agent's per-call limit while the sandbox itself
+        was healthy enough to report them. So the clear is retried, and then
+        retried on a deliberately rebuilt sandbox, before the run is given up.
         """
+        clear = CLEAR_WORKSPACE.format(workspace=args.workspace)
         if envs[slot].ensure_ready():
             # A rebuilt sandbox starts empty, so the clear below is redundant,
             # but running it anyway keeps one path through this function. The
@@ -678,8 +691,25 @@ def main():
             # re-fetched rather than reused.
             runners[slot] = envs[slot].runner()
             logger.warning(f'[challenge] sandbox {slot} was rebuilt before this episode')
-        exit_code, output = runners[slot](
-            CLEAR_WORKSPACE.format(workspace=args.workspace), 'python')
+        exit_code, output = runners[slot](clear, 'python')
+        if exit_code != 0:
+            logger.warning(f'[challenge] workspace reset failed on sandbox {slot} '
+                           f'(exit {exit_code}), retrying in {RESET_RETRY_WAIT}s: '
+                           f'{output[-200:]}')
+            time.sleep(RESET_RETRY_WAIT)
+            exit_code, output = runners[slot](clear, 'python')
+        if exit_code != 0:
+            # Rebuilt rather than retried again: two failures in a row is not the
+            # transient this waits out, and a fresh sandbox brings a workspace
+            # that is already empty -- which is all this function is asked for.
+            # Counted as a recovery so the run's own tally at the end still
+            # accounts for every rebuild, including the ones from here.
+            logger.warning(f'[challenge] workspace reset failed twice on sandbox {slot} '
+                           f'(exit {exit_code}); rebuilding it: {output[-200:]}')
+            envs[slot].reset()
+            envs[slot].n_recoveries += 1
+            runners[slot] = envs[slot].runner()
+            exit_code, output = runners[slot](clear, 'python')
         if exit_code != 0:
             raise RuntimeError(f'workspace reset failed (exit {exit_code}): {output[-400:]}')
 
@@ -1105,6 +1135,13 @@ class ProposeTrajWriter:
             'trace_id': trace_id,
             'npz': npz_name,
             'outcome': record.get('outcome'),
+            # Both of these come straight from _emit_propose and both are what the
+            # proposing side trains on: train_offline.py groups proposals by
+            # group_id to get a GRPO advantage out of them, and skips the whole
+            # dump as a "pre-grouping run" when it is absent. Dropping them here
+            # silently turned SIDES=both into solver-only training.
+            'group_id': record.get('group_id'),
+            'challenger_reward': record.get('challenger_reward'),
             'n_pass': record.get('n_pass'),
             'n_rollouts': record.get('n_rollouts'),
             'pass_rate': record.get('pass_rate'),

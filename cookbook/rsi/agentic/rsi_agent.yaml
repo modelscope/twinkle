@@ -124,10 +124,17 @@ tools:
     plan_filename: .ms_agent/plan.json
     plan_md_filename: .ms_agent/plan.md
 
-# Every refusal ms-agent applies to a shell command, turned off. Read by
-# LLMAgent.prepare_runtime (llm_agent.py builds PermissionConfig.from_dict off
-# this section), so it takes effect in the sandbox, where tool_server.py loads
-# this same file.
+# Every refusal ms-agent applies to a shell command, turned off. `allow_network`
+# and the two list-valued keys are read by LLMAgent.prepare_runtime (llm_agent.py
+# builds PermissionConfig.from_dict off this section) and take effect in the
+# sandbox, where tool_server.py loads this same file.
+#
+# The last two keys are different: ms-agent's SafetyConfig does NOT implement
+# them, and from_dict ignores unknown keys without a word, so on their own they
+# would be dead letters. tool_server.py reads them itself and applies the two
+# relaxations as a runtime patch (_patch_permission) inside the sandbox --
+# ms-agent is a harness twinkle supports, so it is used as released rather than
+# forked. The startup line reports which ones took effect.
 #
 # The reason is what the refusals cost here rather than what they protect: this
 # runs in a microVM that is reset once per episode and holds nothing but the
@@ -147,18 +154,25 @@ permission:
     # means "use the defaults".
     patterns: []
     # Same, for the configurable half of the rm/rmdir path check: `*`, `/*`,
-    # `/`, `~`.
+    # `/`, `~`. Left empty rather than removed to say the intent out loud;
+    # unrestricted_removal below bypasses the whole check, this list included,
+    # and tool_server.py warns at startup if the two ever disagree.
     dangerous_removal_paths: []
-    # And the half that a config cannot reach, added for this: the refusals
-    # written into is_dangerous_removal_path for `*`, anything ending in `/*`,
-    # `/`, a direct child of `/` (which `/workspace` is), and the home directory.
+    # And the half that a config cannot reach, which is why this one needs the
+    # runtime patch: the refusals written into is_dangerous_removal_path for
+    # `*`, anything ending in `/*`, `/`, a direct child of `/` (which
+    # `/workspace` is), and the home directory.
     unrestricted_removal: true
     # A separate refusal, found by running commands through SafetyGuard rather
     # than by reading the config: a glob anywhere in a write or create path is
     # denied on its own ("Glob patterns not allowed in write operations"), which
-    # is what actually stopped `rm -rf *` and `rm -rf build/*` after the two
-    # lists above were emptied. It is not specific to rm -- `cp src/* dst/` and
-    # `chmod +x bin/*` hit it too.
+    # is what actually stopped `rm -rf build/*` after the two lists above were
+    # emptied. It is not specific to rm -- `cp src/* dst/` is refused by the same
+    # check. (`chmod +x bin/*` is NOT: measured through SafetyGuard, chmod's
+    # arguments are not extracted as write paths, so it was already allowed.)
+    # Patched by widening the path that is scope-checked to the directory the
+    # glob expands inside, so a glob still cannot reach outside the workspace --
+    # `cp /etc/* /workspace/` stays denied, now for being out of scope.
     allow_write_globs: true
 
 # Web search is deliberately absent. ms-agent's `web_search` key only provides

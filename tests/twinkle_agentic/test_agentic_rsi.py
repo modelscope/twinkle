@@ -1347,5 +1347,95 @@ class SerialKeywordRefillTest(unittest.TestCase):
         self.assertIn(f'new {cap + 29}', note, 'the newest is always kept')
 
 
+class ProposeTrajIndexTest(unittest.TestCase):
+    """index.jsonl has to carry what the proposing side trains on.
+
+    The challenger emits a proposal record and challenge.py copies it into
+    index.jsonl field by field. Two of those fields are the reason the dump
+    exists at all: train_offline.py groups proposals by ``group_id`` to get a
+    GRPO advantage out of them, and skips a dump without it as a 'pre-grouping
+    run'. While the copy dropped both, SIDES=both trained 384 solver and 0
+    proposer trajectories, and said so only in a line nobody read.
+    """
+
+    def test_group_id_and_reward_survive_the_copy(self):
+        from challenge import ProposeTrajWriter
+
+        out = tempfile.mkdtemp(prefix='proposetraj_test_')
+        try:
+            writer = ProposeTrajWriter(out)
+            writer.write({
+                'outcome': 'kept',
+                'group_id': 0,
+                'challenger_reward': 0.75,
+                'n_pass': 4,
+                'n_rollouts': 8,
+                'pass_rate': 0.5,
+                'keywords': [['transform', 'parse a binary log']],
+                'seeded': False,
+                'rounds': [{'stage': 'episode', 'messages': [],
+                            'input_ids': [1, 2], 'labels': [-100, 2],
+                            'logprobs': []}],
+            })
+            writer.close()
+            with open(os.path.join(out, 'index.jsonl'), encoding='utf-8') as f:
+                rec = json.loads(f.readline())
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+        # Group 0 is a real group, so this also pins that the copy reads the key
+        # rather than testing it for truth.
+        self.assertEqual(rec['group_id'], 0)
+        self.assertEqual(rec['challenger_reward'], 0.75)
+
+
+class TaskCarriesGroupIdTest(unittest.TestCase):
+    """A built task has to remember which group proposed it.
+
+    The difficulty stage emits kept and outside_band proposals off the *task*,
+    so a task built without its group_id reaches the dump ungrouped and the
+    proposing side gets no advantage from it. The reject path reads group_id off
+    the episode instead, so while only the successful path dropped it, a run
+    showed 4 grouped proposals -- all of them early failures -- against 92
+    ungrouped kept/outside_band ones, and the copy downstream looked correct.
+    """
+
+    def _challenger(self):
+        from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
+
+        prompts = AgenticPrompts(
+            system='s', from_scratch='u',
+            check_followup='write checks for {final_state}',
+            check_retry_followup='{error} / {final_state}',
+            problem_followup='write the statement')
+        return AgenticChallenger(
+            prompts,
+            lambda trajectories, **kwargs: list(trajectories),
+            reset_fn=lambda slot=0: None,
+            run_check_fn=lambda script, slot=0: (0, ''),
+            workspace_snapshot_fn=lambda slot=0: 'data.csv 3',
+            solver_rollouts=0,
+        )
+
+    def test_group_id_reaches_the_built_task(self):
+        from twinkle.data_format import user_data_get
+        from twinkle_agentic.challenger.base import attach_user_data
+
+        ch = self._challenger()
+        explored = attach_user_data(
+            {'messages': [{'role': 'user', 'content': 'explore'},
+                          {'role': 'assistant', 'content': 'done'}]},
+            keywords=[['transform', 'parse a binary log']], seeded=False, group_id=7)
+        state = {'checked': True, 'script': 'assert True',
+                 'statement': 'PROBLEM: build a parser\nEND'}
+
+        task = ch._finish_episode(state, explored)
+
+        self.assertIsNotNone(task, 'a checked episode with a statement is a task')
+        # 7, not None: the emit sites downstream read exactly this key, and a None
+        # here is what silently turned SIDES=both into solver-only training.
+        self.assertEqual(user_data_get(task.get('user_data'), 'group_id', None), 7)
+
+
 if __name__ == '__main__':
     unittest.main()

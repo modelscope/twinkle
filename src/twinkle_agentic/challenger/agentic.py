@@ -1064,7 +1064,14 @@ class AgenticChallenger(Challenger):
         task: Trajectory = {
             'messages': [{'role': 'user', 'content': statement}],
         }
+        # group_id travels with the task, not just with the reject path above: the
+        # difficulty stage emits the surviving proposals from the task, so a task
+        # that forgets its group reaches the dump ungrouped and the proposing side
+        # has no advantage to compute. Leaving it off here made every kept and
+        # outside_band proposal group_id=None, and only the episodes that failed
+        # early -- which emit straight off ``explored`` -- kept theirs.
         task = attach_user_data(task, check_script=script, keywords=keywords, seeded=seeded,
+                                group_id=group_id,
                                 setup_script=state.get('setup_script', ''))
         # Carried, not emitted: the verdict this proposal earns depends on the
         # difficulty measurement, which has not run yet. A plain top-level key

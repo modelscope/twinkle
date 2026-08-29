@@ -89,21 +89,15 @@ SERVER_LOG = '/tmp/tool_server.log'
 _RPC_HEADROOM = 60
 _LOCAL_SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sandbox_server', 'tool_server.py')
 
-# ms-agent's permission package, uploaded alongside the yaml because this
-# repository's copy carries two switches the released code does not have:
-# ``safety_rules.unrestricted_removal`` and ``safety_rules.allow_write_globs``,
-# which rsi_agent.yaml turns on. Without them the sandbox reads those keys,
-# finds no code that looks at them, and silently keeps refusing `rm -rf *`,
-# `cp src/* dst/` and `chmod +x bin/*` -- a whole run's worth of tasks shaped by
-# a config that never took effect.
-#
-# The image installs ms-agent editable from a tarball into /opt/ms-agent, so
-# replacing the files under it is what the interpreter picks up; and it has to
-# land before tool_server.py imports them, which is why this is part of the same
-# upload rather than a rebuilt image.
-_MS_AGENT_PERMISSION_DIR = '/opt/ms-agent/ms_agent/permission'
-_PATCHED_PERMISSION_FILES = ('config.py', 'safety.py', 'shell_validator.py',
-                             'path_validator.py')
+# No ms-agent code is uploaded. ``rsi_agent.yaml`` turns on two safety switches
+# -- ``safety_rules.unrestricted_removal`` and ``safety_rules.allow_write_globs``
+# -- that ms-agent's ``SafetyConfig.from_dict`` does not implement and silently
+# ignores. This used to be handled by copying a patched ``ms_agent/permission``
+# package into every sandbox, which meant carrying a fork of a dependency that
+# twinkle supports as a harness, and re-merging it forever. ``tool_server.py``
+# now applies the same two relaxations as a runtime patch inside the sandbox
+# (``_patch_permission``), next to the ``python_executor`` patch that was already
+# there, so the released ms-agent is used as-is on both sides.
 
 
 def tool_payload(observation: str) -> str:
@@ -485,46 +479,20 @@ class RemoteMsAgentToolEnv(Env):
         return Sandbox.create(template=self._template, timeout=self._sandbox_timeout)
 
     def _upload(self) -> None:
-        """Push the yaml, the server script and the permission patch into the sandbox.
+        """Push the yaml and the server script into the sandbox.
 
         Uploading beats baking them into the image: the training host's copy is
         authoritative, so editing a tool line-up is a restart rather than a
         template rebuild, and the two halves cannot fall out of sync.
+
+        Only twinkle's own two files travel. The safety relaxations
+        ``rsi_agent.yaml`` asks for are applied by ``tool_server.py`` at runtime,
+        so no ms-agent source is shipped or overwritten here.
         """
         with open(self._config_path, encoding='utf-8') as f:
             self._sandbox.files.write(f'{_REMOTE_DIR}/rsi_agent.yaml', f.read())
         with open(_LOCAL_SERVER, encoding='utf-8') as f:
             self._sandbox.files.write(f'{_REMOTE_DIR}/tool_server.py', f.read())
-        self._upload_permission_patch()
-
-    def _upload_permission_patch(self) -> None:
-        """Overwrite ms-agent's permission package with this repository's copy.
-
-        Taken from the installed package rather than a path built out of
-        ``__file__``, so what lands in the sandbox is the same code the training
-        host imports.
-
-        Verified rather than assumed: a silent miss here does not fail anything,
-        it just leaves the sandbox refusing commands the yaml said to allow, and
-        the only symptom would be a run whose tasks are quietly narrower than
-        intended. If the switch is not readable afterwards, this raises.
-        """
-        import ms_agent.permission as _perm
-
-        local_dir = os.path.dirname(os.path.abspath(_perm.__file__))
-        for name in _PATCHED_PERMISSION_FILES:
-            with open(os.path.join(local_dir, name), encoding='utf-8') as f:
-                self._sandbox.files.write(f'{_MS_AGENT_PERMISSION_DIR}/{name}', f.read())
-        probe = ('python -c "from ms_agent.permission.config import SafetyConfig as S; '
-                 'print(S().unrestricted_removal, S().allow_write_globs)"')
-        result = self._sandbox.commands.run(probe, timeout=60)
-        out = (getattr(result, 'stdout', '') or '').strip()
-        if out.split() != ['False', 'False']:
-            raise RuntimeError(
-                'permission patch did not land in the sandbox: expected the two '
-                f'switches to exist and default to False, got {out!r}. The '
-                f'sandbox may install ms-agent somewhere other than '
-                f'{_MS_AGENT_PERMISSION_DIR}.')
 
     def _start_server(self) -> None:
         """Launch the tool runtime in the background, with its output on disk.

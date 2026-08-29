@@ -117,7 +117,11 @@ def main():
         lora_dropout=0.05,
     )
 
-    model = TransformersModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model')
+    # torch_dtype=float32: load master weights in fp32. Training precision is still
+    # governed by `mixed_precision` (bf16 autocast); fp32 params avoid the numerically
+    # fragile bf16 optimizer state on this Blackwell + CUDA 13 box.
+    model = TransformersModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model',
+                              torch_dtype='float32')
     model.add_adapter_to_model(ADAPTER_NAME, lora_config,
                                gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     model.set_optimizer('AdamW', lr=LEARNING_RATE)

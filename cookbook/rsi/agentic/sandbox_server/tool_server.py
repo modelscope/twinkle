@@ -45,6 +45,10 @@ _LLM_BACKED_ARGS = {'file_system---read_file': ('abbreviate', )}
 
 _SINGLE_NS_FLAG = '_twinkle_single_namespace'
 
+# Marks a permission function this file has already replaced, so a second
+# ToolRuntime in one process does not wrap a wrapper.
+_PERMISSION_FLAG = '_twinkle_permission_relaxed'
+
 # ms-agent namespaces every tool as ``{server}---{tool}``.
 _TOOL_SPLIT = '---'
 
@@ -167,6 +171,95 @@ def _patch_python_executor() -> bool:
     setattr(python_executor, _SINGLE_NS_FLAG, True)
     LocalCodeExecutionTool.python_executor = python_executor
     return True
+
+
+def _patch_permission(unrestricted_removal: bool,
+                      allow_write_globs: bool) -> List[str]:
+    """Honour two safety switches ms-agent's config schema does not implement.
+
+    ``rsi_agent.yaml`` asks for ``safety_rules.unrestricted_removal`` and
+    ``safety_rules.allow_write_globs``. ``SafetyConfig.from_dict`` reads only the
+    keys it knows and ignores the rest without a word, so on an unmodified
+    ms-agent both are dead letters: the sandbox goes on refusing ``rm -rf
+    build/*``, ``cp src/* dst/`` and ``chmod +x bin/*``, and the only symptom is
+    a run whose tasks are quietly narrower than the config asked for.
+
+    Done as a runtime patch rather than by editing ms-agent, because ms-agent is
+    a supported harness and an ordinary dependency: a forked ``permission``
+    package would have to be carried, and re-merged, by everyone who runs this
+    cookbook. Same reasoning and same shape as :func:`_patch_python_executor`.
+
+    Both refusals are written in ``path_validator``, but ``shell_validator`` and
+    ``safety`` pulled them into their own namespaces with ``from ... import``,
+    so the replacement is written into every module holding a reference --
+    patching the source module alone would leave the copies that actually get
+    called untouched.
+
+    Returns the names of the patches applied, for the startup line.
+    """
+    from ms_agent.permission import path_validator, safety, shell_validator
+
+    applied: List[str] = []
+    # Every module that holds a reference, source module included.
+    targets = (path_validator, shell_validator, safety)
+
+    if unrestricted_removal:
+        original_removal = path_validator.is_dangerous_removal_path
+        # Skips this block only, never the one below: an early return here left
+        # allow_write_globs unapplied whenever the two were configured together.
+        if not getattr(original_removal, _PERMISSION_FLAG, False):
+
+            def is_dangerous_removal_path(path, extra_patterns=(), *args, **kwargs):
+                """No path is too dangerous to remove inside a disposable microVM.
+
+                A blanket bypass, including ``dangerous_removal_paths``: the
+                checks this switch exists to drop are the fixed ones -- ``*``,
+                anything ending in ``/*``, ``/``, a direct child of ``/`` (which
+                ``/workspace`` is) and the home directory -- and they are
+                entangled with the configurable list in one function. Honouring
+                the list here would mean restating ms-agent's matching rules,
+                which is the duplication this whole approach avoids. The caller
+                is warned at startup when it configured a list this makes moot.
+                """
+                return False
+
+            setattr(is_dangerous_removal_path, _PERMISSION_FLAG, True)
+            for module in targets:
+                if hasattr(module, 'is_dangerous_removal_path'):
+                    module.is_dangerous_removal_path = is_dangerous_removal_path
+            applied.append('unrestricted_removal')
+
+    if allow_write_globs:
+        original_validate = path_validator.validate_path
+        if not getattr(original_validate, _PERMISSION_FLAG, False):
+
+            def validate_path(path, cwd, allowed_dirs, op_type, **kwargs):
+                """Let a glob through a write/create path, scope-checked as usual.
+
+                The glob is handed on as the directory it expands inside, which
+                is what the original checks anyway once past the deny -- and it
+                is ms-agent's own ``get_glob_base_directory`` that decides where
+                that boundary falls, so no policy is restated here. Quotes are
+                stripped first for the same reason the original does it: a
+                quoted ``'src/*'`` would otherwise yield a base of ``'src``.
+                """
+                if op_type in ('write', 'create'):
+                    bare = path
+                    if len(bare) >= 2 and bare[0] == bare[-1] and bare[0] in ('"', "'"):
+                        bare = bare[1:-1]
+                    if path_validator.GLOB_CHARS & set(bare):
+                        base = path_validator.get_glob_base_directory(bare)
+                        return original_validate(base, cwd, allowed_dirs, op_type,
+                                                 **kwargs)
+                return original_validate(path, cwd, allowed_dirs, op_type, **kwargs)
+
+            setattr(validate_path, _PERMISSION_FLAG, True)
+            for module in targets:
+                if hasattr(module, 'validate_path'):
+                    module.validate_path = validate_path
+            applied.append('allow_write_globs')
+
+    return applied
 
 
 def _usable_llm(cfg) -> bool:
@@ -317,6 +410,11 @@ class ToolRuntime:
         self.agent._event_sink = None
         self.agent._input_source = None
         self.workspace = workspace
+        # Before prepare_runtime(), which is what builds SafetyGuard and its
+        # validators. Read off the merged config for the same reason `llm` is:
+        # ms-agent layers its own agent.yaml underneath ours, so this is what
+        # actually took effect rather than what our file happens to say.
+        self.permission_patches = _patch_permission(*self._safety_switches())
         self._loop = _LoopThread()
         self._loop.run(self._prepare())
         # Only after prepare_tools(): a contract can only be read off a tool that
@@ -326,6 +424,29 @@ class ToolRuntime:
     async def _prepare(self) -> None:
         self.agent.prepare_runtime()
         await self.agent.prepare_tools()
+
+    def _safety_switches(self) -> Tuple[bool, bool]:
+        """``(unrestricted_removal, allow_write_globs)`` as configured.
+
+        Absent means off, which is what an unmodified ms-agent does with these
+        keys anyway -- so a config that never mentions them keeps every refusal.
+
+        Warns when ``dangerous_removal_paths`` is configured alongside
+        ``unrestricted_removal``, because the patch makes that list moot and a
+        silently ignored blacklist is the one outcome worth shouting about.
+        """
+        rules = {}
+        permission = getattr(self.agent.config, 'permission', None)
+        if permission is not None:
+            rules = getattr(permission, 'safety_rules', None) or {}
+        unrestricted = bool(_cfg_get(rules, 'unrestricted_removal', False))
+        globs = bool(_cfg_get(rules, 'allow_write_globs', False))
+        if unrestricted and _cfg_get(rules, 'dangerous_removal_paths', None):
+            sys.stderr.write('[tool_server] WARNING unrestricted_removal bypasses the '
+                             'rm/rmdir path check entirely, so the configured '
+                             'dangerous_removal_paths list will not be consulted\n')
+            sys.stderr.flush()
+        return unrestricted, globs
 
     @property
     def _tm(self):
@@ -567,6 +688,20 @@ def _as_text(result: Any) -> str:
         return str(result)
 
 
+def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` off an OmegaConf node or a plain dict.
+
+    The permission section arrives as a DictConfig when the yaml declares it and
+    as a dict when it is assembled in code, and only one of those answers to
+    ``.get``.
+    """
+    if node is None:
+        return default
+    if isinstance(node, dict):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
 class _Handler(BaseHTTPRequestHandler):
     runtime: ToolRuntime = None  # set on the class before the server starts
     protocol_version = 'HTTP/1.1'
@@ -633,8 +768,10 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     names = [(t.get('function') or {}).get('name') for t in runtime.tools()]
     llm_note = 'llm configured' if runtime.has_llm else 'no llm (read_file.abbreviate withdrawn)'
-    sys.stderr.write(f'[tool_server] ready on {args.host}:{args.port}, {llm_note}, '
-                     f'{len(names)} tools: {names}\n')
+    perm_note = (', permission: ' + '+'.join(runtime.permission_patches)
+                 if runtime.permission_patches else '')
+    sys.stderr.write(f'[tool_server] ready on {args.host}:{args.port}, {llm_note}'
+                     f'{perm_note}, {len(names)} tools: {names}\n')
     sys.stderr.flush()
     server.serve_forever()
 
