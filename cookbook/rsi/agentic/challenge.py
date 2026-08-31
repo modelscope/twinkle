@@ -8,7 +8,13 @@ Three resources, each a queue anyone may put a request on:
             worker (``enable_continous_work``), so a batch of one is a first-class
             call and 32 threads calling it concurrently is the intended use.
   API       qwen3.8-max, for the stages that must not add untrained tokens: the
-            check script, the problem statement, and the rubric.
+            check script, the problem statement, the rubric, and the keyword bank.
+            Keywords joined this list after measuring what the local model produced
+            for it: 31% of ``transform`` entries named an activity on a running
+            system rather than a computation, and 71% of the bank comes from an
+            expand prompt that had no category rules in it at all. Iteration 9 ran
+            18 refills through the API with the rules added and 1 of 105 keywords
+            missed, against 24% of the bank built without them.
 
 Nothing waits for a batch. A proposal that finishes its build hands its statement
 straight to eight solver jobs and lets go of its sandbox; those eight run whenever
@@ -682,6 +688,15 @@ class Run:
         self.problem_params = SamplingParams(max_tokens=args.problem_max_tokens,
                                              num_samples=1, temperature=args.propose_temp,
                                              top_p=0.95)
+        # Keeps the local path's temperature and top_p rather than the 1.0/0.95 the
+        # other two API stages use. The high temperature is deliberate here -- the
+        # bank is worthless if every refill returns the same phrases -- and moving
+        # the model and the temperature in one step would leave no way to tell which
+        # one changed the result.
+        self.keyword_api_params = SamplingParams(max_tokens=args.keyword_max_tokens,
+                                                 num_samples=1,
+                                                 temperature=args.keyword_temp,
+                                                 top_p=0.98)
 
         # Built once: the cap is part of the system prompt, so a build that got a
         # different one would be a different experiment.
@@ -788,10 +803,35 @@ class Run:
                     + ('\nDo NOT repeat any of these already-used topics: '
                        + ', '.join(avoid) if avoid else '')
                     + f'\n(batch {self.nonce}-{i})')
-            traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
-                                 {'role': 'user', 'content': user}]}
-            out = self.keyword_rollout([traj])
-            reply = self._assistant_text(out[0] if out else {})
+            # Asked of the API model rather than the local one. Keyword text never
+            # enters a trajectory -- it is parsed into a list and thrown away -- so
+            # this adds no untrained tokens, which is the rule that decides what may
+            # use the API. And the bank is the single input every task downstream is
+            # built from: measured over the 1344 keywords iterations 1-7 generated
+            # locally at temperature 1.3, against category rules the model is shown
+            # in full, 31% of transform named an activity on a running system rather
+            # than a computation, 13% of domain named an operation rather than
+            # material, and 24% of edge_case needed hardware the container does not
+            # have. Downstream, 42-70% of statements described themselves as
+            # simulating their own subject matter, which is what a keyword the
+            # sandbox cannot honour turns into. A 4B policy at that temperature is
+            # the wrong instrument for a constraint list this long.
+            #
+            # Falls back to the local model instead of giving up: an unreachable API
+            # must not leave a category dry, because dry means keyword-less prompts
+            # and a run that looks healthy while producing one prompt over and over
+            # -- the exact failure the refill logic already guards against.
+            out = None
+            messages = [{'role': 'system', 'content': P.KEYWORD_SYSTEM}]
+            reply = api_one(self.api, messages, user, self.keyword_api_params,
+                            self.api_extra)
+            via = 'api'
+            if reply is None:
+                traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
+                                     {'role': 'user', 'content': user}]}
+                out = self.keyword_rollout([traj])
+                reply = self._assistant_text(out[0] if out else {})
+                via = 'local-fallback'
             parsed = parse_keyword_list(reply)
             new = [k for k in parsed if k.lower() not in seen]
             for keyword in new:
@@ -799,7 +839,7 @@ class Run:
             fresh.extend(new)
             self.rec.keywords({'category': category, 'prompt': user, 'reply': reply,
                                'parsed': parsed, 'n_parsed': len(parsed),
-                               'n_new': len(new),
+                               'n_new': len(new), 'via': via,
                                'stop_reason': (out[0].get('stop_reason') if out else None),
                                'truncated': bool(out[0].get('truncated')) if out else None})
             if len(fresh) >= want:
@@ -835,17 +875,29 @@ class Run:
         added = 0
         for i, (category, keyword) in enumerate(hard):
             self.nonce += 1
-            traj = {'messages': [
-                {'role': 'system', 'content': P.KEYWORD_SYSTEM},
-                {'role': 'user',
-                 'content': P.KEYWORD_EXPAND_USER.format(kw=keyword, m=8)
-                 + f'\n(batch {self.nonce}-{i})'}]}
-            out = self.keyword_rollout([traj])
-            reply = self._assistant_text(out[0] if out else {})
+            user = (P.KEYWORD_EXPAND_USER.format(kw=keyword, m=8,
+                                                 desc=P.CATEGORY_DESC[category])
+                    + f'\n(batch {self.nonce}-{i})')
+            # Same reasoning as the refill path: the API model, falling back to the
+            # local one. This path matters more, not less -- it wrote 960 of the 1344
+            # keywords the first seven iterations banked, at more than twice their
+            # rule-break rate, so it is the one shaping what later iterations draw.
+            out = None
+            messages = [{'role': 'system', 'content': P.KEYWORD_SYSTEM}]
+            reply = api_one(self.api, messages, user, self.keyword_api_params,
+                            self.api_extra)
+            via = 'api'
+            if reply is None:
+                traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
+                                     {'role': 'user', 'content': user}]}
+                out = self.keyword_rollout([traj])
+                reply = self._assistant_text(out[0] if out else {})
+                via = 'local-fallback'
             parsed = parse_keyword_list(reply)
             added += self.store.add(category, parsed, source='expand', parent=keyword)
             self.rec.keywords({'category': category, 'parent': keyword, 'prompt': 'expand',
-                               'reply': reply, 'parsed': parsed, 'n_parsed': len(parsed)})
+                               'reply': reply, 'parsed': parsed, 'n_parsed': len(parsed),
+                               'via': via})
         self.store.save()
         logger.info(f'[challenge] expanded {len(hard)} hard keyword(s) -> '
                     f'+{added} same-domain topics')

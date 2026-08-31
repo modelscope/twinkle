@@ -140,7 +140,15 @@ ROOT="output/rsi_agentic/${TAG}"
 # disk holds one 4B model rather than one per iteration. The previous round's
 # weights are gone once the next save starts: if a save dies partway there is
 # nothing to fall back to but BASE_MODEL.
-CKPT_DIR="$ROOT/ckpt"
+#
+# Overridable because this is the one path whose filesystem shows up in wall-clock:
+# every iteration reads it 1 + GPUS times, once per vLLM worker at collect and once
+# more at train, so 7.6 GB of weights is around 60 GB of reads per iteration. Two
+# filesystems on this host, same 1.5 T free, measured with dd at 1.5 GB: the repo's
+# own disk reads at 223 MB/s and the parallel one at 1074 MB/s -- 4.8x, which showed
+# up as five minutes of vLLM startup before any topic was launched. Left at $ROOT/ckpt
+# by default so a host with one disk needs to know nothing about this.
+CKPT_DIR="${CKPT_DIR:-$ROOT/ckpt}"
 # Written with ${VAR-default} rather than ${VAR:-default} so that TASK_BANK=""
 # means off; with the colon an empty value would silently get the default back.
 TASK_BANK="${TASK_BANK-$ROOT/task_bank.jsonl}"

@@ -31,6 +31,37 @@ CATEGORIES = ['transform', 'domain', 'edge_case']
 
 # Each category gives three examples, then pushes away from them, then pins the
 # answer to what the sandbox can actually build and read back.
+#
+# The three pins below were each added against a measured miss rate. Counted over
+# the 1344 keywords iterations 1-7 put in keywords.jsonl, scored by the regexes in
+# .temp/prune_keywords.py so the numbers can be reproduced (they are lower bounds --
+# a phrase can be wrong without matching):
+#   transform  517 entries, 37% miss: 31% named an ACTIVITY on a running system
+#              rather than a computation ("Debug memory leaks in multi-threaded
+#              applications", "Monitor system load metrics", "Swap Space
+#              Configuration") and 10% needed hardware or kernel access
+#   domain     503 entries, 17% miss: 13% named what someone DOES rather than what
+#              it is done to ("File format conversion", "Binary data parsing",
+#              "network namespace isolation"), despite the existing rule already
+#              saying "a FILE FORMAT or a DATA STRUCTURE, never a device"; 4%
+#              named a device. Hand-reading a sample puts this category higher than
+#              the regex does -- "Optimize server performance" is a domain entry
+#              and matches nothing -- so 17% is the floor, not the estimate
+#   edge_case  324 entries, 24% needed real hardware or a kernel subsystem
+#              ("USB device enumeration delay", "Linux bridge MAC addresses")
+# The edge_case number had a plain cause: this category was the only one with no
+# container pin at all, so it was free to name devices.
+#
+# Why this matters downstream: a keyword the container cannot honour does not
+# produce a hard task, it produces a pretend one. Across iterations 1-7, 42-70%
+# of statements (mean 53%) described themselves as simulating or synthesising
+# their own subject matter, which is what "analyse TCP congestion" collapses into
+# when there is no TCP stack to look at. The task then tests whether the solver
+# can follow a spec for generating fake data.
+#
+# Not measured: whether these three additions actually lower those rates. They
+# are worded to name the failure rather than restate the rule, because the
+# existing domain pin shows a rule the generator agrees with and ignores.
 _LEAVE_THE_EXAMPLES = (
     '. These three are only to show the form of an answer -- do NOT stay '
     'near them; name things from as many different areas of computer '
@@ -42,10 +73,27 @@ _PINNED_TO_CONTAINER = (
     'reportlab, lxml, pyarrow, matplotlib), sqlite3, ffmpeg, imagemagick, git, '
     'jq, tar/zip/7z, poppler-utils and pip -- and NO compiler, no GPU, no docker, '
     'no hardware devices. Name a FILE FORMAT or a DATA STRUCTURE, never a device '
-    'or a service')
+    'or a service, and never an ACTIVITY carried out on material: "binary data '
+    'parsing", "file format conversion" and "traffic analysis" all name something '
+    'a person does, not something that sits in a file waiting to be read')
 _PINNED_COMPUTATION = (
     ', but only computations that run in that same container: not compiling, not '
-    'flashing firmware, not driving hardware')
+    'flashing firmware, not driving hardware. It has to be a FUNCTION of data '
+    'that can sit in a file -- given the input there is one right answer, and a '
+    'script can recompute it and check it. An activity carried out on a live '
+    'system is not one: "debug X", "monitor X", "detect X in real time", '
+    '"configure X" and "X strategy" have no answer to check, so name the '
+    'calculation instead ("reconstruct the allocation timeline from a heap trace" '
+    'rather than "debug memory leaks")')
+# edge_case had no pin before, and 18% of what it produced needed a device. A
+# twist is only usable if it survives being written down in a file: the solver
+# starts in an empty directory and can only be handed data.
+_PINNED_EDGE = (
+    ', and only a twist that can be REPRODUCED from data in a file: a property of '
+    'the input or of the arithmetic over it. Not the behaviour of a device, a '
+    'kernel subsystem, a real clock, a network peer or another process -- those '
+    'cannot be put in the solver\'s empty directory, so a task built on them can '
+    'only pretend')
 
 CATEGORY_DESC = {
     'transform': 'a specific, non-trivial transformation the solver must COMPUTE '
@@ -58,7 +106,8 @@ CATEGORY_DESC = {
               + _PINNED_TO_CONTAINER,
     'edge_case': 'a twist that makes a naive or copy-the-statement solution fail '
                  'and forces careful handling. For example: floating-point '
-                 'rounding, byte order, cycles in a tree' + _LEAVE_THE_EXAMPLES,
+                 'rounding, byte order, cycles in a tree' + _LEAVE_THE_EXAMPLES
+                 + _PINNED_EDGE,
 }
 
 # ── Keyword generation ─────────────────────────────────────────────────────
@@ -79,10 +128,53 @@ KEYWORD_USER = (
     'Return ONLY a JSON array of short strings, nothing else.'
 )
 
+# This prompt writes most of the bank, and until now it was the only one with no
+# category rules in it. Of the 1344 keywords iterations 1-7 produced, 960 (71%) came
+# from here and 384 from the refill above -- and 31% of the expanded ones break their
+# category's rules against 14% of the generated ones. The mechanism is visible in the
+# data: asked for keywords related to "Deduce network protocol versions", a legitimate
+# computation over captured bytes, it returned "Analyze network traffic patterns",
+# "Troubleshoot DNS resolution issues", "Debug TCP/IP stack issues", "Review firewall
+# rule sets" and "Monitor honeypot logs" -- each a step further from anything a check
+# script can verify. One good keyword decays into eight bad ones, and those eight are
+# what later iterations draw from.
+#
+# So the category description goes in, and with it a sentence saying that being
+# related to the parent does not excuse leaving the category. That second part is
+# load-bearing: every parent here was chosen for being HARD, and a keyword can be
+# hard precisely because the sandbox cannot honour it, in which case following it
+# faithfully is the wrong move.
+#
+# Measured after the change, over iteration 9's 18 refill calls (all via the API,
+# ``keyword_gen.jsonl`` 'via' field): 1 of 105 accepted keywords breaks its category's
+# rules, against 24% of the bank iterations 1-7 built, and that one is a false positive
+# of the scorer ("Amdahl's law speedup bound from parallel workload profile", flagged
+# on the noun "profile"). The wording works.
+#
+# What it broke: 39 of the 144 keywords the model returned (27%) were silently dropped
+# by ``parse_keyword_list``, which keeps only strings of 60 characters or less. All but
+# one were transform -- five of its six calls came back with a median length of 65-98
+# characters, one with all eight over the cap and nothing left. Cause is in this file:
+# KEYWORD_USER says "2-5 words" and this prompt only said "short strings", so the
+# instruction to name a calculation rather than an activity ("reconstruct the
+# allocation timeline from a heap trace") was followed at sentence length. domain came
+# back at a 4-23 character median and edge_case at 32-42, both well clear. The cap is
+# named here in characters because it is a silent filter in library code: a keyword
+# over it does not warn, it just never exists.
+
 KEYWORD_EXPAND_USER = (
     'The keyword "{kw}" produced a very hard task. List {m} related keywords '
-    'in the same domain that might produce similarly challenging but different '
-    'tasks. Return ONLY a JSON array of short strings, nothing else.'
+    'that might produce similarly challenging but different tasks.\n\n'
+    'They belong to this category, whose rules bind them exactly as they bound '
+    'the keyword above:\n{desc}\n\n'
+    'Being related to "{kw}" does not exempt them. If that keyword itself sits '
+    'outside these rules -- and it may, since it was picked only for being hard '
+    '-- move back towards the rules instead of following it further out.\n\n'
+    'Each must be 2-5 words and at most 60 characters: a topic to build a task '
+    'around, not a description of the task. "heap free-list reconstruction" is '
+    'one; "reconstruct the heap free-list state from a sequenced alloc/free '
+    'trace" is a task statement and will be thrown away. Return ONLY a JSON '
+    'array of short strings, nothing else.'
 )
 
 
@@ -132,11 +224,35 @@ BUILD_SIZE_CAP = (
     'model in about twenty tool calls.'
 )
 
+# The three keywords are drawn independently, one per category, with nothing
+# checking that they belong together (``draw_keywords`` takes a random unused entry
+# from each). So a proposal regularly gets a triple no honest task covers -- iter7
+# produced "TCP Congestion Control" + "Geospatial algorithms" + "hash collision",
+# and iter1 "Detect memory leaks in real-time" + "Guitar tablature" + "Thread
+# stack fragmentation". Told to exercise all three, the model has one way out:
+# invent data that stands in for the parts it cannot have, which is how 42-70% of
+# statements (mean 53%) across iterations 1-7 came to describe themselves as
+# simulating their own subject matter.
+#
+# The escape hatch below is deliberately not "ignore a keyword": that would lose
+# the diversity the draw exists to create, and the keyword bank's used-marks would
+# stop describing what was actually built. Demoting one to background keeps the
+# draw meaningful while letting the task be about something real.
+#
+# Not measured: the effect on the simulate rate, and the cost in diversity if the
+# model demotes more often than it needs to. Both are visible in the next run --
+# the statements are in tasks.jsonl and the draws in groups.jsonl.
 FROM_KEYWORDS = (
     'Your direction for this task:\n{keywords}\n\n'
     'Build something complex and realistic that exercises the topics above. '
     'Work in the '
-    'current empty directory, producing files and/or computed output.'
+    'current empty directory, producing files and/or computed output.\n\n'
+    'Those three are a starting point, not a checklist. If all three can only be '
+    'combined by pretending -- generating fake data to stand in for something '
+    'this container cannot have, or inventing a scenario no engineer would meet '
+    '-- then let ONE of them stay in the background and build a task the other '
+    'two support honestly. A real computation over material you actually '
+    'constructed is worth more than a simulation that name-checks everything.'
 )
 
 # ── Stage 2: write the check script ────────────────────────────────────────
@@ -160,6 +276,27 @@ FROM_KEYWORDS = (
 # The noise floor from sampling one prompt twice is 2 points on the source-text rate
 # and 14 on handover, so nothing moved.
 
+# The rule about DERIVED values was added last, against a case where every other
+# rule was satisfied and the check still did not test the task. An iter7 proposal
+# specified a hash table with bucket size 100 and chaining for collisions, but the
+# key was (latitude + longitude) % 100 on floats, so 1000 coordinates produced 1000
+# distinct keys and not one collision ever happened. Its check asserted the bucket
+# count, the threshold, the CSV header and the first coordinate -- all true, all
+# shell -- and passed with reward 0.986, so the solver trained on a task whose
+# stated subject was never exercised.
+#
+# Measured over the 533 check scripts of iterations 1-7: median 6 asserts (range
+# 2-16, 45% outside the 2-6 the rules ask for) and 46% run a program via
+# subprocess. So the shortage is not in volume. Note 46% against the 86-90%
+# recorded above: those were measured on run_clean9's workspaces, and here the
+# build stage usually leaves its outputs on disk already, so reading them is
+# legitimate.
+#
+# Not added, for lack of evidence: a rule against matching a float by its printed
+# digits. It looked like a problem from one example ('58.54579654631016: [0]' in
+# content) but only 2 of 533 scripts compare floats without a tolerance, and the
+# rest already use abs(got - expected) < eps. A rule earns its words here.
+
 CHECK_FOLLOWUP = (
     'Now write a python script that ASSERTS properties of the state you just '
     'produced. It runs in the same directory you worked in.\n\n'
@@ -175,6 +312,11 @@ CHECK_FOLLOWUP = (
     '- 2-6 asserts, standard library only.\n'
     '- Assert only about files holding RESULTS. Never about the text of a '
     'program: not a line it contains, not a name it mentions, not its length.\n'
+    '- At least one assert must pin a DERIVED value: something no one could '
+    'write down without doing the computation -- a total, an ordering, a decoded '
+    'field, a solved quantity. Existence of a file, a header row, a column name '
+    'and a value copied from the input are all shell: a program that produced '
+    'them and got the arithmetic wrong must still fail this script.\n'
     '- If a result only exists once a program runs, RUN it -- '
     'subprocess.run([sys.executable, "thing.py"], capture_output=True, '
     'text=True) -- and assert on what it printed or the files it left.\n'
@@ -193,6 +335,11 @@ CHECK_FOLLOWUP = (
 )
 
 # ── Stage 2b: the one chance to fix a check that did not pass ──────────────
+# "Drop an assertion you cannot make true" and the new DERIVED rule pull against
+# each other: the assert most likely to fail here is exactly the derived one, since
+# the shell asserts (a path exists, a header matches) were already true when they
+# were written. Dropping it is the cheapest way to make the script pass, and it
+# lands back at the check that tests nothing. Hence the carve-out below.
 
 CHECK_RETRY_FOLLOWUP = (
     'That script does not pass. Running it in that directory gave:\n\n'
@@ -205,6 +352,10 @@ CHECK_RETRY_FOLLOWUP = (
     'here. Drop an assertion you cannot make true instead of weakening every one '
     'of them; what stays must still fail for a directory that does not hold this '
     'state.\n\n'
+    'One assertion you may not drop: the one pinning a computed value. If it is '
+    'the one that failed, correct it against the listing -- read the value there '
+    'and assert that -- because a script left asserting only paths, headers and '
+    'input values passes for a program that got the computation wrong.\n\n'
     'Same rules as before: standard library only, 2-6 asserts, no file sizes, '
     'checksums, timestamps, script source text, whole-file exact-string '
     'equality, or claims about the exact set of files in the directory. Keep it '

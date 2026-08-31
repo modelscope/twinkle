@@ -356,7 +356,19 @@ def main():
         # Every numeric metric GRPOMetric returned: loss, clip fractions, approx_kl.
         **{k: v for k, v in log.items() if isinstance(v, (int, float))},
     }
-    upload(challenge, training)
+    # Caught rather than allowed to propagate, because this is the last statement
+    # of the run and loop.sh reads its exit status: an unreachable dashboard would
+    # otherwise take down a loop whose checkpoint is already on disk, and -- worse
+    # than losing the charts -- leave the iteration without its iteration.done
+    # marker, so the next start would redo the iteration from weights that already
+    # contain it. Measured: swanlab 0.7.17 with no api key raises KeyFileError
+    # here, which is exactly the case this has to survive. The numbers are in
+    # challenge_metrics.json and train_summary.json either way.
+    try:
+        upload(challenge, training)
+    except Exception as e:
+        logger.warning(f'[train] swanlab upload failed, charts lost but the '
+                       f'checkpoint and the json metrics are not: {type(e).__name__}: {e}')
 
 
 if __name__ == '__main__':
