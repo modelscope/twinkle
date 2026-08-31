@@ -38,6 +38,7 @@ Prompt text is not here. Every string the model sees arrives in
 """
 import ast
 import json
+import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -241,6 +242,77 @@ def brittle_check_reason(script: str) -> Optional[str]:
     return None
 
 
+# Literals shorter than this match by accident: a statement contains "3" or "id"
+# for its own reasons. Measured on 188 tasks from run_clean9, one and two digit
+# integers appeared in both the check and the statement 91% of the time, which is
+# what an unattributable coincidence rate looks like.
+_MIN_DERIVED_LEN = 3
+
+
+def derived_check_literals(script: str) -> List[str]:
+    """The values a check compares against that the solver is meant to work out.
+
+    A measurement tool, not part of the proposing path. It exists because "does the
+    statement give away the answer" cannot be asked without first separating the
+    three kinds of thing a check's literals are, and only one of them is a leak:
+
+      an identifier, or a name with a file extension
+            The statement MUST carry these. It is naming the file to create and the
+            fields to put in it; a statement that withheld them would describe no
+            particular output at all. Present in 84-93% of run_clean9's statements,
+            which is the correct rate.
+      text that appears in the workspace
+            Input data, which the statement is meant to quote verbatim so the solver
+            can write the same bytes. Not separated here -- the caller filters on
+            the snapshot if it wants to.
+      a long number, a float, or a string that is none of the above
+            Only exists once the work has been done. This is the group returned.
+
+    Feeding the result back to the statement stage as a forbidden list was tried and
+    did not reduce the leak: see the note above PROBLEM_FOLLOWUP_RULES_ONLY in
+    cookbook/rsi/agentic/prompts.py for the two forms measured and their p-values.
+
+    Wrong at the edges by construction: a column named ``total_2024`` reads as an
+    identifier and is not returned, and a computed value that lands on two digits is
+    below the length floor.
+    """
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return []
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for side in [node.left] + list(node.comparators):
+            if not isinstance(side, ast.Constant):
+                continue
+            v = side.value
+            if isinstance(v, bool) or v is None:
+                continue
+            if isinstance(v, (int, float)):
+                text = repr(v)
+                if len(text.lstrip('-').replace('.', '')) < _MIN_DERIVED_LEN:
+                    continue
+                out.append(text)
+            elif isinstance(v, str):
+                if len(v) < _MIN_DERIVED_LEN:
+                    continue
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', v):
+                    continue
+                # A trailing extension means a filename -- but only when the part
+                # after the dot is not itself digits. '0.001' read out of a CSV is a
+                # string here, and skipping it as a filename would let exactly the
+                # kind of value this function exists to catch through.
+                if re.search(r'\.[A-Za-z]\w{0,4}$', v) and ' ' not in v:
+                    continue
+                out.append(v)
+    # Longest first: a short literal is often a substring of a longer one, and
+    # naming the long one first makes the list read as distinct values rather than
+    # as prefixes of each other.
+    return sorted(set(out), key=len, reverse=True)
+
+
 
 def parse_problem_statement(text: str) -> Optional[str]:
     """Extract a problem statement from the model's reply.
@@ -406,7 +478,7 @@ class AgenticChallenger(Challenger):
             episode plus the end state and reasons at length before answering,
             and one that runs out of budget mid-thought never emits its code
             block and is thrown away as unparseable.
-        followup_api: optional OpenAI-compatible API client (e.g. qwen3-max). When
+        followup_api: optional OpenAI-compatible API client (e.g. qwen3.8-max). When
             given, exploration still runs on the local explorer -- so its turns keep
             their ``labels`` and ``logprobs`` and remain trainable -- but the
             check-script (success judgement) and problem-statement stages are
@@ -416,7 +488,7 @@ class AgenticChallenger(Challenger):
             exploration" split. ``None`` keeps the single-model behaviour where the
             local model writes those two stages in the same conversation.
         followup_extra_body: extra request body forwarded on every ``followup_api``
-            call (e.g. ``{'thinking_budget': N}`` to cap qwen3-max reasoning).
+            call (e.g. ``{'thinking_budget': N}`` to cap qwen3.8-max reasoning).
             ``None`` sends the request unmodified. Ignored when ``followup_api`` is
             ``None``.
         keyword_explorer: explorer used to brainstorm keywords. Should have no
@@ -495,6 +567,10 @@ class AgenticChallenger(Challenger):
         setup_script_fn: Optional[Callable[..., str]] = None,
         solver_prompt_fn: Optional[Callable[[str], Trajectory]] = None,
         check_retries: int = 1,
+        task_bank: Optional[Any] = None,
+        novelty_fn: Optional[Callable[[List[Dict[str, Any]]], List[Optional[float]]]] = None,
+        novelty_floor: float = 0.5,
+        keep_per_group: int = 0,
         reject_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         propose_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         solver_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -582,7 +658,7 @@ class AgenticChallenger(Challenger):
         self.problem_params = problem_params
         # When set, exploration runs on the (trainable) local explorer as before,
         # but the check-script and problem-statement stages are generated by this
-        # OpenAI-compatible API (e.g. qwen3-max) instead of the local model. The
+        # OpenAI-compatible API (e.g. qwen3.8-max) instead of the local model. The
         # two stages then contribute nothing to the trainable trajectory: the API
         # returns text only, so the episode's ``input_ids`` / ``labels`` /
         # ``logprobs`` stay exactly the exploration turns the local sampler
@@ -590,7 +666,7 @@ class AgenticChallenger(Challenger):
         # generated check script and statement are used solely to build the task.
         self.followup_api = followup_api
         # extra_body sent on every followup API call (e.g. {'thinking_budget': N}
-        # to cap qwen3-max reasoning). None sends the request unmodified.
+        # to cap qwen3.8-max reasoning). None sends the request unmodified.
         self.followup_extra_body = dict(followup_extra_body) if followup_extra_body else None
         self.keyword_explorer = keyword_explorer
         self.min_batch = max(1, min_batch)
@@ -619,6 +695,41 @@ class AgenticChallenger(Challenger):
         self.check_retries = check_retries
         if check_retries:
             prompts.require('check_retry_followup')
+        # Novelty, off unless both of these are given. ``task_bank`` supplies the
+        # tasks earlier iterations produced (see :mod:`.task_bank`); ``novelty_fn``
+        # takes a list of ``{statement, check, references}`` and returns one score in
+        # [0, 1] per entry, or None where it could not judge. Kept as injected
+        # callables for the same reason the sandbox ones are: this class then holds
+        # no opinion about which judge, model or API produces the number, and a test
+        # can hand it a fixed one.
+        self.task_bank = task_bank
+        self.novelty_fn = novelty_fn
+        if not 0.0 <= novelty_floor <= 1.0:
+            raise ValueError(f'novelty_floor must be in [0, 1], got {novelty_floor}')
+        # How much of the reward a proposal keeps when it is judged fully redundant.
+        # 0.5 halves it; 0.0 would be Ornith-1.5's plain ``V x D x N``, which zeroes
+        # it. The floor exists because our N is coarse where theirs is continuous:
+        # scored over run_clean9's 188 tasks, 44% came out at exactly 0.0, and eight
+        # proposals sharing one keyword draw can all land there -- at floor 0 that
+        # group's rewards are all zero, its advantages are all zero after GRPO
+        # subtracts the mean, and eight sandbox rollouts bought nothing. Ornith's own
+        # text says novelty 'should remain secondary to validity and difficulty'.
+        self.novelty_floor = float(novelty_floor)
+        # At most this many of a keyword group's in-band proposals become tasks the
+        # solver side trains on. 0 keeps every in-band proposal, which is what this
+        # did before. At 1 the two sides come out the same size -- eight groups of
+        # eight proposals give 64 proposing trajectories and 8 tasks x 8 attempts =
+        # 64 solving ones -- and the tasks are one per keyword direction instead of
+        # three from the same one.
+        #
+        # The proposals not selected are NOT wasted from the proposing side: each one
+        # still earns its own reward from its own n_pass, so the whole group still
+        # trains. What is dropped is their solver attempts, which were already run to
+        # measure difficulty: at keep_per_group=1 that is 56 proposals x 8 attempts
+        # per round measured and then not trained on.
+        if keep_per_group < 0:
+            raise ValueError(f'keep_per_group must be >= 0, got {keep_per_group}')
+        self.keep_per_group = keep_per_group
         self.reject_sink = reject_sink
         self.propose_sink = propose_sink
         self.solver_sink = solver_sink
@@ -653,6 +764,25 @@ class AgenticChallenger(Challenger):
             # followup_api mode only: a check or statement API call failed. The
             # conversation is then unusable and the proposal is rejected.
             'followup_api_error': 0,
+            # Novelty judging. ``novelty_error``: the batch's call raised, so every
+            # proposal in it scored None and none lost reward for it.
+            # ``novelty_length_mismatch``: the judge returned a different number of
+            # scores than proposals sent, which would pair scores with the wrong
+            # tasks, so all are dropped. ``novelty_unjudged``: proposals the judge
+            # left without a verdict. ``in_band_not_selected``: proposals inside the
+            # difficulty band whose group already contributed its keep_per_group
+            # task.
+            #
+            # These four have to be listed here: _bump does self.stats[key] += n on
+            # a fixed dict, so an unregistered key raises KeyError and takes the
+            # whole collection down. That is what killed loop2/iter1 -- seven
+            # proposals were measured and scored, then the counter line at the end
+            # of _score_novelty crashed and all seven trajectories were lost.
+            'novelty_error': 0, 'novelty_length_mismatch': 0,
+            'novelty_unjudged': 0, 'in_band_not_selected': 0,
+            # Keyword groups given up on because the judge never scored one of
+            # their proposals. Nothing from them is used.
+            'novelty_group_dropped': 0,
         }
         self._hard: List[Tuple[str, str]] = []
 
@@ -991,7 +1121,8 @@ class AgenticChallenger(Challenger):
             return
 
         # Problem-statement stage: one API reply, kept as the task's statement.
-        reply = self._api_reply(messages, self.prompts.problem_followup, self.problem_params)
+        reply = self._api_reply(messages, self.prompts.problem_followup,
+                                self.problem_params)
         if reply is None:
             self._bump('followup_api_error')
             state['reject'] = ('followup_api_error', 'problem-statement API call failed')
@@ -1109,7 +1240,10 @@ class AgenticChallenger(Challenger):
     def _emit_propose(self, rounds: Optional[List[Dict[str, Any]]], outcome: str, *,
                       keywords: Any = (), seeded: bool = False,
                       n_pass: Optional[int] = None,
-                      group_id: Optional[int] = None) -> None:
+                      group_id: Optional[int] = None,
+                      novelty: Optional[float] = None,
+                      selected: Optional[bool] = None,
+                      novelty_dropped: bool = False) -> None:
         """Hand one proposal attempt's rounds to ``propose_sink``.
 
         ``pass_rate`` is the raw fraction of solver attempts that succeeded.
@@ -1117,6 +1251,10 @@ class AgenticChallenger(Challenger):
         :meth:`challenger_reward`, which is the number the proposing side trains
         on; both are written so a run can be re-scored under a different target
         without re-solving anything.
+
+        ``novelty`` is written next to it for the same reason: the reward already
+        has it multiplied in, and a run cannot be re-scored at a different floor --
+        or with novelty taken back out -- from the product alone.
 
         A proposal with no ``n_pass`` never reached difficulty measurement -- it
         was rejected before that -- and scores 0, the same as one nobody or
@@ -1131,7 +1269,19 @@ class AgenticChallenger(Challenger):
             'n_pass': n_pass,
             'n_rollouts': rollouts,
             'pass_rate': (n_pass / rollouts) if (n_pass is not None and rollouts) else None,
-            'challenger_reward': self.challenger_reward(n_pass),
+            'novelty': novelty,
+            'novelty_factor': self.novelty_factor(novelty),
+            'challenger_reward': self.challenger_reward(n_pass, novelty=novelty),
+            # Whether this proposal's task went on to the solver side. Not the same as
+            # ``outcome``: with keep_per_group set, a proposal can be in the difficulty
+            # band and still not be the one its group contributed. Its own reward is
+            # unaffected either way.
+            'selected': selected,
+            # True when the novelty judge never returned a score for at least one
+            # proposal in this group, after NOVELTY_TRIES attempts. The record is
+            # written either way -- the episode really happened and the file is the
+            # audit trail -- but training skips every group carrying this flag.
+            'novelty_dropped': bool(novelty_dropped),
             'keywords': list(keywords or ()),
             'seeded': bool(seeded),
             'rounds': rounds,
@@ -1139,24 +1289,80 @@ class AgenticChallenger(Challenger):
         with self._sink_lock:
             self.propose_sink(payload)
 
-    def challenger_reward(self, n_pass: Optional[int]) -> float:
-        """Score a proposal by how close the solver came to a 50% pass rate.
+    # Where the pass-rate reward peaks, and how wide the peak is. 0.2 is Ornith-1.5's
+    # target (ornith.ai/ornith_1_5.html), which trains its proposer on
+    # ``exp(-(p-p*)^2 / 2s^2)`` rather than on a peak at one half.
+    PASS_RATE_TARGET = 0.2
+    PASS_RATE_WIDTH = 0.3
 
-        ``1 - 2 * |p - 1/2|`` for ``p = n_pass / solver_rollouts``: 1.0 at half
-        the attempts passing, 0 at none or all of them. The shape is the one
-        R-Zero (arXiv 2508.05004) trains its challenger on, and the reason it is
-        peaked at a half rather than at 'hard' is that a GRPO update's size goes
-        with the reward variance within a group, which for a pass/fail solver is
-        ``p(1-p)`` -- largest exactly there.
+    # How many times the novelty judge is asked before a proposal is given up on.
+    # Only the proposals still missing a score are re-sent. Measured need for this:
+    # loop3/iter1 had 1 of 61 measured proposals come back without a verdict, in 1
+    # of its 10 keyword groups, and giving up on that group costs the 56 sandbox
+    # attempts already spent on its 7 proposals.
+    NOVELTY_TRIES = 3
 
-        ``None`` means the proposal never got as far as being solved, and scores
-        0. That is the floor, not a penalty: nothing here can go below 0, so a
-        failed proposal and an unsolvable one are worth the same.
+    def novelty_factor(self, novelty: Optional[float]) -> float:
+        """What a proposal's difficulty score gets multiplied by for its novelty.
+
+        ``floor + (1 - floor) * N``, so N=1 leaves the reward alone and N=0 leaves
+        ``novelty_floor`` of it. See ``novelty_floor`` in ``__init__`` for why there
+        is a floor at all.
+
+        ``None`` returns 1.0, not the floor: it means nobody judged this proposal --
+        no bank, no judge, or the judge's API failed -- and charging a proposal for a
+        measurement that did not happen would make the reward depend on API uptime.
+        """
+        if novelty is None:
+            return 1.0
+        n = min(1.0, max(0.0, float(novelty)))
+        return self.novelty_floor + (1.0 - self.novelty_floor) * n
+
+    def challenger_reward(self, n_pass: Optional[int],
+                          novelty: Optional[float] = None) -> float:
+        """Score a proposal by how close the solver came to a target pass rate.
+
+        ``exp(-(p - p*)^2 / 2s^2)`` for ``p = n_pass / solver_rollouts``, peaked at
+        ``p* = 0.2`` with width ``s = 0.3``.
+
+        This replaced ``1 - 2*|p - 1/2|``, which is what R-Zero (arXiv 2508.05004)
+        uses, for two reasons measured on run_clean9's 87 in-band proposals:
+
+        It was not injective. With 8 rollouts the seven in-band values of ``n_pass``
+        mapped onto four rewards -- 1 and 7 both scored 0.25, 2 and 6 both 0.50 --
+        so a proposal one solver out of eight could do and one seven out of eight
+        could do were worth the same. The whole distinction between too hard and too
+        easy was erased. The gaussian separates all seven.
+
+        Its signal was smaller than its noise. ``n_pass`` is a binomial draw around
+        the proposal's real difficulty, and propagating that draw through each shape
+        gives a noise SD to compare the spread of rewards against: 0.280 signal over
+        0.246 noise for the old shape, against 0.347 over 0.177 here. A ratio of 1.14
+        means over half of what a GRPO group ranks on is which way eight coin flips
+        landed.
+
+        A peak below one half is also the more useful target. A group's update size
+        goes with reward variance, which for a pass/fail solver peaks at p=0.5 -- the
+        argument for the old shape -- but a proposal only teaches the solver
+        something when the solver mostly cannot do it yet.
+
+        ``None`` means the proposal never got as far as being solved, and 0 means no
+        attempt passed. Both score 0, and that floor is now load-bearing rather than
+        incidental: the gaussian evaluated at p=0 is 0.801, higher than the 0.607 it
+        gives a proposal half the attempts solve. Without the gate the best thing a
+        proposer could do is write tasks nobody can finish.
+
+        ``novelty`` multiplies the result through :meth:`novelty_factor`, which is
+        Ornith-1.5's ``R = V x D x N`` with a floor under the N. Left at ``None`` --
+        which is what happens with no task bank or no judge -- the returned number is
+        exactly what it was before novelty existed.
         """
         rollouts = self.solver_rollouts or 0
-        if n_pass is None or not rollouts:
+        if n_pass is None or not rollouts or n_pass <= 0:
             return 0.0
-        return 1.0 - 2.0 * abs(n_pass / rollouts - 0.5)
+        gap = n_pass / rollouts - self.PASS_RATE_TARGET
+        difficulty = math.exp(-(gap * gap) / (2.0 * self.PASS_RATE_WIDTH ** 2))
+        return difficulty * self.novelty_factor(novelty)
 
     def _take_rounds(self, task: Trajectory) -> Optional[List[Dict[str, Any]]]:
         """Detach a task's proposing rounds. Popped even with no sink attached:
@@ -1381,20 +1587,178 @@ class AgenticChallenger(Challenger):
             for i, task in enumerate(tasks)
         ]
         self.on_difficulty_measured(measured)
+        novelties = self._score_novelty(measured)
         high = self.solver_rollouts - self.keep_max_pass_margin
         in_band = [self.keep_min_pass <= n <= high for n in passes]
+        # Which of the in-band tasks the solver side actually trains on. Decided
+        # before emitting so each proposal's record says whether its task was taken.
+        selected = self._select_per_group(measured, passes, in_band, novelties)
+        dropped = self._unscored_group_ids(measured, novelties)
+        if dropped:
+            self._bump('novelty_group_dropped', len(dropped))
         # Emit here, not in _round: this is where a proposal's verdict is
         # decided, and both sides of the band are worth keeping -- a task nobody
         # solved and one everybody solved are the two failure modes the
         # proposer would need to learn to avoid.
-        for task, n, kept_flag in zip(measured, passes, in_band):
+        for i, (task, n, kept_flag, nov) in enumerate(zip(measured, passes, in_band,
+                                                          novelties)):
+            gid = user_data_get(task.get('user_data'), 'group_id', None)
             self._emit_propose(self._take_rounds(task),
                                'kept' if kept_flag else 'outside_band',
                                keywords=user_data_get(task.get('user_data'), 'keywords', []),
                                seeded=user_data_get(task.get('user_data'), 'seeded', False),
                                n_pass=n,
-                               group_id=user_data_get(task.get('user_data'), 'group_id', None))
-        return [t for t, kept_flag in zip(measured, in_band) if kept_flag]
+                               group_id=gid,
+                               novelty=nov,
+                               selected=selected[i],
+                               novelty_dropped=gid in dropped)
+        return [t for t, take in zip(measured, selected) if take]
+
+    def _unscored_group_ids(self, measured: List[Trajectory],
+                            novelties: List[Optional[float]]) -> set:
+        """Keyword groups the novelty judge never finished answering for.
+
+        A group lands here when at least one of its proposals still has no score
+        after ``NOVELTY_TRIES`` attempts. Nothing from such a group is used: no task
+        is taken from it (``_select_per_group``) and its proposals are marked
+        ``novelty_dropped`` so training skips the whole group. The collecting loop
+        then keeps going and a later keyword draw makes up the shortfall.
+
+        Only meaningful when novelty is on. With it off every score is ``None`` by
+        design, which must not drop everything, so an off judge returns no groups.
+        """
+        if self.task_bank is None or self.novelty_fn is None:
+            return set()
+        return {user_data_get(task.get('user_data'), 'group_id', None)
+                for task, nov in zip(measured, novelties) if nov is None}
+
+    def _select_per_group(self, measured: List[Trajectory], passes: List[int],
+                          in_band: List[bool],
+                          novelties: List[Optional[float]]) -> List[bool]:
+        """Which in-band proposals become tasks: all of them, or the best few per group.
+
+        With ``keep_per_group = k > 0``, each keyword group contributes at most its ``k``
+        highest-reward in-band proposals -- reward being the same number the proposing
+        side trains on, ``challenger_reward``, so the task kept is the one whose pass
+        rate sat closest to the target and, when novelty is on, was not judged a repeat
+        of something already in the bank.
+
+        A group with no in-band proposal contributes nothing and is not replaced here:
+        the collecting loop keeps proposing rounds until the run's target number of
+        tasks is reached, so a group that produced none is skipped and paid for by one
+        more group later.
+
+        Proposals with no ``group_id`` (a run with ``proposals_per_group=1``) are each
+        their own group, so this is a no-op for them beyond the in-band filter.
+        """
+        if self.keep_per_group <= 0:
+            return list(in_band)
+        ranked: Dict[Any, List[Tuple[float, int]]] = {}
+        unscored_groups = self._unscored_group_ids(measured, novelties)
+        for i, task in enumerate(measured):
+            if not in_band[i]:
+                continue
+            gid = user_data_get(task.get('user_data'), 'group_id', None)
+            if gid in unscored_groups:
+                # The judge never finished scoring this group, so there is no honest
+                # way to rank its members against each other.
+                continue
+            key = gid if gid is not None else f'_ungrouped_{i}'
+            ranked.setdefault(key, []).append(
+                (self.challenger_reward(passes[i], novelty=novelties[i]), i))
+        selected = [False] * len(measured)
+        for key, entries in ranked.items():
+            # Ties broken by the earlier proposal, so the choice does not depend on
+            # dict or sort instability.
+            entries.sort(key=lambda pair: (-pair[0], pair[1]))
+            for _, i in entries[:self.keep_per_group]:
+                selected[i] = True
+        dropped = sum(1 for i in range(len(measured)) if in_band[i] and not selected[i])
+        if dropped:
+            self._bump('in_band_not_selected', dropped)
+        return selected
+
+    def _score_novelty(self, measured: List[Trajectory]) -> List[Optional[float]]:
+        """One novelty score per measured proposal, ``None`` for every one if off.
+
+        Scored for the whole batch in one call, and with the batch's own statements
+        as part of each proposal's reference set, because the comparison that matters
+        is against the siblings sharing a keyword draw: GRPO subtracts the group mean,
+        so a term that comes out the same for all eight members of a group cancels
+        exactly and the API calls bought nothing. Only same-group siblings go in --
+        an unrelated proposal from the same round is not evidence of redundancy.
+
+        Failures return ``None`` rather than 0.0 and never raise: a judge that is
+        down must not turn into every proposal being redundant, and must not lose a
+        round of sandbox work either.
+
+        A proposal the judge skipped is asked about again, up to ``NOVELTY_TRIES``
+        attempts in total, sending only the ones still missing. Whatever is still
+        unscored after that leaves its whole keyword group out of both the task
+        selection and the training data -- see ``_select_per_group`` and the
+        ``novelty_dropped`` field written by ``_emit_propose``.
+        """
+        if self.task_bank is None or self.novelty_fn is None or not measured:
+            return [None] * len(measured)
+        statements, checks, groups = [], [], []
+        for task in measured:
+            statements.append(self.statement_of(task))
+            checks.append(user_data_get(task.get('user_data'), 'check_script', '') or '')
+            groups.append(user_data_get(task.get('user_data'), 'group_id', None))
+        payload = []
+        for i, statement in enumerate(statements):
+            siblings = [statements[j] for j in range(len(statements))
+                        if j != i and groups[j] is not None and groups[j] == groups[i]]
+            payload.append({'statement': statement, 'check': checks[i],
+                            'references': self.task_bank.references(statement, siblings)})
+        scores: List[Optional[float]] = [None] * len(measured)
+        pending = list(range(len(measured)))
+        for attempt in range(self.NOVELTY_TRIES):
+            batch = [payload[i] for i in pending]
+            try:
+                got = list(self.novelty_fn(batch))
+            except Exception as e:  # noqa
+                logger.warning(f'[{type(self).__name__}] novelty scoring failed on '
+                               f'{len(batch)} proposals, try {attempt + 1} of '
+                               f'{self.NOVELTY_TRIES} ({type(e).__name__}: {e})')
+                self._bump('novelty_error', len(batch))
+                continue
+            if len(got) != len(batch):
+                # Zipping a short list would pair later proposals with someone
+                # else's number, so the whole reply is dropped.
+                logger.warning(f'[{type(self).__name__}] novelty judge returned '
+                               f'{len(got)} scores for {len(batch)} proposals, try '
+                               f'{attempt + 1} of {self.NOVELTY_TRIES}; ignoring them')
+                self._bump('novelty_length_mismatch', len(batch))
+                continue
+            still: List[int] = []
+            for i, score in zip(pending, got):
+                if score is None:
+                    still.append(i)
+                else:
+                    scores[i] = score
+            if not still:
+                break
+            logger.info(f'[{type(self).__name__}] novelty: {len(still)} of '
+                        f'{len(batch)} left unscored on try {attempt + 1}; '
+                        f'asking again')
+            pending = still
+        else:
+            pending = [i for i, s in enumerate(scores) if s is None]
+        unscored = [i for i, s in enumerate(scores) if s is None]
+        if unscored:
+            self._bump('novelty_unjudged', len(unscored))
+            logger.warning(f'[{type(self).__name__}] {len(unscored)} proposal(s) '
+                           f'still unscored after {self.NOVELTY_TRIES} tries; their '
+                           f'keyword groups are dropped')
+        return scores
+
+    def statement_of(self, task: Trajectory) -> str:
+        """The statement text a task was built around: its first user message."""
+        for message in task.get('messages') or []:
+            if isinstance(message, dict) and message.get('role') == 'user':
+                return message.get('content') or ''
+        return ''
 
     def solver_prompt(self, task: Trajectory) -> Trajectory:
         """The statement as the solver first sees it: system message, query, tools.

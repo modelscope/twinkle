@@ -1,0 +1,197 @@
+# ms-agent config for agentic RSI training.
+#
+# Read by both halves of the setup, which is the point:
+#
+#   * the training host loads it to build a MsAgentHarness for message shaping
+#     only -- the entry script drops `llm:` and `tools:` from the merged config
+#     first, so no tool is ever constructed next to the trainer;
+#   * remote_tool_env.py uploads this same file into each sandbox, where
+#     sandbox_server/tool_server.py loads it and does construct the tools.
+#
+# So the tool line-up below describes what runs in the microVM. Editing it takes
+# effect on the next episode; no image rebuild is involved.
+
+prompt:
+  # Replaces ms-agent's BASE_AGENT_PROMPT (prompting/builtin.py) for the SOLVER
+  # only -- the proposing episode gets prompts.py's own SYSTEM through the
+  # challenger, and never reads this field. That built-in prompt is written for a
+  # general assistant sitting in a user's workspace, and two of its lines work
+  # against being a solver: "First decide whether the task needs tools. If you can
+  # answer reliably from what you know ... just answer", and "Ask first when it
+  # isn't [safe]". Here there is no one to ask (interactive: false) and answering
+  # without touching the directory is always wrong.
+  #
+  # The paragraph about the empty directory is what 5 of armA2shellV5's 8
+  # unsolved tasks needed. Their statements listed a file under "Input data:"
+  # and the solver read that as "already present" -- in 5a70b77f it created the
+  # file the rules told it to generate and left the two listed as input alone,
+  # so it was not confused about being in an empty directory, it was following
+  # the statement's own division of labour. Nothing in the statement or the
+  # prompt said that division does not survive into its workspace.
+  # SHORT ARM of the solver-prompt A/B. 242 words down to 190, by the same
+  # subtractive rule used on prompts.py's two followups: every instruction stays, the
+  # sentences arguing for it go. Only 21% shorter, and that is the ceiling -- the
+  # empty-directory paragraph is 90 of the 190 words and is kept whole, because 5 of
+  # armA2shellV5's 8 unsolved tasks needed exactly it. What left: 'nobody is
+  # watching', 'before anything can read them', 'Do not assume', 'however clearly you
+  # can describe what the answer would be', 'Check each thing the task asked for is
+  # actually there', and the How-to-work heading with its bullets folded into prose.
+  #
+  # This file differs from rsi_agent.yaml in this field ONLY -- tools, permission,
+  # timeouts and output_dir are identical (verified by comparing the parsed configs
+  # with prompt removed), so n_pass measured against the two is measuring the prompt.
+  system: |
+    You are a command-line agent working inside a fresh Linux container. You are
+    given one task and you carry it out by running commands and writing files.
+    Nobody can answer a question, so never ask one and never stop to confirm:
+    decide and act.
+
+    Your working directory starts COMPLETELY EMPTY. Every file the task
+    mentions -- including files it describes as inputs, given data, existing
+    configuration, or material you are handed -- does not exist yet. You have to
+    create all of them yourself, with exactly the names and contents the task
+    specifies. A task that shows you the contents of a file is telling you what to
+    write into it, not telling you it is there.
+
+    Start by listing the directory to see the real state. Create every file the
+    task names, then do the computation it asks for and write the results it asks
+    for. Before you finish, list the directory again and read back what you wrote;
+    if something is missing, fix it rather than reporting success. Answering in
+    prose without creating files is a failure. Never state a value you did not
+    compute from the data.
+
+personalization:
+  # Off: SOUL/AGENTS/PROFILE.md from the developer's own workspace would leak
+  # machine-specific context into every training prompt.
+  enabled: false
+
+# One turn == one sampler call. MultiTurnRollout's max_turns is the real limit;
+# this only stops ms-agent from imposing a lower one.
+max_chat_round: 9999
+
+# Never wait on a human: training runs unattended.
+interactive: false
+permission_mode: auto
+
+# How long ms-agent waits around one tool call. Written down rather than left to
+# its default (tool_manager.py TOOL_CALL_TIMEOUT, 120s, overridable by the
+# TOOL_CALL_TIMEOUT environment variable) so the sandbox does not inherit a
+# number from whatever shell started it. It has to stay below what
+# remote_tool_env allows the whole turn (command_timeout, 180s), which in turn is
+# below the transport's budget: the innermost layer should be the one that times
+# out, because it is the only one that knows which call was slow. When they were
+# equal, one command that never returns made every call in the turn read as an
+# unreachable runtime.
+tool_call_timeout: 120
+
+# Path *inside the sandbox*. One microVM per episode already isolates
+# trajectories from each other, so this is a fixed path rather than a per-slot
+# directory; the entry script overrides it only to match --workspace.
+output_dir: /workspace
+
+callbacks: []
+
+tools:
+  # `file_system` is NOT listed here and is nevertheless on. ms-agent's own
+  # ms_agent/agent/agent.yaml declares it (write_file, read_file, edit_file,
+  # grep, glob) and LLMAgent merges this file *over* that one, so omitting a key
+  # inherits it rather than dropping it. Measured: the merged config's tools are
+  # ['file_system', 'code_executor', 'todo_list'], and /tools advertises all ten
+  # of those tools to the model. In armA2shellV6's 128 proposing calls,
+  # file_system took 63 (43 of them write_file) against code_executor's 58.
+  #
+  # So the paragraph that used to be here -- claiming the five were removed to
+  # stop write_file being the path of least resistance -- described a state that
+  # never existed, through the arms named A2shell*, whose whole premise was
+  # "shell and python only". Turning it off takes an explicit
+  # `file_system: {enabled: false}`, which _tool_on (tool_manager.py:47) reads.
+  # Left on for now, deliberately and with the effect known.
+  code_executor:
+    mcp: false
+    # python_env means "run in this process's machine", and that machine is the
+    # microVM -- the sandbox boundary is the VM itself, not this setting. Do not
+    # switch to the docker implementation: it would nest a container inside the
+    # VM for no extra isolation.
+    implementation: python_env
+    include:
+      - shell_executor
+      # Kept alongside the shell so that writing a file does not depend on
+      # getting a heredoc right. Dropping notebook_executor because it overlaps
+      # this one and adds a cell-state model nothing here needs.
+      - python_executor
+  todo_list:
+    mcp: false
+    # Kept out of the workspace root. The plan files default to
+    # `<output_dir>/plan.json` and `plan.md`, and output_dir *is* the directory
+    # whose end state becomes the task: 2 of ex11's 36 proposals wrote checks
+    # asserting the agent's own todo bookkeeping, one of them pinning
+    # `updated_at`, which no solver can reproduce. `.ms_agent/` is where
+    # ms_agent/project/paths.py says framework internals belong, and the
+    # workspace listing already skips it.
+    plan_filename: .ms_agent/plan.json
+    plan_md_filename: .ms_agent/plan.md
+
+# Every refusal ms-agent applies to a shell command, turned off. `allow_network`
+# and the two list-valued keys are read by LLMAgent.prepare_runtime (llm_agent.py
+# builds PermissionConfig.from_dict off this section) and take effect in the
+# sandbox, where tool_server.py loads this same file.
+#
+# The last two keys are different: ms-agent's SafetyConfig does NOT implement
+# them, and from_dict ignores unknown keys without a word, so on their own they
+# would be dead letters. tool_server.py reads them itself and applies the two
+# relaxations as a runtime patch (_patch_permission) inside the sandbox --
+# ms-agent is a harness twinkle supports, so it is used as released rather than
+# forked. The startup line reports which ones took effect.
+#
+# The reason is what the refusals cost here rather than what they protect: this
+# runs in a microVM that is reset once per episode and holds nothing but the
+# workspace, while each refusal rules out a whole family of tasks the model could
+# otherwise pose. `curl`/`wget` blocked means no task can fetch a source tarball
+# or a dataset; the rm rules mean it cannot clear a directory (`rm -rf *` and
+# `rm -rf build/*` are both refused) or write a task that starts from a mess that
+# has to be cleaned up.
+permission:
+  # Drops the default blacklist wholesale: curl, wget, ssh, scp, rsync, nc,
+  # netcat. (Whether the microVM actually has a route out is a separate
+  # question from whether the command is allowed to run.)
+  allow_network: true
+  safety_rules:
+    # Emptied, replacing the three baked-in patterns: `rm -rf /*`, `mkfs *`,
+    # `dd if=*`. An empty list here is not the same as an absent key -- absent
+    # means "use the defaults".
+    patterns: []
+    # Same, for the configurable half of the rm/rmdir path check: `*`, `/*`,
+    # `/`, `~`. Left empty rather than removed to say the intent out loud;
+    # unrestricted_removal below bypasses the whole check, this list included,
+    # and tool_server.py warns at startup if the two ever disagree.
+    dangerous_removal_paths: []
+    # And the half that a config cannot reach, which is why this one needs the
+    # runtime patch: the refusals written into is_dangerous_removal_path for
+    # `*`, anything ending in `/*`, `/`, a direct child of `/` (which
+    # `/workspace` is), and the home directory.
+    unrestricted_removal: true
+    # A separate refusal, found by running commands through SafetyGuard rather
+    # than by reading the config: a glob anywhere in a write or create path is
+    # denied on its own ("Glob patterns not allowed in write operations"), which
+    # is what actually stopped `rm -rf build/*` after the two lists above were
+    # emptied. It is not specific to rm -- `cp src/* dst/` is refused by the same
+    # check. (`chmod +x bin/*` is NOT: measured through SafetyGuard, chmod's
+    # arguments are not extracted as write paths, so it was already allowed.)
+    # Patched by widening the path that is scope-checked to the directory the
+    # glob expands inside, so a glob still cannot reach outside the workspace --
+    # `cp /etc/* /workspace/` stays denied, now for being out of scope.
+    allow_write_globs: true
+
+# Web search is deliberately absent. ms-agent's `web_search` key only provides
+# fetch_page (retrieve a known URL); a real query-a-search-engine tool needs
+# EXA_API_KEY / SERPAPI_API_KEY and is wired separately from the plain tool
+# list. Add it here once that is decided; until then no task should need it.
+
+# No `llm:` section on purpose, and note that omitting it is not the same as
+# disabling it: ms-agent merges this file over its own ms_agent/agent/agent.yaml,
+# which declares `service: modelscope`. The tool server treats a section with no
+# credentials as absent, drops it, and then withdraws the one argument that
+# needed it (read_file's `abbreviate`, an LLM-written file summary) from the
+# advertised schema -- so the model is never offered a tool argument that cannot
+# work. Put a real `llm:` here, with a key reachable from the sandbox, to get
+# that argument back.

@@ -1,15 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Episode construction and scoring for agentic RSI, shared by training and eval.
+"""Episode construction and scoring, shared by collection and eval.
 
-Both halves need the same three things and must not disagree about any of them:
-how an episode is built (a sandbox with ms-agent's tools plus a local harness
-that only shapes messages), how the tool contract is advertised (schemas read off
-the executor that will honour them), and how a trajectory is scored (the task's
-own checks, run against the state the episode left behind).
+Three things must not differ between the run that invents a task and the run that
+measures it: how an episode is built (a sandbox with ms-agent's tools plus a local
+harness that only shapes messages), how the tool contract is advertised (schemas
+read off the executor that will honour them), and how a trajectory is scored (the
+task's own checks, run against the state the episode left behind).
 
-An eval that differed from training on any of these would measure something other
-than what was trained, so this module is the single definition and the scripts
-are only wiring.
+``challenge.py`` takes ``solver_harness`` from here, and ``eval.py`` takes the
+whole boot/score path, so a task kept at n_pass=4 during collection is a task the
+eval measures the same way. A second copy of these lines would drift.
 """
 import json
 import os
@@ -127,8 +127,9 @@ def build_episode(task: Dict[str, Any], cfg: SandboxConfig) -> Tuple[Any, Any, A
     )
     env.reset()
 
-    # A task may hand the solver its input files instead of asking it to write
-    # them (challenge.py --preseed-inputs). Loudly, not on a best-effort basis: a
+    # A task may carry a setup_script that writes its input files instead of asking
+    # the solver to. Nothing produces one now, but a task file from an older run
+    # can still hold one. Loudly, not on a best-effort basis: a
     # statement that says the inputs are on disk, run against a workspace where
     # they are not, scores 0 for a reason that has nothing to do with the task.
     setup = task.get('setup_script')

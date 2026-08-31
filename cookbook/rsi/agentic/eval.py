@@ -1,23 +1,28 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Held-out evaluation for agentic RSI: pass rate on tasks the trainer never saw.
 
-Episodes are built and scored by :mod:`episode`, the same module ``rl.py`` uses,
-so a number reported here is the number training was optimising -- an eval that
-constructed episodes differently would measure a different agent.
+Episodes are built and scored by :mod:`episode`, the same module ``challenge.py``
+takes ``solver_harness`` from, so a number reported here is measured against the
+opening a task's n_pass was measured against -- an eval that constructed episodes
+differently would measure a different agent.
 
-What it adds on top of training is only what training does not need: several
+What it adds on top of collection is only what collection does not need: several
 attempts per task (a single attempt at temperature 1 is a coin flip, not a rate),
-no optimizer, and a LoRA read off disk rather than synced from a live trainer.
+no optimizer, and weights read off disk rather than held by a live trainer.
+
+Weights are named by ``--model-id`` and nothing else. ``train.py`` trains every
+parameter and saves a whole model, so the trained side of a comparison is a
+checkpoint directory in exactly the place the base model's name goes.
 
 Usage::
 
-    # baseline, no adapter
+    # baseline
     python cookbook/rsi/agentic/eval.py --tasks output/.../eval_tasks.jsonl \\
         --label base --out output/.../eval_base.jsonl
 
     # after training
     python cookbook/rsi/agentic/eval.py --tasks output/.../eval_tasks.jsonl \\
-        --adapter-path output/rsi-agentic-final --label trained \\
+        --model-id output/rsi_agentic/<tag>/ckpt/model --label trained \\
         --out output/.../eval_trained.jsonl
 
 Both runs must use the same ``--tasks``, ``--rollouts-per-task`` and sampling
@@ -48,19 +53,31 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--tasks', required=True, help='task jsonl (challenge.py or structured)')
-    p.add_argument('--model-id', default='ms://Qwen/Qwen3-4B')
-    p.add_argument('--adapter-path', default='',
-                   help='LoRA directory saved by rl.py; empty evaluates the base model')
+    p.add_argument('--model-id', default='ms://Qwen/Qwen3-4B',
+                   help='base model name, or a checkpoint directory saved by train.py')
     p.add_argument('--label', default='eval', help='name for this measurement in the log')
     p.add_argument('--sampler-gpus', type=int, default=4)
     p.add_argument('--max-model-len', type=int, default=32768)
-    p.add_argument('--max-lora-rank', type=int, default=32)
 
     p.add_argument('--rollouts-per-task', type=int, default=4,
                    help='attempts per task; the pass rate is over these')
     p.add_argument('--episodes-per-wave', type=int, default=16,
                    help='sandboxes alive at once; keep at or below RSI_ENV_CONCURRENCY')
     p.add_argument('--max-turns', type=int, default=20)
+    # Both have to equal what challenge.py built the tasks under, and neither was
+    # reachable from the command line before: the rollout was constructed with the
+    # class default for the first and with --max-model-len for the second, while
+    # challenge.py passes --stop-after-stuck-turns and leaves the token cap unset.
+    # The stuck cutoff is the one that bites -- it ended 50 to 88 of each
+    # iteration's ~550 attempts -- so an eval that leaves it at 0 measures an agent
+    # that is allowed to repeat itself forever, against tasks whose n_pass was
+    # measured on an agent that was not.
+    p.add_argument('--stop-after-stuck-turns', type=int, default=2,
+                   help="consecutive no-progress turns that end the tool phase; "
+                        "challenge.py's default is 2, 0 disables the cutoff")
+    p.add_argument('--max-trajectory-tokens', type=int, default=0,
+                   help='cap on the whole trajectory; 0 leaves it unset, which is '
+                        'what challenge.py does')
     # Has to equal the challenger's --solver-max-tokens and --propose-max-tokens.
     # An eval that gives the model less room than the run that built the tasks is
     # measuring the budget, not the model: at 4096, 15 of 50 attempts ended on
@@ -86,14 +103,10 @@ def build_sampler(args):
         mode='ray', nproc_per_node=args.sampler_gpus, lazy_collect=False,
         groups=[DeviceGroup(name='sampler', ranks=list(range(args.sampler_gpus)),
                             device_type='GPU')])
-    engine_args = {'gpu_memory_utilization': 0.8, 'max_model_len': args.max_model_len}
-    if args.adapter_path:
-        # Declared at construction or the engine has no slot to load into, which
-        # surfaces much later as an adapter that appears to do nothing.
-        engine_args.update({'enable_lora': True, 'max_lora_rank': args.max_lora_rank})
     sampler = vLLMSampler(
         model_id=args.model_id,
-        engine_args=engine_args,
+        engine_args={'gpu_memory_utilization': 0.8,
+                     'max_model_len': args.max_model_len},
         device_mesh=DeviceMesh.from_sizes(world_size=args.sampler_gpus,
                                           dp_size=args.sampler_gpus),
         remote_group='sampler',
@@ -105,12 +118,10 @@ def build_sampler(args):
 
 def main():
     args = parse_args()
-    if args.adapter_path and not os.path.isdir(args.adapter_path):
-        raise SystemExit(f'[eval] no adapter directory at {args.adapter_path}')
     tasks = load_tasks(args.tasks)
     cfg = SandboxConfig.from_env()
-    logger.info(f'[eval:{args.label}] {len(tasks)} tasks x {args.rollouts_per_task} attempts, '
-                f'adapter={args.adapter_path or "(base model)"}')
+    logger.info(f'[eval:{args.label}] {len(tasks)} tasks x {args.rollouts_per_task} '
+                f'attempts, weights={args.model_id}')
     logger.info(f'[eval:{args.label}] sandboxes: template={cfg.template} api={cfg.api_url}')
 
     sampler = build_sampler(args)
@@ -122,8 +133,8 @@ def main():
         sampling_params=SamplingParams(max_tokens=args.max_tokens, num_samples=1, logprobs=1,
                                        temperature=args.temperature, top_p=args.top_p),
         max_turns=args.max_turns,
-        max_trajectory_tokens=args.max_model_len,
-        adapter_path=args.adapter_path or None,
+        stop_after_stuck_turns=args.stop_after_stuck_turns,
+        max_trajectory_tokens=args.max_trajectory_tokens or None,
     )
 
     # One flat list of attempts, so a wave is a fixed number of sandboxes no

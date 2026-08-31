@@ -1,33 +1,31 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Prompts for the agentic challenger.
+"""Every string this pipeline sends to a model.
 
-One conversation, three stages:
-  Stage 1: the model acts as an agent in a sandbox (multi-turn with tools),
-           producing a tool-call chain and a final workspace state, and stops
-           calling tools.
-  Stage 2: a user message carrying the real workspace listing is appended to that
-           same conversation, asking for a python check script.
-  Stage 3: another user message asks for the problem statement.
+One proposal is one conversation with three stages:
 
-Stages 2 and 3 are appended rather than sent as fresh calls, so the whole chain
-is one sample whose every assistant turn can be trained on. That is also why
-their rules live in user messages: a conversation has one system message, and it
-was already spent on stage 1.
+  1. the model acts in a sandbox, one tool call per reply, until it stops calling
+     tools (``SYSTEM`` + ``FROM_KEYWORDS``);
+  2. a user message carrying the real workspace listing asks for a python check
+     script (``CHECK_FOLLOWUP``, once more via ``CHECK_RETRY_FOLLOWUP`` if it does
+     not pass);
+  3. a user message asks for the problem statement (``PROBLEM_FOLLOWUP``).
 
-The check script is run against the sandbox immediately after stage 2 to verify
-it passes; any task whose own checks fail is thrown away.
+Stage 1 runs on the local model and is what gets trained. Stages 2 and 3 are
+appended to a copy of that same conversation and answered by the API model, so the
+check script and the statement are written with the whole build history in view
+without adding untrained tokens to the sample.
 
-Keyword categories are configurable; the framework (``KeywordStore`` + draw/combine
-logic) is category-agnostic. A proposal draws one entry from each category, and the
-three are facets of ONE task so combining them yields a single non-trivial
-computation:
-  - transform: the computation the task turns on
-  - domain: the material it runs over (data AND code/compilation)
-  - edge_case: the twist that makes a naive solution fail
+The texts below are unchanged from the pipeline this replaced; the comments
+keep the measurements that decided their wording, because a prompt whose numbers are
+lost is a prompt nobody can edit safely.
 """
-from twinkle_agentic.challenger import AgenticPrompts
 
-# ── Keyword categories (framework-agnostic; only the content is scenario-specific) ─
+# ── Keyword categories ─────────────────────────────────────────────────────
+# A proposal draws one entry from each category, and the three are facets of ONE
+# task, so combining them yields a single non-trivial computation:
+#   transform: the computation the task turns on
+#   domain:    the material it runs over
+#   edge_case: the twist that makes a naive solution fail
 
 CATEGORIES = ['transform', 'domain', 'edge_case']
 
@@ -63,11 +61,36 @@ CATEGORY_DESC = {
                  'rounding, byte order, cycles in a tree' + _LEAVE_THE_EXAMPLES,
 }
 
-# ── Stage 1: model acts in sandbox ─────────────────────────────────────────
+# ── Keyword generation ─────────────────────────────────────────────────────
+# ``parse_keyword_list`` reads a JSON array and returns nothing when it cannot find
+# one, so these must ask for a JSON array; keep them in step with the parser.
+
+KEYWORD_SYSTEM = (
+    'You generate diverse topic keywords for training an AI agent that does '
+    'computer engineering work in a Linux sandbox: writing and running programs, '
+    'building, testing and debugging software, processing and analysing data, '
+    'and administering files and the system.'
+)
+
+KEYWORD_USER = (
+    'List {k} diverse, specific topic keywords for the following category:\n'
+    '{desc}\n\n'
+    'Each should be 2-5 words, concrete enough to inspire a specific task. '
+    'Return ONLY a JSON array of short strings, nothing else.'
+)
+
+KEYWORD_EXPAND_USER = (
+    'The keyword "{kw}" produced a very hard task. List {m} related keywords '
+    'in the same domain that might produce similarly challenging but different '
+    'tasks. Return ONLY a JSON array of short strings, nothing else.'
+)
+
+
+# ── Stage 1: the model acts in the sandbox ─────────────────────────────────
 # Only shell_executor and python_executor exist -- there is no directory-listing
 # tool -- so the prompt names ``ls -R`` explicitly and spells tool names in full.
-# One tool call per message: the sampler stops generation at ``</tool_call>``, and
-# a reply that plans many calls but is cut after the first would be trained on a
+# One tool call per message: the sampler stops generation at ``</tool_call>``, and a
+# reply that plans many calls but is cut after the first would be trained on a
 # reasoning that does not match what happened.
 
 SYSTEM = (
@@ -97,19 +120,16 @@ SYSTEM = (
     '"Done." as your final message.'
 )
 
-FROM_SCRATCH = (
-    'Build something complex and realistic in the current empty directory. '
-    'Create files, write scripts, '
-    'process data -- whatever demonstrates '
-    'competent use of the tools. Take as many turns as the work needs, each '
-    'building on the last.'
-)
-
-FROM_SEED = (
-    'Here is an example of the kind of task we want:\n\n{seed}\n\n'
-    'Build something in the same spirit but on a '
-    'different subject, equally complex and realistic. Change what '
-    'is produced and how, not just the names. Work in the current empty directory.'
+# A cap on volume only: the failure it targets is a smaller model running out of
+# tokens writing many files, and the thing that must survive is the computation.
+# Appended to SYSTEM when --max-build-files > 0, which the loop sets to 4.
+BUILD_SIZE_CAP = (
+    '\n- Keep the result SMALL: at most {n} files in total, counting inputs, '
+    'scripts and outputs. No python package (no __init__.py, no importable '
+    'module tree), no command-line interface with subcommands. Depth, not '
+    'volume: one non-trivial computation done properly on a small input beats '
+    'many files. A task built from this state has to be finishable by a smaller '
+    'model in about twenty tool calls.'
 )
 
 FROM_KEYWORDS = (
@@ -119,48 +139,54 @@ FROM_KEYWORDS = (
     'current empty directory, producing files and/or computed output.'
 )
 
-FROM_SEED_KEYWORDS = (
-    'Here is an example task for inspiration:\n\n{seed}\n\n'
-    'Your direction keywords:\n{keywords}\n\n'
-    'Build something complex and realistic that combines the spirit of the '
-    'example with the keyword topics. '
-    'Work in the current empty directory.'
-)
-
 # ── Stage 2: write the check script ────────────────────────────────────────
-# Appended to the episode as a user message once the model stops calling tools,
-# so it says "you": the same conversation did the work. brittle_check_reason() in
-# challenger/agentic.py rejects size/checksum/source-text asserts on the syntax
-# tree and sends the script back through the rewrite path.
+# Appended to the conversation once the model stops calling tools, so it says
+# "you": the same conversation did the work. ``brittle_check_reason`` rejects
+# size/checksum/source-text asserts on the syntax tree and sends the script back
+# through the rewrite path.
+#
+# The substring rule used to read "that an expected substring is present", next to a
+# separate ban on "script source text". Asserting that a .py file contains
+# 'def worker():' satisfies the permission and violates the ban, and on 188 tasks
+# from run_clean9 the permission won 51% of the time. Merging the two rules and
+# adding the subprocess instruction took that to 0% of 50 tasks, with 84% of the new
+# checks running a program instead of reading one.
+#
+# Then shortened from 475 words to 261 by dropping every sentence that argued FOR a
+# rule while keeping the rule. Measured on the same 50 workspaces, temperature 1.0:
+#              asserts .py source text   runs a program   input data handed over
+#   475 words              0%                 86%                  86%
+#   261 words              2%                 90%                  89%
+# The noise floor from sampling one prompt twice is 2 points on the source-text rate
+# and 14 on handover, so nothing moved.
 
 CHECK_FOLLOWUP = (
     'Now write a python script that ASSERTS properties of the state you just '
-    'produced. It will be run in the same directory you worked in.\n\n'
-    'Here is the actual final state of that directory: first every file as '
-    '"path size-in-bytes", then the contents of each one. This listing is the '
-    'ground truth, not your account of what you did. Assert only about paths '
-    'that appear in it, and only about content you can read here. If it is empty '
-    'or shows nothing worth testing, say UNTESTABLE and write no code.\n\n'
+    'produced. It runs in the same directory you worked in.\n\n'
+    "Below is that directory's actual final state: every file as "
+    '"path size-in-bytes", then each one\'s contents. This is the ground truth, '
+    'not your account of what you did. Assert only about paths and content '
+    'visible here. If there is nothing worth testing, say UNTESTABLE and write '
+    'no code.\n\n'
     '{final_state}\n\n'
+    'The solver will be told what its program must DO and writes its own code, '
+    'so two correct programs share their behaviour and nothing else.\n\n'
     'Rules:\n'
     '- 2-6 asserts, standard library only.\n'
-    '- Make the check ROBUST and BROAD: it must pass for ANY correct '
-    'reproduction of this state, and fail only for one that got the work wrong. '
-    'Assert meaning, not form -- that a file exists, that it parses, that a value '
-    'or a row read out of it is right, that an expected substring is present.\n'
-    '- Do NOT pin exact bytes: no file sizes, no checksums, no asserting that a '
-    'whole file equals one exact string, no timestamps, no script source text. A '
-    'different correct solution writes different bytes and would fail such a '
-    'check even though it is right.\n'
-    '- Do NOT constrain the directory as a whole: never assert the exact number '
-    'of files, or that no other files exist. Check only the files that carry the '
-    'result and ignore the rest.\n'
-    '- Never write down a number you did not read above -- do not recompute a '
-    'mean, a count or a checksum in your head.\n'
-    '- A file shown truncated has more content than you can see: assert about the '
-    'part you were shown, not its end or its length.\n'
-    '- Still discriminating: what you keep must fail for a directory that does '
-    'not hold this state. Robust does not mean empty.\n'
+    '- Assert only about files holding RESULTS. Never about the text of a '
+    'program: not a line it contains, not a name it mentions, not its length.\n'
+    '- If a result only exists once a program runs, RUN it -- '
+    'subprocess.run([sys.executable, "thing.py"], capture_output=True, '
+    'text=True) -- and assert on what it printed or the files it left.\n'
+    '- No exact bytes: no sizes, no checksums, no whole-file equality, no '
+    'timestamps.\n'
+    '- No claim about the directory as a whole: not the file count, not that '
+    'nothing else exists.\n'
+    '- Never write a number you did not read above.\n'
+    '- A truncated file holds more than you can see: assert about the shown '
+    'part, not its end or its length.\n'
+    '- Still discriminating: it must fail for a directory that does not hold '
+    'this state.\n'
     '- Exit 0 when every assertion holds, non-zero otherwise.\n'
     '- Do NOT call any tool now. Return ONLY a fenced python code block, no '
     'prose.'
@@ -188,76 +214,46 @@ CHECK_RETRY_FOLLOWUP = (
     'block, no prose.'
 )
 
-
-# ── Keyword generation ─────────────────────────────────────────────────────
-# ``parse_keyword_list`` reads a JSON array and returns nothing when it cannot
-# find one, so these must ask for a JSON array; keep them in step with the parser.
-
-KEYWORD_SYSTEM = (
-    'You generate diverse topic keywords for training an AI agent that does '
-    'computer engineering work in a Linux sandbox: writing and running programs, '
-    'building, testing and debugging software, processing and analysing data, '
-    'and administering files and the system.'
-)
-
-KEYWORD_USER = (
-    'List {k} diverse, specific topic keywords for the following category:\n'
-    '{desc}\n\n'
-    'Each should be 2-5 words, concrete enough to inspire a specific task. '
-    'Return ONLY a JSON array of short strings, nothing else.'
-)
-
-KEYWORD_EXPAND_USER = (
-    'The keyword "{kw}" produced a very hard task. List {m} related keywords '
-    'in the same domain that might produce similarly challenging but different '
-    'tasks. Return ONLY a JSON array of short strings, nothing else.'
-)
-
-
-# ── Arm C: cap what one episode may build ──────────────────────────────────
-# A cap on volume only: the failure it targets is a smaller model running out of
-# tokens writing many files, and the thing that must survive is the computation.
-
-BUILD_SIZE_CAP = (
-    '\n- Keep the result SMALL: at most {n} files in total, counting inputs, '
-    'scripts and outputs. No python package (no __init__.py, no importable '
-    'module tree), no command-line interface with subcommands. Depth, not '
-    'volume: one non-trivial computation done properly on a small input beats '
-    'many files. A task built from this state has to be finishable by a smaller '
-    'model in about twenty tool calls.'
-)
-
-# ── Stage 3: the statement gives the rules, never the computed answer ────────
+# ── Stage 3: the statement gives the rules, never the computed answer ──────
 # The end state is split in two: input data verbatim (it is not the answer), and
-# everything derived given as the rule that produces it -- otherwise the only way
-# to state what a derived file must contain is to quote the computed answer.
+# everything derived given as the rule that produces it -- otherwise the only way to
+# state what a derived file must contain is to quote the computed answer.
+#
+# Stating the split as a rule is not enough: over run_clean9's 154 tasks whose check
+# compares against a computed-looking value, 52% of statements carry EVERY one of
+# them (mean share 0.72). Listing the values instead of describing them was tried on
+# 50 tasks in two forms and both differences sat inside the noise floor (0.059,
+# p=0.10 to 0.53), so the wording is unchanged and the leak rate is a known open
+# problem. A forbidden list can also hide INPUT data, which makes a task unsolvable,
+# and that cost is invisible to every offline metric.
+#
+# Shortened from 328 words to 236 in the same round as CHECK_FOLLOWUP. Measured on
+# the same 50 workspaces, temperature 1.0:
+#                  input data handed over   leak   statement words p50
+#   328 words               86%             0.57           208
+#   236 words               91%             0.64           201
+#   236 + short check       86%             0.54           198
+# Handover moved 5 points against a 14-point same-prompt spread and the leak 0.07
+# against 0.059, p=0.50 -- a length change that cost nothing measurable.
 
-PROBLEM_FOLLOWUP_RULES_ONLY = (
+PROBLEM_FOLLOWUP = (
     'Your checks pass on the state you produced. Now write the task description '
     'another AI agent would be given to reproduce that same end state.\n\n'
-    'That agent starts in an EMPTY directory and sees nothing but your '
-    'statement: every file that must be there at the end has to be created by '
-    'it.\n\n'
+    'It starts in an EMPTY directory and sees nothing but your statement: every '
+    'file that must be there at the end has to be created by it.\n\n'
     'Give the two halves differently:\n'
     '- INPUT data, the raw material nothing was computed from yet: verbatim, '
     'exact filenames and exact contents, so it can be written byte for byte. '
     'Only passive data counts as input -- a CSV, a JSON config, a binary record '
     'file, a text corpus. Source code is NEVER input data: do not quote the '
-    'body of any script, function or module you wrote, not even one you call a '
-    'fixture. A statement whose input half is the program asks the reader to '
-    'retype your solution, and then it measures typing just as surely as quoting '
-    'a computed answer does.\n'
+    'body of any script you wrote.\n'
     '- Everything DERIVED from it -- computed values, aggregates, orderings, '
-    'resolved references, reports: only the RULE that produces it. Name the '
-    'output file and its format, say how each part follows from the input, and '
-    'never state the resulting value. Not as an example, not in a sample of the '
-    'output. A statement that writes out what you computed can be satisfied by '
-    'copying it, and then it measures typing.\n\n'
+    'reports: only the RULE that produces it. Name the output file and its '
+    'format, say how each part follows from the input, and never state the '
+    'resulting value, not even as an example.\n\n'
     'Rules:\n'
     '- Be specific about formats, filenames and layout.\n'
     '- Say what must be true of the result, not which commands to run.\n'
-    '- Describe the behaviour any script must have -- its inputs, its outputs, '
-    'the transformation between them -- and let the reader write the code.\n'
     '- Do NOT mention the checks or how verification works.\n'
     '- Self-contained: no reference to this conversation or to anything the '
     'reader cannot see.\n'
@@ -265,29 +261,3 @@ PROBLEM_FOLLOWUP_RULES_ONLY = (
     '- Do NOT call any tool now. Return ONLY the problem statement as plain '
     'text, no code fences.'
 )
-
-
-# ── Factory ────────────────────────────────────────────────────────────────
-
-def agentic_prompts(max_build_files: int = 0) -> AgenticPrompts:
-    """Assemble all strings into the object the challenger takes.
-
-    ``max_build_files`` is the one knob: when > 0 it appends BUILD_SIZE_CAP to the
-    system prompt.
-    """
-    system = SYSTEM
-    if max_build_files > 0:
-        system = system + BUILD_SIZE_CAP.format(n=max_build_files)
-    return AgenticPrompts(
-        system=system,
-        from_scratch=FROM_SCRATCH,
-        from_seed=FROM_SEED,
-        from_keywords=FROM_KEYWORDS,
-        from_seed_keywords=FROM_SEED_KEYWORDS,
-        check_followup=CHECK_FOLLOWUP,
-        check_retry_followup=CHECK_RETRY_FOLLOWUP,
-        problem_followup=PROBLEM_FOLLOWUP_RULES_ONLY,
-        keyword_system=KEYWORD_SYSTEM,
-        keyword_user=KEYWORD_USER,
-        keyword_expand_user=KEYWORD_EXPAND_USER,
-    )

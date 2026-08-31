@@ -1,1187 +1,1506 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""RSI self-play, agentic half: generate training tasks by doing them first.
+"""RSI self-play, agentic half: one trajectory is one request, start to finish.
 
-One model plays both roles, and one proposal is one conversation. It first acts
-as an agent in a sandbox (multi-turn with tools), producing a trajectory and a
-final workspace state; then, appended to that same conversation, it writes a
-check script that verifies the end state, and finally describes the task as a
-problem statement. The same model then attempts the problem multiple times, and
-only problems it solves *sometimes* are kept.
+Three resources, each a queue anyone may put a request on:
 
-The machinery lives in :mod:`twinkle_agentic.challenger`; the prompts live in
-``prompts.py`` next to this file. What is here is the wiring: which model, how
-many, the sandbox connection, and where the output goes.
+  sandbox   N microVMs. A job holds one for as long as it needs the workspace.
+  vLLM      the local sampler. ``sample`` routes each request to the least busy
+            worker (``enable_continous_work``), so a batch of one is a first-class
+            call and 32 threads calling it concurrently is the intended use.
+  API       qwen3.8-max, for the stages that must not add untrained tokens: the
+            check script, the problem statement, and the rubric.
 
-Output format (one JSONL line per task):
+Nothing waits for a batch. A proposal that finishes its build hands its statement
+straight to eight solver jobs and lets go of its sandbox; those eight run whenever
+a slot frees up, in any order, interleaved with proposals from other groups. The
+only synchronisation is the last step, deciding whether a group is worth keeping,
+and that is a counter under a lock rather than a barrier.
 
-    --out-flows  {id, query, check_script, n_pass, n_rollouts, keywords, seeded}
+A group is eight proposals sharing one keyword draw and one prompt -- that is what
+makes it a GRPO group, since the advantage of a proposal is its reward minus the
+mean over the others answering the same prompt. It is kept when at least one of its
+eight produced a task the solver passes sometimes (``1 <= n_pass <= 7``); the other
+seven may be anything, including failures, and they train with reward 0. From a kept
+group the highest-reward in-band proposal's eight solver attempts are what the
+solver side trains on, so a kept group contributes 8 proposing and 8 solving
+trajectories, and eight kept groups are the 64 + 64 one training step reads.
+
+Output (all under ``--out-dir``):
+
+    trajs/*.npz          input_ids / labels / logprobs per trajectory
+    trajs/index.jsonl    one line per trajectory: side, group, reward, full text
+    groups.jsonl         one line per decided group: why kept or dropped
+    tasks.jsonl          the statements and check scripts that were delivered
+    keywords.jsonl       the keyword bank, carried between iterations
 
 Run it as a Ray job (sampler only, no trainer)::
 
-    python cookbook/rsi/agentic/challenge.py --keep-target 200
+    python cookbook/rsi/agentic/challenge.py --keep-groups 8
 """
 import argparse
+import collections
 import json
-import base64
-import binascii
-import hashlib
+import math
 import os
+import queue
+import random
+import statistics
 import sys
+import threading
 import time
-from typing import Dict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
-from twinkle.data_format import SamplingParams, user_data_get
+from twinkle.data_format import SamplingParams
 from twinkle.sampler import vLLMSampler
-from twinkle_agentic.challenger import AgenticChallenger, KeywordStore
-from twinkle_agentic.envs import EnvTool
-from twinkle_agentic.rollout import build_rollout
+from twinkle_agentic.challenger import KeywordStore, parse_check_script, parse_problem_statement
+from twinkle_agentic.challenger.agentic import brittle_check_reason
+from twinkle_agentic.challenger.code import parse_keyword_list
+from twinkle_agentic.challenger.task_bank import TaskBank
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.tools.tool_manager import ToolManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from episode import solver_harness  # noqa: E402
-from prompts import CATEGORIES, CATEGORY_DESC, agentic_prompts  # noqa: E402
-from remote_tool_env import RemoteMsAgentToolEnv, tool_payload  # noqa: E402
+import prompts as P  # noqa: E402
+from sandbox import close_pool, open_pool, solver_harness  # noqa: E402
 
 logger = get_logger()
 
-# Cleared through the python tool, not `rm -rf`: ms-agent's safety policy rejects
-# `rm -rf` outright ("Blocked by safety rule"), and it rejects globs in write
-# operations, which rules out `find -delete` too. The script asserts the
-# directory really is empty, so a future policy change surfaces as a failed reset
-# instead of tasks quietly inheriting the previous workspace.
-#
-# Module level so a test can drive the same string the run does; a copy in a test
-# would keep passing after this one changed.
-CLEAR_WORKSPACE = '''
-import os, shutil
-root = {workspace!r}
-os.makedirs(root, exist_ok=True)
-for name in os.listdir(root):
-    path = os.path.join(root, name)
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path, ignore_errors=True)
-    else:
-        os.remove(path)
-leftover = os.listdir(root)
-assert not leftover, 'workspace not empty after clear: %r' % (leftover,)
-'''
+# ── Reward ─────────────────────────────────────────────────────────────────
+# The proposing side's reward, unchanged from challenger/agentic.py where it was
+# measured. Kept as free functions because nothing here has the state the method
+# version read off self.
 
-# ── Arm B: copy the episode's input files out, and put them back later ──────
-#
-# The bytes travel, not a description of them: the model is not asked to write a
-# script that recreates its own inputs, because a wrong one costs the whole
-# episode and would fail exactly where the inputs are least ordinary.
-#
-# Read in slices because the executor truncates its output at roughly 8 KB. Each
-# slice is base64 so any byte survives the trip, and the manifest's sha256 is
-# what says the trip was faithful -- checked locally against the bytes that
-# arrived, so a truncated read cannot pass as a smaller file.
-INPUT_MANIFEST = '''
-import hashlib, os
-root = os.path.join({workspace!r}, 'input')
-rows = []
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in {{'__pycache__', '.ipynb_checkpoints'}}]
-    for name in sorted(filenames):
-        path = os.path.join(dirpath, name)
-        with open(path, 'rb') as handle:
-            body = handle.read()
-        rows.append((os.path.relpath(path, {workspace!r}), len(body),
-                     hashlib.sha256(body).hexdigest()))
-for rel, size, digest in sorted(rows):
-    print(rel, size, digest)
-'''
+# Peak and width of the pass-rate gaussian. This replaced R-Zero's
+# ``1 - 2*|p - 1/2|`` for two reasons measured on run_clean9's 87 in-band
+# proposals: that shape was not injective (with 8 rollouts its seven in-band
+# values of n_pass mapped onto four rewards, so a task 1 of 8 solvers could do and
+# one 7 of 8 could do were worth the same), and its signal was smaller than its
+# noise (0.280 signal over 0.246 binomial noise, against 0.347 over 0.177 here).
+# A peak below one half is also the more useful target: a proposal only teaches
+# the solver something when the solver mostly cannot do it yet.
+PASS_RATE_TARGET = 0.2
+PASS_RATE_WIDTH = 0.3
 
-INPUT_SLICE = '''
-import base64, os
-path = os.path.join({workspace!r}, {rel!r})
-with open(path, 'rb') as handle:
-    handle.seek({offset})
-    print(base64.b64encode(handle.read({length})).decode())
-'''
+# How many phrases the keyword prompt's 'do not repeat these' line may quote.
+# Measured on armA2ser: with 130 quoted the eighth refill call was still answering
+# normally, with 150 it started inventing -- 'iRAPION holistic replace', 10 of 480
+# phrases that run. 100 sits below where that began.
+AVOID_TOTAL = 100
 
-# What gets stored with the task and run before every attempt at it. Writes the
-# captured bytes and nothing else: no cleanup, because whoever runs this has just
-# cleared the workspace.
-SETUP_SCRIPT_TEMPLATE = '''# Recreate the task's input files.
-import base64, os, pathlib
+# How often run() looks for a stall. Only ever reached when the run has already
+# gone quiet, so it costs one wakeup per interval and nothing else.
+STALL_CHECK_SECONDS = 30.0
 
-FILES = {files!r}
 
-for rel, payload in FILES.items():
-    path = pathlib.Path(rel)
-    if path.parent != pathlib.Path('.'):
-        os.makedirs(path.parent, exist_ok=True)
-    with open(path, 'wb') as handle:
-        handle.write(base64.b64decode(payload))
-'''
+def novelty_factor(novelty: Optional[float], floor: float) -> float:
+    """What a proposal's difficulty score is multiplied by for its novelty.
 
-# Seconds to wait before asking a sandbox for its workspace listing a second
-# time. 62 of run_clean6's 63 snapshot failures were the sandbox answering 410
-# "not proxyable", which is the host having paused it -- worth one more ask,
-# since the alternative is throwing the episode away.
-SNAPSHOT_RETRY_WAIT = 3
+    ``floor + (1 - floor) * N``. ``None`` returns 1.0, not the floor: it means
+    nobody judged this proposal, and charging it for a measurement that did not
+    happen would make the reward depend on API uptime.
+    """
+    if novelty is None:
+        return 1.0
+    n = min(1.0, max(0.0, float(novelty)))
+    return floor + (1.0 - floor) * n
 
-# Same idea for the workspace clear, which is the one sandbox call whose failure
-# is fatal to the run rather than to one episode. Longer than the snapshot wait
-# because what it waits out is different: a clear times out when ms-agent's
-# per-call limit expires with the delete still running, so the second attempt
-# wants the first one's rmtree to have drained rather than to race it.
-RESET_RETRY_WAIT = 10
 
-# The ground truth the check script is written against. A listing alone is not
-# enough: three of the six rejected proposals in the first real run failed on a
-# value the model recomputed from its own recollection ("Mean values mismatch")
-# rather than read off the file, so the end state has to arrive as content, not
-# just as names. Bounded on both axes -- 50 files, 600 bytes each, 6000 overall --
-# because this goes into a prompt and a 100k artifact would push the trajectory
-# it has to be read alongside out of the window.
-#
-# Walks the tree in python rather than shelling out to `find`: the same code then
-# decides what is text, what is truncated, and what the budget was spent on,
-# which a pipeline of find/head cannot report back.
-#
-# File bodies go out byte for byte. An earlier version printed `body.rstrip()`,
-# which hid trailing newlines while the size column still counted them, so a
-# check writer shown an 11-byte file whose content looked 10 characters long
-# wrote `content == 'Mean: 63.9'` and the check failed against the very state it
-# was written from. The listing is only ground truth if it does not tidy up.
-#
-# Facts *about* a file go in its header, never after its body. A note printed
-# below the content is indistinguishable from content: annotated one file with a
-# trailing `(no newline at end of file)` line and the next check script asserted
-# the README's content ending in that sentence.
-WORKSPACE_SNAPSHOT = '''
-import os
+def challenger_reward(n_pass: Optional[int], rollouts: int,
+                      novelty: Optional[float] = None, floor: float = 1.0) -> float:
+    """How close the solver came to the target pass rate, times novelty.
 
-root = {workspace!r}
-skip = {{'.ms_agent', '__pycache__', '.ipynb_checkpoints', '.git'}}
-rows = []
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in skip]
-    for name in sorted(filenames):
-        path = os.path.join(dirpath, name)
-        try:
-            rows.append((os.path.relpath(path, root), os.path.getsize(path), path))
-        except OSError:
-            pass
-rows.sort()
-for rel, size, _ in rows[:{max_files}]:
-    print(rel, size)
+    ``None`` means the proposal never got as far as being solved and 0 means no
+    attempt passed. Both score 0, and that floor is load-bearing rather than
+    incidental: the gaussian at p=0 is 0.801, higher than the 0.607 it gives a
+    proposal half the attempts solve, so without the gate the best thing a proposer
+    could do is write tasks nobody can finish.
+    """
+    if n_pass is None or not rollouts or n_pass <= 0:
+        return 0.0
+    gap = n_pass / rollouts - PASS_RATE_TARGET
+    difficulty = math.exp(-(gap * gap) / (2.0 * PASS_RATE_WIDTH**2))
+    return difficulty * novelty_factor(novelty, floor)
 
-budget = {total_budget}
-for rel, size, path in rows[:{max_files}]:
-    if budget <= 0:
-        break
-    try:
-        with open(path, encoding='utf-8') as handle:
-            text = handle.read({per_file} + 1)
-    except (OSError, UnicodeDecodeError):
-        continue          # binary or unreadable: the listing already names it
-    if '\\x00' in text:
-        continue
-    body = text[:{per_file}]
-    budget -= len(body)
-    # The trailing-newline count is stated for every file, both ways. Saying it
-    # only when it is absent made "this file ends with a newline" invisible, and
-    # the check writer then compared exact bytes without one: in ex9 two of the
-    # three checks that failed their own verification failed on exactly that --
-    # the same reply asserted three files, guessed right on the two marked "no
-    # newline at end" and wrong on the unmarked one.
-    trailing = len(body) - len(body.rstrip(chr(10)))
-    if len(text) > len(body):
-        suffix = ' (first {per_file} bytes)'
-    elif trailing == 0:
-        suffix = ' (no newline at end)'
-    else:
-        suffix = ' (ends with %d newline character(s))' % trailing
-    print()
-    print('--- ' + rel + suffix + ' ---')
-    print(body, end='')
-    if not body.endswith(chr(10)):
-        print()
-'''
+
+# ── Arguments ──────────────────────────────────────────────────────────────
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Model
+    # What to collect.
+    p.add_argument('--keep-groups', type=int, default=8,
+                   help='stop once this many groups have been kept. 8 groups x 8 '
+                        'proposals = 64 proposing trajectories, and the selected '
+                        'proposal of each x 8 attempts = 64 solving ones.')
+    p.add_argument('--group-size', type=int, default=8,
+                   help='proposals sharing one keyword draw and one prompt: the '
+                        'GRPO group on the proposing side.')
+    p.add_argument('--solver-rollouts', type=int, default=8,
+                   help='attempts per candidate task: the GRPO group on the solving '
+                        'side, and the denominator of n_pass.')
+    p.add_argument('--max-group-attempts', type=int, default=0,
+                   help='give up after this many groups have been tried, kept or '
+                        'not. 0 leaves the run governed by --keep-groups alone.')
+
+    # Local model (the trainable half).
     p.add_argument('--model-id', default='ms://Qwen/Qwen3-4B')
-    p.add_argument('--template', default='Template',
-                   help='template class in twinkle.template')
+    p.add_argument('--template', default='Template')
     p.add_argument('--sampler-gpus', type=int, default=4)
-    # Challenger backend: local vLLM by default, or an OpenAI-compatible API for
-    # the proposing side only (keywords + explore + check + statement). The
-    # solver side of the difficulty stage still runs through the local sampler,
-    # so --challenger-api is only usable with --solver-rollouts 0 (no local
-    # sampler is built at all in that case). The three connection args default
-    # to the LLM_BACKUP_* env vars the summarizer teacher already uses.
-    p.add_argument('--challenger-api', action='store_true',
-                   help='propose through an OpenAI-compatible API instead of local vLLM; '
-                        'requires --solver-rollouts 0')
-    p.add_argument('--challenger-api-model',
-                   default=os.environ.get('LLM_BACKUP_MODEL', ''))
-    p.add_argument('--challenger-api-base',
-                   default=os.environ.get('LLM_BACKUP_BASE_URL', ''))
-    p.add_argument('--challenger-api-key',
-                   default=os.environ.get('LLM_BACKUP_API_KEY', ''))
-    p.add_argument('--challenger-concurrency', type=int, default=8,
-                   help='parallel API conversations (API backend only)')
-    # Measured on qwen3.8-max at a ~15k-character exploration context: one turn
-    # took 58s with the default (unbounded) thinking and 10s at 2048, because the
-    # default spent ~5300 characters on reasoning per turn. 0 leaves the API's own
-    # default in place; anything else is sent as extra_body={'thinking_budget': N}
-    # on every proposing call (explore, check, statement, keyword generation).
-    p.add_argument('--challenger-thinking-budget', type=int, default=0,
-                   help='cap reasoning tokens per API call; 0 = leave the API default')
-    # Split mode: explore on the local (trainable) vLLM model, but write the check
-    # script (success judgement) and the problem statement over the API instead of
-    # the local model. Only the exploration turns keep labels/logprobs and get
-    # trained; the two API stages are text-only and never enter the trajectory.
-    # Reuses the --challenger-api-* connection args, and is mutually exclusive with
-    # --challenger-api (which sends the whole proposing side to the API).
-    # On by default, because leaving it off is not a milder setting but a
-    # different experiment: run_clean6 was launched without it and the local 4B
-    # wrote the check scripts, which turned 0/55 check_parse_fail (qwen3-max) into
-    # 35/171 and 1/55 check_run_fail into 25/171. Pass --no-followup-api to write
-    # both stages with the local model on purpose.
-    p.add_argument('--followup-api', action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help='explore locally (trainable) but generate the check script and '
-                        'problem statement over --challenger-api-* (e.g. qwen3-max); '
-                        'only the exploration part is trained. Not with --challenger-api.')
-    # How many episodes run at once, each in its own sandbox. An episode owns its
-    # workspace from the reset until its check has run, so this is also the number
-    # of sandboxes booted at startup. Default 96, from two measurements: on 8 vLLM
-    # workers, 96 requests in flight reached 28894 tok/s against a 33108 tok/s
-    # ceiling (87%), where 48 in flight reached only 15599 (47%); and the sandbox
-    # host booted 96 concurrent sandboxes with 0 failures at a p50 reset of 24.5s,
-    # up from 21.9s at 64. Above 96 the KV cache is the next limit -- vLLM reports
-    # room for about 24 sequences per worker, so roughly 192 in total.
-    p.add_argument('--episode-concurrency', type=int, default=96,
-                   help='sandboxes to boot, and how many things run at once in both '
-                        'stages: proposal episodes in flight, and solver attempts '
-                        'per wave in the difficulty filter')
-    # 40960, up from 32768, because one proposal is now a single conversation:
-    # the tool-using turns, the check script and the problem statement all share
-    # this window. Measured on ex9's three separate calls, the worst case summed
-    # to about 25k tokens (12394 + 7643 + 2943 plus the appended messages), so
-    # this leaves room for episodes that take more steps than ex9's 2-5.
-    #
-    # 40960 and not more: it is Qwen3-4B's max_position_embeddings, and vLLM
-    # refuses to start above it -- 49152 was tried and rejected, since going past
-    # a RoPE model's trained positions produces nan rather than longer context.
     p.add_argument('--max-model-len', type=int, default=40960)
+    p.add_argument('--gpu-memory-utilization', type=float, default=0.8)
 
-    # Generation control
-    p.add_argument('--keep-target', type=int, default=200,
-                   help='how many tasks to keep; generation stops once reached')
-    p.add_argument('--batch-size', type=int, default=0,
-                   help='tasks per yielded batch (0 = one batch of --keep-target)')
-    p.add_argument('--max-proposals-per-round', type=int, default=64,
-                   help='max proposals per round (serial, so keep moderate)')
-    p.add_argument('--seed-file', default='', help='seed jsonl with query field')
-    p.add_argument('--seed-mix-prob', type=float, default=0.5)
+    # The API model: check scripts, problem statements, keywords, rubric.
+    p.add_argument('--api-model', default=os.environ.get('LLM_BACKUP_MODEL', ''))
+    p.add_argument('--api-base', default=os.environ.get('LLM_BACKUP_BASE_URL', ''))
+    p.add_argument('--api-key', default=os.environ.get('LLM_BACKUP_API_KEY', ''))
+    p.add_argument('--api-concurrency', type=int, default=32,
+                   help='API calls in flight. Only the rubric runs as its own job; '
+                        'check and statement calls are made from inside a sandbox '
+                        'job and are already capped by the slot count.')
+    p.add_argument('--api-thinking-budget', type=int, default=0,
+                   help='sent as extra_body on every API call when > 0. Capping the '
+                        'reasoning is the one knob that moved wall-clock: 58s -> 10s '
+                        'per turn at 2048 on a ~15k-character context.')
 
-    # Sampling params for the exploring stage (proposing)
+    # Building: stage 1, the part that is trained.
     p.add_argument('--propose-temp', type=float, default=1.0)
-    # 8192, not 4096. At 4096, 3 of 12 explore episodes ended on the first turn
-    # with stop_reason=length and an untouched workspace: the model had written
-    # 15k, 16k and 10k characters of <think>, two of them without ever closing the
-    # tag, and one degenerating into a run of newlines. Nothing was dispatched, so
-    # those three cost a full episode each and produced no end state to write a
-    # check about. The trajectory ceiling and the engine's max_model_len are
-    # 32768, well above prompt plus this.
     p.add_argument('--propose-max-tokens', type=int, default=8192)
-    p.add_argument('--max-turns', type=int, default=24,
-                   help='max tool-calling turns for the exploring stage')
-    # One call per reply, because the calls in one reply run *concurrently*:
-    # tool_manager.call_many hands a turn to Env.step_batch, which the sandbox
-    # server runs through ms-agent's parallel_call_tool. The model writes them in
-    # the order it means them to happen and gets none of the results, so a reply
-    # that writes a file and then reads it back reads the file as it was before.
-    # Measured on ex11: 13 of 36 episodes contain an observation that contradicts
-    # the end state -- read_file answering FileNotFound for a file the snapshot
-    # lists, glob answering with 0 files, `ls -R` missing a file written earlier
-    # in the same reply -- and 3 of the 4 kept tasks are among them. One of those
-    # kept tasks describes two files as "empty", which is what they were only
-    # because the call that filled them had not run yet.
-    #
-    # It also removes the other failure of a batched reply: 6 of 36 episodes
-    # spent the whole 8192-token budget on one reply holding 70 to 259 calls,
-    # the tail of it the same read_file over and over, and were discarded whole.
-    # A reply that can hold one call cannot do either.
-    p.add_argument('--one-call-per-reply', action='store_true', default=True,
-                   help='stop generation at </tool_call> so each reply carries a single '
-                        'call and the model sees its result before choosing the next')
-    p.add_argument('--no-one-call-per-reply', dest='one_call_per_reply',
-                   action='store_false',
-                   help='let a reply carry several calls, which then run concurrently')
+    p.add_argument('--max-turns', type=int, default=24)
+    p.add_argument('--max-build-files', type=int, default=4,
+                   help='appends BUILD_SIZE_CAP to the system prompt, capping how '
+                        'many files one build may leave behind. 0 removes the cap. '
+                        'This changes the prompt, so it changes what is trained.')
     p.add_argument('--stop-after-stuck-turns', type=int, default=2,
-                   help='end an episode after this many consecutive turns that made no '
-                        'progress; 0 runs to --max-turns regardless. A turn counts as '
-                        'stuck when every call in it came back an error, or every call '
-                        'in it was byte-identical to one already made in the episode. '
-                        'Replayed over 12 recorded episodes: errors alone would stop 1 '
-                        'of 12 and save 9 of 239 calls, since the worst offenders mix a '
-                        'failing call with a glob that succeeds; adding the repeat rule '
-                        'stops 3 of 12 and saves 63 calls, and those 3 are exactly the '
-                        'ones that spent 54, 84 and 17 calls to leave a script that '
-                        'could not run.')
+                   help='end the tool phase after this many turns that repeated a '
+                        'call and changed nothing. 0 turns it off.')
+    p.add_argument('--one-call-per-reply', action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="stop generation at '</tool_call>' so a reply carries exactly "
+                        'one call. The stop string is kept in the output, or every '
+                        'turn would train on an unclosed block.')
 
-    # Problem statement
-    p.add_argument('--problem-max-chars', type=int, default=8192)
-    p.add_argument('--check-retries', type=int, default=1,
-                   help='How many times a check script that fails is handed back, '
-                        'with the traceback and the workspace listing, to be '
-                        'rewritten. ex12 lost 36 of 72 proposals here, and 29 of '
-                        'those were one assertion naming a value the model had '
-                        'never read -- a row count, a nearly-right content '
-                        'string, a timestamp -- on a workspace state that was '
-                        'fine. 0 rejects on the first failure, as ex9-ex12 did.')
-    # Budgets for the two stages appended to the episode. Separate numbers
-    # because the two are not alike: writing the checks reads the whole episode
-    # plus the end state and reasons at length (ex9's largest such reply was 7643
-    # trainable tokens, so 4096 would cut the tail off and the proposal would be
-    # discarded as unparseable), while the statement is prose and ex9's largest
-    # was 2943.
+    # Stages 2 and 3, over the API.
     p.add_argument('--check-max-tokens', type=int, default=8192)
+    p.add_argument('--check-retries', type=int, default=1,
+                   help='rewrites offered to a check script that does not parse or '
+                        'does not pass on the state it was written from.')
     p.add_argument('--problem-max-tokens', type=int, default=4096)
+    p.add_argument('--problem-max-chars', type=int, default=8192,
+                   help='a statement longer than this is thrown away: it is quoting '
+                        'the workspace rather than describing the task.')
 
-    # Keywords
-    p.add_argument('--keywords-n', type=int, default=128,
-                   help='per-category refill target; 0 disables keyword bank')
-    p.add_argument('--keyword-db', default='output/rsi_agentic/keywords.jsonl')
-    p.add_argument('--keyword-gen-calls', type=int, default=8)
-    # How many of a refill's generating calls go out together. 1 means each is
-    # told what the ones before it produced; the first round of arm measurements
-    # effectively ran at 8, where the whole first refill went out with an empty
-    # 'do not repeat' list and came back with synonyms of each other.
-    p.add_argument('--keyword-refill-concurrency', type=int, default=1)
-    p.add_argument('--keyword-refill-tries', type=int, default=2)
-    p.add_argument('--keyword-temp', type=float, default=1.3)
-    # 1024 measured 8 of 24 generation calls cut off at the budget with nothing
-    # parseable: the model spends most of it listing candidates inside <think>,
-    # rewrites the list two or three times, and the JSON array afterwards gets
-    # severed mid-string. The successful calls landed just under 1024, so the cap
-    # sat inside the distribution of working replies rather than beyond it.
-    p.add_argument('--keyword-max-tokens', type=int, default=4096)
-    p.add_argument('--single-kw-prob', type=float, default=0.1)
-    p.add_argument('--combo-arity', default='triple', choices=['triple', 'mix'])
-    p.add_argument('--arity-weights', default='',
-                   help="'w1,w2,w3' for --combo-arity mix (empty = uniform)")
-    # How many proposals answer each keyword draw. Above 1 they share one prompt
-    # and one group id, which is what the proposing side needs to have a group to
-    # compute an advantage over -- at 1 every group has one member and every
-    # advantage is zero. It does not change the compute at a fixed
-    # --max-proposals-total; it divides the number of distinct keyword draws by
-    # the same factor, so 216 proposals come from 27 draws at 8 instead of 216.
-    p.add_argument('--proposals-per-group', type=int, default=1,
-                   help='proposals sharing one keyword draw and prompt (1 = no groups, '
-                        'so no proposer advantage)')
-
-    # Difficulty filter
-    # 8 attempts, keeping 2-6: with 4 attempts the band was 1-3 and ex9's
-    # measured pass counts came out {0: 6, 1: 1, 4: 2} -- two-thirds of the
-    # tasks landed on an end of the range where one attempt either way changes
-    # the verdict. 8 costs twice the sandbox time per task and puts the kept
-    # band around one third of attempts passing.
-    p.add_argument('--solver-rollouts', type=int, default=8)
+    # Solving.
     p.add_argument('--solver-temp', type=float, default=1.0)
-    # Same 8192 as the explore round, and for the same measured reason: at 4096,
-    # 15 of 50 solver attempts ended on stop_reason=length with an untouched
-    # workspace, and one task lost all four of its attempts that way and was
-    # discarded as too hard. Raising it took that to 0 of 20. It has to stay in
-    # step with --propose-max-tokens: a task the proposer needed room to build is
-    # not solvable in less.
     p.add_argument('--solver-max-tokens', type=int, default=8192)
-    p.add_argument('--solver-max-turns', type=int, default=24,
-                   help='NOT WIRED: no solver_explorer is passed, so solver attempts '
-                        'run through the same rollout as the proposing episodes and '
-                        'obey --max-turns. Kept so the value can be set once the two '
-                        'are separated; changing it alone has no effect.')
-    p.add_argument('--keep-min-pass', type=int, default=2)
-    p.add_argument('--keep-max-margin', type=int, default=2)
+    p.add_argument('--solver-max-turns', type=int, default=24)
 
-    # Sandbox
-    p.add_argument('--sandbox-template', default='',
-                   help='AgentENV/e2b template name (required)')
-    p.add_argument('--sandbox-api-url', default='',
-                   help='AgentENV server URL (or AENV_API_URL env var)')
-    p.add_argument('--agent-config', default='cookbook/rsi/agentic/rsi_agent.yaml',
-                   help='ms-agent yaml for the sandbox tool server')
+    # Keywords.
+    p.add_argument('--keywords-n', type=int, default=128,
+                   help='how many keywords a dry category is refilled with.')
+    p.add_argument('--keyword-gen-calls', type=int, default=8,
+                   help='calls a refill is split over, run one at a time so each can '
+                        'be told what the ones before it already said.')
+    p.add_argument('--keyword-refill-tries', type=int, default=2,
+                   help='refill rounds before a dry category is recycled, i.e. every '
+                        'keyword in it marked unused again. Without this a bank the '
+                        'model has run out of new ideas for ends the run.')
+    p.add_argument('--keyword-expand', action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help='after the last group, ask for more keywords in the domains '
+                        'that produced tasks nobody solved, and write them to the '
+                        'bank the next iteration reads.')
+    p.add_argument('--keyword-temp', type=float, default=1.3)
+    p.add_argument('--keyword-max-tokens', type=int, default=4096)
+
+    # Novelty.
+    p.add_argument('--task-bank', default='',
+                   help='jsonl of statements from earlier iterations. Empty turns '
+                        'novelty off, and the reward is the pass-rate gaussian alone.')
+    p.add_argument('--task-bank-refs', type=int, default=5,
+                   help='stored statements shown to the judge, on top of the group '
+                        "'s own siblings, which are always shown.")
+    # 1.0 leaves the novelty term at exactly 1.0, so a proposal is scored on its
+    # pass rate alone while the rubric still runs and still writes
+    # novelty_scores.jsonl. See loop.sh for the measurement that set it there.
+    p.add_argument('--novelty-floor', type=float, default=1.0)
+    p.add_argument('--novelty-tries', type=int, default=3,
+                   help='attempts to get a verdict for a group. After the last one '
+                        'the group is dropped and its pending solver jobs skipped.')
+
+    # Sandbox.
+    p.add_argument('--sandbox-slots', type=int, default=32,
+                   help='microVMs, i.e. how many jobs run at once. One job owns one '
+                        'slot from the workspace clear to its last check.')
+    p.add_argument('--sandbox-template', default=os.environ.get('AENV_TEMPLATE', ''))
+    p.add_argument('--sandbox-api-url', default=os.environ.get('AENV_API_URL', ''))
     p.add_argument('--sandbox-timeout', type=int, default=900)
-    p.add_argument('--workspace', default='/workspace',
-                   help='working directory inside the sandbox')
-    p.add_argument('--snapshot-max-files', type=int, default=50,
-                   help='files listed in the end-state snapshot')
-    p.add_argument('--snapshot-per-file', type=int, default=600,
-                   help='bytes of each file shown to the check writer')
-    p.add_argument('--snapshot-budget', type=int, default=6000,
-                   help='total bytes of file content in the snapshot')
+    p.add_argument('--agent-config', default='cookbook/rsi/agentic/rsi_agent.yaml')
+    p.add_argument('--workspace', default='/workspace')
+    p.add_argument('--snapshot-max-files', type=int, default=50)
+    p.add_argument('--snapshot-per-file', type=int, default=600)
+    p.add_argument('--snapshot-budget', type=int, default=6000)
 
-    # Output
-    # ---- Experiment arms. Each isolates one measured failure and can be used
-    # alone or stacked. Off by default, so an unflagged run is the old behaviour.
-    #
-    # A: ex11/ex12/ex13 statements quoted their own answer, because stage 3 asks
-    # for the full end state while the solver starts empty -- the only way to say
-    # what a derived file holds is to write out what was computed. Difficulty came
-    # out 8/8 or 0/8. This makes the statement give input data verbatim and
-    # everything derived as a rule.
-    # C: apitest4's statements each wanted an 8-12 file package with a CLI, and
-    # Qwen3-4B passed 0 of 96 -- 32 attempts spent the whole token budget typing
-    # source, 64 declared success with the files unwritten.
-    p.add_argument('--max-build-files', type=int, default=0,
-                   help='arm C: cap the episode at this many files, no package, '
-                        'no CLI with subcommands (0 = no cap)')
-    # For measuring a configuration rather than filling a dataset: two arms are
-    # only comparable when given the same number of tries.
-    p.add_argument('--max-proposals-total', type=int, default=0,
-                   help='stop after this many proposals regardless of keep-target '
-                        '(0 = run until keep-target)')
+    # Output.
+    p.add_argument('--out-dir', default='output/rsi_agentic')
+    p.add_argument('--keyword-db', default='',
+                   help='defaults to <out-dir>/keywords.jsonl')
     p.add_argument('--random-seed', type=int, default=0)
-    p.add_argument('--out-flows', default='output/rsi_agentic/challenge_flows.jsonl')
-    p.add_argument('--dump-rejected', default='output/rsi_agentic/challenge_rejected.jsonl')
-    p.add_argument('--dump-propose-traj', default='output/rsi_agentic/propose_traj',
-                   help='directory for the proposing rounds (token ids + logprobs, one npz '
-                        'per attempt plus index.jsonl). Empty string turns it off; keeping '
-                        'it is what leaves the door open to training the challenger itself.')
-    p.add_argument('--dump-solver-attempts',
-                   default='output/rsi_agentic/solver_attempts.jsonl',
-                   help='one line per difficulty-stage solver attempt: the statement, the '
-                        'check script, the attempt, the state it left and what the check '
-                        'said. Without it a task measured 0 of 4 gives no way to tell an '
-                        'impossible task from a statement that withholds what the check '
-                        'demands. Empty string turns it off.')
-    p.add_argument('--no-sort-by-difficulty', action='store_true')
-    p.add_argument('--stage', default='all', choices=['all', 'keywords', 'explore'],
-                   help="'keywords' runs step 1 only -- fill the keyword bank, draw "
-                        'the combinations, write the proposal prompts they produce to '
-                        '--out-flows, and exit without touching the sandbox. '
-                        "'explore' adds steps 2-4: clear the workspace, run the "
-                        'sandbox episode, snapshot the end state, and stop before the '
-                        'check-writing round. Both exist because a stage that is '
-                        'broken cannot be diagnosed from the far end of an '
-                        'hours-long full run.')
-    p.add_argument('--stage-proposals', type=int, default=16,
-                   help='how many proposals --stage keywords or --stage explore runs')
-    p.add_argument('--dump-explore', default='output/rsi_agentic/explore_episodes.jsonl',
-                   help='one line per --stage explore episode: the prompt, every '
-                        'message, every tool call and its observation, and the end '
-                        'state the snapshot saw. Empty string turns it off.')
-    p.add_argument('--dump-keyword-gen',
-                   default='output/rsi_agentic/keyword_gen.jsonl',
-                   help='one line per keyword-generation call: the prompt, the raw '
-                        'reply, and what the parser made of it. Without it a bank that '
-                        'stays empty gives no way to tell a disobedient model from a '
-                        'parser that rejects valid output. Empty string turns it off.')
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.api_model or not args.api_base:
+        raise SystemExit('[challenge] --api-model and --api-base are required '
+                         '(or LLM_BACKUP_MODEL / LLM_BACKUP_BASE_URL)')
+    if args.solver_rollouts < 2:
+        raise SystemExit('[challenge] --solver-rollouts must be >= 2: it is both the '
+                         "solver side's GRPO group size and the denominator n_pass is "
+                         'judged against')
+    if args.group_size < 2:
+        raise SystemExit('[challenge] --group-size must be >= 2: a group of one has '
+                         'no mean to subtract, so every advantage is zero')
+    args.keyword_db = args.keyword_db or os.path.join(args.out_dir, 'keywords.jsonl')
+    return args
 
 
-def build_env(args):
-    """Create the long-lived sandbox environment."""
-    template = args.sandbox_template or os.environ.get('AENV_TEMPLATE', '')
-    api_url = args.sandbox_api_url or os.environ.get('AENV_API_URL', '')
-    if not template:
-        raise SystemExit('[challenge] --sandbox-template or AENV_TEMPLATE is required')
-    if not api_url:
-        raise SystemExit('[challenge] --sandbox-api-url or AENV_API_URL is required')
+# ── Resources ──────────────────────────────────────────────────────────────
 
-    env = RemoteMsAgentToolEnv(
-        template=template,
+
+def initialize_device(args) -> Tuple[Any, Any]:
+    """Bring up Ray and the local vLLM sampler; returns (sampler, template).
+
+    The template is built here as well as inside the sampler because the rollout
+    encodes with it locally: one object, so the token ids the sampler continues
+    from are the ids the trajectory was encoded with.
+    """
+    twinkle.initialize(
+        mode='ray', nproc_per_node=args.sampler_gpus, lazy_collect=False,
+        groups=[DeviceGroup(name='sampler', ranks=list(range(args.sampler_gpus)),
+                            device_type='GPU')])
+    sampler = vLLMSampler(
+        model_id=args.model_id,
+        engine_args={'gpu_memory_utilization': args.gpu_memory_utilization,
+                     'max_model_len': args.max_model_len},
+        device_mesh=DeviceMesh.from_sizes(world_size=args.sampler_gpus,
+                                          dp_size=args.sampler_gpus),
+        remote_group='sampler',
+    )
+    sampler.set_template(args.template, model_id=args.model_id, enable_thinking=True,
+                         max_length=args.max_model_len)
+    import twinkle.template as template_module
+    template = getattr(template_module, args.template)(
+        args.model_id, max_length=args.max_model_len, enable_thinking=True)
+    if not getattr(type(sampler).sample, '_enable_continous_work', False):
+        raise SystemExit(
+            '[challenge] this sampler does not route requests one at a time '
+            '(sample lacks enable_continous_work), so a batch of one would be '
+            'padded to the worker count and most of every generation thrown away. '
+            'The whole design here is one trajectory per request.')
+    return sampler, template
+
+
+def initialize_sandbox(args) -> List[Any]:
+    """Boot the slots. See ``sandbox.open_pool``."""
+    return open_pool(
+        args.sandbox_slots,
+        template=args.sandbox_template,
+        api_url=args.sandbox_api_url,
         config_path=args.agent_config,
-        api_url=api_url,
         workspace=args.workspace,
         sandbox_timeout=args.sandbox_timeout,
-    )
-    env.reset()
-    return env
-
-
-def main():
-    args = parse_args()
-    for path in (args.out_flows, args.dump_rejected, args.keyword_db,
-                 args.dump_keyword_gen, args.dump_explore):
-        if path:
-            os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
-
-    # Build the proposing backend: an OpenAI-compatible API, or a local vLLM
-    # sampler. The API path skips twinkle.initialize entirely -- it needs no GPUs
-    # -- and passes no template, since the API re-sends messages as text rather
-    # than splicing token ids the way the sampler continuation does.
-    use_api = args.challenger_api
-    if args.followup_api:
-        # Split mode needs the local sampler for exploration (that is the trainable
-        # half), so it cannot run under --challenger-api, which builds no sampler.
-        if use_api:
-            raise SystemExit('[challenge] --followup-api and --challenger-api are mutually '
-                             'exclusive: --followup-api explores on the local sampler and '
-                             'sends only the check/statement stages to the API, while '
-                             '--challenger-api sends the whole proposing side to the API.')
-        if not args.challenger_api_model or not args.challenger_api_base:
-            raise SystemExit('[challenge] --followup-api needs --challenger-api-model and '
-                             '--challenger-api-base (or LLM_BACKUP_MODEL / '
-                             'LLM_BACKUP_BASE_URL).')
-    if use_api:
-        if args.solver_rollouts:
-            raise SystemExit('[challenge] --challenger-api needs --solver-rollouts 0: the '
-                             'solver side still runs on the local sampler, which is not '
-                             'built in API mode.')
-        if not args.challenger_api_model or not args.challenger_api_base:
-            raise SystemExit('[challenge] --challenger-api needs --challenger-api-model and '
-                             '--challenger-api-base (or LLM_BACKUP_MODEL / LLM_BACKUP_BASE_URL).')
-        from twinkle_agentic.protocol.openai import OpenAI
-        backend = OpenAI(model=args.challenger_api_model,
-                         api_key=args.challenger_api_key or None,
-                         base_url=args.challenger_api_base)
-        template = None
-        logger.info(f'[challenge] proposing via API model={args.challenger_api_model} '
-                    f'base={args.challenger_api_base}')
-    else:
-        # Initialize twinkle (sampler only, no trainer)
-        twinkle.initialize(
-            mode='ray', nproc_per_node=args.sampler_gpus, lazy_collect=False,
-            groups=[DeviceGroup(name='sampler', ranks=list(range(args.sampler_gpus)),
-                                device_type='GPU')])
-        backend = vLLMSampler(
-            model_id=args.model_id,
-            engine_args={'gpu_memory_utilization': 0.8, 'max_model_len': args.max_model_len},
-            device_mesh=DeviceMesh.from_sizes(world_size=args.sampler_gpus,
-                                              dp_size=args.sampler_gpus),
-            remote_group='sampler',
-        )
-        backend.set_template(args.template, model_id=args.model_id, enable_thinking=True,
-                             max_length=args.max_model_len)
-
-        import twinkle.template as template_module
-        template = getattr(template_module, args.template)(
-            args.model_id, max_length=args.max_model_len, enable_thinking=True)
-
-    # Build sandbox environments -- one per episode slot, since an episode owns
-    # its workspace from the reset until its check has run and two episodes
-    # sharing a sandbox would read each other's files. Skipped for
-    # --stage keywords: that stage only brainstorms and draws keywords, and
-    # booting a microVM to do it would make checking step 1 depend on the one part
-    # of the setup most likely to be down.
-    #
-    # ``envs[0]`` is also the one the serial paths use (the difficulty stage, and
-    # --stage explore), so ``env`` stays a name for it.
-    envs = []
-    env = None
-    schemas = None
-    tool_manager = ToolManager()
-    episode_tool_managers = None
-    if args.stage != 'keywords':
-        n_slots = max(1, args.episode_concurrency)
-        if n_slots == 1:
-            envs = [build_env(args)]
-        else:
-            # Booted in parallel: each is a microVM taking ~10s, and doing eight
-            # of them one after another would put a minute and a half in front of
-            # every run.
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=n_slots) as pool:
-                envs = list(pool.map(lambda _: build_env(args), range(n_slots)))
-        env = envs[0]
-        schemas = env.tool_schemas()
-        # One ToolManager per sandbox: the tools carry the env they dispatch into,
-        # so slot i's model turns have to go through slot i's manager.
-        episode_tool_managers = [ToolManager(EnvTool.from_schemas(e, schemas)) for e in envs]
-        tool_manager = episode_tool_managers[0]
-        logger.info(f'[challenge] {len(envs)} sandbox(es) ready '
-                    f'(episode concurrency {n_slots})')
-
-    # Explorer: multi-turn rollout with sandbox tools
-    # ``stop`` ends the reply at the end of the first tool call, and
-    # ``include_stop_str_in_output`` keeps that '</tool_call>' in what the policy
-    # is trained on -- vLLM drops the matched stop by default, which would train
-    # every turn to end on an unclosed block.
-    explore_stop = ['</tool_call>'] if (args.one_call_per_reply and not use_api) else None
-    # Sent on every API call when set. Capping the reasoning is the one knob that
-    # moved the wall-clock: 58s -> 10s per turn at 2048 on a ~15k-character context.
-    api_extra_body = ({'thinking_budget': args.challenger_thinking_budget}
-                      if (use_api and args.challenger_thinking_budget > 0) else None)
-    if api_extra_body:
-        logger.info(f'[challenge] thinking_budget={args.challenger_thinking_budget} '
-                    f'on every API call')
-    explore_params = SamplingParams(max_tokens=args.propose_max_tokens, num_samples=1,
-                                    logprobs=1, temperature=args.propose_temp, top_p=0.95,
-                                    stop=explore_stop,
-                                    include_stop_str_in_output=bool(explore_stop))
-    # One tool call per reply and stuck-turn early stop are sampler-path features:
-    # the API dispatches native tool_calls (never a '</tool_call>' string) and
-    # APIMultiTurnRollout takes neither kwarg.
-    if use_api:
-        explorer = build_rollout(
-            backend, tool_manager=tool_manager, max_turns=args.max_turns,
-            concurrency=args.challenger_concurrency, sampling_params=explore_params,
-            extra_body=api_extra_body)
-    else:
-        explorer = build_rollout(
-            backend, template=template, tool_manager=tool_manager,
-            max_turns=args.max_turns, stop_after_stuck_turns=args.stop_after_stuck_turns,
-            sampling_params=explore_params)
-
-    # Keyword brainstorming runs through this one instead of the sandbox
-    # explorer: a list is a text answer, and a bracketed list in a reply is
-    # exactly what the sandbox explorer would try to dispatch as a call.
-    #
-    # max_turns=1 is what makes it tool-less: MultiTurnRollout ends the
-    # trajectory on the turn limit before it dispatches anything, so the empty
-    # ToolManager below is never consulted. It is here because the rollout
-    # requires one at construction, not because these calls have tools.
-    keyword_params = SamplingParams(max_tokens=args.keyword_max_tokens, num_samples=1,
-                                    logprobs=1, temperature=args.keyword_temp, top_p=0.98)
-    if use_api:
-        keyword_explorer = build_rollout(
-            backend, tool_manager=ToolManager(), max_turns=1,
-            concurrency=args.challenger_concurrency, sampling_params=keyword_params,
-            extra_body=api_extra_body)
-    else:
-        keyword_explorer = build_rollout(
-            backend,
-            template=template,
-            tool_manager=ToolManager(),
-            max_turns=1,
-            sampling_params=keyword_params,
-        )
-
-    # Sandbox control functions -- use env.runner() which resolves tool names
-    # (ms-agent registers tools as "server---name") and parses exit codes from
-    # the marker protocol, so we don't rely on string matching.
-    #
-    # One runner per sandbox; ``slot`` picks which one. The challenger passes the
-    # slot of the episode it is serving, so a concurrent episode never clears or
-    # inspects another episode's workspace. Everything serial (the difficulty
-    # stage, --stage explore) leaves it at the default and uses sandbox 0.
-    #
-    # Empty for --stage keywords, which has no sandbox. The functions below index
-    # into it and would raise if that stage ever reached them; it returns first.
-    runners = [e.runner() for e in envs]
-    runner = runners[0] if runners else None
-
-    def reset_fn(slot: int = 0):
-        """Empty sandbox ``slot``'s workspace before an episode.
-
-        Raises rather than returning: every caller depends on a clean start, and
-        a silent no-op here means a task inherits the previous task's files --
-        which lets a solver pass without doing anything and makes the difficulty
-        numbers meaningless.
-
-        This is also the one point where losing the sandbox costs nothing, since
-        the workspace is about to be emptied regardless -- so a runtime that went
-        away is rebuilt here instead of ending a run that may have hours of
-        proposals behind it. The same reasoning covers a clear that *fails* on a
-        runtime still answering /health, which ensure_ready cannot see: run 'rsi'
-        reached iteration 7 -- six checkpoints, eight hours -- and ended on three
-        clears timing out at ms-agent's per-call limit while the sandbox itself
-        was healthy enough to report them. So the clear is retried, and then
-        retried on a deliberately rebuilt sandbox, before the run is given up.
-        """
-        clear = CLEAR_WORKSPACE.format(workspace=args.workspace)
-        if envs[slot].ensure_ready():
-            # A rebuilt sandbox starts empty, so the clear below is redundant,
-            # but running it anyway keeps one path through this function. The
-            # rebuild replaces the sandbox behind this env, so the runner is
-            # re-fetched rather than reused.
-            runners[slot] = envs[slot].runner()
-            logger.warning(f'[challenge] sandbox {slot} was rebuilt before this episode')
-        exit_code, output = runners[slot](clear, 'python')
-        if exit_code != 0:
-            logger.warning(f'[challenge] workspace reset failed on sandbox {slot} '
-                           f'(exit {exit_code}), retrying in {RESET_RETRY_WAIT}s: '
-                           f'{output[-200:]}')
-            time.sleep(RESET_RETRY_WAIT)
-            exit_code, output = runners[slot](clear, 'python')
-        if exit_code != 0:
-            # Rebuilt rather than retried again: two failures in a row is not the
-            # transient this waits out, and a fresh sandbox brings a workspace
-            # that is already empty -- which is all this function is asked for.
-            # Counted as a recovery so the run's own tally at the end still
-            # accounts for every rebuild, including the ones from here.
-            logger.warning(f'[challenge] workspace reset failed twice on sandbox {slot} '
-                           f'(exit {exit_code}); rebuilding it: {output[-200:]}')
-            envs[slot].reset()
-            envs[slot].n_recoveries += 1
-            runners[slot] = envs[slot].runner()
-            exit_code, output = runners[slot](clear, 'python')
-        if exit_code != 0:
-            raise RuntimeError(f'workspace reset failed (exit {exit_code}): {output[-400:]}')
-
-    def run_check_fn(script: str, slot: int = 0):
-        """Run a python check script in sandbox ``slot``; returns (exit_code, output)."""
-        return runners[slot](script, 'python')
-
-    # Why the last snapshot for each slot came back empty: the failure text if the
-    # listing could not be read, absent if the workspace really was empty. Read by
-    # snapshot_error_fn below so a paused sandbox is not filed as the model having
-    # built nothing.
-    snapshot_errors: Dict[int, str] = {}
-
-    def workspace_snapshot_fn(slot: int = 0):
-        """Every file the episode left behind: ``path size`` lines, then contents.
-
-        This is the ground truth the check script is written against, so it is
-        unwrapped from the tool's JSON envelope and returned as a bare listing:
-        the model has to be able to read it as a directory rather than as a tool
-        result, or it falls back on what it *believes* it created.
-
-        Returns an empty string when the episode left nothing behind, and also
-        when the listing could not be read at all. Both mean the same thing to
-        the caller -- there is no end state to write checks about -- and neither
-        may be dressed up as a plausible one: a snapshot that says "empty"
-        when it means "I could not look" produces tasks whose only true
-        assertion is that nothing happened. Which of the two it was is recorded
-        in ``snapshot_errors`` instead, for the rejection to be filed under.
-        """
-        snapshot_errors.pop(slot, None)
-        script = WORKSPACE_SNAPSHOT.format(workspace=args.workspace,
-                                           max_files=args.snapshot_max_files,
-                                           per_file=args.snapshot_per_file,
-                                           total_budget=args.snapshot_budget)
-        exit_code, output = runners[slot](script, 'python')
-        if exit_code != 0:
-            # One retry: 62 of run_clean6's 63 snapshot failures were the sandbox
-            # answering 410 "not proxyable", which is the host having paused it and
-            # may be over by the time we ask again. Not fatal either way, but not
-            # silent: checks written against a missing end state are the failure
-            # this whole function exists to prevent.
-            logger.warning(f'[challenge] workspace snapshot failed (exit {exit_code}), '
-                           f'retrying in {SNAPSHOT_RETRY_WAIT}s: {output[-200:]}')
-            time.sleep(SNAPSHOT_RETRY_WAIT)
-            exit_code, output = runners[slot](script, 'python')
-        if exit_code != 0:
-            logger.warning(f'[challenge] workspace snapshot failed again (exit '
-                           f'{exit_code}): {output[-200:]}')
-            snapshot_errors[slot] = f'workspace snapshot failed (exit {exit_code}): {output[-500:]}'
-            return ''
-        return tool_payload(output).strip()
-
-    def snapshot_error_fn(slot: int = 0) -> str:
-        """Why the last snapshot for ``slot`` was empty; '' if it really was."""
-        return snapshot_errors.get(slot, '')
-
-    # Arm B. Read at most this much per call: the executor truncates its output
-    # near 8 KB, and base64 grows 3 bytes into 4, so 4 KB of file is about 5.5 KB
-    # of text with room left for the JSON envelope.
-    SLICE_BYTES = 4096
-
-
-    # The opening the solver is measured against, built by the same function the
-    # eval script uses so that n_pass and pass@k are measuring one thing. Until
-    # this existed the difficulty stage handed over the statement as a lone user
-    # message with no system prompt: nothing said the model was in a sandbox, could
-    # take many turns, or should make one call per reply, and it answered by
-    # writing whole programs into a single call argument until they truncated.
-    _solver_harness = solver_harness(args.agent_config) if args.solver_rollouts > 0 else None
-
-    def solver_prompt_fn(query: str):
-        return _solver_harness.start(query)
-
-    # Keywords
-    store = None
-    # Arm D replaces the three topic axes with one bank of 'kind of work' phrases:
-    # a proposal takes one phrase, not one entry from each of three axes.
-    categories = CATEGORIES
-    category_desc = CATEGORY_DESC
-    if args.keywords_n > 0:
-        store = KeywordStore(args.keyword_db, categories)
-        logger.info('[challenge] keyword bank loaded: '
-                    + ', '.join(f'{c}={len(store.items[c])}' for c in categories))
-
-    # Seeds
-    seeds = []
-    if args.seed_file:
-        with open(args.seed_file, encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    seeds.append(json.loads(line))
-        logger.info(f'[challenge] loaded {len(seeds)} seeds from {args.seed_file}')
-
-    # Rejected log
-    rejected = open(args.dump_rejected, 'w', encoding='utf-8') if args.dump_rejected else None
-
-    def _reject(record):
-        if rejected is not None:
-            rejected.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-            # Flushed per record: this file is the only account of why proposals
-            # are being dropped, and a run is worth watching for hours before it
-            # ends. Buffered, it stays empty until then.
-            rejected.flush()
-
-    propose_writer = ProposeTrajWriter(args.dump_propose_traj)
-
-    # Solver attempts from the difficulty stage. One line per attempt, so a task
-    # measured at 0 of 4 can be read rather than guessed at: the attempt, the
-    # state it left, and what the check said about it.
-    solver_log = (open(args.dump_solver_attempts, 'w', encoding='utf-8')
-                  if args.dump_solver_attempts else None)
-
-    def _solver_attempt(record):
-        if solver_log is not None:
-            solver_log.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-            solver_log.flush()
-
-    # Keyword generation, one line per call. The bank is the first step of the
-    # whole pipeline and the easiest place to fail invisibly: a reply the parser
-    # rejects leaves the bank empty, and every proposal downstream then runs the
-    # no-keyword prompt while the run looks healthy. Whole runs went that way
-    # before this existed, so prompt and reply are both kept verbatim.
-    keyword_log = (open(args.dump_keyword_gen, 'w', encoding='utf-8')
-                   if args.dump_keyword_gen else None)
-
-    def _keyword_gen(record):
-        if keyword_log is not None:
-            keyword_log.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-            keyword_log.flush()
-
-    # Build challenger
-    prompts = agentic_prompts(max_build_files=args.max_build_files)
-    # Followup API: explore on the local (trainable) sampler above, but write the
-    # check script and problem statement over an OpenAI-compatible API (qwen3-max).
-    # Reuses the --challenger-api-* connection args; the thinking cap, when set, is
-    # sent as extra_body on every check/statement call.
-    followup_api = None
-    followup_extra_body = None
-    if args.followup_api:
-        from twinkle_agentic.protocol.openai import OpenAI
-        followup_api = OpenAI(model=args.challenger_api_model,
-                              api_key=args.challenger_api_key or None,
-                              base_url=args.challenger_api_base)
-        if args.challenger_thinking_budget > 0:
-            followup_extra_body = {'thinking_budget': args.challenger_thinking_budget}
-        logger.info(f'[challenge] followup (check + statement) via API '
-                    f'model={args.challenger_api_model} base={args.challenger_api_base}'
-                    + (f' thinking_budget={args.challenger_thinking_budget}'
-                       if followup_extra_body else ''))
-    challenger = AgenticChallenger(
-        prompts,
-        explorer,
-        seeds=seeds,
-        keyword_store=store,
-        category_desc=category_desc if store else None,
-        seed_mix_prob=args.seed_mix_prob,
-        reset_fn=reset_fn,
-        run_check_fn=run_check_fn,
-        workspace_snapshot_fn=workspace_snapshot_fn,
-        snapshot_error_fn=snapshot_error_fn,
-        # The executor's own schemas, so the rounds that may call tools advertise
-        # exactly what will run -- same source as the training script uses.
-        tool_schemas=schemas,
-        episode_concurrency=max(1, args.episode_concurrency),
-        episode_tool_managers=episode_tool_managers,
-        combo_arity=args.combo_arity,
-        arity_weights=[float(x) for x in args.arity_weights.split(',')] if args.arity_weights
-        else None,
-        single_kw_prob=args.single_kw_prob,
-        proposals_per_group=max(1, args.proposals_per_group),
-        keyword_refill_target=args.keywords_n,
-        keyword_gen_calls=args.keyword_gen_calls,
-        keyword_refill_concurrency=max(1, args.keyword_refill_concurrency),
-        keyword_refill_tries=args.keyword_refill_tries,
-        keyword_params=SamplingParams(max_tokens=args.keyword_max_tokens, num_samples=1,
-                                      logprobs=1, temperature=args.keyword_temp, top_p=0.98),
-        # Same temperature as the episode, different budgets: the only thing
-        # being changed per stage is how much room the reply gets.
-        check_params=SamplingParams(max_tokens=args.check_max_tokens, num_samples=1,
-                                    logprobs=1, temperature=args.propose_temp, top_p=0.95),
-        problem_params=SamplingParams(max_tokens=args.problem_max_tokens, num_samples=1,
-                                      logprobs=1, temperature=args.propose_temp, top_p=0.95),
-        followup_api=followup_api,
-        followup_extra_body=followup_extra_body,
-        keyword_explorer=keyword_explorer,
-        min_batch=args.sampler_gpus,
-        problem_max_chars=args.problem_max_chars,
-        max_proposals_total=args.max_proposals_total,
-        solver_prompt_fn=solver_prompt_fn if _solver_harness is not None else None,
-        check_retries=args.check_retries,
-        reject_sink=_reject,
-        propose_sink=propose_writer.write,
-        solver_sink=_solver_attempt,
-        keyword_sink=_keyword_gen,
-        max_proposals_per_round=args.max_proposals_per_round,
-        solver_rollouts=args.solver_rollouts,
-        keep_min_pass=args.keep_min_pass,
-        keep_max_pass_margin=args.keep_max_margin,
-        # One call per reply here too, for the same reason and to keep the two
-        # sides comparable: a solver whose read-back is dispatched alongside the
-        # write it is checking fails a task the proposer built cleanly, and
-        # n_pass would then be measuring the dispatch, not the difficulty.
-        solver_params=SamplingParams(max_tokens=args.solver_max_tokens, num_samples=1,
-                                     logprobs=1, temperature=args.solver_temp, top_p=0.95,
-                                     stop=explore_stop,
-                                     include_stop_str_in_output=bool(explore_stop)),
-        seed=args.random_seed,
+        snapshot_max_files=args.snapshot_max_files,
+        snapshot_per_file=args.snapshot_per_file,
+        snapshot_budget=args.snapshot_budget,
     )
 
-    # Generate
-    batch_size = args.batch_size or args.keep_target
-    kept = []
 
-    # --stage keywords stops after step 1: fill the bank, draw the combinations,
-    # write out the proposal prompts they produce, and exit without touching the
-    # sandbox. Step 1 was broken for several runs and the failure was only
-    # visible by reading what it fed the next step, so it has to be runnable on
-    # its own rather than only as the first minute of an hours-long run.
-    if args.stage == 'keywords':
-        proposals = challenger.propose(args.stage_proposals)
-        with open(args.out_flows, 'w', encoding='utf-8') as out:
-            for i, proposal in enumerate(proposals):
-                data = proposal.get('user_data')
-                out.write(json.dumps({
-                    'index': i,
-                    'keywords': user_data_get(data, 'keywords', []),
-                    'seeded': user_data_get(data, 'seeded', False),
-                    'prompt': proposal['messages'][-1]['content'],
-                }, ensure_ascii=False) + '\n')
-        drawn = sum(1 for p in proposals
-                    if user_data_get(p.get('user_data'), 'keywords', []))
-        logger.info(f'[challenge] stage=keywords: {len(proposals)} proposals, '
-                    f'{drawn} of them carry keywords')
-        if store is not None:
-            store.save()
-            logger.info('[challenge] keyword bank saved -> ' + args.keyword_db
-                        + ' (' + ', '.join(f'{c}={len(store.items[c])}'
-                                           for c in categories) + ')')
-        if keyword_log is not None:
-            keyword_log.close()
-        propose_writer.close()
-        if rejected is not None:
-            rejected.close()
-        if solver_log is not None:
-            solver_log.close()
-        if env is not None:
-            for e in envs:
-                e.close()
-        return
+def rollout_one(rollout: MultiTurnRollout, traj: Dict[str, Any],
+                params: SamplingParams, slot) -> Optional[Dict[str, Any]]:
+    """Run one trajectory: vLLM for the replies, ``slot`` for the tool calls.
 
-    # --stage explore stops after step 4: draw a proposal, clear the workspace,
-    # run the sandbox episode, snapshot what it left, and stop before the
-    # check-writing round. What it is for: the episode is where the run either
-    # produces something worth writing a check about or leaves an empty directory,
-    # and 9 of 30 proposals in run11 left an empty one for reasons the rejection
-    # record could not distinguish. Everything the episode saw and did goes out
-    # verbatim, so that question is answerable from the file.
-    if args.stage == 'explore':
-        explore_log = (open(args.dump_explore, 'w', encoding='utf-8')
-                       if args.dump_explore else None)
-        empty = 0
-        for i, proposal in enumerate(challenger.propose(args.stage_proposals)):
-            reset_fn()
-            result = challenger.explore([proposal])
-            episode = result[0] if result else {}
-            snapshot = workspace_snapshot_fn()
-            if not snapshot.strip():
-                empty += 1
-            messages = episode.get('messages') or []
-            calls = sum(len(m.get('tool_calls') or []) for m in messages
-                        if isinstance(m, dict))
-            logger.info(f'[challenge] episode {i}: stop={episode.get("stop_reason")} '
-                        f'truncated={bool(episode.get("truncated"))} '
-                        f'stuck_stop={bool(episode.get("stuck_stop"))} '
-                        f'turns={episode.get("turns")} calls={calls} '
-                        f'end_state={len(snapshot)}b')
-            if explore_log is not None:
-                explore_log.write(json.dumps({
-                    'index': i,
-                    'keywords': user_data_get(proposal.get('user_data'), 'keywords', []),
-                    'prompt': proposal['messages'][-1]['content'],
-                    'stop_reason': episode.get('stop_reason'),
-                    'truncated': bool(episode.get('truncated')),
-                    'stuck_stop': bool(episode.get('stuck_stop')),
-                    'turns': episode.get('turns'),
-                    'n_tool_calls': calls,
-                    'messages': messages,
-                    'end_state': snapshot,
-                }, ensure_ascii=False, default=str) + '\n')
-                explore_log.flush()
-        logger.info(f'[challenge] stage=explore: {args.stage_proposals} episodes, '
-                    f'{empty} left an empty workspace')
-        if explore_log is not None:
-            explore_log.close()
-        if keyword_log is not None:
-            keyword_log.close()
-        propose_writer.close()
-        if rejected is not None:
-            rejected.close()
-        if solver_log is not None:
-            solver_log.close()
-        if store is not None:
-            store.save()
-        if env is not None:
-            for e in envs:
-                e.close()
-        return
-
-    # Appended as batches arrive, then rewritten sorted at the end. A run that
-    # keeps one task every few minutes for hours cannot afford to hold them all
-    # in memory only: a crash at hour three would leave nothing to train on,
-    # while an unsorted partial file is a usable task set.
-    with open(args.out_flows, 'w', encoding='utf-8') as partial:
-        for batch in challenger(batch_size=batch_size, total=args.keep_target):
-            for offset, task in enumerate(batch):
-                partial.write(json.dumps(flow_record(len(kept) + offset, task),
-                                         ensure_ascii=False) + '\n')
-            partial.flush()
-            kept.extend(batch)
-            logger.info(f'[challenge] kept {len(kept)}/{args.keep_target} so far; '
-                        f'stats {challenger.stats}')
-    if rejected is not None:
-        rejected.close()
-    if solver_log is not None:
-        solver_log.close()
-    propose_writer.close()
-
-    # Before the keyword log is closed: expanding the bank generates keywords,
-    # and generating them writes to that log. Closing it first ended ex11 --
-    # after all 4 tasks were kept and written -- with `ValueError: I/O operation
-    # on closed file`, which also skipped store.save() below and every line
-    # after it, so the run reported nothing about what it had produced.
-    if store is not None:
-        challenger.expand_hard_keywords()
-        store.save()
-        logger.info('[challenge] keyword bank saved -> ' + args.keyword_db)
-    if keyword_log is not None:
-        keyword_log.close()
-
-    # Sort by difficulty (hardest last)
-    if not args.no_sort_by_difficulty:
-        kept.sort(key=lambda t: -(user_data_get(t.get('user_data'), 'n_pass', 0) or 0))
-
-    # Write output
-    write_flows(kept, args)
-    logger.info(f'[challenge] wrote {len(kept)} tasks -> {args.out_flows}')
-    if env.n_recoveries:
-        logger.warning(f'[challenge] sandbox was rebuilt {env.n_recoveries} time(s) during '
-                       f'this run; episodes in flight at those moments were lost')
-    dist = {}
-    for task in kept:
-        n = user_data_get(task.get('user_data'), 'n_pass', 0)
-        dist[n] = dist.get(n, 0) + 1
-    logger.info(f'[challenge] pass-count distribution: {dict(sorted(dist.items()))}')
-
-    for e in envs:
-        e.close()
+    A batch of one. The sampler routes it to whichever worker is free, so this is
+    called from every sandbox thread at once and the requests share vLLM's batch
+    without any of them waiting for the others to be ready.
+    """
+    out = rollout([traj], sampling_params=params, tool_manager=slot.tool_manager)
+    return out[0] if out else None
 
 
-class ProposeTrajWriter:
-    """Persist the proposing rounds so the challenger could be trained later.
+def call_one(slot, script: str) -> Tuple[int, str]:
+    """Run one python script inside ``slot``; returns (exit code, output)."""
+    return slot.run(script)
 
-    One ``.npz`` per proposal attempt holds the arrays, and one line per attempt
-    in ``index.jsonl`` holds everything a human reads plus the outcome. Splitting
-    them is what keeps this affordable: a 20-turn agentic episode is tens of
-    thousands of token ids, which as JSON is an order of magnitude larger than
-    the same numbers as int32.
 
-    ``logprobs`` arrive as ``[[(token_id, logprob)]]`` and are flattened to the
-    logprob column alone -- that is the shape GRPO's ``old_logps`` wants, and the
-    token each one belongs to is already in ``labels``.
+def api_one(api, messages: List[Dict[str, Any]], user_text: str,
+            params: SamplingParams, extra_body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Append ``user_text`` and one API reply to ``messages``; returns the reply.
 
-    Rejected attempts are written too. Their outcome is the reward's zero, and a
-    dump of kept-only attempts would have nothing to contrast against.
+    ``messages`` is the caller's private copy, never a trainable trajectory, so
+    mutating it in place costs the model nothing. ``None`` means the call raised:
+    the caller rejects rather than building a task on a broken conversation.
+
+    Tools are withdrawn for these stages on purpose -- they are answers, not
+    actions -- so only the text is kept and any structured ``tool_calls`` the API
+    returned are dropped.
+    """
+    messages.append({'role': 'user', 'content': user_text})
+    request = {'messages': messages}
+    try:
+        reply = api(request, params, extra_body=extra_body) if extra_body else api(request, params)
+    except Exception as e:  # noqa: BLE001 -- one bad call must not kill the run
+        logger.warning(f'[challenge] API call failed: {type(e).__name__}: {e}')
+        return None
+    if isinstance(reply, list):
+        reply = reply[0] if reply else {}
+    content = (reply.get('content') if isinstance(reply, dict) else None) or ''
+    messages.append({'role': 'assistant', 'content': content})
+    return content
+
+
+# ── Output ─────────────────────────────────────────────────────────────────
+
+
+def logprob_column(logprobs: Any) -> List[float]:
+    """One float per generated token: the logprob of the token that was chosen.
+
+    The sampler hands these over as ``List[List[Tuple[int, float]]]`` -- per
+    generated token, a list of top-k ``(token_id, logprob)`` pairs with the chosen
+    token first (``SampledSequence.logprobs``, data_format/sampling.py:185).
+    Passing that to ``np.asarray`` directly would store an ``(N, k, 2)`` array and
+    the loader would hand GRPO nested lists where it wants one float per trainable
+    token -- which is a crash inside the step, or worse a silent reshape.
+
+    A plain list of floats is accepted too, for a sampler that already flattened.
+    Anything else raises rather than being coerced: a wrong ``old_logps`` makes the
+    GRPO ratio wrong on the first step, and nothing downstream would say so.
+    """
+    out: List[float] = []
+    for step in logprobs:
+        if isinstance(step, (int, float)):
+            out.append(float(step))
+            continue
+        if isinstance(step, (list, tuple)) and step:
+            head = step[0]
+            if isinstance(head, (list, tuple)) and len(head) >= 2:
+                out.append(float(head[1]))
+                continue
+        raise TypeError(f'cannot read a logprob out of {step!r}; expected a float '
+                        f'or a list of (token_id, logprob) pairs')
+    return out
+
+
+class Recorder:
+    """Everything a run writes, behind one lock.
+
+    Trajectories go to ``.npz`` for the token fields and to ``index.jsonl`` for
+    everything a reader needs to interpret them. The text is written in full and
+    never truncated: these files are read to check whether a reward was deserved,
+    which a shortened statement cannot answer.
     """
 
     def __init__(self, out_dir: str):
         self.dir = out_dir
-        self.index = None
-        self.n = 0
-        if not out_dir:
-            return
-        os.makedirs(out_dir, exist_ok=True)
-        self.index = open(os.path.join(out_dir, 'index.jsonl'), 'w', encoding='utf-8')
+        self.traj_dir = os.path.join(out_dir, 'trajs')
+        os.makedirs(self.traj_dir, exist_ok=True)
+        self._lock = threading.Lock()
+        self._n = 0
+        self._index = open(os.path.join(self.traj_dir, 'index.jsonl'), 'w', encoding='utf-8')
+        self._groups = open(os.path.join(out_dir, 'groups.jsonl'), 'w', encoding='utf-8')
+        self._tasks = open(os.path.join(out_dir, 'tasks.jsonl'), 'w', encoding='utf-8')
+        # Why a build produced no task. The reason alone is not diagnosable: nine
+        # empty_workspace rejections in one run all looked like the model refusing
+        # to act, and the question of whether it had run out of tokens or simply
+        # emitted no call could not be answered from the record, because the fields
+        # that answered it were on the trajectory and were dropped.
+        self._rejected = open(os.path.join(out_dir, 'rejected.jsonl'), 'w', encoding='utf-8')
+        # Keyword replies, both sides in full. The one question this file exists to
+        # answer -- did the model disobey the format, or does the parser reject what
+        # it produced -- cannot be answered from a count. Keyword generation was
+        # silently broken for whole runs when the prompt asked for one per line and
+        # the parser wanted a JSON array.
+        self._keywords = open(os.path.join(out_dir, 'keyword_gen.jsonl'), 'w', encoding='utf-8')
+        # Every solver attempt, passed or not, with the state it left and what the
+        # check said about it. A task measured at 0 of 8 has three explanations --
+        # the check is wrong, the statement withholds something the check demands,
+        # or the solver gave up -- and only the attempt and the workspace it left
+        # tell them apart. Written for every attempt, not only for the ones that
+        # end up trained on: the failures are what this file is for.
+        self._attempts = open(os.path.join(out_dir, 'solver_attempts.jsonl'), 'w',
+                             encoding='utf-8')
+        # The rubric, all three of its dimensions. Only novelty reaches a reward;
+        # usefulness and complexity are recorded so the question of whether they
+        # should count can be answered from a run instead of argued.
+        self._novelty = open(os.path.join(out_dir, 'novelty_scores.jsonl'), 'w',
+                             encoding='utf-8')
 
-    def write(self, record):
-        if self.index is None:
+    def trajectory(self, traj: Dict[str, Any], **fields: Any) -> None:
+        """One training sample: token fields to npz, everything else to the index.
+
+        A trajectory with no ``logprobs`` is written anyway, with the field left
+        null. It is not trainable and the loader will say so -- which is the point:
+        a sample silently dropped here would make the group it belongs to look like
+        a different size than it was.
+        """
+        input_ids = np.asarray(traj.get('input_ids') or [], dtype=np.int32)
+        labels = np.asarray(traj.get('labels') or [], dtype=np.int32)
+        logprobs = traj.get('logprobs')
+        with self._lock:
+            self._n += 1
+            name = f'{self._n:06d}.npz'
+        arrays = {'input_ids': input_ids, 'labels': labels}
+        if logprobs is not None:
+            # float64, and the chosen token's column only. These are the old_logps a
+            # GRPO step divides by; float32 would round them to about 7 digits, so
+            # the ratio exp(logp - old_logp) would be off by roughly 1e-7 for
+            # reasons that have nothing to do with the policy having changed.
+            arrays['logprobs'] = np.asarray(logprob_column(logprobs), dtype=np.float64)
+        # Compressed: a 24-turn agentic episode is tens of thousands of token ids,
+        # and 128 of them per iteration adds up on disk.
+        np.savez_compressed(os.path.join(self.traj_dir, name), **arrays)
+        record = dict(fields)
+        record.update({
+            'npz': name,
+            'n_tokens': int(input_ids.size),
+            'n_trainable': int((labels != -100).sum()) if labels.size else 0,
+            'has_logprobs': logprobs is not None,
+            # The rollout guarantees one logprob per trainable label; recorded so a
+            # loader can check it rather than trust it.
+            'n_logprobs': int(arrays['logprobs'].size) if logprobs is not None else 0,
+            'turns': traj.get('turns'),
+            'stop_reason': traj.get('stop_reason'),
+            'truncated': bool(traj.get('truncated')),
+            'tool_stop': traj.get('tool_stop'),
+            'messages': traj.get('messages') or [],
+        })
+        self._write(self._index, record)
+
+    def group(self, record: Dict[str, Any]) -> None:
+        self._write(self._groups, record)
+
+    def task(self, record: Dict[str, Any]) -> None:
+        self._write(self._tasks, record)
+
+    def rejected(self, record: Dict[str, Any]) -> None:
+        self._write(self._rejected, record)
+
+    def keywords(self, record: Dict[str, Any]) -> None:
+        self._write(self._keywords, record)
+
+    def attempt(self, record: Dict[str, Any]) -> None:
+        self._write(self._attempts, record)
+
+    def novelty(self, record: Dict[str, Any]) -> None:
+        self._write(self._novelty, record)
+
+    def close(self) -> None:
+        for handle in (self._index, self._groups, self._tasks, self._rejected,
+                       self._keywords, self._attempts, self._novelty):
+            handle.close()
+
+    def _write(self, handle, record: Dict[str, Any]) -> None:
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with self._lock:
+            handle.write(line + '\n')
+            handle.flush()
+
+
+# ── Group state ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Proposal:
+    """One trajectory's worth of state, from the build to its solver attempts."""
+
+    group: 'Group'
+    idx: int
+    outcome: str = ''                       # 'ok', or why this one produced no task
+    detail: str = ''                        # what to look at when it did not
+    statement: str = ''
+    check: str = ''
+    traj: Optional[Dict[str, Any]] = None   # the trainable build trajectory
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    passes: List[bool] = field(default_factory=list)
+    novelty: Optional[float] = None
+    n_solved: int = 0                       # attempts finished, not attempts passed
+
+    @property
+    def n_pass(self) -> Optional[int]:
+        """How many attempts passed, or None if the task was never measured."""
+        if not self.statement or self.n_solved < self.group.rollouts:
+            return None
+        return sum(1 for p in self.passes if p)
+
+    def reward(self, rollouts: int, floor: float) -> float:
+        return challenger_reward(self.n_pass, rollouts, self.novelty, floor)
+
+
+class Group:
+    """``size`` proposals sharing one keyword draw, and the counters that decide them.
+
+    Every method that reads more than one field takes the lock, because the
+    proposals resolve on different threads and in any order. Nothing here blocks:
+    a thread reports what it finished and asks whether that was the last thing
+    outstanding, and only the thread that gets ``True`` runs the decision.
+    """
+
+    def __init__(self, gid: int, keywords: List[Tuple[str, str]], keyword_block: str,
+                 prompt: str, size: int, rollouts: int):
+        self.id = gid
+        self.keywords = keywords
+        self.keyword_block = keyword_block
+        self.prompt = prompt
+        self.rollouts = rollouts
+        self.proposals = [Proposal(self, i) for i in range(size)]
+        self.lock = threading.Lock()
+        self.n_built = 0                    # proposals whose build stage is over
+        self.rubric_done = False
+        self.dropped = ''                   # reason, once this group is abandoned
+        self.decided = False
+
+    @property
+    def size(self) -> int:
+        return len(self.proposals)
+
+    def abandon(self, reason: str) -> bool:
+        """Give up on this group. True if this call is the one that decided it.
+
+        Jobs already queued for it check ``dropped`` and return their slot without
+        doing any work, so abandoning is also how the remaining solver attempts of
+        a group are cancelled.
+        """
+        with self.lock:
+            if self.decided:
+                return False
+            self.dropped = reason
+            self.decided = True
+            return True
+
+    def built(self, prop: Proposal) -> str:
+        """Record that ``prop``'s build stage is over; returns what to do next.
+
+        ``'rubric'`` when this was the last build and the statements are ready to
+        be judged, ``'decide'`` when the group needs no judging and nothing else is
+        outstanding, ``''`` when there is still work in flight.
+        """
+        with self.lock:
+            self.n_built += 1
+            if self.n_built < self.size or self.decided:
+                return ''
+            if any(p.statement for p in self.proposals):
+                return 'rubric'
+            self.rubric_done = True
+            return self._ready_locked()
+
+    def judged(self) -> str:
+        with self.lock:
+            self.rubric_done = True
+            return self._ready_locked()
+
+    def solved(self, prop: Proposal, attempt: Optional[Dict[str, Any]], passed: bool) -> str:
+        with self.lock:
+            prop.n_solved += 1
+            prop.attempts.append(attempt or {})
+            prop.passes.append(passed)
+            return self._ready_locked()
+
+    def _ready_locked(self) -> str:
+        """``'decide'`` once every outstanding piece of this group has landed."""
+        if self.decided or self.n_built < self.size or not self.rubric_done:
+            return ''
+        if any(p.statement and p.n_solved < self.rollouts for p in self.proposals):
+            return ''
+        self.decided = True
+        return 'decide'
+
+    def statements(self) -> List[Proposal]:
+        return [p for p in self.proposals if p.statement]
+
+
+
+# ── The run ────────────────────────────────────────────────────────────────
+
+
+class Run:
+    """One collection pass: the resources, the queue, and the three job bodies.
+
+    Sandbox jobs go on one FIFO queue served by one thread per slot, so a slot is
+    never idle while there is work. Rubric jobs go to a separate pool because they
+    need no sandbox, and putting them on the same queue would let a group's
+    judgement wait behind the solver attempts of another group.
+
+    Nothing in a job waits for another job. A build enqueues its solver attempts
+    and returns its slot; a group is decided by whichever thread happens to land
+    the last outstanding piece. That is what keeps the pool from deadlocking on
+    itself, which a build that waited for its own solvers would do at once.
+    """
+
+    def __init__(self, args, sampler, template, slots: List[Any], recorder: Recorder):
+        self.args = args
+        self.slots = slots
+        self.rec = recorder
+        self.rng = random.Random(args.random_seed or None)
+
+        # Two rollouts over one sampler and one template: they differ only in the
+        # turn budget, and a per-call override for that does not exist. The
+        # trajectory-level state a rollout keeps is all local to __call__, so both
+        # are called from every thread at once with a per-call tool_manager.
+        self.propose_params = SamplingParams(
+            max_tokens=args.propose_max_tokens, num_samples=1, logprobs=1,
+            temperature=args.propose_temp, top_p=0.95,
+            stop=['</tool_call>'] if args.one_call_per_reply else None,
+            include_stop_str_in_output=bool(args.one_call_per_reply))
+        self.solve_params = SamplingParams(
+            max_tokens=args.solver_max_tokens, num_samples=1, logprobs=1,
+            temperature=args.solver_temp, top_p=0.95,
+            stop=['</tool_call>'] if args.one_call_per_reply else None,
+            include_stop_str_in_output=bool(args.one_call_per_reply))
+        self.propose_rollout = MultiTurnRollout(
+            sampler, template=template, tool_manager=ToolManager(),
+            max_turns=args.max_turns, stop_after_stuck_turns=args.stop_after_stuck_turns,
+            sampling_params=self.propose_params)
+        self.solve_rollout = MultiTurnRollout(
+            sampler, template=template, tool_manager=ToolManager(),
+            max_turns=args.solver_max_turns,
+            stop_after_stuck_turns=args.stop_after_stuck_turns,
+            sampling_params=self.solve_params)
+        self.keyword_rollout = MultiTurnRollout(
+            sampler, template=template, tool_manager=ToolManager(), max_turns=1,
+            sampling_params=SamplingParams(max_tokens=args.keyword_max_tokens,
+                                           num_samples=1, logprobs=1,
+                                           temperature=args.keyword_temp, top_p=0.98))
+
+        from twinkle_agentic.protocol.openai import OpenAI
+        self.api = OpenAI(model=args.api_model, api_key=args.api_key or None,
+                          base_url=args.api_base)
+        self.api_extra = ({'thinking_budget': args.api_thinking_budget}
+                          if args.api_thinking_budget > 0 else None)
+        self.check_params = SamplingParams(max_tokens=args.check_max_tokens, num_samples=1,
+                                           temperature=args.propose_temp, top_p=0.95)
+        self.problem_params = SamplingParams(max_tokens=args.problem_max_tokens,
+                                             num_samples=1, temperature=args.propose_temp,
+                                             top_p=0.95)
+
+        # Built once: the cap is part of the system prompt, so a build that got a
+        # different one would be a different experiment.
+        self.system = P.SYSTEM + (P.BUILD_SIZE_CAP.format(n=args.max_build_files)
+                                  if args.max_build_files > 0 else '')
+        self.store = KeywordStore(args.keyword_db, P.CATEGORIES)
+        self.bank = TaskBank(args.task_bank, refs=args.task_bank_refs) if args.task_bank else None
+        # ms-agent builds the solver's opening messages, and it does so through a
+        # stateful agent object -- so one instance, one lock, and only for the few
+        # milliseconds it takes to shape two messages.
+        self.harness = solver_harness(args.agent_config)
+        self.harness_lock = threading.Lock()
+
+        self.jobs: 'queue.Queue' = queue.Queue()
+        self.api_pool = ThreadPoolExecutor(max_workers=args.api_concurrency,
+                                           thread_name_prefix='api')
+        self.state = threading.Lock()
+        self.kw_lock = threading.Lock()
+        # Jobs actually being worked on right now, sandbox and API. Only used by
+        # the stall check in run(): 'the queue is empty' is not 'there is nothing
+        # left to do' while a thread is still inside a job that will queue more.
+        self.busy = 0
+        self.api_jobs = 0
+        self.nonce = 0
+        # (category, keyword) pairs behind tasks nobody solved. Read at the end by
+        # expand_hard_keywords, which asks for more in the same domains.
+        self.hard: List[Tuple[str, str]] = []
+        self.kept: List[Group] = []
+        self.groups: List[Group] = []
+        self.n_launched = 0
+        self.stop = threading.Event()
+        self.counts: Dict[str, int] = {}
+
+    # ---------------------------------------------------------------- helpers
+
+    def bump(self, key: str, n: int = 1) -> None:
+        with self.state:
+            self.counts[key] = self.counts.get(key, 0) + n
+
+    def draw_keywords(self) -> Tuple[List[Tuple[str, str]], str]:
+        """One entry from each category, refilling any that has run dry.
+
+        On its own lock, not ``state``: a refill is eight model calls and holding
+        the lock every ``bump`` needs for that long would stall all 32 slots. Two
+        threads drawing at once still have to take turns, or the second refill's
+        prompt would not know what the first one had just said.
+        """
+        with self.kw_lock:
+            for category in P.CATEGORIES:
+                if not self.store.unused(category):
+                    self.refill(category)
+            picks = []
+            for category in P.CATEGORIES:
+                text = self.store.take(category, self.rng)
+                if text is not None:
+                    picks.append((category, text))
+        return picks, '\n'.join(f'- {c}: {t}' for c, t in picks)
+
+    def refill(self, category: str) -> None:
+        """Ask the local model for more keywords in ``category``.
+
+        Says so when it comes back empty. A silent no-op here is the worst outcome
+        available: every proposal then falls back to a keyword-less prompt and the
+        run looks normal while producing one identical prompt over and over. That
+        is exactly what happened for whole runs when the prompt asked for one
+        keyword per line and the parser wanted a JSON array.
+
+        The calls run one at a time so each can be told what the ones before it
+        said; each is answered by a rollout with ``max_turns=1``, which ends the
+        trajectory before any tool could be dispatched -- brainstorming a list is a
+        text round, and a bracketed list in a reply is exactly what a tool-calling
+        rollout would try to run.
+        """
+        for attempt in range(1, max(1, self.args.keyword_refill_tries) + 1):
+            if self.generate_keywords(category):
+                return
+            logger.warning(f'[challenge] keyword refill for {category!r} produced '
+                           f'nothing new on try {attempt}')
+        if self.store.items[category]:
+            # Every keyword marked unused again. The alternative is a category that
+            # can never be drawn from, which stops the run: a repeat draw is worse
+            # than no run only if diversity matters more than collecting anything.
+            self.store.recycle(category)
+            self.store.save()
+            logger.warning(f'[challenge] keyword category {category!r} exhausted -> '
+                           f'recycled {len(self.store.items[category])} topics')
+
+    def generate_keywords(self, category: str) -> bool:
+        """One refill round. True when it added something the bank did not have."""
+        want = self.args.keywords_n
+        calls = max(1, self.args.keyword_gen_calls)
+        per_call = max(1, -(-want // calls) + 4)
+        known = self.store.texts(category)
+        fresh: List[str] = []
+        seen = {t.strip().lower() for t in known}
+        for i in range(calls):
+            # Newest first: the calls run one at a time so each can avoid what the
+            # ones before it said, and letting older entries evict those would undo
+            # it. Past the cap the oldest of this refill's phrases fall off, which
+            # is also the least costly thing to drop.
+            avoid = (fresh + known)[:AVOID_TOTAL]
+            self.nonce += 1
+            user = (P.KEYWORD_USER.format(k=per_call, desc=P.CATEGORY_DESC[category])
+                    + ('\nDo NOT repeat any of these already-used topics: '
+                       + ', '.join(avoid) if avoid else '')
+                    + f'\n(batch {self.nonce}-{i})')
+            traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
+                                 {'role': 'user', 'content': user}]}
+            out = self.keyword_rollout([traj])
+            reply = self._assistant_text(out[0] if out else {})
+            parsed = parse_keyword_list(reply)
+            new = [k for k in parsed if k.lower() not in seen]
+            for keyword in new:
+                seen.add(keyword.lower())
+            fresh.extend(new)
+            self.rec.keywords({'category': category, 'prompt': user, 'reply': reply,
+                               'parsed': parsed, 'n_parsed': len(parsed),
+                               'n_new': len(new),
+                               'stop_reason': (out[0].get('stop_reason') if out else None),
+                               'truncated': bool(out[0].get('truncated')) if out else None})
+            if len(fresh) >= want:
+                break
+        added = self.store.add(category, fresh[:want], source='gen')
+        if added:
+            # Written now rather than at the end of the run: a run that crashes after
+            # spending eight model calls on keywords should not have to spend them
+            # again, and the next iteration reads this file to know what was used.
+            self.store.save()
+            logger.info(f'[challenge] keywords {category!r} +{added}')
+        return bool(added)
+
+    @staticmethod
+    def _assistant_text(traj: Dict[str, Any]) -> str:
+        for message in reversed((traj.get('messages') if traj else []) or []):
+            if message.get('role') == 'assistant':
+                return message.get('content') or ''
+        return ''
+
+    def expand_hard_keywords(self) -> int:
+        """More keywords in the domains that produced tasks nobody solved.
+
+        Run once at the end, so what it adds is there for the next iteration rather
+        than for the groups still in flight. One call per hard keyword, capped at
+        32 of them: this is the only feedback the keyword bank gets from difficulty,
+        and without it the bank drifts wherever the refill prompt happens to go.
+        """
+        with self.state:
+            hard = list(self.hard)[:32]
+        if not hard:
+            return 0
+        added = 0
+        for i, (category, keyword) in enumerate(hard):
+            self.nonce += 1
+            traj = {'messages': [
+                {'role': 'system', 'content': P.KEYWORD_SYSTEM},
+                {'role': 'user',
+                 'content': P.KEYWORD_EXPAND_USER.format(kw=keyword, m=8)
+                 + f'\n(batch {self.nonce}-{i})'}]}
+            out = self.keyword_rollout([traj])
+            reply = self._assistant_text(out[0] if out else {})
+            parsed = parse_keyword_list(reply)
+            added += self.store.add(category, parsed, source='expand', parent=keyword)
+            self.rec.keywords({'category': category, 'parent': keyword, 'prompt': 'expand',
+                               'reply': reply, 'parsed': parsed, 'n_parsed': len(parsed)})
+        self.store.save()
+        logger.info(f'[challenge] expanded {len(hard)} hard keyword(s) -> '
+                    f'+{added} same-domain topics')
+        return added
+
+    def launch_group(self) -> Optional[Group]:
+        """Draw a topic and queue its ``group_size`` builds. None once at the cap."""
+        with self.state:
+            if self.stop.is_set():
+                return None
+            if self.args.max_group_attempts and self.n_launched >= self.args.max_group_attempts:
+                return None
+            gid = self.n_launched
+            self.n_launched += 1
+        picks, block = self.draw_keywords()
+        if len(picks) != len(P.CATEGORIES):
+            # Every proposal's prompt is the keyword draw, so there is no honest
+            # prompt to send without one. Stopping is the reportable outcome; a
+            # substitute prompt would change what is being trained and say nothing.
+            logger.error(f'[challenge] keyword bank gave {len(picks)} of '
+                         f'{len(P.CATEGORIES)} categories; cannot build a prompt')
+            return None
+        prompt = P.FROM_KEYWORDS.format(keywords=block)
+        group = Group(gid, picks, block, prompt, self.args.group_size,
+                      self.args.solver_rollouts)
+        with self.state:
+            self.groups.append(group)
+        for prop in group.proposals:
+            self.jobs.put(lambda slot, p=prop: self.build_job(p, slot))
+        logger.info(f'[challenge] group {gid} launched: {block.replace(chr(10), " | ")}')
+        return group
+
+    # ------------------------------------------------------------------ jobs
+
+    def build_job(self, prop: Proposal, slot) -> None:
+        """Stage 1-3 for one proposal, then hand its statement to eight solvers."""
+        if prop.group.dropped:
+            self.bump('build_skipped')
             return
-        trace_id = f'p{self.n:06d}'
-        self.n += 1
-        arrays, meta = {}, []
-        for i, rnd in enumerate(record.get('rounds') or []):
-            labels = rnd.get('labels') or []
-            logprobs = rnd.get('logprobs') or []
-            if rnd.get('input_ids'):
-                arrays[f'r{i}_input_ids'] = np.asarray(rnd['input_ids'], dtype=np.int32)
-            if labels:
-                arrays[f'r{i}_labels'] = np.asarray(labels, dtype=np.int32)
-            if logprobs:
-                # float64, not float32: these are the ``old_logps`` a GRPO step
-                # divides by, and the sampler hands them over as full-precision
-                # python floats (the solver-side json dump keeps all 17 digits,
-                # e.g. -0.4740769863128662). float32 would round them to about 7
-                # digits, so the ratio exp(logp - old_logp) would be off by
-                # roughly 1e-7 for reasons that have nothing to do with the
-                # policy having changed.
-                arrays[f'r{i}_logprobs'] = np.asarray(
-                    [lp[0][1] for lp in logprobs], dtype=np.float64)
-            meta.append({
-                'stage': rnd.get('stage'),
-                'messages': rnd.get('messages') or [],
-                'n_tokens': len(rnd.get('input_ids') or []),
-                'n_trainable': sum(1 for label in labels if label != -100),
-                'n_logprobs': len(logprobs),
-            })
-        # No arrays means the explorer was text-only (an API rollout), so there
-        # is nothing trainable to store -- record the attempt without an npz
-        # rather than leaving thousands of empty archives behind.
-        npz_name = f'{trace_id}.npz' if arrays else None
-        if arrays:
-            np.savez_compressed(os.path.join(self.dir, npz_name), **arrays)
-        line = {
-            'trace_id': trace_id,
-            'npz': npz_name,
-            'outcome': record.get('outcome'),
-            # Both of these come straight from _emit_propose and both are what the
-            # proposing side trains on: train_offline.py groups proposals by
-            # group_id to get a GRPO advantage out of them, and skips the whole
-            # dump as a "pre-grouping run" when it is absent. Dropping them here
-            # silently turned SIDES=both into solver-only training.
-            'group_id': record.get('group_id'),
-            'challenger_reward': record.get('challenger_reward'),
-            'n_pass': record.get('n_pass'),
-            'n_rollouts': record.get('n_rollouts'),
-            'pass_rate': record.get('pass_rate'),
-            'keywords': record.get('keywords'),
-            'seeded': record.get('seeded'),
-            'rounds': meta,
+        try:
+            self.build(prop, slot)
+        except Exception as e:  # noqa: BLE001 -- one bad build must not end the run
+            logger.warning(f'[challenge] build g{prop.group.id}/{prop.idx} raised: '
+                           f'{type(e).__name__}: {e}')
+            prop.outcome, prop.detail = 'build_error', f'{type(e).__name__}: {e}'
+        self.bump(f'build:{prop.outcome}')
+        if not prop.statement:
+            self.record_rejection(prop)
+        if prop.statement and not prop.group.dropped:
+            for _ in range(self.args.solver_rollouts):
+                self.jobs.put(lambda s, p=prop: self.solve_job(p, s))
+        action = prop.group.built(prop)
+        if action == 'rubric':
+            with self.state:
+                self.api_jobs += 1
+            self.api_pool.submit(self.rubric_job, prop.group)
+        elif action == 'decide':
+            self.decide(prop.group)
+
+    def record_rejection(self, prop: Proposal) -> None:
+        """Why this build produced no task, with enough of the episode to tell.
+
+        How the episode ended travels with the reason. A reason on its own is not
+        diagnosable: whether a model that left an empty workspace ran out of tokens
+        or simply emitted no tool call is answered by stop_reason and the call
+        count, not by the word 'empty_workspace'.
+        """
+        traj = prop.traj or {}
+        messages = traj.get('messages') or []
+        self.rec.rejected({
+            'group_id': prop.group.id,
+            'proposal_idx': prop.idx,
+            'reason': prop.outcome,
+            'detail': prop.detail,
+            'keywords': prop.group.keywords,
+            'stop_reason': traj.get('stop_reason'),
+            'truncated': bool(traj.get('truncated')),
+            'stuck_stop': bool(traj.get('stuck_stop')),
+            'tool_stop': traj.get('tool_stop'),
+            'turns': traj.get('turns'),
+            'n_assistant': sum(1 for m in messages
+                               if isinstance(m, dict) and m.get('role') == 'assistant'),
+            'n_tool_calls': sum(len(m.get('tool_calls') or []) for m in messages
+                                if isinstance(m, dict)),
+            'last_assistant': self._assistant_text(traj),
+            'check': prop.check,
+        })
+
+    def build(self, prop: Proposal, slot) -> None:
+        """Build in the sandbox, then have the API write the check and the task.
+
+        The build is the trainable part and runs on the local model. The two stages
+        after it are appended to a *copy* of its messages and answered by the API,
+        so the check script and the statement are written with the whole build
+        history in view while the trajectory keeps exactly the tokens the local
+        model produced.
+        """
+        args = self.args
+        slot.clear()
+        traj = {'messages': [{'role': 'system', 'content': self.system},
+                             {'role': 'user', 'content': prop.group.prompt}],
+                'tools': slot.schemas}
+        prop.traj = rollout_one(self.propose_rollout, traj, self.propose_params, slot)
+        if prop.traj is None:
+            prop.outcome = 'rollout_empty'
+            return
+        if prop.traj.get('stop_reason') == 'length':
+            # A reply cut off at the token budget never finished its thought, so
+            # continuing the conversation over the API would write a check against
+            # a half-written turn. The trajectory is kept and trains with reward 0;
+            # what stops here are the two stages after it.
+            prop.outcome = 'cut_short'
+            prop.detail = f'stop_reason=length after {prop.traj.get("turns")} turn(s)'
+            return
+
+        snapshot, error = slot.snapshot()
+        if error:
+            # Not filed as an empty workspace: a snapshot that says "empty" when it
+            # means "I could not look" produces tasks whose only true assertion is
+            # that nothing happened.
+            prop.outcome, prop.detail = 'snapshot_unavailable', error
+            return
+        if not snapshot:
+            prop.outcome = 'empty_workspace'
+            return
+
+        messages = [dict(m) for m in prop.traj.get('messages') or []]
+        user_text = P.CHECK_FOLLOWUP.format(final_state=snapshot)
+        attempt = 0
+        while True:
+            attempt += 1
+            reply = api_one(self.api, messages, user_text, self.check_params, self.api_extra)
+            if reply is None:
+                prop.outcome, prop.detail = 'api_error', 'check-script call failed'
+                return
+            script = parse_check_script(reply)
+            if script is None:
+                if attempt <= args.check_retries:
+                    user_text = P.CHECK_RETRY_FOLLOWUP.format(
+                        error='Could not read a check script from your reply: it was '
+                              'not a fenced python code block. Do not wrap it in a '
+                              'tool call and do not add prose -- return ONLY a fenced '
+                              'python code block.',
+                        final_state=snapshot)
+                    continue
+                prop.outcome, prop.detail = 'check_parse_fail', reply
+                return
+            # Rejected on the syntax tree before it can pass on the author's own
+            # state, since passing there is exactly what hides the defect: a check
+            # that pins a file's size or quotes a script's source passes for its
+            # author and fails every correct reproduction.
+            brittle = brittle_check_reason(script)
+            exit_code, output = (1, brittle) if brittle else call_one(slot, script)
+            if exit_code == 0:
+                prop.check = script
+                break
+            after, _ = slot.snapshot()
+            if attempt <= args.check_retries:
+                user_text = P.CHECK_RETRY_FOLLOWUP.format(error=output,
+                                                          final_state=after or snapshot)
+                continue
+            prop.outcome = 'check_run_fail'
+            prop.detail = (f'exit {exit_code}\n{output}\n--- check script ---\n{script}'
+                           f'\n--- state after check ---\n{after}')
+            return
+
+        reply = api_one(self.api, messages, P.PROBLEM_FOLLOWUP, self.problem_params,
+                        self.api_extra)
+        if reply is None:
+            prop.outcome, prop.detail = 'api_error', 'problem-statement call failed'
+            return
+        statement = parse_problem_statement(reply)
+        if not statement:
+            prop.outcome, prop.detail = 'problem_parse_fail', reply
+            return
+        if len(statement) > args.problem_max_chars:
+            prop.outcome = 'too_long'
+            prop.detail = f'{len(statement)} chars > {args.problem_max_chars}'
+            return
+        prop.statement = statement
+        prop.outcome = 'ok'
+
+    def solve_job(self, prop: Proposal, slot) -> None:
+        """One attempt at ``prop``'s task, scored by ``prop``'s own check script.
+
+        A truncated attempt is a failed attempt: it left a workspace the check
+        rejects, and the denominator stays at ``solver_rollouts`` so the same
+        ``n_pass`` means the same thing in every group.
+        """
+        if prop.group.dropped:
+            self.bump('solve_skipped')
+            return
+        attempt, passed = None, False
+        exit_code, output, end_state = None, '', ''
+        try:
+            slot.clear()
+            with self.harness_lock:
+                opening = self.harness.start(prop.statement)
+            if not opening.get('tools'):
+                # The harness only shapes messages -- its tool list is empty on
+                # purpose -- so the schemas come from the slot that will run them.
+                opening['tools'] = slot.schemas
+            attempt = rollout_one(self.solve_rollout, opening, self.solve_params, slot)
+            if attempt is not None:
+                exit_code, output = call_one(slot, prop.check)
+                passed = exit_code == 0
+            # Read after the check, not before: the check is allowed to write, and
+            # what a reader of a failed attempt needs is the workspace the check
+            # was unhappy with.
+            end_state, _ = slot.snapshot()
+        except Exception as e:  # noqa: BLE001 -- a lost attempt is a failed attempt
+            logger.warning(f'[challenge] solve g{prop.group.id}/{prop.idx} raised: '
+                           f'{type(e).__name__}: {e}')
+            output = f'{type(e).__name__}: {e}'
+        self.rec.attempt({
+            'group_id': prop.group.id,
+            'proposal_idx': prop.idx,
+            'statement': prop.statement,
+            'check_script': prop.check,
+            'passed': passed,
+            'check_exit': exit_code,
+            'check_output': output,
+            # A cut-off reply counts as a failed attempt and stays in the
+            # denominator, so the flag travels with the record for that to be
+            # checkable from the file rather than taken on trust.
+            'truncated': bool((attempt or {}).get('truncated')),
+            'stop_reason': (attempt or {}).get('stop_reason'),
+            'turns': (attempt or {}).get('turns'),
+            'messages': (attempt or {}).get('messages') or [],
+            'end_state': end_state,
+        })
+        self.bump('solve_pass' if passed else 'solve_fail')
+        if prop.group.solved(prop, attempt, passed) == 'decide':
+            self.decide(prop.group)
+
+    def rubric_job(self, group: Group) -> None:
+        """Score the group's statements for novelty, all against each other.
+
+        The siblings are the references that matter: a whole group can be scored
+        identically novel against history while being eight versions of one idea,
+        and GRPO subtracts the group mean, so a term identical across the group
+        produces no gradient at all. That is why this waits for all eight builds
+        instead of scoring each statement as it lands -- and why waiting costs
+        nothing: the slots are held by other groups' jobs the whole time.
+
+        Retried up to ``--novelty-tries`` times. If the last one still has no
+        verdict for some statement, the group is dropped and its pending solver
+        attempts are skipped.
+
+        Wrapped whole, because this is the one job whose exceptions nobody would
+        see: it runs on a pool whose futures are never read, so a raise in here
+        left the group waiting for a verdict that never came, and the run then sat
+        with an empty queue and idle slots until it was killed. Anything
+        unexpected drops the group instead of stalling everything.
+        """
+        try:
+            self._rubric(group)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f'[challenge] rubric for group {group.id} raised: '
+                           f'{type(e).__name__}: {e}')
+            if group.abandon(f'rubric_error: {type(e).__name__}: {e}'):
+                self.bump('group_dropped:rubric_error')
+                self.decide(group)
+        finally:
+            with self.state:
+                self.api_jobs -= 1
+
+    def _rubric(self, group: Group) -> None:
+        if group.dropped:
+            return
+        props = group.statements()
+        if self.bank is None:
+            # No bank means no reference set, so nothing to be novel against.
+            # Novelty stays None and the reward is the pass-rate gaussian alone.
+            self._advance(group, group.judged())
+            return
+        from twinkle_agentic.verifier import DIMENSIONS, score_tasks
+        texts = [p.statement for p in props]
+        pending = list(range(len(props)))
+        for attempt in range(1, max(1, self.args.novelty_tries) + 1):
+            payload = [{
+                'statement': texts[i],
+                'check': props[i].check,
+                'references': self.bank.references(
+                    texts[i], extra=[t for j, t in enumerate(texts) if j != i]),
+            } for i in pending]
+            results = score_tasks(payload, workers=self.args.api_concurrency,
+                                  model=self.args.api_model,
+                                  extra_body=self.api_extra)
+            still: List[int] = []
+            for i, task, result in zip(pending, payload, results):
+                score = result.scores.get('novelty')
+                self.rec.novelty({
+                    'group_id': group.id, 'proposal_idx': props[i].idx, 'try': attempt,
+                    **{dim: result.scores.get(dim) for dim in DIMENSIONS},
+                    'verdicts': result.verdicts, 'n_votes': result.n_votes,
+                    'error': result.error,
+                    'n_references': len(task.get('references') or ()),
+                    # Full text on both sides: this file is read to check whether a
+                    # score was deserved, which a shortened statement cannot answer.
+                    'statement': task.get('statement') or '',
+                    'references': list(task.get('references') or ()),
+                })
+                if score is None:
+                    still.append(i)
+                else:
+                    props[i].novelty = float(score)
+            if not still:
+                break
+            pending = still
+            logger.warning(f'[challenge] group {group.id}: {len(still)} statement(s) '
+                           f'came back without a novelty verdict (try {attempt})')
+        else:
+            if pending and group.abandon(f'novelty_unscored x{len(pending)}'):
+                self.bump('group_dropped:novelty')
+                self.decide(group)
+                return
+        self._advance(group, group.judged())
+
+    # -------------------------------------------------------------- decision
+
+    def decide(self, group: Group) -> None:
+        """Keep or drop the group, then start a replacement or stop the run.
+
+        The second half is in a ``finally`` because the first half writes files: a
+        raise while writing used to take the replacement topic down with it, and
+        the run then had one fewer group in flight for every failure until there
+        was nothing left running and nothing left to wait for.
+        """
+        try:
+            self._decide(group)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f'[challenge] deciding group {group.id} raised: '
+                           f'{type(e).__name__}: {e}')
+            self.bump('group_decide_error')
+        finally:
+            self._after_decision()
+
+    def _decide(self, group: Group) -> None:
+        rollouts = self.args.solver_rollouts
+        floor = self.args.novelty_floor
+        in_band = [p for p in group.proposals
+                   if p.n_pass is not None and 1 <= p.n_pass <= rollouts - 1]
+        chosen = max(in_band, key=lambda p: p.reward(rollouts, floor)) if in_band else None
+        if chosen is not None and group.dropped:
+            # An abandoned group can still have in-band proposals: its solver
+            # attempts were already running when it was abandoned. Keeping it on
+            # that basis would train on the very group that was judged unusable,
+            # and would do it with a novelty term measured for some members and
+            # missing for others.
+            chosen = None
+        if chosen is not None and not self._claim_keep(group):
+            # The target was reached while this group was finishing. Claimed before
+            # anything is written, because writing first and counting after is how
+            # a run ends up with eleven groups on disk and a loader that reads a
+            # different number of GRPO groups than the run reported.
+            chosen = None
+            self.bump('group_late')
+        record = {
+            'group_id': group.id,
+            'kept': chosen is not None,
+            'dropped': group.dropped,
+            'keywords': group.keywords,
+            'chosen': chosen.idx if chosen is not None else None,
+            'n_in_band': len(in_band),
+            'proposals': [{
+                'idx': p.idx,
+                'outcome': p.outcome,
+                'n_pass': p.n_pass,
+                'novelty': p.novelty,
+                'reward': p.reward(rollouts, floor),
+                'statement': p.statement,
+                'check': p.check,
+                'detail': p.detail,
+            } for p in group.proposals],
         }
-        self.index.write(json.dumps(line, ensure_ascii=False, default=str) + '\n')
-        self.index.flush()
+        self.rec.group(record)
+        # Keyword draws behind tasks nobody solved, for expand_hard_keywords. Taken
+        # from every decided group, kept or not: a task at n_pass=0 says the same
+        # thing about its keywords either way.
+        if any(p.statement and p.n_pass == 0 for p in group.proposals):
+            with self.state:
+                seen = {(c, t.lower()) for c, t in self.hard}
+                for category, text in group.keywords:
+                    if (category, text.lower()) not in seen:
+                        self.hard.append((category, text))
+        if chosen is None:
+            self.bump('group_dropped' if not group.dropped else 'group_dropped_early')
+            return
 
-    def close(self):
-        if self.index is not None:
-            self.index.close()
-            logger.info(f'[challenge] wrote {self.n} propose traces -> {self.dir}')
+        # Every proposal of a kept group trains, including the ones that produced
+        # no task: they are the zero-reward half of the GRPO group, and a set of
+        # kept-only records has no variance to learn from.
+        for prop in group.proposals:
+            if prop.traj is None:
+                continue
+            self.rec.trajectory(
+                prop.traj, side='propose', group_id=group.id, proposal_idx=prop.idx,
+                reward=prop.reward(rollouts, floor), n_pass=prop.n_pass,
+                novelty=prop.novelty, outcome=prop.outcome,
+                keywords=group.keywords, selected=prop is chosen)
+        # Only the chosen proposal's attempts. The others were measured and are
+        # reported in groups.jsonl, but training on eight near-identical tasks from
+        # one keyword draw is what a group of one keyword direction is meant to
+        # avoid.
+        for i, (attempt, passed) in enumerate(zip(chosen.attempts, chosen.passes)):
+            if not attempt:
+                continue
+            self.rec.trajectory(attempt, side='solve', group_id=group.id,
+                                proposal_idx=chosen.idx, attempt_idx=i,
+                                reward=1.0 if passed else 0.0, passed=passed,
+                                statement=chosen.statement)
+        self.rec.task({'id': f'ag_g{group.id:04d}p{chosen.idx}',
+                       'group_id': group.id, 'proposal_idx': chosen.idx,
+                       'query': chosen.statement, 'check_script': chosen.check,
+                       'n_pass': chosen.n_pass, 'n_rollouts': rollouts,
+                       'novelty': chosen.novelty,
+                       'reward': chosen.reward(rollouts, floor),
+                       'keywords': group.keywords})
+        if self.bank is not None:
+            self.bank.add(chosen.statement, chosen.check, group_id=group.id,
+                          n_pass=chosen.n_pass)
+        self.bump('group_kept')
+
+    def _claim_keep(self, group: Group) -> bool:
+        """Take one of the ``--keep-groups`` slots, if there is one left.
+
+        The slot is taken before the group's trajectories are written and released
+        by nobody, so the number of groups on disk is exactly the number claimed
+        even though several groups can finish at the same moment.
+        """
+        with self.state:
+            if len(self.kept) >= self.args.keep_groups:
+                return False
+            self.kept.append(group)
+            return True
+
+    def _after_decision(self) -> None:
+        """Stop the run if the target is met, otherwise start a replacement topic.
+
+        Replacing one topic per decided group is what keeps the number of groups in
+        flight at ``sandbox_slots / group_size`` without anything having to track
+        it: the queue is fed by whatever finishes.
+        """
+        with self.state:
+            enough = len(self.kept) >= self.args.keep_groups
+        if enough:
+            if not self.stop.is_set():
+                logger.info(f'[challenge] {len(self.kept)} groups kept; stopping')
+                self.stop.set()
+            return
+        if self.launch_group() is None and self._idle():
+            logger.warning('[challenge] no topics left to try and nothing in flight; '
+                           f'stopping with {len(self.kept)} kept group(s)')
+            self.stop.set()
+
+    def _idle(self) -> bool:
+        with self.state:
+            return all(g.decided for g in self.groups)
+
+    def _advance(self, group: Group, action: str) -> None:
+        if action == 'decide':
+            self.decide(group)
+
+    # ------------------------------------------------------------- the loop
+
+    def work(self, slot) -> None:
+        """One thread, one slot, jobs until the run stops."""
+        while not self.stop.is_set():
+            try:
+                job = self.jobs.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            with self.state:
+                self.busy += 1
+            try:
+                job(slot)
+            except Exception as e:  # noqa: BLE001 -- never lose the thread
+                logger.warning(f'[challenge] job on slot {slot.slot} raised: '
+                               f'{type(e).__name__}: {e}')
+            finally:
+                with self.state:
+                    self.busy -= 1
+                self.jobs.task_done()
+
+    def run(self) -> None:
+        """Start one thread per slot, prime the queue, and wait for the target."""
+        n_topics = max(1, len(self.slots) // self.args.group_size)
+        threads = [threading.Thread(target=self.work, args=(slot,), daemon=True,
+                                    name=f'slot{slot.slot}') for slot in self.slots]
+        for thread in threads:
+            thread.start()
+        for _ in range(n_topics):
+            if self.launch_group() is None:
+                break
+        # Waited on in slices rather than once, so a run that has stopped making
+        # progress ends with the reason on stdout instead of sitting there. Two
+        # consecutive idle checks, because one can catch the moment between a job
+        # being taken off the queue and the counter going up.
+        idle_rounds = 0
+        while not self.stop.wait(STALL_CHECK_SECONDS):
+            with self.state:
+                quiet = self.busy == 0 and self.api_jobs == 0
+                stuck = [g.id for g in self.groups if not g.decided]
+            if not (quiet and self.jobs.empty()):
+                idle_rounds = 0
+                continue
+            idle_rounds += 1
+            if idle_rounds < 2:
+                continue
+            # Reached only when the run has gone quiet without meeting its target
+            # and without deciding to stop, which is a bug rather than attrition:
+            # normally either a group finishes (and launches a replacement) or
+            # launch_group runs out and sets stop itself.
+            logger.error(f'[challenge] nothing running and nothing queued after '
+                         f'{len(self.kept)}/{self.args.keep_groups} kept groups '
+                         f'and {self.n_launched} launched'
+                         + (f'; group(s) {stuck} were never decided' if stuck else '')
+                         + '. Stopping.')
+            for group in list(self.groups):
+                if group.abandon('never_decided'):
+                    self.bump('group_dropped:never_decided')
+                    self.decide(group)
+            self.stop.set()
+        for thread in threads:
+            thread.join(timeout=self.args.sandbox_timeout)
+        self.api_pool.shutdown(wait=True)
 
 
-def flow_record(index, task):
-    """One task as the training script reads it back."""
-    data = task.get('user_data')
-    messages = task.get('messages') or []
-    query = next((m['content'] for m in messages if m.get('role') == 'user'), '')
+def collect_metrics(out_dir: str, counts: Dict[str, int], launched: int,
+                    rollouts: int, wall: float) -> Dict[str, Any]:
+    """What this collection produced, as numbers, for ``challenge_metrics.json``.
+
+    Read back out of ``groups.jsonl`` rather than taken from the live objects, so
+    the file cannot disagree with the audit files it sits next to, and so the same
+    function can recompute the metrics for a directory that finished hours ago.
+
+    Three sections, because they are read for different things:
+
+    * ``scalars`` -- fixed keys, always present, every value a float or int. This
+      is the set that goes to swanlab; a key appearing in one iteration and not the
+      next would make a chart that means something different in each.
+    * ``counts`` -- the raw bump counters, dynamic keys and all
+      (``group_dropped:rubric_error`` only exists in a run where that happened).
+      Kept here and not uploaded.
+    * ``distributions`` -- the histograms behind the means, because a mean n_pass
+      of 4 is a different collection depending on whether it came from eights and
+      zeros or from fours.
+
+    ``solve_pass_rate`` is over every solver attempt run, the number the user
+    asked for as accuracy. It is not a fixed yardstick: the tasks change every
+    iteration, so it moving says the pair moved, not which half.
+    """
+    path = os.path.join(out_dir, 'groups.jsonl')
+    groups: List[Dict[str, Any]] = []
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        groups.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    props = [p for g in groups for p in g.get('proposals') or []]
+    with_stmt = [p for p in props if p.get('statement')]
+    measured = [p for p in with_stmt if p.get('n_pass') is not None]
+    in_band = [p for p in measured if 1 <= p['n_pass'] <= rollouts - 1]
+    chosen = [next((p for p in g['proposals'] if p['idx'] == g.get('chosen')), None)
+              for g in groups if g.get('kept')]
+    chosen = [p for p in chosen if p is not None]
+    novelty = [p['novelty'] for p in props if p.get('novelty') is not None]
+    rewards = [p['reward'] for p in props if p.get('reward') is not None]
+    passes = counts.get('solve_pass', 0)
+    attempts = passes + counts.get('solve_fail', 0)
+    kept = sum(1 for g in groups if g.get('kept'))
+
+    def rate(num: float, den: float) -> float:
+        return float(num) / den if den else 0.0
+
+    scalars = {
+        'groups_launched': launched,
+        'groups_kept': kept,
+        'groups_decided': len(groups),
+        'group_keep_rate': rate(kept, len(groups)),
+        'wall_seconds': round(wall, 1),
+        'builds': len(props),
+        'builds_with_statement': len(with_stmt),
+        'build_statement_rate': rate(len(with_stmt), len(props)),
+        # The accuracy: every solver attempt that ran, passed over total.
+        'solve_attempts': attempts,
+        'solve_pass_rate': rate(passes, attempts),
+        # Of the tasks that were measured at all, how many landed in the band the
+        # keep rule wants. This is the proposer's hit rate.
+        'n_pass_in_band_rate': rate(len(in_band), len(measured)),
+        'n_pass_mean': statistics.fmean(p['n_pass'] for p in measured) if measured else 0.0,
+        'delivered_n_pass_mean':
+            statistics.fmean(p['n_pass'] for p in chosen if p.get('n_pass') is not None)
+            if chosen else 0.0,
+        'proposer_reward_mean': statistics.fmean(rewards) if rewards else 0.0,
+        'novelty_scored_rate': rate(len(novelty), len(with_stmt)),
+        'novelty_mean': statistics.fmean(novelty) if novelty else 0.0,
+        'novelty_zero_rate': rate(sum(1 for v in novelty if v == 0.0), len(novelty)),
+    }
     return {
-        'id': f'ag_{index:06d}',
-        'query': query,
-        'check_script': user_data_get(data, 'check_script', ''),
-        # Arm B: run before the solver starts, to put the input files it is told
-        # it already has on disk. Empty for every other arm.
-        'setup_script': user_data_get(data, 'setup_script', ''),
-        'n_pass': user_data_get(data, 'n_pass'),
-        'n_rollouts': user_data_get(data, 'n_rollouts'),
-        'keywords': user_data_get(data, 'keywords', []),
-        'seeded': user_data_get(data, 'seeded', False),
+        'scalars': scalars,
+        'counts': dict(sorted(counts.items())),
+        'distributions': {
+            'n_pass': {str(k): v for k, v in
+                       sorted(collections.Counter(p['n_pass'] for p in measured).items())},
+            'build_outcome': {k.split(':', 1)[1]: v for k, v in sorted(counts.items())
+                              if k.startswith('build:')},
+            'novelty': {str(round(v, 2)): n for v, n in
+                        sorted(collections.Counter(novelty).items())},
+        },
     }
 
 
-def write_flows(kept, args):
-    """Write one flow per task, replacing whatever the run appended as it went."""
-    with open(args.out_flows, 'w', encoding='utf-8') as f:
-        for i, task in enumerate(kept):
-            f.write(json.dumps(flow_record(i, task), ensure_ascii=False) + '\n')
+def main():
+    args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+    recorder = Recorder(args.out_dir)
+    sampler, template = initialize_device(args)
+    slots = initialize_sandbox(args)
+    run = Run(args, sampler, template, slots, recorder)
+    started = time.time()
+    try:
+        run.run()
+        # After the loop, not during: what it adds is for the next iteration, and
+        # doing it here means a crash in collection does not also lose the bank.
+        if args.keyword_expand:
+            run.expand_hard_keywords()
+    finally:
+        rebuilds = close_pool(slots)
+        recorder.close()
+        if run.bank is not None:
+            logger.info(f'[challenge] task bank: {run.bank.stats()}')
+        run.store.save()
+        if rebuilds:
+            logger.warning(f'[challenge] sandboxes were rebuilt {rebuilds} time(s); '
+                           f'the jobs in flight at those moments were lost')
+        # Written after recorder.close(), so groups.jsonl is complete and flushed
+        # before it is read back. In the finally block because a run that crashed
+        # is the one whose numbers are most worth having.
+        metrics = collect_metrics(args.out_dir, run.counts, run.n_launched,
+                                  args.solver_rollouts, time.time() - started)
+        with open(os.path.join(args.out_dir, 'challenge_metrics.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False, default=str)
+        logger.info(f'[challenge] {len(run.kept)}/{run.n_launched} groups kept in '
+                    f'{time.time() - started:.0f}s, counts: '
+                    f'{dict(sorted(run.counts.items()))}')
+        logger.info(f'[challenge] metrics -> '
+                    f'{os.path.join(args.out_dir, "challenge_metrics.json")}: '
+                    f'{metrics["scalars"]}')
 
 
 if __name__ == '__main__':
