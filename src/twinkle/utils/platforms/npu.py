@@ -1,10 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import hashlib
 import os
+import platform
 import re
 import socket
 import subprocess
 from typing import Optional
+
+from packaging import version
 
 from .base import Platform
 
@@ -15,7 +18,6 @@ _HCCL_IF_BASE_PORT_ENV = 'HCCL_IF_BASE_PORT'
 _HCCL_HOST_SOCKET_PORT_RANGE_ENV = 'HCCL_HOST_SOCKET_PORT_RANGE'
 # NPU-side socket port pool used by HCCL for device communication channels.
 _HCCL_NPU_SOCKET_PORT_RANGE_ENV = 'HCCL_NPU_SOCKET_PORT_RANGE'
-
 
 def _derive_hccl_socket_env_defaults(master_port: int) -> dict:
     """Derive deterministic default HCCL socket env values from master_port."""
@@ -98,6 +100,61 @@ def ensure_npu_backend() -> None:
 
 
 class NPU(Platform):
+
+    @staticmethod
+    def is_ipc_supported() -> bool:
+        """Return whether HDK and CANN meet the NPU device-IPC requirement."""
+        try:
+            result = subprocess.run(
+                ['npu-smi', 'info', '-t', 'board', '-i', '1'], capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
+            visible_devices = (os.environ.get('ASCEND_VISIBLE_DEVICES')
+                               or os.environ.get('ASCEND_RT_VISIBLE_DEVICES'))
+            if not visible_devices:
+                raise
+            device_id = int(visible_devices.split(',')[0])
+            try:
+                result = subprocess.run(
+                    ['npu-smi', 'info', '-t', 'board', '-i', str(device_id)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                result = subprocess.run(
+                    ['npu-smi', 'info', '-t', 'board', '-i', str(device_id // 2)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+        software_version = next(
+            (line.split(':', 1)[1].strip().lower()
+             for line in result.stdout.splitlines() if 'Software Version' in line),
+            None,
+        )
+        if software_version is None:
+            raise RuntimeError('Could not find Software Version in npu-smi output')
+
+        ascend_home = os.environ.get('ASCEND_HOME_PATH', '/usr/local/Ascend/ascend-toolkit/latest')
+        info_file = os.path.join(ascend_home, f'{platform.machine()}-linux', 'ascend_toolkit_install.info')
+        with open(info_file) as info:
+            cann_version = next(
+                (line.split('=', 1)[1].strip().lower() for line in info if line.startswith('version=')),
+                None,
+            )
+        if cann_version is None:
+            raise RuntimeError('Could not find version in CANN toolkit info file')
+
+        pattern = r'(\d+\.\d+(?=\.t))|(\d+\.\d+(?:\.(?:rc\d+|\d+))?)'
+        software_match = re.match(pattern, software_version)
+        cann_match = re.match(pattern, cann_version)
+        if software_match is None or cann_match is None:
+            raise RuntimeError(f'Invalid NPU versions: HDK={software_version}, CANN={cann_version}')
+        software_base = software_match.group(1) or software_match.group(2)
+        cann_base = cann_match.group(1) or cann_match.group(2)
+        return (version.parse(software_base) >= version.parse('25.3.rc1')
+                and version.parse(cann_base) >= version.parse('8.3.rc1'))
 
     @staticmethod
     def visible_device_env():
