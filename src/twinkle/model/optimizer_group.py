@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch
 from dataclasses import dataclass, field
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -83,6 +84,21 @@ class BaseOptimizerGroup:
         """Calculate and return metrics."""
         self.accumulate_metrics(is_training)
         status = self.train_status if is_training else self.eval_status
+        # The metrics below gather over the DP group, and that gather is the first
+        # use of its NCCL communicator: NCCL connects it with its own cudaMalloc,
+        # which draws on device memory torch's caching allocator has *not* taken, so
+        # it fails on whichever rank has the least left -- and it fails where nothing
+        # reports it. Measured on 8xH20 with one padded trajectory per micro batch:
+        # 16 mini batches of 7k-19k tokens left the allocator holding 87.8 GiB
+        # reserved against 29.0 GiB live, one rank down to 164 MiB free, and that
+        # rank raised inside all_gather_object while the other seven waited in it
+        # forever -- 54 minutes, no log line, GPUs at 0% with their memory held,
+        # because calculate_metric is collected 'last_pp_first' so the driver never
+        # fetches the failing rank's exception. Releasing the cache first puts every
+        # rank above 54 GiB free and the same step completes in 5 ms. The cost is one
+        # re-allocation per optimizer step, which is once per iteration here.
+        if status.metrics and torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())

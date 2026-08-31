@@ -214,12 +214,23 @@ while [ "$ITERATIONS" -eq 0 ] || [ "$i" -lt $((START + ITERATIONS)) ]; do
         2>&1 | tee "$OUT/challenge.log"
 
     echo "=== iteration $i: train on $OUT -> $CKPT_DIR"
+    # expandable_segments on the training stage only, and not on collect: one padded
+    # trajectory per micro batch means every micro batch is a new shape (119 distinct
+    # lengths in 128 trajectories, 7k-19k tokens), and the caching allocator cannot
+    # reuse a block across sizes, so it grew to 87.8 GiB reserved against 29.0 GiB
+    # live on a 97.4 GiB card. That is what starved NCCL of the few hundred MiB it
+    # needs to connect the metric gather's communicator, which hung iteration 2 for
+    # 54 minutes. Expandable segments let one virtual range serve every shape, so
+    # reserved tracks the real peak instead of the sum of shapes. Left off for
+    # collect because that stage is vLLM, which profiles its own KV cache against
+    # allocator behaviour and has nothing to do with this failure.
     RSI_RUN_DIR="$OUT" \
     RSI_SAVE_DIR="$CKPT_DIR" \
     RSI_SAVE_NAME="model" \
     RSI_SIDES="$SIDES" \
     RSI_TAG="$TAG" \
     RSI_ITER="$i" \
+    PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
     CUDA_VISIBLE_DEVICES="$DEVICES" python cookbook/rsi/agentic/train.py \
         --model_id "$MODEL" \
         --model_gpus "$GPUS" \
