@@ -162,6 +162,24 @@ class FakeTemplate:
             })
         return results
 
+    def tool_call_errors(self, decoded: str) -> List[str]:
+        """Why ``parse_tool_call`` returned fewer calls than the markup asked for.
+
+        Mirrors that method's two ``continue`` branches. Returning an empty list
+        would pass just as well and would quietly make the parse-failure retry in
+        MultiTurnRollout unreachable from these tests.
+        """
+        errors: List[str] = []
+        for m in re.findall(r'<tool_call>\s*([\s\S]*?)\s*</tool_call>', decoded or ''):
+            try:
+                d = json.loads(m)
+            except json.JSONDecodeError as exc:
+                errors.append(f'tool_call is not valid JSON: {exc.msg}')
+                continue
+            if not (d.get('name') or d.get('tool_name')):
+                errors.append('tool_call has no "name" field')
+        return errors
+
     def concat_input_feature(self, pif: Dict[str, Any], new_tokens: List[int]) -> Dict[str, Any]:
         result = copy.deepcopy(pif)
         prompt_ids = list(result['input_ids'])

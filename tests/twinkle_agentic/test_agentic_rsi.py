@@ -1178,6 +1178,41 @@ class KeywordBankTest(unittest.TestCase):
         # rewording back to one-per-line fails here rather than in a night's run.
         self.assertEqual(parse_keyword_list('csv deduplication\nlog rotation'), [])
 
+    def test_over_length_keywords_are_reported_and_not_merely_gone(self):
+        """A dropped phrase has to be distinguishable from one never produced.
+
+        The length filter used to live inside a list comprehension, so a reply of
+        eight well-formed keywords written at sentence length reached the caller as
+        an empty list and was recorded as ``n_parsed: 0`` -- identical to a garbled
+        reply and to a timeout. Iteration 9 lost 27% of a refill that way, on four
+        of six expand calls, and the cause was found by re-parsing stored replies.
+
+        The direction matters as much as the count: length tracks specificity, so
+        what the filter removes is the half of the output the bank most wants.
+        """
+        from twinkle_agentic.challenger.code import (KEYWORD_MAX_LEN,
+                                                     split_keyword_list)
+        from prompts import KEYWORD_EXPAND_USER
+
+        # Verbatim from iteration 9, one of the eight a single expand call lost.
+        wordy = ('Compute the critical path delay through a gate-level netlist '
+                 'with annotated cell delays')
+        self.assertGreater(len(wordy), KEYWORD_MAX_LEN, 'fixture must exceed the cap')
+        kept, dropped = split_keyword_list(f'["crc32 table generation", "{wordy}"]')
+        self.assertEqual(kept, ['crc32 table generation'])
+        self.assertEqual(dropped, [wordy], 'the dropped phrase must be recoverable')
+
+        # The three cases a reader has to be able to tell apart. Only the first
+        # carries anything in the dropped half, which is what makes the other two
+        # diagnosable as format failures rather than length failures.
+        self.assertEqual(split_keyword_list(f'["{wordy}"]'), ([], [wordy]))
+        self.assertEqual(split_keyword_list('sorry, I cannot'), ([], []))
+        self.assertEqual(split_keyword_list('["unterminated'), ([], []))
+
+        # And the prompt has to name the same ceiling the parser enforces, or the
+        # model is being marked down against a rule it was never told.
+        self.assertIn(str(KEYWORD_MAX_LEN), KEYWORD_EXPAND_USER)
+
     def test_a_json_reply_fills_the_bank_and_reaches_the_proposal(self):
         from twinkle.data_format import user_data_get
         ch = self._challenger('["csv deduplication", "log rotation"]')
@@ -1356,37 +1391,42 @@ class ProposeTrajIndexTest(unittest.TestCase):
     GRPO advantage out of them, and skips a dump without it as a 'pre-grouping
     run'. While the copy dropped both, SIDES=both trained 384 solver and 0
     proposer trajectories, and said so only in a line nobody read.
+
+    Written against ``ProposeTrajWriter``, which no longer exists -- the writer is
+    ``Recorder`` now and the reward field is ``reward``, not ``challenger_reward``.
+    So this test spent an unknown number of commits failing at import, which is to
+    say the invariant above went unguarded for exactly as long as it looked
+    guarded. Kept pointed at ``Recorder.trajectory`` with the keywords the
+    production call passes, so a rename breaks it again rather than retiring it.
+
+    What it does not cover: that the *caller* passes group_id at all. That was the
+    other half of the original bug and it needs the collection loop, not this.
     """
 
     def test_group_id_and_reward_survive_the_copy(self):
-        from challenge import ProposeTrajWriter
+        from challenge import Recorder
 
         out = tempfile.mkdtemp(prefix='proposetraj_test_')
         try:
-            writer = ProposeTrajWriter(out)
-            writer.write({
-                'outcome': 'kept',
-                'group_id': 0,
-                'challenger_reward': 0.75,
-                'n_pass': 4,
-                'n_rollouts': 8,
-                'pass_rate': 0.5,
-                'keywords': [['transform', 'parse a binary log']],
-                'seeded': False,
-                'rounds': [{'stage': 'episode', 'messages': [],
-                            'input_ids': [1, 2], 'labels': [-100, 2],
-                            'logprobs': []}],
-            })
-            writer.close()
-            with open(os.path.join(out, 'index.jsonl'), encoding='utf-8') as f:
-                rec = json.loads(f.readline())
+            rec = Recorder(out)
+            # The field names and shape of challenge.py's own propose-side call.
+            rec.trajectory(
+                {'input_ids': [1, 2], 'labels': [-100, 2], 'logprobs': None,
+                 'messages': []},
+                side='propose', group_id=0, proposal_idx=3, reward=0.75, n_pass=4,
+                novelty=1.0, outcome='kept',
+                keywords=[['transform', 'parse a binary log']], selected=True)
+            rec.close()
+            with open(os.path.join(out, 'trajs', 'index.jsonl'), encoding='utf-8') as f:
+                record = json.loads(f.readline())
         finally:
             shutil.rmtree(out, ignore_errors=True)
 
         # Group 0 is a real group, so this also pins that the copy reads the key
         # rather than testing it for truth.
-        self.assertEqual(rec['group_id'], 0)
-        self.assertEqual(rec['challenger_reward'], 0.75)
+        self.assertEqual(record['group_id'], 0)
+        self.assertEqual(record['reward'], 0.75)
+        self.assertEqual(record['side'], 'propose')
 
 
 class TaskCarriesGroupIdTest(unittest.TestCase):

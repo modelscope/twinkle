@@ -65,7 +65,7 @@ from twinkle.data_format import SamplingParams
 from twinkle.sampler import vLLMSampler
 from twinkle_agentic.challenger import KeywordStore, parse_check_script, parse_problem_statement
 from twinkle_agentic.challenger.agentic import brittle_check_reason
-from twinkle_agentic.challenger.code import parse_keyword_list
+from twinkle_agentic.challenger.code import split_keyword_list
 from twinkle_agentic.challenger.task_bank import TaskBank
 from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.tools.tool_manager import ToolManager
@@ -832,7 +832,7 @@ class Run:
                 out = self.keyword_rollout([traj])
                 reply = self._assistant_text(out[0] if out else {})
                 via = 'local-fallback'
-            parsed = parse_keyword_list(reply)
+            parsed, dropped_long = split_keyword_list(reply)
             new = [k for k in parsed if k.lower() not in seen]
             for keyword in new:
                 seen.add(keyword.lower())
@@ -840,6 +840,8 @@ class Run:
             self.rec.keywords({'category': category, 'prompt': user, 'reply': reply,
                                'parsed': parsed, 'n_parsed': len(parsed),
                                'n_new': len(new), 'via': via,
+                               'dropped_long': dropped_long,
+                               'n_dropped_long': len(dropped_long),
                                'stop_reason': (out[0].get('stop_reason') if out else None),
                                'truncated': bool(out[0].get('truncated')) if out else None})
             if len(fresh) >= want:
@@ -893,11 +895,22 @@ class Run:
                 out = self.keyword_rollout([traj])
                 reply = self._assistant_text(out[0] if out else {})
                 via = 'local-fallback'
-            parsed = parse_keyword_list(reply)
+            parsed, dropped_long = split_keyword_list(reply)
             added += self.store.add(category, parsed, source='expand', parent=keyword)
-            self.rec.keywords({'category': category, 'parent': keyword, 'prompt': 'expand',
+            # The prompt goes in whole, as the refill path already does. It used to
+            # record the literal string 'expand', which made this file unable to
+            # answer the one question it gets asked -- whether a change to
+            # KEYWORD_EXPAND_USER was live in a given iteration -- and cost an
+            # afternoon to a wrong answer inferred from mtimes instead.
+            #
+            # ``dropped_long`` for the same reason one step further in: iteration 9
+            # recorded n_parsed 0 on four of six expand calls whose replies were
+            # well-formed JSON, and nothing in this file said the phrases had been
+            # thrown away for length rather than never produced.
+            self.rec.keywords({'category': category, 'parent': keyword, 'prompt': user,
                                'reply': reply, 'parsed': parsed, 'n_parsed': len(parsed),
-                               'via': via})
+                               'dropped_long': dropped_long,
+                               'n_dropped_long': len(dropped_long), 'via': via})
         self.store.save()
         logger.info(f'[challenge] expanded {len(hard)} hard keyword(s) -> '
                     f'+{added} same-domain topics')

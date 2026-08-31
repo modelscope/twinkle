@@ -151,16 +151,29 @@ KEYWORD_USER = (
 # of the scorer ("Amdahl's law speedup bound from parallel workload profile", flagged
 # on the noun "profile"). The wording works.
 #
-# What it broke: 39 of the 144 keywords the model returned (27%) were silently dropped
-# by ``parse_keyword_list``, which keeps only strings of 60 characters or less. All but
-# one were transform -- five of its six calls came back with a median length of 65-98
-# characters, one with all eight over the cap and nothing left. Cause is in this file:
-# KEYWORD_USER says "2-5 words" and this prompt only said "short strings", so the
-# instruction to name a calculation rather than an activity ("reconstruct the
-# allocation timeline from a heap trace") was followed at sentence length. domain came
-# back at a 4-23 character median and edge_case at 32-42, both well clear. The cap is
-# named here in characters because it is a silent filter in library code: a keyword
-# over it does not warn, it just never exists.
+# What it broke, or looked like it did: 39 of the 144 keywords iteration 9's model
+# returned (27%) were silently dropped by ``parse_keyword_list``, which keeps only
+# strings of 60 characters or less. All but one were transform -- five of its six calls
+# came back at a median length of 65-98 characters, one with all eight over the cap and
+# nothing left.
+#
+# The cause is NOT established, and the first version of this comment claimed it was.
+# It blamed the wording here: KEYWORD_USER says "2-5 words" and this prompt only said
+# "short strings", so the instruction to name a calculation rather than an activity was
+# supposedly followed at sentence length. Iteration 10 ran the same prompt, before the
+# length rule below existed, and dropped 0 of 168 at a median of 28-33 characters. Both
+# iterations had identical prompt text -- this file was not touched between their starts
+# -- so the wording cannot be what separated them. Nor does it track the parent: the two
+# parents that break their own category's rules ("Performance tuning", "Diagnose kernel
+# panics") both produced short keywords, while "Analyze TCP congestion patterns"
+# produced 33 and "Network Latency Analysis" produced 98. What is left is API sampling
+# at temperature 1.3, which is a weak explanation for a split as clean as six calls all
+# above 55 against seven all below 34.
+#
+# The rule below is therefore a guard, not a fix: it earns its words because the failure
+# mode is silent and cost 27% of a refill once, not because its cause is understood. The
+# cap is named in characters because it is a filter in library code that does not warn
+# -- a keyword over it never exists, and nothing in the logs says so.
 
 KEYWORD_EXPAND_USER = (
     'The keyword "{kw}" produced a very hard task. List {m} related keywords '

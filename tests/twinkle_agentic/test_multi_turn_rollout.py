@@ -156,6 +156,27 @@ class FakeTemplate:
             })
         return results
 
+    def tool_call_errors(self, decoded: str) -> list[str]:
+        """Why ``parse_tool_call`` returned fewer calls than the markup asked for.
+
+        Mirrors that method's two ``continue`` branches instead of returning an
+        empty list. A stub that always reported no errors would keep these tests
+        green while silently retiring the branch in MultiTurnRollout that hands a
+        parse failure back to the model -- the retry would become unreachable and
+        no test would notice, which is the failure mode a stub is supposed to
+        prevent rather than cause.
+        """
+        errors: list[str] = []
+        for m in re.findall(r'<tool_call>\s*([\s\S]*?)\s*</tool_call>', decoded or ''):
+            try:
+                d = json.loads(m)
+            except json.JSONDecodeError as exc:
+                errors.append(f'tool_call is not valid JSON: {exc.msg}')
+                continue
+            if not (d.get('name') or d.get('tool_name')):
+                errors.append('tool_call has no "name" field')
+        return errors
+
     def clean_tool_call(self, decoded: str) -> str:
         """Strip the call blocks, as the real template does before storing."""
         return re.sub(r'<tool_call>[\s\S]*?</tool_call>', '', decoded or '')

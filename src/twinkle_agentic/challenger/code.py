@@ -234,21 +234,54 @@ def parse_challenge(text: str, require_solution: bool = True) -> Optional[Dict[s
             'entry': str(obj.get('entry') or '').strip(), 'checks': checks}
 
 
-def parse_keyword_list(text: str) -> List[str]:
-    """Extract a JSON array of short strings from a (possibly thinking) reply."""
+# A keyword is a topic to build a task around, not a task statement. Past this many
+# characters the model has written the second thing, and storing it makes the next
+# prompt ask for a variation on a sentence rather than on a subject.
+KEYWORD_MAX_LEN = 60
+
+
+def split_keyword_list(text: str) -> Tuple[List[str], List[str]]:
+    """Extract a JSON array of short strings; return (kept, dropped for length).
+
+    The dropped half exists because it used to be discarded inside a list
+    comprehension. A refill that returned eight well-formed keywords, all of them
+    written out as sentences, reached the caller as an empty list and was recorded
+    as ``n_parsed: 0`` -- the same three characters a garbled reply, a timeout and
+    an over-length reply all produce, so the log could not tell them apart. One
+    iteration lost 27% of its keywords that way and the cause was found by
+    re-parsing the stored replies by hand.
+
+    The bias is the reason to count rather than only to log: length correlates with
+    specificity, so the filter removes "Compute the critical path delay through a
+    gate-level netlist with annotated cell delays" and keeps whatever was vague
+    enough to be short. That is the opposite of what the bank is for.
+    """
     body = text
     idx = body.rfind('</think>')
     if idx >= 0:
         body = body[idx + len('</think>'):]
     start, end = body.find('['), body.rfind(']')
     if start < 0 or end <= start:
-        return []
+        return [], []
     try:
         arr = json.loads(body[start:end + 1])
     except (ValueError, TypeError):
-        return []
-    return [x.strip() for x in arr
-            if isinstance(x, str) and x.strip() and len(x.strip()) <= 60]
+        return [], []
+    kept: List[str] = []
+    dropped: List[str] = []
+    for x in arr:
+        if not isinstance(x, str):
+            continue
+        s = x.strip()
+        if not s:
+            continue
+        (kept if len(s) <= KEYWORD_MAX_LEN else dropped).append(s)
+    return kept, dropped
+
+
+def parse_keyword_list(text: str) -> List[str]:
+    """The kept half of :func:`split_keyword_list`, for callers with nothing to record."""
+    return split_keyword_list(text)[0]
 
 
 def load_seeds(path: str) -> List[Dict[str, str]]:
@@ -648,12 +681,21 @@ class CodeChallenger(Challenger):
         } for i in range(n_calls)]
         seen = {t.strip().lower() for t in known}
         out: List[str] = []
+        n_long = 0
         for reply in self.explore(prompts, sampling_params=self.keyword_params):
-            for kw in parse_keyword_list(assistant_text(reply)):
+            kept, dropped = split_keyword_list(assistant_text(reply))
+            n_long += len(dropped)
+            for kw in kept:
                 key = kw.lower()
                 if key not in seen:
                     seen.add(key)
                     out.append(kw)
+        if n_long:
+            # This path has no dump to write to, so the count has to be said out
+            # loud or the refill looks like the model simply produced less.
+            logger.warning(f'[CodeChallenger] dropped {n_long} keyword(s) over '
+                           f'{KEYWORD_MAX_LEN} chars while refilling; the prompt is '
+                           f'asking for task statements rather than topics')
         self.rng.shuffle(out)
         return out[:n_want]
 
@@ -817,10 +859,16 @@ class CodeChallenger(Challenger):
             ],
         } for i, (_c, kw) in enumerate(reqs)]
         added = 0
+        n_long = 0
         for (cat, kw), reply in zip(reqs, self.explore(prompts,
-                                                       sampling_params=self.keyword_params)):
-            added += self.store.add(cat, parse_keyword_list(assistant_text(reply)),
-                                    source='expand', parent=kw)
+                                                      sampling_params=self.keyword_params)):
+            kept, dropped = split_keyword_list(assistant_text(reply))
+            n_long += len(dropped)
+            added += self.store.add(cat, kept, source='expand', parent=kw)
+        if n_long:
+            logger.warning(f'[CodeChallenger] dropped {n_long} expanded keyword(s) over '
+                           f'{KEYWORD_MAX_LEN} chars; expansion follows the parent, so a '
+                           f'wordy parent produces wordy children')
         logger.info(f'[CodeChallenger] expanded {len(hard)} hard keyword(s) -> '
                     f'+{added} same-domain topics')
         return added

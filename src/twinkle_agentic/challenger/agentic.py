@@ -49,7 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from twinkle.data_format import SamplingParams, Trajectory, user_data_get
 from twinkle.utils import get_logger
 from .base import Challenger, Explorer, assistant_text, attach_user_data
-from .code import KeywordStore, parse_keyword_list
+from .code import KeywordStore, split_keyword_list
 
 logger = get_logger()
 
@@ -524,11 +524,12 @@ class AgenticChallenger(Challenger):
             that is impossible from one whose statement withholds a value its
             check demands, and both look like a hard task worth keeping.
         keyword_sink: called once per keyword-generation call, with the prompt,
-            the raw reply and what ``parse_keyword_list`` made of it. A bank that
+            the raw reply and what ``split_keyword_list`` made of it. A bank that
             refuses to fill is invisible otherwise -- proposals fall back to the
             no-keyword prompt and the run carries on looking normal -- and a count
             of zero does not say whether the model broke the format or the parser
-            rejected output that was fine.
+            rejected output that was fine, which is why the over-length phrases are
+            recorded next to the kept ones rather than summed into the difference.
     """
 
     def __init__(
@@ -1933,7 +1934,7 @@ class AgenticChallenger(Challenger):
             for user, reply in zip(users, explorer(prompts,
                                                   sampling_params=self.keyword_params)):
                 text = assistant_text(reply)
-                parsed = parse_keyword_list(text)
+                parsed, dropped_long = split_keyword_list(text)
                 fresh = []
                 for kw in parsed:
                     key = kw.lower()
@@ -1954,6 +1955,12 @@ class AgenticChallenger(Challenger):
                         'parsed': parsed,
                         'n_parsed': len(parsed),
                         'n_new': len(fresh),
+                        # The two fields that make the sentence above true. Without
+                        # them ``n_parsed: 0`` reads the same whether the reply was
+                        # garbled, empty, or eight usable keywords written at
+                        # sentence length -- and the third is the one that happened.
+                        'dropped_long': dropped_long,
+                        'n_dropped_long': len(dropped_long),
                     }
                     with self._sink_lock:
                         self.keyword_sink(record)
@@ -2026,7 +2033,7 @@ class AgenticChallenger(Challenger):
         for (cat, kw), reply in zip(reqs, explorer(prompts,
                                                    sampling_params=self.keyword_params)):
             text = assistant_text(reply)
-            parsed = parse_keyword_list(text)
+            parsed, dropped_long = split_keyword_list(text)
             added += self.store.add(cat, parsed, source='expand', parent=kw)
             if self.keyword_sink is not None:
                 self.keyword_sink({
@@ -2034,6 +2041,8 @@ class AgenticChallenger(Challenger):
                     'stop_reason': reply.get('stop_reason'),
                     'truncated': bool(reply.get('truncated')),
                     'parsed': parsed, 'n_parsed': len(parsed),
+                    'dropped_long': dropped_long,
+                    'n_dropped_long': len(dropped_long),
                 })
         logger.info(f'[AgenticChallenger] expanded {len(hard)} hard keyword(s) -> '
                     f'+{added} same-domain topics')
