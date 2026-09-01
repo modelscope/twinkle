@@ -103,6 +103,7 @@ Solving side: 1.0 if the check exits 0, else 0.0.
 ## Files
 
 ```
+run.sh             start or continue a run: the GPU split, the guards, the env
 rsi.py             the loop: one resident process, collect -> step -> sync, forever
 challenge.py       collect: the queues, the three job bodies, the group decision
 train.py           one GRPO step over what was collected, as a library rsi.py calls
@@ -180,8 +181,14 @@ so a task's `n_pass` here and its `pass@k` there are measured against one openin
 export E2B_API_KEY=...              # sandbox host
 export SANDBOX_API_URL=http://...   # sandbox host address, with port
 export LLM_BACKUP_API_KEY=...       # dashscope
-python cookbook/rsi/agentic/rsi.py --tag v4 --iterations 1
+TAG=v4 bash cookbook/rsi/agentic/run.sh
 ```
+
+`run.sh` only sets up the process — the GPU split, the allocator, the guard against
+starting on top of another job — and passes anything else through to `rsi.py`, so
+`TAG=v4 bash cookbook/rsi/agentic/run.sh --iterations 1 --keep-groups 4` works.
+`python cookbook/rsi/agentic/rsi.py --tag v4` directly is the same thing without
+those checks.
 
 `--iterations 0`, the default, runs until killed. Restarting the same `--tag`
 continues it: iterations are counted by the `iteration.done` marker, which is
