@@ -103,20 +103,31 @@ Solving side: 1.0 if the check exits 0, else 0.0.
 ## Files
 
 ```
+rsi.py             the loop: one resident process, collect -> step -> sync, forever
 challenge.py       collect: the queues, the three job bodies, the group decision
-train.py           one GRPO step over what was collected, then overwrite the ckpt
+train.py           one GRPO step over what was collected, as a library rsi.py calls
 sandbox.py         the sandbox as a resource: clear, snapshot, run a script
 prompts.py         every string sent to a model
-loop.sh            collect -> train -> collect from the new weights, until killed
 episode.py         how an episode is built and scored, shared with eval.py
 remote_tool_env.py the transport to one microVM, paired with sandbox_server/
 sandbox_server/    the image and the in-sandbox tool server it talks to
 eval.py            held-out pass rate on tasks the trainer never saw
-split_tasks.py     split a collection's tasks into a train and an eval half
 rsi_agent.yaml     the ms-agent config both sides' openings are shaped by
 ```
 
-Output under `--out-dir`:
+The trainer and the sampler are two disjoint device groups in one Ray job -- 2 and
+6 GPUs by default -- and both stay resident for the whole run. After each step the
+new weights go to the live vLLM engines over NCCL (`CheckpointEngineManager`), so
+nothing is restarted and nothing round-trips through the filesystem. `loop.sh`,
+which used to run a fresh `challenge.py` and `train.py` per iteration, is retired
+under `.temp/retired_rsi/`: it spent 11 minutes per iteration on startup, re-read
+the checkpoint once per GPU, and -- the reason it had to go -- passed the model
+between iterations as bf16 weights only, which threw away the fp32 master weights
+and the Adam moments every time. Measured on v3 after 12 iterations at lr 1e-6:
+98.54% of the 4.02 B weights were still bit-identical to the base model, and the
+largest change anywhere was 2.289e-05, one bf16 step at that magnitude.
+
+Output under `<root>/<tag>/iter<n>`:
 
 ```
 trajs/*.npz            input_ids / labels / logprobs
@@ -169,15 +180,23 @@ so a task's `n_pass` here and its `pass@k` there are measured against one openin
 export E2B_API_KEY=...              # sandbox host
 export SANDBOX_API_URL=http://...   # sandbox host address, with port
 export LLM_BACKUP_API_KEY=...       # dashscope
-ITERATIONS=1 bash cookbook/rsi/agentic/loop.sh
+python cookbook/rsi/agentic/rsi.py --tag v4 --iterations 1
 ```
 
+`--iterations 0`, the default, runs until killed. Restarting the same `--tag`
+continues it: iterations are counted by the `iteration.done` marker, which is
+written after the checkpoint, and the loop picks up from
+`<root>/<tag>/ckpt/model`. The optimizer is state that only exists in memory, so
+it is checkpointed every `--save-optimizer-every` iterations (5); a crash between
+two of those resumes with the weights and with Adam at zero moments.
+
 Charts land in swanlab project `twinkle-rsi-agentic`, one experiment named after
-`TAG`, one step per iteration. `train.py` uploads after saving the checkpoint, so a
-swanlab failure costs the charts and not the weights — the numbers are still in
-`challenge_metrics.json` and `train_summary.json` either way. Resume is by
-`id=TAG`: a second run under the same tag appends to that curve, a new tag starts a
-new one. `RSI_SWANLAB_MODE=disabled` turns it off, `RSI_SWANLAB_PROJECT` moves it.
+`--tag`, one step per iteration. The upload happens after the checkpoint is saved
+and its failure is caught, so an unreachable dashboard costs the charts and not the
+weights — the numbers are still in `challenge_metrics.json` and
+`train_summary.json` either way. Resume is by `id=tag`: a second run under the same
+tag appends to that curve, a new tag starts a new one. `--swanlab-mode disabled`
+turns it off, `--swanlab-project` moves it.
 
 Verified on this machine at swanlab 0.9.2: three separate processes with the same
 tag at steps 1, 2, 3 landed on one run (the second and third print `disabled in
@@ -197,8 +216,8 @@ re-measured under this scheduler.
 | truncated solver attempt counts as a failure, denominator fixed at 8 | — | decided for this pipeline |
 | a build cut off at `--propose-max-tokens` writes no check and no statement | — | restored from the old pipeline, which skipped both stages after a length cut |
 | rubric failure after 3 tries drops the whole group | — | decided for this pipeline |
-| `--max-build-files` | 4 | inherited: `loop.sh` has passed this since it was added. It is text in the system prompt. |
-| `--api-thinking-budget` | 4096 | inherited from the old `loop.sh` |
+| `--max-build-files` | 4 | inherited: every run since it was added has passed this. It is text in the system prompt. |
+| `--api-thinking-budget` | 4096 | inherited from the retired `loop.sh` |
 | `--propose-max-tokens` / `--max-turns` / `--stop-after-stuck-turns` | 8192 / 24 / 2 | inherited |
 | `--one-call-per-reply` | on | inherited |
 | `--check-retries` / `--check-max-tokens` | 1 / 8192 | inherited |

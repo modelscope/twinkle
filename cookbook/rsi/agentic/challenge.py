@@ -31,17 +31,20 @@ group the highest-reward in-band proposal's eight solver attempts are what the
 solver side trains on, so a kept group contributes 8 proposing and 8 solving
 trajectories, and eight kept groups are the 64 + 64 one training step reads.
 
-Output (all under ``--out-dir``):
+Output (per iteration, under ``<root>/<tag>/iter<n>``):
 
     trajs/*.npz          input_ids / labels / logprobs per trajectory
     trajs/index.jsonl    one line per trajectory: side, group, reward, full text
     groups.jsonl         one line per decided group: why kept or dropped
     tasks.jsonl          the statements and check scripts that were delivered
-    keywords.jsonl       the keyword bank, carried between iterations
 
-Run it as a Ray job (sampler only, no trainer)::
+and two files that belong to the loop rather than to an iteration, at
+``<root>/<tag>``: keywords.jsonl, the keyword bank, and task_bank.jsonl, the
+statements novelty is judged against.
 
-    python cookbook/rsi/agentic/challenge.py --keep-groups 8
+This is the collecting half as a library. rsi.py owns the process, the sampler and
+the sandbox pool, and calls in here once per iteration; the argument parser lives
+here because collection is what almost all of the arguments are about.
 """
 import argparse
 import collections
@@ -59,8 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle import DeviceMesh, get_logger
 from twinkle.data_format import SamplingParams
 from twinkle.sampler import vLLMSampler
 from twinkle_agentic.challenger import KeywordStore, parse_check_script, parse_problem_statement
@@ -72,7 +74,7 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import prompts as P  # noqa: E402
-from sandbox import close_pool, open_pool, solver_harness  # noqa: E402
+from sandbox import open_pool, solver_harness  # noqa: E402
 
 logger = get_logger()
 
@@ -155,9 +157,15 @@ def parse_args():
                         'not. 0 leaves the run governed by --keep-groups alone.')
 
     # Local model (the trainable half).
-    p.add_argument('--model-id', default='ms://Qwen/Qwen3-4B')
+    p.add_argument('--model-id', default='ms://Qwen/Qwen3-4B',
+                   help='where the loop starts from. Once an iteration has '
+                        'finished, its own checkpoint is used instead.')
     p.add_argument('--template', default='Template')
-    p.add_argument('--sampler-gpus', type=int, default=4)
+    p.add_argument('--sampler-gpus', type=int, default=6)
+    p.add_argument('--model-gpus', type=int, default=2,
+                   help='trainer GPUs. Disjoint from the sampler\'s, so the two '
+                        'halves stay resident side by side; --sampler-gpus + this '
+                        'is the size of the Ray job.')
     p.add_argument('--max-model-len', type=int, default=40960)
     p.add_argument('--gpu-memory-utilization', type=float, default=0.8)
 
@@ -225,9 +233,10 @@ def parse_args():
     p.add_argument('--keyword-max-tokens', type=int, default=4096)
 
     # Novelty.
-    p.add_argument('--task-bank', default='',
-                   help='jsonl of statements from earlier iterations. Empty turns '
-                        'novelty off, and the reward is the pass-rate gaussian alone.')
+    p.add_argument('--task-bank', default=None,
+                   help='jsonl of statements from earlier iterations, defaulting to '
+                        "<root>/<tag>/task_bank.jsonl. '' turns novelty off, and the "
+                        'reward is the pass-rate gaussian alone.')
     p.add_argument('--task-bank-refs', type=int, default=5,
                    help='stored statements shown to the judge, on top of the group '
                         "'s own siblings, which are always shown.")
@@ -243,8 +252,14 @@ def parse_args():
     p.add_argument('--sandbox-slots', type=int, default=32,
                    help='microVMs, i.e. how many jobs run at once. One job owns one '
                         'slot from the workspace clear to its last check.')
-    p.add_argument('--sandbox-template', default=os.environ.get('AENV_TEMPLATE', ''))
-    p.add_argument('--sandbox-api-url', default=os.environ.get('AENV_API_URL', ''))
+    # AENV_* is what the sandbox client reads; E2B_API_KEY / SANDBOX_API_URL is
+    # what the host hands out and what the README tells you to export. The
+    # translation used to live in loop.sh and has to live somewhere.
+    p.add_argument('--sandbox-template',
+                   default=os.environ.get('AENV_TEMPLATE') or 'twinkle-rsi-msagent')
+    p.add_argument('--sandbox-api-url',
+                   default=(os.environ.get('AENV_API_URL')
+                            or os.environ.get('SANDBOX_API_URL', '')))
     p.add_argument('--sandbox-timeout', type=int, default=900)
     p.add_argument('--agent-config', default='cookbook/rsi/agentic/rsi_agent.yaml')
     p.add_argument('--workspace', default='/workspace')
@@ -252,40 +267,95 @@ def parse_args():
     p.add_argument('--snapshot-per-file', type=int, default=600)
     p.add_argument('--snapshot-budget', type=int, default=6000)
 
+    # Training, one step per iteration. See train.py.
+    p.add_argument('--lr', type=float, default=1e-6)
+    p.add_argument('--sides', default='both', choices=('both', 'propose', 'solve'))
+    p.add_argument('--micro-batch-size', type=int, default=1,
+                   help='trajectories per micro batch. One, because padding_free is '
+                        'off: a micro batch is padded to its longest member, so '
+                        'pairing a short solver attempt with a long build episode '
+                        'pays for the long one twice.')
+    p.add_argument('--mini-batch-size', type=int, default=0,
+                   help='0 means --model-gpus x --micro-batch-size, which is the '
+                        "floor: forward_backward is dispatch='slice_dp', so a mini "
+                        'batch has to give every rank at least one micro batch.')
+    p.add_argument('--max-train-len', type=int, default=32768,
+                   help='a trajectory longer than this is not trained on. Below '
+                        '--max-model-len, so collection can produce some.')
+
+    # The loop.
+    p.add_argument('--root', default='output/rsi_agentic')
+    p.add_argument('--tag', default='',
+                   help='names the run: everything lives under <root>/<tag>, and '
+                        'restarting a tag continues it rather than redoing it.')
+    p.add_argument('--iterations', type=int, default=0,
+                   help='0 runs until killed.')
+    p.add_argument('--ckpt-dir', default='',
+                   help='defaults to <root>/<tag>/ckpt. Worth pointing at a faster '
+                        'filesystem than the repo: the first load reads it once per '
+                        'GPU, and measured with dd at 1.5 GB this host has one disk '
+                        'at 223 MB/s and another at 1074 MB/s.')
+    p.add_argument('--save-optimizer-every', type=int, default=5,
+                   help='iterations between checkpoints that include the optimizer. '
+                        'Weights are saved every iteration either way; this is what '
+                        'a resume needs to keep the Adam moments, and it is ~48 GB '
+                        'for a 4B model against 7.6 GB for the weights alone.')
+    p.add_argument('--swanlab-project', default='twinkle-rsi-agentic')
+    p.add_argument('--swanlab-mode', default='online',
+                   help="'disabled' keeps a run off the dashboard entirely.")
+
     # Output.
-    p.add_argument('--out-dir', default='output/rsi_agentic')
-    p.add_argument('--keyword-db', default='',
-                   help='defaults to <out-dir>/keywords.jsonl')
     p.add_argument('--random-seed', type=int, default=0)
     args = p.parse_args()
     if not args.api_model or not args.api_base:
-        raise SystemExit('[challenge] --api-model and --api-base are required '
+        raise SystemExit('[rsi] --api-model and --api-base are required '
                          '(or LLM_BACKUP_MODEL / LLM_BACKUP_BASE_URL)')
+    if not args.tag:
+        raise SystemExit('[rsi] --tag is required: it decides which run these '
+                         'iterations belong to and which checkpoint they overwrite')
     if args.solver_rollouts < 2:
-        raise SystemExit('[challenge] --solver-rollouts must be >= 2: it is both the '
-                         "solver side's GRPO group size and the denominator n_pass is "
-                         'judged against')
+        raise SystemExit('[rsi] --solver-rollouts must be >= 2: it is both the '
+                         "solver side's GRPO group size and the denominator n_pass "
+                         'is judged against')
     if args.group_size < 2:
-        raise SystemExit('[challenge] --group-size must be >= 2: a group of one has '
+        raise SystemExit('[rsi] --group-size must be >= 2: a group of one has '
                          'no mean to subtract, so every advantage is zero')
-    args.keyword_db = args.keyword_db or os.path.join(args.out_dir, 'keywords.jsonl')
+    # Checked here rather than where the pool is opened, which is after the model
+    # and the sampler are up: that is six minutes of startup to find out that a
+    # host address is missing.
+    if not args.sandbox_api_url:
+        raise SystemExit('[rsi] --sandbox-api-url is required (or SANDBOX_API_URL / '
+                         'AENV_API_URL)')
+    if not os.environ.get('E2B_API_KEY') and not os.environ.get('AENV_API_KEY'):
+        raise SystemExit('[rsi] E2B_API_KEY is required: the sandbox client reads '
+                         'it from the environment')
+    os.environ.setdefault('AENV_API_URL', args.sandbox_api_url)
+    os.environ.setdefault('AENV_TEMPLATE', args.sandbox_template)
+    os.environ.setdefault('AENV_API_KEY', os.environ.get('E2B_API_KEY', ''))
+    # The bank and the keyword store belong to the loop, not to an iteration:
+    # comparing iteration k+1's proposals against what k produced is the point of
+    # them. ``--task-bank ''`` turns novelty off and leaves the pass-rate gaussian
+    # alone. out_dir is set per iteration by rsi.py.
+    root = os.path.join(args.root, args.tag)
+    args.keyword_db = os.path.join(root, 'keywords.jsonl')
+    if args.task_bank is None:
+        args.task_bank = os.path.join(root, 'task_bank.jsonl')
+    args.out_dir = root
     return args
 
 
 # ── Resources ──────────────────────────────────────────────────────────────
 
 
-def initialize_device(args) -> Tuple[Any, Any]:
-    """Bring up Ray and the local vLLM sampler; returns (sampler, template).
+def build_sampler(args) -> Tuple[Any, Any]:
+    """The resident vLLM sampler; returns (sampler, template).
 
-    The template is built here as well as inside the sampler because the rollout
-    encodes with it locally: one object, so the token ids the sampler continues
-    from are the ids the trajectory was encoded with.
+    Ray and the device groups are already up -- rsi.py owns them, because the
+    trainer needs a group of its own on the same job. The template is built here as
+    well as inside the sampler because the rollout encodes with it locally: one
+    object, so the token ids the sampler continues from are the ids the trajectory
+    was encoded with.
     """
-    twinkle.initialize(
-        mode='ray', nproc_per_node=args.sampler_gpus, lazy_collect=False,
-        groups=[DeviceGroup(name='sampler', ranks=list(range(args.sampler_gpus)),
-                            device_type='GPU')])
     sampler = vLLMSampler(
         model_id=args.model_id,
         engine_args={'gpu_memory_utilization': args.gpu_memory_utilization,
@@ -301,7 +371,7 @@ def initialize_device(args) -> Tuple[Any, Any]:
         args.model_id, max_length=args.max_model_len, enable_thinking=True)
     if not getattr(type(sampler).sample, '_enable_continous_work', False):
         raise SystemExit(
-            '[challenge] this sampler does not route requests one at a time '
+            '[rsi] this sampler does not route requests one at a time '
             '(sample lacks enable_continous_work), so a batch of one would be '
             'padded to the worker count and most of every generation thrown away. '
             'The whole design here is one trajectory per request.')
@@ -1527,46 +1597,3 @@ def collect_metrics(out_dir: str, counts: Dict[str, int], launched: int,
                         sorted(collections.Counter(novelty).items())},
         },
     }
-
-
-def main():
-    args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-    recorder = Recorder(args.out_dir)
-    sampler, template = initialize_device(args)
-    slots = initialize_sandbox(args)
-    run = Run(args, sampler, template, slots, recorder)
-    started = time.time()
-    try:
-        run.run()
-        # After the loop, not during: what it adds is for the next iteration, and
-        # doing it here means a crash in collection does not also lose the bank.
-        if args.keyword_expand:
-            run.expand_hard_keywords()
-    finally:
-        rebuilds = close_pool(slots)
-        recorder.close()
-        if run.bank is not None:
-            logger.info(f'[challenge] task bank: {run.bank.stats()}')
-        run.store.save()
-        if rebuilds:
-            logger.warning(f'[challenge] sandboxes were rebuilt {rebuilds} time(s); '
-                           f'the jobs in flight at those moments were lost')
-        # Written after recorder.close(), so groups.jsonl is complete and flushed
-        # before it is read back. In the finally block because a run that crashed
-        # is the one whose numbers are most worth having.
-        metrics = collect_metrics(args.out_dir, run.counts, run.n_launched,
-                                  args.solver_rollouts, time.time() - started)
-        with open(os.path.join(args.out_dir, 'challenge_metrics.json'), 'w',
-                  encoding='utf-8') as f:
-            json.dump(metrics, f, indent=2, ensure_ascii=False, default=str)
-        logger.info(f'[challenge] {len(run.kept)}/{run.n_launched} groups kept in '
-                    f'{time.time() - started:.0f}s, counts: '
-                    f'{dict(sorted(run.counts.items()))}')
-        logger.info(f'[challenge] metrics -> '
-                    f'{os.path.join(args.out_dir, "challenge_metrics.json")}: '
-                    f'{metrics["scalars"]}')
-
-
-if __name__ == '__main__':
-    main()
