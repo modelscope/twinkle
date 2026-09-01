@@ -143,6 +143,15 @@ def main():
                 f'{args.model_gpus} trainer + {args.sampler_gpus} sampler GPUs, '
                 f'model {model_id}, checkpoint {hf_dir}, lr {args.lr}')
 
+    # Before the GPUs: a dashboard that will not accept this client is worth
+    # finding out about now rather than 35 minutes in, and there is nothing to
+    # lose yet if it raises.
+    T.init_swanlab(tag=args.tag, project=args.swanlab_project,
+                   mode=args.swanlab_mode,
+                   config={'model_id': args.model_id, 'learning_rate': args.lr,
+                           'sides': args.sides, 'model_gpus': args.model_gpus,
+                           'sampler_gpus': args.sampler_gpus})
+
     # Both groups are named here, once, and every remote object below is pinned to
     # one of them. Disjoint rank ranges are what keeps the two halves from sharing
     # a card.
@@ -200,23 +209,7 @@ def main():
                         f'{time.time() - t0:.0f}s'
                         f'{" with optimizer state" if with_optimizer else ""}')
 
-            # Caught rather than allowed to propagate: an unreachable dashboard
-            # would otherwise take down a loop whose checkpoint is already on disk
-            # and, worse than losing the charts, leave the iteration without its
-            # marker, so the next start would redo it from weights that already
-            # contain it. Measured: swanlab 0.7.17 with no api key raises
-            # KeyFileError here, which is exactly the case this has to survive.
-            try:
-                T.upload(challenge_metrics.get('scalars') or {}, summary, tag=args.tag,
-                         iteration=i, project=args.swanlab_project,
-                         mode=args.swanlab_mode,
-                         config={'model_id': args.model_id, 'learning_rate': args.lr,
-                                 'sides': args.sides, 'model_gpus': args.model_gpus,
-                                 'sampler_gpus': args.sampler_gpus})
-            except Exception as e:
-                logger.warning(f'[rsi] swanlab upload failed, charts lost but the '
-                               f'checkpoint and the json metrics are not: '
-                               f'{type(e).__name__}: {e}')
+            T.upload(challenge_metrics.get('scalars') or {}, summary, iteration=i)
             # Last, so a resume counts only iterations whose weights are on disk.
             open(os.path.join(out_dir, 'iteration.done'), 'w').close()
             logger.info(f'[rsi] iteration {i} done')

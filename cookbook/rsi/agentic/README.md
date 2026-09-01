@@ -198,12 +198,14 @@ it is checkpointed every `--save-optimizer-every` iterations (5); a crash betwee
 two of those resumes with the weights and with Adam at zero moments.
 
 Charts land in swanlab project `twinkle-rsi-agentic`, one experiment named after
-`--tag`, one step per iteration. The upload happens after the checkpoint is saved
-and its failure is caught, so an unreachable dashboard costs the charts and not the
-weights — the numbers are still in `challenge_metrics.json` and
-`train_summary.json` either way. Resume is by `id=tag`: a second run under the same
-tag appends to that curve, a new tag starts a new one. `--swanlab-mode disabled`
-turns it off, `--swanlab-project` moves it.
+`--tag`, one step per iteration. `swanlab.init` happens once at startup, before the
+GPUs are touched, and it is not guarded: a dashboard that will not accept this
+client stops the run in the first second rather than after the first iteration. The
+per-iteration upload is not guarded either — the numbers are in
+`challenge_metrics.json` and `train_summary.json` either way, but a connection that
+worked at startup and fails mid-run is worth stopping on. Resume is by `id=tag`: a
+second run under the same tag appends to that curve, a new tag starts a new one.
+`--swanlab-mode disabled` turns it off, `--swanlab-project` moves it.
 
 Verified on this machine at swanlab 0.9.2: three separate processes with the same
 tag at steps 1, 2, 3 landed on one run (the second and third print `disabled in

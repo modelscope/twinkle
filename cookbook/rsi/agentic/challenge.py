@@ -177,10 +177,16 @@ def parse_args():
                    help='API calls in flight. Only the rubric runs as its own job; '
                         'check and statement calls are made from inside a sandbox '
                         'job and are already capped by the slot count.')
-    p.add_argument('--api-thinking-budget', type=int, default=0,
+    p.add_argument('--api-thinking-budget', type=int, default=4096,
                    help='sent as extra_body on every API call when > 0. Capping the '
                         'reasoning is the one knob that moved wall-clock: 58s -> 10s '
-                        'per turn at 2048 on a ~15k-character context.')
+                        'per turn at 2048 on a ~15k-character context. Not zero by '
+                        'default, because the judge is a reasoning model and left '
+                        'uncapped it spends thousands of reasoning tokens on a reply '
+                        'of nine short lines: measured on v5 iteration 1, 55 of 129 '
+                        'novelty calls hit the 120s client timeout and took their '
+                        'whole group down as novelty_unscored, at three times the '
+                        'wall-clock of the same collection with this set.')
 
     # Building: stage 1, the part that is trained.
     p.add_argument('--propose-temp', type=float, default=1.0)

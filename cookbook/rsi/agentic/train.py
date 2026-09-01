@@ -23,7 +23,7 @@ reason that has nothing to do with the policy being wrong.
 import collections
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -261,27 +261,41 @@ def train_one_step(model, run_dir: str, *, sides: str, max_length: int,
     return summary
 
 
-def upload(challenge: Dict[str, Any], summary: Dict[str, Any], *, tag: str,
-           iteration: int, project: str, mode: str, config: Dict[str, Any]) -> None:
-    """Send one iteration's numbers to swanlab, as one step.
+# swanlab state for this process. ``init`` may be called once and only once here:
+# a second call raises 'DataPorter instance already exists', which the old
+# process-per-iteration arrangement never hit because every iteration was a fresh
+# interpreter. So it happens once, at startup, before anything expensive has been
+# built -- a dashboard that will not accept this client is worth finding out about
+# in the first second rather than after the first iteration.
+def init_swanlab(*, tag: str, project: str, mode: str, config: Dict[str, Any]) -> None:
+    """Open the one experiment this process logs to. Raises if it cannot.
 
     One experiment for the whole loop rather than one per iteration: the question
     these charts answer is whether iteration k+1 is better than k, which a chart
-    that ends after one point cannot show. ``id`` is the tag, so re-running a tag
-    appends to its curve and a new tag starts a new one.
+    that ends after one point cannot show. ``id`` is the tag, so a later process
+    under the same tag appends to its curve and a new tag starts a new one.
+    """
+    import swanlab
+    swanlab.init(project=project, name=tag, id=tag, resume='allow', mode=mode,
+                 config={'tag': tag, **config})
+    logger.info(f'[train] swanlab {project}/{tag}, mode {mode}')
+
+
+def upload(challenge: Dict[str, Any], summary: Dict[str, Any], *,
+           iteration: int) -> None:
+    """Send one iteration's numbers to the experiment ``init_swanlab`` opened.
 
     Only ``challenge['scalars']`` goes up, not its counts: those have keys that
     exist in one iteration and not the next (``group_dropped:rubric_error``), and a
     chart that appears halfway through a run is read as a change in the run rather
     than a change in what was recorded.
 
-    Called after the checkpoint is saved and wrapped by the caller, so an
-    unreachable dashboard costs this iteration's charts and not its weights. The
-    numbers are in challenge_metrics.json and train_summary.json either way.
+    Called after the checkpoint is saved, and it does not swallow anything: the
+    connection was proved at startup by ``init_swanlab``, so a failure here is a
+    dashboard that went away mid-run and that is worth stopping on. The numbers
+    are in challenge_metrics.json and train_summary.json either way.
     """
     import swanlab
-    swanlab.init(project=project, name=tag, id=tag, resume='allow', mode=mode,
-                 config={'tag': tag, **config})
     log = {f'challenge/{k}': v for k, v in challenge.items()}
     metrics = summary.get('metrics') or {}
     log.update({
@@ -300,4 +314,4 @@ def upload(challenge: Dict[str, Any], summary: Dict[str, Any], *, tag: str,
         **{f'train/{k}': v for k, v in metrics.items() if isinstance(v, (int, float))},
     })
     swanlab.log(log, step=iteration)
-    logger.info(f'[train] swanlab {project}/{tag} step {iteration}: {len(log)} metrics')
+    logger.info(f'[train] swanlab step {iteration}: {len(log)} metrics')
