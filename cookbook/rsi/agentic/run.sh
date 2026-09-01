@@ -84,6 +84,15 @@ export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/mnt/workspace/.cache/modelscope/hu
 # since swanlab.init is no longer guarded, would stop the run in its first second.
 # SWANLAB_MODE=local writes swanlog/ instead, for `swanlab watch`.
 SWANLAB_MODE="${SWANLAB_MODE:-online}"
+# The sequence limit that bounds training memory. Deliberately not given a value
+# here: rsi.py's default (16384) is the measured one and duplicating the number in
+# two places is how the two drift apart. Set MAX_TRAIN_LEN to override it, which is
+# what a change of model, vocabulary, or trainer GPU count calls for -- the bound is
+# vocab x length x 2 bytes of logits against whatever the card has left.
+LIMIT=()
+if [ -n "${MAX_TRAIN_LEN:-}" ]; then
+    LIMIT=(--max-train-len "$MAX_TRAIN_LEN")
+fi
 mkdir -p "$ROOT/$TAG"
 LOG="$ROOT/$TAG/run.log"
 echo "=== $TAG: $MODEL_GPUS trainer + $SAMPLER_GPUS sampler GPUs, checkpoint $CKPT_DIR,"
@@ -106,4 +115,5 @@ $PYTHON cookbook/rsi/agentic/rsi.py \
     --root "$ROOT" \
     --ckpt-dir "$CKPT_DIR" \
     --swanlab-mode "$SWANLAB_MODE" \
+    ${LIMIT[@]+"${LIMIT[@]}"} \
     "$@" 2>&1 | tee -a "$LOG"

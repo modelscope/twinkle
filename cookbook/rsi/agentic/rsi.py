@@ -129,9 +129,22 @@ def main():
                 f'gone: start a new --tag, or delete the iteration.done markers '
                 f'to redo them from {args.model_id}.')
         model_id = hf_dir
-        # Written by save(save_optimizer=True). Its absence is not an error, it
-        # means the crash landed between two optimizer checkpoints.
-        if os.path.exists(os.path.join(hf_dir, 'trainer_state.json')):
+        # Written by save(save_optimizer=True), which only fires every
+        # --save-optimizer-every iterations. Staleness is not a matter of losing a
+        # few moments: _load_mcore_optimizer reads latest_checkpointed_iteration.txt
+        # and restores the model from that sub-checkpoint too, so an optimizer state
+        # older than the weights sitting beside it rolls the weights back to
+        # whichever iteration wrote it -- silently, since both come from the same
+        # directory. Only the iteration that saved it may load it back.
+        saved_at = (start - 1) - (start - 1) % args.save_optimizer_every
+        if saved_at != start - 1:
+            logger.warning(
+                f'[rsi] the optimizer state under {hf_dir} is from iteration '
+                f'{saved_at} and the weights are from {start - 1}; loading it would '
+                f'take the weights back with it, so it is skipped and Adam starts '
+                f'at zero moments. Every {args.save_optimizer_every} iterations is '
+                f'a resume point; the others cost the fp32 master residue.')
+        elif os.path.exists(os.path.join(hf_dir, 'trainer_state.json')):
             resume_from = hf_dir
         else:
             logger.warning(f'[rsi] no optimizer state in {hf_dir}; resuming from '

@@ -291,9 +291,22 @@ def parse_args():
                    help='0 means --model-gpus x --micro-batch-size, which is the '
                         "floor: forward_backward is dispatch='slice_dp', so a mini "
                         'batch has to give every rank at least one micro batch.')
-    p.add_argument('--max-train-len', type=int, default=32768,
+    p.add_argument('--max-train-len', type=int, default=16384,
                    help='a trajectory longer than this is not trained on. Below '
-                        '--max-model-len, so collection can produce some.')
+                        '--max-model-len, so collection can produce some. This is '
+                        'the one bound on training memory that works when the micro '
+                        'batch is already a single sequence: the peak allocation is '
+                        'the logits, vocab 151936 x length x 2 bytes, which is '
+                        '0.29 MiB per token and nothing else comes close -- the '
+                        'allocation that ran out was 5.87 GiB for a 20742-token '
+                        'trajectory, matching that product exactly. 16384 leaves '
+                        '~0.8 GiB of headroom under the longest trajectory that has '
+                        'ever trained here (19312) and costs, measured over 12 '
+                        'iterations of v4 and v5, 0.98%% of trajectories (3.91%% in '
+                        'the worst single iteration) and not one whole group: an '
+                        'eight-member group can lose its longest one or two members '
+                        'and still produce an advantage. 32768, the old default, was '
+                        'above every length ever collected and so never fired.')
 
     # The loop.
     p.add_argument('--root', default='output/rsi_agentic')
