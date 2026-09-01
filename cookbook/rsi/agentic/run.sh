@@ -21,12 +21,26 @@ fi
 cd "$REPO"
 
 missing=""
-for v in TAG E2B_API_KEY SANDBOX_API_URL LLM_BACKUP_API_KEY; do
+for v in TAG E2B_API_KEY SANDBOX_API_URL LLM_BACKUP_API_KEY LLM_BACKUP_MODEL \
+         LLM_BACKUP_BASE_URL; do
     [ -z "${!v:-}" ] && missing="$missing $v"
 done
 if [ -n "$missing" ]; then
     echo "set these first:$missing" >&2
-    echo "  TAG names the run; the other three are the sandbox host and dashscope" >&2
+    echo "  TAG names the run; the rest are the sandbox host and the API judge" >&2
+    echo "  (LLM_BACKUP_MODEL and LLM_BACKUP_BASE_URL are where --api-model and" >&2
+    echo "   --api-base get their defaults, so an empty one is a run with no judge)" >&2
+    exit 1
+fi
+
+# The interpreter, checked rather than hardcoded: a login shell without the conda
+# environment active resolves python to /usr/local/bin/python, whose megatron.core
+# has no transformer-engine metadata and raises PackageNotFoundError on import --
+# after Ray is up, which reads as eight actors dying for no stated reason.
+PYTHON="${PYTHON:-python}"
+if ! "$PYTHON" -c 'import twinkle, megatron.core' 2>/dev/null; then
+    echo "$PYTHON cannot import twinkle and megatron.core: activate the environment" >&2
+    echo "  twinkle was installed into, or point PYTHON at its interpreter" >&2
     exit 1
 fi
 
@@ -61,15 +75,35 @@ export TWINKLE_DISABLE_CUDNN_SDP="${TWINKLE_DISABLE_CUDNN_SDP:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 ROOT="${ROOT:-output/rsi_agentic}"
+# Not under ROOT: ROOT is on the NAS, and this is 7.6 GB of weights every iteration
+# and ~48 GB more on the iterations that include the optimizer.
+CKPT_DIR="${CKPT_DIR:-/mnt/data2/rsi_agentic/$TAG/ckpt}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/mnt/workspace/.cache/modelscope/hub}"
+# Pushed to the cloud dashboard. This works on the default project and not on the
+# older twinkle-rsi-agentic one, which answers this client (0.7.17) with 422 and,
+# since swanlab.init is no longer guarded, would stop the run in its first second.
+# SWANLAB_MODE=local writes swanlog/ instead, for `swanlab watch`.
+SWANLAB_MODE="${SWANLAB_MODE:-online}"
 mkdir -p "$ROOT/$TAG"
 LOG="$ROOT/$TAG/run.log"
-echo "=== $TAG: $MODEL_GPUS trainer + $SAMPLER_GPUS sampler GPUs, logging to $LOG"
+echo "=== $TAG: $MODEL_GPUS trainer + $SAMPLER_GPUS sampler GPUs, checkpoint $CKPT_DIR,"
+echo "===      swanlab $SWANLAB_MODE, logging to $LOG"
 
 # tee rather than a redirect so a foreground run is watchable, and pipefail above
 # so the exit status is python's and not tee's.
-python cookbook/rsi/agentic/rsi.py \
+#
+# Every knob that decides what gets collected or how it is trained is left to
+# rsi.py's own defaults on purpose. The one time a verified setting lived in a
+# launcher instead -- --api-thinking-budget 4096, in a throwaway script under
+# .temp -- a restart that retyped the command line dropped it, the rubric judge
+# went back to thinking without a cap, 43% of its calls hit the 120s timeout and
+# took their whole group down, and the iteration ran at three times its usual
+# wall-clock before anyone noticed.
+$PYTHON cookbook/rsi/agentic/rsi.py \
     --tag "$TAG" \
     --model-gpus "$MODEL_GPUS" \
     --sampler-gpus "$SAMPLER_GPUS" \
     --root "$ROOT" \
+    --ckpt-dir "$CKPT_DIR" \
+    --swanlab-mode "$SWANLAB_MODE" \
     "$@" 2>&1 | tee -a "$LOG"

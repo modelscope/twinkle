@@ -274,7 +274,13 @@ def parse_args():
     p.add_argument('--snapshot-budget', type=int, default=6000)
 
     # Training, one step per iteration. See train.py.
-    p.add_argument('--lr', type=float, default=1e-6)
+    p.add_argument('--lr', type=float, default=5e-6,
+                   help='One optimizer step per iteration, so this is the whole of '
+                        'what an iteration moves. 1e-6 was inherited from the '
+                        'process-per-iteration arrangement, where it did not matter: '
+                        'the update was rounded away by the bf16 round trip through '
+                        'the checkpoint anyway -- after 12 such iterations 98.54%% of '
+                        'the weights were still bit-identical to the base model.')
     p.add_argument('--sides', default='both', choices=('both', 'propose', 'solve'))
     p.add_argument('--micro-batch-size', type=int, default=1,
                    help='trajectories per micro batch. One, because padding_free is '
@@ -306,7 +312,11 @@ def parse_args():
                         'Weights are saved every iteration either way; this is what '
                         'a resume needs to keep the Adam moments, and it is ~48 GB '
                         'for a 4B model against 7.6 GB for the weights alone.')
-    p.add_argument('--swanlab-project', default='twinkle-rsi-agentic')
+    p.add_argument('--swanlab-project', default='twinkle-rsi-selfplay',
+                   help='not twinkle-rsi-agentic: that project answers POST '
+                        '/api/project with 422 for this client (0.7.17), while a '
+                        'project it creates itself works. Measured by initialising '
+                        'both from the same interpreter.')
     p.add_argument('--swanlab-mode', default='online',
                    help="'disabled' keeps a run off the dashboard entirely.")
 

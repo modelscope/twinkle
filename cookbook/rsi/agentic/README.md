@@ -181,30 +181,44 @@ so a task's `n_pass` here and its `pass@k` there are measured against one openin
 export E2B_API_KEY=...              # sandbox host
 export SANDBOX_API_URL=http://...   # sandbox host address, with port
 export LLM_BACKUP_API_KEY=...       # dashscope
-TAG=v4 bash cookbook/rsi/agentic/run.sh
+export LLM_BACKUP_MODEL=...         # the judge, e.g. qwen3.8-max
+export LLM_BACKUP_BASE_URL=...      # its endpoint
+TAG=v5 bash cookbook/rsi/agentic/run.sh
 ```
 
-`run.sh` only sets up the process — the GPU split, the allocator, the guard against
-starting on top of another job — and passes anything else through to `rsi.py`, so
-`TAG=v4 bash cookbook/rsi/agentic/run.sh --iterations 1 --keep-groups 4` works.
-`python cookbook/rsi/agentic/rsi.py --tag v4` directly is the same thing without
-those checks.
+That is the whole command: everything a run needs is either one of those five
+variables or a default in the code, and nothing has to be remembered on the command
+line. `run.sh` sets up the process — the GPU split (`MODEL_GPUS` / `SAMPLER_GPUS`,
+2 and 6), the allocator, the guard against starting on top of another job, the
+checkpoint directory (`CKPT_DIR`, on `/mnt/data2` rather than the NAS because it is
+7.6 GB per iteration), the swanlab mode (`SWANLAB_MODE`, see below) — and passes
+anything else through to `rsi.py`, so
+`TAG=v5 bash cookbook/rsi/agentic/run.sh --iterations 1 --keep-groups 4` works.
+`python cookbook/rsi/agentic/rsi.py --tag v5` directly is the same thing without
+those checks and without those process settings.
 
 `--iterations 0`, the default, runs until killed. Restarting the same `--tag`
 continues it: iterations are counted by the `iteration.done` marker, which is
-written after the checkpoint, and the loop picks up from
-`<root>/<tag>/ckpt/model`. The optimizer is state that only exists in memory, so
-it is checkpointed every `--save-optimizer-every` iterations (5); a crash between
-two of those resumes with the weights and with Adam at zero moments.
+written after the checkpoint, and the loop picks up from `$CKPT_DIR/model`. The
+optimizer is state that only exists in memory, so it is checkpointed every
+`--save-optimizer-every` iterations (5); a crash between two of those resumes with
+the weights and with Adam at zero moments. Note that resuming from a checkpoint
+that *does* carry optimizer state also restores that checkpoint's learning rate:
+Megatron's scheduler prefers the checkpointed value over the class value, so a
+restart with a different `--lr` keeps the old one and only says so in an INFO line.
 
-Charts land in swanlab project `twinkle-rsi-agentic`, one experiment named after
-`--tag`, one step per iteration. `swanlab.init` happens once at startup, before the
-GPUs are touched, and it is not guarded: a dashboard that will not accept this
-client stops the run in the first second rather than after the first iteration. The
-per-iteration upload is not guarded either — the numbers are in
+Charts land in swanlab project `twinkle-rsi-selfplay`, one experiment named after
+`--tag`, one step per iteration, pushed to the cloud. `swanlab.init` happens once at
+startup, before the GPUs are touched, and it is not guarded: a dashboard that will
+not accept this client stops the run in the first second rather than after the first
+iteration. The per-iteration upload is not guarded either — the numbers are in
 `challenge_metrics.json` and `train_summary.json` either way, but a connection that
-worked at startup and fails mid-run is worth stopping on. Resume is by `id=tag`: a
-second run under the same tag appends to that curve, a new tag starts a new one.
+worked at startup and fails mid-run is worth stopping on. The project name is part
+of this: the older `twinkle-rsi-agentic` project answers `POST /api/project` with
+422 for the client here (0.7.17), while a project this client creates itself works,
+so the default was moved rather than the client upgraded. `SWANLAB_MODE=local`
+writes `swanlog/` for `swanlab watch` instead. Resume is by `id=tag`: a second run
+under the same tag appends to that curve, a new tag starts a new one.
 `--swanlab-mode disabled` turns it off, `--swanlab-project` moves it.
 
 Verified on this machine at swanlab 0.9.2: three separate processes with the same
@@ -238,7 +252,7 @@ re-measured under this scheduler.
 | `--keywords-n` / `--keyword-gen-calls` / `--keyword-temp` | 128 / 8 / 1.3 | inherited |
 | `--snapshot-max-files` / `-per-file` / `-budget` | 50 / 600 / 6000 | inherited |
 | `--sandbox-slots` | 32 | inherited: a probe once held 96, but not reliably for a whole run |
-| lr / one optimizer step / `GRPOLoss(epsilon=0.2, beta=0.0)` | 1e-6 | inherited |
+| lr / one optimizer step / `GRPOLoss(epsilon=0.2, beta=0.0)` | 5e-6 | one step per iteration is the whole of what an iteration moves; 1e-6 was inherited from the era when the bf16 round trip rounded it away anyway |
 | `MICRO_BATCH_SIZE=1`, `padding_free=False` | — | inherited, forced by an OOM at 2 |
 
 Prompt texts are byte-identical to the ones the old pipeline sent — verified
