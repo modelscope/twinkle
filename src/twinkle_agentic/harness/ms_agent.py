@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
@@ -83,11 +84,20 @@ class MsAgentHarness(AgentHarness):
                 cfg = OmegaConf.create(config)
             else:
                 cfg = config
-            self.agent = LLMAgent(
-                cfg,
-                trust_remote_code=trust_remote_code,
-                **agent_kwargs,
-            )
+            # ms-agent's Config.parse_args() reads sys.argv and asserts every
+            # token is a --key/value pair. When this harness is built inside a
+            # Ray worker, sys.argv carries the driver's args (e.g. rsi.py's),
+            # which break that parser. Hide them during construction.
+            saved_argv = sys.argv
+            sys.argv = [saved_argv[0]]
+            try:
+                self.agent = LLMAgent(
+                    cfg,
+                    trust_remote_code=trust_remote_code,
+                    **agent_kwargs,
+                )
+            finally:
+                sys.argv = saved_argv
         self.auto_prepare = auto_prepare
         self.freeze_system = freeze_system
         self.permission_mode = permission_mode
@@ -116,7 +126,12 @@ class MsAgentHarness(AgentHarness):
         return traj
 
     def before_generate(self, trajectory: Trajectory) -> Trajectory:
-        from ms_agent.hooks.context import condense_hook_attachments_for_llm
+        # ms-agent >= 1.6 removed ms_agent.hooks; the two helpers below
+        # moved or dropped, so degrade gracefully per installed version.
+        try:
+            from ms_agent.hooks.context import condense_hook_attachments_for_llm
+        except ImportError:  # ms-agent >= 1.6 dropped ms_agent.hooks
+            condense_hook_attachments_for_llm = None
 
         if self.auto_prepare:
             self.prepare()
@@ -124,8 +139,11 @@ class MsAgentHarness(AgentHarness):
         frozen_system = messages[0].content if (self.freeze_system and messages
                                                 and messages[0].role == 'system') else None
 
-        messages = self.agent._append_task_notifications(messages)
-        messages = condense_hook_attachments_for_llm(messages)
+        # _append_task_notifications existed in older ms-agent; skip on >= 1.6.
+        if hasattr(self.agent, '_append_task_notifications'):
+            messages = self.agent._append_task_notifications(messages)
+        if condense_hook_attachments_for_llm is not None:
+            messages = condense_hook_attachments_for_llm(messages)
 
         if getattr(self.agent, 'runtime', None) is not None:
             run_sync(self.agent.on_generate_response, messages)
@@ -183,17 +201,22 @@ class MsAgentHarness(AgentHarness):
             tc = calls[i] if i < len(calls) else {}
             tid = tc.get('id') or str(uuid.uuid4())[:8]
             name = tc.get('tool_name') or ''
-            messages.append(
-                Message(
-                    role='tool',
-                    content=formatted.text,
-                    tool_call_id=tid,
-                    name=name,
-                    resources=formatted.resources,
-                    tool_detail=formatted.tool_detail,
-                    hook_attachments=formatted.hook_attachments,
-                    is_error=formatted.is_error,
-                ))
+            kwargs: Dict[str, Any] = {
+                'role': 'tool',
+                'content': formatted.text,
+                'tool_call_id': tid,
+                'name': name,
+            }
+            # ms-agent 1.6.0 ToolResult.from_raw() only carries text/
+            # resources/extra; older versions carried the fields below on
+            # the object. Forward whichever exist so Message never gets a
+            # kwarg it cannot take.
+            for _field in ('resources', 'tool_detail', 'hook_attachments',
+                           'is_error'):
+                _value = getattr(formatted, _field, None)
+                if _value is not None:
+                    kwargs[_field] = _value
+            messages.append(Message(**kwargs))
             if i < len(calls) and not tc.get('id'):
                 calls[i]['id'] = tid
 
@@ -231,7 +254,12 @@ class MsAgentHarness(AgentHarness):
             agent.prepare_runtime()
         if getattr(agent, 'tool_manager', None) is None:
             await agent.prepare_tools()
-        await agent.prepare_skills()
+        if hasattr(agent, 'prepare_skills'):
+            await agent.prepare_skills()
+        else:
+            # ms-agent >= 1.6 has no prepare_skills: AutoSkills initializes
+            # lazily on first use, so only force the lazy init here.
+            agent._ensure_auto_skills()
         await agent.load_memory()
         if hasattr(agent, 'prepare_rag'):
             await agent.prepare_rag()
