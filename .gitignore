@@ -150,6 +150,7 @@ megatron_output/
 .qoder
 .kiro/
 .claude/
+.codex_tmp/
 
 # Pytorch
 *.pth

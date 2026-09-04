@@ -41,8 +41,15 @@ def apply_expert_parallel(
     device_mesh: DeviceMesh,
     config: dict[str, Any] | None = None,
     ep_fsdp_device_mesh: torch.distributed.DeviceMesh | None = None,
+    clone_tensor_expert_weights: bool = True,
 ) -> list[ExpertShardingSpec]:
-    """Apply expert parallelism to all MoE blocks in the model."""
+    """Apply expert parallelism to all MoE blocks in the model.
+
+    ``clone_tensor_expert_weights=False`` is only intended for the native-FSDP
+    rank-0 broadcast path. That path retains the complete immutable state dict,
+    so temporary local expert parameters may be views of the retained storage
+    until the model is converted to meta and materialized by FSDP.
+    """
     cfg = _merge_config(config)
 
     # EP info comes from the separate ep_fsdp_device_mesh, not from main mesh
@@ -64,7 +71,13 @@ def apply_expert_parallel(
 
     specs = []
     for block_name, block in find_moe_blocks_with_names(model):
-        spec = shard_experts(block, ep_world_size, ep_rank, cfg)
+        spec = shard_experts(
+            block,
+            ep_world_size,
+            ep_rank,
+            cfg,
+            clone_tensor_expert_weights=clone_tensor_expert_weights,
+        )
         patch_forward(block, ep_group, ep_world_size, cfg, block_name)
         specs.append(spec)
 
@@ -105,6 +118,8 @@ def shard_experts(
     ep_world_size: int,
     ep_rank: int,
     cfg: ExpertParallelConfig,
+    *,
+    clone_tensor_expert_weights: bool = True,
 ) -> ExpertShardingSpec:
     """Shard experts in a MoE block across EP ranks.
 
@@ -113,6 +128,9 @@ def shard_experts(
         ep_world_size: The world size for expert parallelism.
         ep_rank: The current rank in the EP group.
         cfg: Expert parallel configuration.
+        clone_tensor_expert_weights: Clone local expert slices for long-lived
+            training storage. The memory-efficient native-FSDP bootstrap may
+            disable this because it retains the complete immutable source.
 
     Returns an ExpertShardingSpec describing the sharding.
     """
@@ -130,7 +148,12 @@ def shard_experts(
         block.experts = local_experts
         is_tensor_experts = False
     else:
-        _shard_tensor_experts(block.experts, local_start, local_end)
+        _shard_tensor_experts(
+            block.experts,
+            local_start,
+            local_end,
+            clone=clone_tensor_expert_weights,
+        )
         is_tensor_experts = True
 
     block._ep_num_experts = num_experts
@@ -430,9 +453,16 @@ def _is_moe_experts(experts: Any) -> bool:
     return False
 
 
-def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
-    experts.gate_up_proj = nn.Parameter(experts.gate_up_proj.data[start:end].clone())
-    experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
+def _shard_tensor_experts(experts: nn.Module, start: int, end: int, *, clone: bool = True) -> None:
+
+    def _slice_parameter(parameter: nn.Parameter) -> nn.Parameter:
+        local_tensor = parameter.data[start:end]
+        if clone:
+            local_tensor = local_tensor.clone()
+        return nn.Parameter(local_tensor, requires_grad=parameter.requires_grad)
+
+    experts.gate_up_proj = _slice_parameter(experts.gate_up_proj)
+    experts.down_proj = _slice_parameter(experts.down_proj)
     if hasattr(experts, 'num_experts'):
         experts.num_experts = end - start
 
@@ -441,9 +471,9 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
         if not isinstance(target_param_wrapper, TargetParameterLoraWrapper):
             continue
         for tenant_name, tenant_tensor in target_param_wrapper.lora_A.items():
-            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+            target_param_wrapper.lora_A[tenant_name] = _slice_parameter(tenant_tensor)
         for tenant_name, tenant_tensor in target_param_wrapper.lora_B.items():
-            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+            target_param_wrapper.lora_B[tenant_name] = _slice_parameter(tenant_tensor)
 
 
 def _run_local_experts(

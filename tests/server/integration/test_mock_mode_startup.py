@@ -240,6 +240,8 @@ def _exercise_twinkle_clients(base: str) -> None:
     assert fwd.result is not None
     fwd_only = model.forward_only(inputs)
     assert fwd_only.result is not None
+    generated = model.generate(inputs, generation_config={'max_new_tokens': 3})
+    assert generated.result[0].text == 'mock completion'
     fwd_bwd = model.forward_backward(inputs)
     assert fwd_bwd.result is not None
 

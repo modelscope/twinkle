@@ -29,6 +29,7 @@ _REQUIRED_METHODS = (
     'tinker_calculate_metric',
     'tinker_load',
     'forward_only',
+    'generate',
     'forward_backward',
     'forward',
     'calculate_loss',
@@ -86,6 +87,16 @@ def test_forward_only_deterministic_and_shaped(seq_lens: list, seed: int) -> Non
     for record, n in zip(out_a, seq_lens):
         assert len(record['logprobs']) == n
         assert len(record['elementwise_loss']) == n
+
+
+def test_generate_returns_json_safe_completion() -> None:
+    model = TwinkleCompatMockModel('mid')
+    assert model.generate(inputs=[{'input_ids': [10, 11]}]) == [{
+        'prompt_token_ids': [10, 11],
+        'tokens': [1, 2, 3],
+        'text': 'mock completion',
+        'stop_reason': 'length',
+    }]
 
 
 @settings(max_examples=100)

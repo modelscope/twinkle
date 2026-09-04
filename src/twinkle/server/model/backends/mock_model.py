@@ -90,6 +90,16 @@ class TwinkleCompatMockModel:
     def forward_only(self, *, inputs: Any, **kwargs: Any) -> list[dict[str, Any]]:
         return self._build_forward_result(inputs, kwargs.get('adapter_name'))
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def generate(self, *, inputs: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        generated = [1, 2, 3]
+        return [{
+            'prompt_token_ids': list(item.get('input_ids', [])),
+            'tokens': generated,
+            'text': 'mock completion',
+            'stop_reason': 'length',
+        } for item in (inputs if isinstance(inputs, list) else [inputs])]
+
     @remote_function()
     def forward_backward(self, *, inputs: Any, **kwargs: Any) -> list[Any]:
         loss = float(np.random.default_rng(self._rng_seed).uniform(0.0, 1.0))

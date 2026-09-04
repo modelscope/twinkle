@@ -217,6 +217,7 @@ class ResourceManager:
                         local_device_groups.append(
                             dict(
                                 gpu_rank=gpu_ranks_local,
+                                node_rank=node_rank,
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
@@ -224,7 +225,11 @@ class ResourceManager:
                         node_rank = alloc_rank // nproc_per_node
                         gpu_rank = self.visible_devices[node_rank - self.min_node_idx][alloc_rank % nproc_per_node]
                         local_device_groups.append(
-                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
+                            dict(
+                                gpu_rank=[gpu_rank],
+                                node_rank=node_rank,
+                                placement_group=self.node2pg[node_rank],
+                                ray_address=ray_address))
 
                 self.device_groups[group.name] = local_device_groups
 
@@ -237,9 +242,11 @@ class ResourceManager:
                 ranks = group.ranks
                 local_device_groups = []
                 for _ in range(ranks):
+                    node_rank = self.cpu_node_map[global_cpu_proc_idx][0]
                     local_device_groups.append(
                         dict(
-                            placement_group=self.cpu_placement_groups[self.cpu_node_map[global_cpu_proc_idx][0]],
+                            node_rank=node_rank,
+                            placement_group=self.cpu_placement_groups[node_rank],
                             ray_address=ray_address))
                     global_cpu_proc_idx += 1
                 self.device_groups[group.name] = local_device_groups

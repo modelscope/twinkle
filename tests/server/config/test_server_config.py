@@ -240,6 +240,7 @@ def test_cookbook_examples_load() -> None:
     here = Path(__file__).resolve().parents[3]
     examples = [
         here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config.yaml',
+        here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config_dsv4_0731.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config_4b.yaml',
     ]

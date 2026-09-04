@@ -37,7 +37,13 @@ class TargetParameterRecord:
 
 class TargetParameterLoraWrapper(nn.Module):
 
-    def __init__(self, record: TargetParameterRecord, max_loras: int, max_r: int):
+    def __init__(
+        self,
+        record: TargetParameterRecord,
+        max_loras: int,
+        max_r: int,
+        defer_initial_weights: bool = False,
+    ):
         super().__init__()
         self.record = record
         # Unsharded original target parameter (pre-sharding snapshot)
@@ -53,6 +59,7 @@ class TargetParameterLoraWrapper(nn.Module):
 
         self.max_loras = max_loras
         self.max_r = max_r
+        self.defer_initial_weights = defer_initial_weights
         self.active_adapter: str | None = None
         self.disable_adapters = False
         self.lora_A = nn.ParameterDict()
@@ -90,10 +97,7 @@ class TargetParameterLoraWrapper(nn.Module):
             raise ValueError(
                 f'target parameter {self.record.key} has {parameter.ndim} dimensions; only 2D and 3D are supported')
 
-        # Note: reset_slot requires the tensor to be created on a physical device, not on a meta device.
         device = parameter.device
-        if device.type == 'meta':
-            device = 'cpu'
         for index in range(self.max_loras):
             slot_name = f'lora_{index}'
             self.lora_A[slot_name] = nn.Parameter(
@@ -114,24 +118,68 @@ class TargetParameterLoraWrapper(nn.Module):
                 ))
             self.r[slot_name] = self.max_r
             self.scaling[slot_name] = 1.0
-            self.reset_slot(slot_name)
+            if device.type != 'meta':
+                nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B[slot_name])
+                if not self.defer_initial_weights:
+                    self._initial_lora_A[slot_name] = self.lora_A[slot_name].detach().cpu().clone()
+
+    @staticmethod
+    def _read_parameter(parameter: nn.Parameter) -> torch.Tensor:
+        if hasattr(parameter, 'to_local'):
+            return parameter.to_local()
+        if hasattr(parameter, 'full_tensor'):
+            return parameter.full_tensor()
+        return parameter
+
+    @staticmethod
+    @torch.no_grad()
+    def _write_parameter(parameter: nn.Parameter, value: torch.Tensor) -> None:
+        if hasattr(parameter, 'to_local') and hasattr(parameter, 'device_mesh'):
+            local_parameter = parameter.to_local()
+            if tuple(value.shape) == tuple(local_parameter.shape):
+                local_parameter.copy_(value.to(device=local_parameter.device, dtype=local_parameter.dtype))
+                return
+            if tuple(value.shape) != tuple(parameter.shape):
+                raise ValueError(f'Cannot restore target-parameter LoRA with shape {tuple(value.shape)} to distributed '
+                                 f'parameter with global shape {tuple(parameter.shape)} and local shape '
+                                 f'{tuple(local_parameter.shape)}')
+            from torch.distributed.tensor import distribute_tensor
+            distributed = distribute_tensor(
+                value.to(device=parameter.device, dtype=parameter.dtype),
+                parameter.device_mesh,
+                parameter.placements,
+            )
+            local_parameter.copy_(distributed.to_local())
+            return
+        parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+    def save_initial_weights(self) -> None:
+        for slot_name, parameter in self.lora_A.items():
+            tensor = self._read_parameter(parameter)
+            if tensor.is_meta:
+                raise RuntimeError(f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
+                                   'materialize the model before saving its initial weights.')
+            self._initial_lora_A[slot_name] = tensor.detach().cpu().clone()
 
     def reset_slot(self, slot_name: str) -> None:
-        if slot_name not in self._initial_lora_A:
-            nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))
-            self._initial_lora_A[slot_name] = self.lora_A[slot_name].detach().clone().cpu()
-        else:
-            initial = self._initial_lora_A[slot_name]
-            if hasattr(self.record.module, '_ep_local_start') and hasattr(self.record.module, '_ep_local_end'):
-                start = self.record.module._ep_local_start
-                end = self.record.module._ep_local_end
-                initial = initial[start:end]
-            initial = initial.to(
-                device=self.lora_A[slot_name].device,
-                dtype=self.lora_A[slot_name].dtype,
-            )
-            self.lora_A[slot_name].data.copy_(initial)
-        nn.init.zeros_(self.lora_B[slot_name])
+        if self.lora_A[slot_name].is_meta or self.lora_B[slot_name].is_meta:
+            raise RuntimeError(f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
+                               'materialize the model before resetting it.')
+        with torch.no_grad():
+            if slot_name not in self._initial_lora_A:
+                nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))
+                self._initial_lora_A[slot_name] = self.lora_A[slot_name].detach().clone().cpu()
+            else:
+                initial = self._initial_lora_A[slot_name]
+                if (initial.shape[0] != self.lora_A[slot_name].shape[0]
+                        and hasattr(self.record.module, '_ep_local_start')
+                        and hasattr(self.record.module, '_ep_local_end')):
+                    start = self.record.module._ep_local_start
+                    end = self.record.module._ep_local_end
+                    initial = initial[start:end]
+                self._write_parameter(self.lora_A[slot_name], initial)
+            self._read_parameter(self.lora_B[slot_name]).zero_()
 
     def configure_slot(self, slot_name: str, config: LoraConfig) -> None:
         if slot_name not in self.lora_A:
@@ -179,7 +227,7 @@ class TargetParameterLoraWrapper(nn.Module):
         return torch.einsum('e o r, e r i -> e i o', weight_B, weight_A) * self.scaling[slot_name]
 
     @contextmanager
-    def activate(self, slot_name: str | None, disable_lora: bool = False):
+    def activate(self, slot_name: str | None, disable_lora: bool = False, cache: bool = True):
         if disable_lora or slot_name is None or slot_name not in self.lora_A:
             yield
             return
@@ -198,7 +246,10 @@ class TargetParameterLoraWrapper(nn.Module):
             )
             module.parametrizations[param_name].original.requires_grad_(requires_grad_before)
         try:
-            with nn.utils.parametrize.cached():
+            if cache:
+                with nn.utils.parametrize.cached():
+                    yield
+            else:
                 yield
         finally:
             if not already_parametrized:
@@ -280,13 +331,18 @@ class TargetParameterLoraWrapper(nn.Module):
 
 class TargetParameterLoraManager:
 
-    def __init__(self, max_loras: int, max_r: int):
+    def __init__(self, max_loras: int, max_r: int, defer_initial_weights: bool = False):
         self.max_loras = max_loras
         self.max_r = max_r
+        self.defer_initial_weights = defer_initial_weights
         self.wrappers: list[TargetParameterLoraWrapper] = []
         self.tenant_to_slot: dict[str, str] = {}
         self.tenant_configs: dict[str, LoraConfig] = {}
         self._target_parameters: tuple[str, ...] | None = None
+
+    @property
+    def patched_target_parameters(self) -> tuple[str, ...] | None:
+        return self._target_parameters
 
     def patch(self, model: nn.Module, target_parameters: Iterable[str]) -> None:
         target_parameters = tuple(target_parameters)
@@ -312,7 +368,12 @@ class TargetParameterLoraManager:
             raise ValueError(f'target_parameters={target_parameters} were set but no parameter was matched')
 
         for record in records:
-            wrapper = TargetParameterLoraWrapper(record, max_loras=self.max_loras, max_r=self.max_r)
+            wrapper = TargetParameterLoraWrapper(
+                record,
+                max_loras=self.max_loras,
+                max_r=self.max_r,
+                defer_initial_weights=self.defer_initial_weights,
+            )
             record.module.add_module(f'_twinkle_lora_{record.parameter_name}', wrapper)
             self.wrappers.append(wrapper)
         self._assign_peft_key_prefixes()
@@ -341,19 +402,24 @@ class TargetParameterLoraManager:
             wrapper.configure_slot(slot_name, config)
 
     def release(self, tenant_adapter_name: str) -> None:
-        slot_name = self.tenant_to_slot.pop(tenant_adapter_name, None)
-        self.tenant_configs.pop(tenant_adapter_name, None)
+        slot_name = self.tenant_to_slot.get(tenant_adapter_name)
         if slot_name is None:
             return
         for wrapper in self.wrappers:
             wrapper.reset_slot(slot_name)
+        self.tenant_to_slot.pop(tenant_adapter_name, None)
+        self.tenant_configs.pop(tenant_adapter_name, None)
+
+    def save_initial_weights(self) -> None:
+        for wrapper in self.wrappers:
+            wrapper.save_initial_weights()
 
     @contextmanager
-    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
+    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False, cache: bool = True):
         slot_name = self.tenant_to_slot.get(tenant_adapter_name)
         with ExitStack() as stack:
             for wrapper in self.wrappers:
-                stack.enter_context(wrapper.activate(slot_name, disable_lora=disable_lora))
+                stack.enter_context(wrapper.activate(slot_name, disable_lora=disable_lora, cache=cache))
             yield
 
     def parameters_for_tenant(self, tenant_adapter_name: str) -> list[nn.Parameter]:

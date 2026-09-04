@@ -7,6 +7,36 @@ from .resource_manager import ResourceManager
 
 T = TypeVar('T')
 
+# Ray injects these process-local values when it launches each worker.  They
+# must never be copied from a parent actor into a child runtime_env: a child
+# scheduled on another node would otherwise monitor the parent's raylet PID
+# and immediately exit with "the local raylet failed".
+_RAY_INTERNAL_ENV_VARS = frozenset({
+    'RAY_JOB_ID',
+    'RAY_RAYLET_PID',
+    'RAY_OVERRIDE_NODE_ID_FOR_TESTING',
+})
+
+
+def _copy_worker_env() -> Dict[str, str]:
+    """Copy inherited environment without Ray's per-process internal flags."""
+    return {key: value for key, value in os.environ.items() if key not in _RAY_INTERNAL_ENV_VARS}
+
+
+def _get_node_local_topology(placements: List[Dict[str, Any]]) -> List[Tuple[int, List[int]]]:
+    """Return each worker's node-local index and distributed ranks on that node."""
+    node_to_ranks: Dict[int, List[int]] = {}
+    for rank, placement in enumerate(placements):
+        node_rank = int(placement.get('node_rank', 0))
+        node_to_ranks.setdefault(node_rank, []).append(rank)
+
+    topology = []
+    for rank, placement in enumerate(placements):
+        node_rank = int(placement.get('node_rank', 0))
+        node_ranks = node_to_ranks[node_rank]
+        topology.append((node_ranks.index(rank), node_ranks))
+    return topology
+
 
 class RayHelper:
 
@@ -304,6 +334,7 @@ class RayHelper:
             ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
 
         device_type_upper = (device_config.device_type or '').upper()
+        node_local_topology = _get_node_local_topology(placement_groups)
         if device_type_upper != 'CPU':
             world_size = len(ranks)
             device_type = Platform.get_platform(device_type_upper).__name__
@@ -311,7 +342,7 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(pg_idx)
-                env_vars = os.environ.copy()
+                env_vars = _copy_worker_env()
                 env_vars.update({
                     'WORLD_SIZE':
                     str(world_size),
@@ -319,6 +350,17 @@ class RayHelper:
                     str(pg_idx),
                     'LOCAL_RANK':
                     str(0),
+                    # Each Ray actor sees only its own accelerator, so LOCAL_RANK
+                    # must remain 0 as the device index. Keep the node-local
+                    # distributed topology in separate Twinkle variables.
+                    'TWINKLE_NODE_LOCAL_RANK':
+                    str(node_local_topology[pg_idx][0]),
+                    'TWINKLE_NODE_LOCAL_WORLD_SIZE':
+                    str(len(node_local_topology[pg_idx][1])),
+                    'TWINKLE_NODE_RANKS':
+                    ','.join(str(rank) for rank in node_local_topology[pg_idx][1]),
+                    'NODE_RANK':
+                    str(deploy_pg.get('node_rank', 0)),
                     'CLUSTER_NAME':
                     cluster_name,
                     'WORKER_NAME':
@@ -368,11 +410,15 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(rank)
-                env_vars = os.environ.copy()
+                env_vars = _copy_worker_env()
                 env_vars.update({
                     'WORLD_SIZE': str(world_size),
                     'RANK': str(rank),
                     'LOCAL_RANK': str(0),
+                    'TWINKLE_NODE_LOCAL_RANK': str(node_local_topology[rank][0]),
+                    'TWINKLE_NODE_LOCAL_WORLD_SIZE': str(len(node_local_topology[rank][1])),
+                    'TWINKLE_NODE_RANKS': ','.join(str(item) for item in node_local_topology[rank][1]),
+                    'NODE_RANK': str(deploy_pg.get('node_rank', 0)),
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',

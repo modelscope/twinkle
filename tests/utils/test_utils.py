@@ -18,6 +18,7 @@ from twinkle.utils.seed import stable_seed as _stable_seed
 from twinkle.utils.torch_utils import (
     clone_state_dict_to_cpu,
     selective_log_softmax,
+    snapshot_state_dict_to_cpu,
     to_device,
 )
 from twinkle.utils.network import find_free_port
@@ -81,6 +82,35 @@ class TestCloneStateDictToCpu:
         cloned = clone_state_dict_to_cpu(state)
         assert cloned['step'] == 100
         assert cloned['name'] == 'model'
+
+
+class TestSnapshotStateDictToCpu:
+
+    def test_reuses_cpu_tensor_storage(self):
+        state = {'w': torch.randn(3, 4), 'b': torch.randn(4)}
+        snapshot = snapshot_state_dict_to_cpu(state)
+
+        assert snapshot['w'].device == torch.device('cpu')
+        assert snapshot['w'].data_ptr() == state['w'].data_ptr()
+        assert torch.equal(snapshot['w'], state['w'])
+
+    def test_snapshot_survives_module_meta_conversion(self):
+        model = torch.nn.Linear(4, 3)
+        expected = model.weight.detach().clone()
+        snapshot = snapshot_state_dict_to_cpu(model.state_dict())
+
+        model.to(torch.device('meta'))
+
+        assert model.weight.is_meta
+        assert snapshot['weight'].device == torch.device('cpu')
+        assert torch.equal(snapshot['weight'], expected)
+
+    def test_preserves_non_tensors(self):
+        state = {'step': 100, 'name': 'model'}
+        snapshot = snapshot_state_dict_to_cpu(state)
+
+        assert snapshot['step'] == 100
+        assert snapshot['name'] == 'model'
 
 
 class TestPadSequenceToLength:

@@ -4,7 +4,7 @@ Pydantic request/response models for twinkle model management endpoints.
 
 These models are used by both the server-side handler and the twinkle client.
 """
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -25,6 +25,15 @@ class ForwardRequest(BaseModel):
 class ForwardOnlyRequest(BaseModel):
     inputs: Any
     adapter_name: Optional[str] = None
+
+    class Config:
+        extra = 'allow'
+
+
+class GenerateRequest(BaseModel):
+    inputs: Any
+    adapter_name: Optional[str] = None
+    generation_config: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         extra = 'allow'
@@ -200,6 +209,18 @@ class ForwardResponse(BaseModel):
 class ForwardBackwardResponse(BaseModel):
     """Response for /forward_backward endpoint (returns ModelOutput)."""
     result: Any
+
+
+class GeneratedSequence(BaseModel):
+    """One completion returned by the Transformers training model."""
+    prompt_token_ids: List[int]
+    tokens: List[int]
+    text: str
+    stop_reason: str
+
+
+class GenerateResponse(BaseModel):
+    result: List[GeneratedSequence]
 
 
 class CalculateLossResponse(BaseModel):

@@ -32,6 +32,28 @@ def clone_state_dict_to_cpu(state_dict: Mapping[str, Any]) -> dict:
     return cloned
 
 
+def snapshot_state_dict_to_cpu(state_dict: Mapping[str, Any]) -> dict:
+    """Keep a detached CPU snapshot without duplicating CPU tensor storage.
+
+    ``state_dict()`` returns detached tensor views of module parameters and
+    persistent buffers.  Keeping those views alive is enough to retain their
+    storage after the module replaces the corresponding parameters (for
+    example, while EP shards experts or while FSDP moves the module to meta).
+
+    CPU tensors are therefore retained by reference instead of cloned.  A
+    non-CPU tensor still has to be copied to CPU.  Callers must treat the
+    returned tensors as immutable until the snapshot is released.
+    """
+    snapshot = {}
+    for key, value in state_dict.items():
+        if not hasattr(value, 'detach'):
+            snapshot[key] = value
+            continue
+        value = value.detach()
+        snapshot[key] = value if value.device.type == 'cpu' else value.cpu()
+    return snapshot
+
+
 def pad_sequence_to_length(
     tensor: 'torch.Tensor',
     max_seq_len: int,

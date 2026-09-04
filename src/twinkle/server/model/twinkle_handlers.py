@@ -152,6 +152,39 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 task_type='forward_only',
             ))
 
+    @app.post('/twinkle/generate', response_model=types.GenerateResponse)
+    async def generate(
+            request: Request,
+            body: types.GenerateRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.GenerateResponse:
+        """Generate directly with the Transformers model deployment."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            extra_kwargs = body.model_extra or {}
+            inputs = _parse_inputs(body.inputs)
+            ret = self.model.generate(
+                inputs=inputs,
+                adapter_name=adapter_name,
+                generation_config=body.generation_config,
+                **extra_kwargs,
+            )
+            return {'result': ret}
+
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='generate',
+            ))
+
     @app.post('/twinkle/calculate_loss', response_model=types.CalculateLossResponse)
     async def calculate_loss(
             request: Request,

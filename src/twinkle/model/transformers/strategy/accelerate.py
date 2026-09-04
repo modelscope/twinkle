@@ -231,6 +231,11 @@ class AccelerateStrategy:
             del local
         return state_dict
 
+    def gather_adapter_state_dict(self, model, adapter_state: dict, adapter_name: str) -> dict:
+        """Move an already filtered Multi-LoRA state dict to CPU."""
+        from twinkle.utils import torch_util
+        return {name: torch_util.to_local_tensor(param).cpu() for name, param in adapter_state.items()}
+
 
 def _is_lora_state_key(name: str) -> bool:
     return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name

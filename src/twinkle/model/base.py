@@ -30,6 +30,10 @@ class TwinkleModel(ABC):
     def forward_only(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
         ...
 
+    def generate(self, *, inputs: Dict[str, Any], **kwargs) -> Any:
+        """Generate completions with the training model when the backend supports it."""
+        raise NotImplementedError(f'{type(self).__name__} does not implement generate()')
+
     @abstractmethod
     def calculate_loss(self, **kwargs) -> float:
         ...

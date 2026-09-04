@@ -58,7 +58,15 @@ class ModelArgs(_ArgsBase):
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
+    max_r: int | None = None
     max_length: int | None = None
+    mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] | None = None
+    strategy: Literal['accelerate', 'native_fsdp'] | None = None
+    ddp_config: dict[str, Any] | None = None
+    fsdp_config: dict[str, Any] | None = None
+    grad_scaler_config: dict[str, Any] | None = None
+    memory_efficient_init: bool | None = None
+    target_modules: str | list[str] | None = None
 
 
 class SamplerArgs(_ArgsBase):

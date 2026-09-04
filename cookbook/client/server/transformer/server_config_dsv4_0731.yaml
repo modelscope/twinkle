@@ -1,0 +1,120 @@
+# DeepSeek-V4-Flash-0731 client/server Multi-LoRA SFT on one 2-GPU node.
+# Both GPUs are assigned to the Transformers training model. A vLLM sampler
+# is intentionally omitted because it would compete with training for GPUs.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+telemetry:
+  enabled: false
+  otlp_endpoint: http://localhost:4317
+
+persistence:
+  mode: file
+  file_path: /tmp/twinkle_dsv4_0731_state.json
+
+applications:
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 2
+      # This public name is used by the client and HTTP routes. The launcher
+      # maps it to the local model_id configured on the model deployment.
+      supported_models:
+        - deepseek-v4-0731-local
+    deployments:
+      - name: TinkerCompatServer
+        max_ongoing_requests: 50
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 32
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"
+
+  - name: models-deepseek-v4-0731-local
+    route_prefix: /api/v1/model/deepseek-v4-0731-local
+    import_path: model
+    args:
+      backend: transformers
+      model_id: /nas/disk1/random-deepseek-v4-4b
+      nproc_per_node: 2
+      max_loras: 2
+      max_r: 8
+      max_length: 8192
+      mixed_precision: bf16
+      strategy: native_fsdp
+      memory_efficient_init: true
+      target_modules: all-linear
+      fsdp_config:
+        reshard_after_forward: true
+        expert_parallel:
+          enabled: true
+          ep_size: 2
+          router_dtype: fp32
+          keep_router_logits: false
+      device_group:
+        name: model
+        ranks: 2
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        fsdp_size: 2
+        dp_size: 1
+        ep_size: 2
+      queue_config:
+        rps_limit: 20
+        tps_limit: 100000
+        max_input_tokens: 8192
+        queue_timeout: 3600
+        execution_timeout: 3600
+      adapter_config:
+        adapter_timeout: 3600
+        adapter_max_lifetime: 86400
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 8
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
+
+  # Dataset/tokenization stays on CPU and reads the local JSONL path from the
+  # machine running the server.
+  - name: processor
+    route_prefix: /api/v1/processor
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 2
+      device_group:
+        name: processor
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 2
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 32
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"

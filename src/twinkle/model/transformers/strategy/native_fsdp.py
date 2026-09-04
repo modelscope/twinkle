@@ -2,23 +2,34 @@
 import os
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
-from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
-from twinkle.utils.torch_utils import clone_state_dict_to_cpu
+from twinkle.utils import DeviceMesh, Platform, torch_util
+from twinkle.utils.torch_utils import snapshot_state_dict_to_cpu
 from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
 
-logger = get_logger()
-
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
 PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
+TWINKLE_NODE_LOCAL_RANK = 'TWINKLE_NODE_LOCAL_RANK'
+TWINKLE_NODE_LOCAL_WORLD_SIZE = 'TWINKLE_NODE_LOCAL_WORLD_SIZE'
+TWINKLE_NODE_RANKS = 'TWINKLE_NODE_RANKS'
+
+
+def _get_node_local_rank() -> int:
+    """Return process topology rank without changing the actor-local device index."""
+    return int(os.environ.get(TWINKLE_NODE_LOCAL_RANK, Platform.get_local_rank()))
+
+
+def _get_node_local_world_size() -> int:
+    return int(os.environ.get(TWINKLE_NODE_LOCAL_WORLD_SIZE, Platform.get_local_world_size()))
 
 
 class NativeFSDPStrategy:
@@ -49,17 +60,34 @@ class NativeFSDPStrategy:
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
 
+    def is_node_local_source_rank(self) -> bool:
+        local_rank = _get_node_local_rank()
+        if local_rank < 0:
+            raise RuntimeError('Native FSDP memory_efficient_init requires node-local rank topology.')
+        return local_rank == 0
+
     def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
         if self._pre_ep_state_captured:
             return
         if not (enable_ep and self.use_rank0_pretrained_broadcast()):
             return
-        local_rank = Platform.get_local_rank()
+        local_rank = _get_node_local_rank()
         if local_rank < 0:
-            raise RuntimeError('Native FSDP node-local pre-EP state capture requires LOCAL_RANK.')
+            raise RuntimeError('Native FSDP node-local pre-EP state capture requires node-local rank topology.')
         is_source_rank = dist.is_available() and dist.is_initialized() and local_rank == 0
-        self.set_rank0_pre_ep_full_state_dict(clone_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
+        # Do not clone the complete checkpoint here. The source-rank model
+        # already owns one full CPU copy, and state_dict() tensors keep that
+        # storage alive when EP replaces expert parameters and FSDP later moves
+        # the model skeleton to meta. Cloning this state used to require a
+        # second full-model-sized allocation on every node-local source rank.
+        # The retained tensors are immutable until wrap_model() finishes
+        # broadcasting the rank-local shards.
+        self.set_rank0_pre_ep_full_state_dict(snapshot_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
         self._pre_ep_state_captured = True
+
+    def can_reuse_pre_ep_tensor_storage(self) -> bool:
+        """Whether EP may use temporary views into the retained full state."""
+        return self._pre_ep_state_captured and self.use_rank0_pretrained_broadcast()
 
     def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
         if not enable_ep:
@@ -113,9 +141,15 @@ class NativeFSDPStrategy:
         return ep_mesh.to_torch_device_mesh()
 
     def wrap_model(self, model, optimizer=None):
-        if self.device_mesh is None:
+        fsdp_mesh = _build_fsdp_mesh(self.device_mesh) if self.device_mesh is not None else None
+        if fsdp_mesh is None:
+            # FSDP normally materializes/moves parameters onto the mesh device
+            # while wrapping.  A singleton (or absent) mesh skips FSDP, so do
+            # the equivalent device placement explicitly.  Without this, a
+            # model loaded by ``from_pretrained`` remains on CPU while the
+            # input processor creates tensors on the actor's CUDA/NPU device.
+            model = model.to(torch.device(Platform.get_local_device()))
             return model, optimizer
-        fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
@@ -130,17 +164,27 @@ class NativeFSDPStrategy:
             adapter_source_sd = {}
             adapter_full_sd = {}
             if use_meta:
-                local_rank = Platform.get_local_rank()
+                local_rank = _get_node_local_rank()
                 if local_rank < 0:
-                    raise RuntimeError('Native FSDP node-local state loading requires LOCAL_RANK.')
+                    raise RuntimeError('Native FSDP node-local state loading requires node-local rank topology.')
                 is_source_rank = local_rank == 0
                 if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
                     original_sd = self._rank0_pre_ep_full_state_dict if is_source_rank else {}
                 else:
                     original_sd = model.state_dict() if is_source_rank else {}
-                adapter_source_sd = _collect_adapter_source_state(model.state_dict())
-                adapter_full_sd = (
-                    self._adapter_full_state_dict if is_source_rank and self._adapter_full_state_dict else {})
+                # These tensors are consumed before any training step and only
+                # need to outlive model.to(meta), so detached CPU views are
+                # sufficient here as well. Avoid duplicating all preallocated
+                # Multi-LoRA slots during initialization.
+                adapter_source_sd = _collect_adapter_source_state(model.state_dict(), clone=False)
+                if is_source_rank:
+                    # Multi-LoRA target-parameter slots are installed before EP
+                    # and then sharded with their experts.  Preserve their full
+                    # pre-EP tensors so every EP rank receives its own expert
+                    # range instead of a copy of the source rank's local range.
+                    adapter_full_sd = _collect_adapter_source_state(original_sd or {}, clone=False)
+                    if self._adapter_full_state_dict:
+                        adapter_full_sd.update(self._adapter_full_state_dict)
                 saved_buffers = _get_non_persistent_buffers(model) if is_source_rank else {}
                 if is_source_rank:
                     model = model.to(torch.device('meta'))
@@ -208,18 +252,30 @@ class NativeFSDPStrategy:
                 device_type = self.device_mesh.device_type or 'cuda'
                 expert_shard_specs = _collect_ep_expert_shard_specs(model) if ep_enabled else {}
                 rank_to_ep_rank = _build_rank_to_ep_rank(self.ep_fsdp_device_mesh) if ep_enabled else {}
-                _broadcast_sharded_state_dict(
-                    model,
-                    original_sd or {},
-                    device_type=device_type,
-                    expert_shard_specs=expert_shard_specs,
-                    rank_to_ep_rank=rank_to_ep_rank,
-                    adapter_source_sd=adapter_source_sd,
-                    adapter_full_sd=adapter_full_sd,
-                )
-                self._adapter_full_state_dict = None
+                try:
+                    _broadcast_sharded_state_dict(
+                        model,
+                        original_sd or {},
+                        device_type=device_type,
+                        expert_shard_specs=expert_shard_specs,
+                        rank_to_ep_rank=rank_to_ep_rank,
+                        adapter_source_sd=adapter_source_sd,
+                        adapter_full_sd=adapter_full_sd,
+                    )
+                finally:
+                    # The materialized FSDP/EP shards now own their device
+                    # storage. Release all full CPU checkpoint references even
+                    # when loading fails, otherwise a long-lived Ray actor can
+                    # retain an entire model-sized snapshot.
+                    self._rank0_pre_ep_full_state_dict = None
+                    self._adapter_full_state_dict = None
+                    original_sd = None
+                    adapter_source_sd.clear()
+                    adapter_full_sd.clear()
                 target_device = torch.device(device_type)
                 _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
+                if saved_buffers is not None:
+                    saved_buffers.clear()
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
@@ -233,6 +289,28 @@ class NativeFSDPStrategy:
             optimizer = _rebind_optimizer(optimizer, model)
 
         return model, optimizer
+
+    @contextmanager
+    def generation_context(self, model):
+        """Materialize root FSDP parameters while PEFT delegates generation.
+
+        ``PeftModel.generate()`` calls ``get_base_model().generate()`` directly,
+        bypassing the outer PEFT module's forward hooks.  When that outer module
+        is an FSDP2 root, its directly managed parameters (for example token
+        embeddings and ``lm_head``) would otherwise remain DTensors while the
+        generation inputs are regular tensors.
+        """
+        unshard = getattr(model, 'unshard', None)
+        reshard = getattr(model, 'reshard', None)
+        if not callable(unshard) or not callable(reshard):
+            yield
+            return
+
+        unshard()
+        try:
+            yield
+        finally:
+            reshard()
 
     def _prepare_optimizer_state_dict_options(self, *, for_load: bool):
         from torch.distributed.checkpoint.state_dict import StateDictOptions
@@ -327,16 +405,16 @@ class NativeFSDPStrategy:
             ep_group = ep_fsdp_mesh['ep'].get_group()
             ep_world_size = ep_fsdp_mesh['ep'].size()
 
-        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        expert_specs = _collect_ep_expert_shard_specs(unwrapped) if ep_world_size > 1 else {}
 
         for name, param in unwrapped.named_parameters():
             local_full = torch_util.to_local_tensor(param)
 
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+            if name in expert_specs and ep_world_size > 1 and ep_group is not None:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                local_full = _concat_ep_expert_shards(name, gathered, expert_specs[name])
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
@@ -375,7 +453,7 @@ class NativeFSDPStrategy:
             ep_group = ep_fsdp_mesh['ep'].get_group()
             ep_world_size = ep_fsdp_mesh['ep'].size()
 
-        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        expert_specs = _collect_ep_expert_shard_specs(unwrapped) if ep_world_size > 1 else {}
         adapter_suffix = f'.{adapter_name}.'
 
         for name, param in unwrapped.named_parameters():
@@ -383,17 +461,52 @@ class NativeFSDPStrategy:
                 continue
 
             local_full = torch_util.to_local_tensor(param)
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+            if name in expert_specs and ep_world_size > 1 and ep_group is not None:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                local_full = _concat_ep_expert_shards(name, gathered, expert_specs[name])
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
                 state_dict[name] = local_full.cpu()
                 del local_full
 
+        return state_dict
+
+    def gather_adapter_state_dict(self, model, adapter_state: dict, adapter_name: str) -> dict:
+        """Gather a tenant-filtered Multi-LoRA state dict across the EP group."""
+        unwrapped = self.unwrap_model(model)
+        ep_mesh = self.ep_fsdp_device_mesh
+        if ep_mesh is None or ep_mesh['ep'].size() <= 1:
+            return {name: torch_util.to_local_tensor(param).cpu() for name, param in adapter_state.items()}
+
+        ep_group = ep_mesh['ep'].get_group()
+        slot_suffix = f'.{adapter_name}.'
+        normalized_specs = {
+            _strip_peft_base_prefix(name.replace(slot_suffix, '.')): spec
+            for name, spec in _collect_ep_expert_shard_specs(unwrapped).items()
+        }
+        expert_owner_specs = {
+            name.split('.experts.', 1)[0] + '.experts.': spec
+            for name, spec in normalized_specs.items() if '.experts.' in name
+        }
+        state_dict = {}
+        for name, param in adapter_state.items():
+            local = torch_util.to_local_tensor(param)
+            canonical_name = _strip_peft_base_prefix(name)
+            spec = normalized_specs.get(canonical_name)
+            if spec is None and '.experts.' in canonical_name:
+                owner = canonical_name.split('.experts.', 1)[0] + '.experts.'
+                spec = expert_owner_specs.get(owner)
+            if spec is not None:
+                local = local.contiguous().to(Platform.get_local_device())
+                gathered = [torch.empty_like(local) for _ in range(ep_mesh['ep'].size())]
+                dist.all_gather(gathered, local, group=ep_group)
+                local = _concat_ep_expert_shards(name, gathered, spec)
+                del gathered
+            state_dict[name] = local.cpu()
+            del local
         return state_dict
 
 
@@ -412,17 +525,38 @@ def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
     return candidate_names & actual_param_names
 
 
-def _ep_expert_state_dict_gather_dim(name: str) -> int:
+def _ep_expert_state_dict_gather_dim(
+    name: str,
+    shape: Optional[tuple] = None,
+    experts_per_rank: Optional[int] = None,
+) -> int:
     # PEFT ParamWrapper keeps expert LoRA tensors flattened instead of storing
     # them as [num_experts, ...]: lora_A is [r * num_experts, in] and lora_B is
     # [out, r * num_experts]. EP therefore owns a contiguous expert block on
     # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
     # parallelism, so the forward pass does not need an EP all-reduce.
+    # Current target-parameter/3D PEFT tensors keep experts explicitly on dim 0:
+    # A=[local_experts, r, in], B=[local_experts, out, r]. Detect this before
+    # applying the legacy flattened-PEFT convention below.
+    if shape and len(shape) == 3:
+        return 0
     if '_twinkle_lora_' in name:
         return 0
     if 'lora_B' in name:
         return 1
     return 0
+
+
+def _concat_ep_expert_shards(name: str, shards: List[torch.Tensor], spec: Dict[str, int]) -> torch.Tensor:
+    if not shards:
+        raise ValueError(f'No EP shards collected for {name}.')
+    local_shape = tuple(shards[0].shape)
+    gather_dim = _ep_expert_state_dict_gather_dim(name, local_shape, spec['experts_per_rank'])
+    result = torch.cat(shards, dim=gather_dim)
+    if local_shape[0] == spec['experts_per_rank'] and result.shape[0] != spec['num_experts']:
+        raise RuntimeError(f"EP adapter parameter '{name}' reconstructed {result.shape[0]} experts; "
+                           f"expected {spec['num_experts']}.")
+    return result
 
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
@@ -594,19 +728,28 @@ def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
     """Return local-rank topology for node-local state-dict fanout."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = Platform.get_local_rank()
-    if 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
-        raise RuntimeError('Native FSDP node-local state loading requires LOCAL_WORLD_SIZE or LOCAL_SIZE.')
-    local_world_size = Platform.get_local_world_size()
-    if local_rank < 0 or local_world_size <= 0 or world_size % local_world_size != 0:
+    local_rank = _get_node_local_rank()
+    has_twinkle_topology = TWINKLE_NODE_LOCAL_WORLD_SIZE in os.environ
+    if not has_twinkle_topology and 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
+        raise RuntimeError('Native FSDP node-local state loading requires Twinkle Ray worker topology, '
+                           'LOCAL_WORLD_SIZE, or LOCAL_SIZE.')
+    local_world_size = _get_node_local_world_size()
+    raw_node_ranks = os.environ.get(TWINKLE_NODE_RANKS)
+    if (local_rank < 0 or local_world_size <= 0 or (not raw_node_ranks and world_size % local_world_size != 0)):
         raise RuntimeError(f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
                            f'local_rank={local_rank}, local_world_size={local_world_size}.')
-    node_start = rank - local_rank
-    node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
+    if raw_node_ranks:
+        node_ranks = [int(item) for item in raw_node_ranks.split(',') if item]
+    else:
+        node_start = rank - local_rank
+        node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
     if rank not in node_ranks or len(node_ranks) != local_world_size:
         raise RuntimeError(f'Invalid local rank group: rank={rank}, local_rank={local_rank}, '
                            f'local_world_size={local_world_size}, node_ranks={node_ranks}.')
-    return rank, world_size, node_start, node_ranks
+    if node_ranks[local_rank] != rank:
+        raise RuntimeError(f'Invalid node-local rank ordering: rank={rank}, local_rank={local_rank}, '
+                           f'node_ranks={node_ranks}.')
+    return rank, world_size, node_ranks[0], node_ranks
 
 
 def _find_experts_in_layer(layer_mod: nn.Module, experts_map: Dict[str, nn.Module]) -> Optional[nn.Module]:
@@ -755,14 +898,15 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
                    f'Tried source keys: {", ".join(candidates)}.')
 
 
-def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+def _collect_adapter_source_state(state_dict: Mapping[str, Any], *, clone: bool = True) -> Dict[str, Any]:
     adapter_state = {}
     for name, tensor in state_dict.items():
         if not _is_lora_state_key(name) or not hasattr(tensor, 'detach'):
             continue
         if getattr(tensor, 'is_meta', False):
             continue
-        adapter_state[name] = tensor.detach().cpu().clone()
+        tensor = tensor.detach().cpu()
+        adapter_state[name] = tensor.clone() if clone else tensor
     return adapter_state
 
 
@@ -803,7 +947,7 @@ def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_
 
     if not matched:
         return value
-    shard_dim = _ep_expert_state_dict_gather_dim(model_key)
+    shard_dim = _ep_expert_state_dict_gather_dim(model_key, tuple(value.shape))
     chunk = value.size(shard_dim) // ep_world_size
     return value.narrow(shard_dim, ep_rank * chunk, chunk).contiguous()
 
@@ -955,7 +1099,9 @@ def _broadcast_sharded_state_dict(
         local_shape = tuple(sharded_param.size())
         _, source_dtype = adapter_metadata[param_name]
         local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
-        shard_dim = _ep_expert_state_dict_gather_dim(param_name)
+        spec = expert_shard_specs.get(param_name)
+        experts_per_rank = spec['experts_per_rank'] if spec is not None else None
+        shard_dim = _ep_expert_state_dict_gather_dim(param_name, local_shape, experts_per_rank)
         local_dim = local_shape[shard_dim]
         local_tensor = _scatter_ep_tensor_from_source(
             full_tensor,

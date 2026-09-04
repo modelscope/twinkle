@@ -190,7 +190,7 @@ def preprocess(
     expert_mask: torch.Tensor,
     num_experts: int,
     ep_group: dist.ProcessGroup,
-) -> torch.Tensor:
+) -> tuple[list[int], list[int], torch.Tensor, torch.Tensor]:
     ep_size = ep_group.size()
     num_local_experts = num_experts // ep_size
     rank = dist.get_rank(ep_group)

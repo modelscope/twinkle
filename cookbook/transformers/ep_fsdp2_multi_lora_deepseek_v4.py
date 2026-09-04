@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """EP + FSDP2 + Multi-LoRA SFT cookbook for DeepSeek-V4.
 
-Run on 8 GPUs:
-    torchrun --nproc-per-node=8 cookbook/transformers/ep_fsdp2_multi_lora_deepseek_v4.py
+Run on 2 GPUs:
+    torchrun --nproc-per-node=2 cookbook/transformers/ep_fsdp2_multi_lora_deepseek_v4.py
 """
 import os
 from pathlib import Path
@@ -19,10 +19,10 @@ from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('DSV4_MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-Flash')
-DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
+MODEL_ID = os.environ.get('DSV4_MODEL_ID', '/nas/disk1/random-deepseek-v4-4b')
+DATASET_ID = os.environ.get('DATASET_ID', '/model/ljl/dataset/self-cognition.jsonl')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))
 GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '4'))
 LOG_INTERVAL = GRAD_ACCUM_STEPS
 LR = float(os.environ.get('LR', '1e-4'))
@@ -37,11 +37,12 @@ RESUME_FROM_CHECKPOINT = os.environ.get('RESUME_FROM_CHECKPOINT') or None
 RESUME_ONLY_MODEL = os.environ.get('RESUME_ONLY_MODEL', '0') == '1'
 IGNORE_DATA_SKIP = os.environ.get('IGNORE_DATA_SKIP', '0') == '1'
 ADAPTER_NAMES = [name.strip() for name in os.environ.get('ADAPTER_NAMES', 'tenant_a,tenant_b').split(',') if name]
+WORLD_SIZE = int(os.environ.get('WORLD_SIZE', '2'))
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=8,
+    fsdp_size=WORLD_SIZE,
     dp_size=1,
-    ep_size=8,
+    ep_size=WORLD_SIZE,
     device_type=Platform.get_platform().device_prefix(),
 )
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
@@ -86,14 +87,14 @@ def train():
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, device_mesh=device_mesh)
 
-    ep_lora_cfg = _build_lora_config(enable_ep=ENABLE_EP) # LoraConfig for target params
+    ep_lora_cfg = _build_lora_config(enable_ep=ENABLE_EP)  # LoraConfig for target params
     lora_cfg = _build_lora_config(enable_ep=False)  # LoraConfig for PEFT adapter
     model = MultiLoraTransformersModel(
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
         strategy='native_fsdp',
-        memory_efficient_init=False,
+        memory_efficient_init=True,
         max_loras=MAX_LORAS,
         max_r=MAX_R,
         fsdp_config={
@@ -108,6 +109,10 @@ def train():
 
     for adapter_name in ADAPTER_NAMES:
         model.add_adapter_to_model(adapter_name, ep_lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
+
+    # Materialize rank-local EP/FSDP shards before loading adapter checkpoints
+    # or creating optimizers.
+    model._lazy_wrap_model()
 
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
@@ -127,9 +132,6 @@ def train():
     logger.info(
         f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}, '
         f'enable_ep={ENABLE_EP}, adapters={ADAPTER_NAMES}, output_dir={OUTPUT_DIR}')
-
-    # After LoRA init, before forward (LoRA active): perform EP + FSDP broadcast & sharding.
-    model._lazy_wrap_model()
 
     # Must call set_optimizer() after EP + FSDP sharding, otherwise optimizer may
     # capture stale parameter references and fail to update the actual LoRA weights.

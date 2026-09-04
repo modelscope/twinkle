@@ -106,6 +106,11 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    def generate(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
+        """Generate with the resident Transformers model rather than a sampler deployment."""
+        return super().generate(inputs=inputs, **kwargs)
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     @nccl_safe
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):

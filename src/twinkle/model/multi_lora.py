@@ -30,14 +30,18 @@ class LoraTenant:
 
 class MultiLora:
 
-    def __init__(self, max_loras=5, max_r=32, max_length: int = 8192):
+    def __init__(self, max_loras=5, max_r=32, max_length: int = 8192, defer_initial_weights: bool = False):
         self.max_loras = max_loras
         self.max_r = max_r
         self.loras: List[LoraTenant] = []
         self.module: PeftModel
         self._active_adapters = []
         self.max_length = max_length
-        self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
+        self.target_parameter_manager = TargetParameterLoraManager(
+            max_loras=max_loras,
+            max_r=max_r,
+            defer_initial_weights=defer_initial_weights,
+        )
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -49,6 +53,12 @@ class MultiLora:
         return torch_util.to_local_tensor(parameter)
 
     @staticmethod
+    def _read_local_param_tensor(parameter):
+        if hasattr(parameter, 'to_local'):
+            return parameter.to_local()
+        return parameter
+
+    @staticmethod
     def _is_distributed_param(parameter):
         return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
 
@@ -56,7 +66,14 @@ class MultiLora:
     def _is_target_parameter_lora_name(name: str) -> bool:
         return '._twinkle_lora_' in name
 
+    @torch.no_grad()
     def _write_param_tensor(self, parameter, value):
+        """Copy a value into a regular parameter or its local DTensor shard.
+
+        ``DTensor.to_local()`` can return a view produced by a custom autograd
+        Function. In-place writes to that view are forbidden while grad mode is
+        enabled, even for lifecycle operations such as adapter reset/load.
+        """
         if value is None:
             return
         value = value.detach().to(dtype=parameter.dtype)
@@ -115,6 +132,10 @@ class MultiLora:
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
+    def _lora_slot_assignments(self):
+        """Return a compact snapshot used to diagnose per-rank slot state."""
+        return [(lora.adapter_name, lora.tenant_adapter_name) for lora in self.loras]
+
     def reset_adapter_status(self):
         """Force lora_0 require_grad, disable others"""
         if isinstance(self.module, list):
@@ -152,9 +173,10 @@ class MultiLora:
         self.target_parameter_manager.patch(module, target_parameters)
 
     @contextmanager
-    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
+    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False, cache_target_parameters: bool = True):
         self.activate_adapter(tenant_adapter_name)
-        with self.target_parameter_manager.adapter(tenant_adapter_name, disable_lora=disable_lora):
+        with self.target_parameter_manager.adapter(
+                tenant_adapter_name, disable_lora=disable_lora, cache=cache_target_parameters):
             if disable_lora:
                 # Temporarily disable all adapters while keeping optimizer_group active
                 with self._disable_lora_context(tenant_adapter_name):
@@ -222,19 +244,39 @@ class MultiLora:
                 slot_name=_available_lora.adapter_name,
                 config=config,
             )
-        logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
+        logger.info(
+            'LoRA acquired: tenant=%s, slot=%s, available_lora=%s',
+            tenant_adapter_name,
+            _available_lora.adapter_name,
+            self._count_available_loras(),
+        )
         return _available_lora.adapter_name
 
     def release_lora(self, tenant_adapter_name: str) -> Optional[str]:
         try:
             _lora = self.find_lora_by_tenant(tenant_adapter_name)
-            _lora.tenant_config = None
-            _lora.tenant_adapter_name = None
-            self._load_initial_weights(_lora.adapter_name)
-            self.target_parameter_manager.release(tenant_adapter_name)
-            logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         except ValueError:
+            logger.warning(
+                'LoRA release skipped: tenant=%s was not found, assignments=%s',
+                tenant_adapter_name,
+                self._lora_slot_assignments(),
+                ranks='all',
+            )
             return
+        # Restore every backing slot before publishing it as available. If a
+        # DTensor reset fails, retain the tenant mapping so cleanup can retry
+        # safely instead of exposing a partially reset LoRA slot.
+        self._load_initial_weights(_lora.adapter_name)
+        self.target_parameter_manager.release(tenant_adapter_name)
+        _lora.tenant_config = None
+        _lora.tenant_adapter_name = None
+        logger.info(
+            'LoRA released: tenant=%s, slot=%s, available_lora=%s',
+            tenant_adapter_name,
+            _lora.adapter_name,
+            self._count_available_loras(),
+        )
+        return _lora.adapter_name
 
     def has_lora(self, adapter_name: str) -> bool:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0
@@ -568,13 +610,19 @@ class MultiLora:
                     if self._is_target_parameter_lora_name(name):
                         continue
                     if pattern.search(name):
-                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
+                        local_parameter = self._read_local_param_tensor(parameter)
+                        if local_parameter.is_meta:
+                            raise RuntimeError(
+                                f'LoRA parameter {name} is still on meta; materialize the model before saving '
+                                'its initial weights.')
+                        lora_tenant.lora_A_weights[name] = local_parameter.detach().cpu().clone()
 
             if isinstance(self.module, list):
                 for _module in self.module:
                     _store_weights(_module)
             else:
                 _store_weights(self.module)
+        self.target_parameter_manager.save_initial_weights()
 
     def load_lora_converter(self, name, parameter, **kwargs):
 
@@ -741,12 +789,12 @@ class MultiLora:
                 if self._is_target_parameter_lora_name(name):
                     continue
                 if pattern_A.search(name):
-                    local_param = self._read_param_tensor(parameter)
+                    local_param = self._read_local_param_tensor(parameter)
                     if local_param is not None:
                         value = _lora.lora_A_weights[name].to(dtype=parameter.dtype, device=local_param.device)
                         self._write_param_tensor(parameter, value)
                 if pattern_B.search(name):
-                    local_param = self._read_param_tensor(parameter)
+                    local_param = self._read_local_param_tensor(parameter)
                     if local_param is not None:
                         self._write_param_tensor(parameter, torch.zeros_like(local_param))
 

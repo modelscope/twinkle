@@ -446,6 +446,5 @@ class MultiLoraMegatronModel(MegatronModel):
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):
-        if adapter_name in self.optimizer_group:
-            self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
+        self.optimizer_group.pop(adapter_name, None)

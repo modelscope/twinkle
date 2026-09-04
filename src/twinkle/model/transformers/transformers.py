@@ -314,6 +314,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
         if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
             return False
+        is_node_local_source_rank = getattr(self.strategy, 'is_node_local_source_rank', None)
+        if is_node_local_source_rank is not None:
+            return not is_node_local_source_rank()
         local_rank = Platform.get_local_rank()
         if local_rank < 0:
             raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')
@@ -444,11 +447,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
         ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
+        can_reuse_storage = getattr(self.strategy, 'can_reuse_pre_ep_tensor_storage', None)
+        reuse_pre_ep_storage = bool(can_reuse_storage()) if callable(can_reuse_storage) else False
         apply_expert_parallel(
             model,
             self.device_mesh,
             config=self._expert_parallel_config,
             ep_fsdp_device_mesh=ep_fsdp_mesh,
+            clone_tensor_expert_weights=not reuse_pre_ep_storage,
         )
         self._expert_parallel_applied = True
 
@@ -753,6 +759,174 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if recorded_routing is not None:
                 return_outputs['routed_experts'] = recorded_routing
             return return_outputs
+
+    @staticmethod
+    def _generated_token_ids(sequence: torch.Tensor, prompt_width: int, eos_token_ids, pad_token_id):
+        """Return completion IDs without batch padding and whether EOS was reached."""
+        if eos_token_ids is None:
+            eos_ids = set()
+        elif isinstance(eos_token_ids, int):
+            eos_ids = {eos_token_ids}
+        else:
+            eos_ids = {int(token_id) for token_id in eos_token_ids}
+
+        token_ids = []
+        stopped = False
+        for token_id in sequence[prompt_width:].tolist():
+            token_id = int(token_id)
+            if pad_token_id is not None and token_id == pad_token_id and token_id not in eos_ids:
+                break
+            token_ids.append(token_id)
+            if token_id in eos_ids:
+                stopped = True
+                break
+        return token_ids, stopped
+
+    def _prepare_generate_inputs(self, inputs, optimizer_config):
+        """Encode trajectories and create a left-padded HF generation batch."""
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        else:
+            inputs = list(inputs)
+        if not inputs:
+            raise ValueError('inputs empty, check your generate() inputs')
+
+        template = optimizer_config.template
+        if self._not_encoded(inputs[0]):
+            assert template is not None, \
+                'Use set_template before passing Trajectory inputs to generate()'
+            inputs = template.batch_encode(inputs, add_generation_prompt=True)
+
+        if hasattr(self, 'multi_adapter'):
+            self.multi_adapter.check_length(inputs)
+
+        prompt_token_ids = []
+        for item in inputs:
+            ids = item.get('input_ids')
+            if ids is None:
+                raise ValueError("Every generate() input must contain 'input_ids'")
+            if torch.is_tensor(ids):
+                ids = ids.detach().cpu().reshape(-1).tolist()
+            elif isinstance(ids, np.ndarray):
+                ids = ids.reshape(-1).tolist()
+            else:
+                ids = list(ids)
+            prompt_token_ids.append([int(token_id) for token_id in ids])
+
+        # The training processor defaults to right padding and may be configured
+        # for padding-free batches. Decoder-only generation needs a conventional
+        # left-padded batch, so use a shallow per-call copy without mutating the
+        # tenant's training processor.
+        processor = copy(optimizer_config.processor)
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before generate()'
+        processor.padding_side = 'left'
+        processor.padding_free = False
+        model_inputs: Dict[str, Any] = processor(
+            inputs,
+            sp_strategy=None,
+            model=self.model,
+            hf_config=self.hf_config,
+            enable_sp=False,
+        )
+        for key in ('labels', 'completion_mask', 'length', 'routed_experts'):
+            model_inputs.pop(key, None)
+
+        # Rebuild position IDs after left padding. Template position IDs describe
+        # each unpadded sample and therefore cannot be padded with -1 and passed
+        # unchanged to GenerationMixin.
+        attention_mask = model_inputs.get('attention_mask')
+        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            model_inputs['position_ids'] = position_ids
+
+        return model_inputs, prompt_token_ids, template
+
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    def generate(self,
+                 *,
+                 inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                 generation_config: Optional[Dict[str, Any]] = None,
+                 **kwargs):
+        """Generate completions directly with the resident Transformers model.
+
+        Unlike ``forward_only()``, this keeps and reuses ``past_key_values`` via
+        Hugging Face ``GenerationMixin``. All distributed ranks receive the same
+        request so FSDP/EP collectives remain aligned; only rank 0's JSON-safe
+        result is returned by the remote-function collector.
+        """
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        self._lazy_wrap_model()
+        if getattr(self, '_enable_sp', False):
+            raise NotImplementedError('TransformersModel.generate() does not support sequence parallelism; '
+                                      'start this model with ulysses/sp size 1.')
+
+        self.model.eval()
+        model_inputs, prompt_token_ids, template = self._prepare_generate_inputs(inputs, optimizer_config)
+        generate_model = self.strategy.unwrap_model(self.model)
+        if not hasattr(generate_model, 'generate'):
+            raise TypeError(f'{type(generate_model).__name__} does not expose Hugging Face generate()')
+
+        gen_kwargs = dict(generation_config or {})
+        gen_kwargs.setdefault('max_new_tokens', 128)
+        gen_kwargs.setdefault('do_sample', False)
+        gen_kwargs.setdefault('use_cache', True)
+        gen_kwargs.setdefault('return_dict_in_generate', False)
+        if gen_kwargs['return_dict_in_generate']:
+            raise ValueError('return_dict_in_generate=True is not supported by the Twinkle generate API')
+
+        tokenizer = template.tokenizer if template is not None else None
+        if tokenizer is not None:
+            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                gen_kwargs.setdefault('pad_token_id', tokenizer.eos_token_id)
+            else:
+                gen_kwargs.setdefault('pad_token_id', tokenizer.pad_token_id)
+            gen_kwargs.setdefault('eos_token_id', tokenizer.eos_token_id)
+
+        seed = int(gen_kwargs.pop('seed', 0))
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            # Ranks may finish at different moments for different prompts. Keep
+            # every rank participating until the complete distributed group is done.
+            gen_kwargs.setdefault('synced_gpus', True)
+
+        num_return_sequences = int(gen_kwargs.get('num_return_sequences', 1))
+        rng_state = self._get_training_rng_state()
+        try:
+            # Identical seeds keep sampled tokens aligned on all FSDP/EP ranks.
+            # Restore the training RNG afterwards so an evaluation request does
+            # not perturb dropout or any later stochastic training operation.
+            Torch.seed_everything(seed)
+            generation_context = getattr(self.strategy, 'generation_context', None)
+            fsdp_root_context = (
+                generation_context(generate_model) if generation_context is not None else contextlib.nullcontext())
+            with torch.no_grad(), fsdp_root_context:
+                sequences = generate_model.generate(**model_inputs, **gen_kwargs)
+        finally:
+            self._set_training_rng_state(rng_state)
+
+        if not torch.is_tensor(sequences):
+            raise TypeError(f'generate() returned unsupported output type: {type(sequences).__name__}')
+        expected = len(prompt_token_ids) * num_return_sequences
+        if sequences.shape[0] != expected:
+            raise RuntimeError(f'generate() returned {sequences.shape[0]} sequences, expected {expected}')
+
+        prompt_width = int(model_inputs['input_ids'].shape[-1])
+        eos_token_ids = gen_kwargs.get('eos_token_id')
+        pad_token_id = gen_kwargs.get('pad_token_id')
+        max_new_tokens = int(gen_kwargs['max_new_tokens'])
+        results = []
+        for sequence_index, sequence in enumerate(sequences):
+            prompt_index = sequence_index // num_return_sequences
+            token_ids, stopped = self._generated_token_ids(sequence, prompt_width, eos_token_ids, pad_token_id)
+            text = template.decode(token_ids, skip_special_tokens=True) if template is not None else ''
+            results.append({
+                'prompt_token_ids': prompt_token_ids[prompt_index],
+                'tokens': token_ids,
+                'text': text,
+                'stop_reason': 'stop' if stopped or len(token_ids) < max_new_tokens else 'length',
+            })
+        return results
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -1379,8 +1553,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state['device_rng_state'] = None
         return state
 
-    def _load_rng_state(self, rng_path):
-        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+    @staticmethod
+    def _set_training_rng_state(rng_state):
         random.setstate(rng_state['python_rng_state'])
         np.random.set_state(rng_state['numpy_rng_state'])
         torch.set_rng_state(rng_state['torch_rng_state'])
@@ -1391,6 +1565,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             device_module = getattr(torch, device_type, None)
             if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
                 device_module.set_rng_state(device_rng_state)
+
+    def _load_rng_state(self, rng_path):
+        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        self._set_training_rng_state(rng_state)
 
     def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')

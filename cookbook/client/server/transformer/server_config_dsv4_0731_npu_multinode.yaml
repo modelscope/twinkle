@@ -1,0 +1,127 @@
+# DeepSeek-V4-Flash-0731 Multi-LoRA SFT on two Ascend A3 nodes.
+# Each node contributes 16 NPUs, for a 32-rank Native FSDP2 + EP deployment.
+#
+# Required on both nodes:
+#   - the same Twinkle commit and Python/CANN/torch_npu environment
+#   - enough local Hub cache space on both nodes for the downloaded checkpoint
+#   - OUTPUT_DIR used by the client mounted as a shared filesystem
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+telemetry:
+  enabled: false
+  otlp_endpoint: http://localhost:4317
+
+# "memory" is backed by one detached Ray actor and is shared by all Serve
+# processes on both nodes. It does not survive a full Ray-cluster shutdown.
+persistence:
+  mode: memory
+  key_prefix: dsv4-0731-a3-32npu
+
+applications:
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 1
+      supported_models:
+        - DeepSeek-V4-Flash-0731
+    deployments:
+      - name: TinkerCompatServer
+        max_ongoing_requests: 50
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 32
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"
+
+  - name: models-DeepSeek-V4-Flash-0731
+    route_prefix: /api/v1/model/DeepSeek-V4-Flash-0731
+    import_path: model
+    args:
+      backend: transformers
+      # Twinkle treats an unprefixed ID as ModelScope. Keep the hf:// prefix
+      # here to select Hugging Face explicitly.
+      # Resolved from the launch environment on the head node.
+      model_id: ${oc.env:DSV4_MODEL_ID,hf://deepseek-ai/DeepSeek-V4-Flash-0731}
+      nproc_per_node: 16
+      max_loras: 3
+      max_r: 32
+      max_length: 8192
+      mixed_precision: bf16
+      strategy: native_fsdp
+      memory_efficient_init: true
+      target_modules: all-linear
+      fsdp_config:
+        reshard_after_forward: true
+        expert_parallel:
+          enabled: true
+          ep_size: 32
+          router_dtype: fp32
+          keep_router_logits: false
+      device_group:
+        name: model
+        ranks: 32
+        device_type: npu
+      device_mesh:
+        device_type: npu
+        fsdp_size: 32
+        dp_size: 1
+        ep_size: 32
+      queue_config:
+        rps_limit: 20
+        tps_limit: 100000
+        max_input_tokens: 8192
+        queue_timeout: 7200
+        execution_timeout: 7200
+      adapter_config:
+        adapter_timeout: 60
+        adapter_max_lifetime: 86400
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 8
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
+
+  # Dataset construction and tokenization run on CPU. The dataset and model
+  # encoding files are resolved on the node selected for this deployment.
+  - name: processor
+    route_prefix: /api/v1/processor
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 2
+      device_group:
+        name: processor
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 2
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 32
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"

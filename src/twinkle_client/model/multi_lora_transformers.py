@@ -8,6 +8,7 @@ from twinkle_client.types.model import (
     ClipGradNormResponse,
     ForwardBackwardResponse,
     ForwardResponse,
+    GenerateResponse,
     GetStateDictResponse,
     GetTrainConfigsResponse,
     SaveResponse,
@@ -71,6 +72,32 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return ForwardResponse(**response.json())
+
+    def generate(
+        self,
+        inputs: Any,
+        generation_config: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[int] = None,
+        **kwargs,
+    ) -> GenerateResponse:
+        """Generate text directly with the Transformers training model.
+
+        This does not use the sampler deployment. ``generation_config`` is
+        forwarded to Hugging Face ``generate()``.
+        """
+        response = http_post(
+            url=f'{self.server_url}/generate',
+            json_data={
+                'inputs': inputs,
+                'adapter_name': self.adapter_name,
+                'generation_config': generation_config or {},
+                **kwargs,
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return GenerateResponse(**response.json())
 
     def calculate_loss(self, **kwargs) -> CalculateLossResponse:
         """Calculate loss from model outputs."""
