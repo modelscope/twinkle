@@ -20,9 +20,11 @@ class Accuracy(Metric):
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         assert not isinstance(inputs, list), 'Accuracy does not support list InputFeature yet.'
-        labels = inputs['labels']
+        labels = inputs.get('labels')
         logits = outputs.get('logits')
-        if logits is None:
+        if labels is None or logits is None:
+            # Pairwise objectives (a reward model ranks chosen against rejected) and pooled heads
+            # carry no per-token labels, so there is no token accuracy to accumulate.
             return
         output_token_ids = logits.argmax(dim=-1)
         mask = inputs.get('completion_mask')

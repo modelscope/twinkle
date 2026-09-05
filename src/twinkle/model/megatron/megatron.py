@@ -160,11 +160,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        if config is None:
+        model_loader = kwargs.pop('model_loader', None)
+        if config is not None:
+            self.hf_config = config
+        elif model_loader is not None:
+            # Same caller-supplied builder contract as TransformersModel: a duck-typed loader
+            # (build_config + process_config -- dev's ModelLoader) owns the HF config, so a family
+            # that rewrites it keeps doing so on this backend too. Only the config hooks apply here;
+            # mcore builds the module itself, and weights come from bridge.load_weights below.
+            self.hf_config = model_loader.process_config(model_loader.build_config(self._model_path))
+        else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
-        else:
-            self.hf_config = config
         self.strategy = MegatronStrategy(
             self._model_path,
             self.device_mesh,
