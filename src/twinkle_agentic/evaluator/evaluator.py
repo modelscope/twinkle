@@ -130,9 +130,10 @@ class Evaluator:
                 batcher = adapter.batcher
             config = dict(self._task_config)
             config.setdefault('eval_batch_size', 8)
+            # Leave model_id unset: TaskConfig derives a filesystem-safe id via safe_filename,
+            # whereas a raw path is joined onto the reports dir verbatim and escapes work_dir.
             config.update({
                 'model': adapter,
-                'model_id': self._model_id,
                 'datasets': list(self._datasets),
                 'eval_type': EvalType.CUSTOM,
                 'eval_backend': EvalBackend.NATIVE,

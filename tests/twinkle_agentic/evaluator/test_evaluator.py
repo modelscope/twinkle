@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from twinkle_agentic.evaluator import Evaluator
@@ -64,6 +66,19 @@ def test_single_use_after_failure(monkeypatch, recording_api):
         evaluator.run()
     with pytest.raises(RuntimeError, match='single-use'):
         evaluator.run()
+
+
+@pytest.mark.parametrize('model_id', ['/models/Qwen3-1.7B', '/models/Qwen3-1.7B/', 'ms://Qwen/Qwen3-1.7B'])
+def test_path_like_model_id_stays_inside_work_dir(monkeypatch, recording_sampler, model_id):
+    import evalscope.run
+    monkeypatch.setattr(evalscope.run, 'run_task', lambda config: {'ok': True})
+    work_dir = '/tmp/twinkle-evaluator-work-dir'
+    evaluator = Evaluator(datasets=['x'], sampler=recording_sampler, model_id=model_id,
+                          task_config={'work_dir': work_dir})
+    evaluator.run()
+    reports_dir = os.path.join(work_dir, 'reports')
+    assert os.path.join(reports_dir, evaluator.resolved_task_config.model_id).startswith(reports_dir + os.sep)
+    assert evaluator.resolved_task_config.model.model_name == model_id
 
 
 @pytest.mark.parametrize('backend', ['api', 'sampler'])
