@@ -354,7 +354,8 @@ class InputProcessor:
                 ])
 
                 for key in [
-                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'loss_scale',
+                        'mm_token_type_ids'
                 ]:
                     value = _input.get(key)
                     if value is None:
@@ -370,7 +371,8 @@ class InputProcessor:
             elif self.device_mesh.sequence_parallel and tp_size > 1:
                 # Sequence parallel without CP still requires seq_len % TP == 0
                 for key in [
-                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'loss_scale',
+                        'mm_token_type_ids'
                 ]:
                     value = _input.get(key)
                     if value is not None:
@@ -435,6 +437,10 @@ class InputProcessor:
                 completion_mask = inputs.get('completion_mask')
                 if completion_mask is not None:
                     inputs['completion_mask'] = split_cp_inputs(completion_mask, cu_seqlens_q, dim=-1)
+
+                loss_scale = inputs.get('loss_scale')
+                if loss_scale is not None:
+                    inputs['loss_scale'] = split_cp_inputs(loss_scale, cu_seqlens_q, dim=-1)
 
                 mm_token_type_ids = inputs.get('mm_token_type_ids')
                 if mm_token_type_ids is not None:
@@ -661,23 +667,29 @@ class InputProcessor:
 
         from copy import copy
 
-        # Collect output keys to unpack: (key, pad_value)
+        # Collect input/output keys to unpack: (key, pad_value). ``channel`` stays
+        # sample-level metadata, while ``loss_scale`` follows the token layout.
+        input_keys = [('labels', -100)]
+        if inputs.get('loss_scale') is not None:
+            input_keys.append(('loss_scale', 0))
         output_keys = []
         for key, pad_val in [('logps', 0), ('entropies', 0), ('logits', 0)]:
             if outputs and outputs.get(key) is not None:
                 output_keys.append((key, pad_val))
 
-        all_tensors = [labels] + [outputs[k] for k, _ in output_keys]
-        all_pads = [-100] + [p for _, p in output_keys]
+        all_tensors = [inputs[k] for k, _ in input_keys] + [outputs[k] for k, _ in output_keys]
+        all_pads = [p for _, p in input_keys] + [p for _, p in output_keys]
         unpacked = self._unpack_by_position_ids(position_ids, *all_tensors, padding_values=all_pads)
 
         inputs = copy(inputs)
-        inputs['labels'] = unpacked[0]
+        for i, (key, _) in enumerate(input_keys):
+            inputs[key] = unpacked[i]
 
         if output_keys:
             outputs = copy(outputs)
+            offset = len(input_keys)
             for i, (key, _) in enumerate(output_keys):
-                outputs[key] = unpacked[i + 1]
+                outputs[key] = unpacked[offset + i]
 
         return inputs, outputs
 
@@ -702,6 +714,8 @@ class InputProcessor:
                 'position_ids',
                 'labels',
                 'completion_mask',
+                'loss_scale',
+                'channel',
                 'cu_seq_lens_q',
                 'cu_seq_lens_k',
                 'cu_seqlens_q',
@@ -715,7 +729,7 @@ class InputProcessor:
                 if key not in _keys:
                     continue
                 value = _input[key]
-                if isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
+                if key == 'channel' or isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
                     output[key] = value
                 else:
                     output[key] = np.array(value)

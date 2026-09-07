@@ -21,6 +21,8 @@ class InputFeature(TypedDict, total=False):
         position_ids: The position ids of the input_ids, can be used to distinguish sentences.
         labels: The labels of the input_ids, used to calculate loss.
         completion_mask: Boolean array used in RL algorithms, indicate which tokens need to calculate loss.
+        loss_scale: Optional per-token loss weights.
+        channel: Optional sample group used for per-channel loss metrics.
         length: The length of input_ids.
 
     Multimodal fields (raw data, processed by engine/model):
@@ -35,5 +37,7 @@ class InputFeature(TypedDict, total=False):
     position_ids: InputType
     labels: InputType
     completion_mask: InputType
+    loss_scale: InputType
+    channel: Any
     length: int
     routed_experts: InputType

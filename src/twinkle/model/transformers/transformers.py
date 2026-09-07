@@ -549,6 +549,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             enable_sp=getattr(self, '_enable_sp', False),
         )
         labels: torch.Tensor = inputs.pop('labels', None)
+        loss_scale = inputs.pop('loss_scale', None)
+        channel = inputs.pop('channel', None)
         optimizer_config.accumulate_metrics(True)
 
         # Routing replay: respects router_replay_action regardless of caller
@@ -567,6 +569,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         recorded_routing = rr_cleanup()
 
         inputs['labels'] = labels
+        if loss_scale is not None:
+            inputs['loss_scale'] = loss_scale
+        if channel is not None:
+            inputs['channel'] = channel
         if task != 'embedding' and labels is not None and loss_require_logps:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
@@ -640,6 +646,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 enable_sp=getattr(self, '_enable_sp', False),
             )
             labels = inputs.pop('labels', None)
+            loss_scale = inputs.pop('loss_scale', None)
+            channel = inputs.pop('channel', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
@@ -661,6 +669,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             recorded_routing = rr_cleanup()
 
             inputs['labels'] = labels
+            if loss_scale is not None:
+                inputs['loss_scale'] = loss_scale
+            if channel is not None:
+                inputs['channel'] = channel
             if task != 'embedding' and labels is not None and loss_require_logps:
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
@@ -737,6 +749,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         status.loss_value += loss_value
         outputs['loss'] = status.loss_value
         outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
+        if result.get('channel_loss') is not None:
+            outputs['channel_loss'] = result['channel_loss']
         return status.loss_value.item()
 
     @remote_function()

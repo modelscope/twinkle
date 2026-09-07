@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Loss
+from .channel import ChannelLoss
 from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
 from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
@@ -16,6 +17,7 @@ from .value import PPOValueLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
+    'channel': ChannelLoss,
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
     'cross_entropy': CrossEntropyLoss,
     'liger_fused_linear_cross_entropy': LigerFusedLinearCrossEntropyLoss,

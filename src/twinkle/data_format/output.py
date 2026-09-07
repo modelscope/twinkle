@@ -28,6 +28,7 @@ class ModelOutput(TypedDict, total=False):
     num_tokens: Optional[OutputType]
     embeddings: Optional[OutputType]
     routed_experts: Optional[OutputType]
+    channel_loss: dict[str | None, OutputType] | None
 
 
 class LossOutput(TypedDict, total=False):
@@ -35,3 +36,4 @@ class LossOutput(TypedDict, total=False):
 
     loss: Optional[OutputType]
     num_tokens: Optional[OutputType]
+    channel_loss: dict[str | None, OutputType] | None

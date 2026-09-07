@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Unit tests for InputProcessor: normal, padding_free, micro_batch, multimodal, GRPO."""
-import pytest
+from types import SimpleNamespace
+
 import torch
 
 import twinkle
@@ -37,6 +38,17 @@ class TestNormalMode:
         out = proc.collate_fn(batch)
         assert out[0]['input_ids'].shape == (2, 5)
 
+    def test_channel_and_loss_scale_survive_collation(self):
+        proc = InputProcessor(padding_free=False, padding_side='right')
+        batch = _make_text_batch(2, seq_len=3)
+        batch[0].update(channel='math', loss_scale=torch.tensor([1.0, 0.5, 0.0]))
+        batch[1].update(channel='code', loss_scale=torch.tensor([0.0, 1.0, 1.0]))
+
+        out = proc.to_transformers_dict(proc.collate_fn(batch))[0]
+
+        assert out['channel'] == ['math', 'code']
+        assert out['loss_scale'].tolist() == [[1.0, 0.5, 0.0], [0.0, 1.0, 1.0]]
+
     def test_completion_mask_padding(self):
         proc = InputProcessor(padding_free=False, padding_side='right')
         batch = [
@@ -71,6 +83,40 @@ class TestPaddingFreeMode:
         b = out[0]
         assert b['input_ids'].shape == (1, 12)
         assert b['labels'].shape == (1, 12)
+
+    def test_padding_free_unpacks_loss_scale_and_keeps_channels(self):
+        proc = InputProcessor(padding_free=True)
+        batch = _make_text_batch(2, seq_len=3)
+        batch[0].update(channel='math', loss_scale=torch.tensor([1.0, 0.5, 0.0]))
+        batch[1].update(channel='code', loss_scale=torch.tensor([0.0, 1.0, 1.0]))
+        packed = proc.collate_fn(batch)[0]
+
+        inputs, _ = proc.unpack_packed_sequences(packed)
+
+        assert inputs['channel'] == ['math', 'code']
+        assert inputs['loss_scale'].tolist() == [[1.0, 0.5, 0.0], [0.0, 1.0, 1.0]]
+
+
+class TestContextParallelMode:
+    """Context parallelism keeps token-level loss metadata aligned."""
+
+    def test_loss_scale_is_padded_and_split_with_labels(self):
+        mesh = SimpleNamespace(cp_world_size=2, cp_rank=0, tp_world_size=1, sequence_parallel=False)
+        proc = InputProcessor(device_mesh=mesh, framework='megatron')
+        proc.device_mesh = mesh
+        inputs = [{
+            'input_ids': torch.arange(1, 7).unsqueeze(0),
+            'attention_mask': torch.ones(1, 6),
+            'position_ids': torch.arange(6).unsqueeze(0),
+            'labels': torch.arange(1, 7).unsqueeze(0),
+            'loss_scale': torch.arange(1, 7, dtype=torch.float32).unsqueeze(0),
+        }]
+
+        padded = proc.pad_cp(inputs)
+        split = proc.split_cp(padded)[0]
+
+        assert split['labels'].tolist() == [[1, 2, -100, -100]]
+        assert split['loss_scale'].tolist() == [[1.0, 2.0, 0.0, 0.0]]
 
 
 class TestMicroBatchMode:

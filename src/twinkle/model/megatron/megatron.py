@@ -556,13 +556,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
+            reduced = self.strategy.reduce_loss(losses, counts, output_tensor, logps)
+            if result.get('channel_loss') is not None:
+                reduced[2]['channel_loss'] = result['channel_loss']
+            return reduced
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
+            loss_scale = batch.pop('loss_scale', None)
+            channel = batch.pop('channel', None)
             # MTP joint training. ``labels`` is deliberately withheld from the model so the main loss
             # stays external (twinkle derives log-probs from logits), but the MTP heads still need
             # next-token targets -- so they get them on a separate keyword. Passed only into the model
@@ -579,6 +584,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**model_kwargs)
 
             batch['labels'] = labels
+            if loss_scale is not None:
+                batch['loss_scale'] = loss_scale
+            if channel is not None:
+                batch['channel'] = channel
             logps = None
             unpacked_logits = None
             entropies = None
@@ -646,6 +655,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         if entropies is not None:
                             entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
                     batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
+                    if batch.get('loss_scale') is not None:
+                        batch['loss_scale'] = processor.postprocess_tensor_cp(
+                            batch['loss_scale'], cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
@@ -715,6 +727,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         loss = torch.tensor(0.0).to(Platform.get_local_device())
         logits = []
         logps = []
+        channel_loss = {}
         count = 0
         if losses:
             for loss_dict in losses:
@@ -727,6 +740,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         logps.append(loss_dict['logps'])
                     if 'num_tokens' in loss_dict:
                         count += loss_dict['num_tokens']
+                    for channel, stats in loss_dict.get('channel_loss', {}).items():
+                        if channel in channel_loss:
+                            channel_loss[channel] = channel_loss[channel] + stats
+                        else:
+                            channel_loss[channel] = stats
                 elif isinstance(loss_dict, torch.Tensor):
                     raise ValueError('Expected loss dict, got tensor')
 
@@ -766,15 +784,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if not return_logits:
             logits = None
         inputs = processor.unpack_inputs(inputs, task=task)
+        model_output = ModelOutput(logits=logits, loss=loss, logps=logps)
+        if channel_loss:
+            model_output['channel_loss'] = channel_loss
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
-            optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.eval_status.outputs = model_output
             optimizer_config.eval_status.forward_kwargs = kwargs
         else:
             optimizer_config.train_status.inputs = inputs
-            optimizer_config.train_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.train_status.outputs = model_output
             optimizer_config.train_status.forward_kwargs = kwargs
-        return ModelOutput(logits=logits, loss=loss, logps=logps)
+        return model_output
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):
