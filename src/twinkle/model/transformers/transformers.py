@@ -33,6 +33,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
@@ -823,8 +824,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
-        optimizer_config.cur_step += 1
-        should_sync = optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+        increment_step = kwargs.pop('_increment_step', True)
+        if increment_step:
+            optimizer_config.cur_step += 1
+        sync_gradients = kwargs.pop('sync_gradients', None)
+        should_sync = (
+            optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+            if sync_gradients is None else bool(sync_gradients))
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
@@ -848,6 +854,117 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optimizer_config.train_status.loss_value = None
 
+    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        processor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
+        optimizer_config._ensure_dp_group()
+        dp_group = optimizer_config._dp_group
+        min_micro_batches = 1
+        while True:
+            try:
+                plan = plan_micro_batches(
+                    inputs,
+                    config,
+                    padding_free=processor.padding_free,
+                    min_micro_batches=min_micro_batches,
+                )
+                planning_error = None
+            except Exception as exc:
+                if dp_group is None:
+                    raise
+                plan = None
+                planning_error = f'{type(exc).__name__}: {exc}'
+
+            if dp_group is None:
+                return plan
+
+            local_state = {
+                'micro_batch_count': len(plan) if plan is not None else None,
+                'input_count': len(inputs),
+                'error': planning_error,
+            }
+            states = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(states, local_state, group=dp_group)
+            errors = [
+                f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
+            ]
+            if errors:
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
+
+            counts = [state['micro_batch_count'] for state in states]
+            if all(count == len(plan) for count in counts):
+                return plan
+            min_micro_batches = max(counts)
+            if any(min_micro_batches > state['input_count'] for state in states):
+                raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
+                                 'make the input batch divisible by the model data-parallel size')
+
+    def _forward_backward_micro_batch(
+        self,
+        *,
+        inputs,
+        optimizer_config,
+        loss_scale,
+        sync_gradients,
+        increment_step,
+        **kwargs,
+    ):
+        outputs = self.forward(
+            inputs=inputs,
+            router_replay_manual_cleanup=True,
+            **kwargs,
+        )
+        previous_normalizer = optimizer_config.train_status.num_tokens
+        loss = self.calculate_loss(**kwargs)
+        normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
+        optimizer_config.train_status.loss_value = (optimizer_config.train_status.loss_value * loss_scale)
+        optimizer_config.train_status.num_tokens = (previous_normalizer + normalizer_delta * loss_scale)
+        outputs['loss'] = loss * loss_scale
+        self.backward(
+            sync_gradients=sync_gradients,
+            _increment_step=increment_step,
+            **kwargs,
+        )
+        return outputs
+
+    def _forward_backward_micro_batches(
+        self,
+        *,
+        inputs,
+        config,
+        sync_gradients,
+        loss_scale,
+        **kwargs,
+    ):
+        adapter_name = kwargs.get('adapter_name')
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        optimizer_config = self.optimizer_group[adapter_name]
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)
+
+        local_batch_size = len(inputs)
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        outputs = {}
+        loss_instance = optimizer_config.loss_instance
+        for micro_batch_index, indices in enumerate(plan):
+            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_loss_scale = loss_scale * loss_instance.micro_batch_scale(inputs, indices)
+            is_last_micro_batch = micro_batch_index == len(plan) - 1
+            outputs = self._forward_backward_micro_batch(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                loss_scale=micro_loss_scale,
+                sync_gradients=sync_gradients if is_last_micro_batch else False,
+                increment_step=is_last_micro_batch,
+                **micro_kwargs,
+            )
+        return outputs
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
@@ -858,10 +975,26 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 gradient_accumulation_steps: Number of gradient accumulation steps.
+                micro_batch_size: Maximum samples processed per rank in one forward/backward.
+                dynamic_batching: Pack sequences by token cost instead of fixed sample slices.
+                max_tokens_per_micro_batch: Per-rank token limit used by dynamic batching.
+                packing_algorithm: Dynamic packing algorithm.
+                sync_gradients: Override gradient synchronization on the final micro-batch.
+                loss_scale: Weight applied to this input batch's loss.
                 Any parameters needed for the specific loss type.
         Returns:
             The output of the model forward.
         """
+        micro_batch_config = MicroBatchConfig.from_kwargs(kwargs)
+        if micro_batch_config is not None:
+            return self._forward_backward_micro_batches(
+                inputs=inputs,
+                config=micro_batch_config,
+                sync_gradients=kwargs.pop('sync_gradients', None),
+                loss_scale=float(kwargs.pop('loss_scale', 1.0)),
+                **kwargs,
+            )
+
         outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss

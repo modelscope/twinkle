@@ -85,6 +85,11 @@ class MockSampler:
     # ----- Sampler interface --------------------------------------------- #
 
     @remote_function()
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Mirror the production cache-eviction API for control-plane tests."""
+        return None
+
+    @remote_function()
     def sample(
         self,
         inputs: Any,

@@ -159,3 +159,23 @@ class GSM8KProcessor(Preprocessor):
             messages=messages,
             user_data=[('ground_truth', ground_truth)],
         )
+
+
+class DAPOMathProcessor(Preprocessor):
+    """Prepare BytedTsinghua-SIA/DAPO-Math-17k rows for on-policy rollout.
+
+    Required source schema::
+
+        prompt: list[{"role": str, "content": str}]
+        reward_model: {"ground_truth": str, ...}
+    """
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        return self.map_row_to_col(rows)
+
+    def preprocess(self, row) -> Trajectory:
+        messages = [Message(role=message['role'], content=message['content']) for message in row['prompt']]
+        ground_truth = str(row['reward_model']['ground_truth'])
+        return Trajectory(messages=messages, user_data=[('ground_truth', ground_truth)])

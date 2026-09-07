@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Per-deployment ``ApplicationSpec`` and typed argument schemas.
 
-Each deployment kind (``server | model | sampler | processor``) carries its
+Each deployment kind (``server | model | sampler | processor | data_plane``) carries its
 own ``args`` block with strict field validation. ``ApplicationSpec`` holds
 the routing metadata plus the deployment kind and validates ``args`` against
 the matching ``*Args`` schema in a model validator.
@@ -59,6 +59,7 @@ class ModelArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
     max_length: int | None = None
+    data_plane_url: str | None = None
 
 
 class SamplerArgs(_ArgsBase):
@@ -71,9 +72,10 @@ class SamplerArgs(_ArgsBase):
     nproc_per_node: int = 1
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
-    sampler_type: Literal['mock', 'vllm', 'torch']
+    sampler_type: Literal['mock', 'vllm', 'vllm_async', 'torch']
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    data_plane_url: str | None = None
 
 
 class ServerStateArgs(_ArgsBase):
@@ -112,11 +114,18 @@ class ProcessorArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
+class DataPlaneArgs(_ArgsBase):
+    """Args for the TransferQueue-backed client data plane."""
+
+    config: dict[str, Any] | None = None
+
+
 _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
     'server': ServerArgs,
     'model': ModelArgs,
     'sampler': SamplerArgs,
     'processor': ProcessorArgs,
+    'data_plane': DataPlaneArgs,
 }
 
 # ---------- ApplicationSpec ------------------------------------------------ #
@@ -138,12 +147,12 @@ class ApplicationSpec(BaseModel):
 
     name: str
     route_prefix: str = '/'
-    import_path: Literal['server', 'model', 'sampler', 'processor']
+    import_path: Literal['server', 'model', 'sampler', 'processor', 'data_plane']
     # ``args`` is always populated by the ``mode='before'`` validator below
     # (which validates the raw block against the schema selected by
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
     deployments: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode='before')
