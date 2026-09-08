@@ -9,6 +9,14 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
 
+def is_flash_attention_implementation(attn_implementation: Any) -> bool:
+    """Return whether an attention backend belongs to the FlashAttention family."""
+    if not isinstance(attn_implementation, str):
+        return False
+    normalized = attn_implementation.strip().lower().replace('-', '_')
+    return 'flash_attention' in normalized or 'flash_attn' in normalized
+
+
 def align_logps_to_mask(
     ragged: Any,
     mask: 'torch.Tensor',

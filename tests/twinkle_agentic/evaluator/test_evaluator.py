@@ -3,7 +3,7 @@ import os
 import pytest
 
 from twinkle_agentic.evaluator import Evaluator
-from twinkle_agentic.evaluator._contracts import EvaluatorConfigError
+from twinkle_agentic.evaluator.base import EvaluatorConfigError
 
 from .conftest import RecordingAPI, RecordingSampler
 

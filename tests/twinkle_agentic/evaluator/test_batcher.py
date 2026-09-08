@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from twinkle.data_format import SamplingParams
-from twinkle_agentic.evaluator._batcher import SamplerBatcher
+from twinkle_agentic.evaluator.batcher import SamplerBatcher
 
 from .conftest import RecordingSampler
 

@@ -17,7 +17,7 @@ from hypothesis import strategies as st
 
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.sampler.app import SAMPLER_SELECTOR
+from twinkle.server.sampler.app import SAMPLER_SELECTOR, _construct_sampler_backend
 from twinkle.server.sampler.backends.mock_sampler import MockSampler
 
 _SAMPLER_TYPES = tuple(SAMPLER_SELECTOR.builders)
@@ -112,6 +112,41 @@ def test_add_adapter_to_sampler(name: str) -> None:
 def test_mock_dispatch_returns_mock_sampler() -> None:
     s = SAMPLER_SELECTOR.construct(SAMPLER_SELECTOR.validate('mock'), {'model_id': 'mid'})
     assert isinstance(s, MockSampler)
+
+
+def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
+    from twinkle_agentic.async_rl import vllm_sampler_tq as module
+
+    captured = {}
+
+    def construct(**kwargs):
+        captured.update(kwargs)
+        return 'vllm-tq'
+
+    monkeypatch.setattr(module, 'VLLMSamplerTQ', construct)
+
+    sampler = _construct_sampler_backend(
+        'vllm_async',
+        {'model_id': 'local-model'},
+        None,
+    )
+
+    assert sampler == 'vllm-tq'
+    assert captured == {'model_id': 'local-model', 'context_manager': None}
+
+
+def test_standard_vllm_is_independent_of_data_plane(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        SAMPLER_SELECTOR,
+        'construct',
+        lambda sampler_type, kwargs: calls.append((sampler_type, kwargs)) or 'standard-vllm',
+    )
+
+    sampler = _construct_sampler_backend('vllm', {'model_id': 'local-model'}, 'http://data-plane')
+
+    assert sampler == 'standard-vllm'
+    assert calls == [('vllm', {'model_id': 'local-model'})]
 
 
 @settings(max_examples=100)

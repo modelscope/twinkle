@@ -4,8 +4,8 @@ from evalscope.api.messages import ChatMessageAssistant, ChatMessageTool, ChatMe
 from evalscope.api.model import GenerateConfig, Model
 from evalscope.api.tool import ToolInfo, ToolParams
 
-from twinkle_agentic.evaluator._contracts import BackendContractError, UnsupportedCapabilityError
-from twinkle_agentic.evaluator._evalscope_adapter import ProtocolModelAPI, SamplerModelAPI, to_twinkle_trajectory
+from twinkle_agentic.evaluator.base import BackendContractError, UnsupportedCapabilityError
+from twinkle_agentic.evaluator.evalscope_adapter import ProtocolModelAPI, SamplerModelAPI, to_twinkle_trajectory
 
 from .conftest import RecordingAPI, RecordingSampler, ToolTemplate
 

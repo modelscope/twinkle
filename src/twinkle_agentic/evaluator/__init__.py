@@ -1,6 +1,6 @@
 """EvalScope-backed evaluation for Twinkle Agentic backends."""
 
-from ._contracts import BackendContractError, EvaluatorConfigError, SamplerBatchError, UnsupportedCapabilityError
+from .base import BackendContractError, EvaluatorConfigError, SamplerBatchError, UnsupportedCapabilityError
 from .evaluator import Evaluator
 
 __all__ = [

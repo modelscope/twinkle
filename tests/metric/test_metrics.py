@@ -271,6 +271,26 @@ class TestDPOMetric:
         assert 'rewards/chosen' in result
         assert 'rewards/accuracies' in result
 
+    def test_dpo_metric_accepts_json_ref_logps(self):
+        labels = torch.tensor([[1, 2, -100], [3, 4, -100]])
+        logps = torch.randn(2, 3)
+        ref_logps = torch.randn(2, 3)
+        tensor_metric = _no_dist_metric(DPOMetric, beta=0.1)
+        json_metric = _no_dist_metric(DPOMetric, beta=0.1)
+
+        tensor_metric.accumulate(
+            {'labels': labels},
+            {'logps': logps},
+            ref_outputs={'logps': ref_logps},
+        )
+        json_metric.accumulate(
+            {'labels': labels},
+            {'logps': logps},
+            ref_outputs={'logps': ref_logps.tolist()},
+        )
+
+        assert json_metric.calculate() == pytest.approx(tensor_metric.calculate())
+
     def test_dpo_metric_no_logps_skips(self):
         m = _no_dist_metric(DPOMetric, beta=0.1)
         m.accumulate({'labels': torch.tensor([[1, 2]])}, {})

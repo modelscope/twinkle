@@ -2,29 +2,42 @@
 
 import json
 from copy import deepcopy
+from evalscope.api.messages import ChatMessageAssistant, ContentReasoning, ContentText
+from evalscope.api.model import ChatCompletionChoice, GenerateConfig, ModelAPI, ModelOutput
+from evalscope.api.model.model_output import Logprob, Logprobs, ModelUsage, TopLogprob, as_stop_reason
+from evalscope.api.tool import ToolCall, ToolFunction
 from threading import Lock
 from time import monotonic
 from typing import Any, Mapping, Sequence
 
-from evalscope.api.messages import (ChatMessageAssistant, ContentReasoning, ContentText)
-from evalscope.api.model import (ChatCompletionChoice, GenerateConfig, ModelAPI, ModelOutput)
-from evalscope.api.model.model_output import Logprob, Logprobs, ModelUsage, TopLogprob, as_stop_reason
-from evalscope.api.tool import ToolCall, ToolFunction
-
 from twinkle.data_format import SamplingParams
 from twinkle_agentic.protocol.openai import OpenAI
-
-from ._batcher import SamplerBatcher
-from ._contracts import BackendContractError, UnsupportedCapabilityError, read_value
-
+from .base import BackendContractError, UnsupportedCapabilityError, read_value
+from .batcher import SamplerBatcher
 
 _COMMON_FIELDS = {
-    'max_tokens', 'seed', 'stop_seqs', 'temperature', 'top_k', 'top_p', 'repetition_penalty', 'n', 'logprobs',
+    'max_tokens',
+    'seed',
+    'stop_seqs',
+    'temperature',
+    'top_k',
+    'top_p',
+    'repetition_penalty',
+    'n',
+    'logprobs',
     'top_logprobs',
 }
 _OPENAI_FIELDS = {
-    'timeout', 'frequency_penalty', 'presence_penalty', 'logit_bias',
-    'parallel_tool_calls', 'reasoning_effort', 'reasoning_summary', 'extra_body', 'extra_query', 'extra_headers',
+    'timeout',
+    'frequency_penalty',
+    'presence_penalty',
+    'logit_bias',
+    'parallel_tool_calls',
+    'reasoning_effort',
+    'reasoning_summary',
+    'extra_body',
+    'extra_query',
+    'extra_headers',
 }
 
 
@@ -52,7 +65,10 @@ def _tool_call_to_twinkle(tool_call: Any) -> dict[str, Any]:
     return {
         'id': read_value(tool_call, 'id'),
         'type': read_value(tool_call, 'type', 'function') or 'function',
-        'function': {'name': read_value(function, 'name'), 'arguments': deepcopy(arguments)},
+        'function': {
+            'name': read_value(function, 'name'),
+            'arguments': deepcopy(arguments)
+        },
     }
 
 
@@ -110,8 +126,14 @@ def _normalize_tool_calls(raw_calls: Any, request_id: int, choice_index: int) ->
     return calls
 
 
-def _assistant_choice(raw: Any, *, model: str, request_id: int, choice_index: int, decoded: str | None = None,
-                      stop_reason: str | None = None, logprobs: Logprobs | None = None) -> ChatCompletionChoice:
+def _assistant_choice(raw: Any,
+                      *,
+                      model: str,
+                      request_id: int,
+                      choice_index: int,
+                      decoded: str | None = None,
+                      stop_reason: str | None = None,
+                      logprobs: Logprobs | None = None) -> ChatCompletionChoice:
     content = read_value(raw, 'content', decoded if decoded is not None else '')
     reasoning = read_value(raw, 'reasoning_content')
     calls = read_value(raw, 'tool_calls')
@@ -135,7 +157,8 @@ def _sequence_logprobs(sequence: Any, template: Any) -> Logprobs | None:
         return None
     tokens = read_value(sequence, 'tokens')
     if not isinstance(tokens, Sequence) or len(values) != len(tokens) or template is None:
-        raise UnsupportedCapabilityError('Exact token logprobs require token ids, aligned logprobs, and a template decoder')
+        raise UnsupportedCapabilityError(
+            'Exact token logprobs require token ids, aligned logprobs, and a template decoder')
     result: list[Logprob] = []
     for token_id, position in zip(tokens, values):
         if not position:
@@ -148,6 +171,7 @@ def _sequence_logprobs(sequence: Any, template: Any) -> Logprobs | None:
 
 
 class _BaseModelAPI(ModelAPI):
+
     def __init__(self, model_id: str, explicit_generation_keys: set[str]) -> None:
         super().__init__(model_name=model_id)
         self._explicit_generation_keys = set(explicit_generation_keys)
@@ -172,8 +196,8 @@ class _BaseModelAPI(ModelAPI):
         if is_openai and 'repetition_penalty' in self._explicit_generation_keys:
             extra = config.extra_body or {}
             if extra.get('repetition_penalty') != config.repetition_penalty:
-                raise UnsupportedCapabilityError(
-                    'protocol.OpenAI cannot map repetition_penalty exactly; pass the same value in extra_body or omit it')
+                raise UnsupportedCapabilityError('protocol.OpenAI cannot map repetition_penalty exactly; '
+                                                 'pass the same value in extra_body or omit it')
             repetition = 1.0
         return SamplingParams(
             max_tokens=config.max_tokens,
@@ -200,6 +224,7 @@ class _BaseModelAPI(ModelAPI):
 
 
 class ProtocolModelAPI(_BaseModelAPI):
+
     def __init__(self, api: Any, model_id: str, explicit_generation_keys: set[str]) -> None:
         super().__init__(model_id, explicit_generation_keys)
         self.api = api
@@ -242,17 +267,24 @@ class ProtocolModelAPI(_BaseModelAPI):
         if not choices_raw:
             raise BackendContractError(f'API {type(self.api).__name__} returned no choices for {self.model_name}')
         if any(not isinstance(item, Mapping) for item in choices_raw):
-            raise BackendContractError(f'API {type(self.api).__name__} returned a non-message choice for {self.model_name}')
-        choices = [_assistant_choice(
-            item, model=self.model_name, request_id=request_id, choice_index=index,
-            stop_reason=read_value(item, 'finish_reason'),
-        ) for index, item in enumerate(choices_raw)]
+            raise BackendContractError(
+                f'API {type(self.api).__name__} returned a non-message choice for {self.model_name}')
+        choices = [
+            _assistant_choice(
+                item,
+                model=self.model_name,
+                request_id=request_id,
+                choice_index=index,
+                stop_reason=read_value(item, 'finish_reason'),
+            ) for index, item in enumerate(choices_raw)
+        ]
         return ModelOutput(model=self.model_name, choices=choices, time=elapsed)
 
 
 class SamplerModelAPI(_BaseModelAPI):
-    def __init__(self, sampler: Any, model_id: str, template: Any, explicit_generation_keys: set[str], *, batch_size: int,
-                 batch_wait_ms: float, sampler_kwargs: Mapping[str, Any]) -> None:
+
+    def __init__(self, sampler: Any, model_id: str, template: Any, explicit_generation_keys: set[str], *,
+                 batch_size: int, batch_wait_ms: float, sampler_kwargs: Mapping[str, Any]) -> None:
         super().__init__(model_id, explicit_generation_keys)
         self.sampler = sampler
         self.template = template
@@ -287,7 +319,8 @@ class SamplerModelAPI(_BaseModelAPI):
             messages = read_value(feature, 'messages', []) if feature is not None else []
             structured = messages[-1] if messages and read_value(messages[-1], 'role') == 'assistant' else None
             if decoded is None and structured is None:
-                raise BackendContractError(f'Sampler response sequence {index} has neither decoded text nor assistant message')
+                raise BackendContractError(
+                    f'Sampler response sequence {index} has neither decoded text nor assistant message')
             raw = dict(structured) if isinstance(structured, Mapping) else {}
             if not raw:
                 raw['content'] = decoded
@@ -295,26 +328,29 @@ class SamplerModelAPI(_BaseModelAPI):
                 raw['content'] = decoded or ''
             if tools and tool_choice != 'none' and not raw.get('tool_calls'):
                 if self.template is None or not hasattr(self.template, 'parse_tool_call'):
-                    raise UnsupportedCapabilityError('Sampler tool calls require structured output or template.parse_tool_call()')
+                    raise UnsupportedCapabilityError(
+                        'Sampler tool calls require structured output or template.parse_tool_call()')
                 parsed = self.template.parse_tool_call(decoded or '')
                 if parsed:
                     raw['tool_calls'] = parsed
-            choices.append(_assistant_choice(
-                raw,
-                model=self.model_name,
-                request_id=request_id,
-                choice_index=index,
-                decoded=decoded,
-                stop_reason=stop_reason,
-                logprobs=_sequence_logprobs(sequence, self.template)
-                if 'top_logprobs' in self._explicit_generation_keys else None,
-            ))
+            choices.append(
+                _assistant_choice(
+                    raw,
+                    model=self.model_name,
+                    request_id=request_id,
+                    choice_index=index,
+                    decoded=decoded,
+                    stop_reason=stop_reason,
+                    logprobs=_sequence_logprobs(sequence, self.template)
+                    if 'top_logprobs' in self._explicit_generation_keys else None,
+                ))
         prompt_ids = read_value(response, 'prompt_token_ids')
         output_tokens = sum(len(read_value(sequence, 'tokens', []) or []) for sequence in sequences)
         input_tokens = len(prompt_ids) if prompt_ids is not None else 0
         return ModelOutput(
             model=self.model_name,
             choices=choices,
-            usage=ModelUsage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=input_tokens + output_tokens),
+            usage=ModelUsage(
+                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=input_tokens + output_tokens),
             time=elapsed,
         )

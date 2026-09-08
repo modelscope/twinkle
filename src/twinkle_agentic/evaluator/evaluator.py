@@ -6,12 +6,18 @@ from threading import Lock
 from typing import Any, Mapping, Sequence
 
 from twinkle_agentic.protocol.base import API
-
-from ._contracts import EvaluatorConfigError
-
+from .base import EvaluatorConfigError
 
 _OWNED_TASK_KEYS = {
-    'model', 'model_id', 'datasets', 'eval_type', 'eval_backend', 'model_task', 'api_url', 'api_key', 'model_args',
+    'model',
+    'model_id',
+    'datasets',
+    'eval_type',
+    'eval_backend',
+    'model_task',
+    'api_url',
+    'api_key',
+    'model_args',
 }
 
 
@@ -79,9 +85,11 @@ class Evaluator:
         self._template = template if sampler is not None else None
         if self._template is None and sampler is not None:
             self._template = getattr(sampler, 'template', None)
-        inferred = model_id or getattr(sampler, 'model_id', None) or getattr(api, 'model', None) or getattr(api, 'model_name', None)
+        inferred = model_id or getattr(sampler, 'model_id', None) or getattr(api, 'model', None) or getattr(
+            api, 'model_name', None)
         if not isinstance(inferred, str) or not inferred.strip():
-            raise EvaluatorConfigError('model_id is required when it cannot be inferred from sampler.model_id or api.model')
+            raise EvaluatorConfigError(
+                'model_id is required when it cannot be inferred from sampler.model_id or api.model')
         self._model_id = inferred
         self._sampler_batch_size = sampler_batch_size or self._task_config.get('eval_batch_size', 8)
         if not isinstance(self._sampler_batch_size, int) or self._sampler_batch_size < 1:
@@ -109,12 +117,14 @@ class Evaluator:
         batcher = None
         try:
             try:
-                from ._evalscope_adapter import ProtocolModelAPI, SamplerModelAPI
                 from evalscope.config import TaskConfig
                 from evalscope.constants import EvalBackend, EvalType
                 from evalscope.run import run_task
+
+                from .evalscope_adapter import ProtocolModelAPI, SamplerModelAPI
             except ImportError as exc:
-                raise ImportError("Evaluator requires EvalScope. Install it with:\n  pip install 'twinkle-kit[eval]'") from exc
+                raise ImportError(
+                    "Evaluator requires EvalScope. Install it with:\n  pip install 'twinkle-kit[eval]'") from exc
             if self._api is not None:
                 adapter = ProtocolModelAPI(self._api, self._model_id, self._generation_keys)
             else:

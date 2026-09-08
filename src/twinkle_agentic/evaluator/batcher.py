@@ -8,8 +8,7 @@ from time import monotonic
 from typing import Any, Hashable, Mapping
 
 from twinkle.data_format import SamplingParams, Trajectory
-
-from ._contracts import BackendContractError, SamplerBatchError
+from .base import BackendContractError, SamplerBatchError
 
 
 def _freeze(value: Any) -> Hashable:
@@ -102,11 +101,12 @@ class SamplerBatcher:
         physical_size = max(len(inputs), self._minimum_physical_batch_size())
         physical_inputs = inputs + [inputs[-1]] * (physical_size - len(inputs))
         try:
-            responses = list(self._sampler.sample(
-                physical_inputs,
-                sampling_params=requests[0].sampling_params,
-                **requests[0].sampler_kwargs,
-            ))
+            responses = list(
+                self._sampler.sample(
+                    physical_inputs,
+                    sampling_params=requests[0].sampling_params,
+                    **requests[0].sampler_kwargs,
+                ))
             if len(responses) != physical_size:
                 raise BackendContractError(
                     f'Sampler returned {len(responses)} responses for physical batch size {physical_size}')

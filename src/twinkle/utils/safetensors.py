@@ -1,7 +1,9 @@
 import json
+import numpy as np
 import os
+import torch
 from functools import partial
-from typing import Literal
+from typing import Any, Literal
 
 from .device_mesh import is_last_rank, is_master
 
@@ -17,6 +19,74 @@ class LazyTensor:
         if self.tensor is None:
             return self.loader()
         return self.tensor
+
+
+_STATE_TYPE = '__twinkle_state_type__'
+
+
+def save_state_dict(state: Any, path: str) -> None:
+    """Safely persist a nested checkpoint state without pickle serialization."""
+    from safetensors.torch import save_file
+
+    tensors = {}
+    manifest = _encode_state(state, tensors)
+    save_file(tensors, path)
+    with open(f'{path}.json', 'w') as f:
+        json.dump(manifest, f, separators=(',', ':'))
+
+
+def load_state_dict(path: str) -> Any:
+    """Load a checkpoint written by :func:`save_state_dict`."""
+    from safetensors.torch import load_file
+
+    with open(f'{path}.json') as f:
+        manifest = json.load(f)
+    return _decode_state(manifest, load_file(path, device='cpu'))
+
+
+def _encode_state(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
+    if isinstance(value, torch.Tensor):
+        name = f'tensor_{len(tensors)}'
+        tensors[name] = value.detach().cpu().contiguous().clone()
+        return {_STATE_TYPE: 'tensor', 'name': name}
+    if isinstance(value, np.ndarray):
+        name = f'tensor_{len(tensors)}'
+        tensors[name] = torch.from_numpy(value).contiguous().clone()
+        return {_STATE_TYPE: 'ndarray', 'name': name, 'dtype': value.dtype.str}
+    if isinstance(value, np.generic):
+        return {_STATE_TYPE: 'numpy_scalar', 'dtype': value.dtype.str, 'value': value.item()}
+    if isinstance(value, dict):
+        return {
+            _STATE_TYPE: 'dict',
+            'items': [[_encode_state(k, tensors), _encode_state(v, tensors)] for k, v in value.items()]
+        }
+    if isinstance(value, tuple):
+        return {_STATE_TYPE: 'tuple', 'items': [_encode_state(v, tensors) for v in value]}
+    if isinstance(value, list):
+        return {_STATE_TYPE: 'list', 'items': [_encode_state(v, tensors) for v in value]}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f'Unsupported checkpoint value type: {type(value).__name__}')
+
+
+def _decode_state(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
+    if not isinstance(value, dict) or _STATE_TYPE not in value:
+        return value
+
+    value_type = value[_STATE_TYPE]
+    if value_type == 'tensor':
+        return tensors[value['name']]
+    if value_type == 'ndarray':
+        return tensors[value['name']].numpy().astype(np.dtype(value['dtype']), copy=False)
+    if value_type == 'numpy_scalar':
+        return np.dtype(value['dtype']).type(value['value'])
+    if value_type == 'dict':
+        return {_decode_state(k, tensors): _decode_state(v, tensors) for k, v in value['items']}
+    if value_type == 'tuple':
+        return tuple(_decode_state(v, tensors) for v in value['items'])
+    if value_type == 'list':
+        return [_decode_state(v, tensors) for v in value['items']]
+    raise ValueError(f'Unknown checkpoint value type: {value_type}')
 
 
 class SafetensorLazyLoader:

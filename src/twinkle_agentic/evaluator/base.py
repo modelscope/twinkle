@@ -23,12 +23,14 @@ class SamplerBatchError(RuntimeError):
 
 @runtime_checkable
 class SamplerLike(Protocol):
+
     def sample(
         self,
         inputs: list[Trajectory],
         sampling_params: SamplingParams | Mapping[str, Any],
         **kwargs: Any,
-    ) -> Sequence[Any]: ...
+    ) -> Sequence[Any]:
+        ...
 
 
 def read_value(value: Any, name: str, default: Any = None) -> Any:

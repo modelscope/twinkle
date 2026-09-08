@@ -116,6 +116,11 @@ class NativeFSDPStrategy:
         if self.device_mesh is None:
             return model, optimizer
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
+        if fsdp_mesh is None:
+            # FSDP has nothing to shard with a single rank, but callers still
+            # expect the native strategy to place the model on the worker's
+            # local device before CUDA inputs reach it.
+            model = model.to(torch.device(Platform.get_local_device()))
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 

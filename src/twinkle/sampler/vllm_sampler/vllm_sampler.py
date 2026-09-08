@@ -269,6 +269,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     logprobs=seq.logprobs,
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
+                    sampling_mask=seq.sampling_mask,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(
@@ -485,6 +486,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 self.engine.invalidate_synced_lora()
 
         self._run_in_loop(_receive_and_load())
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Unload policy snapshots from vLLM and clear cached requests."""
+        self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def load_full_weights_from_path(self, path: str) -> int:

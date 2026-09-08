@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Characterization tests for the four App_Builders.
+"""Characterization tests for the component App_Builders.
 
 These freeze the externally observable behavior of ``build_gateway_app``,
-``build_model_app``, ``build_sampler_app`` and ``build_processor_app`` BEFORE
+``build_model_app``, ``build_sampler_app``, ``build_processor_app``, and the
+DataPlane builder. The original four were captured before
 the Shared_App_Scaffold is extracted, so the extraction can be shown to be
 behavior-preserving. For each builder they assert, as fixed expectations:
 
@@ -15,7 +16,7 @@ behavior-preserving. For each builder they assert, as fixed expectations:
    stack is wired in front of the routes;
 3. the **bound deployment** identified by the name passed to ``serve.deployment``
    (``GatewayServer``, ``ModelManagement``, ``SamplerManagement``,
-   ``ProcessorManagement``).
+   ``ProcessorManagement``, ``DataPlaneManagement``).
 
 They MUST NOT assert internal object identity or internal middleware-stack
 structure. They are built by capturing the FastAPI app the builder
@@ -185,6 +186,29 @@ def test_processor_builder_characterization(monkeypatch) -> None:
     assert _route_set(res.app) == _baseline_route_set('processor')
     _assert_auth_middleware_effect(res.app)
     _assert_middleware_lifo_order(res.app, expect_cleanup=False)
+
+
+def test_data_plane_builder_characterization(monkeypatch) -> None:
+    from twinkle.server.data_plane import app as data_plane_mod
+
+    res = _capture_builder(
+        monkeypatch,
+        data_plane_mod.build_data_plane_app,
+        deploy_options={},
+    )
+    assert res.deployment_name == 'DataPlaneManagement'
+    assert _route_set(res.app) == _baseline_route_set('data_plane')
+    _assert_auth_middleware_effect(res.app)
+    _assert_middleware_lifo_order(res.app, expect_cleanup=False)
+
+
+def test_data_plane_builder_rejects_multiple_replicas() -> None:
+    from twinkle.server.data_plane import app as data_plane_mod
+
+    with pytest.raises(ValueError, match='exactly one replica'):
+        data_plane_mod.build_data_plane_app(
+            deploy_options={'num_replicas': 2},
+        )
 
 
 # ----- black-box middleware-effect oracle ---------------------------------- #

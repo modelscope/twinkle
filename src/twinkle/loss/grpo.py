@@ -32,15 +32,24 @@ class GRPOLoss(Loss):
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
+        enable_sampling_replay: bool = False,
         **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
         self.entropy_coef = entropy_coef
+        self.enable_sampling_replay = enable_sampling_replay
+        if enable_sampling_replay and beta != 0.0:
+            raise ValueError('sampling replay does not support a GRPO KL penalty (beta must be 0)')
+        if enable_sampling_replay and entropy_coef != 0.0:
+            raise ValueError('sampling replay does not support a GRPO entropy bonus')
         # Gate the expensive entropy compute path in the model forward.
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
+
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
 
     def _compute_log_importance_weights(
         self,
@@ -222,6 +231,9 @@ class GRPOLoss(Loss):
             **kwargs: Additional arguments
         """
         import torch
+        if self.enable_sampling_replay:
+            if old_logps is None:
+                raise ValueError('old_logps are required when sampling replay is enabled')
         labels = inputs.get('labels')
         assert labels is not None, "inputs must contain 'labels'"
         if not torch.is_tensor(labels):
@@ -230,6 +242,8 @@ class GRPOLoss(Loss):
             labels = labels.unsqueeze(0)
 
         logps = outputs.get('logps')
+        if self.enable_sampling_replay and logps is None:
+            raise RuntimeError('sampling replay logps must be computed by the model forward')
         loss_mask = (labels != self.ignore_index).bool()
         if logps is None:
             logits = outputs.get('logits')
@@ -400,6 +414,19 @@ class CISPOLoss(GRPOLoss):
     Clamps the IS weight and uses policy gradient.
     """
 
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
+
     def _compute_per_token_loss(
         self,
         ratio: 'torch.Tensor',
@@ -430,6 +457,19 @@ class BNPOLoss(GRPOLoss):
 
     Normalizes by total completion tokens across batch.
     """
+
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
 
     def _aggregate_loss(
         self,

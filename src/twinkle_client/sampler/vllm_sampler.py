@@ -1,9 +1,12 @@
+import asyncio
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature, SamplingParams
+from twinkle_client.common.json_utils import json_safe
+from twinkle_client.types.component import DataRef
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -18,17 +21,7 @@ def _json_safe(obj: Any) -> Any:
     duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
     honouring the CPU-only client contract noted above.
     """
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(x) for x in obj]
-    tolist = getattr(obj, 'tolist', None)
-    if callable(tolist) and not isinstance(obj, (str, bytes, int, float, bool)):
-        try:
-            return _json_safe(tolist())
-        except Exception:
-            return obj
-    return obj
+    return json_safe(obj)
 
 
 class vLLMSampler:
@@ -42,6 +35,8 @@ class vLLMSampler:
         """Create the sampler instance on server."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
+        from twinkle_client.data_plane import DataPlaneClient
+        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None))
 
         self.adapter_name = None
         if '://' in model_id:
@@ -88,15 +83,10 @@ class vLLMSampler:
         """
         if isinstance(sampling_params, SamplingParams):
             sampling_params = asdict(sampling_params)
-        elif sampling_params is not None:
-            sampling_params = dict(sampling_params)
-        if num_samples != 1:
-            if sampling_params is None:
-                sampling_params = {'num_samples': num_samples}
-            elif sampling_params.get('num_samples', num_samples) != num_samples:
-                raise ValueError('num_samples conflicts with sampling_params.num_samples')
-            else:
-                sampling_params['num_samples'] = num_samples
+        else:
+            sampling_params = dict(sampling_params or {})
+        if num_samples != 1 and sampling_params.setdefault('num_samples', num_samples) != num_samples:
+            raise ValueError('num_samples conflicts with sampling_params.num_samples')
         json_data = {
             'inputs': _json_safe(inputs),
             'sampling_params': _json_safe(sampling_params),
@@ -111,6 +101,84 @@ class vLLMSampler:
         )
         response.raise_for_status()
         return [SampleResponseModel(**r) for r in response.json()['samples']]
+
+    def sample_to_data_plane(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature], DataRef],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        *,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        policy_version: int | None = None,
+        group_ids: list[str] | None = None,
+        num_samples: int = 1,
+    ) -> DataRef:
+        """Generate complete prompt groups and keep their rows in the server DataPlane."""
+        body = {
+            'sampling_params': sampling_params,
+            'adapter_name': adapter_name,
+            'adapter_uri': adapter_uri,
+            'policy_version': policy_version,
+            'group_ids': group_ids,
+            'num_samples': num_samples,
+        }
+        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
+            inputs.model_dump() if isinstance(inputs, DataRef) else _json_safe(inputs))
+        response = http_post(
+            url=f'{self.server_url}/sample_to_data_plane',
+            json_data=json_safe(body),
+        )
+        response.raise_for_status()
+        return DataRef(**response.json())
+
+    async def asample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        num_samples: int = 1,
+    ) -> List[SampleResponseModel]:
+        """Asynchronous convenience wrapper for the materialized sample API."""
+        return await asyncio.to_thread(
+            self.sample,
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            num_samples=num_samples,
+        )
+
+    async def asample_to_data_plane(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature], DataRef],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        *,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        policy_version: int | None = None,
+        group_ids: list[str] | None = None,
+        num_samples: int = 1,
+    ) -> DataRef:
+        """Asynchronously sample and return the opaque server-side result reference."""
+        return await asyncio.to_thread(
+            self.sample_to_data_plane,
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            policy_version=policy_version,
+            group_ids=group_ids,
+            num_samples=num_samples,
+        )
+
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Evict policy snapshots that are no longer referenced by this client."""
+        response = http_post(
+            url=f'{self.server_url}/unload_adapter_paths',
+            json_data={'adapter_paths': adapter_paths},
+        )
+        response.raise_for_status()
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
