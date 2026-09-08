@@ -45,26 +45,20 @@ VLLM_LORA_PATH = 'twinkle_lora_path'
 
 
 def _rebuild_ipc(handle, device_id: Optional[int] = None) -> torch.Tensor:
-    """Rebuild CUDA tensor from IPC handle."""
-    from torch.multiprocessing.reductions import rebuild_cuda_tensor
-
+    """Rebuild an accelerator tensor from an IPC reducer handle."""
     func, args = handle
     list_args = list(args)
     if device_id is not None:
         list_args[6] = device_id
-
-    if callable(func):
-        return func(*list_args)
-    else:
-        return rebuild_cuda_tensor(*list_args)
+    return func(*list_args)
 
 
 def _ipc_handle_signature(handle) -> Optional[tuple]:
-    """Derive a stable signature for a CUDA IPC handle.
+    """Derive a stable signature for an accelerator IPC handle.
 
     ``reduce_tensor`` returns ``(func, args)`` where ``args`` contains the
-    CUDA IPC storage handle bytes, storage size, ref-counter handle, etc.
-    Two handles are equivalent (i.e. map the same CUDA memory region) when
+    IPC storage handle bytes, storage size, ref-counter handle, etc.
+    Two handles are equivalent (i.e. map the same device memory region) when
     these inner fields match. We hash only the parts that are picklable and
     comparable to avoid accidental mismatches due to local objects.
     """
@@ -127,12 +121,12 @@ class TwinkleWorkerExtension:
         use_shm: bool = False,
         zmq_handle: Optional[str] = None,
     ) -> None:
-        """Receive and load weights via ZMQ + CUDA IPC/SHM.
+        """Receive and load weights via ZMQ + device IPC/SHM.
 
         Called via ``collective_rpc("update_weights_from_ipc", ...)`` from
         :meth:`VLLMEngine.update_weights`.  The VLLMEngine sends weights
-        in buckets over a ZMQ REQ/REP channel backed by CUDA IPC (GPU
-        tensors) or shared memory (CPU tensors).
+        in buckets over a ZMQ REQ/REP channel backed by device IPC
+        (accelerator tensors) or shared memory (CPU tensors).
 
         For TP > 1, only TP rank 0 communicates with the VLLMEngine over
         ZMQ.  It broadcasts the IPC handle and bucket metadata to other
@@ -142,7 +136,7 @@ class TwinkleWorkerExtension:
         Args:
             peft_config: If provided with base_sync_done, loads as LoRA.
             base_sync_done: If True and peft_config, replaces existing LoRA.
-            use_shm: If True, use shared memory instead of CUDA IPC.
+            use_shm: If True, use shared memory instead of device IPC.
             zmq_handle: Optional ZMQ IPC endpoint. If None, uses _get_zmq_handle().
         """
         import torch.distributed as dist
@@ -196,6 +190,10 @@ class TwinkleWorkerExtension:
         # ── Step 2: Receive and broadcast IPC/SHM handle ──
         buffer, shm = None, None
 
+        if not use_shm and self.device.type == 'npu':
+            # Register the NPU reducer before recv_pyobj() unpickles its callable.
+            import torch_npu  # noqa: F401
+
         if is_driver:
             try:
                 comm_metadata = socket.recv_pyobj()
@@ -210,9 +208,9 @@ class TwinkleWorkerExtension:
         if not use_shm:
             handle = comm_metadata
             # All TP ranks rebuild the IPC buffer from the same handle.
-            # CUDA IPC allows any process on the same node to map the memory.
+            # Device IPC allows any process on the same node to map the memory.
             # Reuse a cached buffer across syncs when the sender reuses the
-            # same IPC handle: this avoids creating a fresh CUDA IPC mapping
+            # same IPC handle: this avoids creating a fresh device IPC mapping
             # per sync, which the driver releases lazily and is the root
             # cause of the apparent GPU memory growth under frequent syncs.
             handle_signature = _ipc_handle_signature(handle)

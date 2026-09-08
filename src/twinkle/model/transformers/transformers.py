@@ -382,6 +382,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return next(iter(self.optimizer_group))
         return self.active_group
 
+    def __repr__(self) -> str:
+        # nn.Module.__repr__ dumps the full tree; RayTaskError interpolates actor repr
+        # into the exception string and that dump swallows the real traceback.
+        return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
+
     @staticmethod
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)

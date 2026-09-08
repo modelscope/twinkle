@@ -127,8 +127,6 @@ class CheckpointEngineManager:
 
         platform_name = Platform.get_platform(platform).__name__
         if mode == 'colocate':
-            if platform_name != 'GPU':
-                raise NotImplementedError("mode='colocate' currently requires the GPU platform.")
             from twinkle.checkpoint_engine import IPCCheckpointEngine
             return IPCCheckpointEngine
         if mode != 'standalone':
@@ -166,8 +164,8 @@ class CheckpointEngineManager:
             self._sync_weights_naive(merge_and_sync)
             return
 
-        is_master = [True] + [False] * (self.model.device_mesh.world_size - 1)
-        model_metadata = self.model.prepare_checkpoint_engine(is_master)
+        model_metadata = self.model.prepare_checkpoint_engine([True]
+                                                              + [False] * (self.model.device_mesh.world_size - 1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             self.model.device_mesh.world_size,
