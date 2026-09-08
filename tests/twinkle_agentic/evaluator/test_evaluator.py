@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from twinkle.data_format import SampleResponse, SampledSequence
 from twinkle_agentic.evaluator import Evaluator
 from twinkle_agentic.evaluator.base import EvaluatorConfigError
 
@@ -84,12 +85,21 @@ def test_path_like_model_id_stays_inside_work_dir(monkeypatch, recording_sampler
 @pytest.mark.parametrize('backend', ['api', 'sampler'])
 def test_offline_native_evalscope_run(tmp_path, recording_api, recording_sampler, backend):
     dataset = tmp_path / 'questions.jsonl'
-    dataset.write_text('{"question": "Say ok", "answer": "ok"}\n', encoding='utf-8')
+    dataset.write_text('{"question": "Choose A", "A": "yes", "B": "no", "answer": "A"}\n', encoding='utf-8')
+    recording_api.response = {'role': 'assistant', 'content': 'A', 'finish_reason': 'stop'}
+
+    def sample_a(inputs, sampling_params, **kwargs):
+        recording_sampler.calls.append((list(inputs), sampling_params, kwargs))
+        return [
+            SampleResponse(sequences=[SampledSequence(stop_reason='stop', tokens=[1], decoded='A')]) for _ in inputs
+        ]
+
+    recording_sampler.sample = sample_a
     kwargs = {'api': recording_api} if backend == 'api' else {'sampler': recording_sampler}
     evaluator = Evaluator(
-        datasets=['general_qa'],
+        datasets=['general_mcq'],
         task_config={
-            'dataset_args': {'general_qa': {'local_path': str(dataset)}},
+            'dataset_args': {'general_mcq': {'local_path': str(dataset)}},
             'dataset_hub': 'Local',
             'work_dir': str(tmp_path / 'outputs'),
             'no_timestamp': True,
