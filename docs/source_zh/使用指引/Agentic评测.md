@@ -24,6 +24,8 @@ reports = Evaluator(
 ## Sampler
 
 ```python
+from twinkle_agentic.evaluator import Evaluator
+
 reports = Evaluator(
     sampler=sampler,
     datasets=['gsm8k'],
