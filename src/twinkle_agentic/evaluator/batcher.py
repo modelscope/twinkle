@@ -51,7 +51,7 @@ class SamplerBatcher:
         self._condition = Condition()
         self._closed = False
         self._request_id = 0
-        self._worker = Thread(target=self._run, name='twinkle-evaluator-sampler-batcher', daemon=False)
+        self._worker = Thread(target=self._run, name='twinkle-evaluator-sampler-batcher', daemon=True)
         self._worker.start()
 
     def submit(self, trajectory: Trajectory, sampling_params: SamplingParams) -> Any:

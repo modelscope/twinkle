@@ -1,5 +1,7 @@
 import pytest
 
+pytest.importorskip('evalscope')
+
 from evalscope.api.messages import ChatMessageAssistant, ChatMessageTool, ChatMessageUser, ContentImage, ContentReasoning, ContentText
 from evalscope.api.model import GenerateConfig, Model
 from evalscope.api.tool import ToolInfo, ToolParams
@@ -64,6 +66,7 @@ def test_sampler_parses_tools_and_rejects_forcing():
         {'sequences': [{'stop_reason': 'stop', 'tokens': [1], 'decoded': 'tool'}]} for _ in inputs]
     adapter = SamplerModelAPI(sampler, 's', ToolTemplate(), set(), batch_size=1, batch_wait_ms=0, sampler_kwargs={})
     try:
+        assert adapter.batcher._worker.daemon
         output = Model(adapter, GenerateConfig()).generate([ChatMessageUser(content='x')], tools=[ToolInfo(name='lookup', description='x')])
         assert output.stop_reason == 'tool_calls'
         with pytest.raises(UnsupportedCapabilityError, match='tool_choice'):
