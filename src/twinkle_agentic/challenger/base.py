@@ -11,8 +11,7 @@ things that vary between deployments are all injected:
   rollouts in :mod:`twinkle_agentic.rollout` have that signature already, so a
   challenger can explore *with tools* -- running code, reading files -- while
   it invents, over a local sampler or over an HTTP endpoint alike.
-  :func:`twinkle_agentic.rollout.build_rollout` picks the right one for the
-  backend at hand.
+  :class:`twinkle_agentic.rollout.MultiTurnRollout` accepts either backend.
 * **what counts as a keeper** -- subclasses decide, in :meth:`Challenger.build`.
 * **how hard is hard enough** -- optional. Ask for ``solver_rollouts`` attempts per
   candidate and only tasks the model solves *sometimes* are kept: a task every
@@ -44,8 +43,7 @@ logger = get_logger()
 __all__ = ['Challenger', 'Explorer', 'KeywordPrompts', 'PromptSet']
 
 # A batch of trajectories in, the same trajectories with the model's reply
-# appended out. Both MultiTurnRollout and APIMultiTurnRollout satisfy this
-# as-is; build_rollout() returns whichever fits the backend. Both also accept a
+# appended out. MultiTurnRollout accepts either backend and also accepts a
 # per-call ``sampling_params=`` keyword, which is how the difficulty stage asks
 # for its own temperature and length budget without a second explorer.
 Explorer = Callable[[List[Trajectory]], List[Trajectory]]
@@ -141,9 +139,9 @@ class Challenger(ABC):
 
     Args:
         explorer: takes a batch of trajectories and returns them with the
-            model's reply appended -- a rollout from
-            :func:`twinkle_agentic.rollout.build_rollout`, over a local sampler
-            or over an API endpoint.
+            model's reply appended -- typically a
+            :class:`twinkle_agentic.rollout.MultiTurnRollout` over a local
+            sampler or an API endpoint.
         system: system prompt handed to the model. It carries the output
             contract, which is why ``build`` -- the code that reads that output
             back -- lives in the same subclass.

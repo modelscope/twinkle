@@ -1,6 +1,6 @@
 # Multi-Turn Rollout
 
-The Rollout module provides multi-turn conversation rollout engines for agentic RLHF training. Two implementations are available: `MultiTurnRollout` for batched vLLM sampling and `APIMultiTurnRollout` for OpenAI-compatible API endpoints.
+The Rollout module provides one multi-turn conversation engine for agentic RLHF training. `MultiTurnRollout` can generate each assistant turn with a local sampler, an OpenAI-compatible API, or a callback that chooses between them.
 
 ## Rollout Base Class
 
@@ -19,12 +19,12 @@ All rollouts accept a list of trajectories and return the same number of traject
 
 ## MultiTurnRollout
 
-Batched multi-turn rollout engine that uses a vLLM sampler for generation. All active trajectories are sampled in a single batched call per turn for maximum throughput.
+Multi-turn rollout engine supporting local samplers, external APIs, and per-turn backend selection. Each trajectory runs independently in the rollout thread pool.
 
 ### Per-turn Loop
 
 1. Encode each trajectory into an `InputFeature` with a generation prompt
-2. Batch `sampler.sample(active_pifs)` — all live trajectories in parallel
+2. Call `response_callback(...)` to obtain one `SampledSequence` from the sampler or API
 3. Check termination: `stop_reason == 'length'`, no tool calls, or max turns reached
 4. Dispatch tools via `ToolManager`, append tool responses
 5. Compute bridge tokens (tool turns + generation prompt) with `labels = -100`
@@ -53,8 +53,12 @@ results = rollout(trajectories)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `sampler` | Sampler | vLLM sampler instance for batched generation. |
-| `template` | `Template` | Chat template for encoding/decoding. |
+| `sampler` | Sampler | Local sampler. Used by default when both backends exist. |
+| `api` | `API` | Optional external generation API. |
+| `template` | `Template` | Required local chat template for encoding every backend's output. |
+| `response_callback` | `Callable` | Optional per-turn backend selector returning `SampledSequence`. |
+| `api_appended_as` | `str` | API turns are `demonstration` (SFT only) or `context` (no loss). |
+| `api_kwargs` | `Dict` | Request fields forwarded to each API call. |
 | `tool_manager` | `ToolManager` | Tool dispatcher. Can also be passed per-call. |
 | `sampling_params` | `SamplingParams` | Default sampling parameters. |
 | `max_turns` | `int` | Maximum number of turns per trajectory (default: 6). |
@@ -72,6 +76,7 @@ Each output trajectory dict includes:
 | `messages` | `List[Dict]` | Full conversation including tool turns. |
 | `input_ids` | `List[int]` | Token IDs of the full sequence. |
 | `labels` | `List[int]` | Training labels (`-100` for non-trainable tokens). |
+| `completion_mask` | `List[int]` | Policy-generated positions that carry rollout log probabilities. |
 | `turns` | `int` | Number of turns performed. |
 | `stop_reason` | `str` | `'stop'` / `'length'` |
 | `truncated` | `bool` | Whether the trajectory was cut off rather than concluding on its own: generation hit `max_tokens` (`stop_reason='length'`), the turn limit was reached, or a length cap dropped it. |
@@ -87,54 +92,33 @@ rollout_actor = MultiTurnRollout.remote(sampler=sampler, template=template, ...)
 results = ray.get(rollout_actor.__call__.remote(trajectories))
 ```
 
-## APIMultiTurnRollout
+## API and Mixed-Backend Rollouts
 
-Multi-turn rollout over an OpenAI-compatible chat-completions API. Each trajectory runs independently in a thread pool for network concurrency.
+API-only rollout uses the same class and still requires the local template that tokenizes external replies:
 
 ```python
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
 from twinkle_agentic.protocol.openai import OpenAI
+from twinkle_agentic.rollout import MultiTurnRollout
 
-api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1')
-
-rollout = APIMultiTurnRollout(
-    api=api,
+api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1', concurrency=8)
+rollout = MultiTurnRollout(
+    api,
+    template=template,
     tool_manager=tool_manager,
     sampling_params=SamplingParams(temperature=0.7),
     max_turns=6,
-    concurrency=8,
     trace_dir='api_traces/',
 )
-
 results = rollout(trajectories)
 ```
 
-### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `api` | `OpenAI` | OpenAI-compatible API client. |
-| `tool_manager` | `ToolManager` | Tool dispatcher (single or per-trajectory list). |
-| `sampling_params` | `SamplingParams` | Default sampling parameters. |
-| `max_turns` | `int` | Maximum turns per trajectory (default: 6). |
-| `concurrency` | `int` | Thread pool size for parallel API calls (default: 8). |
-| `extra_body` | `Dict` | Extra fields to include in API requests. |
-| `trace_dir` | `str` | Directory for trace dumps. |
+When both `sampler` and `api` are supplied, the default is the sampler. Pass `response_callback` to choose per turn; it receives both backends and must return one `SampledSequence`. API turns have no rollout log probabilities, so `api_appended_as='demonstration'` includes them in SFT but excludes them from GRPO. Use `'context'` to exclude them from both.
 
 ### Stop Reasons
 
 | Reason | Description |
 |--------|-------------|
 | `stop` | Assistant responded without tool calls (natural end). |
-| `length` | API returned `finish_reason='length'` (token limit). |
-| `max_turns` | Reached `max_turns` limit. |
-| `api_error` | API call or tool execution raised an exception. |
-
-## Choosing Between Rollouts
-
-| Feature | MultiTurnRollout | APIMultiTurnRollout |
-|---------|-----------------|---------------------|
-| **Backend** | vLLM sampler (local GPU) | OpenAI-compatible API |
-| **Training integration** | Produces `input_ids` / `labels` for GRPO | Messages only (for data collection) |
-| **Batching** | GPU-level batch parallelism | Network-level thread concurrency |
-| **Use case** | Online RLHF training loop | Offline data generation / evaluation |
+| `length` | Generation reached its token limit. |
+| `max_turns` | Reached the tool-turn limit without a follow-up. |
+| `generation_error` | The external endpoint failed before returning a valid response. |

@@ -71,10 +71,20 @@ def _require_rollout_logprobs(sample: dict[str, Any], *, sample_key: str) -> lis
         values.append(float(value))
     labels = sample.get('labels')
     if labels is not None:
-        trainable_tokens = sum(1 for label in labels if label != -100)
-        if len(values) != trainable_tokens:
-            raise ValueError(f'rollout sample {sample_key!r} logprobs length must match trainable labels: '
-                             f'{len(values)} != {trainable_tokens}')
+        # Only policy-generated tokens carry a sampling log-prob. A turn written by
+        # an API or a human is trainable yet has none, and is marked
+        # completion_mask=0 -- the same basis GRPOLoss restricts itself to.
+        completion_mask = sample.get('completion_mask')
+        if completion_mask is None:
+            expected = sum(1 for label in labels if label != -100)
+        elif len(completion_mask) != len(labels):
+            raise ValueError(f'rollout sample {sample_key!r} completion_mask length must match labels: '
+                             f'{len(completion_mask)} != {len(labels)}')
+        else:
+            expected = sum(1 for label, flag in zip(labels, completion_mask) if label != -100 and flag)
+        if len(values) != expected:
+            raise ValueError(f'rollout sample {sample_key!r} logprobs length must match policy-generated tokens: '
+                             f'{len(values)} != {expected}')
     return values
 
 

@@ -13,10 +13,14 @@ logger = get_logger()
 # Reasoning block regex covers both <think> and <thinking> forms.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>(.*?)</think(?:ing)?>', re.DOTALL | re.IGNORECASE)
 
-# ── Intent categories (canonical vocabulary lives in intents.py; re-exported) ──
-from .intents import (INTENT_CODE, INTENT_COMPLEX_LOGIC,  # noqa: F401,E402
-                      INTENT_MATH, INTENT_OTHER, INTENT_REASONING,
-                      INTENT_TOOL_CALL, INTENT_USER_DISSATISFACTION)
+# ── Intent categories ─────────────────────────────────────────────────────────
+INTENT_TOOL_CALL = 'tool_call'
+INTENT_CODE = 'code'
+INTENT_MATH = 'math'
+INTENT_COMPLEX_LOGIC = 'complex_logic'
+INTENT_REASONING = 'reasoning'
+INTENT_USER_DISSATISFACTION = 'user_dissatisfaction'
+INTENT_OTHER = 'other'
 
 # ── Heuristic patterns ────────────────────────────────────────────────────────
 _CODE_BLOCK_RE = re.compile(r'```[\s\S]{10,}?```')

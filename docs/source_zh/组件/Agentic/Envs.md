@@ -191,7 +191,7 @@ env.close()
 ```python
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
+from twinkle_agentic.rollout import MultiTurnRollout
 
 env.reset()
 
@@ -200,7 +200,7 @@ env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 
 # 在 rollout 中使用
-rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
+rollout = MultiTurnRollout(api=api, template=template, tool_manager=manager, max_turns=10)
 results = rollout(trajectories)
 ```
 

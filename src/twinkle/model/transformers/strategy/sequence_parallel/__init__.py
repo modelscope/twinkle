@@ -845,7 +845,7 @@ class SequenceParallel:
         """Prepare inputs
 
         1. set extra_kwargs['position_ids']
-        2. split labels
+        2. split labels, and completion_mask when present
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
@@ -863,7 +863,11 @@ class SequenceParallel:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
             labels = inputs.get('labels')
-            _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
+            # completion_mask sits on the labels' index space, so it is padded and
+            # split identically -- unlike loss_scale, which is rolled beforehand.
+            completion_mask = inputs.get('completion_mask')
+            extra_split_values = None if completion_mask is None else [(completion_mask, 0, -1)]
+            _, _, labels, _, _, _, extra_values = self.pad_and_split_inputs(
                 None,
                 None,
                 labels,
@@ -871,8 +875,11 @@ class SequenceParallel:
                 None,
                 None,
                 real_position_ids=real_position_ids,
+                extra_split_values=extra_split_values,
             )
             inputs['labels'] = labels
+            if extra_values:
+                inputs['completion_mask'] = extra_values[0]
         return inputs
 
 
@@ -986,6 +993,19 @@ class SequenceParallelStrategy:
             return torch.cat(pieces, dim=1).contiguous() if pieces else tensor[:, :0].contiguous()
         return tensor[:, :real_position_ids.shape[-1]].contiguous()
 
+    def _gather_completion_mask(self, inputs: Dict[str, Any], real_position_ids) -> None:
+        """Gather ``completion_mask`` in place, mirroring the labels gather.
+
+        Deliberately not routed through :class:`GatherLoss`: the mask carries no
+        gradient, and reusing that autograd Function would attach a second backward
+        path to whichever tensor were passed alongside it, double-scaling its grad.
+        """
+        mask = inputs.get('completion_mask')
+        if mask is None or not torch.is_tensor(mask) or mask.dim() < 2:
+            return
+        gathered = sequence_parallel.gather(mask, dim=1, position_ids=real_position_ids)
+        inputs['completion_mask'] = self._trim_gathered_sequence_padding(gathered, real_position_ids)
+
     def gather_loss_tensors(
         self,
         inputs: Dict[str, Any],
@@ -1017,6 +1037,7 @@ class SequenceParallelStrategy:
             gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
             outputs['logits'] = gathered_hidden
             inputs['labels'] = gathered_labels
+            self._gather_completion_mask(inputs, real_position_ids)
             return inputs, outputs
         if labels is None or logps is None:
             return inputs, outputs
@@ -1031,6 +1052,7 @@ class SequenceParallelStrategy:
         gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
+        self._gather_completion_mask(inputs, real_position_ids)
         entropies = outputs.get('entropies')
         if entropies is not None and torch.is_tensor(entropies) and entropies.dim() >= 2:
             gathered_entropies, _ = GatherLoss.apply(entropies, labels, 1, real_position_ids)

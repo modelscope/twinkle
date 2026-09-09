@@ -1,4 +1,6 @@
-from typing import Any, Dict, List, Optional, Union
+import threading
+from contextlib import nullcontext
+from typing import Any, ContextManager, Dict, List, Optional, Union
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Message
@@ -11,6 +13,11 @@ class OpenAI(API):
 
     Works with any endpoint speaking the ``/v1/chat/completions`` protocol
     (OpenAI, Azure OpenAI, vLLM, SGLang, Ollama, ...).
+
+    Requests in flight are capped here rather than by whatever thread pool calls
+    in. A caller's thread count sizes local parallelism and wants to be large; a
+    provider's quota belongs to the endpoint and wants to be small. One number
+    cannot serve both, and only this object knows which endpoint it is talking to.
     """
 
     def __init__(
@@ -18,15 +25,47 @@ class OpenAI(API):
         model: str,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        *,
+        concurrency: Optional[int] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
         client_kwargs: Optional[Dict[str, Any]] = None,
     ):
+        """
+        Args:
+            concurrency: most requests allowed in flight at once, or None for no
+                cap. The limit is per instance and shared by every thread holding
+                it, so a module-level client caps the whole process.
+            timeout: per-request timeout in seconds. Left at the SDK's default
+                when None.
+            max_retries: how many times the SDK retries a request it deems
+                transient -- 429, 5xx, timeouts, dropped connections -- using its
+                own exponential backoff. Left at the SDK's default when None.
+            client_kwargs: anything else the ``openai`` constructor accepts.
+        """
         from openai import OpenAI as _OpenAIClient
 
+        if concurrency is not None and concurrency < 1:
+            raise ValueError(f'concurrency must be >= 1 or None, got {concurrency}')
+        kwargs = dict(client_kwargs or {})
+        for name, value in (('timeout', timeout), ('max_retries', max_retries)):
+            if value is None:
+                continue
+            if name in kwargs:
+                raise ValueError(f'{name} was passed both directly and in client_kwargs; '
+                                 'drop one so that which value wins is not a matter of ordering')
+            kwargs[name] = value
+
         self.model = model
+        self.concurrency = concurrency
+        # Held across the SDK's own retries too: a request that is backing off
+        # still occupies the endpoint's attention, so it keeps its slot.
+        self._slots: ContextManager[Any] = (
+            threading.BoundedSemaphore(concurrency) if concurrency is not None else nullcontext())
         self._client = _OpenAIClient(
             api_key=api_key,
             base_url=base_url,
-            **(client_kwargs or {}),
+            **kwargs,
         )
 
     def __call__(
@@ -36,7 +75,8 @@ class OpenAI(API):
         **kwargs,
     ) -> Union[Message, List[Message]]:
         request = self._build_request(trajectory, sampling_params, kwargs)
-        response = self._client.chat.completions.create(**request)
+        with self._slots:
+            response = self._client.chat.completions.create(**request)
         messages = [self._choice_to_message(c) for c in response.choices]
         return messages[0] if sampling_params.num_samples == 1 else messages
 

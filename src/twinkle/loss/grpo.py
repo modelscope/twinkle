@@ -227,6 +227,39 @@ class GRPOLoss(Loss):
 
         return result
 
+    def _resolve_loss_mask(self, inputs: Dict, labels: 'torch.Tensor') -> 'torch.Tensor':
+        """Positions this loss may score: trainable *and* log-prob-bearing.
+
+        ``labels`` alone answers "should this token be scored", which is all SFT
+        needs. A policy-gradient loss also needs a sampling log-prob per token to
+        form an importance ratio, and a turn produced outside the sampled policy
+        (an API, a human, a replayed demonstration) has none. Such turns carry
+        ``completion_mask == 0``: excluded here, yet still trainable for SFT.
+
+        A feature without ``completion_mask`` predates the field, and there every
+        trainable token was the policy's own, so the mask degenerates to
+        ``labels != ignore_index`` and old trajectories train exactly as before.
+        """
+        import torch
+        trainable = (labels != self.ignore_index).bool()
+        completion_mask = inputs.get('completion_mask')
+        if completion_mask is None:
+            return trainable
+        if not torch.is_tensor(completion_mask):
+            completion_mask = torch.as_tensor(completion_mask)
+        completion_mask = completion_mask.to(trainable.device)
+        if completion_mask.dim() == 1:
+            completion_mask = completion_mask.unsqueeze(0)
+        if completion_mask.shape != trainable.shape:
+            raise ValueError(f'completion_mask shape {tuple(completion_mask.shape)} does not match labels shape '
+                             f'{tuple(trainable.shape)}. A misaligned mask would apply importance ratios to '
+                             'the wrong tokens, so it is refused rather than broadcast.')
+        loss_mask = trainable & completion_mask.bool()
+        if self.enable_sampling_replay and not bool((loss_mask == trainable).all()):
+            raise ValueError('sampling replay does not support turns generated outside the sampled policy: '
+                             'they are trainable but have no sampling mask to replay against.')
+        return loss_mask
+
     def __call__(
         self,
         inputs: Dict,
@@ -269,7 +302,7 @@ class GRPOLoss(Loss):
         logps = outputs.get('logps')
         if self.enable_sampling_replay and logps is None:
             raise RuntimeError('sampling replay logps must be computed by the model forward')
-        loss_mask = (labels != self.ignore_index).bool()
+        loss_mask = self._resolve_loss_mask(inputs, labels)
         if logps is None:
             logits = outputs.get('logits')
             if logits.shape[1] != labels.shape[1]:

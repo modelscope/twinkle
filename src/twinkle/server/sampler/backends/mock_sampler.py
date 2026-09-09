@@ -252,8 +252,9 @@ class MockSampler:
 
         Produces a plain-dict ``InputFeature`` that carries the running context
         for the next multi-turn round: ``input_ids`` is the prior prompt plus
-        this round's sampled tokens, and ``labels`` marks the sampled tokens as
-        trainable (their own ids) while prior/context positions stay ``-100``.
+        this round's sampled tokens, ``labels`` marks the sampled tokens as
+        trainable (their own ids) while prior/context positions stay ``-100``,
+        and ``completion_mask`` marks them as the policy's own output.
         This mirrors the shape a real sampler's ``concat_input_feature`` yields,
         which the multi-turn rollout relies on (it reads
         ``new_input_feature.input_ids`` and counts trainable ``labels``).
@@ -270,8 +271,14 @@ class MockSampler:
             # No (or misaligned) prior labels: treat the entire prior context as
             # non-trainable so only this round's sampled tokens count.
             labels = [-100] * len(prev_ids)
+        prev_mask = feat.get('completion_mask')
+        if prev_mask is not None and len(prev_mask) == len(prev_ids):
+            completion_mask = list(prev_mask)
+        else:
+            completion_mask = [0 if label == -100 else 1 for label in labels]
 
         feat['input_ids'] = prev_ids + list(tokens)
         feat['labels'] = labels + list(tokens)
+        feat['completion_mask'] = completion_mask + [1] * len(tokens)
         feat['length'] = len(feat['input_ids'])
         return feat

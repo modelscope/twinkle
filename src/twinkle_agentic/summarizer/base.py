@@ -5,11 +5,12 @@ import math
 import re
 from typing import TYPE_CHECKING, Any, Sequence
 
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.utils.llm_backup import llm_backup
+from twinkle_agentic.utils.message_utils import assistant_text
 
 if TYPE_CHECKING:
     from twinkle.data_format import SamplingParams, Trajectory  # noqa: F401
-    from twinkle.sampler.base import Sampler  # noqa: F401
 
 
 DEFAULT_USER_PROMPT_TEMPLATE = """\
@@ -36,7 +37,8 @@ class Summarizer:
         - LLM_BACKUP_BASE_URL: API endpoint
 
     Args:
-        sampler: Student model sampler (local inference, shared across types).
+        backend: a sampler or an API client, driven through
+            :class:`~twinkle_agentic.rollout.MultiTurnRollout`.
         compression_ratio: Target compression factor (> 1).
         model_path: Model identifier.
         sampling_params: Default sampling params.
@@ -44,14 +46,19 @@ class Summarizer:
         user_prompt_template: User prompt template. Must contain
             ``{budget}`` and ``{text}``. May contain ``{query}``.
         min_budget_chars: Floor for the character budget in the prompt.
-        template: Optional :class:`Template` for special token stripping.
+        template: local :class:`Template`, required by the sampler path and also
+            what special-token stripping reads its tokenizer from.
         lora_path: LoRA adapter path specific to this summarizer type.
-            Each subclass can use a different LoRA for its task.
+            Each subclass can use a different LoRA for its task. Without one the
+            base weights are asked for explicitly -- a sampler mid-training
+            otherwise lends this out the policy LoRA synced into it.
+        rollout_kwargs: passed to ``MultiTurnRollout``. API request options
+            belong in ``api_kwargs``.
     """
 
     def __init__(
         self,
-        sampler: Sampler,
+        backend: Any,
         compression_ratio: float = 2.0,
         *,
         model_path: str = '',
@@ -61,9 +68,10 @@ class Summarizer:
         min_budget_chars: int = 250,
         template: Any | None = None,
         lora_path: str | None = None,
+        **rollout_kwargs: Any,
     ):
-        if sampler is None:
-            raise ValueError('sampler is required')
+        if backend is None:
+            raise ValueError('backend is required')
         if compression_ratio <= 1.0:
             raise ValueError(f'compression_ratio must be > 1, got {compression_ratio}')
         if min_budget_chars < 1:
@@ -74,7 +82,6 @@ class Summarizer:
             raise ValueError('user_prompt_template must contain both {budget} and {text}')
 
         self.model_path = model_path
-        self.sampler = sampler
         self.compression_ratio = float(compression_ratio)
         self.sampling_params = sampling_params
         self.system_prompt = system_prompt
@@ -83,6 +90,20 @@ class Summarizer:
         self.template = template
         self.lora_path = lora_path if lora_path else None
         self._special_tokens_cache: tuple[str, ...] | None = None
+        # Built on the first call rather than here, so a summarizer that never
+        # compresses anything (every text already under budget) costs nothing.
+        self._backend = backend
+        self._rollout_kwargs = dict(rollout_kwargs, max_turns=1)
+        if template is not None:
+            self._rollout_kwargs['template'] = template
+        # Which weights, and only for a local sampler: an API endpoint serves
+        # whatever it serves and has no notion of an adapter.
+        if hasattr(backend, 'sample'):
+            if self.lora_path:
+                self._rollout_kwargs['adapter_path'] = self.lora_path
+            else:
+                self._rollout_kwargs['use_base_model'] = True
+        self._rollout: Any | None = None
 
     # ------------------------------------------------------------------
     # public entry point (pre/post processing, NOT decorated)
@@ -106,14 +127,15 @@ class Summarizer:
     # ------------------------------------------------------------------
     @llm_backup(key_params=["query"])
     def _sample(self, trajectory, sampling_params, query: str = None) -> str:
-        """Student model: trajectory + sampling_params -> raw text."""
-        sample_kwargs: dict[str, Any] = {'sampling_params': sampling_params}
-        if self.lora_path is None:
-            sample_kwargs['use_base_model'] = True
-        else:
-            sample_kwargs['adapter_path'] = self.lora_path
-        responses = self.sampler.sample([trajectory], **sample_kwargs)
-        return self._decoded(list(responses)[0]) if responses else ''
+        """Student model: trajectory + sampling_params -> raw text.
+
+        The signature is what ``llm_backup`` reads by name to hand the teacher the
+        same input, so it stays even though the body no longer touches a sampler.
+        """
+        if self._rollout is None:
+            self._rollout = MultiTurnRollout(self._backend, **self._rollout_kwargs)
+        replies = self._rollout([trajectory], sampling_params=sampling_params)
+        return assistant_text(replies[0]) if replies else ''
 
     # ------------------------------------------------------------------
     # internals
@@ -121,7 +143,7 @@ class Summarizer:
     def _get_special_tokens(self) -> tuple[str, ...]:
         if self._special_tokens_cache is not None:
             return self._special_tokens_cache
-        tpl = self.template or getattr(self.sampler, 'template', None)
+        tpl = self.template or getattr(self._backend, 'template', None)
         tokenizer = getattr(tpl, 'tokenizer', None) if tpl is not None else None
         tokens: list[str] = []
         if tokenizer is not None:
@@ -175,13 +197,6 @@ class Summarizer:
         if len(text) >= len(original):
             return None
         return text
-
-    @staticmethod
-    def _decoded(response: Any) -> str:
-        seqs = getattr(response, 'sequences', None) or []
-        if not seqs:
-            return ''
-        return getattr(seqs[0], 'decoded', None) or ''
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:

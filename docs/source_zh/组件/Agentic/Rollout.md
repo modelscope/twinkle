@@ -1,6 +1,6 @@
 # 多轮 Rollout
 
-Rollout 模块提供了用于 Agentic RLHF 训练的多轮对话 rollout 引擎。包含两种实现：用于批量 vLLM 采样的 `MultiTurnRollout` 和用于 OpenAI 兼容 API 端点的 `APIMultiTurnRollout`。
+Rollout 模块提供统一的多轮对话引擎 `MultiTurnRollout`，每轮 assistant 可由本地 sampler、OpenAI 兼容 API，或在两者间动态选择的 callback 生成。
 
 ## Rollout 基类
 
@@ -19,12 +19,12 @@ class Rollout(ABC):
 
 ## MultiTurnRollout
 
-批量多轮 rollout 引擎，使用 vLLM 采样器进行生成。每轮中所有活跃轨迹通过单次批量采样调用并行处理，最大化吞吐量。
+统一的多轮 rollout 引擎，支持本地 sampler、外部 API 和逐轮后端选择。每条轨迹在线程池中独立执行。
 
 ### 每轮循环
 
 1. 将每个轨迹编码为带生成提示的 `InputFeature`
-2. 批量调用 `sampler.sample(active_pifs)` —— 所有活跃轨迹并行
+2. 调用 `response_callback(...)`，从 sampler 或 API 获取一个 `SampledSequence`
 3. 检查终止条件：`stop_reason == 'length'`、无工具调用、或达到最大轮次
 4. 通过 `ToolManager` 分发工具调用，追加工具响应
 5. 计算桥接 token（工具轮次 + 生成提示），设置 `labels = -100`
@@ -53,8 +53,12 @@ results = rollout(trajectories)
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `sampler` | Sampler | 用于批量生成的 vLLM 采样器实例。 |
-| `template` | `Template` | 用于编码/解码的聊天模板。 |
+| `sampler` | Sampler | 本地 sampler；两个后端同时存在时默认使用它。 |
+| `api` | `API` | 可选的外部生成 API。 |
+| `template` | `Template` | 必传；用于编码所有后端的输出。 |
+| `response_callback` | `Callable` | 可选的逐轮后端选择器，返回 `SampledSequence`。 |
+| `api_appended_as` | `str` | API 轮为 `demonstration`（仅 SFT）或 `context`（不训练）。 |
+| `api_kwargs` | `Dict` | 传给每次 API 调用的请求字段。 |
 | `tool_manager` | `ToolManager` | 工具分发器。也可以按调用传入。 |
 | `sampling_params` | `SamplingParams` | 默认采样参数。 |
 | `max_turns` | `int` | 每个轨迹的最大轮次（默认：6）。 |
@@ -72,6 +76,7 @@ results = rollout(trajectories)
 | `messages` | `List[Dict]` | 包含工具轮次的完整对话。 |
 | `input_ids` | `List[int]` | 完整序列的 token ID。 |
 | `labels` | `List[int]` | 训练标签（非可训练 token 为 `-100`）。 |
+| `completion_mask` | `List[int]` | 由 policy 生成且具有 rollout log probability 的位置。 |
 | `turns` | `int` | 执行的轮次数。 |
 | `stop_reason` | `str` | `'stop'` / `'length'` |
 | `truncated` | `bool` | 轨迹是否被截断（而非自行结束）：生成触及 `max_tokens`（`stop_reason='length'`）、达到轮次上限，或被长度上限丢弃。 |
@@ -87,54 +92,33 @@ rollout_actor = MultiTurnRollout.remote(sampler=sampler, template=template, ...)
 results = ray.get(rollout_actor.__call__.remote(trajectories))
 ```
 
-## APIMultiTurnRollout
+## API 与混合后端 Rollout
 
-通过 OpenAI 兼容 chat-completions API 进行多轮 rollout。每个轨迹在线程池中独立运行，实现网络并发。
+纯 API 模式使用同一个类，并仍需传入本地 template，以便将外部回复编码成训练侧一致的 token：
 
 ```python
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
 from twinkle_agentic.protocol.openai import OpenAI
+from twinkle_agentic.rollout import MultiTurnRollout
 
-api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1')
-
-rollout = APIMultiTurnRollout(
-    api=api,
+api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1', concurrency=8)
+rollout = MultiTurnRollout(
+    api,
+    template=template,
     tool_manager=tool_manager,
     sampling_params=SamplingParams(temperature=0.7),
     max_turns=6,
-    concurrency=8,
     trace_dir='api_traces/',
 )
-
 results = rollout(trajectories)
 ```
 
-### 参数
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `api` | `OpenAI` | OpenAI 兼容 API 客户端。 |
-| `tool_manager` | `ToolManager` | 工具分发器（单个或按轨迹的列表）。 |
-| `sampling_params` | `SamplingParams` | 默认采样参数。 |
-| `max_turns` | `int` | 每轨迹最大轮次（默认：6）。 |
-| `concurrency` | `int` | 并行 API 调用的线程池大小（默认：8）。 |
-| `extra_body` | `Dict` | API 请求中附加的额外字段。 |
-| `trace_dir` | `str` | 跟踪文件目录。 |
+同时传入 `sampler` 和 `api` 时，默认使用 sampler。传入 `response_callback` 可逐轮选择后端；callback 会收到两个后端，并必须返回一个 `SampledSequence`。API 轮没有 rollout log probability，因此 `api_appended_as='demonstration'` 会让它参与 SFT 但跳过 GRPO；使用 `'context'` 可让它完全不参与训练。
 
 ### 停止原因
 
 | 原因 | 说明 |
 |------|------|
 | `stop` | 助手回复未包含工具调用（自然结束）。 |
-| `length` | API 返回 `finish_reason='length'`（token 限制）。 |
-| `max_turns` | 达到 `max_turns` 限制。 |
-| `api_error` | API 调用或工具执行抛出异常。 |
-
-## 选择建议
-
-| 特性 | MultiTurnRollout | APIMultiTurnRollout |
-|------|-----------------|---------------------|
-| **后端** | vLLM 采样器（本地 GPU） | OpenAI 兼容 API |
-| **训练集成** | 生成 `input_ids` / `labels` 用于 GRPO | 仅消息（用于数据收集） |
-| **批处理** | GPU 级别批量并行 | 网络级别线程并发 |
-| **用例** | 在线 RLHF 训练循环 | 离线数据生成 / 评估 |
+| `length` | 生成达到 token 上限。 |
+| `max_turns` | 达到工具轮次上限且没有 follow-up。 |
+| `generation_error` | 外部端点未能返回有效响应。 |

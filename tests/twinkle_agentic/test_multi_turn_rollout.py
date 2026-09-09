@@ -23,6 +23,7 @@ import copy
 import json
 import pytest
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
@@ -215,15 +216,40 @@ class FakeTemplate:
 
 
 class FakeSampler:
-    """Queue-driven sampler that mirrors VLLMSampler output shape."""
+    """Queue-driven sampler that mirrors VLLMSampler output shape.
+
+    ``queue`` feeds one shared FIFO, which is all a single-trajectory test needs.
+    A batch needs ``queue_for(key, ...)``: episodes run in parallel threads, so
+    the order in which their turns reach ``sample`` is not defined, and a shared
+    FIFO would hand one trajectory's scripted reply to another. The key is the
+    text of the trajectory's first user message.
+    """
 
     def __init__(self, template: FakeTemplate) -> None:
         self.template = template
         self._queue: list[dict[str, Any]] = []
+        self._keyed: dict[str, list[dict[str, Any]]] = {}
         self.sample_calls = 0
         # One entry per sample() call, so a test can assert which budget each
         # stage was sampled under.
         self.params_seen: list[Any] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _entry(
+        template: FakeTemplate,
+        response_text: str,
+        stop_reason: str,
+        logprobs: list[Any] | None,
+        append_im_end: bool,
+    ) -> dict[str, Any]:
+        raw = response_text + ('<|im_end|>' if append_im_end else '')
+        return {
+            'tokens': template.tokenizer.encode(raw, add_special_tokens=False),
+            'decoded': response_text,
+            'stop_reason': stop_reason,
+            'logprobs': logprobs,
+        }
 
     def queue(
         self,
@@ -236,14 +262,26 @@ class FakeSampler:
         ``<|im_end|>`` is appended to the encoded tokens when ``append_im_end``.
         ``seq.decoded`` is the raw response WITHOUT the trailing <|im_end|>
         (matches vLLM's common behaviour)."""
-        raw = response_text + ('<|im_end|>' if append_im_end else '')
-        tokens = self.template.tokenizer.encode(raw, add_special_tokens=False)
-        self._queue.append({
-            'tokens': tokens,
-            'decoded': response_text,
-            'stop_reason': stop_reason,
-            'logprobs': logprobs,
-        })
+        self._queue.append(self._entry(self.template, response_text, stop_reason, logprobs, append_im_end))
+
+    def queue_for(
+        self,
+        key: str,
+        response_text: str,
+        stop_reason: str = 'stop',
+        logprobs: list[Any] | None = None,
+        append_im_end: bool = True,
+    ) -> None:
+        """Script one turn for the trajectory whose first user message is ``key``."""
+        self._keyed.setdefault(key, []).append(
+            self._entry(self.template, response_text, stop_reason, logprobs, append_im_end))
+
+    @staticmethod
+    def _key_of(pif: dict[str, Any]) -> str | None:
+        for m in pif.get('messages') or []:
+            if m.get('role') == 'user':
+                return m.get('content')
+        return None
 
     def sample(self, pifs, sampling_params=None):
         # Batched contract: accept a list of pifs, return one
@@ -252,12 +290,14 @@ class FakeSampler:
         if isinstance(pifs, dict):
             pifs = [pifs]
         assert isinstance(pifs, list), (f'FakeSampler.sample expects a list, got {type(pifs).__name__}')
-        self.params_seen.append(sampling_params)
         responses: list[SampleResponse] = []
         for pif in pifs:
-            assert self._queue, 'FakeSampler queue exhausted — scripted turns'
-            r = self._queue.pop(0)
-            self.sample_calls += 1
+            with self._lock:
+                self.params_seen.append(sampling_params)
+                queue = self._keyed.get(self._key_of(pif)) or self._queue
+                assert queue, 'FakeSampler queue exhausted — scripted turns'
+                r = queue.pop(0)
+                self.sample_calls += 1
             new_pif = self.template.concat_input_feature(pif, r['tokens'])
             seq = SampledSequence(
                 stop_reason=r['stop_reason'],
@@ -268,6 +308,10 @@ class FakeSampler:
             )
             responses.append(SampleResponse(sequences=[seq]))
         return responses
+
+    # MultiTurnRollout samples one trajectory per call and refuses a sampler
+    # that would slice such a batch across workers.
+    sample._enable_continous_work = True
 
 
 class EchoTool(Tool):
@@ -607,12 +651,13 @@ def test_stuck_stop_is_per_trajectory_in_a_batch(make_rollout, sampler, template
     bad = ToolManager({})
     bad.register(FailTool('search'))
 
-    sampler.queue(_tool_call_text('search', {'q': 1}), stop_reason='stop')
-    sampler.queue(_tool_call_text('search', {'q': 1}), stop_reason='stop')
-    sampler.queue(_tool_call_text('search', {'q': 2}), stop_reason='stop')
-    sampler.queue(_tool_call_text('search', {'q': 3}), stop_reason='stop')
-    sampler.queue('Done.', stop_reason='stop')
-    sampler.queue('Done.', stop_reason='stop')
+    sampler.queue_for('a', _tool_call_text('search', {'q': 1}), stop_reason='stop')
+    sampler.queue_for('a', _tool_call_text('search', {'q': 2}), stop_reason='stop')
+    sampler.queue_for('a', _tool_call_text('search', {'q': 3}), stop_reason='stop')
+    sampler.queue_for('a', 'Done.', stop_reason='stop')
+    # 'b' calls the failing tool twice, which trips stop_after_stuck_turns=2.
+    sampler.queue_for('b', _tool_call_text('search', {'q': 1}), stop_reason='stop')
+    sampler.queue_for('b', _tool_call_text('search', {'q': 1}), stop_reason='stop')
 
     rollout = MultiTurnRollout(
         sampler=sampler, template=template, tool_manager=[good, bad],
@@ -766,6 +811,28 @@ def test_rejects_num_samples_gt_1(sampler, template, tool_manager):
             sampling_params=SamplingParams(num_samples=2))
 
 
+def test_rejects_sampler_without_continous_work(template, tool_manager):
+    """A batch of one is what a slice_dp sampler cannot serve."""
+
+    class SlicingSampler:
+
+        def sample(self, pifs, sampling_params=None):
+            return []
+
+    with pytest.raises(ValueError, match='enable_continous_work'):
+        MultiTurnRollout(sampler=SlicingSampler(), template=template, tool_manager=tool_manager)
+
+
+def test_rejects_one_harness_shared_by_a_batch(sampler, template, tool_manager):
+    """Episodes run in parallel threads, so a stateful harness cannot be shared."""
+    from twinkle_agentic.harness.base import AgentHarness
+
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, harness=AgentHarness())
+    with pytest.raises(ValueError, match='harness holds per-episode state'):
+        rollout([_user_traj('A'), _user_traj('B')])
+
+
 # =============================================================================
 # Tests: defensive guards
 # =============================================================================
@@ -779,6 +846,8 @@ def test_missing_new_input_feature_raises(template, tool_manager):
             seq = SampledSequence(stop_reason='stop', tokens=[], logprobs=None, decoded='', new_input_feature=None)
             return [SampleResponse(sequences=[seq]) for _ in pifs]
 
+        sample._enable_continous_work = True
+
     rollout = MultiTurnRollout(sampler=BrokenSampler(), template=template, tool_manager=tool_manager)
     with pytest.raises(RuntimeError, match='new_input_feature'):
         rollout([_user_traj()])
@@ -790,6 +859,8 @@ def test_empty_sampler_response_raises(template, tool_manager):
 
         def sample(self, pifs, sampling_params=None):
             return []
+
+        sample._enable_continous_work = True
 
     rollout = MultiTurnRollout(sampler=EmptySampler(), template=template, tool_manager=tool_manager)
     # Batched contract: 0 responses for a batch of 1 → mismatch error.
@@ -806,6 +877,8 @@ def test_sample_response_no_sequences_raises(template, tool_manager):
                 pifs = [pifs]
             return [SampleResponse(sequences=[]) for _ in pifs]
 
+        sample._enable_continous_work = True
+
     rollout = MultiTurnRollout(sampler=NoSeqSampler(), template=template, tool_manager=tool_manager)
     with pytest.raises(RuntimeError, match='no sequences'):
         rollout([_user_traj()])
@@ -820,18 +893,17 @@ def test_empty_batch_returns_empty_list(make_rollout):
 
 
 def test_batch_single_turn_two_trajectories(make_rollout, sampler):
-    """Two trajectories finish on turn 1 → one batched sample call."""
-    sampler.queue('answer-A', stop_reason='stop')
-    sampler.queue('answer-B', stop_reason='stop')
+    """Two trajectories, one turn each, in their own threads."""
+    sampler.queue_for('Q-A', 'answer-A', stop_reason='stop')
+    sampler.queue_for('Q-B', 'answer-B', stop_reason='stop')
     rollout = make_rollout(max_turns=3)
     outs = rollout([_user_traj('Q-A'), _user_traj('Q-B')])
 
     assert len(outs) == 2
-    # Exactly ONE batched sample call, not two.
-    assert sampler.sample_calls == 2  # one per item, still one turn
-    # But FakeSampler counts per-input; the critical batching invariant is
-    # that MultiTurnRollout only calls sampler.sample ONCE per turn. We
-    # enforce this via the queue ordering + single turn.
+    assert sampler.sample_calls == 2  # one generation per trajectory
+    # Results come back in input order even though the threads may not.
+    assert outs[0]['messages'][-1]['content'] == 'answer-A'
+    assert outs[1]['messages'][-1]['content'] == 'answer-B'
     for out in outs:
         assert out['turns'] == 1
         assert out['stop_reason'] == 'stop'
@@ -841,14 +913,12 @@ def test_batch_single_turn_two_trajectories(make_rollout, sampler):
 def test_batch_different_termination_turns(make_rollout, sampler):
     """Trajectory A finishes on turn 1; trajectory B needs a tool turn.
 
-    Turn 1 batch:  [A: 'done-A' stop, B: tool_call stop]  → A parked.
-    Turn 2 batch:  [B: 'done-B' stop]                     → only B live.
+    Each episode owns its turn budget, so B taking a second turn neither waits
+    for A nor buys A anything.
     """
-    sampler.queue('done-A', stop_reason='stop')  # A turn 1
-    sampler.queue(
-        _tool_call_text('search', {'q': 'b'}),  # B turn 1
-        stop_reason='stop')
-    sampler.queue('done-B', stop_reason='stop')  # B turn 2
+    sampler.queue_for('Q-A', 'done-A', stop_reason='stop')
+    sampler.queue_for('Q-B', _tool_call_text('search', {'q': 'b'}), stop_reason='stop')
+    sampler.queue_for('Q-B', 'done-B', stop_reason='stop')
     rollout = make_rollout(max_turns=4)
     outs = rollout([_user_traj('Q-A'), _user_traj('Q-B')])
 
@@ -889,10 +959,10 @@ def test_batch_per_trajectory_tool_manager(make_rollout, sampler, template):
     tm_b = ToolManager({})
     tm_b.register(TagTool('B'))
 
-    sampler.queue(_tool_call_text('search', {'q': 'x'}), stop_reason='stop')
-    sampler.queue(_tool_call_text('search', {'q': 'y'}), stop_reason='stop')
-    sampler.queue('done-A', stop_reason='stop')
-    sampler.queue('done-B', stop_reason='stop')
+    sampler.queue_for('A', _tool_call_text('search', {'q': 'x'}), stop_reason='stop')
+    sampler.queue_for('A', 'done-A', stop_reason='stop')
+    sampler.queue_for('B', _tool_call_text('search', {'q': 'y'}), stop_reason='stop')
+    sampler.queue_for('B', 'done-B', stop_reason='stop')
 
     rollout = MultiTurnRollout(
         sampler=sampler,
@@ -1014,8 +1084,8 @@ def test_trace_dir_success_callback_drives_filename_prefix(tmp_path, sampler, te
         max_turns=2,
         trace_dir=str(trace_dir),
         success_callback=_is_success)
-    sampler.queue('good answer', stop_reason='stop')
-    sampler.queue('bad answer', stop_reason='stop')
+    sampler.queue_for('A', 'good answer', stop_reason='stop')
+    sampler.queue_for('B', 'bad answer', stop_reason='stop')
 
     rollout([_user_traj('A'), _user_traj('B')])
 
@@ -1031,9 +1101,9 @@ def test_trace_dir_batch_writes_one_file_per_trajectory(tmp_path, sampler, templ
     rollout = MultiTurnRollout(
         sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, trace_dir=str(trace_dir))
     # Traj 0: stops turn 1. Traj 1: tool-calls turn 1, stops turn 2.
-    sampler.queue('done0', stop_reason='stop')
-    sampler.queue(_tool_call_text('search', {'q': 'y'}))
-    sampler.queue('done1', stop_reason='stop')
+    sampler.queue_for('A', 'done0', stop_reason='stop')
+    sampler.queue_for('B', _tool_call_text('search', {'q': 'y'}))
+    sampler.queue_for('B', 'done1', stop_reason='stop')
 
     rollout([_user_traj('A'), _user_traj('B')])
 

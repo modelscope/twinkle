@@ -1,16 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Shared, pure bridge-token stitching logic for multi-turn rollouts.
+"""Shared, pure template-space stitching logic for multi-turn rollouts.
 
-This module hosts :func:`extend_with_bridge`, a ``self``-free function that
-appends tool messages and the next generation prompt to a running
-``InputFeature`` (``pif``) as ``-100`` "bridge" tokens. It is shared between
-the core-library ``MultiTurnRollout`` and the client-side rollout so the two
-paths cannot drift.
+This module hosts ``self``-free functions that grow a running ``InputFeature``
+(``pif``) one turn at a time, all measuring what a turn adds by diffing rendered
+chat-template output rather than by pasting special tokens together:
 
-The logic was lifted verbatim from ``MultiTurnRollout._extend_with_bridge`` and
-``MultiTurnRollout._append_bridge_tokens``; every ``self.template`` access was
-rewritten to use the ``template`` parameter. No Ray decorators
-(``@remote_function`` / ``@remote_class``) are applied here.
+* :func:`extend_with_bridge` appends tool messages and the next generation
+  prompt as ``-100`` "bridge" tokens.
+* :func:`encode_appended_turn` returns the tokens an assistant turn written
+  outside the sampler (an API, a human) contributes.
+
+The bridge logic was lifted verbatim from ``MultiTurnRollout._extend_with_bridge``
+and ``MultiTurnRollout._append_bridge_tokens``; every ``self.template`` access was
+rewritten to use the ``template`` parameter. It is shared between the
+core-library ``MultiTurnRollout`` and the client-side rollout so the two paths
+cannot drift. No Ray decorators (``@remote_function`` / ``@remote_class``) are
+applied here.
 """
 
 
@@ -48,6 +53,101 @@ def _to_plain(obj: Any) -> Any:
     return obj
 
 
+def _delta_text(
+    template: Template,
+    messages_before: List[Dict[str, Any]],
+    appended: List[Dict[str, Any]],
+    *,
+    gen_prompt_before: bool,
+    gen_prompt_after: bool,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Text the chat template adds when ``appended`` is tacked onto history.
+
+    ``gen_prompt_*`` place the delta relative to the generation prompt: a bridge
+    ends on one (``False -> True``), a completion consumes one
+    (``True -> False``).
+    """
+    tokenizer = template.tokenizer
+    enable_thinking = getattr(template, 'enable_thinking', False)
+
+    def render(messages: List[Dict[str, Any]], add_generation_prompt: bool) -> str:
+        return tokenizer.apply_chat_template(
+            messages,
+            tools=tools or None,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking)
+
+    s_before = render(messages_before, gen_prompt_before)
+    s_after = render(list(messages_before) + list(appended), gen_prompt_after)
+
+    if not s_after.startswith(s_before):
+        # Appending a *user* message moves where Qwen3's template thinks the
+        # conversation's last question is, and it renders assistant turns either
+        # side of that point differently: the turn before it loses its <think>
+        # block, and the turn after it gains an empty one when it had none.
+        # Measured on Qwen3-4B with three messages -- rendered alone, the
+        # assistant turn reads '<think>\nthinking hard\n</think>\n\nAll tasks are
+        # complete.'; rendered with a user turn after it, just 'All tasks are
+        # complete.'. Tool messages do not move that point, which is why
+        # appending tool observations has always been a clean extension.
+        #
+        # So the delta is measured against a stand-in history instead: render one
+        # user turn, then the same turn plus these messages, and take the
+        # difference. That is exact as long as a message block does not depend on
+        # what precedes it, which the prefix check below still enforces.
+        #
+        # What stays on record is the history as generated, thinking included --
+        # those are the tokens the policy read back when it produced the next
+        # turn, and a later training step has to see the same.
+        s_anchor = render(_ANCHOR, gen_prompt_before)
+        s_anchor_after = render(_ANCHOR + list(appended), gen_prompt_after)
+        if not s_anchor_after.startswith(s_anchor):
+            raise RuntimeError('Canonical chat_template output for messages_after is not a '
+                               'prefix-extension of messages_before, and the same is true '
+                               'of a one-message stand-in history; cannot compute the '
+                               'delta. This indicates the template is non-monotonic in the '
+                               'message list (e.g. reorders / rewrites earlier turns).\n'
+                               f's_before tail: {s_before[-80:]!r}\n'
+                               f's_after at same offset: '
+                               f'{s_after[max(0, len(s_before) - 80):len(s_before) + 80]!r}')
+        s_before, s_after = s_anchor, s_anchor_after
+    return s_after[len(s_before):]
+
+
+def encode_appended_turn(
+    messages_before: List[Dict[str, Any]],
+    message: Dict[str, Any],
+    template: Template,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> List[int]:
+    """Tokens an assistant turn authored elsewhere contributes to the sequence.
+
+    A sampler returns the ids it generated; an API returns text, whose tokens are
+    only part of the turn -- the template also writes the turn terminator and
+    whatever follows it. Diffing the rendered template recovers those without
+    naming a single special token, so this holds for any chat template.
+
+    The result is what :meth:`Template.concat_input_feature` expects as
+    ``new_tokens``, and is token-for-token what :meth:`Template.encode` would
+    have produced for the same conversation.
+    """
+    delta = _delta_text(
+        template,
+        messages_before, [template.decode_tool_calls(message)],
+        gen_prompt_before=True,
+        gen_prompt_after=False,
+        tools=tools)
+    if not delta:
+        raise RuntimeError(f'Appending {message.get("role")!r} turn added no text; '
+                           'the chat template dropped it entirely.')
+    tokens = template.tokenizer.encode(delta, add_special_tokens=False)
+    if not tokens:
+        raise RuntimeError(f'Appended turn tokenised to an empty id list: {delta!r}')
+    return tokens
+
+
 def extend_with_bridge(
     pif: Dict[str, Any],
     tool_messages: List[Dict[str, Any]],
@@ -71,58 +171,16 @@ def extend_with_bridge(
     Returns ``None`` when the trajectory exceeds ``max_length`` and the
     template's truncation strategy is ``'delete'``.
     """
-    tokenizer = template.tokenizer
-
     messages_before = list(pif.get('messages') or [])
     messages_after = messages_before + list(tool_messages)
 
-    enable_thinking = getattr(template, 'enable_thinking', False)
-    s_before = tokenizer.apply_chat_template(
-        messages_before, tokenize=False, add_generation_prompt=False, enable_thinking=enable_thinking)
-    s_after = tokenizer.apply_chat_template(
-        messages_after, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
-
-    if not s_after.startswith(s_before):
-        # Appending a *user* message moves where Qwen3's template thinks the
-        # conversation's last question is, and it renders assistant turns either
-        # side of that point differently: the turn before it loses its <think>
-        # block, and the turn after it gains an empty one when it had none.
-        # Measured on Qwen3-4B with three messages -- rendered alone, the
-        # assistant turn reads '<think>\nthinking hard\n</think>\n\nAll tasks are
-        # complete.'; rendered with a user turn after it, just 'All tasks are
-        # complete.'. Tool messages do not move that point, which is why
-        # appending tool observations has always been a clean extension.
-        #
-        # So the delta is measured against a stand-in history instead: render one
-        # user turn, then the same turn plus these messages, and take the
-        # difference. That is exact as long as a message block does not depend on
-        # what precedes it, which the prefix check below still enforces.
-        #
-        # What stays on record is the history as generated, thinking included --
-        # those are the tokens the policy read back when it produced the next
-        # turn, and a later training step has to see the same.
-        s_anchor = tokenizer.apply_chat_template(
-            _ANCHOR, tokenize=False, add_generation_prompt=False,
-            enable_thinking=enable_thinking)
-        s_anchor_after = tokenizer.apply_chat_template(
-            _ANCHOR + list(tool_messages), tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking)
-        if not s_anchor_after.startswith(s_anchor):
-            raise RuntimeError('Canonical chat_template output for messages_after is not a '
-                               'prefix-extension of messages_before, and the same is true '
-                               'of a one-message stand-in history; cannot compute bridge '
-                               'delta. This indicates the template is non-monotonic in the '
-                               'message list (e.g. reorders / rewrites earlier turns).\n'
-                               f's_before tail: {s_before[-80:]!r}\n'
-                               f's_after at same offset: '
-                               f'{s_after[max(0, len(s_before) - 80):len(s_before) + 80]!r}')
-        s_before, s_after = s_anchor, s_anchor_after
-    bridge_text = s_after[len(s_before):]
+    bridge_text = _delta_text(
+        template, messages_before, tool_messages, gen_prompt_before=False, gen_prompt_after=True)
     if not bridge_text:
         raise RuntimeError('Bridge text computation returned empty string; '
                            'tool turn would add no tokens (template misconfiguration?).')
 
-    bridge_ids = tokenizer.encode(bridge_text, add_special_tokens=False)
+    bridge_ids = template.tokenizer.encode(bridge_text, add_special_tokens=False)
     if not bridge_ids:
         raise RuntimeError(f'Bridge text tokenised to empty id list: {bridge_text!r}')
 
@@ -142,8 +200,10 @@ def _append_bridge_tokens(
     """Append bridge tokens with labels = -100.
 
     Mirrors the unroll-append-reroll pattern of
-    :meth:`Template.concat_input_feature` so that ``labels`` semantics
-    stay consistent with the sampler-produced pif.
+    :meth:`Template.concat_input_feature` so that ``labels`` and
+    ``completion_mask`` semantics stay consistent with the sampler-produced
+    pif. Bridge tokens are nobody's completion -- neither scored nor
+    log-prob-bearing -- so both fields are appended as zeros.
 
     Shallow copy is deliberately used: every mutation below is a
     top-level key reassignment, never an in-place change to nested
@@ -164,12 +224,15 @@ def _append_bridge_tokens(
         labels = labels[-1:] + labels[:-1]
     else:
         labels = [-100] * len(input_ids)
+    completion_mask = template._prefix_completion_mask(result, labels)
 
     input_ids = input_ids + list(bridge_ids)
     labels = labels + [-100] * len(bridge_ids)
+    completion_mask = completion_mask + [0] * len(bridge_ids)
 
     result['input_ids'] = input_ids
     result['labels'] = labels
+    result['completion_mask'] = completion_mask
 
     if 'mm_token_type_ids' in result:
         import torch

@@ -402,6 +402,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
+            # Not a model argument; restored below so the loss can read it.
+            completion_mask = batch.pop('completion_mask', None)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
@@ -410,6 +412,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**batch)
 
             batch['labels'] = labels
+            if completion_mask is not None:
+                batch['completion_mask'] = completion_mask
             logps = None
             unpacked_logits = None
             entropies = None
@@ -440,6 +444,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         if entropies is not None:
                             entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
                     batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
+                    if completion_mask is not None:
+                        # Same index space as labels, so it needs the same CP reassembly.
+                        batch['completion_mask'] = processor.postprocess_tensor_cp(
+                            completion_mask, cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
