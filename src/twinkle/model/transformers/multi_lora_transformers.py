@@ -84,6 +84,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
+        # PEFT creates LoRA parameters in FP32 even when the base model uses a
+        # lower-precision dtype. Align the preallocated slots before FSDP2
+        # records their parameter and gradient dtypes.
+        self._ensure_lora_dtype(self.model)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None

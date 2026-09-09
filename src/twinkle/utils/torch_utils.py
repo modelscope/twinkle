@@ -1,4 +1,5 @@
 import socket
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
@@ -134,6 +135,166 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
         if return_entropy:
             return per_token_logps, torch.stack(per_token_entropy)
     return per_token_logps
+
+
+@dataclass(frozen=True)
+class ReplayedLogSoftmaxMetadata:
+    """Validated, flattened CSR metadata used by sampling replay."""
+    token_ids: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+
+def prepare_replayed_selective_log_softmax(
+    labels: 'torch.Tensor',
+    loss_mask: 'torch.Tensor',
+    sampling_masks,
+    temperature: float,
+    vocab_size: int,
+    allow_packed_masks: bool = False,
+) -> ReplayedLogSoftmaxMetadata:
+    """Align and flatten sampling masks before the model forward.
+
+    When ``allow_packed_masks`` is true, a padding-free batch may concatenate
+    multiple logical masks into one tensor row. Their sampler-validated CSR
+    rows are flattened in logical-sample order.
+    """
+    import math
+    import torch
+
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError('temperature must be greater than 0 for sampling replay')
+    if not torch.is_tensor(labels) or labels.dim() != 2:
+        shape = tuple(labels.shape) if torch.is_tensor(labels) else type(labels)
+        raise ValueError(f'labels must have shape [batch, seq_len], got {shape}')
+    if loss_mask.shape != labels.shape:
+        raise ValueError('loss_mask must have the same shape as labels')
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError(f'vocab_size must be a positive integer, got {vocab_size!r}')
+    if not sampling_masks:
+        raise ValueError('sampling mask batch has 0 samples')
+
+    batch_size = labels.shape[0]
+    if len(sampling_masks) == batch_size:
+        mask_groups = [[sampling_mask] for sampling_mask in sampling_masks]
+    elif batch_size == 1 and allow_packed_masks:
+        # padding_free/packing collapses multiple logical samples into batch=1.
+        mask_groups = [list(sampling_masks)]
+    else:
+        raise ValueError(f'sampling mask batch has {len(sampling_masks)} samples, expected {batch_size}')
+
+    flat_token_ids = []
+    global_offsets = [0]
+    for batch_idx, mask_group in enumerate(mask_groups):
+        sampled_labels = labels[batch_idx][loss_mask[batch_idx]].tolist()
+        parsed_masks = []
+        group_rows = 0
+        for sampling_mask in mask_group:
+            if sampling_mask is None:
+                raise ValueError(f'sampling mask is missing for sample {batch_idx}')
+            token_ids = [int(token_id) for token_id in sampling_mask.token_ids]
+            offsets = [int(offset) for offset in sampling_mask.offsets]
+            invalid_token_id = next(
+                (token_id for token_id in token_ids if token_id < 0 or token_id >= vocab_size),
+                None,
+            )
+            if invalid_token_id is not None:
+                raise ValueError(f'sampling mask token ID {invalid_token_id} is outside vocabulary [0, {vocab_size})')
+
+            base_offset = global_offsets[-1]
+            flat_token_ids.extend(token_ids)
+            global_offsets.extend(base_offset + offset for offset in offsets[1:])
+            group_rows += len(offsets) - 1
+            parsed_masks.append((token_ids, offsets))
+
+        num_train_tokens = len(sampled_labels)
+        if group_rows != num_train_tokens:
+            raise ValueError(f'sampling mask for sample {batch_idx} has {group_rows} rows but '
+                             f'{num_train_tokens} training tokens')
+        row_idx = 0
+        for token_ids, offsets in parsed_masks:
+            for start, end in zip(offsets, offsets[1:]):
+                sampled_label = sampled_labels[row_idx]
+                if sampled_label < 0 or sampled_label >= vocab_size:
+                    raise ValueError(f'sampled label {sampled_label} is outside vocabulary [0, {vocab_size})')
+                try:
+                    token_ids.index(sampled_label, start, end)
+                except ValueError as e:
+                    raise ValueError(f'sampled label {sampled_label} is absent from sampling mask row {row_idx}') from e
+                row_idx += 1
+
+    return ReplayedLogSoftmaxMetadata(tuple(flat_token_ids), tuple(global_offsets))
+
+
+# Re-normalize trainer logits over each rollout-time top-p/top-k support set
+# before reading the sampled token's log probability. Replaying the sampler's
+# action space removes the sampling/training distribution mismatch in GRPO.
+def replayed_selective_log_softmax(
+    logits: 'torch.Tensor',
+    labels: 'torch.Tensor',
+    loss_mask: 'torch.Tensor',
+    sampling_masks,
+    temperature: float,
+    metadata: Optional[ReplayedLogSoftmaxMetadata] = None,
+    allow_packed_masks: bool = False,
+) -> 'torch.Tensor':
+    """Compute selected log probabilities on rollout-time CSR support sets."""
+    import torch
+
+    if logits.dim() != 3:
+        raise ValueError(f'logits must have shape [batch, seq_len, vocab], got {tuple(logits.shape)}')
+    if labels.shape != logits.shape[:2] or loss_mask.shape != labels.shape:
+        raise ValueError('labels and loss_mask must match the first two logits dimensions')
+    if metadata is None:
+        metadata = prepare_replayed_selective_log_softmax(
+            labels=labels,
+            loss_mask=loss_mask,
+            sampling_masks=sampling_masks,
+            temperature=temperature,
+            vocab_size=logits.shape[-1],
+            allow_packed_masks=allow_packed_masks,
+        )
+
+    # CSR rows are ordered exactly like the masked training-token positions.
+    positions = loss_mask.nonzero(as_tuple=False)
+    num_rows = positions.shape[0]
+    result = torch.zeros(labels.shape, dtype=torch.float32, device=logits.device)
+    if num_rows == 0:
+        return result
+
+    offsets_tensor = torch.tensor(metadata.offsets, dtype=torch.long, device=logits.device)
+    lengths = offsets_tensor[1:] - offsets_tensor[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(num_rows, device=logits.device),
+        lengths,
+    )
+    kept_token_ids = torch.tensor(metadata.token_ids, dtype=torch.long, device=logits.device)
+    sampled_labels = labels[positions[:, 0], positions[:, 1]].long()
+
+    # Gather only logits retained by the rollout sampler, then normalize per CSR row.
+    kept_logits = logits[
+        positions[row_ids, 0],
+        positions[row_ids, 1],
+        kept_token_ids,
+    ].float() / temperature
+    selected_logits = logits[
+        positions[:, 0],
+        positions[:, 1],
+        sampled_labels,
+    ].float() / temperature
+
+    # Use max-shifted log-sum-exp for numerically stable restricted softmax.
+    row_max = torch.full(
+        (num_rows, ),
+        -torch.inf,
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    row_max.scatter_reduce_(0, row_ids, kept_logits, reduce='amax', include_self=True)
+    row_exp_sums = torch.zeros(num_rows, dtype=torch.float32, device=logits.device)
+    row_exp_sums.scatter_add_(0, row_ids, torch.exp(kept_logits - row_max[row_ids]))
+    flat_logps = selected_logits - (row_max + torch.log(row_exp_sums))
+    result[positions[:, 0], positions[:, 1]] = flat_logps
+    return result
 
 
 def _vocab_parallel_selective_log_softmax(

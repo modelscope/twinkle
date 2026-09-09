@@ -1,4 +1,48 @@
 {
+  "data_plane": {
+    "paths": {
+      "/twinkle/append": {
+        "POST": {
+          "operationId": "append_twinkle_append_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/get": {
+        "POST": {
+          "operationId": "get_twinkle_get_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/put": {
+        "POST": {
+          "operationId": "put_twinkle_put_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/release": {
+        "POST": {
+          "operationId": "release_twinkle_release_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      }
+    }
+  },
   "gateway": {
     "paths": {
       "/asample": {
@@ -733,6 +777,16 @@
           ]
         }
       },
+      "/twinkle/forward_from_data_plane": {
+        "POST": {
+          "operationId": "forward_from_data_plane_twinkle_forward_from_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/forward_backward": {
         "POST": {
           "operationId": "forward_backward_twinkle_forward_backward_post",
@@ -743,9 +797,29 @@
           ]
         }
       },
+      "/twinkle/forward_backward_from_data_plane": {
+        "POST": {
+          "operationId": "forward_backward_from_data_plane_twinkle_forward_backward_from_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/forward_only": {
         "POST": {
           "operationId": "forward_only_twinkle_forward_only_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/forward_only_from_data_plane": {
+        "POST": {
+          "operationId": "forward_only_from_data_plane_twinkle_forward_only_from_data_plane_post",
           "parameters": [],
           "responses": [
             "200",
@@ -786,6 +860,16 @@
       "/twinkle/lr_step": {
         "POST": {
           "operationId": "lr_step_twinkle_lr_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/remove_adapter": {
+        "POST": {
+          "operationId": "remove_adapter_twinkle_remove_adapter_post",
           "parameters": [],
           "responses": [
             "200",
@@ -990,6 +1074,16 @@
           ]
         }
       },
+      "/twinkle/sample_to_data_plane": {
+        "POST": {
+          "operationId": "sample_to_data_plane_twinkle_sample_to_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/sample_stream": {
         "POST": {
           "operationId": "sample_stream_twinkle_sample_stream_post",
@@ -1003,6 +1097,16 @@
       "/twinkle/set_template": {
         "POST": {
           "operationId": "set_template_twinkle_set_template_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/unload_adapter_paths": {
+        "POST": {
+          "operationId": "unload_adapter_paths_twinkle_unload_adapter_paths_post",
           "parameters": [],
           "responses": [
             "200",

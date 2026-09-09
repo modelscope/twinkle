@@ -15,6 +15,7 @@ Twinkle DOCUMENTATION
    Usage Guide/NPU-Support.md
    Usage Guide/Train-as-a-Service.md
    Usage Guide/Agentic-RL-Deployment-and-Training.md
+   Usage Guide/Agentic-Evaluator.md
    Usage Guide/Introduction-with-Qwen3.5.md
    Usage Guide/Embedding-Training.md
 

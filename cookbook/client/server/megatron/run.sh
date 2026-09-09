@@ -3,7 +3,8 @@
 # ============================================
 # Twinkle Megatron 服务启动脚本
 # ============================================
-# 功能：启动 Ray 集群（支持多 GPU/CPU 节点）、LGTM 观测栈和 Twinkle 服务器
+# 功能：启动 Ray 集群（支持 GPU 节点）、LGTM 观测栈和 Twinkle 服务器。
+# 设置 TWINKLE_DASHSERVING_ADAPTER=1 时，同时启动 ASI Native HTTP Adapter。
 #
 # 用法：./run.sh [选项]
 #
@@ -11,15 +12,15 @@
 #   --restart           如果已有 run.sh 实例正在运行，请求其退出并由 entrypoint 重启服务
 #   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
-#   --cpu-workers N      CPU Worker 数量 (默认: 1)
-#   --temp-dir DIR       Ray 临时目录 (默认: /dashscope/caches/application/ray_logs)
-#   --save-dir DIR       Twinkle 模型保存目录 (默认: /dashscope/caches/application/save)
+#   --temp-dir DIR       Ray 临时目录 (默认: /twinkle/runtime/ray_logs)
+#   --save-dir DIR       Twinkle 模型保存目录 (默认: /twinkle/runtime/save)
 #   --server-config FILE Twinkle 服务器配置文件路径 (默认: /twinkle/cookbook/client/server/megatron/server_config.yaml)
 #   --help               显示帮助信息
 #
 # 环境变量：
-#   MODELSCOPE_CACHE                         默认 /dashscope/caches/application/.cache
-#   TWINKLE_WORK_DIR                         默认 /dashscope/caches/application/twinkle
+#   MODELSCOPE_CACHE                         默认 /twinkle/runtime/.cache
+#   TWINKLE_WORK_DIR                         默认 /twinkle/runtime/work
+#   TWINKLE_DASHSERVING_ADAPTER              设为 1 时启动端口 9000 的 Adapter
 #   TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart（默认 exit）
 #   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数（默认 120）
 #
@@ -30,9 +31,6 @@
 #                                               # 直接启动服务，前台等待 server 子进程
 #   bash /twinkle/cookbook/client/server/megatron/run.sh --restart
 #                                               # 更新代码后请求已有 run.sh 退出并由 entrypoint 重启
-#   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
-#   ./run.sh --head "0,1,2,3" --gpu-workers "" --cpu-workers 0
-#   ./run.sh --head "" --cpu-workers 4          # 纯 CPU 模式
 #   ./run.sh --temp-dir /tmp/my_ray_logs        # 自定义临时目录
 # ============================================
 
@@ -53,20 +51,18 @@ set -e  # 遇到错误立即退出
 # 示例："4,5,6,7" 或 "4,5,6,7;8,9,10,11"
 # 可通过命令行参数 $2 传入
 
-# CPU Worker 数量
-# 可通过命令行参数 $3 传入
-
 # --- 网络配置 ---
 RAY_PORT=6379
 RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 
 # --- 路径配置 ---
-export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/dashscope/caches/application/.cache}"
-TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-/dashscope/caches/application/twinkle}"
-DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
+TWINKLE_RUNTIME_DIR="${TWINKLE_RUNTIME_DIR:-/twinkle/runtime}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-$TWINKLE_RUNTIME_DIR/.cache}"
+TWINKLE_WORK_DIR="${TWINKLE_WORK_DIR:-$TWINKLE_RUNTIME_DIR/work}"
+DEFAULT_TEMP_DIR="${TWINKLE_TEMP_DIR:-$TWINKLE_RUNTIME_DIR/ray_logs}"
 LOG_FILE="run.log"
 REDIS_LOG_FILE="/twinkle/redis.log"
-DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
+DEFAULT_SAVE_DIR="${TWINKLE_SAVE_DIR:-$TWINKLE_RUNTIME_DIR/save}"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
 # --- LGTM 版本配置（与 grafana/otel-lgtm:0.28.0 保持一致） ---
@@ -87,8 +83,10 @@ TWINKLE_RUN_RESTART_REQUEST_FILE="${TWINKLE_RUN_RESTART_REQUEST_FILE:-/tmp/twink
 TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-exit}"
 TWINKLE_RUN_RESTART_TIMEOUT_SECONDS="${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS:-120}"
 SERVER_PID=""
+ADAPTER_PID=""
 TAIL_PID=""
 RESTART_REQUESTED_BY_SIGNAL=0
+TWINKLE_DASHSERVING_ADAPTER="${TWINKLE_DASHSERVING_ADAPTER:-0}"
 
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
@@ -97,7 +95,6 @@ RESTART_REQUESTED_BY_SIGNAL=0
 # 默认值
 HEAD_NODE="0,1,2,3"
 GPU_WORKERS_INPUT="4,5,6,7"
-CPU_WORKER_COUNT="1"
 TEMP_DIR="$DEFAULT_TEMP_DIR"
 SAVE_DIR="$DEFAULT_SAVE_DIR"
 SERVER_CONFIG_FILE="$DEFAULT_SERVER_CONFIG_FILE"
@@ -110,15 +107,15 @@ print_usage() {
   --restart           如果已有 run.sh 实例正在运行，请求其退出并由 entrypoint 重启服务
   --head NODE          Head 节点 GPU 设备列表，逗号分隔 (默认: 0,1,2,3)
   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)
-  --cpu-workers N      CPU Worker 数量 (默认: 1)
   --temp-dir DIR       Ray 临时目录
   --save-dir DIR       Twinkle 模型保存目录 (默认: $DEFAULT_SAVE_DIR)
   --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)
   --help, -h           显示帮助信息
 
 环境变量:
-  MODELSCOPE_CACHE                         默认: /dashscope/caches/application/.cache
-  TWINKLE_WORK_DIR                         默认: /dashscope/caches/application/twinkle
+  MODELSCOPE_CACHE                         默认: /twinkle/runtime/.cache
+  TWINKLE_WORK_DIR                         默认: /twinkle/runtime/work
+  TWINKLE_DASHSERVING_ADAPTER              设为 1 时启动端口 9000 的 Adapter
   TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart (默认: exit)
   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
@@ -134,7 +131,6 @@ print_usage() {
   ./run.sh --head '0,1,2,3' --gpu-workers '4,5,6,7'
   ./run.sh --head '0,1,2,3,4,5,6,7'             # 单机 8 卡
   ./run.sh --gpu-workers '4,5,6,7;8,9,10,11'    # 多 GPU Worker
-  ./run.sh --cpu-workers 4 --head ''            # 纯 CPU 模式
 EOF
 }
 
@@ -159,14 +155,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpu-workers=*)
             GPU_WORKERS_INPUT="${1#*=}"
-            shift
-            ;;
-        --cpu-workers)
-            CPU_WORKER_COUNT="$2"
-            shift 2
-            ;;
-        --cpu-workers=*)
-            CPU_WORKER_COUNT="${1#*=}"
             shift
             ;;
         --temp-dir)
@@ -367,15 +355,6 @@ cleanup_pid_file() {
     fi
 }
 
-require_non_negative_int() {
-    local name="$1"
-    local value="$2"
-    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-        print_error "$name 必须是非负整数，当前值: $value"
-        exit 1
-    fi
-}
-
 require_positive_int() {
     local name="$1"
     local value="$2"
@@ -396,7 +375,13 @@ validate_runtime_config() {
     esac
 
     require_positive_int "TWINKLE_RUN_RESTART_TIMEOUT_SECONDS" "$TWINKLE_RUN_RESTART_TIMEOUT_SECONDS"
-    require_non_negative_int "CPU_WORKER_COUNT" "$CPU_WORKER_COUNT"
+    case "$TWINKLE_DASHSERVING_ADAPTER" in
+        0|1) ;;
+        *)
+            print_error "TWINKLE_DASHSERVING_ADAPTER 只能是 0 或 1，当前值: $TWINKLE_DASHSERVING_ADAPTER"
+            exit 1
+            ;;
+    esac
 }
 
 require_command() {
@@ -493,8 +478,10 @@ stop_pid() {
 
 cleanup_existing_runtime() {
     stop_pid "$TAIL_PID" "日志 tail"
+    stop_pid "$ADAPTER_PID" "DashServing Adapter"
     stop_pid "$SERVER_PID" "Twinkle Server"
     TAIL_PID=""
+    ADAPTER_PID=""
     SERVER_PID=""
 
     print_info "停止已有的 Twinkle Server..."
@@ -609,11 +596,6 @@ print_runtime_config() {
         done
     fi
 
-    if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
-        echo ""
-        echo "  [CPU Worker 节点] $CPU_WORKER_COUNT 个"
-    fi
-
     echo ""
     print_info "运行参数："
     echo "  - Ray 地址: $RAY_ADDRESS"
@@ -683,16 +665,6 @@ start_ray_cluster() {
         print_success "GPU Worker $((i+1)) 启动成功！"
     done
 
-    if [ "$CPU_WORKER_COUNT" -gt 0 ]; then
-        print_info "启动 $CPU_WORKER_COUNT 个 CPU Worker..."
-        for ((i=1; i<=CPU_WORKER_COUNT; i++)); do
-            CUDA_VISIBLE_DEVICES="" ray start \
-                --address=$RAY_ADDRESS \
-                --num-gpus=0
-        done
-        print_success "CPU Worker 启动成功！"
-    fi
-
     echo ""
     print_info "集群状态："
     ray status 2>/dev/null || true
@@ -742,6 +714,20 @@ start_twinkle_server() {
     start_log_tail
 }
 
+start_dashserving_adapter() {
+    if [ "$TWINKLE_DASHSERVING_ADAPTER" != "1" ]; then
+        return
+    fi
+
+    print_header "启动 DashServing Adapter"
+    export PORT="${PORT:-9000}"
+    export TWINKLE_INTERNAL_URL="${TWINKLE_INTERNAL_URL:-http://127.0.0.1:8000}"
+    export TWINKLE_DS_TIMEOUT_SECONDS="${TWINKLE_DS_TIMEOUT_SECONDS:-600}"
+    nohup python -m twinkle.server.dashserving >> "$LOG_FILE" 2>&1 &
+    ADAPTER_PID=$!
+    print_success "DashServing Adapter 已启动 (PID: $ADAPTER_PID, port: $PORT)"
+}
+
 wait_runtime() {
     print_info "Twinkle runtime 已启动，等待 server 进程..."
     while true; do
@@ -751,6 +737,12 @@ wait_runtime() {
 
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
+            return 1
+        fi
+
+        if [ "$TWINKLE_DASHSERVING_ADAPTER" = "1" ] \
+            && ! kill -0 "$ADAPTER_PID" 2>/dev/null; then
+            print_error "DashServing Adapter 进程已退出 (PID: $ADAPTER_PID)"
             return 1
         fi
 
@@ -772,6 +764,7 @@ run_service_once() {
     start_ray_cluster
     start_lgtm
     start_twinkle_server
+    start_dashserving_adapter
     wait_runtime
 }
 
