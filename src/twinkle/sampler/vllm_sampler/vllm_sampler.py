@@ -36,12 +36,10 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-# max_concurrency: how many sample() calls one worker serves at once. Without it
-# Ray runs one method per actor at a time, so concurrent callers queue at the actor
-# and never share a batch inside AsyncLLM. 24 is what vLLM reports as the maximum
-# concurrency its KV cache holds for this context length; past it vLLM preempts and
-# recomputes, which costs more than it gains.
-@remote_class(max_concurrency=24)
+_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+
+
+@remote_class(max_concurrency=_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 

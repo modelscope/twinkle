@@ -4,25 +4,41 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SamplingParams
 from .bridge import _to_plain
 
+# Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
+# path takes the first three from the sampler itself; the API path has to name
+# them, and one vocabulary for both is what lets a consumer read either.
+STOP_NO_TOOL = 'stop'
+STOP_LENGTH = 'length'
+STOP_MAX_TURNS = 'max_turns'
+STOP_GENERATION_ERROR = 'generation_error'
+
+# Runaway guard: a ``followup_fn`` is expected to return None eventually. This
+# only bounds a callback that never does, so one bad hook cannot spin forever.
+MAX_FOLLOWUPS = 20
+
 
 class Rollout(ABC):
     """A batch of trajectories in, the same batch with the model's turns appended.
 
-    Implementations differ in where the turns come from -- a local sampler,
-    whose token ids are spliced into the trajectory, or an HTTP endpoint, which
-    only ever returns text -- and the difference is real enough that they stay
-    separate classes: only one of them produces something trainable.
+    The concrete multi-turn loop may source each assistant turn from a local
+    sampler or an HTTP endpoint. Everything independent of that choice lives
+    here: option validation, spreading a per-call argument over the batch, the
+    thread pool that runs episodes, and trace dumping.
 
-    Everything that is *not* generation is here: option validation, spreading a
-    per-call argument over the batch, and the trace dump. It moved up because
-    the two implementations had drifted into sharing it by reaching across the
-    class boundary for each other's underscore methods.
+    One episode per thread, and a subclass only writes the episode. Both
+    backends are latency-bound on something that is not the caller's CPU -- an
+    HTTP round trip, a sandbox, a sampler that routes each request to whichever
+    worker is free -- so the threads overlap the waiting. Nothing crosses
+    between episodes, which is what makes the pool safe and also what the old
+    lockstep loop had to give up: there, one slow sandbox round trip held up the
+    next generation for every trajectory in the batch.
     """
 
     # Set by _init_common. Declared at class level so a subclass that does its
@@ -33,10 +49,7 @@ class Rollout(ABC):
     trace_dir: Optional[str] = None
     trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None
     success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None
-
-    @abstractmethod
-    def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
-        raise NotImplementedError()
+    concurrency: Optional[int] = None
 
     # ------------------------------------------------------------------ setup
 
@@ -45,6 +58,7 @@ class Rollout(ABC):
         *,
         max_turns: int,
         sampling_params: Optional[SamplingParams] = None,
+        concurrency: Optional[int] = None,
         trace_dir: Optional[str] = None,
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
@@ -59,21 +73,93 @@ class Rollout(ABC):
             # passing the trajectory several times instead.
             raise ValueError(f'{type(self).__name__} supports num_samples=1 only, '
                              f'got {sp.num_samples}')
+        if concurrency is not None and concurrency < 1:
+            raise ValueError(f'concurrency must be >= 1 or None, got {concurrency}')
         self.max_turns = max_turns
         self.sampling_params = sp
+        # None means one thread per trajectory. A cap below the batch size costs
+        # throughput rather than buying safety, so it has to be asked for.
+        self.concurrency = concurrency
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
         if trace_dir:
             os.makedirs(trace_dir, exist_ok=True)
 
+    # ------------------------------------------------------------------- drive
+
+    def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
+        """Run one episode per trajectory and return them in the input order.
+
+        Order is restored from the future map rather than from completion order,
+        because callers pair the result with their own list positionally -- a
+        GRPO group is a slice of this list.
+        """
+        if isinstance(trajectories, dict):
+            raise TypeError(f'{type(self).__name__}.__call__ expects a List[Trajectory]; '
+                            'wrap a single trajectory as [trajectory].')
+        trajectories = list(trajectories)
+        n = len(trajectories)
+        if n == 0:
+            return []
+
+        ctx = self._resolve_call(kwargs, n)
+        outs: List[Optional[Trajectory]] = [None] * n
+        workers = min(n, self.concurrency or n)
+        if workers == 1:
+            # No pool for a single episode: a thread would only make the
+            # traceback of a failing one harder to read.
+            outs = [self._run_one(trajectories[i], i, ctx) for i in range(n)]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(self._run_one, trajectories[i], i, ctx): i for i in range(n)}
+                for fut in as_completed(futures):
+                    outs[futures[fut]] = fut.result()
+
+        result: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
+        if self.trace_dir:
+            self._write_rollout_traces(result, global_step=kwargs.get('global_step'))
+        return result
+
+    @abstractmethod
+    def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+        """One trajectory, start to finish, in its own thread.
+
+        ``ctx`` is whatever ``_resolve_call`` produced; ``index`` is the
+        trajectory's position in the batch, which is how per-trajectory entries
+        in ``ctx`` are addressed.
+        """
+        raise NotImplementedError()
+
+    def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
+        """Fold per-call ``**kwargs`` over the constructor defaults, once.
+
+        Done before the pool starts so a bad argument raises from the caller's
+        frame instead of inside n threads, and so ``_broadcast`` runs once
+        rather than per episode.
+        """
+        return {}
+
     @staticmethod
-    def _broadcast(arg, n: int, *, name: str, required: bool = False) -> List[Any]:
+    def _unpack_followup(followup: Any) -> Tuple[str, Optional[SamplingParams]]:
+        """``followup_fn`` may answer with text, or text plus its own budget."""
+        if isinstance(followup, tuple):
+            text, params = followup
+            return text, params
+        return followup, None
+
+    @staticmethod
+    def _broadcast(arg, n: int, *, name: str, required: bool = False, per_trajectory: bool = False) -> List[Any]:
         """One value shared by the batch, or a list already aligned 1:1 with it.
 
         A list of the wrong length is refused rather than zipped short: the
         mismatch would silently pair trajectories with the wrong tool manager,
         which reads downstream as a model that used the wrong sandbox.
+
+        ``per_trajectory`` refuses to share one instance across a batch at all.
+        It is for arguments that carry episode state: episodes now run in
+        parallel threads, so a shared one would have several conversations
+        writing to the same object instead of merely interleaving in it.
         """
         if arg is None:
             if required:
@@ -85,6 +171,10 @@ class Rollout(ABC):
                 raise ValueError(f'per-call {name} list length ({len(arg)}) does '
                                  f'not match number of trajectories ({n})')
             return list(arg)
+        if per_trajectory and n > 1:
+            raise ValueError(f'{name} holds per-episode state and cannot be shared by '
+                             f'{n} trajectories running in parallel threads: pass a list '
+                             f'of {n}, one per trajectory.')
         return [arg] * n
 
     # ------------------------------------------------------------------ trace
@@ -92,6 +182,7 @@ class Rollout(ABC):
     _TRACE_SKIP_KEYS = (
         'input_ids',
         'labels',
+        'completion_mask',
         'attention_mask',
         'position_ids',
         'logprobs',

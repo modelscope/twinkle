@@ -105,7 +105,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 - 🎉2026-08-12 ModelScope的训练服务部署为[Qwen/Qwen3.8-27B](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B)。
 - 🎉2026-08-04 支持沙箱环境下的多轮RL训练：模型生成的代码可在隔离的 [AgentENV](https://github.com/kvcache-ai/AgentENV) Firecracker microVM 或 OpenEnv 服务中执行，两个后端共用同一份 `train.py`。参考 [cookbook](cookbook/rl/envs) 和[部署文档](docs/source_zh/使用指引/Agentic%20RL部署与训练.md)。
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
-- 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用`from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout`进行多轮rollout。
+- 🎉2026-05-20 支持多轮rollout和RL中的工具调用，Cookbook正在编写中，可以直接使用 `from twinkle_agentic.rollout import MultiTurnRollout` 进行 sampler、API 或混合后端的多轮 rollout。
 - 🎉2026-05-20 支持训练任务失败后的IM消息告警, 使用方式: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`。
 - 🎉2026-04-27 支持sft/dpo/grpo/gkd的padding_free方法, 使用`set_processor('InputProcessor', padding_free=True)`来开启训练。
 - 🎉2026-04-22 ModelScope的训练服务部署为[Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)，并发布了0.2.1版本。

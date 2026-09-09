@@ -568,6 +568,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             enable_sp=getattr(self, '_enable_sp', False),
         )
         labels: torch.Tensor = inputs.pop('labels', None)
+        # Not a model argument; the loss reads it back off `inputs` further down.
+        completion_mask = inputs.pop('completion_mask', None)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
             replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
@@ -595,6 +597,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         recorded_routing = rr_cleanup()
 
         inputs['labels'] = labels
+        if completion_mask is not None:
+            inputs['completion_mask'] = completion_mask
         if task != 'embedding' and labels is not None and loss_require_logps:
             loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
             masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
@@ -689,6 +693,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 enable_sp=getattr(self, '_enable_sp', False),
             )
             labels = inputs.pop('labels', None)
+            # Not a model argument; the loss reads it back off `inputs` further down.
+            completion_mask = inputs.pop('completion_mask', None)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
                 packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
@@ -720,6 +726,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             recorded_routing = rr_cleanup()
 
             inputs['labels'] = labels
+            if completion_mask is not None:
+                inputs['completion_mask'] = completion_mask
             if task != 'embedding' and labels is not None and loss_require_logps:
                 loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
                 masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)

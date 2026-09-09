@@ -40,16 +40,17 @@ PYTHON_TAGS: Tuple[str, ...] = ('python', 'py')
 
 
 @lru_cache(maxsize=None)
-def _fence_re(language_tags: Tuple[str, ...]) -> Pattern:
-    """A fenced block whose language tag is one of ``language_tags``, or absent.
+def _fence_re(language_tags: Optional[Tuple[str, ...]]) -> Pattern:
+    """Match a fenced block, optionally restricting its language label.
 
-    ``python``, ``py``, ``Python`` and ``python3`` are one intent spelled four
-    ways, so a tag matches case-insensitively and with any version suffix. A tag
-    that is not on the list -- ``bash``, ``json`` -- is a different intent, and is
-    not read as code at all.
+    ``None`` accepts any label. Otherwise, listed tags match case-insensitively,
+    with any version suffix; an unlabelled fence is accepted as well.
     """
-    alts = '|'.join(re.escape(tag) for tag in language_tags)
-    label = r'(?:(?:%s)[\d.]*)?' % alts if alts else ''
+    if language_tags is None:
+        label = r'[^\r\n]*'
+    else:
+        alts = '|'.join(re.escape(tag) for tag in language_tags)
+        label = r'(?:(?:%s)[\d.]*)?' % alts if alts else ''
     return re.compile(r'```[ \t]*%s[ \t]*\r?\n(.*?)```' % label, re.S | re.I)
 
 
@@ -69,10 +70,14 @@ def strip_reasoning(text: str) -> str:
     return body[cut:]
 
 
-def parse_fenced_code(text: str, language_tags: Tuple[str, ...] = PYTHON_TAGS) -> Optional[str]:
-    """The last block ``text`` fenced as that language, or None if there is none.
+def parse_fenced_code(
+    text: str,
+    language_tags: Optional[Tuple[str, ...]] = PYTHON_TAGS,
+) -> Optional[str]:
+    """Return the last matching fenced block, or None if there is none.
 
-    The last one, not the first: a model often drafts a version before the final
+    Pass ``language_tags=None`` to accept any language label. The last block, not
+    the first, is returned because a model often drafts a version before the final
     one, and the block it ends on is its answer.
 
     What is inside is taken as given -- a fence is the model saying which part is

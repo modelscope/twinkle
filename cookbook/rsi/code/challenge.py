@@ -31,7 +31,7 @@ from twinkle.data_format import SamplingParams, user_data_get
 from twinkle.sampler import vLLMSampler
 from twinkle_agentic.challenger import CodeChallenger, KeywordStore, load_seeds
 from twinkle_agentic.envs import LocalEnv
-from twinkle_agentic.rollout import build_rollout
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.tools.tool_manager import ToolManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -132,7 +132,7 @@ def main():
     # Single-turn generation, but through the same rollout the RL loop uses, so a
     # challenger that should be allowed to run code while inventing only needs a
     # tool manager here rather than a different code path.
-    explorer = build_rollout(
+    explorer = MultiTurnRollout(
         sampler,
         template=template,
         tool_manager=ToolManager([]),

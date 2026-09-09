@@ -13,12 +13,16 @@ ms-agent owns the tool names and schemas so the prompt is identical in
 training and serving; the Env owns the implementation. Wire the executing
 side from the same list, or the prompt advertises tools the Env cannot run::
 
-    harness = MsAgentHarness(config)
-    harness.prepare()
-    tool_manager = env.tool_manager(harness.tool_schemas())
-    rollout = MultiTurnRollout(sampler, template,
-                               tool_manager=tool_manager, harness=harness)
-    outs = rollout([harness.start(q) for q in queries])
+One harness per trajectory: each holds an ``LLMAgent`` with memory and context
+of its own, and episodes run in parallel threads::
+
+    harnesses = [MsAgentHarness(config) for _ in queries]
+    for h in harnesses:
+        h.prepare()
+    tool_managers = [env.tool_manager(h.tool_schemas()) for h, env in zip(harnesses, envs)]
+    rollout = MultiTurnRollout(sampler, template)
+    outs = rollout([h.start(q) for h, q in zip(harnesses, queries)],
+                   tool_manager=tool_managers, harness=harnesses)
 
 Serving path keeps using ``LLMAgent.run()`` with the same ``agent.yaml`` and
 the same :class:`~twinkle_agentic.envs.base.Env` backend. This class must

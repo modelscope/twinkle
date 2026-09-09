@@ -1,18 +1,47 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import re
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from twinkle.data_format import Trajectory
-from twinkle.data_format.sampling import SampleResponse, SamplingParams
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
 from twinkle_agentic.harness.base import AgentHarness
+from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .base import Rollout
+from .api_sampler import APIGenerationError, APISampler
+from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
 from .bridge import _to_plain, extend_with_bridge
+
+
+ResponseCallback = Callable[..., SampledSequence]
+
+
+def _default_response_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs,
+                               **kwargs) -> SampledSequence:
+    """Use the sampler when present, otherwise the API adapter."""
+    if sampler is None:
+        if api is None:
+            raise ValueError('response_callback was omitted, but no sampler or API was provided')
+        return api(input_feature, sampling_params, **adapter_kwargs)
+    responses = sampler.sample([input_feature], sampling_params=sampling_params, **adapter_kwargs)
+    if not isinstance(responses, list):
+        raise TypeError(f'expected List[SampleResponse] from sampler.sample, got '
+                        f'{type(responses).__name__}')
+    if len(responses) != 1:
+        raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; '
+                           'expected exactly one.')
+    response = responses[0]
+    if not isinstance(response, SampleResponse):
+        raise TypeError(f'expected SampleResponse from sampler.sample, got '
+                        f'{type(response).__name__}')
+    if len(response.sequences) != 1:
+        raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
+    sequence = response.sequences[0]
+    if not isinstance(sequence, SampledSequence):
+        raise TypeError(f'expected SampledSequence, got {type(sequence).__name__}')
+    return sequence
 
 
 def _append_only_delta(
@@ -111,63 +140,118 @@ def _malformed_tool_message(errors: List[str]) -> Dict[str, Any]:
 
 @remote_class()
 class MultiTurnRollout(Rollout):
-    """Agentic multi-turn rollout with tool use (batched).
+    """Agentic multi-turn rollout with tool use, one episode per thread.
 
     Contract (matches :class:`Rollout`): accepts a ``List[Trajectory]`` and
     returns a ``List[Trajectory]`` of the same length, in the same order.
-    Every turn issues a SINGLE batched ``sampler.sample(active_pifs)`` call
-    so vLLM can run all live trajectories in parallel; finished trajectories
-    are parked and excluded from subsequent batches.
 
     Per-trajectory loop::
 
         harness.before_generate     # append-only after the first encode
-        sampler.sample(batch)       # keep seq.new_input_feature
+        response_callback(...)      # sampler or API -> SampledSequence
         harness.after_generate
-        ToolManager.call_many       # Env.step_batch when tools share an Env
+        ToolManager.call_many       # this turn's calls, one Env round trip
         harness.after_tools         # format observations as tool messages
         extend_with_bridge          # labels=-100; never decode-reencode history
 
+    Each trajectory runs its whole loop in its own thread. The callback may route
+    each turn to the sampler or the API adapter; either can overlap with other
+    trajectories while its thread waits on a GPU worker, endpoint, or sandbox.
+
+    A supplied sampler must declare ``sample`` with ``enable_continous_work``.
+    Without it, ``slice_dp`` spreads each single-request call over every worker
+    and raises on ranks that receive nothing.
+
+    Shared state: ``sampler``, API client and ``template`` are read-only during a
+    rollout and safe to share. A ``harness`` is not -- an ms-agent one delegates to an
+    ``LLMAgent`` that holds memory and context of its own -- so a batch of more
+    than one trajectory has to be given a 1:1 list of them; a single instance is
+    refused rather than shared.
+
     Per-call overrides via ``**kwargs``:
-        * ``sampling_params``: shared :class:`SamplingParams` for the batch.
+        * ``sampling_params``: :class:`SamplingParams` for every episode.
+        * ``response_callback``: chooses a backend for each assistant turn and
+          returns one :class:`SampledSequence`.
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
-        * ``harness``: a single :class:`AgentHarness` or a 1:1 list. Framework
-          specifics (ms-agent system/memory/tool-message shape) live in the
-          harness subclass, not here.
+        * ``harness``: a 1:1 list of :class:`AgentHarness` (a single instance
+          only for a batch of one). Framework specifics (ms-agent
+          system/memory/tool-message shape) live in the harness subclass, not
+          here.
+        * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
     """
 
     def __init__(
         self,
-        sampler,
-        template: Template,
+        sampler=None,
+        template: Optional[Template] = None,
         tool_manager: Optional[ToolManager] = None,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
+        concurrency: Optional[int] = None,
         trace_dir: Optional[str] = None,
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         harness: Optional[AgentHarness] = None,
         adapter_path: Optional[str] = None,
+        use_base_model: bool = False,
         stop_after_stuck_turns: int = 0,
         max_malformed_retries: int = 2,
         followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
+        api: Optional[API] = None,
+        response_callback: Optional[ResponseCallback] = None,
+        api_appended_as: Literal['demonstration', 'context'] = 'demonstration',
+        api_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+        if isinstance(sampler, (API, APISampler)):
+            if api is not None:
+                raise ValueError('the positional backend and api= both specify an API')
+            api, sampler = sampler, None
         if template is None:
             raise ValueError('MultiTurnRollout requires a local Template instance')
+        if response_callback is None and sampler is None and api is None:
+            raise ValueError('MultiTurnRollout requires a sampler or API when response_callback is omitted')
+        if sampler is not None:
+            sample = getattr(type(sampler), 'sample', None)
+            if sample is None:
+                raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
+            if not getattr(sample, '_enable_continous_work', False):
+                raise ValueError(
+                    f'{type(sampler).__name__}.sample must be declared with '
+                    'enable_continous_work=True: this rollout samples one trajectory per '
+                    'call, and a slice_dp sampler raises when a worker gets nothing from '
+                    'a batch of one.')
+        if adapter_path and use_base_model:
+            raise ValueError('adapter_path and use_base_model=True ask for opposite '
+                             'weights; the sampler would drop the adapter silently.')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
                              f'{max_trajectory_tokens}')
         self._init_common(
             max_turns=max_turns,
             sampling_params=sampling_params,
+            concurrency=concurrency,
             trace_dir=trace_dir,
             trace_callback=trace_callback,
             success_callback=success_callback)
         self.sampler = sampler
         self.template = template
+        if isinstance(api, APISampler):
+            if api_kwargs:
+                raise ValueError('api_kwargs belongs on the APISampler when api= is already adapted')
+            if api.template is not template:
+                raise ValueError('MultiTurnRollout and APISampler must share the same template instance')
+            self.api = api
+        elif api is not None:
+            self.api = APISampler(
+                api, template, appended_as=api_appended_as, api_kwargs=api_kwargs)
+        else:
+            if api_kwargs:
+                raise ValueError('api_kwargs requires an API backend')
+            self.api = None
+        self.response_callback = response_callback or _default_response_callback
         self.tool_manager = tool_manager
         self.harness = harness
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
@@ -175,6 +259,11 @@ class MultiTurnRollout(Rollout):
         # such channel: without this, an eval script would silently measure the
         # base model and report it as the trained one.
         self.adapter_path = adapter_path
+        # The other direction: force the base weights. Needed because a sampler
+        # mid-training falls back to the LoRA synced into it whenever a call names
+        # no adapter, so a utility rollout (summarizing, judging) that wants the
+        # untrained model has to say so rather than stay silent.
+        self.use_base_model = use_base_model
         self.max_trajectory_tokens = max_trajectory_tokens
         # How many stuck turns in a row end the episode; 0 runs to ``max_turns``
         # regardless. A turn is stuck when it made no progress at all, which is
@@ -242,391 +331,363 @@ class MultiTurnRollout(Rollout):
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
-        if isinstance(trajectories, dict):
-            raise TypeError('MultiTurnRollout.__call__ expects a List[Trajectory]; '
-                            'wrap a single trajectory as [trajectory].')
-        trajectories = list(trajectories)
-        n = len(trajectories)
-        if n == 0:
-            return []
+        """The base implementation; the decorator is what a deployed handle needs."""
+        return super().__call__(trajectories, **kwargs)
 
-        sampling_params = kwargs.get('sampling_params', self.sampling_params)
+    def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
         adapter_path = kwargs.get('adapter_path', self.adapter_path)
         # Left out entirely when unset, so a sampler without LoRA enabled sees the
         # same call it always did.
         adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
-        tool_managers = self._broadcast(
-            kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager', required=True)
-        harnesses = self._broadcast(kwargs.get('harness', self.harness), n, name='harness')
-        lives: List[Optional[Trajectory]] = [
-            dict(trajectories[i]) if harnesses[i] is not None else None for i in range(n)
-        ]
-        for live in lives:
-            if live is not None:
-                live['messages'] = list(live.get('messages') or [])
+        if kwargs.get('use_base_model', self.use_base_model):
+            adapter_kwargs['use_base_model'] = True
+        sampling_params = kwargs.get('sampling_params', self.sampling_params)
+        if sampling_params.num_samples != 1:
+            raise ValueError(f'MultiTurnRollout supports num_samples=1 only, got '
+                             f'{sampling_params.num_samples}')
+        response_callback = kwargs.get('response_callback', self.response_callback)
+        if not callable(response_callback):
+            raise TypeError('response_callback must be callable')
+        return {
+            'sampling_params': sampling_params,
+            'adapter_kwargs': adapter_kwargs,
+            'response_callback': response_callback,
+            'tool_managers': self._broadcast(
+                kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
+            'harnesses': self._broadcast(
+                kwargs.get('harness', self.harness), n, name='harness', per_trajectory=True),
+            'followup_fn': kwargs.get('followup_fn', self.followup_fn),
+        }
+
+    def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+        tool_manager: ToolManager = ctx['tool_managers'][index]
+        harness: Optional[AgentHarness] = ctx['harnesses'][index]
+        followup_fn = ctx['followup_fn']
+        adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
+        response_callback: ResponseCallback = ctx['response_callback']
 
         # 1. First before_generate happens *before* encode so memory/system
         #    injection is in the initial prefix (not a later rewrite).
-        encode_trajs: List[Trajectory] = []
-        for i, traj in enumerate(trajectories):
-            h, live = harnesses[i], lives[i]
-            if h is not None and live is not None:
-                lives[i] = h.before_generate(live)
-                live = lives[i]
-                traj = dict(traj)
-                traj['messages'] = list(live.get('messages') or [])
-                if live.get('tools'):
-                    traj['tools'] = list(live['tools'])
-            encode_trajs.append(traj)
+        live: Optional[Trajectory] = None
+        to_encode = trajectory
+        if harness is not None:
+            live = dict(trajectory)
+            live['messages'] = list(live.get('messages') or [])
+            live = harness.before_generate(live)
+            to_encode = dict(trajectory)
+            to_encode['messages'] = list(live.get('messages') or [])
+            if live.get('tools'):
+                to_encode['tools'] = list(live['tools'])
 
-        pifs: List[Dict[str, Any]] = []
-        for i, traj in enumerate(encode_trajs):
-            pif = self.template.encode(traj, add_generation_prompt=True)
-            pif = _to_plain(pif)
-            pif.setdefault('messages', list(traj.get('messages', [])))
-            pifs.append(pif)
-            if lives[i] is not None:
-                lives[i]['messages'] = list(pifs[i].get('messages') or [])
+        pif = _to_plain(self.template.encode(to_encode, add_generation_prompt=True))
+        pif.setdefault('messages', list(to_encode.get('messages') or []))
+        if 'tools' in to_encode:
+            pif['tools'] = list(to_encode.get('tools') or [])
+        elif tool_manager is not None:
+            pif['tools'] = list(tool_manager.tool_infos() or [])
+        if live is not None:
+            live['messages'] = list(pif.get('messages') or [])
 
-        all_logprobs: List[List[Any]] = [[] for _ in range(n)]
-        stop_reasons: List[Optional[str]] = [None] * n
-        turns: List[int] = [0] * n
-        truncated: List[bool] = [False] * n
-        done: List[bool] = [False] * n
-        # Consecutive turns that made no progress, the calls already issued in
-        # each episode, and whether being stuck is what ended it. All three stay
-        # at their initial value when ``stop_after_stuck_turns`` is 0.
-        stuck_turns: List[int] = [0] * n
-        seen_calls: List[set] = [set() for _ in range(n)]
-        stuck_stop: List[bool] = [False] * n
+        logprobs: List[Any] = []
+        stop_reason: Optional[str] = None
+        generation_error: Optional[str] = None
+        turns = 0
+        truncated = False
+        params = ctx['sampling_params']
+        # Consecutive turns that made no progress, the calls already issued, and
+        # whether being stuck is what ended the episode. All three stay at their
+        # initial value when ``stop_after_stuck_turns`` is 0.
+        stuck_turns = 0
+        seen_calls: set = set()
+        stuck_stop = False
         # Replies in a row whose tool-call markup did not parse. Reset by any
         # reply that produced a call, so one bad escape in the middle of a
         # working episode does not count against a later one.
-        malformed_turns: List[int] = [0] * n
-        # Follow-up bookkeeping (all no-ops when ``followup_fn`` is None):
-        # how many follow-ups each trajectory has had, and the params its next
-        # turn should use. A trajectory that has had one stops dispatching tools.
-        followups: List[int] = [0] * n
-        params_for: List[Any] = [sampling_params] * n
-        followup_fn = kwargs.get('followup_fn', self.followup_fn)
-        # Why the tool-calling part of each episode ended, when it was not the
-        # model's own choice: 'max_turns' or 'stuck'. Reported separately from
-        # ``truncated`` because an episode can hit the turn limit and still go on
-        # to answer the follow-up stages, in which case nothing was cut off.
-        tool_stop: List[Optional[str]] = [None] * n
+        malformed_turns = 0
+        followups = 0
+        # Why the tool-calling part ended, when it was not the model's own
+        # choice: 'max_turns' or 'stuck'. Reported separately from ``truncated``
+        # because an episode can hit the turn limit and still go on to answer the
+        # follow-up stages, in which case nothing was cut off.
+        tool_stop: Optional[str] = None
+        # The loop counts generations, and each granted follow-up buys the one
+        # extra generation it asked for. Paying for the follow-up stages out of
+        # ``max_turns`` would mean an episode that spent its whole tool budget
+        # never reaches the stages that read what it built, and a short one
+        # silently gets more tool turns than a long one.
+        budget = self.max_turns
+        spent = 0
 
-        def append_followup(global_idx: int) -> bool:
+        def grant_followup() -> bool:
             """Ask for one more stage; True when the episode carries on.
 
             Sets ``truncated`` itself in the one case where the answer is "there
             is no room for another stage", which is a cut trajectory rather than
             a caller that had nothing more to ask.
             """
-            nonlocal iterations
-            if followup_fn is None:
+            nonlocal pif, live, followups, budget, params, truncated
+            if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
             followup = followup_fn(
-                self._as_trajectory(trajectories[global_idx], pifs[global_idx],
-                                    all_logprobs[global_idx], turns[global_idx],
-                                    stop_reasons[global_idx], truncated[global_idx]),
-                followups[global_idx])
+                self._as_trajectory(trajectory, pif, logprobs, turns, stop_reason, truncated), followups)
             if followup is None:
                 return False
-            text, next_params = followup if isinstance(followup, tuple) else (followup, None)
-            extended = extend_with_bridge(
-                pifs[global_idx], [{'role': 'user', 'content': text}], self.template)
+            text, next_params = self._unpack_followup(followup)
+            extended = extend_with_bridge(pif, [{'role': 'user', 'content': text}], self.template)
             if extended is None:
-                truncated[global_idx] = True
+                truncated = True
                 return False
-            pifs[global_idx] = extended
-            if lives[global_idx] is not None:
-                lives[global_idx]['messages'] = list(extended.get('messages') or [])
-            followups[global_idx] += 1
-            iterations += 1
+            pif = extended
+            # Follow-up stages are answers, so an API must not see tool schemas.
+            pif['tools'] = []
+            if live is not None:
+                live['messages'] = list(extended.get('messages') or [])
+            followups += 1
+            budget += 1
             if next_params is not None:
-                params_for[global_idx] = next_params
+                params = next_params
             return True
 
-        # The loop counts generations, and each granted follow-up buys the one
-        # extra generation it asked for. Paying for the follow-up stages out of
-        # ``max_turns`` would mean an episode that spent its whole tool budget
-        # never reaches the stages that read what it built, and a short one
-        # silently gets more tool turns than a long one.
-        iterations = self.max_turns
-        done_iterations = 0
-        first_turn = True
-        while done_iterations < iterations:
-            done_iterations += 1
-            active = [i for i in range(n) if not done[i]]
-            if not active:
+        while spent < budget:
+            spent += 1
+
+            if spent > 1:
+                pif, live, dropped = self._harness_before_generate(pif, live, harness)
+                if dropped:
+                    truncated = True
+                    break
+
+            # 2. One request. The callback chooses the local sampler or the API
+            # adapter, but both paths return exactly one SampledSequence.
+            try:
+                seq = response_callback(
+                    self.sampler,
+                    self.api,
+                    params,
+                    input_feature=pif,
+                    adapter_kwargs=adapter_kwargs,
+                    trajectory=trajectory,
+                    trajectory_index=index,
+                    turn=turns + 1,
+                    followups=followups,
+                )
+            except APIGenerationError as exc:
+                stop_reason = STOP_GENERATION_ERROR
+                generation_error = str(exc)
+                truncated = True
+                break
+            if not isinstance(seq, SampledSequence):
+                raise TypeError(f'response_callback must return SampledSequence, got '
+                                f'{type(seq).__name__}')
+            turns += 1
+
+            if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
+                raise RuntimeError(f'Sampler returned a SampledSequence without '
+                                   f'new_input_feature.input_ids for trajectory '
+                                   f'{index}; cannot continue multi-turn.')
+
+            pif = _to_plain(dict(seq.new_input_feature))
+            if seq.logprobs is not None:
+                if len(seq.logprobs) != len(seq.tokens):
+                    raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not '
+                                       f'match sampled token count ({len(seq.tokens)}) '
+                                       f'at turn {turns} (trajectory {index})')
+                logprobs.extend(seq.logprobs)
+            stop_reason = seq.stop_reason
+
+            msgs = pif.get('messages') or []
+            last_msg = msgs[-1] if msgs else None
+            tool_calls = (last_msg.get('tool_calls') if isinstance(last_msg, dict) else None)
+            if not tool_calls:
+                tool_calls = self.template.parse_tool_call(seq.decoded or '')
+            # After a follow-up, a parsed call is not a call: the tools were
+            # withdrawn for these stages on purpose (see ``followup_fn``), and
+            # dispatching python that the model wrote as *an answer* would edit
+            # the state the answer is about.
+            if followups:
+                tool_calls = None
+                # The parse also *rewrote* the message: when a reply parses as
+                # a call, the template stores it with the call text removed, so
+                # a caller reading the message gets less than the model wrote.
+                # For these stages the reply is the deliverable, and one of the
+                # tool-call formats is XML-shaped, so a check script asserting
+                # the content of an .xml file matches it: 5 of ex12's 72 check
+                # scripts came back with the XML cut out of them -- three then
+                # ran with `content == ''` where the model had written the file's
+                # real text, and two no longer held a code block at all.
+                if msgs and isinstance(last_msg, dict):
+                    # Decoded without the special tokens, the way the template
+                    # writes a message: ``seq.decoded`` keeps the closing
+                    # ``<|im_end|>``, and putting that in the content put it in
+                    # the problem statements ex13 handed to solvers -- 7 of 7 of
+                    # them ended in a literal '<|im_end|>'.
+                    tok = getattr(self.template, 'tokenizer', None)
+                    if tok is not None and seq.tokens:
+                        last_msg['content'] = tok.decode(seq.tokens, skip_special_tokens=True)
+                    else:
+                        last_msg['content'] = seq.decoded or ''
+                    last_msg.pop('tool_calls', None)
+
+            if live is not None:
+                live['messages'] = list(msgs)
+            if harness is not None and live is not None:
+                live = harness.after_generate(live, seq.decoded or '', tool_calls or [])
+                self._merge_assistant_metadata(pif, live)
+
+            # 3. Termination conditions
+            # A reply cut off at ``max_tokens`` is truncated in exactly the sense
+            # the flag names, and consumers read the flag to tell a trajectory
+            # that finished from one that ran out of room: a difficulty
+            # measurement counting such an attempt as a genuine failure blames
+            # the task for the token budget. Tool calls the cut reply happens to
+            # contain are still not dispatched -- the turn never got to decide it
+            # was done emitting them.
+            if seq.stop_reason == 'length':
+                truncated = True
                 break
 
-            if not first_turn:
-                for global_idx in active:
-                    pifs[global_idx], lives[global_idx], dropped = self._harness_before_generate(
-                        pifs[global_idx], lives[global_idx], harnesses[global_idx])
-                    if dropped:
-                        truncated[global_idx] = True
-                        done[global_idx] = True
-                active = [i for i in range(n) if not done[i]]
-                if not active:
-                    break
-            first_turn = False
+            # 3a. Sequence-length cap.
+            if (self.max_trajectory_tokens is not None
+                    and len(pif.get('input_ids') or []) >= self.max_trajectory_tokens):
+                truncated = True
+                break
 
-            # 2. One batched sample call per distinct SamplingParams among the
-            #    live trajectories -- normally exactly one, since only a
-            #    follow-up stage asks for its own budget. Grouping rather than
-            #    taking the first is what keeps a mixed batch honest: sampling one
-            #    trajectory under another's token limit would silently truncate or
-            #    over-spend, and the two are indistinguishable afterwards.
-            groups: List[List[int]] = []
-            group_params: List[Any] = []
-            for global_idx in active:
-                for slot, params in enumerate(group_params):
-                    if params is params_for[global_idx]:
-                        groups[slot].append(global_idx)
-                        break
-                else:
-                    group_params.append(params_for[global_idx])
-                    groups.append([global_idx])
-
-            resps_by_idx: Dict[int, Any] = {}
-            device_mesh = getattr(self.sampler, 'device_mesh', None)
-            min_batch_size = (device_mesh.data_world_size if device_mesh is not None else 1)
-            # A sampler that routes each request on its own accepts a batch smaller
-            # than its worker count, so the padding below is not needed. It was only
-            # ever there because slicing a batch over all workers raises when some
-            # rank gets nothing, and the duplicates it added were generated and then
-            # dropped -- with one prompt and 8 workers that is 8 generations for 1
-            # kept result.
-            if getattr(type(self.sampler).sample, '_enable_continous_work', False):
-                min_batch_size = 1
-            for slot, group in enumerate(groups):
-                batch_pifs = [pifs[i] for i in group]
-                actual = len(batch_pifs)
-                if actual < min_batch_size:
-                    batch_pifs = batch_pifs + ([batch_pifs[-1]] * (min_batch_size - actual))
-                group_resps = self.sampler.sample(batch_pifs,
-                                                  sampling_params=group_params[slot],
-                                                  **adapter_kwargs)
-                group_resps = self._unwrap_response_list(group_resps, len(batch_pifs))[:actual]
-                for local_idx, global_idx in enumerate(group):
-                    resps_by_idx[global_idx] = group_resps[local_idx]
-
-            pending_tools: List[tuple] = []  # (global_idx, tool_calls)
-            for global_idx in active:
-                turns[global_idx] += 1
-                seq = resps_by_idx[global_idx].sequences[0]
-
-                if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
-                    raise RuntimeError(f'Sampler returned a SampledSequence without '
-                                       f'new_input_feature.input_ids for trajectory '
-                                       f'{global_idx}; cannot continue multi-turn.')
-
-                pifs[global_idx] = _to_plain(dict(seq.new_input_feature))
-                if seq.logprobs is not None:
-                    if len(seq.logprobs) != len(seq.tokens):
-                        raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not '
-                                           f'match sampled token count ({len(seq.tokens)}) '
-                                           f'at turn {turns[global_idx]} '
-                                           f'(trajectory {global_idx})')
-                    all_logprobs[global_idx].extend(seq.logprobs)
-                stop_reasons[global_idx] = seq.stop_reason
-
-                _msgs = pifs[global_idx].get('messages') or []
-                _last_msg = _msgs[-1] if _msgs else None
-                tool_calls = (_last_msg.get('tool_calls') if isinstance(_last_msg, dict) else None)
-                if not tool_calls:
-                    tool_calls = self.template.parse_tool_call(seq.decoded or '')
-                # After a follow-up, a parsed call is not a call: the tools were
-                # withdrawn for these stages on purpose (see ``followup_fn``), and
-                # dispatching python that the model wrote as *an answer* would edit
-                # the state the answer is about.
-                if followups[global_idx]:
-                    tool_calls = None
-                    # The parse also *rewrote* the message: when a reply parses as
-                    # a call, the template stores it with the call text removed, so
-                    # a caller reading the message gets less than the model wrote.
-                    # For these stages the reply is the deliverable, and one of the
-                    # tool-call formats is XML-shaped, so a check script asserting
-                    # the content of an .xml file matches it: 5 of ex12's 72 check
-                    # scripts came back with the XML cut out of them -- three then
-                    # ran with `content == ''` where the model had written the file's
-                    # real text, and two no longer held a code block at all.
-                    if _msgs and isinstance(_last_msg, dict):
-                        # Decoded without the special tokens, the way the
-                        # template writes a message: ``seq.decoded`` keeps the
-                        # closing ``<|im_end|>``, and putting that in the content
-                        # put it in the problem statements ex13 handed to solvers
-                        # -- 7 of 7 of them ended in a literal '<|im_end|>'.
-                        tok = getattr(self.template, 'tokenizer', None)
-                        if tok is not None and seq.tokens:
-                            _last_msg['content'] = tok.decode(
-                                seq.tokens, skip_special_tokens=True)
-                        else:
-                            _last_msg['content'] = seq.decoded or ''
-                        _last_msg.pop('tool_calls', None)
-
-                if lives[global_idx] is not None:
-                    lives[global_idx]['messages'] = list(_msgs)
-                if harnesses[global_idx] is not None and lives[global_idx] is not None:
-                    lives[global_idx] = harnesses[global_idx].after_generate(
-                        lives[global_idx], seq.decoded or '', tool_calls or [])
-                    self._merge_assistant_metadata(pifs[global_idx], lives[global_idx])
-
-                # 3. Termination conditions
-                # A reply cut off at ``max_tokens`` is truncated in exactly the
-                # sense the flag names, and consumers read the flag to tell a
-                # trajectory that finished from one that ran out of room: a
-                # difficulty measurement counting such an attempt as a genuine
-                # failure blames the task for the token budget. Tool calls the
-                # cut reply happens to contain are still not dispatched -- the
-                # turn never got to decide it was done emitting them.
-                if seq.stop_reason == 'length':
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                    continue
-
-                # 3a. Sequence-length cap.
-                if (self.max_trajectory_tokens is not None
-                        and len(pifs[global_idx].get('input_ids') or []) >= self.max_trajectory_tokens):
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                    continue
-
-                if not tool_calls:
-                    # Markup that did not parse is the model asking for a tool,
-                    # not declining one -- ending here tells it nothing and throws
-                    # the turn away. Hand back the parser's own reason and let it
-                    # write the call again. Not after a follow-up: tools are
-                    # withdrawn there on purpose (see ``followup_fn``), so a reply
-                    # that looks like a call is meant to be read as text.
-                    parse_errors = ([] if followups[global_idx] else
-                                    self.template.tool_call_errors(seq.decoded or ''))
-                    if (parse_errors and malformed_turns[global_idx] < self.max_malformed_retries):
-                        malformed_turns[global_idx] += 1
-                        extended = extend_with_bridge(pifs[global_idx],
-                                                      [_malformed_tool_message(parse_errors)],
-                                                      self.template)
-                        if extended is None:
-                            truncated[global_idx] = True
-                            done[global_idx] = True
-                            continue
-                        pifs[global_idx] = extended
-                        if lives[global_idx] is not None:
-                            lives[global_idx]['messages'] = list(extended.get('messages') or [])
-                        continue
-                    # The episode is over as far as the model is concerned. Give
-                    # the caller one chance to say otherwise -- see
-                    # ``followup_fn`` for why this is not a second rollout.
-                    if append_followup(global_idx):
-                        continue
-                    done[global_idx] = True
-                    continue
-
-                if turns[global_idx] >= self.max_turns:
-                    # Out of tool turns, not out of episode: the stages that read
-                    # the end state can still run on what was built.
-                    tool_stop[global_idx] = 'max_turns'
-                    if append_followup(global_idx):
-                        continue
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                    continue
-
-                malformed_turns[global_idx] = 0
-                pending_tools.append((global_idx, list(tool_calls)))
-
-            # 4. Parallel tool dispatch across the live batch, then harness
-            #    formats observations into tool messages (append-only bridge).
-            #    The bridge itself is computed serially: it is a cheap
-            #    decode-diff-encode on python strings / token lists.
-            if pending_tools:
-                obs_by_traj = self._dispatch_tools(tool_managers, pending_tools)
-                for global_idx, tool_calls in pending_tools:
-                    observations = obs_by_traj.get(global_idx) or [''] * len(tool_calls)
-                    if self.stop_after_stuck_turns:
-                        keys = [_call_key(tc) for tc in tool_calls]
-                        all_repeats = bool(keys) and all(k in seen_calls[global_idx]
-                                                        for k in keys)
-                        seen_calls[global_idx].update(keys)
-                        all_errors = bool(observations) and all(
-                            is_error_observation(o) for o in observations)
-                        if all_errors or all_repeats:
-                            stuck_turns[global_idx] += 1
-                        else:
-                            stuck_turns[global_idx] = 0
-                    tool_messages, lives[global_idx] = self._tool_messages_after(
-                        pifs[global_idx], lives[global_idx], harnesses[global_idx],
-                        observations, tool_calls)
-                    extended = extend_with_bridge(pifs[global_idx], tool_messages, self.template)
+            if not tool_calls:
+                # Markup that did not parse is the model asking for a tool, not
+                # declining one -- ending here tells it nothing and throws the
+                # turn away. Hand back the parser's own reason and let it write
+                # the call again. Not after a follow-up: tools are withdrawn
+                # there on purpose (see ``followup_fn``), so a reply that looks
+                # like a call is meant to be read as text.
+                parse_errors = ([] if followups else self.template.tool_call_errors(seq.decoded or ''))
+                if parse_errors and malformed_turns < self.max_malformed_retries:
+                    malformed_turns += 1
+                    extended = extend_with_bridge(pif, [_malformed_tool_message(parse_errors)], self.template)
                     if extended is None:
-                        # Trajectory exceeded max_length, mark as done (deleted)
-                        truncated[global_idx] = True
-                        done[global_idx] = True
-                    else:
-                        pifs[global_idx] = extended
-                        if lives[global_idx] is not None:
-                            lives[global_idx]['messages'] = list(extended.get('messages') or [])
-                    # Checked after the messages are appended, so the turns that
-                    # ended the episode are in the trajectory the caller reads.
-                    if (self.stop_after_stuck_turns
-                            and stuck_turns[global_idx] >= self.stop_after_stuck_turns):
-                        stuck_stop[global_idx] = True
-                        tool_stop[global_idx] = 'stuck'
-                        # Same as the turn limit: the tool phase is over, the
-                        # state it left is not, so the stages still get their turn.
-                        if not done[global_idx] and append_followup(global_idx):
-                            continue
-                        truncated[global_idx] = True
-                        done[global_idx] = True
+                        truncated = True
+                        break
+                    pif = extended
+                    if live is not None:
+                        live['messages'] = list(extended.get('messages') or [])
+                    continue
+                # The episode is over as far as the model is concerned. Give the
+                # caller one chance to say otherwise -- see ``followup_fn`` for
+                # why this is not a second rollout.
+                if grant_followup():
+                    continue
+                break
 
-        for i in range(n):
-            if not all_logprobs[i]:
-                continue
-            labels_i = pifs[i].get('labels') or []
-            trainable_i = sum(1 for label in labels_i if label != -100)
-            if len(all_logprobs[i]) != trainable_i:
-                raise RuntimeError(f'logprobs/labels misaligned for trajectory {i}: '
-                                   f'{len(all_logprobs[i])} logprobs vs {trainable_i} '
-                                   f'trainable labels (labels != -100). This invariant is '
-                                   f'required by grpo._pad_and_align_to_batch; a mismatch '
-                                   f'would silently corrupt GRPO old_logps alignment.')
+            if turns >= self.max_turns:
+                # Out of tool turns, not out of episode: the stages that read the
+                # end state can still run on what was built.
+                tool_stop = 'max_turns'
+                if grant_followup():
+                    continue
+                truncated = True
+                break
 
-        # 5. Merge pif fields into each trajectory dict at TOP LEVEL so
-        #    downstream consumers (VLLMSampler with ``'input_ids' in inputs``)
-        #    see an encoded InputFeature and skip re-encoding.
-        outs: List[Trajectory] = []
-        for i, traj in enumerate(trajectories):
-            out = dict(traj)
-            out.update(pifs[i])
-            out['messages'] = list(pifs[i].get('messages') or out.get('messages', []))
-            out['logprobs'] = all_logprobs[i] if all_logprobs[i] else None
-            out['turns'] = turns[i]
-            out['stop_reason'] = stop_reasons[i]
-            out['truncated'] = truncated[i]
-            # ``truncated`` says something was cut off; these two say what ended
-            # the tool-calling part, which is a different question -- an episode
-            # can run out of turns, be handed a follow-up stage, and finish it.
-            out['stuck_stop'] = stuck_stop[i]
-            out['tool_stop'] = tool_stop[i]
-            out['followups'] = followups[i]
-            outs.append(out)
+            malformed_turns = 0
 
-        # Per-rollout trace dump: one JSON file per selected trajectory.
-        # ``trace_callback`` decides whether to store; ``success_callback``
-        # decides the filename prefix. Observability only -- any failure
-        # is swallowed inside ``_write_rollout_traces``.
-        if self.trace_dir:
-            self._write_rollout_traces(outs, global_step=kwargs.get('global_step'))
-        return outs
+            # 4. This turn's calls, then the harness formats the observations
+            #    into tool messages (append-only bridge).
+            if tool_manager is None:
+                raise ValueError('the model emitted tool_calls but this trajectory has no ToolManager')
+            observations = self._run_tools(tool_manager, tool_calls)
+            if self.stop_after_stuck_turns:
+                keys = [_call_key(tc) for tc in tool_calls]
+                all_repeats = bool(keys) and all(k in seen_calls for k in keys)
+                seen_calls.update(keys)
+                all_errors = bool(observations) and all(is_error_observation(o) for o in observations)
+                if all_errors or all_repeats:
+                    stuck_turns += 1
+                else:
+                    stuck_turns = 0
+
+            tool_messages, live = self._tool_messages_after(pif, live, harness, observations, tool_calls)
+            extended = extend_with_bridge(pif, tool_messages, self.template)
+            overflowed = extended is None
+            if overflowed:
+                # Trajectory exceeded max_length.
+                truncated = True
+            else:
+                pif = extended
+                if live is not None:
+                    live['messages'] = list(extended.get('messages') or [])
+            # Checked after the messages are appended, so the turns that ended
+            # the episode are in the trajectory the caller reads.
+            if self.stop_after_stuck_turns and stuck_turns >= self.stop_after_stuck_turns:
+                stuck_stop = True
+                tool_stop = 'stuck'
+                # Same as the turn limit: the tool phase is over, the state it
+                # left is not, so the stages still get their turn.
+                if not overflowed and grant_followup():
+                    continue
+                truncated = True
+                break
+            if overflowed:
+                break
+
+        if logprobs:
+            labels = pif.get('labels') or []
+            completion_mask = pif.get('completion_mask')
+            if completion_mask is None:
+                expected = sum(1 for label in labels if label != -100)
+            elif len(completion_mask) != len(labels):
+                raise RuntimeError(f'completion_mask/labels misaligned for trajectory {index}: '
+                                   f'{len(completion_mask)} != {len(labels)}')
+            else:
+                expected = sum(1 for label, flag in zip(labels, completion_mask) if label != -100 and flag)
+            if len(logprobs) != expected:
+                raise RuntimeError(f'logprobs/policy-token alignment failed for trajectory {index}: '
+                                   f'{len(logprobs)} logprobs vs {expected} positions selected by '
+                                   '(labels != -100) & completion_mask.')
+
+        # 5. Merge pif fields into the trajectory dict at TOP LEVEL so downstream
+        #    consumers (VLLMSampler with ``'input_ids' in inputs``) see an encoded
+        #    InputFeature and skip re-encoding.
+        out = dict(trajectory)
+        out.update(pif)
+        out['messages'] = list(pif.get('messages') or out.get('messages', []))
+        out['logprobs'] = logprobs if logprobs else None
+        out['turns'] = turns
+        out['stop_reason'] = stop_reason
+        out['truncated'] = truncated
+        # ``truncated`` says something was cut off; these two say what ended the
+        # tool-calling part, which is a different question -- an episode can run
+        # out of turns, be handed a follow-up stage, and finish it.
+        out['stuck_stop'] = stuck_stop
+        out['tool_stop'] = tool_stop
+        out['followups'] = followups
+        if generation_error is not None:
+            out['error'] = generation_error
+        return out
 
     # ------------------------------------------------------------------ private
 
     @staticmethod
-    def _as_trajectory(traj: Trajectory, pif: Dict[str, Any], logprobs: List[Any],
-                      turns: int, stop_reason: Optional[str],
-                      truncated: bool) -> Trajectory:
+    def _run_tools(tool_manager: ToolManager, tool_calls: List[Dict[str, Any]]) -> List[str]:
+        """Run one turn's calls, through ``call_many`` when the manager has it.
+
+        A turn's calls go together because they share one Env round trip
+        (``Env.step_batch``). Calls from *different* trajectories no longer meet
+        here -- each episode has its own thread and, in the sandbox case, its own
+        Env -- so there is nothing left to group across.
+
+        A manager that answers with fewer results than calls leaves the rest
+        empty rather than shifting them onto the wrong call.
+        """
+        if hasattr(tool_manager, 'call_many'):
+            contents = tool_manager.call_many(tool_calls)
+        else:
+            contents = [tool_manager(tc) for tc in tool_calls]
+        obs = [''] * len(tool_calls)
+        for i, content in enumerate(contents[:len(tool_calls)]):
+            obs[i] = '' if content is None else str(content)
+        return obs
+
+    @staticmethod
+    def _as_trajectory(traj: Trajectory, pif: Dict[str, Any], logprobs: List[Any], turns: int,
+                       stop_reason: Optional[str], truncated: bool) -> Trajectory:
         """The episode so far, shaped like the value ``__call__`` returns.
 
         Handed to ``followup_fn`` so the callback reads an episode the same way
@@ -683,55 +744,6 @@ class MultiTurnRollout(Rollout):
             if last_asst.get(key) and not dst.get(key):
                 dst[key] = last_asst[key]
 
-    def _dispatch_tools(
-        self,
-        tool_managers: List[ToolManager],
-        pending: List[Tuple[int, List[Dict[str, Any]]]],
-    ) -> Dict[int, List[str]]:
-        """Run tool calls for the live batch, grouped by ToolManager.
-
-        Trajectories that share a manager (and therefore often one Env) go
-        through ``call_many`` / ``Env.step_batch``. Distinct managers run
-        concurrently so remote sandboxes are not serialized on generate.
-        """
-        obs: Dict[int, List[str]] = {
-            gi: [''] * len(tcs) for gi, tcs in pending
-        }
-        groups: Dict[int, List[Tuple[int, int, Dict[str, Any]]]] = defaultdict(list)
-        mgr_by_id: Dict[int, ToolManager] = {}
-        for gi, tcs in pending:
-            mid = id(tool_managers[gi])
-            mgr_by_id[mid] = tool_managers[gi]
-            for ci, tc in enumerate(tcs):
-                groups[mid].append((gi, ci, tc))
-
-        def _run_group(items: List[Tuple[int, int, Dict[str, Any]]], mgr: ToolManager):
-            tcs = [tc for _, _, tc in items]
-            if hasattr(mgr, 'call_many'):
-                contents = mgr.call_many(tcs)
-            else:
-                contents = [mgr(tc) for tc in tcs]
-            return list(zip(items, contents))
-
-        group_items = list(groups.items())
-        if len(group_items) == 1:
-            mid, items = group_items[0]
-            finished = [_run_group(items, mgr_by_id[mid])]
-        else:
-            finished = []
-            with ThreadPoolExecutor(max_workers=min(32, len(group_items))) as pool:
-                futs = [
-                    pool.submit(_run_group, items, mgr_by_id[mid])
-                    for mid, items in group_items
-                ]
-                for fut in as_completed(futs):
-                    finished.append(fut.result())
-
-        for group_result in finished:
-            for (gi, ci, _tc), content in group_result:
-                obs[gi][ci] = '' if content is None else str(content)
-        return obs
-
     def _tool_messages_after(
         self,
         pif: Dict[str, Any],
@@ -750,22 +762,3 @@ class MultiTurnRollout(Rollout):
         if not delta:
             return fallback, live
         return delta, live
-
-    @staticmethod
-    def _unwrap_response_list(resps, expected: int) -> List[SampleResponse]:
-        """Validate that the sampler returned ``expected`` ``SampleResponse``s,
-        one per input in the batch.
-        """
-        if not isinstance(resps, list):
-            raise TypeError(f'expected List[SampleResponse] from sampler.sample (batched '
-                            f'call), got {type(resps).__name__}')
-        if len(resps) != expected:
-            raise RuntimeError(f'sampler returned {len(resps)} responses for a batch of '
-                               f'{expected} trajectories; expected one per input.')
-        for i, r in enumerate(resps):
-            if not isinstance(r, SampleResponse):
-                raise TypeError(f'expected SampleResponse at batch index {i}, got '
-                                f'{type(r).__name__}')
-            if not r.sequences:
-                raise RuntimeError(f'SampleResponse at batch index {i} has no sequences')
-        return resps

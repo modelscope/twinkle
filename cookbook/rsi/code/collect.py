@@ -32,7 +32,7 @@ from twinkle import get_logger
 from twinkle.data_format import SamplingParams, Trajectory, user_data_get
 from twinkle_agentic.challenger import CodeChallenger, KeywordStore, load_seeds
 from twinkle_agentic.envs import LocalEnv
-from twinkle_agentic.rollout import build_rollout
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.tools.tool_manager import ToolManager
 
 # Appended, not prepended: rsi.py imports this half into the process that already
@@ -115,9 +115,9 @@ def build_challenger(args, sampler, template, *, recorder=None) -> CollectingCha
     # One rollout for proposing and, through solver_params, for solving. max_turns=1
     # because a code answer is one message: there is nothing for a second turn to
     # react to until the asserts have run, and running them is the next stage.
-    explorer = build_rollout(sampler, template=template,
-                             tool_manager=ToolManager([]), max_turns=1,
-                             sampling_params=params)
+    explorer = MultiTurnRollout(sampler, template=template,
+                                tool_manager=ToolManager([]), max_turns=1,
+                                sampling_params=params)
     store = None
     if args.code_keywords_n > 0:
         store = KeywordStore(args.code_keyword_db, CATEGORIES)
