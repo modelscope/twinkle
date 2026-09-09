@@ -26,73 +26,9 @@ from typing import Any, Callable, Dict, List, Optional
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import Env, StepResult
+from .base import DEFAULT_TOOLS, Env, StepResult, format_command_output, truncate_observation
 
 logger = get_logger()
-
-_MAX_OBSERVATION_CHARS = 32 * 1024
-
-_DEFAULT_TOOLS: List[ToolInfo] = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'run_command',
-            'description': 'Run a shell command inside the sandbox and return its output.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'command': {
-                        'type': 'string',
-                        'description': 'The shell command to execute.'
-                    },
-                    'cwd': {
-                        'type': 'string',
-                        'description': 'Working directory (optional).'
-                    },
-                },
-                'required': ['command'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'write_file',
-            'description': 'Write text content to a file inside the sandbox.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'path': {
-                        'type': 'string',
-                        'description': 'Absolute file path in the sandbox.'
-                    },
-                    'content': {
-                        'type': 'string',
-                        'description': 'Text content to write.'
-                    },
-                },
-                'required': ['path', 'content'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'read_file',
-            'description': 'Read a text file from the sandbox.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'path': {
-                        'type': 'string',
-                        'description': 'Absolute file path in the sandbox.'
-                    },
-                },
-                'required': ['path'],
-            },
-        },
-    },
-]
 
 
 def _require_e2b():
@@ -105,23 +41,6 @@ def _require_e2b():
                           'Then point it at your deployment via api_url/api_key or the '
                           'E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY environment variables.') from e
     return Sandbox
-
-
-def _truncate(text: str, limit: int = _MAX_OBSERVATION_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f'\n... [truncated, {len(text) - limit} chars omitted]'
-
-
-def _format_command_output(stdout: str, stderr: str, exit_code: int) -> str:
-    parts = []
-    if stdout:
-        parts.append(stdout)
-    if stderr:
-        parts.append(f'[stderr]\n{stderr}')
-    if exit_code != 0:
-        parts.append(f'[exit code: {exit_code}]')
-    return _truncate('\n'.join(parts)) if parts else '(no output)'
 
 
 class AgentEnv(Env):
@@ -299,7 +218,7 @@ class AgentEnv(Env):
                 self._sandbox.files.write(arguments['path'], arguments.get('content', ''))
                 observation = f"File written: {arguments['path']}"
             elif self._include_default_tools and tool_name == 'read_file':
-                observation = _truncate(str(self._sandbox.files.read(arguments['path'])))
+                observation = truncate_observation(str(self._sandbox.files.read(arguments['path'])))
             else:
                 available = [t['function']['name'] for t in self.tools()]
                 observation = f'Error: unknown tool {tool_name!r}. Available tools: {available}.'
@@ -319,7 +238,7 @@ class AgentEnv(Env):
         tools: List[ToolInfo] = []
         if self._include_default_tools:
             custom_names = set(self._custom_handlers)
-            tools.extend(t for t in _DEFAULT_TOOLS if t['function']['name'] not in custom_names)
+            tools.extend(t for t in DEFAULT_TOOLS if t['function']['name'] not in custom_names)
         tools.extend(self._custom_tools)
         return tools
 
@@ -350,7 +269,7 @@ class AgentEnv(Env):
                 cwd=arguments.get('cwd'),
                 timeout=int(arguments.get('timeout', self._command_timeout)),
             )
-            return _format_command_output(result.stdout or '', result.stderr or '', result.exit_code or 0)
+            return format_command_output(result.stdout or '', result.stderr or '', result.exit_code or 0)
         except Exception as e:  # noqa
             # The SDK raises on non-zero exit codes; surface the output
             # instead of failing the step so the model can react to it.
@@ -359,7 +278,7 @@ class AgentEnv(Env):
             exit_code = getattr(e, 'exit_code', None)
             if exit_code is None:
                 raise
-            return _format_command_output(stdout, stderr, exit_code)
+            return format_command_output(stdout, stderr, exit_code)
 
     def _kill_sandbox(self) -> None:
         if self._sandbox is None:

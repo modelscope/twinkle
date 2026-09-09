@@ -43,6 +43,8 @@ from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
+from twinkle_agentic.utils.code_utils import unwrap_code
+from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
 args = CLI.from_args()
@@ -80,32 +82,12 @@ SYSTEM_PROMPT = ('You are an expert Python programmer. Write a complete, self-co
 
 TEST_TIMEOUT = int(os.environ.get('TEST_TIMEOUT', 60))
 
-_FENCE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.S)
 _SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>')
 
 
 # ========== Text handling (same as e18_kodcode) ==========
-def after_think(text: str) -> str:
-    """Keep only what follows </think>; return the text unchanged if unclosed."""
-    idx = text.rfind('</think>')
-    return text[idx + len('</think>'):] if idx >= 0 else text
-
-
 def clean_text(decoded: Optional[str]) -> str:
     return _SPECIAL_TOKEN_RE.sub('', decoded or '').strip()
-
-
-def extract_code(text: str) -> str:
-    """Take the last fenced block; fall back to the whole body when unfenced.
-
-    The last one, not the first: models often draft a version before the final
-    one, and the last block is their conclusion.
-    """
-    body = after_think(text)
-    blocks = _FENCE_RE.findall(body)
-    if blocks:
-        return blocks[-1].strip()
-    return body.strip()
 
 
 # ========== Sandbox (same contract as e18_kodcode.run_tests) ==========
@@ -274,12 +256,7 @@ class KodCodePytestReward(Reward):
                     break
             if payload is None:
                 continue
-            completion = ''
-            for msg in reversed(traj.get('messages', []) or []):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '') or ''
-                    break
-            jobs.append((i, extract_code(completion), payload))
+            jobs.append((i, unwrap_code(assistant_text(traj)), payload))
 
         if not jobs:
             return rewards
@@ -302,12 +279,7 @@ class KodCodeFormatReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for traj in trajectories:
-            completion = ''
-            for msg in reversed(traj.get('messages', []) or []):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '') or ''
-                    break
-            rewards.append(1.0 if extract_code(completion).strip() else 0.0)
+            rewards.append(1.0 if unwrap_code(assistant_text(traj)).strip() else 0.0)
         return rewards
 
 

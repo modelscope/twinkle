@@ -31,14 +31,17 @@ ragged batches for reasons that have nothing to do with it.
 import math
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from twinkle.data_format import SamplingParams, Trajectory, pack_user_data
+from twinkle.data_format import SamplingParams, Trajectory, attach_user_data
 from twinkle.utils import get_logger
+from twinkle_agentic.envs import Env
 
 logger = get_logger()
 
-__all__ = ['Challenger', 'Explorer', 'assistant_text', 'attach_user_data']
+__all__ = ['Challenger', 'Explorer', 'KeywordPrompts', 'PromptSet']
 
 # A batch of trajectories in, the same trajectories with the model's reply
 # appended out. Both MultiTurnRollout and APIMultiTurnRollout satisfy this
@@ -48,34 +51,89 @@ __all__ = ['Challenger', 'Explorer', 'assistant_text', 'attach_user_data']
 Explorer = Callable[[List[Trajectory]], List[Trajectory]]
 
 
-def attach_user_data(trajectory: Trajectory, **values: Any) -> Trajectory:
-    """Return ``trajectory`` with ``values`` merged into its packed ``user_data``.
+@dataclass
+class KeywordPrompts:
+    """The three strings a :class:`~.keywords.KeywordBank` sends, and nothing else.
 
-    ``user_data`` is a list of ``(key, json_string)`` pairs rather than a dict,
-    so it cannot be updated in place with ``update()``; going through
-    :func:`pack_user_data` keeps it in the one shape readers understand.
+    Its own type rather than the caller's prompt object: the challengers here
+    carry a dozen other prompts, the RSI drivers in ``cookbook/rsi`` keep theirs
+    as module constants, and a bank that reached into either by attribute name
+    would be coupled to both spellings. Building one of these is how a caller
+    says which of its strings are the keyword ones -- see
+    :meth:`PromptSet.keyword_prompts` for the challengers' answer.
+
+    Lives here rather than beside the bank so that :class:`PromptSet` can produce
+    one without importing it.
+
+    Args:
+        system: the system message every keyword call carries.
+        user: asks for ``{k}`` topics in a category described by ``{desc}``.
+        expand_user: asks for ``{m}`` more topics like ``{kw}``, optionally with
+            the category's ``{desc}``. Only :meth:`.KeywordBank.expand_hard`
+            needs it.
     """
-    merged: Dict[str, Any] = {}
-    for entry in trajectory.get('user_data') or []:
-        if isinstance(entry, (list, tuple)) and len(entry) == 2:
-            merged[entry[0]] = entry[1]
-    merged.update(values)
-    out = dict(trajectory)
-    out['user_data'] = pack_user_data(merged)
-    return out
+    system: str
+    user: str
+    expand_user: str = ''
+
+    def __post_init__(self):
+        missing = [f for f in ('system', 'user') if not getattr(self, f).strip()]
+        if missing:
+            raise ValueError(f'KeywordPrompts needs {" and ".join(missing)}: a dry '
+                             f'category could not be refilled without it.')
 
 
-def assistant_text(trajectory: Trajectory) -> str:
-    """The last assistant message's text, or '' if the model produced none.
+class PromptSet:
+    """Base for a challenger's bundle of prompts: what is required, and validation.
 
-    Explorers differ in what else they attach -- token ids, logprobs, tool
-    turns -- but every one of them leaves the reply as an assistant message,
-    so this is the one field a parser can rely on.
+    Every challenger here is a dataclass of strings plus the same three questions
+    -- are the mandatory ones filled in, do the optional ones carry the
+    placeholders they will be formatted with, and does this configuration have
+    the ones it needs. Answering them once means a missing placeholder is caught
+    at construction in every domain, rather than as a ``KeyError`` mid-run in
+    whichever domain remembered to check.
+
+    Subclasses declare:
+
+    * ``_REQUIRED`` -- fields that must carry text.
+    * ``_REQUIRED_FIELDS`` -- field -> placeholders its text must contain.
     """
-    for message in reversed(trajectory.get('messages') or []):
-        if isinstance(message, dict) and message.get('role') == 'assistant':
-            return message.get('content') or ''
-    return ''
+
+    _REQUIRED: Tuple[str, ...] = ()
+    _REQUIRED_FIELDS: Dict[str, Sequence[str]] = {}
+
+    def __post_init__(self):
+        name = type(self).__name__
+        for field in self._REQUIRED:
+            if not getattr(self, field).strip():
+                raise ValueError(f'{name}.{field} is required')
+        for field, placeholders in self._REQUIRED_FIELDS.items():
+            text = getattr(self, field)
+            if not text:
+                continue
+            for placeholder in placeholders:
+                if '{' + placeholder + '}' not in text:
+                    raise ValueError(f'{name}.{field} must contain {{{placeholder}}}')
+
+    def require(self, *names: str) -> None:
+        """Raise unless every named prompt was supplied.
+
+        For what only a configuration knows: drawing from a keyword bank needs the
+        keyword prompts, seeds need the seed prompt, and a challenger asks for the
+        ones its arguments imply.
+        """
+        missing = [n for n in names if not getattr(self, n).strip()]
+        if missing:
+            name = type(self).__name__
+            separator = f', {name}.'
+            raise ValueError(f'this configuration needs {name}.'
+                             f'{separator.join(missing)}')
+
+    def keyword_prompts(self) -> KeywordPrompts:
+        """The keyword subset, for the bank. Validated by :meth:`require` first."""
+        self.require('keyword_system', 'keyword_user')
+        return KeywordPrompts(system=self.keyword_system, user=self.keyword_user,
+                              expand_user=self.keyword_expand_user)
 
 
 class Challenger(ABC):
@@ -89,17 +147,28 @@ class Challenger(ABC):
         system: system prompt handed to the model. It carries the output
             contract, which is why ``build`` -- the code that reads that output
             back -- lives in the same subclass.
+        envs: the environments this challenger works in, one per slot. A slot is
+            owned whole for as long as a job needs it, because the workspace
+            lives inside it, so ``len(envs)`` is also how many jobs may run at
+            once. Both halves take the same parameter and reach it the same way
+            (:meth:`env`), which is what lets one caller decide where everything
+            it runs is executed and graded: ``[LocalEnv()]`` keeps judgement on
+            the training host and costs milliseconds, sandbox slots trade that
+            for isolation. Empty is allowed for a challenger that executes
+            nothing; :meth:`env` then says so rather than raising IndexError.
         max_proposals_per_round: ceiling on how many proposals one round may
             request. Without it a low keep rate makes the estimator ask for an
             unbounded batch after the first round.
         solver_rollouts: attempts per candidate in the difficulty stage. ``0``
             skips the stage entirely; any other value requires the subclass to
             implement :meth:`solver_prompt` and :meth:`judge_attempt`.
-        keep_min_pass: keep a candidate only if at least this many attempts
-            succeeded. The default drops tasks nobody solved.
-        keep_max_pass_margin: keep a candidate only if at most
-            ``solver_rollouts - keep_max_pass_margin`` attempts succeeded. The
-            default drops tasks everybody solved.
+        keep_pass_band: ``(low, high)`` attempt counts, inclusive on both ends:
+            keep a candidate only if that many of its ``solver_rollouts``
+            attempts succeeded. Required whenever the stage runs, and has no
+            default because the counts are absolute -- ``(1, 7)`` reads as "hard
+            but solvable" against eight rollouts and as something far stricter
+            against sixteen, so it has to be written by whoever chose the
+            rollout count.
         solver_params: sampling params for the difficulty stage only, passed to
             the explorer per call. ``None`` reuses whatever the explorer was
             built with -- which is usually the proposing temperature, and that
@@ -117,10 +186,10 @@ class Challenger(ABC):
         explorer: Explorer,
         *,
         system: str,
+        envs: Sequence[Env] = (),
         max_proposals_per_round: int = 512,
         solver_rollouts: int = 0,
-        keep_min_pass: int = 1,
-        keep_max_pass_margin: int = 1,
+        keep_pass_band: Optional[Tuple[int, int]] = None,
         solver_params: Optional[SamplingParams] = None,
         solver_explorer: Optional[Explorer] = None,
         seed: Optional[int] = None,
@@ -143,17 +212,29 @@ class Challenger(ABC):
                     f'solver_rollouts={solver_rollouts} needs {type(self).__name__} to '
                     f'implement {", ".join(missing)}; pass solver_rollouts=0 to skip the '
                     f'difficulty stage.')
-            if keep_min_pass > solver_rollouts - keep_max_pass_margin:
+            if keep_pass_band is None:
+                raise ValueError(f'solver_rollouts={solver_rollouts} needs '
+                                 f'keep_pass_band=(low, high): the band is in attempt '
+                                 f'counts, so what it asks for depends on how many '
+                                 f'attempts were run.')
+            if len(keep_pass_band) != 2:
+                raise ValueError(f'keep_pass_band is (low, high) in attempt counts, got '
+                                 f'{keep_pass_band}')
+            low, high = keep_pass_band
+            if not 0 <= low <= high <= solver_rollouts:
                 raise ValueError(
-                    f'difficulty band is empty: keep_min_pass={keep_min_pass} > '
-                    f'solver_rollouts - keep_max_pass_margin = '
-                    f'{solver_rollouts - keep_max_pass_margin}')
+                    f'keep_pass_band must satisfy 0 <= low <= high <= solver_rollouts, '
+                    f'got {keep_pass_band} against solver_rollouts={solver_rollouts}')
+        elif keep_pass_band is not None:
+            raise ValueError('keep_pass_band has nothing to filter while '
+                             'solver_rollouts=0 leaves the difficulty stage off; pass '
+                             'the rollout count too, or drop the band.')
         self.explorer = explorer
         self.system = system
+        self.envs = list(envs)
         self.max_proposals_per_round = max_proposals_per_round
         self.solver_rollouts = solver_rollouts
-        self.keep_min_pass = keep_min_pass
-        self.keep_max_pass_margin = keep_max_pass_margin
+        self.keep_pass_band = keep_pass_band
         self.solver_params = solver_params
         self.solver_explorer = solver_explorer
         self.rng = random.Random(seed)
@@ -162,6 +243,28 @@ class Challenger(ABC):
         # that the model is bad.
         self.n_proposed = 0
         self.n_kept = 0
+
+    # ----------------------------------------------------------------- envs
+
+    @property
+    def n_slots(self) -> int:
+        """How many jobs may run at once: one per environment."""
+        return len(self.envs)
+
+    def env(self, slot: int = 0) -> Env:
+        """The environment for ``slot``.
+
+        Fetched per use rather than held in a local, so a slot that had to be
+        rebuilt underneath is picked up on the next call instead of being used
+        dead. ``slot=0`` is the default because a challenger with nothing to run
+        concurrently -- one script, no state to share -- has only one.
+        """
+        if not self.envs:
+            raise RuntimeError(
+                f'{type(self).__name__} was given no envs, so there is nowhere to run '
+                f'anything: pass envs=[LocalEnv()] to execute on the training host, or '
+                f'sandbox slots to execute in one.')
+        return self.envs[slot]
 
     # ------------------------------------------------------------- subclass
 
@@ -338,8 +441,8 @@ class Challenger(ABC):
             for i, task in enumerate(tasks)
         ]
         self.on_difficulty_measured(measured)
-        high = self.solver_rollouts - self.keep_max_pass_margin
-        return [t for t, n in zip(measured, passes) if self.keep_min_pass <= n <= high]
+        low, high = self.keep_pass_band
+        return [t for t, n in zip(measured, passes) if low <= n <= high]
 
     def _estimate(self, missing: int) -> int:
         """How many proposals to make for ``missing`` keepers.
@@ -371,6 +474,25 @@ class Challenger(ABC):
     def draw(rng: random.Random, pool: Sequence[Any], count: int) -> List[Any]:
         """Draw ``count`` items with replacement; ``[]`` for an empty pool."""
         return [rng.choice(pool) for _ in range(count)] if pool else []
+
+
+def map_parallel(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
+    """Map ``fn`` over ``items`` at once, results in input order.
+
+    Every use of this is waiting on a sandbox or on a model call, not computing,
+    so the thread pool is the point. One item runs inline: a pool for a single
+    call only adds a thread, and it keeps a serial configuration on exactly the
+    code path it had before.
+    """
+    items = list(items)
+    if len(items) <= 1:
+        return [fn(item) for item in items]
+    out: List[Any] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        futures = {pool.submit(fn, item): i for i, item in enumerate(items)}
+        for fut in as_completed(futures):
+            out[futures[fut]] = fut.result()
+    return out
 
 
 def sampling_params_of(explorer: Any) -> Optional[SamplingParams]:

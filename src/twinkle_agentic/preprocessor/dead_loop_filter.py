@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import cjk_ratio, is_agent_row, msg_content_text
+from twinkle_agentic.utils.message_utils import is_agent_row, msg_content_text
+from twinkle_agentic.utils.text_utils import cjk_ratio
 
 # ── Hesitation-marker regexes ─────────────────────────────────────────────────
 #

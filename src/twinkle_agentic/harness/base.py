@@ -34,7 +34,7 @@ class AgentHarness(ABC):
         advertise the identical set; the Env owns the *implementation*. Build
         the executing side from the same list::
 
-            tm = ToolManager(EnvTool.from_schemas(env, harness.tool_schemas()))
+            tm = env.tool_manager(harness.tool_schemas())
 
         Skipping that step lets the prompt advertise tools the Env cannot run,
         and every call comes back as an unknown-tool error.

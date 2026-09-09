@@ -18,8 +18,8 @@ from typing import Any, Dict, Optional, Sequence
 
 from twinkle.preprocessor import Filter
 from twinkle.utils import get_logger
-
-from .message_utils import cjk_ratio, msg_content_text
+from twinkle_agentic.utils.message_utils import msg_content_text
+from twinkle_agentic.utils.text_utils import cjk_ratio
 
 logger = get_logger()
 

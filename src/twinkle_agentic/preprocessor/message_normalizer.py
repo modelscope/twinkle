@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.template.tools import ToolCallRegistry
-from .utils import msg_content_text, msg_has_media, normalize_tool_calls
+from twinkle_agentic.utils.message_utils import msg_content_text, msg_has_media, normalize_tool_calls
 
 # IGNORECASE absorbs every variant ("Read HEARTBEAT.md", "HEARTBEAT_OK",
 # "duplicate heartbeat", etc.) under the single token "heartbeat".

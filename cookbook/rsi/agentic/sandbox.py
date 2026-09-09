@@ -12,14 +12,12 @@ solver's opening messages come from ``episode.solver_harness``, the same functio
 ``eval.py`` uses, so a task's difficulty here and its pass rate there are measured
 against one opening.
 """
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import get_logger
-from twinkle_agentic.envs import EnvTool
-from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.envs import Env, StepResult
 
 from episode import solver_harness  # noqa: I100,I202
 from remote_tool_env import RemoteMsAgentToolEnv, tool_payload  # noqa: I100,I202
@@ -133,14 +131,21 @@ SNAPSHOT_RETRY_WAIT = 3
 RESET_RETRY_WAIT = 10
 
 
-class Sandbox:
+class Sandbox(Env):
     """One slot: clear the workspace, run a script in it, read it back.
+
+    An :class:`~twinkle_agentic.envs.base.Env` wrapping another one, and what it
+    adds is RSI's policy rather than a transport: which script empties a
+    workspace, which one reads it back and in what format, and what to do when
+    either fails. That split is why the same policy works over a microVM and over
+    :class:`~twinkle_agentic.envs.local.LocalEnv` -- and why a caller holding a
+    slot does not need to know which it has.
 
     Not thread-safe on purpose. A slot belongs to whoever holds it, and the pool
     hands each one to exactly one worker thread.
     """
 
-    def __init__(self, slot: int, env: RemoteMsAgentToolEnv, schemas: list,
+    def __init__(self, slot: int, env: Env, schemas: list,
                  *, snapshot_max_files: int, snapshot_per_file: int, snapshot_budget: int):
         self.slot = slot
         self.env = env
@@ -149,18 +154,33 @@ class Sandbox:
         # the prompt: the schemas a trajectory is built with have to be the ones
         # the slot it runs on will honour.
         self.schemas = schemas
-        self._runner = env.runner()
-        # The tools carry the env they dispatch into, so this slot's model turns
-        # have to go through this slot's manager.
-        self.tool_manager = ToolManager(EnvTool.from_schemas(env, schemas))
         self._snapshot_script = WORKSPACE_SNAPSHOT.format(
             workspace=self.workspace, max_files=snapshot_max_files,
             per_file=snapshot_per_file, total_budget=snapshot_budget)
         self._clear_script = CLEAR_WORKSPACE.format(workspace=self.workspace)
 
-    def run(self, script: str) -> Tuple[int, str]:
-        """Run a python script in the workspace; returns (exit code, output)."""
-        return self._runner(script, 'python')
+    # ------------------------------------------------------------------ Env
+
+    def run_script(self, source: str, interpreter: str = 'python',
+                   timeout: Optional[int] = None) -> Tuple[int, str]:
+        """Run a script in this slot's workspace; returns (exit code, output)."""
+        return self.env.run_script(source, interpreter, timeout)
+
+    def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
+        return self.env.step(tool_name, arguments or {})
+
+    def step_batch(self, calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[StepResult]:
+        return self.env.step_batch(calls)
+
+    def tools(self) -> list:
+        """The schemas this slot was built with, not the ones it could re-read.
+
+        Read once off the pool and carried, so every slot advertises the same
+        contract: these go into the prompt, and a slot rebuilt mid-run must not
+        start describing itself differently from the trajectories already in
+        flight against it.
+        """
+        return list(self.schemas)
 
     def clear(self) -> None:
         """Empty the workspace. Raises rather than returning quietly.
@@ -178,23 +198,21 @@ class Sandbox:
         the clear is retried, then retried on a deliberately rebuilt sandbox.
         """
         if self.env.ensure_ready():
-            self._rebind('runtime was unreachable')
-        code, out = self.run(self._clear_script)
+            logger.warning(f'[sandbox {self.slot}] runtime was unreachable; rebuilt')
+        code, out = self.run_script(self._clear_script)
         if code != 0:
             logger.warning(f'[sandbox {self.slot}] clear failed (exit {code}), '
                            f'retrying in {RESET_RETRY_WAIT}s: {out[-200:]}')
             time.sleep(RESET_RETRY_WAIT)
-            code, out = self.run(self._clear_script)
+            code, out = self.run_script(self._clear_script)
         if code != 0:
             # Rebuilt rather than retried again: two failures in a row is not the
             # transient this waits out, and a fresh sandbox brings a workspace
             # that is already empty -- which is all this method is asked for.
             logger.warning(f'[sandbox {self.slot}] clear failed twice (exit {code}); '
                            f'rebuilding: {out[-200:]}')
-            self.env.reset()
-            self.env.n_recoveries += 1
-            self._rebind('rebuilt after two failed clears')
-            code, out = self.run(self._clear_script)
+            self.env.rebuild()
+            code, out = self.run_script(self._clear_script)
         if code != 0:
             raise RuntimeError(f'workspace clear failed (exit {code}): {out[-400:]}')
 
@@ -210,24 +228,18 @@ class Sandbox:
         kept apart because a snapshot that says "empty" when it means "I could not
         look" produces tasks whose only true assertion is that nothing happened.
         """
-        code, out = self.run(self._snapshot_script)
+        code, out = self.run_script(self._snapshot_script)
         if code != 0:
             logger.warning(f'[sandbox {self.slot}] snapshot failed (exit {code}), '
                            f'retrying in {SNAPSHOT_RETRY_WAIT}s: {out[-200:]}')
             time.sleep(SNAPSHOT_RETRY_WAIT)
-            code, out = self.run(self._snapshot_script)
+            code, out = self.run_script(self._snapshot_script)
         if code != 0:
             return '', f'workspace snapshot failed (exit {code}): {out[-500:]}'
         return tool_payload(out).strip(), ''
 
     def close(self) -> None:
         self.env.close()
-
-    def _rebind(self, why: str) -> None:
-        """Point the runner and the tools at the sandbox behind this env now."""
-        self._runner = self.env.runner()
-        self.tool_manager = ToolManager(EnvTool.from_schemas(self.env, self.env.tool_schemas()))
-        logger.warning(f'[sandbox {self.slot}] rebound ({why})')
 
 
 def open_pool(
@@ -265,7 +277,7 @@ def open_pool(
     n = max(1, n)
     with ThreadPoolExecutor(max_workers=n) as pool:
         envs = list(pool.map(_boot, range(n)))
-    schemas = envs[0].tool_schemas()
+    schemas = envs[0].tools()
     slots = [
         Sandbox(i, env, schemas, snapshot_max_files=snapshot_max_files,
                 snapshot_per_file=snapshot_per_file, snapshot_budget=snapshot_budget)
@@ -283,7 +295,7 @@ def close_pool(slots: List[Sandbox]) -> int:
     produced its numbers under a different environment than one that was rebuilt
     never, and that is invisible from the output files alone.
     """
-    total = sum(getattr(s.env, 'n_recoveries', 0) for s in slots)
+    total = sum(s.env.n_recoveries for s in slots)
     for slot in slots:
         try:
             slot.close()

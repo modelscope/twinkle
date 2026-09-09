@@ -10,12 +10,9 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import (build_sensitive_regex, cjk_ratio, is_agent_row, load_sensitive_words, msg_content_text,
-                    msg_has_media, msg_has_payload, normalize_tool_calls)
-
-# Backward-compat re-exports.
-_msg_content_text = msg_content_text
-_normalize_tool_calls = normalize_tool_calls
+from twinkle_agentic.utils.message_utils import (is_agent_row, msg_content_text, msg_has_media, msg_has_payload,
+                                                 normalize_tool_calls)
+from twinkle_agentic.utils.text_utils import build_sensitive_regex, cjk_ratio, load_sensitive_words
 
 _VALID_ROLES = {'system', 'user', 'assistant', 'tool'}
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_.\-]*$')

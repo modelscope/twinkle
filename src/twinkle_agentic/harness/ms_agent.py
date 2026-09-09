@@ -15,7 +15,7 @@ side from the same list, or the prompt advertises tools the Env cannot run::
 
     harness = MsAgentHarness(config)
     harness.prepare()
-    tool_manager = ToolManager(EnvTool.from_schemas(env, harness.tool_schemas()))
+    tool_manager = env.tool_manager(harness.tool_schemas())
     rollout = MultiTurnRollout(sampler, template,
                                tool_manager=tool_manager, harness=harness)
     outs = rollout([harness.start(q) for q in queries])

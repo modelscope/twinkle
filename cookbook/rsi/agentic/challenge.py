@@ -61,19 +61,24 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 from twinkle import DeviceMesh, get_logger
 from twinkle.data_format import SamplingParams
 from twinkle.sampler import vLLMSampler
-from twinkle_agentic.challenger import KeywordStore, parse_check_script, parse_problem_statement
+from twinkle_agentic.challenger import (ApiExplorer, ApiModel, KeywordBank, KeywordPrompts, KeywordStore,
+                                        parse_check_script, parse_problem_statement)
 from twinkle_agentic.challenger.agentic import brittle_check_reason
-from twinkle_agentic.challenger.code import split_keyword_list
 from twinkle_agentic.challenger.task_bank import TaskBank
 from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.utils.message_utils import assistant_text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The parent too: recorder.py is shared with the code half, which is a sibling
+# directory rather than a package -- both halves are run as scripts.
+sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import prompts as P  # noqa: E402
+import train as T  # noqa: E402
+from recorder import Recorder  # noqa: E402
 from sandbox import open_pool, solver_harness  # noqa: E402
 
 logger = get_logger()
@@ -93,12 +98,6 @@ logger = get_logger()
 # the solver something when the solver mostly cannot do it yet.
 PASS_RATE_TARGET = 0.2
 PASS_RATE_WIDTH = 0.3
-
-# How many phrases the keyword prompt's 'do not repeat these' line may quote.
-# Measured on armA2ser: with 130 quoted the eighth refill call was still answering
-# normally, with 150 it started inventing -- 'iRAPION holistic replace', 10 of 480
-# phrases that run. 100 sits below where that began.
-AVOID_TOTAL = 100
 
 # How often run() looks for a stall. Only ever reached when the run has already
 # gone quiet, so it costs one wakeup per interval and nothing else.
@@ -281,7 +280,13 @@ def parse_args():
                         'the update was rounded away by the bf16 round trip through '
                         'the checkpoint anyway -- after 12 such iterations 98.54%% of '
                         'the weights were still bit-identical to the base model.')
-    p.add_argument('--sides', default='both', choices=('both', 'propose', 'solve'))
+    p.add_argument('--sides', default='both',
+                   help="which sides to train, comma-separated: 'both' is the "
+                        "agentic pair (propose + solve), 'code' is the code half, "
+                        "and 'both,code' runs all three into one step. Each name "
+                        'also decides whether that task source is collected at '
+                        'all, so this is one switch rather than two that can '
+                        'disagree about what an iteration contains.')
     p.add_argument('--micro-batch-size', type=int, default=1,
                    help='trajectories per micro batch. One, because padding_free is '
                         'off: a micro batch is padded to its longest member, so '
@@ -333,40 +338,104 @@ def parse_args():
     p.add_argument('--swanlab-mode', default='online',
                    help="'disabled' keeps a run off the dashboard entirely.")
 
+    # The code half. Only read when --sides names 'code'; see code/collect.py.
+    # Its own prefix throughout, because every one of these has an agentic
+    # counterpart that means something else: --solver-rollouts is a 24-turn
+    # sandbox episode and --code-solver-rollouts is one message of python.
+    p.add_argument('--code-keep-target', type=int, default=8,
+                   help='problems to keep per iteration, i.e. GRPO groups: one '
+                        'problem is one prompt answered --code-solver-rollouts '
+                        'times.')
+    p.add_argument('--code-batch-size', type=int, default=0,
+                   help='problems per written batch; 0 is one batch of the target.')
+    p.add_argument('--code-solver-rollouts', type=int, default=8,
+                   help='attempts per candidate. The group size and the denominator '
+                        'of n_pass in one number: these attempts ARE what the code '
+                        'side trains on, so the difficulty stage is not overhead.')
+    p.add_argument('--code-keep-pass-band', type=int, nargs=2, default=(1, 7),
+                   metavar=('LOW', 'HIGH'),
+                   help='keep a problem solved this many times out of '
+                        '--code-solver-rollouts, inclusive. Also what guarantees '
+                        'the group has a gradient, so it has to be read against '
+                        'the rollout count: (1,7) is the band for 8.')
+    p.add_argument('--code-max-proposals-per-round', type=int, default=2000,
+                   help='ceiling on one proposing round, i.e. one batched generate.')
+    p.add_argument('--code-propose-temp', type=float, default=1.1)
+    p.add_argument('--code-propose-max-tokens', type=int, default=8192)
+    p.add_argument('--code-solver-temp', type=float, default=1.0)
+    p.add_argument('--code-solver-max-tokens', type=int, default=2048)
+    p.add_argument('--code-problem-max-chars', type=int, default=4000)
+    p.add_argument('--code-max-checks', type=int, default=6)
+    p.add_argument('--code-script-timeout', type=int, default=30,
+                   help='seconds one script gets. A local subprocess, not a '
+                        'sandbox slot: a judgement is milliseconds and the stage '
+                        'makes candidates x rollouts of them, which through a '
+                        'microVM would cost more than the rest of the iteration.')
+    p.add_argument('--code-seed-file', default='',
+                   help='seed jsonl with query [+ code], from prepare.py.')
+    p.add_argument('--code-seed-mix-prob', type=float, default=0.5)
+    p.add_argument('--code-no-two-step', action='store_true',
+                   help='never take the two-call path, even for seeds with code.')
+    p.add_argument('--code-keywords-n', type=int, default=128,
+                   help='per-category refill target; 0 disables the keyword bank.')
+
     # Output.
     p.add_argument('--random-seed', type=int, default=0)
     args = p.parse_args()
-    if not args.api_model or not args.api_base:
-        raise SystemExit('[rsi] --api-model and --api-base are required '
-                         '(or LLM_BACKUP_MODEL / LLM_BACKUP_BASE_URL)')
     if not args.tag:
         raise SystemExit('[rsi] --tag is required: it decides which run these '
                          'iterations belong to and which checkpoint they overwrite')
-    if args.solver_rollouts < 2:
-        raise SystemExit('[rsi] --solver-rollouts must be >= 2: it is both the '
-                         "solver side's GRPO group size and the denominator n_pass "
-                         'is judged against')
-    if args.group_size < 2:
-        raise SystemExit('[rsi] --group-size must be >= 2: a group of one has '
-                         'no mean to subtract, so every advantage is zero')
-    # Checked here rather than where the pool is opened, which is after the model
-    # and the sampler are up: that is six minutes of startup to find out that a
-    # host address is missing.
-    if not args.sandbox_api_url:
-        raise SystemExit('[rsi] --sandbox-api-url is required (or SANDBOX_API_URL / '
-                         'AENV_API_URL)')
-    if not os.environ.get('E2B_API_KEY') and not os.environ.get('AENV_API_KEY'):
-        raise SystemExit('[rsi] E2B_API_KEY is required: the sandbox client reads '
-                         'it from the environment')
-    os.environ.setdefault('AENV_API_URL', args.sandbox_api_url)
-    os.environ.setdefault('AENV_TEMPLATE', args.sandbox_template)
-    os.environ.setdefault('AENV_API_KEY', os.environ.get('E2B_API_KEY', ''))
+    # Parsed here rather than left to argparse choices, which cannot express a
+    # comma-separated set. A typo has to stop the run: train.py counts an unknown
+    # side as 'not requested' and would take a whole iteration to say so.
+    args.sides_list = T.sides_wanted(args.sides)
+    unknown = [s for s in args.sides_list if s not in ('propose', 'solve', 'code')]
+    if unknown or not args.sides_list:
+        raise SystemExit(f'[rsi] --sides {args.sides!r} names {unknown or "nothing"}; '
+                         f"it takes 'both', 'propose', 'solve' and 'code', "
+                         f"comma-separated (e.g. 'both,code')")
+    # And parsed before everything below it, because most of what follows is one
+    # half's requirements: an API model and a sandbox host are what the agentic
+    # half needs to invent and check a task, and --sides code neither calls the API
+    # nor opens a microVM. Demanding them anyway is a run refused over a resource
+    # it was never going to touch.
+    if 'propose' in args.sides_list or 'solve' in args.sides_list:
+        if not args.api_model or not args.api_base:
+            raise SystemExit('[rsi] --api-model and --api-base are required '
+                             '(or LLM_BACKUP_MODEL / LLM_BACKUP_BASE_URL)')
+        if args.solver_rollouts < 2:
+            raise SystemExit('[rsi] --solver-rollouts must be >= 2: it is both the '
+                             "solver side's GRPO group size and the denominator "
+                             'n_pass is judged against')
+        if args.group_size < 2:
+            raise SystemExit('[rsi] --group-size must be >= 2: a group of one has '
+                             'no mean to subtract, so every advantage is zero')
+        # Checked here rather than where the pool is opened, which is after the
+        # model and the sampler are up: that is six minutes of startup to find out
+        # that a host address is missing.
+        if not args.sandbox_api_url:
+            raise SystemExit('[rsi] --sandbox-api-url is required (or '
+                             'SANDBOX_API_URL / AENV_API_URL)')
+        if not os.environ.get('E2B_API_KEY') and not os.environ.get('AENV_API_KEY'):
+            raise SystemExit('[rsi] E2B_API_KEY is required: the sandbox client '
+                             'reads it from the environment')
+        os.environ.setdefault('AENV_API_URL', args.sandbox_api_url)
+        os.environ.setdefault('AENV_TEMPLATE', args.sandbox_template)
+        os.environ.setdefault('AENV_API_KEY', os.environ.get('E2B_API_KEY', ''))
+    if 'code' in args.sides_list and args.code_solver_rollouts < 2:
+        raise SystemExit('[rsi] --code-solver-rollouts must be >= 2: those attempts '
+                         'are the code side\'s GRPO group, and a group of one has '
+                         'no mean to subtract')
     # The bank and the keyword store belong to the loop, not to an iteration:
     # comparing iteration k+1's proposals against what k produced is the point of
     # them. ``--task-bank ''`` turns novelty off and leaves the pass-rate gaussian
     # alone. out_dir is set per iteration by rsi.py.
     root = os.path.join(args.root, args.tag)
     args.keyword_db = os.path.join(root, 'keywords.jsonl')
+    # The code half draws from a bank of its own: its categories are
+    # algorithm/computer/noncs against the agentic half's
+    # transform/domain/edge_case, and one file cannot hold both.
+    args.code_keyword_db = os.path.join(root, 'code_keywords.jsonl')
     if args.task_bank is None:
         args.task_bank = os.path.join(root, 'task_bank.jsonl')
     args.out_dir = root
@@ -430,186 +499,8 @@ def rollout_one(rollout: MultiTurnRollout, traj: Dict[str, Any],
     called from every sandbox thread at once and the requests share vLLM's batch
     without any of them waiting for the others to be ready.
     """
-    out = rollout([traj], sampling_params=params, tool_manager=slot.tool_manager)
+    out = rollout([traj], sampling_params=params, tool_manager=slot.tool_manager())
     return out[0] if out else None
-
-
-def call_one(slot, script: str) -> Tuple[int, str]:
-    """Run one python script inside ``slot``; returns (exit code, output)."""
-    return slot.run(script)
-
-
-def api_one(api, messages: List[Dict[str, Any]], user_text: str,
-            params: SamplingParams, extra_body: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Append ``user_text`` and one API reply to ``messages``; returns the reply.
-
-    ``messages`` is the caller's private copy, never a trainable trajectory, so
-    mutating it in place costs the model nothing. ``None`` means the call raised:
-    the caller rejects rather than building a task on a broken conversation.
-
-    Tools are withdrawn for these stages on purpose -- they are answers, not
-    actions -- so only the text is kept and any structured ``tool_calls`` the API
-    returned are dropped.
-    """
-    messages.append({'role': 'user', 'content': user_text})
-    request = {'messages': messages}
-    try:
-        reply = api(request, params, extra_body=extra_body) if extra_body else api(request, params)
-    except Exception as e:  # noqa: BLE001 -- one bad call must not kill the run
-        logger.warning(f'[challenge] API call failed: {type(e).__name__}: {e}')
-        return None
-    if isinstance(reply, list):
-        reply = reply[0] if reply else {}
-    content = (reply.get('content') if isinstance(reply, dict) else None) or ''
-    messages.append({'role': 'assistant', 'content': content})
-    return content
-
-
-# ── Output ─────────────────────────────────────────────────────────────────
-
-
-def logprob_column(logprobs: Any) -> List[float]:
-    """One float per generated token: the logprob of the token that was chosen.
-
-    The sampler hands these over as ``List[List[Tuple[int, float]]]`` -- per
-    generated token, a list of top-k ``(token_id, logprob)`` pairs with the chosen
-    token first (``SampledSequence.logprobs``, data_format/sampling.py:185).
-    Passing that to ``np.asarray`` directly would store an ``(N, k, 2)`` array and
-    the loader would hand GRPO nested lists where it wants one float per trainable
-    token -- which is a crash inside the step, or worse a silent reshape.
-
-    A plain list of floats is accepted too, for a sampler that already flattened.
-    Anything else raises rather than being coerced: a wrong ``old_logps`` makes the
-    GRPO ratio wrong on the first step, and nothing downstream would say so.
-    """
-    out: List[float] = []
-    for step in logprobs:
-        if isinstance(step, (int, float)):
-            out.append(float(step))
-            continue
-        if isinstance(step, (list, tuple)) and step:
-            head = step[0]
-            if isinstance(head, (list, tuple)) and len(head) >= 2:
-                out.append(float(head[1]))
-                continue
-        raise TypeError(f'cannot read a logprob out of {step!r}; expected a float '
-                        f'or a list of (token_id, logprob) pairs')
-    return out
-
-
-class Recorder:
-    """Everything a run writes, behind one lock.
-
-    Trajectories go to ``.npz`` for the token fields and to ``index.jsonl`` for
-    everything a reader needs to interpret them. The text is written in full and
-    never truncated: these files are read to check whether a reward was deserved,
-    which a shortened statement cannot answer.
-    """
-
-    def __init__(self, out_dir: str):
-        self.dir = out_dir
-        self.traj_dir = os.path.join(out_dir, 'trajs')
-        os.makedirs(self.traj_dir, exist_ok=True)
-        self._lock = threading.Lock()
-        self._n = 0
-        self._index = open(os.path.join(self.traj_dir, 'index.jsonl'), 'w', encoding='utf-8')
-        self._groups = open(os.path.join(out_dir, 'groups.jsonl'), 'w', encoding='utf-8')
-        self._tasks = open(os.path.join(out_dir, 'tasks.jsonl'), 'w', encoding='utf-8')
-        # Why a build produced no task. The reason alone is not diagnosable: nine
-        # empty_workspace rejections in one run all looked like the model refusing
-        # to act, and the question of whether it had run out of tokens or simply
-        # emitted no call could not be answered from the record, because the fields
-        # that answered it were on the trajectory and were dropped.
-        self._rejected = open(os.path.join(out_dir, 'rejected.jsonl'), 'w', encoding='utf-8')
-        # Keyword replies, both sides in full. The one question this file exists to
-        # answer -- did the model disobey the format, or does the parser reject what
-        # it produced -- cannot be answered from a count. Keyword generation was
-        # silently broken for whole runs when the prompt asked for one per line and
-        # the parser wanted a JSON array.
-        self._keywords = open(os.path.join(out_dir, 'keyword_gen.jsonl'), 'w', encoding='utf-8')
-        # Every solver attempt, passed or not, with the state it left and what the
-        # check said about it. A task measured at 0 of 8 has three explanations --
-        # the check is wrong, the statement withholds something the check demands,
-        # or the solver gave up -- and only the attempt and the workspace it left
-        # tell them apart. Written for every attempt, not only for the ones that
-        # end up trained on: the failures are what this file is for.
-        self._attempts = open(os.path.join(out_dir, 'solver_attempts.jsonl'), 'w',
-                             encoding='utf-8')
-        # The rubric, all three of its dimensions. Only novelty reaches a reward;
-        # usefulness and complexity are recorded so the question of whether they
-        # should count can be answered from a run instead of argued.
-        self._novelty = open(os.path.join(out_dir, 'novelty_scores.jsonl'), 'w',
-                             encoding='utf-8')
-
-    def trajectory(self, traj: Dict[str, Any], **fields: Any) -> None:
-        """One training sample: token fields to npz, everything else to the index.
-
-        A trajectory with no ``logprobs`` is written anyway, with the field left
-        null. It is not trainable and the loader will say so -- which is the point:
-        a sample silently dropped here would make the group it belongs to look like
-        a different size than it was.
-        """
-        input_ids = np.asarray(traj.get('input_ids') or [], dtype=np.int32)
-        labels = np.asarray(traj.get('labels') or [], dtype=np.int32)
-        logprobs = traj.get('logprobs')
-        with self._lock:
-            self._n += 1
-            name = f'{self._n:06d}.npz'
-        arrays = {'input_ids': input_ids, 'labels': labels}
-        if logprobs is not None:
-            # float64, and the chosen token's column only. These are the old_logps a
-            # GRPO step divides by; float32 would round them to about 7 digits, so
-            # the ratio exp(logp - old_logp) would be off by roughly 1e-7 for
-            # reasons that have nothing to do with the policy having changed.
-            arrays['logprobs'] = np.asarray(logprob_column(logprobs), dtype=np.float64)
-        # Compressed: a 24-turn agentic episode is tens of thousands of token ids,
-        # and 128 of them per iteration adds up on disk.
-        np.savez_compressed(os.path.join(self.traj_dir, name), **arrays)
-        record = dict(fields)
-        record.update({
-            'npz': name,
-            'n_tokens': int(input_ids.size),
-            'n_trainable': int((labels != -100).sum()) if labels.size else 0,
-            'has_logprobs': logprobs is not None,
-            # The rollout guarantees one logprob per trainable label; recorded so a
-            # loader can check it rather than trust it.
-            'n_logprobs': int(arrays['logprobs'].size) if logprobs is not None else 0,
-            'turns': traj.get('turns'),
-            'stop_reason': traj.get('stop_reason'),
-            'truncated': bool(traj.get('truncated')),
-            'tool_stop': traj.get('tool_stop'),
-            'messages': traj.get('messages') or [],
-        })
-        self._write(self._index, record)
-
-    def group(self, record: Dict[str, Any]) -> None:
-        self._write(self._groups, record)
-
-    def task(self, record: Dict[str, Any]) -> None:
-        self._write(self._tasks, record)
-
-    def rejected(self, record: Dict[str, Any]) -> None:
-        self._write(self._rejected, record)
-
-    def keywords(self, record: Dict[str, Any]) -> None:
-        self._write(self._keywords, record)
-
-    def attempt(self, record: Dict[str, Any]) -> None:
-        self._write(self._attempts, record)
-
-    def novelty(self, record: Dict[str, Any]) -> None:
-        self._write(self._novelty, record)
-
-    def close(self) -> None:
-        for handle in (self._index, self._groups, self._tasks, self._rejected,
-                       self._keywords, self._attempts, self._novelty):
-            handle.close()
-
-    def _write(self, handle, record: Dict[str, Any]) -> None:
-        line = json.dumps(record, ensure_ascii=False, default=str)
-        with self._lock:
-            handle.write(line + '\n')
-            handle.flush()
 
 
 # ── Group state ────────────────────────────────────────────────────────────
@@ -771,6 +662,10 @@ class Run:
             max_turns=args.solver_max_turns,
             stop_after_stuck_turns=args.stop_after_stuck_turns,
             sampling_params=self.solve_params)
+        # The keyword bank's local fallback, below. ``max_turns=1`` because
+        # brainstorming a list is a text round: the trajectory ends before a tool
+        # could be dispatched, and a bracketed list in a reply is exactly what a
+        # tool-calling rollout would try to run.
         self.keyword_rollout = MultiTurnRollout(
             sampler, template=template, tool_manager=ToolManager(), max_turns=1,
             sampling_params=SamplingParams(max_tokens=args.keyword_max_tokens,
@@ -778,10 +673,14 @@ class Run:
                                            temperature=args.keyword_temp, top_p=0.98))
 
         from twinkle_agentic.protocol.openai import OpenAI
-        self.api = OpenAI(model=args.api_model, api_key=args.api_key or None,
-                          base_url=args.api_base)
+        # Kept as its own attribute as well as inside the model: the novelty rubric
+        # goes out through score_tasks rather than through here, and has to send the
+        # same body or the two API paths would be capped differently.
         self.api_extra = ({'thinking_budget': args.api_thinking_budget}
                           if args.api_thinking_budget > 0 else None)
+        self.api = ApiModel(OpenAI(model=args.api_model, api_key=args.api_key or None,
+                                   base_url=args.api_base),
+                            extra_body=self.api_extra, name='challenge')
         self.check_params = SamplingParams(max_tokens=args.check_max_tokens, num_samples=1,
                                            temperature=args.propose_temp, top_p=0.95)
         self.problem_params = SamplingParams(max_tokens=args.problem_max_tokens,
@@ -801,7 +700,29 @@ class Run:
         # different one would be a different experiment.
         self.system = P.SYSTEM + (P.BUILD_SIZE_CAP.format(n=args.max_build_files)
                                   if args.max_build_files > 0 else '')
-        self.store = KeywordStore(args.keyword_db, P.CATEGORIES)
+        # The keyword cycle -- draw, refill, the avoid list, expansion, the bank on
+        # disk -- is the framework's, not a third copy of it here. What is local is
+        # only which model answers: the API model, because keyword text never enters
+        # a trajectory (it is parsed into a list and thrown away) so no untrained
+        # tokens come of it, and because the bank is the single input every task
+        # downstream is built from -- measured over the 1344 keywords iterations 1-7
+        # generated locally at temperature 1.3, 31% of transform named an activity
+        # on a running system rather than a computation, 13% of domain named an
+        # operation rather than material, and 24% of edge_case needed hardware the
+        # container does not have. The one-turn local rollout is the fallback rather
+        # than nothing, because an unreachable API must not leave a category dry.
+        self.keywords = KeywordBank(
+            KeywordStore(args.keyword_db, P.CATEGORIES),
+            prompts=KeywordPrompts(system=P.KEYWORD_SYSTEM, user=P.KEYWORD_USER,
+                                   expand_user=P.KEYWORD_EXPAND_USER),
+            category_desc=P.CATEGORY_DESC,
+            explorer=ApiExplorer(self.api, params=self.keyword_api_params,
+                                 fallback=self.keyword_rollout),
+            rng=self.rng, name='challenge', sink=self.rec.keywords,
+            # Every prompt here quotes one keyword per category, so a draw that
+            # covered a subset would send a prompt this run's prompts cannot fill.
+            single_kw_prob=0.0, refill_target=args.keywords_n,
+            gen_calls=args.keyword_gen_calls, refill_tries=args.keyword_refill_tries)
         self.bank = TaskBank(args.task_bank, refs=args.task_bank_refs) if args.task_bank else None
         # ms-agent builds the solver's opening messages, and it does so through a
         # stateful agent object -- so one instance, one lock, and only for the few
@@ -813,16 +734,11 @@ class Run:
         self.api_pool = ThreadPoolExecutor(max_workers=args.api_concurrency,
                                            thread_name_prefix='api')
         self.state = threading.Lock()
-        self.kw_lock = threading.Lock()
         # Jobs actually being worked on right now, sandbox and API. Only used by
         # the stall check in run(): 'the queue is empty' is not 'there is nothing
         # left to do' while a thread is still inside a job that will queue more.
         self.busy = 0
         self.api_jobs = 0
-        self.nonce = 0
-        # (category, keyword) pairs behind tasks nobody solved. Read at the end by
-        # expand_hard_keywords, which asks for more in the same domains.
-        self.hard: List[Tuple[str, str]] = []
         self.kept: List[Group] = []
         self.groups: List[Group] = []
         self.n_launched = 0
@@ -835,186 +751,6 @@ class Run:
         with self.state:
             self.counts[key] = self.counts.get(key, 0) + n
 
-    def draw_keywords(self) -> Tuple[List[Tuple[str, str]], str]:
-        """One entry from each category, refilling any that has run dry.
-
-        On its own lock, not ``state``: a refill is eight model calls and holding
-        the lock every ``bump`` needs for that long would stall all 32 slots. Two
-        threads drawing at once still have to take turns, or the second refill's
-        prompt would not know what the first one had just said.
-        """
-        with self.kw_lock:
-            for category in P.CATEGORIES:
-                if not self.store.unused(category):
-                    self.refill(category)
-            picks = []
-            for category in P.CATEGORIES:
-                text = self.store.take(category, self.rng)
-                if text is not None:
-                    picks.append((category, text))
-        return picks, '\n'.join(f'- {c}: {t}' for c, t in picks)
-
-    def refill(self, category: str) -> None:
-        """Ask the local model for more keywords in ``category``.
-
-        Says so when it comes back empty. A silent no-op here is the worst outcome
-        available: every proposal then falls back to a keyword-less prompt and the
-        run looks normal while producing one identical prompt over and over. That
-        is exactly what happened for whole runs when the prompt asked for one
-        keyword per line and the parser wanted a JSON array.
-
-        The calls run one at a time so each can be told what the ones before it
-        said; each is answered by a rollout with ``max_turns=1``, which ends the
-        trajectory before any tool could be dispatched -- brainstorming a list is a
-        text round, and a bracketed list in a reply is exactly what a tool-calling
-        rollout would try to run.
-        """
-        for attempt in range(1, max(1, self.args.keyword_refill_tries) + 1):
-            if self.generate_keywords(category):
-                return
-            logger.warning(f'[challenge] keyword refill for {category!r} produced '
-                           f'nothing new on try {attempt}')
-        if self.store.items[category]:
-            # Every keyword marked unused again. The alternative is a category that
-            # can never be drawn from, which stops the run: a repeat draw is worse
-            # than no run only if diversity matters more than collecting anything.
-            self.store.recycle(category)
-            self.store.save()
-            logger.warning(f'[challenge] keyword category {category!r} exhausted -> '
-                           f'recycled {len(self.store.items[category])} topics')
-
-    def generate_keywords(self, category: str) -> bool:
-        """One refill round. True when it added something the bank did not have."""
-        want = self.args.keywords_n
-        calls = max(1, self.args.keyword_gen_calls)
-        per_call = max(1, -(-want // calls) + 4)
-        known = self.store.texts(category)
-        fresh: List[str] = []
-        seen = {t.strip().lower() for t in known}
-        for i in range(calls):
-            # Newest first: the calls run one at a time so each can avoid what the
-            # ones before it said, and letting older entries evict those would undo
-            # it. Past the cap the oldest of this refill's phrases fall off, which
-            # is also the least costly thing to drop.
-            avoid = (fresh + known)[:AVOID_TOTAL]
-            self.nonce += 1
-            user = (P.KEYWORD_USER.format(k=per_call, desc=P.CATEGORY_DESC[category])
-                    + ('\nDo NOT repeat any of these already-used topics: '
-                       + ', '.join(avoid) if avoid else '')
-                    + f'\n(batch {self.nonce}-{i})')
-            # Asked of the API model rather than the local one. Keyword text never
-            # enters a trajectory -- it is parsed into a list and thrown away -- so
-            # this adds no untrained tokens, which is the rule that decides what may
-            # use the API. And the bank is the single input every task downstream is
-            # built from: measured over the 1344 keywords iterations 1-7 generated
-            # locally at temperature 1.3, against category rules the model is shown
-            # in full, 31% of transform named an activity on a running system rather
-            # than a computation, 13% of domain named an operation rather than
-            # material, and 24% of edge_case needed hardware the container does not
-            # have. Downstream, 42-70% of statements described themselves as
-            # simulating their own subject matter, which is what a keyword the
-            # sandbox cannot honour turns into. A 4B policy at that temperature is
-            # the wrong instrument for a constraint list this long.
-            #
-            # Falls back to the local model instead of giving up: an unreachable API
-            # must not leave a category dry, because dry means keyword-less prompts
-            # and a run that looks healthy while producing one prompt over and over
-            # -- the exact failure the refill logic already guards against.
-            out = None
-            messages = [{'role': 'system', 'content': P.KEYWORD_SYSTEM}]
-            reply = api_one(self.api, messages, user, self.keyword_api_params,
-                            self.api_extra)
-            via = 'api'
-            if reply is None:
-                traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
-                                     {'role': 'user', 'content': user}]}
-                out = self.keyword_rollout([traj])
-                reply = self._assistant_text(out[0] if out else {})
-                via = 'local-fallback'
-            parsed, dropped_long = split_keyword_list(reply)
-            new = [k for k in parsed if k.lower() not in seen]
-            for keyword in new:
-                seen.add(keyword.lower())
-            fresh.extend(new)
-            self.rec.keywords({'category': category, 'prompt': user, 'reply': reply,
-                               'parsed': parsed, 'n_parsed': len(parsed),
-                               'n_new': len(new), 'via': via,
-                               'dropped_long': dropped_long,
-                               'n_dropped_long': len(dropped_long),
-                               'stop_reason': (out[0].get('stop_reason') if out else None),
-                               'truncated': bool(out[0].get('truncated')) if out else None})
-            if len(fresh) >= want:
-                break
-        added = self.store.add(category, fresh[:want], source='gen')
-        if added:
-            # Written now rather than at the end of the run: a run that crashes after
-            # spending eight model calls on keywords should not have to spend them
-            # again, and the next iteration reads this file to know what was used.
-            self.store.save()
-            logger.info(f'[challenge] keywords {category!r} +{added}')
-        return bool(added)
-
-    @staticmethod
-    def _assistant_text(traj: Dict[str, Any]) -> str:
-        for message in reversed((traj.get('messages') if traj else []) or []):
-            if message.get('role') == 'assistant':
-                return message.get('content') or ''
-        return ''
-
-    def expand_hard_keywords(self) -> int:
-        """More keywords in the domains that produced tasks nobody solved.
-
-        Run once at the end, so what it adds is there for the next iteration rather
-        than for the groups still in flight. One call per hard keyword, capped at
-        32 of them: this is the only feedback the keyword bank gets from difficulty,
-        and without it the bank drifts wherever the refill prompt happens to go.
-        """
-        with self.state:
-            hard = list(self.hard)[:32]
-        if not hard:
-            return 0
-        added = 0
-        for i, (category, keyword) in enumerate(hard):
-            self.nonce += 1
-            user = (P.KEYWORD_EXPAND_USER.format(kw=keyword, m=8,
-                                                 desc=P.CATEGORY_DESC[category])
-                    + f'\n(batch {self.nonce}-{i})')
-            # Same reasoning as the refill path: the API model, falling back to the
-            # local one. This path matters more, not less -- it wrote 960 of the 1344
-            # keywords the first seven iterations banked, at more than twice their
-            # rule-break rate, so it is the one shaping what later iterations draw.
-            out = None
-            messages = [{'role': 'system', 'content': P.KEYWORD_SYSTEM}]
-            reply = api_one(self.api, messages, user, self.keyword_api_params,
-                            self.api_extra)
-            via = 'api'
-            if reply is None:
-                traj = {'messages': [{'role': 'system', 'content': P.KEYWORD_SYSTEM},
-                                     {'role': 'user', 'content': user}]}
-                out = self.keyword_rollout([traj])
-                reply = self._assistant_text(out[0] if out else {})
-                via = 'local-fallback'
-            parsed, dropped_long = split_keyword_list(reply)
-            added += self.store.add(category, parsed, source='expand', parent=keyword)
-            # The prompt goes in whole, as the refill path already does. It used to
-            # record the literal string 'expand', which made this file unable to
-            # answer the one question it gets asked -- whether a change to
-            # KEYWORD_EXPAND_USER was live in a given iteration -- and cost an
-            # afternoon to a wrong answer inferred from mtimes instead.
-            #
-            # ``dropped_long`` for the same reason one step further in: iteration 9
-            # recorded n_parsed 0 on four of six expand calls whose replies were
-            # well-formed JSON, and nothing in this file said the phrases had been
-            # thrown away for length rather than never produced.
-            self.rec.keywords({'category': category, 'parent': keyword, 'prompt': user,
-                               'reply': reply, 'parsed': parsed, 'n_parsed': len(parsed),
-                               'dropped_long': dropped_long,
-                               'n_dropped_long': len(dropped_long), 'via': via})
-        self.store.save()
-        logger.info(f'[challenge] expanded {len(hard)} hard keyword(s) -> '
-                    f'+{added} same-domain topics')
-        return added
-
     def launch_group(self) -> Optional[Group]:
         """Draw a topic and queue its ``group_size`` builds. None once at the cap."""
         with self.state:
@@ -1024,7 +760,8 @@ class Run:
                 return None
             gid = self.n_launched
             self.n_launched += 1
-        picks, block = self.draw_keywords()
+        picks = self.keywords.draw()
+        block = KeywordBank.block(picks)
         if len(picks) != len(P.CATEGORIES):
             # Every proposal's prompt is the keyword draw, so there is no honest
             # prompt to send without one. Stopping is the reportable outcome; a
@@ -1094,7 +831,7 @@ class Run:
                                if isinstance(m, dict) and m.get('role') == 'assistant'),
             'n_tool_calls': sum(len(m.get('tool_calls') or []) for m in messages
                                 if isinstance(m, dict)),
-            'last_assistant': self._assistant_text(traj),
+            'last_assistant': assistant_text(traj),
             'check': prop.check,
         })
 
@@ -1111,7 +848,7 @@ class Run:
         slot.clear()
         traj = {'messages': [{'role': 'system', 'content': self.system},
                              {'role': 'user', 'content': prop.group.prompt}],
-                'tools': slot.schemas}
+                'tools': slot.tools()}
         prop.traj = rollout_one(self.propose_rollout, traj, self.propose_params, slot)
         if prop.traj is None:
             prop.outcome = 'rollout_empty'
@@ -1141,7 +878,7 @@ class Run:
         attempt = 0
         while True:
             attempt += 1
-            reply = api_one(self.api, messages, user_text, self.check_params, self.api_extra)
+            reply = self.api.reply(messages, user_text, self.check_params)
             if reply is None:
                 prop.outcome, prop.detail = 'api_error', 'check-script call failed'
                 return
@@ -1162,7 +899,7 @@ class Run:
             # that pins a file's size or quotes a script's source passes for its
             # author and fails every correct reproduction.
             brittle = brittle_check_reason(script)
-            exit_code, output = (1, brittle) if brittle else call_one(slot, script)
+            exit_code, output = (1, brittle) if brittle else slot.run_script(script)
             if exit_code == 0:
                 prop.check = script
                 break
@@ -1176,8 +913,7 @@ class Run:
                            f'\n--- state after check ---\n{after}')
             return
 
-        reply = api_one(self.api, messages, P.PROBLEM_FOLLOWUP, self.problem_params,
-                        self.api_extra)
+        reply = self.api.reply(messages, P.PROBLEM_FOLLOWUP, self.problem_params)
         if reply is None:
             prop.outcome, prop.detail = 'api_error', 'problem-statement call failed'
             return
@@ -1211,10 +947,10 @@ class Run:
             if not opening.get('tools'):
                 # The harness only shapes messages -- its tool list is empty on
                 # purpose -- so the schemas come from the slot that will run them.
-                opening['tools'] = slot.schemas
+                opening['tools'] = slot.tools()
             attempt = rollout_one(self.solve_rollout, opening, self.solve_params, slot)
             if attempt is not None:
-                exit_code, output = call_one(slot, prop.check)
+                exit_code, output = slot.run_script(prop.check)
                 passed = exit_code == 0
             # Read after the check, not before: the check is allowed to write, and
             # what a reader of a failed attempt needs is the workspace the check
@@ -1387,15 +1123,11 @@ class Run:
             } for p in group.proposals],
         }
         self.rec.group(record)
-        # Keyword draws behind tasks nobody solved, for expand_hard_keywords. Taken
-        # from every decided group, kept or not: a task at n_pass=0 says the same
-        # thing about its keywords either way.
+        # Keyword draws behind tasks nobody solved, for the end-of-run expansion.
+        # Taken from every decided group, kept or not: a task at n_pass=0 says the
+        # same thing about its keywords either way.
         if any(p.statement and p.n_pass == 0 for p in group.proposals):
-            with self.state:
-                seen = {(c, t.lower()) for c, t in self.hard}
-                for category, text in group.keywords:
-                    if (category, text.lower()) not in seen:
-                        self.hard.append((category, text))
+            self.keywords.remember_hard(group.keywords)
         if chosen is None:
             self.bump('group_dropped' if not group.dropped else 'group_dropped_early')
             return

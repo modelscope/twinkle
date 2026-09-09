@@ -22,8 +22,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
-
-from ..message_utils import msg_content_text
+from twinkle_agentic.utils.message_utils import msg_content_text
 
 logger = get_logger()
 

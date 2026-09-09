@@ -19,9 +19,8 @@ import re
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
+from twinkle_agentic.utils.message_utils import msg_content_text
 from .. import label_schema as L
-from ..message_utils import msg_content_text
 
 KEY_CONTAMINATED = 'contaminated'
 

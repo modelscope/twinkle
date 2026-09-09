@@ -30,11 +30,14 @@ from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.data_format import SamplingParams, user_data_get
 from twinkle.sampler import vLLMSampler
 from twinkle_agentic.challenger import CodeChallenger, KeywordStore, load_seeds
+from twinkle_agentic.envs import LocalEnv
 from twinkle_agentic.rollout import build_rollout
 from twinkle_agentic.tools.tool_manager import ToolManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prompts import CATEGORIES, CATEGORY_DESC, code_prompts  # noqa: E402
+# challenge_prompts, not prompts: the agentic half has a prompts.py of its own
+# with a CATEGORIES in it, and rsi.py imports both halves into one process.
+from challenge_prompts import CATEGORIES, CATEGORY_DESC, code_prompts  # noqa: E402
 
 logger = get_logger()
 
@@ -84,8 +87,10 @@ def parse_args():
     p.add_argument('--solver-rollouts', type=int, default=8)
     p.add_argument('--solver-temp', type=float, default=1.0)
     p.add_argument('--solver-max-tokens', type=int, default=2048)
-    p.add_argument('--keep-min-pass', type=int, default=1)
-    p.add_argument('--keep-max-margin', type=int, default=1)
+    p.add_argument('--keep-pass-band', type=int, nargs=2, default=(1, 7),
+                   metavar=('LOW', 'HIGH'),
+                   help='keep problems solved this many times out of '
+                        '--solver-rollouts, inclusive; the default is the band for 8')
 
     p.add_argument('--sandbox-timeout', type=int, default=30)
     p.add_argument('--max-checks', type=int, default=6)
@@ -155,6 +160,12 @@ def main():
     challenger = CodeChallenger(
         code_prompts(),
         explorer,
+        # Checks run on this machine, in a throwaway directory per script. A
+        # generated check is a self-contained program over its own asserts, so
+        # it needs no workspace to carry state between calls -- and the same
+        # slot is handed a sandbox instead when a task needs one. The per-check
+        # deadline comes from ``sandbox_timeout`` below, stated on every call.
+        envs=[LocalEnv()],
         seeds=seeds,
         keyword_store=store,
         category_desc=CATEGORY_DESC if store else None,
@@ -181,8 +192,7 @@ def main():
         reject_sink=_reject,
         max_proposals_per_round=args.max_proposals_per_round,
         solver_rollouts=args.solver_rollouts,
-        keep_min_pass=args.keep_min_pass,
-        keep_max_pass_margin=args.keep_max_margin,
+        keep_pass_band=tuple(args.keep_pass_band),
         solver_params=SamplingParams(max_tokens=args.solver_max_tokens, num_samples=1,
                                      logprobs=1, temperature=args.solver_temp, top_p=0.95),
         seed=args.random_seed,
@@ -251,8 +261,12 @@ def write_flows(kept, args):
                 }],
             }
             ff.write(json.dumps(flow, ensure_ascii=False) + '\n')
+            # The challenger keeps one check script, the shape the agentic half
+            # also uses; this file is a list of asserts because that is what
+            # rsi_rl reads, so split it back on the way out.
+            check_script = user_data_get(data, 'check_script', '') or ''
             ft.write(json.dumps({'id': cid,
-                                 'test_list': user_data_get(data, 'asserts', []),
+                                 'test_list': check_script.splitlines(),
                                  'test_setup_code': ''}, ensure_ascii=False) + '\n')
 
 

@@ -69,18 +69,37 @@ def build_model(*, model_id: str, model_gpus: int, lr: float, template: str,
     return model
 
 
+def sides_wanted(sides: str) -> tuple:
+    """The side names ``--sides`` asks for, in order, without repeats.
+
+    Comma-separated because an iteration can collect from more than one task
+    source: ``both`` is the agentic pair, ``code`` is the code half, and
+    ``both,code`` runs all three into the same step. Unknown names are not
+    rejected here -- a side nobody wrote is a side ``load`` counts as skipped,
+    with the name in the reason, which says more than a parser error would.
+    """
+    out = []
+    for part in sides.split(','):
+        part = part.strip()
+        if part:
+            out.extend(('propose', 'solve') if part == 'both' else (part, ))
+    return tuple(dict.fromkeys(out))
+
+
 def load(run_dir: str, *, sides: str, max_length: int) -> tuple:
     """Read the index into GRPO groups; returns (groups, skipped).
 
-    A group is ``(side, group_id)`` for the proposing side and
-    ``(side, group_id, proposal_idx)`` for the solving side -- one prompt answered
-    several times, which is what an advantage is computed over.
+    A group is ``(side, group_id)`` for the proposing and the code side and
+    ``(side, group_id, proposal_idx)`` for the agentic solving side -- one prompt
+    answered several times, which is what an advantage is computed over. The code
+    half proposes nothing it trains on, so one problem is one group and there is
+    no proposal to index within it.
     """
     traj_dir = os.path.join(run_dir, 'trajs')
     index = os.path.join(traj_dir, 'index.jsonl')
     if not os.path.exists(index):
         raise SystemExit(f'[train] no {index}')
-    wanted = {'both': ('propose', 'solve')}.get(sides, (sides, ))
+    wanted = sides_wanted(sides)
     skipped: collections.Counter = collections.Counter()
     by_key: Dict[Any, List[Dict[str, Any]]] = collections.OrderedDict()
     with open(index, encoding='utf-8') as f:
@@ -124,7 +143,7 @@ def load(run_dir: str, *, sides: str, max_length: int) -> tuple:
                 # max_model_len 40960, which is above this.
                 skipped[f'longer than max_length={max_length}'] += 1
                 continue
-            key = ((side, record.get('group_id')) if side == 'propose' else
+            key = ((side, record.get('group_id')) if side in ('propose', 'code') else
                    (side, record.get('group_id'), record.get('proposal_idx')))
             by_key.setdefault(key, []).append({
                 'side': side,
@@ -204,8 +223,18 @@ def train_one_step(model, run_dir: str, *, sides: str, max_length: int,
     batch = [m for g in interleave(groups) for m in g['members']]
     mix = collections.Counter(m['side'] for m in batch)
     sizes = collections.Counter((g['side'], len(g['members'])) for g in groups)
+    # What interleave cannot balance. It spreads the sides evenly by trajectory
+    # count, and a code attempt is an order of magnitude shorter than an agentic
+    # episode, so equal counts are nothing like equal shares of the update.
+    # Measured and reported rather than corrected for: the weighting to apply, if
+    # any, has to come off an observed ratio instead of a guess at one.
+    side_tokens: collections.Counter = collections.Counter()
+    side_trainable: collections.Counter = collections.Counter()
+    for m in batch:
+        side_tokens[m['side']] += len(m['input_ids'])
+        side_trainable[m['side']] += sum(1 for lb in m['labels'] if lb != -100)
     logger.info(f'[train] {len(groups)} groups, {len(batch)} trajectories {dict(mix)}; '
-                f'group sizes {dict(sizes)}')
+                f'group sizes {dict(sizes)}; trainable tokens {dict(side_trainable)}')
     for note, n in sorted(skipped.items()):
         logger.warning(f'[train] skipped: {note} x{n}')
 
@@ -246,6 +275,8 @@ def train_one_step(model, run_dir: str, *, sides: str, max_length: int,
         'trained': len(batch) - dropped,
         'dropped_tail': dropped,
         'sides': dict(mix),
+        'side_tokens': dict(side_tokens),
+        'side_trainable_tokens': dict(side_trainable),
         'group_sizes': {f'{s}:{n}': c for (s, n), c in sizes.items()},
         'advantage_min': min(advantages),
         'advantage_max': max(advantages),
@@ -305,6 +336,13 @@ def upload(challenge: Dict[str, Any], summary: Dict[str, Any], *,
         'train/dropped_tail': summary['dropped_tail'],
         'train/propose_trajectories': summary['sides'].get('propose', 0),
         'train/solve_trajectories': summary['sides'].get('solve', 0),
+        'train/code_trajectories': summary['sides'].get('code', 0),
+        # The same three by trainable tokens, which is the share of the update
+        # each side actually got. Always present, at 0 for a side this iteration
+        # did not collect, so no chart appears or disappears mid-run.
+        'train/propose_tokens': summary['side_trainable_tokens'].get('propose', 0),
+        'train/solve_tokens': summary['side_trainable_tokens'].get('solve', 0),
+        'train/code_tokens': summary['side_trainable_tokens'].get('code', 0),
         'train/advantage_min': summary['advantage_min'],
         'train/advantage_max': summary['advantage_max'],
         'train/learning_rate': summary['learning_rate'],

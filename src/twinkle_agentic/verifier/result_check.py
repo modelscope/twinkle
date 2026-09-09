@@ -9,23 +9,20 @@ trajectory always earns the same reward and difficulty filtering stays stable.
 A task declares a list of :class:`Check`; :func:`run_checks` evaluates them and
 returns a :class:`CheckReport` whose ``score`` is the reward.
 
-Checks that need to *run* something (``shell`` / ``python``) go through a
-``runner`` so they execute wherever the episode ran -- pass the sandbox's
-runner and the check sees exactly the state the agent left behind. Without one
-they fall back to a local subprocess in ``workspace``, which is only correct
-when the episode itself ran locally.
+Checks that need to *run* something (``shell`` / ``python``) run inside the
+episode's :class:`~twinkle_agentic.envs.base.Env`, so they see exactly the state
+the agent left behind -- hand over the sandbox the episode acted in. Without one
+they fall back to a :class:`~twinkle_agentic.envs.local.LocalEnv` over
+``workspace``, which is only correct when the episode itself ran locally.
 """
 import json
 import os
 import re
-import resource
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # importing the env package for a type would cost every caller
+    from ..envs.base import Env  # a second of import time -- see _local_env.
 
 __all__ = [
     'Check',
@@ -34,15 +31,11 @@ __all__ = [
     'CheckContext',
     'run_checks',
     'checks_from_dicts',
-    'local_runner',
 ]
-
-# (exit_code, output) for one command run inside the episode's workspace.
-Runner = Callable[[str, str], Tuple[int, str]]
 
 DEFAULT_TIMEOUT = int(os.environ.get('RESULT_CHECK_TIMEOUT', 60))
 # Cap a runaway check so one bad task cannot take the trainer down with it.
-_MEM_LIMIT_BYTES = 2 * 1024**3
+_MEM_LIMIT_GB = 2.0
 
 _KINDS = (
     'file_exists',
@@ -131,70 +124,29 @@ class CheckContext:
     Args:
         workspace: directory the episode wrote into.
         final_answer: text of the last assistant turn, for the ``answer_*`` kinds.
-        runner: executes a command in the episode's environment. ``None`` runs
-            it locally in ``workspace``.
+        env: where the ``shell`` / ``python`` kinds run -- the environment the
+            episode acted in. ``None`` runs them locally in ``workspace``.
     """
     workspace: str = ''
     final_answer: str = ''
-    runner: Optional[Runner] = None
+    env: Optional['Env'] = None
 
 
-def local_runner(workspace: str) -> Runner:
-    """Run commands in ``workspace`` as a local subprocess.
+def _local_env(workspace: str) -> 'Env':
+    """Run checks in ``workspace`` on this machine.
 
-    Uses ``start_new_session`` + ``killpg`` so a forking command cannot leave
-    grandchildren behind on timeout, and caps address space at 2GB.
+    The fallback for a :class:`CheckContext` with no env. It is a
+    :class:`~twinkle_agentic.envs.local.LocalEnv`, so a check that falls back to
+    here and a check that runs in a sandbox go through one interface -- and the
+    process isolation (own session, killpg on timeout, capped address space)
+    lives in one place instead of being restated by every caller that needs it.
     """
-
-    def _run(command: str, interpreter: str) -> Tuple[int, str]:
-        return _local_exec(command, interpreter, workspace, DEFAULT_TIMEOUT)
-
-    return _run
-
-
-def _local_exec(source: str, interpreter: str, cwd: str, timeout: int) -> Tuple[int, str]:
-    cwd = cwd or '.'
-    os.makedirs(cwd, exist_ok=True)
-    if interpreter == 'python':
-        tmp = tempfile.mkdtemp(prefix='rescheck_')
-        script = os.path.join(tmp, '_check.py')
-        with open(script, 'w', encoding='utf-8') as f:
-            f.write(source)
-        argv = [sys.executable, script]
-    else:
-        tmp = None
-        argv = ['/bin/bash', '-lc', source]
-
-    env = dict(os.environ, MPLBACKEND='Agg', PYTHONHASHSEED='0',
-               OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
-               TOKENIZERS_PARALLELISM='false')
-    env.pop('CUDA_VISIBLE_DEVICES', None)
-
-    def _limit():
-        resource.setrlimit(resource.RLIMIT_AS, (_MEM_LIMIT_BYTES, _MEM_LIMIT_BYTES))
-
-    try:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors='replace',
-                                start_new_session=True, preexec_fn=_limit)
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            return proc.returncode, out or ''
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.communicate(timeout=5)
-            except Exception:  # noqa
-                pass
-            return 124, f'check did not finish within {timeout}s'
-    except Exception as e:  # noqa
-        return 1, f'{type(e).__name__}: {e}'
-    finally:
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
+    # Imported here, not at module scope: the env package pulls in twinkle's
+    # remote-class machinery, and a task declaring only file_* checks should not
+    # pay a second of import time for an environment it never runs anything in.
+    from ..envs.local import LocalEnv
+    return LocalEnv(workspace=workspace or '.', command_timeout=DEFAULT_TIMEOUT,
+                    memory_limit_gb=_MEM_LIMIT_GB)
 
 
 def checks_from_dicts(raw: Sequence[Dict[str, Any]]) -> List[Check]:
@@ -297,11 +249,12 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
                             f'{check.path}:{check.key} is {got!r}, expected {check.value!r}')
 
     if kind in ('shell', 'python'):
-        runner = ctx.runner or local_runner(ctx.workspace)
+        env = ctx.env or _local_env(ctx.workspace)
         try:
-            code, out = runner(check.code, 'python' if kind == 'python' else 'shell')
+            code, out = env.run_script(check.code, kind, check.timeout)
         except Exception as e:  # noqa
-            return CheckOutcome(check, False, f'runner raised {type(e).__name__}: {e}')
+            return CheckOutcome(check, False,
+                                f'{type(env).__name__} raised {type(e).__name__}: {e}')
         if code != check.expect_exit:
             return CheckOutcome(check, False,
                                 f'exit {code} (expected {check.expect_exit}); output: {out[-300:]}')
@@ -336,7 +289,7 @@ def run_checks(
     Args:
         checks: the task's assertions. An empty list scores 0.0 rather than a
             free 1.0, so a task that forgot to declare checks cannot look solved.
-        ctx: workspace / final answer / runner.
+        ctx: workspace / final answer / environment.
         mode: ``fraction`` gives weighted partial credit, ``all_or_nothing``
             gives 1.0 only when every check passes.
 

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tests for preprocessor.utils — pure logprob math helpers.
+"""Tests for preprocessor.logprob_utils — pure logprob math helpers.
 
 These helpers compute conditional-vs-unconditional logprob deltas for
 IFD-family scoring (CherryLLM, T-SHIRT, ChR).  All functions are stateless
@@ -14,9 +14,9 @@ Conventions used in this test file:
 import math
 import pytest
 
-from twinkle_agentic.preprocessor.utils import (_chr_min_distinct, _chr_min_weighted, _extract_logprob,
-                                                _ifd_family_metrics, _lp_to_jsonable, _mean_logprob_delta, _pad_batch,
-                                                _to_int_list)
+from twinkle_agentic.preprocessor.logprob_utils import (_chr_min_distinct, _chr_min_weighted, _extract_logprob,
+                                                        _ifd_family_metrics, _lp_to_jsonable, _mean_logprob_delta,
+                                                        _pad_batch, _to_int_list)
 
 # ── _extract_logprob ────────────────────────────────────────────────────────
 

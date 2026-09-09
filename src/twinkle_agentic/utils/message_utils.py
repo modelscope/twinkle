@@ -1,14 +1,35 @@
-"""Message-format utilities shared across active preprocessor steps.
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Reading what messages carry.
 
-Split out of ``utils.py`` (AUDIT A2): content projection, tool-call
-normalization, CJK ratio, sensitive-word regex, and agent-row detection. These
-are the helpers every cleaning step depends on, independent of the log-prob
-scoring math (see :mod:`logprob_utils`).
+A message's ``content`` is a plain string in the simple case and a list of typed
+parts when it is multimodal, so every caller that wants the text has to handle
+both shapes. ``tool_calls`` has the same problem one level up: a round trip
+through PyArrow or a JSONL dataset can leave it as a string holding JSON, or a
+list of such strings, so asking "did the model call a tool" means decoding
+before looking. A whole conversation raises the same kind of question -- which
+turn is the model's answer, did it use tools at all -- answered the same way,
+by looking rather than trusting the shape.
+
+These live here rather than under any one consumer because none of the questions
+is a preprocessing one: a challenger reading a model's reply, a reward scoring
+one, and a cleaning step filtering one all ask them. Each place that answered on
+its own answered differently -- handing back the raw list, or raising on it.
+
+Kept to a plain ``Dict`` rather than :class:`~twinkle.data_format.Message` on
+purpose: rows read straight off disk go through these too, before anything has
+promised they match the type.
 """
 import json
-import os
-import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
+
+__all__ = [
+    'assistant_text',
+    'is_agent_row',
+    'msg_content_text',
+    'msg_has_media',
+    'msg_has_payload',
+    'normalize_tool_calls',
+]
 
 
 def msg_content_text(msg: Dict[str, Any]) -> str:
@@ -34,9 +55,6 @@ def msg_has_payload(msg: Dict[str, Any]) -> bool:
     return bool(
         msg_content_text(msg).strip() or msg.get('tool_calls') or msg.get('reasoning_content') or msg.get('thinking')
         or msg_has_media(msg))
-
-
-_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
 
 
 def normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
@@ -75,50 +93,6 @@ def normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
     return result
 
 
-CJK_CHARS_RE = _CJK_RE
-
-
-def cjk_ratio(text: str) -> float:
-    """Fraction of non-whitespace characters that are CJK."""
-    chars = text.replace(' ', '').replace('\n', '').replace('\t', '')
-    if not chars:
-        return 0.0
-    return len(CJK_CHARS_RE.findall(chars)) / len(chars)
-
-
-def load_sensitive_words(path: Optional[str]) -> Set[str]:
-    """Load from external file (one word per line). Blank lines and #-comments ignored."""
-    if not path or not os.path.isfile(path):
-        return set()
-    words: Set[str] = set()
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                words.add(line)
-    return words
-
-
-def build_sensitive_regex(words: Set[str]) -> Optional['re.Pattern']:
-    """Build a compiled regex from a set of words. Returns None if empty."""
-    if not words:
-        return None
-    cjk_words = []
-    latin_words = []
-    cjk_re = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
-    for w in sorted(words):
-        if cjk_re.search(w):
-            cjk_words.append(re.escape(w))
-        else:
-            latin_words.append(re.escape(w))
-    parts = []
-    if latin_words:
-        parts.append(r'\b(' + '|'.join(latin_words) + r')\b')
-    if cjk_words:
-        parts.append('(' + '|'.join(cjk_words) + ')')
-    return re.compile('|'.join(parts), re.IGNORECASE)
-
-
 def is_agent_row(messages) -> bool:
     """Return True if the conversation contains tool interactions (agent trace).
 
@@ -135,3 +109,19 @@ def is_agent_row(messages) -> bool:
         if normalize_tool_calls(m):
             return True
     return False
+
+
+def assistant_text(trajectory: Dict[str, Any]) -> str:
+    """The last assistant message's text, or '' if the model produced none.
+
+    Explorers differ in what else they attach -- token ids, logprobs, tool
+    turns -- but every one of them leaves the reply as an assistant message,
+    so this is the one field a parser can rely on.
+
+    The *last* one: a conversation that went through tools has several, and the
+    model's answer is the turn it finished on.
+    """
+    for message in reversed(trajectory.get('messages') or []):
+        if isinstance(message, dict) and message.get('role') == 'assistant':
+            return msg_content_text(message)
+    return ''

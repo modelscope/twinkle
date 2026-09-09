@@ -28,7 +28,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import get_logger
-from twinkle_agentic.envs.base import Env, StepResult
+from twinkle.data_format.message import Tool as ToolInfo
+from twinkle_agentic.envs.base import Env, StepResult, truncate_observation
 
 logger = get_logger()
 
@@ -224,11 +225,20 @@ class RemoteMsAgentToolEnv(Env):
         """
         if self.healthy():
             return False
-        self.n_recoveries += 1
-        logger.warning(f'tool runtime unreachable; rebuilding the sandbox '
-                       f'(recovery #{self.n_recoveries})')
-        self.reset()
+        logger.warning('tool runtime unreachable; rebuilding the sandbox')
+        self.rebuild()
         return True
+
+    def rebuild(self) -> None:
+        """Kill this sandbox and boot a replacement, counting the recovery.
+
+        A microVM is disposable, so there is nothing to repair: :meth:`reset`
+        already kills the old one and brings a fresh runtime up. All this adds is
+        the count, which is the part a run reports at the end.
+        """
+        self.n_recoveries += 1
+        logger.warning(f'rebuilding the sandbox (recovery #{self.n_recoveries})')
+        self.reset()
 
     def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
         return self.step_batch([(tool_name, arguments or {})])[0]
@@ -240,6 +250,16 @@ class RemoteMsAgentToolEnv(Env):
         several, and it keeps ms-agent's own ``parallel_call_tool`` semantics
         rather than serialising what production would run concurrently.
         """
+        return self._dispatch(calls, self._command_timeout)
+
+    def _dispatch(self, calls: Sequence[Tuple[str, Dict[str, Any]]],
+                  timeout: int) -> List[StepResult]:
+        """One request, with the per-call budget stated. See :meth:`step_batch`.
+
+        Split out so :meth:`run_script` can name its own timeout -- a check with
+        a deadline of its own must not be judged by the budget a model turn was
+        given -- without restating the dispatch.
+        """
         calls = list(calls)
         if not calls:
             return []
@@ -248,10 +268,10 @@ class RemoteMsAgentToolEnv(Env):
                 'tool_name': self._dispatch_name(name),
                 'arguments': args or {}
             } for name, args in calls],
-            'timeout': self._command_timeout,
+            'timeout': timeout,
         }
         try:
-            body = self._rpc('/call', payload)
+            body = self._rpc('/call', payload, timeout=timeout)
             results = body.get('results') or []
         except Exception as e:  # noqa
             # A dead sandbox must not kill the training step: report it as an
@@ -349,7 +369,7 @@ class RemoteMsAgentToolEnv(Env):
                 return name
         return self._short_to_full.get(name, name)
 
-    def tool_schemas(self) -> List[Dict[str, Any]]:
+    def tools(self) -> List[ToolInfo]:
         """Schemas from the runtime that will execute them.
 
         These go straight into the prompt. Sourcing them from the executor
@@ -362,7 +382,7 @@ class RemoteMsAgentToolEnv(Env):
 
     def tool_names(self) -> List[str]:
         names = []
-        for schema in self.tool_schemas():
+        for schema in self.tools():
             name = (schema.get('function') or {}).get('name')
             if name:
                 names.append(str(name))
@@ -396,31 +416,31 @@ class RemoteMsAgentToolEnv(Env):
 
     # ------------------------------------------------------- for the checker
 
-    def runner(self, shell_tool: str = 'shell_executor', python_tool: str = 'python_executor'):
-        """A ``result_check`` runner that executes inside this episode's sandbox.
+    def run_script(self, source: str, interpreter: str = 'python',
+                   timeout: Optional[int] = None) -> Tuple[int, str]:
+        """Run a whole script inside this episode's sandbox.
 
         Verification has to see the filesystem the agent actually wrote to, so
         the check goes back through the same tools rather than a local
         subprocess. Those tools return prose, not an exit status, so the command
         is made to print a marker and the status is read back out of the output.
         """
-        shell_name = self.resolve_tool(shell_tool)
-        python_name = self.resolve_tool(python_tool)
-
-        def _run(source: str, interpreter: str) -> Tuple[int, str]:
-            if interpreter == 'python':
-                code = _PY_WRAPPER.format(body=repr(source), mark=_RC_MARK)
-                out = self.step(python_name, {'code': code}).observation
-            else:
-                out = self.step(shell_name, {'command': f'{source}\necho "{_RC_MARK}:$?"'}).observation
-            match = _RC_RE.search(out or '')
-            if match is None:
-                # No marker means the tool itself failed (timeout, sandbox down)
-                # rather than the check failing; report non-zero and keep output.
-                return 1, out or 'check produced no output and no exit marker'
-            return int(match.group(1)), _RC_RE.sub('', out or '').strip()
-
-        return _run
+        seconds = timeout or self._command_timeout
+        if interpreter == 'python':
+            code = _PY_WRAPPER.format(body=repr(source), mark=_RC_MARK)
+            call = (self.resolve_tool('python_executor'), {'code': code})
+        elif interpreter in ('shell', 'bash'):
+            call = (self.resolve_tool('shell_executor'),
+                    {'command': f'{source}\necho "{_RC_MARK}:$?"'})
+        else:
+            return 1, f'unsupported interpreter {interpreter!r}; use python or shell'
+        out = self._dispatch([call], seconds)[0].observation
+        match = _RC_RE.search(out or '')
+        if match is None:
+            # No marker means the tool itself failed (timeout, sandbox down)
+            # rather than the check failing; report non-zero and keep output.
+            return 1, out or 'check produced no output and no exit marker'
+        return int(match.group(1)), _RC_RE.sub('', out or '').strip()
 
     def download_workspace(self, dest: str, max_files: int = 200, max_bytes: int = 1 << 20) -> str:
         """Copy the episode's files out of the sandbox for the ``file_*`` checks.
@@ -429,7 +449,7 @@ class RemoteMsAgentToolEnv(Env):
         interface for a generic verifier but cannot see inside a microVM. The
         episode is over by the time this runs, so a snapshot is equivalent to
         the live filesystem -- and the shell/python checks still go through
-        :meth:`runner`, against the sandbox itself.
+        :meth:`run_script`, against the sandbox itself.
 
         Files above ``max_bytes`` are skipped: a check that needs to look at a
         100MB artifact wants a command, not a copy.
@@ -607,6 +627,4 @@ class RemoteMsAgentToolEnv(Env):
 
     def _truncate(self, text: str) -> str:
         limit = self.max_observation_chars
-        if limit and len(text) > limit:
-            return f'{text[:limit]}\n...[truncated {len(text) - limit} chars]'
-        return text
+        return truncate_observation(text, limit) if limit else text

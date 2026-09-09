@@ -18,9 +18,8 @@ from collections import Counter
 from typing import Any, Dict
 
 from twinkle.preprocessor import Mapper
-
+from twinkle_agentic.utils.message_utils import msg_content_text, normalize_tool_calls
 from . import label_schema as L
-from .message_utils import msg_content_text, normalize_tool_calls
 
 KEY_NOISE_RATIO = 'structural_noise_ratio'
 

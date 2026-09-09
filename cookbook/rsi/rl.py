@@ -47,11 +47,12 @@ CLI (model/infra/rl knobs) stays identical to the reference:
 
 Solver learning mode (RSI step-3 subclass, RSI_SOLVER_MODE):
   * 'grpo' (default) -- on a code round whose first attempt FAILS the asserts, the
-    sandbox error is injected back as a {'role':'tool'} message and the model is
-    asked to continue, up to RSI_SOLVER_MAX_TURNS total turns. The whole
-    multi-turn trajectory (turn-1 tokens + turn-2 tokens, the tool error bridged
-    in as -100) is trained by GRPO on the final pass/fail reward. Tool rounds and
-    length-stopped rollouts stay single-shot. Bridge tokens are computed in
+    execution output is handed back as a {'role':'user'} message and the model is
+    asked to fix it, up to RSI_SOLVER_MAX_TURNS total turns. The whole
+    multi-turn trajectory (turn-1 tokens + turn-2 tokens, the error message
+    bridged in as -100) is trained by GRPO on the final pass/fail reward. Tool
+    rounds and length-stopped rollouts stay single-shot. The continuation is
+    MultiTurnRollout's ``followup_fn``, so the bridge tokens are computed in
     template space and appended verbatim -- never decode-then-re-encode.
   * 'opsd' -- single turn. A teacher forward conditioned on a PRIVILEGED extra
     system message carrying the challenger's passing reference solution
@@ -71,12 +72,6 @@ import json
 import os
 import random
 import re
-import resource
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,13 +81,18 @@ from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.cli import CLI
-from twinkle.data_format import SamplingParams
+from twinkle.data_format import SamplingParams, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from twinkle.processor import InputProcessor
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
+from twinkle_agentic.challenger.code import run_asserts, run_check_script
+from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
+from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.utils.code_utils import unwrap_code
+from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
 args = CLI.from_args()
@@ -389,68 +389,10 @@ class ToolMatchReward(Reward):
 # Same sandbox contract as cookbook/rl/grpo/mbpp_grpo.py, which was checked
 # against all 974 MBPP reference solutions (974/974 pass): the generated code,
 # the setup code and the asserts are concatenated into one file and executed, so
-# a bare ``assert fn(...) == x`` resolves the function by name.
-_FENCE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.S)
-
-
-def extract_code(text: str) -> str:
-    """Take the last fenced block; fall back to the whole body when unfenced."""
-    idx = (text or '').rfind('</think>')
-    body = text[idx + len('</think>'):] if idx >= 0 else (text or '')
-    blocks = _FENCE_RE.findall(body)
-    return (blocks[-1] if blocks else body).strip()
-
-
-def run_asserts(code: str, setup: str, asserts: List[str], timeout: int = TEST_TIMEOUT) -> bool:
-    """True when every assert passes. Thin wrapper over run_asserts_verbose."""
-    return run_asserts_verbose(code, setup, asserts, timeout)[0]
-
-
-def run_asserts_verbose(code: str, setup: str, asserts: List[str],
-                        timeout: int = TEST_TIMEOUT) -> Tuple[bool, str]:
-    """Run code+setup+asserts and return (passed, stderr_text).
-
-    Same sandbox contract as the MBPP-verified path (start_new_session + killpg
-    so a forking solution leaves no stray processes; RLIMIT_AS caps the child at
-    2GB). stderr is captured (not sent to /dev/null) so the GRPO continuation can
-    feed the actual traceback back to the model as a tool message. ``passed`` is
-    exactly ``returncode == 0``, identical to the old bool-only behavior.
-    """
-    if not code.strip() or not asserts:
-        return False, 'no code was produced'
-    parts = [code]
-    if (setup or '').strip():
-        parts.append(setup)
-    parts.extend(asserts)
-    tmp = tempfile.mkdtemp(prefix='rsi_code_')
-    try:
-        with open(os.path.join(tmp, '_run.py'), 'w', encoding='utf-8') as f:
-            f.write('\n\n'.join(parts) + '\n')
-        env = dict(os.environ, MPLBACKEND='Agg', PYTHONHASHSEED='0', OMP_NUM_THREADS='1',
-                   MKL_NUM_THREADS='1', TOKENIZERS_PARALLELISM='false')
-        env.pop('CUDA_VISIBLE_DEVICES', None)
-
-        def _limit():
-            resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-
-        proc = subprocess.Popen([sys.executable, '_run.py'], cwd=tmp, env=env,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True, preexec_fn=_limit)
-        try:
-            _, err = proc.communicate(timeout=timeout)
-            return proc.returncode == 0, (err or '')
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-            return False, f'execution timed out after {timeout}s (possible infinite loop)'
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+# a bare ``assert fn(...) == x`` resolves the function by name. Both the run and
+# the fence-stripping come from the library -- ``run_asserts`` for a verdict,
+# ``run_check_script`` for a verdict plus the output that error feedback shows
+# the model, and ``unwrap_code`` for reading the code out of a reply.
 
 
 def load_tests() -> Dict[str, Dict[str, Any]]:
@@ -540,7 +482,7 @@ class RoundReward(Reward):
                     spec = json.loads(ud['code_tests'])
                 except (ValueError, TypeError):
                     continue
-                code_jobs.append((i, extract_code(completion), spec))
+                code_jobs.append((i, unwrap_code(completion), spec))
                 recs[i]['kind'] = 'code'
 
         if code_jobs:
@@ -551,7 +493,8 @@ class RoundReward(Reward):
             todo = list(uniq)
             with ThreadPoolExecutor(max_workers=max(1, min(JUDGE_WORKERS, len(todo)))) as ex:
                 verdicts = dict(zip(todo, ex.map(
-                    lambda k: run_asserts(k[1], uniq[k]['setup'], uniq[k]['asserts']), todo)))
+                    lambda k: run_asserts(k[1], uniq[k]['setup'], uniq[k]['asserts'],
+                                          TEST_TIMEOUT), todo)))
             for i, code, spec in code_jobs:
                 rewards[i] = 1.0 if verdicts.get((str(spec.get('id')), code)) else 0.0
 
@@ -857,15 +800,8 @@ def make_local_template():
     return t
 
 
-def _last_assistant_text(pif: Dict[str, Any]) -> str:
-    for m in reversed(pif.get('messages') or []):
-        if m.get('role') == 'assistant':
-            return m.get('content', '') or ''
-    return ''
-
-
 def _format_exec_error(err: str) -> str:
-    """Turn captured stderr into the tool message shown back to the model."""
+    """Turn a failed check's output into the message shown back to the model."""
     err = (err or '').strip() or 'Your code did not pass the tests (no error output captured).'
     if len(err) > 1500:
         err = err[:700] + '\n...[truncated]...\n' + err[-700:]
@@ -875,142 +811,55 @@ def _format_exec_error(err: str) -> str:
             '```python code block.')
 
 
-def _bridge_tool_message(template, pif: Dict[str, Any], tool_content: str) -> Optional[Dict[str, Any]]:
-    """Append a {'role':'tool'} turn + next generation prompt as -100 bridge.
+def check_script_of(spec: Dict[str, Any]) -> str:
+    """A tests entry's setup + asserts as the one script ``run_check_script`` runs."""
+    parts = [spec['setup']] if (spec.get('setup') or '').strip() else []
+    parts.extend(spec.get('asserts') or ())
+    return '\n\n'.join(parts)
 
-    Computed entirely in template space (render-after minus render-before), so
-    history tokens stay byte-for-byte in ``input_ids`` and only the new tool turn
-    is tokenized from canonical template output -- never decode-then-re-encode.
-    Mirrors Template.concat_input_feature / MultiTurnRollout._extend_with_bridge.
-    Returns the extended pif, or None if it would exceed the template max_length.
+
+def code_error_followup(traj: Trajectory, n_followups: int) -> Optional[str]:
+    """Ask a failed code rollout to fix itself, or None to let the episode end.
+
+    MultiTurnRollout calls this at the moment a rollout would finish, which is
+    where the hand-rolled retry pass used to run. The budget is unchanged:
+    SOLVER_MAX_TURNS counts turns and turn 1 is the rollout's own, so there are
+    SOLVER_MAX_TURNS - 1 follow-ups to give away. A tool round has no tests to
+    fail and is never continued, and a reply cut off at ``max_tokens`` never gets
+    here -- the rollout ends a length-stopped trajectory before asking.
     """
-    import copy
-    tok = template.tokenizer
-    messages_before = list(pif.get('messages') or [])
-    messages_after = messages_before + [{'role': 'tool', 'content': tool_content}]
-    et = getattr(template, 'enable_thinking', False)
-    s_before = tok.apply_chat_template(messages_before, tokenize=False,
-                                       add_generation_prompt=False, enable_thinking=et)
-    s_after = tok.apply_chat_template(messages_after, tokenize=False,
-                                      add_generation_prompt=True, enable_thinking=et)
-    # SEAM: the vLLM pif ends at the assistant's closing <|im_end|> with NO trailing
-    # newline (generation stops at the eos token), but the canonical render puts a
-    # "\n" right after that <|im_end|>. Splitting at len(s_before) would drop that
-    # "\n" and append the tool turn directly onto <|im_end|>, producing a malformed
-    # "<|im_end|><|im_start|>" boundary that the trained turn-2 tokens then condition
-    # on. Split right AFTER the assistant's <|im_end|> so the bridge carries the
-    # "\n" + tool turn and reproduces the canonical tokenization exactly.
-    marker = '<|im_end|>'
-    cut = s_before.rfind(marker)
-    if cut < 0:
-        raise RuntimeError('tool bridge: no <|im_end|> found in the rendered history; '
-                           'cannot locate the assistant turn boundary.')
-    head = s_before[:cut + len(marker)]
-    if not s_after.startswith(head):
-        raise RuntimeError('tool bridge: chat template is not monotonic in the message list; '
-                           'cannot append a tool turn as a suffix.')
-    bridge_text = s_after[len(head):]
-    bridge_ids = tok.encode(bridge_text, add_special_tokens=False)
-    if not bridge_ids:
-        raise RuntimeError('tool bridge tokenized to an empty id list')
-    result = copy.deepcopy(pif)
-    input_ids = list(result['input_ids'])
-    labels = list(result.get('labels') or [])
-    if labels:
-        if len(labels) != len(input_ids):
-            raise RuntimeError('tool bridge: labels/input_ids length mismatch')
-        labels = labels[-1:] + labels[:-1]  # unroll to input order (mirror concat_input_feature)
-    else:
-        labels = [-100] * len(input_ids)
-    result['input_ids'] = input_ids + bridge_ids
-    result['labels'] = labels + [-100] * len(bridge_ids)
-    max_len = getattr(template, 'max_length', None)
-    if max_len and len(result['input_ids']) > max_len:
+    if n_followups >= SOLVER_MAX_TURNS - 1:
         return None
-    new_if = template._invoke_post_pipeline([result])[0]
-    result.update(new_if)
-    result['messages'] = messages_after
-    return result
+    ud = {item[0]: item[1] for item in (traj.get('user_data') or [])}
+    if 'code_tests' not in ud:
+        return None
+    try:
+        spec = json.loads(ud['code_tests'])
+    except (ValueError, TypeError):
+        return None
+    passed, output = run_check_script(unwrap_code(assistant_text(traj)),
+                                      check_script_of(spec), TEST_TIMEOUT)
+    return None if passed else _format_exec_error(output)
 
 
-def grpo_continue(sampler, template, expand_prompts, sampling_params):
-    """GRPO rollout with error-feedback continuation for code rounds.
+def make_solver_rollout(sampler, template, sampling_params):
+    """The GRPO rollout: one turn of code, plus a fix-it round when it fails.
 
-    Turn 1 samples every prompt. A code sample that FAILS its asserts (and did
-    not stop on 'length') gets the sandbox stderr injected as a {'role':'tool'}
-    message and is re-sampled, up to SOLVER_MAX_TURNS total turns. Tool rounds
-    and length-stopped samples are never continued. The returned per-sample
-    input feature is the full multi-turn trajectory (turn tokens trainable, tool
-    bridge -100) and old_logps is the concatenation of each turn's logprobs, so
-    the (#logps == #trainable labels) invariant holds for GRPO training.
+    ``max_turns=1`` is what makes this a text rollout. A code round's reply IS
+    python, and python parses as a tool-call list; the rollout checks the turn
+    budget before dispatching, so at 1 the calls it thinks it found are never
+    run. ``max_malformed_retries=0`` is the same concern from the other side:
+    markup that only looks like a call must not buy the sample another turn.
+    The ToolManager is empty and present only because the rollout requires one.
+
+    Follow-ups are paid for separately from ``max_turns`` -- each one granted
+    adds a generation -- so a rollout still runs at most SOLVER_MAX_TURNS turns,
+    and ``code_error_followup`` is what stops before that.
     """
-    resps = sampler.sample(expand_prompts, sampling_params)
-    pifs: List[Dict[str, Any]] = []
-    logps: List[List[float]] = []
-    lens: List[int] = []
-    stops: List[Optional[str]] = []
-    for r in resps:
-        s = r.sequences[0]
-        pifs.append(s.new_input_feature)
-        logps.append([lp[0][1] for lp in s.logprobs])
-        lens.append(len(s.tokens))
-        stops.append(s.stop_reason)
-
-    done = [False] * len(expand_prompts)
-    dm = getattr(sampler, 'device_mesh', None)
-    min_batch = dm.data_world_size if dm is not None else 1
-    for _turn in range(2, SOLVER_MAX_TURNS + 1):
-        retry: List[int] = []
-        for i, prompt in enumerate(expand_prompts):
-            if done[i]:
-                continue
-            ud = {item[0]: item[1] for item in (prompt.get('user_data') or [])}
-            if 'code_tests' not in ud or stops[i] == 'length':
-                done[i] = True
-                continue
-            try:
-                spec = json.loads(ud['code_tests'])
-            except (ValueError, TypeError):
-                done[i] = True
-                continue
-            code = extract_code(_last_assistant_text(pifs[i]))
-            passed, err = run_asserts_verbose(code, spec.get('setup', ''), spec.get('asserts', []))
-            if passed:
-                done[i] = True
-                continue
-            # Bridge the tool error in. If the template can't append a tool turn as
-            # a clean suffix (e.g. a malformed/cut turn-1 without a proper </think>),
-            # skip continuation for THIS sample rather than crashing the whole step.
-            try:
-                bridged = _bridge_tool_message(template, pifs[i], _format_exec_error(err))
-            except RuntimeError as e:
-                logger.warning(f'[rsi_rl][grpo] skip continuation for sample {i}: {e}')
-                bridged = None
-            if bridged is None:
-                done[i] = True
-                continue
-            pifs[i] = bridged
-            retry.append(i)
-        if not retry:
-            break
-        batch = [pifs[i] for i in retry]
-        if len(batch) < min_batch:
-            batch = batch + [batch[-1]] * (min_batch - len(batch))
-        rresps = sampler.sample(batch, sampling_params)[:len(retry)]
-        for j, i in enumerate(retry):
-            s2 = rresps[j].sequences[0]
-            pifs[i] = s2.new_input_feature
-            logps[i].extend([lp[0][1] for lp in s2.logprobs])
-            lens[i] += len(s2.tokens)
-            stops[i] = s2.stop_reason
-
-    # Same invariant MultiTurnRollout enforces: one logp per trainable token.
-    for i, pif in enumerate(pifs):
-        trainable = sum(1 for lb in (pif.get('labels') or []) if lb != -100)
-        if len(logps[i]) != trainable:
-            raise RuntimeError(f'GRPO continuation logps/labels misaligned for sample {i}: '
-                               f'{len(logps[i])} logps vs {trainable} trainable labels')
-    return pifs, logps, lens
+    return MultiTurnRollout(sampler, template=template, tool_manager=ToolManager(),
+                            max_turns=1, max_malformed_retries=0,
+                            followup_fn=code_error_followup,
+                            sampling_params=sampling_params)
 
 
 def _teacher_pif(template, student_pif: Dict[str, Any], ref_solution: str,
@@ -1200,8 +1049,8 @@ def main():
         ref_model.set_template(TEMPLATE, model_id=REF_MODEL_ID, max_length=MAX_MODEL_LEN,
                                enable_thinking=True)
 
-    # Driver-side template for token surgery: the GRPO tool-error bridge and the
-    # OPSD teacher-prompt concat both run on the driver.
+    # Driver-side template for token surgery: the GRPO rollout's follow-up bridge
+    # and the OPSD teacher-prompt concat both run on the driver.
     local_template = make_local_template()
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
@@ -1213,6 +1062,8 @@ def main():
     metrics = CompletionRewardMetric()
     reward_fn = RoundReward()
     sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95)
+    solver_rollout = (make_solver_rollout(sampler, local_template, sampling_params)
+                      if SOLVER_MODE == 'grpo' else None)
 
     optim_step = 0
     logger.info('Starting RSI per-round GRPO (full-parameter Megatron)')
@@ -1232,9 +1083,16 @@ def main():
 
         all_tokens: List[List[int]] = []
         if SOLVER_MODE == 'grpo':
-            # Rollout with error-feedback continuation on failed code rounds.
-            all_input_data, all_old_logps, all_completion_lengths = grpo_continue(
-                sampler, local_template, expand_prompts, sampling_params)
+            # One rollout per prompt; a code round that fails its asserts is asked
+            # to fix itself in the SAME trajectory (code_error_followup), so the
+            # first attempt's tokens stay trainable and its logprobs stay aligned.
+            all_input_data = solver_rollout(expand_prompts)
+            all_old_logps = [[lp[0][1] for lp in (traj.get('logprobs') or [])]
+                             for traj in all_input_data]
+            # Trainable tokens, not sampled tokens: a continued rollout has two
+            # generations in one trajectory and the bridge between them is -100.
+            all_completion_lengths = [sum(1 for lb in (traj.get('labels') or []) if lb != -100)
+                                      for traj in all_input_data]
         else:
             # OPSD: single turn; also keep raw response tokens for the teacher concat.
             all_input_data, all_old_logps, all_completion_lengths = [], [], []

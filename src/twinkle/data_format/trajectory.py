@@ -2,7 +2,7 @@
 import json
 import sys
 from collections.abc import Mapping
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .message import Message, Tool
 
@@ -43,6 +43,23 @@ def pack_user_data(values: Any) -> List[Tuple[str, str]]:
     if isinstance(values, Mapping):
         return [(k, v if isinstance(v, str) else pack_value(v)) for k, v in values.items()]
     return [(k, v if isinstance(v, str) else pack_value(v)) for k, v in values]
+
+
+def attach_user_data(trajectory: Trajectory, **values: Any) -> Trajectory:
+    """Return ``trajectory`` with ``values`` merged into its packed ``user_data``.
+
+    ``user_data`` is a list of ``(key, json_string)`` pairs rather than a dict,
+    so it cannot be updated in place with ``update()``; going through
+    :func:`pack_user_data` keeps it in the one shape readers understand.
+    """
+    merged: Dict[str, Any] = {}
+    for entry in trajectory.get('user_data') or []:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            merged[entry[0]] = entry[1]
+    merged.update(values)
+    out = dict(trajectory)
+    out['user_data'] = pack_user_data(merged)
+    return out
 
 
 def user_data_get(items: Any, key: str, default: Any = None) -> Any:

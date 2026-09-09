@@ -18,7 +18,6 @@ here as requested.
 """
 import json
 import os
-import re
 import resource
 import shutil
 import signal
@@ -45,6 +44,8 @@ from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
+from twinkle_agentic.utils.code_utils import unwrap_code
+from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
 args = CLI.from_args()
@@ -75,17 +76,6 @@ TEST_TIMEOUT = int(os.environ.get('TEST_TIMEOUT', 30))
 
 SYSTEM_PROMPT = ('You are an expert Python programmer. Write a complete, self-contained '
                  'solution in a single ```python code block. Do not include tests.')
-
-_FENCE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.S)
-
-
-# ========== Text handling ==========
-def extract_code(text: str) -> str:
-    """Take the last fenced block; fall back to the whole body when unfenced."""
-    idx = (text or '').rfind('</think>')
-    body = text[idx + len('</think>'):] if idx >= 0 else (text or '')
-    blocks = _FENCE_RE.findall(body)
-    return (blocks[-1] if blocks else body).strip()
 
 
 # ========== Sandbox ==========
@@ -154,12 +144,7 @@ class MbppAssertReward(Reward):
                     break
             if payload is None:
                 continue
-            completion = ''
-            for msg in reversed(traj.get('messages', []) or []):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '') or ''
-                    break
-            jobs.append((i, extract_code(completion), payload))
+            jobs.append((i, unwrap_code(assistant_text(traj)), payload))
 
         if not jobs:
             return rewards
@@ -182,12 +167,7 @@ class MbppFormatReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for traj in trajectories:
-            completion = ''
-            for msg in reversed(traj.get('messages', []) or []):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '') or ''
-                    break
-            rewards.append(1.0 if extract_code(completion).strip() else 0.0)
+            rewards.append(1.0 if unwrap_code(assistant_text(traj)).strip() else 0.0)
         return rewards
 
 

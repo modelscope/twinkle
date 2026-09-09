@@ -51,8 +51,17 @@ from twinkle import DeviceGroup, get_device_placement, get_logger
 from twinkle.checkpoint_engine import CheckpointEngineManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_RSI = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# recorder.py sits one level up, shared with the code half, and the code half
+# itself is a sibling directory. Appended rather than inserted, and behind the
+# agentic directory on purpose: both halves have a challenge.py, and the one this
+# process means by that name is the agentic one.
+sys.path.insert(1, _RSI)
+sys.path.append(os.path.join(_RSI, 'code'))
 import challenge as C  # noqa: E402
+import collect as CODE  # noqa: E402
 import train as T  # noqa: E402
+from recorder import Recorder  # noqa: E402
 from sandbox import close_pool  # noqa: E402
 
 logger = get_logger()
@@ -71,15 +80,14 @@ def next_iteration(root: str) -> int:
     return i
 
 
-def collect_once(args, sampler, template, slots, out_dir: str) -> Dict[str, Any]:
-    """One collection pass into ``out_dir``; returns its metrics.
+def collect_agentic(args, sampler, template, slots, recorder: Recorder,
+                    out_dir: str) -> Dict[str, Any]:
+    """The agentic half of one collection pass; returns its metrics.
 
     The body of what challenge.py's main() did, minus the resources: the sampler,
-    the template and the sandbox pool are owned by the caller and outlive this.
+    the template, the sandbox pool and the recorder are owned by the caller and
+    outlive this.
     """
-    os.makedirs(out_dir, exist_ok=True)
-    args.out_dir = out_dir
-    recorder = C.Recorder(out_dir)
     run = C.Run(args, sampler, template, slots, recorder)
     started = time.time()
     try:
@@ -87,18 +95,18 @@ def collect_once(args, sampler, template, slots, out_dir: str) -> Dict[str, Any]
         # After the loop, not during: what it adds is for the next iteration, and
         # doing it here means a crash in collection does not also lose the bank.
         if args.keyword_expand:
-            run.expand_hard_keywords()
+            run.keywords.expand_hard()
     finally:
-        recorder.close()
-        run.store.save()
+        run.keywords.save()
         # A Run per iteration means a thread pool per iteration. close_pool cannot
         # do this because the sandbox pool is the one thing that is not per-Run.
         run.api_pool.shutdown(wait=False)
         if run.bank is not None:
             logger.info(f'[rsi] task bank: {run.bank.stats()}')
         # In the finally block because a run that crashed is the one whose numbers
-        # are most worth having, and after recorder.close() so groups.jsonl is
-        # flushed before collect_metrics reads it back.
+        # are most worth having. Reading groups.jsonl back no longer waits on a
+        # close -- the recorder flushes every line as it writes it, and its handles
+        # outlive this half now that the code half writes through the same ones.
         metrics = C.collect_metrics(out_dir, run.counts, run.n_launched,
                                     args.solver_rollouts, time.time() - started)
         with open(os.path.join(out_dir, 'challenge_metrics.json'), 'w',
@@ -107,6 +115,57 @@ def collect_once(args, sampler, template, slots, out_dir: str) -> Dict[str, Any]
         logger.info(f'[rsi] {len(run.kept)}/{run.n_launched} groups kept in '
                     f'{time.time() - started:.0f}s: {metrics["scalars"]}')
     return metrics
+
+
+def collect_code(args, sampler, template, recorder: Recorder,
+                 out_dir: str) -> Dict[str, Any]:
+    """The code half of the same pass; returns its metrics.
+
+    Takes no sandbox slot and asks for none. A code problem is checked by running
+    its asserts in a subprocess -- milliseconds, against the hundreds a microVM
+    round trip costs -- and the difficulty stage runs one per candidate per
+    rollout, so routing that through the pool would make it the dominant cost of
+    the iteration. The slots stay with the agentic half, whose episodes have
+    nowhere else to run at all.
+    """
+    challenger = CODE.build_challenger(args, sampler, template, recorder=recorder)
+    metrics = CODE.collect(args, challenger, recorder)
+    with open(os.path.join(out_dir, 'code_metrics.json'), 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False, default=str)
+    return metrics
+
+
+def collect_once(args, sampler, template, slots, out_dir: str) -> Dict[str, Any]:
+    """Collect from every task source ``--sides`` names, into one ``out_dir``.
+
+    One recorder for all of them, so the numbering is global and index.jsonl
+    interleaves the halves. That is the whole of what makes a mixed step possible:
+    train.py groups on ``(side, group_id)`` and never learns that two different
+    generators wrote the file it read.
+
+    Each half keeps its own metrics file. Their ``counts`` use the same words for
+    different things -- ``groups`` is a set of sibling proposals on one side and a
+    single problem's attempts on the other -- and adding those together produces a
+    number that means neither. Only the ``scalars`` are merged, and only because
+    their names are disjoint by construction: the code half prefixes all of its own.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    args.out_dir = out_dir
+    recorder = Recorder(out_dir)
+    scalars: Dict[str, Any] = {}
+    try:
+        if 'propose' in args.sides_list or 'solve' in args.sides_list:
+            # Named by either side, the agentic pair is collected whole: one build
+            # is what produces the task its attempts are graded on, so there is no
+            # way to collect the solving side without the proposing one.
+            metrics = collect_agentic(args, sampler, template, slots, recorder, out_dir)
+            scalars.update(metrics.get('scalars') or {})
+        if 'code' in args.sides_list:
+            metrics = collect_code(args, sampler, template, recorder, out_dir)
+            scalars.update(metrics.get('scalars') or {})
+    finally:
+        recorder.close()
+    return {'scalars': scalars}
 
 
 def main():
@@ -186,7 +245,14 @@ def main():
     # Model rank 0 serves the TCPStore the sampler ranks connect to, so this must
     # be built after both halves exist. Its first call is what sends the weights.
     weights = CheckpointEngineManager(model=model, sampler=sampler)
-    slots = C.initialize_sandbox(args)
+    # Only if a task source needs them: --sides code boots no microVMs at all,
+    # which is 32 fewer machines to wait for and to be billed for. close_pool of
+    # an empty list is a no-op, so the teardown below needs no second condition.
+    agentic = 'propose' in args.sides_list or 'solve' in args.sides_list
+    slots = C.initialize_sandbox(args) if agentic else []
+    if not agentic:
+        logger.info(f'[rsi] --sides {args.sides!r} names no agentic side, so no '
+                    f'sandbox pool is opened')
     logger.info(get_device_placement())
 
     i = start

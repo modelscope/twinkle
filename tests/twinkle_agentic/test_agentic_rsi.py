@@ -24,11 +24,18 @@ sys.path.insert(0, os.path.join(_REPO, 'src'))
 _COOKBOOK = os.path.join(_REPO, 'cookbook', 'rsi', 'agentic')
 sys.path.insert(0, _COOKBOOK)
 sys.path.insert(0, os.path.join(_COOKBOOK, 'sandbox_server'))
+# recorder.py sits one level up, shared with the code half.
+sys.path.insert(0, os.path.dirname(_COOKBOOK))
+# The code half itself, appended rather than inserted: both halves have a
+# challenge.py, and the one these tests mean by that name is the agentic one.
+sys.path.append(os.path.join(os.path.dirname(_COOKBOOK), 'code'))
 
 from remote_tool_env import RemoteMsAgentToolEnv  # noqa: E402
 from tool_server import (ToolRuntime, _usable_llm,  # noqa: E402
                          _without_internal_args, _without_llm_args)
+from twinkle_agentic.envs.base import Env, StepResult  # noqa: E402
 from twinkle_agentic.envs.env_tool import EnvTool  # noqa: E402
+from twinkle_agentic.envs.local import LocalEnv  # noqa: E402
 from twinkle_agentic.tools.tool_manager import ToolManager  # noqa: E402
 from twinkle_agentic.verifier.result_check import (Check, CheckContext,  # noqa: E402
                                                    checks_from_dicts, run_checks)
@@ -126,6 +133,121 @@ def make_env(responder=None, tools=None, **kwargs):
     env = RemoteMsAgentToolEnv(template='fake', config_path=AGENT_CONFIG, **kwargs)
     env._sandbox = FakeSandbox(responder, tools)
     return env
+
+
+class EnvJournal:
+    """What each slot's environment was asked to do, in order, across threads.
+
+    One journal shared by a challenger's whole rack of environments. What the
+    slot tests are about is the correspondence between slots -- the env an
+    episode's check ran in has to be the env its tool calls were dispatched into
+    -- and that is only readable if every env and every manager writes to the
+    same place.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.events = []   # (kind, slot, payload) per operation, in order
+
+    def add(self, kind, slot, payload=None):
+        with self._lock:
+            self.events.append((kind, slot, payload))
+
+    def kinds(self, *wanted):
+        """The sequence of operations, keeping only ``wanted``."""
+        return [kind for kind, _, _ in self.events if kind in wanted]
+
+    def slots(self, kind):
+        """Which slot each ``kind`` operation reached, in order."""
+        return [slot for kind_, slot, _ in self.events if kind_ == kind]
+
+    def payloads(self, kind, slot=None):
+        """What each ``kind`` operation carried, for one slot or all of them."""
+        return [payload for kind_, slot_, payload in self.events
+                if kind_ == kind and slot in (None, slot_)]
+
+
+class FakeToolManager:
+    """The dispatcher a :class:`FakeEnv` hands out, tagged with its slot."""
+
+    def __init__(self, slot, journal):
+        self.slot = slot
+        self.journal = journal
+
+    def tool_infos(self):
+        return []
+
+    def __call__(self, tool_call):
+        self.journal.add('tool', self.slot)
+        return 'ok'
+
+
+class FakeEnv(Env):
+    """A workspace a challenger can drive without a sandbox.
+
+    A challenger reaches its workspace through four Env operations -- wipe it,
+    run a script in it, read the listing back, dispatch a tool call -- and this
+    implements those over a listing the test dictates and a queue of exit codes
+    it hands out. Shared by every challenger test below rather than a fresh set
+    of callbacks per test class: what they pin down is that the challenger drives
+    one env per slot correctly, which only means something while they all agree
+    on what an env is.
+    """
+
+    def __init__(self, listing='a.txt 1\n', *, slot=0, exit_code=0, exit_codes=None,
+                 error='AssertionError', journal=None, with_tools=False):
+        """
+        Args:
+            listing: what :meth:`snapshot` reports the workspace holds.
+            slot: which slot of the rack this is; recorded on every operation.
+            exit_code: what a script exits with once ``exit_codes`` runs out.
+            exit_codes: one exit code per script, consumed in order. A check that
+                fails and a rewrite that passes is the case this exists for.
+            error: the output a non-zero script comes back with.
+            journal: shared record; a private one when not given.
+            with_tools: advertise tools and hand out a :class:`FakeToolManager`.
+                Off by default -- an env that only runs scripts has none, and the
+                challenger is expected to leave the model without any.
+        """
+        self.listing = listing
+        self.slot = slot
+        self.exit_code = exit_code
+        self.error = error
+        self.journal = journal if journal is not None else EnvJournal()
+        self.manager = FakeToolManager(slot, self.journal) if with_tools else None
+        self._exits = list(exit_codes) if exit_codes is not None else []
+        self._lock = threading.Lock()
+
+    # -- the operations a challenger performs on its workspace ---------------
+
+    def clear(self):
+        self.journal.add('clear', self.slot)
+
+    def snapshot(self):
+        self.journal.add('snapshot', self.slot)
+        return self.listing, ''
+
+    def run_script(self, source, interpreter='python', timeout=None):
+        with self._lock:
+            code = self._exits.pop(0) if self._exits else self.exit_code
+        self.journal.add('run', self.slot, source)
+        return code, (self.error if code else '')
+
+    def tools(self):
+        return DEFAULT_TOOLS if self.manager is not None else []
+
+    def tool_manager(self, schemas=None):
+        return self.manager
+
+    def step(self, tool_name, arguments):
+        return StepResult(observation=f'ran {tool_name}')
+
+    # -- what a test reads back ----------------------------------------------
+
+    @property
+    def scripts(self):
+        """Every script this env was asked to run, in order."""
+        return self.journal.payloads('run', self.slot)
 
 
 class ResultCheckFileTest(unittest.TestCase):
@@ -240,7 +362,7 @@ class RemoteMsAgentToolEnvTest(unittest.TestCase):
         env = make_env(responder=lambda call: 'x' * 50, max_observation_chars=10)
         obs = env.step('grep', {}).observation
         self.assertTrue(obs.startswith('x' * 10))
-        self.assertIn('truncated 40 chars', obs)
+        self.assertIn('40 chars omitted', obs)
 
     def test_unreachable_runtime_becomes_an_observation(self):
         # A dead sandbox must not take down the training step: the episode plays
@@ -280,7 +402,7 @@ class RemoteMsAgentToolEnvTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.env.resolve_tool('no_such_tool')
 
-    def test_runner_recovers_exit_code_from_text_output(self):
+    def test_run_script_recovers_exit_code_from_text_output(self):
         # The sandbox tools return prose; the marker is how the exit status
         # survives. Emulate a shell that echoes the marker. Matching on the
         # namespaced name also proves the plain name was resolved.
@@ -289,19 +411,21 @@ class RemoteMsAgentToolEnvTest(unittest.TestCase):
                 return 'some output\n__TWINKLE_RC__:0'
             return '__TWINKLE_RC__:3'
 
-        runner = make_env(responder).runner()
-        self.assertEqual(runner('ls', 'shell'), (0, 'some output'))
-        self.assertEqual(runner('boom()', 'python')[0], 3)
+        env = make_env(responder)
+        self.assertEqual(env.run_script('ls', 'shell'), (0, 'some output'))
+        self.assertEqual(env.run_script('boom()')[0], 3)
 
-    def test_runner_missing_marker_is_a_failure_not_a_pass(self):
-        code, out = make_env(lambda c: 'sandbox died').runner()('ls', 'shell')
+    def test_run_script_missing_marker_is_a_failure_not_a_pass(self):
+        code, out = make_env(lambda c: 'sandbox died').run_script('ls', 'shell')
         self.assertNotEqual(code, 0)
         self.assertIn('sandbox died', out)
 
-    def test_checks_run_through_the_env_runner(self):
+    def test_checks_run_through_the_env(self):
+        # The env is the one thing a check needs to reach the episode's own
+        # filesystem, so it is passed as itself rather than as a callable.
         env = make_env(lambda c: '__TWINKLE_RC__:0')
         report = run_checks([Check(kind='shell', code='true')],
-                            CheckContext(workspace=self.tmp, runner=env.runner()))
+                            CheckContext(workspace=self.tmp, env=env))
         self.assertTrue(report.all_passed)
 
     def test_download_workspace_brings_files_back_for_file_checks(self):
@@ -500,29 +624,18 @@ class EmptyWorkspaceTest(unittest.TestCase):
     def _challenger(self, snapshot):
         from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
 
-        self.checks_run = []
-
         def explorer(trajectories, **kwargs):
             return [{'messages': list(t['messages'])
                      + [{'role': 'assistant', 'content': '```python\nassert True\n```'}]}
                     for t in trajectories]
 
-        def run_check_fn(script, slot=0):
-            self.checks_run.append(script)
-            return 0, ''
-
+        self.env = FakeEnv(snapshot)
         prompts = AgenticPrompts(
             system='s', from_scratch='u',
             check_followup='write checks for {final_state}',
             check_retry_followup='{error} / {final_state}',
             problem_followup='write the statement')
-        return AgenticChallenger(
-            prompts, explorer,
-            reset_fn=lambda slot=0: None,
-            run_check_fn=run_check_fn,
-            workspace_snapshot_fn=lambda slot=0: snapshot,
-            solver_rollouts=0,
-        )
+        return AgenticChallenger(prompts, explorer, envs=[self.env], solver_rollouts=0)
 
     def _explored(self):
         return {'messages': [{'role': 'user', 'content': 'do something'},
@@ -536,7 +649,7 @@ class EmptyWorkspaceTest(unittest.TestCase):
         self.assertEqual(ch.stats['empty_workspace'], 1)
         self.assertEqual(state['reject'][0], 'empty_workspace')
         # No check script was even run: there was nothing to check.
-        self.assertEqual(self.checks_run, [])
+        self.assertEqual(self.env.scripts, [])
         # And the episode is not turned into a task afterwards.
         self.assertIsNone(ch._finish_episode(state, self._explored()))
 
@@ -555,13 +668,13 @@ class EmptyWorkspaceTest(unittest.TestCase):
         # checks are written against.
         self.assertIn('--- data.csv ---', text)
         self.assertIsNone(params)
-        self.assertEqual(self.checks_run, [])
+        self.assertEqual(self.env.scripts, [])
 
         wrote_script = {'messages': [
             {'role': 'assistant', 'content': '```python\nassert True\n```'}]}
         self.assertEqual(ch._followup(state, wrote_script, 1),
                          ('write the statement', None))
-        self.assertEqual(self.checks_run, ['assert True'])
+        self.assertEqual(self.env.scripts, ['assert True'])
 
 
 class ProblemStatementParseTest(unittest.TestCase):
@@ -616,13 +729,6 @@ class EpisodeStagesTest(unittest.TestCase):
         self.emitted = []
         self.rejected = []
         self.appended = []
-        # One exit code per check run, so a test can make the first fail and the
-        # rewrite pass.
-        exits = list(check_exits) if check_exits is not None else None
-
-        def run_check(script, slot=0):
-            code = exits.pop(0) if exits else check_exit
-            return (code, 'AssertionError' if code else '')
 
         def explorer(trajectories, **kw):
             followup_fn = kw.get('followup_fn')
@@ -646,9 +752,9 @@ class EpisodeStagesTest(unittest.TestCase):
             problem_followup='statement please')
         return AgenticChallenger(
             prompts, explorer,
-            reset_fn=lambda slot=0: None,
-            run_check_fn=run_check,
-            workspace_snapshot_fn=lambda slot=0: snapshot,
+            # One exit code per check run, so a test can make the first fail and
+            # the rewrite pass.
+            envs=[FakeEnv(snapshot, exit_code=check_exit, exit_codes=check_exits)],
             reject_sink=self.rejected.append,
             propose_sink=self.emitted.append,
             solver_rollouts=0,
@@ -753,9 +859,7 @@ class EpisodeStagesTest(unittest.TestCase):
                            check_retry_followup='{error} / {final_state}',
                            problem_followup='p'),
             explorer,
-            reset_fn=lambda slot=0: None,
-            run_check_fn=lambda script, slot=0: (0, ''),
-            workspace_snapshot_fn=lambda slot=0: 'a.txt 1\n',
+            envs=[FakeEnv()],
             reject_sink=self.rejected.append,
             propose_sink=self.emitted.append,
             solver_rollouts=0)
@@ -768,51 +872,25 @@ class EpisodeStagesTest(unittest.TestCase):
 
 
 class ConcurrentEpisodeSlotsTest(unittest.TestCase):
-    """Concurrent episodes must each drive their own sandbox slot.
+    """Concurrent episodes must each drive their own environment.
 
     A rack of one sandbox per slot is the whole point of running episodes in
-    parallel; if the slot the challenger passes for episode i is not the slot
-    reset_fn / run_check_fn / workspace_snapshot_fn / tool_manager see for that
-    episode, then two episodes end up sharing a workspace and the check written
-    against one runs against the other. That is the failure mode this test
-    exists to catch.
+    parallel; if the env the challenger hands episode i is not the env that
+    episode's clear, check, snapshot and tool calls land in, then two episodes
+    end up sharing a workspace and the check written against one runs against the
+    other. That is the failure mode this test exists to catch.
     """
 
     def test_each_episode_uses_its_own_slot_end_to_end(self):
         from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
 
         n_slots = 4
-        resets = []  # (slot,) per call
-        checks = []  # (slot, script) per call
-        snaps = []   # (slot,) per call
-        tm_calls = []  # (slot,) per tool_manager use
-        lock = threading.Lock()
-
-        class FakeTM:
-            def __init__(self, slot): self.slot = slot
-            def tool_infos(self): return []
-            def __call__(self, tc):
-                with lock:
-                    tm_calls.append(self.slot)
-                return 'ok'
-
-        tool_managers = [FakeTM(i) for i in range(n_slots)]
-
-        def reset_fn(slot):
-            with lock:
-                resets.append(slot)
-
-        def run_check_fn(script, slot):
-            with lock:
-                checks.append((slot, script))
-            return 0, ''
-
-        def workspace_snapshot_fn(slot):
-            with lock:
-                snaps.append(slot)
-            # Encode the slot in the snapshot so an episode reading the wrong
-            # slot's workspace would produce a mismatched check statement.
-            return f'slot_{slot}.txt 1\n\n--- slot_{slot}.txt ---\nx'
+        journal = EnvJournal()
+        # The slot is encoded in the listing too, so an episode reading the wrong
+        # slot's workspace would write its checks against another one's files.
+        envs = [FakeEnv(f'slot_{i}.txt 1\n\n--- slot_{i}.txt ---\nx',
+                        slot=i, journal=journal, with_tools=True)
+                for i in range(n_slots)]
 
         def explorer(trajectories, **kw):
             # The two follow-ups (check script, then statement) are threaded
@@ -845,11 +923,7 @@ class ConcurrentEpisodeSlotsTest(unittest.TestCase):
             problem_followup='p')
         ch = AgenticChallenger(
             prompts, explorer,
-            reset_fn=reset_fn,
-            run_check_fn=run_check_fn,
-            workspace_snapshot_fn=workspace_snapshot_fn,
-            episode_concurrency=n_slots,
-            episode_tool_managers=tool_managers,
+            envs=envs,
             propose_sink=emitted.append,
             solver_rollouts=0,
             max_proposals_per_round=8,
@@ -857,29 +931,28 @@ class ConcurrentEpisodeSlotsTest(unittest.TestCase):
         kept = ch._round(8)
 
         self.assertEqual(len(kept), 8)
-        # 8 episodes across 4 slots, evenly split -> each slot reset twice, ran
+        # 8 episodes across 4 slots, evenly split -> each slot cleared twice, ran
         # its own check twice, and every check saw the slot's own snapshot text.
         from collections import Counter
-        self.assertEqual(Counter(resets), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
-        self.assertEqual(Counter(s for s, _ in checks), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
+        self.assertEqual(Counter(journal.slots('clear')), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
+        self.assertEqual(Counter(journal.slots('run')), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
         # The tool_manager slot used matches the check slot for each episode.
-        self.assertEqual(Counter(tm_calls), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
+        self.assertEqual(Counter(journal.slots('tool')), Counter({0: 2, 1: 2, 2: 2, 3: 2}))
 
-    def test_wrong_tool_manager_count_is_refused(self):
+    def test_a_challenger_without_an_env_is_refused(self):
+        """There is no episode without a workspace, and no check without one either.
+
+        Refused at construction rather than at the first episode: the failure is a
+        missing argument in the wiring, and finding out about it a round into a run
+        costs the round.
+        """
         from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
         prompts = AgenticPrompts(system='s', from_scratch='u',
                                  check_followup='c {final_state}',
                                  check_retry_followup='{error} / {final_state}',
                                  problem_followup='p')
         with self.assertRaises(ValueError):
-            AgenticChallenger(
-                prompts, explorer=lambda t, **k: t,
-                reset_fn=lambda slot=0: None,
-                run_check_fn=lambda s, slot=0: (0, ''),
-                workspace_snapshot_fn=lambda slot=0: '',
-                episode_concurrency=4,
-                episode_tool_managers=[object(), object()],  # wrong count
-                solver_rollouts=0)
+            AgenticChallenger(prompts, explorer=lambda t, **k: t, solver_rollouts=0)
 
 
 class PreseedInputsTest(unittest.TestCase):
@@ -891,7 +964,7 @@ class PreseedInputsTest(unittest.TestCase):
     data its statement says is there -- which reads as 'too hard' and is not.
     """
 
-    def _challenger(self, run_check_fn, **kwargs):
+    def _challenger(self, env, **kwargs):
         from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
 
         prompts = AgenticPrompts(
@@ -903,11 +976,9 @@ class PreseedInputsTest(unittest.TestCase):
             prompts,
             lambda trajs, **kw: [{'messages': list(t['messages']), 'stop_reason': 'stop'}
                                  for t in trajs],
-            run_check_fn=run_check_fn,
-            workspace_snapshot_fn=lambda slot=0: 'input/a.csv 3\n',
+            envs=[env],
             solver_rollouts=2,
-            keep_min_pass=1,
-            keep_max_pass_margin=0,
+            keep_pass_band=(1, 2),
             propose_sink=[].append,
             **kwargs)
 
@@ -918,29 +989,30 @@ class PreseedInputsTest(unittest.TestCase):
                                 keywords=[])
 
     def test_setup_runs_after_the_clear_and_before_the_check(self):
-        events = []
-        ch = self._challenger(
-            run_check_fn=lambda script, slot=0: (events.append(
-                'setup' if script.startswith('#SETUP') else 'check'), (0, ''))[1],
-            reset_fn=lambda slot=0: events.append('clear'))
+        env = FakeEnv('input/a.csv 3\n')
+        ch = self._challenger(env)
         kept = ch._filter_difficulty([self._task('#SETUP\nopen("a","w")')])
-        self.assertEqual(events, ['clear', 'setup', 'check'] * 2)
+        # Per attempt: wipe the workspace, replay the inputs, then check.
+        self.assertEqual(env.journal.kinds('clear', 'run'), ['clear', 'run', 'run'] * 2)
+        self.assertEqual([s.startswith('#SETUP') for s in env.scripts], [True, False] * 2)
         self.assertEqual(len(kept), 1)
 
     def test_failed_setup_skips_the_attempt_instead_of_scoring_it_zero(self):
         """An attempt that never ran must not be counted as an attempt that failed."""
-        checks = []
 
-        def run_check(script, slot=0):
-            if script.startswith('#SETUP'):
-                return 1, 'no space left on device'
-            checks.append(script)
-            return 0, ''
+        class NoSpaceEnv(FakeEnv):
+            """A workspace where the replay fails and a check would have passed."""
 
-        ch = self._challenger(run_check_fn=run_check, reset_fn=lambda slot=0: None)
+            def run_script(self, source, interpreter='python', timeout=None):
+                if source.startswith('#SETUP'):
+                    return 1, 'no space left on device'
+                return super().run_script(source, interpreter, timeout)
+
+        env = NoSpaceEnv('input/a.csv 3\n')
+        ch = self._challenger(env)
         kept = ch._filter_difficulty([self._task('#SETUP\nboom')])
         # The solver was never asked, so nothing was checked and nothing is kept.
-        self.assertEqual(checks, [])
+        self.assertEqual(env.scripts, [])
         self.assertEqual(kept, [])
         self.assertEqual(ch.stats['setup_replay_fail'], 2)
 
@@ -963,15 +1035,8 @@ class ParallelDifficultyTest(unittest.TestCase):
         n_slots = 4
         lock = threading.Lock()
         batch_sizes = []      # trajectories per explorer call
-        reset_slots = []      # slot per reset
-        pairs = []            # (tool_manager slot, check slot) per attempt
-
-        class FakeTM:
-            def __init__(self, slot): self.slot = slot
-            def tool_infos(self): return []
-            def __call__(self, tc): return 'ok'
-
-        tool_managers = [FakeTM(i) for i in range(n_slots)]
+        journal = EnvJournal()
+        envs = [FakeEnv(slot=i, journal=journal, with_tools=True) for i in range(n_slots)]
         # Which slot's manager each trajectory of the current wave was handed.
         wave_slots = []
 
@@ -984,20 +1049,6 @@ class ParallelDifficultyTest(unittest.TestCase):
             return [{'messages': list(t['messages']), 'stop_reason': 'stop'}
                     for t in trajectories]
 
-        # One attempt in flight per slot, so the check for the attempt that used
-        # slot k must itself run in slot k. Recorded as a pair to compare.
-        seq = iter(range(10_000))
-
-        def run_check_fn(script, slot=0):
-            with lock:
-                pairs.append(slot)
-                next(seq)
-            return 0, ''
-
-        def reset_fn(slot=0):
-            with lock:
-                reset_slots.append(slot)
-
         prompts = AgenticPrompts(
             system='s', from_scratch='u',
             check_followup='c {final_state}',
@@ -1005,14 +1056,9 @@ class ParallelDifficultyTest(unittest.TestCase):
             problem_followup='p')
         ch = AgenticChallenger(
             prompts, explorer,
-            reset_fn=reset_fn,
-            run_check_fn=run_check_fn,
-            workspace_snapshot_fn=lambda slot=0: 'a.txt 1\n',
-            episode_concurrency=n_slots,
-            episode_tool_managers=tool_managers,
+            envs=envs,
             solver_rollouts=4,
-            keep_min_pass=1,
-            keep_max_pass_margin=0,
+            keep_pass_band=(1, 4),
             propose_sink=[].append,
         )
         tasks = [attach_user_data({'messages': [{'role': 'user', 'content': f'task {i}'}]},
@@ -1025,10 +1071,10 @@ class ParallelDifficultyTest(unittest.TestCase):
         self.assertEqual(batch_sizes, [4, 4])
         # Every slot cleared once per wave, and the managers handed out are the
         # slots that were cleared.
-        self.assertEqual(sorted(reset_slots), [0, 0, 1, 1, 2, 2, 3, 3])
+        self.assertEqual(sorted(journal.slots('clear')), [0, 0, 1, 1, 2, 2, 3, 3])
         self.assertEqual(sorted(wave_slots), [0, 1, 2, 3])
         # One check per attempt, one per slot per wave.
-        self.assertEqual(sorted(pairs), [0, 0, 1, 1, 2, 2, 3, 3])
+        self.assertEqual(sorted(journal.slots('run')), [0, 0, 1, 1, 2, 2, 3, 3])
         # All checks passed -> both tasks scored 4 of 4.
         self.assertEqual([user_data_get(t.get('user_data'), 'n_pass', -1) for t in kept],
                          [4, 4])
@@ -1047,19 +1093,18 @@ class TruncatedSolverTest(unittest.TestCase):
         """``attempt_flags``: one (truncated, passes) pair per solver attempt."""
         from twinkle_agentic.challenger.agentic import AgenticChallenger, AgenticPrompts
 
-        self.flags = list(attempt_flags)
         self.emitted = []
+        # One attempt per wave with a single env, so the explorer and the env walk
+        # the flags in step: the truncation and the verdict below it belong to the
+        # same attempt, which is the whole point of the count being read together.
+        truncations = [truncated for truncated, _ in attempt_flags]
 
         def explorer(trajectories, **kw):
-            truncated, _ = self.flags[0]
+            truncated = truncations.pop(0)
             return [{'messages': list(t['messages']),
                      'truncated': truncated,
                      'stop_reason': 'length' if truncated else 'stop'}
                     for t in trajectories]
-
-        def run_check_fn(script, slot=0):
-            _, passes = self.flags.pop(0)
-            return (0 if passes else 1), ''
 
         prompts = AgenticPrompts(
             system='s', from_scratch='u',
@@ -1067,9 +1112,7 @@ class TruncatedSolverTest(unittest.TestCase):
             check_retry_followup='{error} / {final_state}', problem_followup='ps')
         return AgenticChallenger(
             prompts, explorer,
-            reset_fn=lambda slot=0: None,
-            run_check_fn=run_check_fn,
-            workspace_snapshot_fn=lambda slot=0: 'a.txt 1\n',
+            envs=[FakeEnv(exit_codes=[0 if passes else 1 for _, passes in attempt_flags])],
             propose_sink=self.emitted.append,
             solver_rollouts=4,
             **kwargs)
@@ -1085,7 +1128,7 @@ class TruncatedSolverTest(unittest.TestCase):
         # truncations visible in stats so the 1-of-4 can be read for what it is.
         ch = self._challenger([(False, True), (False, False),
                                (True, False), (True, False)],
-                              keep_min_pass=1, keep_max_pass_margin=1)
+                              keep_pass_band=(1, 3))
         kept = ch._filter_difficulty([self._task()])
 
         self.assertEqual(ch.stats['solver_truncated'], 2)
@@ -1099,7 +1142,7 @@ class TruncatedSolverTest(unittest.TestCase):
         # discarded for being too hard and stats['solver_truncated'] == 4 is the
         # only thing that says no solver ever acted.
         ch = self._challenger([(True, False)] * 4,
-                              keep_min_pass=1, keep_max_pass_margin=1)
+                              keep_pass_band=(1, 3))
         kept = ch._filter_difficulty([self._task()])
 
         self.assertEqual(ch.stats['solver_truncated'], 4)
@@ -1146,11 +1189,9 @@ class KeywordBankTest(unittest.TestCase):
             keyword_expand_user=KEYWORD_EXPAND_USER)
         return AgenticChallenger(
             prompts, tool_explorer,
+            envs=[FakeEnv()],
             keyword_store=self.store,
             category_desc={'filesystem': 'files and directories'},
-            reset_fn=lambda slot=0: None,
-            run_check_fn=lambda script, slot=0: (0, ''),
-            workspace_snapshot_fn=lambda slot=0: 'a.txt 1\n',
             keyword_explorer=text_explorer,
             keyword_sink=self.gen_records.append,
             keyword_gen_calls=1,
@@ -1165,7 +1206,7 @@ class KeywordBankTest(unittest.TestCase):
 
     def test_the_shipped_prompt_asks_for_what_the_parser_reads(self):
         """The real prompt string, not a stand-in: this is the contract that broke."""
-        from twinkle_agentic.challenger.code import parse_keyword_list
+        from twinkle_agentic.challenger.keywords import parse_keyword_list
         from prompts import KEYWORD_EXPAND_USER, KEYWORD_USER
 
         for text in (KEYWORD_USER, KEYWORD_EXPAND_USER):
@@ -1190,8 +1231,8 @@ class KeywordBankTest(unittest.TestCase):
         The direction matters as much as the count: length tracks specificity, so
         what the filter removes is the half of the output the bank most wants.
         """
-        from twinkle_agentic.challenger.code import (KEYWORD_MAX_LEN,
-                                                     split_keyword_list)
+        from twinkle_agentic.challenger.keywords import (KEYWORD_MAX_LEN,
+                                                         split_keyword_list)
         from prompts import KEYWORD_EXPAND_USER
 
         # Verbatim from iteration 9, one of the eight a single expand call lost.
@@ -1291,11 +1332,9 @@ class SerialKeywordRefillTest(unittest.TestCase):
         self.store = KeywordStore(os.path.join(self.tmp, 'kw.jsonl'), (category,))
         return AgenticChallenger(
             prompts, explorer,
+            envs=[FakeEnv()],
             keyword_store=self.store,
             category_desc={category: 'some kind of work'},
-            reset_fn=lambda slot=0: None,
-            run_check_fn=lambda script, slot=0: (0, ''),
-            workspace_snapshot_fn=lambda slot=0: 'a.txt 1\n',
             keyword_explorer=explorer,
             keyword_gen_calls=3,
             keyword_refill_concurrency=refill_concurrency,
@@ -1316,7 +1355,7 @@ class SerialKeywordRefillTest(unittest.TestCase):
     def test_three_axis_refill_shows_each_call_the_previous_output(self):
         ch = self._challenger(self._three_axis_prompts(), 'transform')
 
-        got = ch._generate_keywords('transform', 9)
+        got = ch.keywords._generate('transform', 9)
 
         self.assertEqual(sorted(got), ['topic 0', 'topic 1', 'topic 2'])
         self.assertEqual(self.batch_sizes, [1, 1, 1],
@@ -1337,7 +1376,7 @@ class SerialKeywordRefillTest(unittest.TestCase):
         ch = self._challenger(self._three_axis_prompts(), 'transform',
                              refill_concurrency=3)
 
-        got = ch._generate_keywords('transform', 9)
+        got = ch.keywords._generate('transform', 9)
 
         self.assertEqual(sorted(got), ['topic 0', 'topic 1', 'topic 2'])
         self.assertEqual(self.batch_sizes, [3], 'all three go out as one batch')
@@ -1364,10 +1403,10 @@ class SerialKeywordRefillTest(unittest.TestCase):
             keyword_system=KEYWORD_SYSTEM, keyword_user=KEYWORD_USER,
             keyword_expand_user=KEYWORD_EXPAND_USER)
         ch = self._challenger(prompts, 'transform')
-        cap = ch._AVOID_TOTAL
+        cap = ch.keywords._AVOID_TOTAL
         older = [f'old {i}' for i in range(200)]
         fresh = [f'new {i}' for i in range(5)]
-        note = ch._avoid_note(older, fresh, 'avoid: ')
+        note = ch.keywords._avoid_note(older, fresh)
         for kw in fresh:
             self.assertIn(kw, note)
         self.assertEqual(note.count('old '), cap - len(fresh))
@@ -1375,7 +1414,7 @@ class SerialKeywordRefillTest(unittest.TestCase):
         # Once this refill alone fills the cap, no banked phrase is quoted and the
         # line stops growing -- it is the growth that broke the eighth call.
         many = [f'new {i}' for i in range(cap + 30)]
-        note = ch._avoid_note(older, many, 'avoid: ')
+        note = ch.keywords._avoid_note(older, many)
         self.assertEqual(note.count('old '), 0)
         self.assertEqual(note.count('new '), cap)
         self.assertNotIn('new 0', note, 'the oldest of this refill falls off first')
@@ -1404,7 +1443,7 @@ class ProposeTrajIndexTest(unittest.TestCase):
     """
 
     def test_group_id_and_reward_survive_the_copy(self):
-        from challenge import Recorder
+        from recorder import Recorder
 
         out = tempfile.mkdtemp(prefix='proposetraj_test_')
         try:
@@ -1451,9 +1490,7 @@ class TaskCarriesGroupIdTest(unittest.TestCase):
         return AgenticChallenger(
             prompts,
             lambda trajectories, **kwargs: list(trajectories),
-            reset_fn=lambda slot=0: None,
-            run_check_fn=lambda script, slot=0: (0, ''),
-            workspace_snapshot_fn=lambda slot=0: 'data.csv 3',
+            envs=[FakeEnv('data.csv 3')],
             solver_rollouts=0,
         )
 
@@ -1475,6 +1512,196 @@ class TaskCarriesGroupIdTest(unittest.TestCase):
         # 7, not None: the emit sites downstream read exactly this key, and a None
         # here is what silently turned SIDES=both into solver-only training.
         self.assertEqual(user_data_get(task.get('user_data'), 'group_id', None), 7)
+
+
+# ── the code half ──────────────────────────────────────────────────────────
+
+# Two problems the local runner can actually verify, so the difficulty stage
+# here is the production one: build_asserts runs the solution to capture each
+# check's repr, and every judgement is a real subprocess.
+_SOLVE_MARK = 'SOLVE:'
+_CODE_PROBLEMS = (
+    {'problem': 'Double an integer.',
+     'solution': 'def double(x):\n    return x * 2\n',
+     'wrong': 'def double(x):\n    return x\n',
+     'entry': 'double',
+     'checks': ['double(2)', 'double(5)']},
+    {'problem': 'Sum a list of integers.',
+     'solution': 'def total(xs):\n    return sum(xs)\n',
+     'wrong': 'def total(xs):\n    return 0\n',
+     'entry': 'total',
+     'checks': ['total([1, 2, 3])', 'total([])']},
+)
+
+
+def _explored(traj, text, n_prompt=3, n_new=4):
+    """What a local sampler returns: the reply, and the tokens behind it.
+
+    The token fields matter as much as the text. train.py refuses a trajectory
+    whose logprob count disagrees with its trainable label count, so a fake that
+    got the counts wrong would pass the collection tests and be dropped by the
+    step -- which is the failure this half was built to make impossible.
+    """
+    ids = list(range(1, n_prompt + n_new + 1))
+    return {
+        'messages': list(traj['messages']) + [{'role': 'assistant', 'content': text}],
+        'input_ids': ids,
+        'labels': [-100] * n_prompt + ids[n_prompt:],
+        # Top-1 pairs, the shape SampledSequence.logprobs uses.
+        'logprobs': [[(i, -0.5)] for i in ids[n_prompt:]],
+    }
+
+
+class _ScriptedCodeExplorer:
+    """Answers a code challenger's prompts from a fixed script.
+
+    Proposals are answered in order from ``problems``; solver prompts are matched
+    back to their problem by the statement they quote and answered from
+    ``verdicts[i]``, one boolean per attempt. Stating the pass counts is the point:
+    the band is what decides whether a group has a gradient, so a test about it
+    cannot depend on which code a model would have happened to write.
+    """
+
+    def __init__(self, problems, verdicts):
+        self.problems = list(problems)
+        self.verdicts = [list(v) for v in verdicts]
+        self.by_statement = {p['problem']: i for i, p in enumerate(self.problems)}
+        self.n_proposed = 0
+        self.n_attempted = [0] * len(self.problems)
+
+    def __call__(self, trajectories, sampling_params=None, **kwargs):
+        return [self._reply(t) for t in trajectories]
+
+    def _reply(self, traj):
+        user = next(m['content'] for m in reversed(traj['messages'])
+                    if m.get('role') == 'user')
+        if not user.startswith(_SOLVE_MARK):
+            problem = self.problems[min(self.n_proposed, len(self.problems) - 1)]
+            self.n_proposed += 1
+            return _explored(traj, json.dumps(
+                {k: problem[k] for k in ('problem', 'solution', 'entry', 'checks')}))
+        i = self.by_statement[user[len(_SOLVE_MARK):].strip()]
+        problem = self.problems[i]
+        passing = self.verdicts[i][self.n_attempted[i]]
+        self.n_attempted[i] += 1
+        return _explored(traj, f'```python\n{problem["solution" if passing else "wrong"]}```')
+
+
+class _CodeArgs:
+    """The two attributes ``collect`` reads off the parsed arguments."""
+
+    code_keep_target = 1
+    code_batch_size = 0
+
+
+class CodeHalfCollectionTest(unittest.TestCase):
+    """The attempts the difficulty stage makes are the code half's training data.
+
+    Measuring a candidate samples it ``solver_rollouts`` times and then reports one
+    number, and the base class drops the attempts. Those attempts are exactly what
+    a solver trains on, and a problem kept inside the band is a group already
+    measured to contain both a pass and a failure. Sampling a fresh group after the
+    band has been applied pays for the same tokens twice and can still land at 0 or
+    8, where every advantage is the reward minus itself.
+
+    So ``CollectingChallenger`` keeps them, and what these pin is the whole path:
+    the kept problem arrives with all of its attempts, a problem the band drops
+    does not go on holding its own, and what reaches index.jsonl loads back as one
+    code group with a gradient.
+
+    The out-of-band problem is proposed first on purpose. It is measured in a round
+    of its own, so the round that keeps a problem is not the round that has to
+    forget one -- the two would otherwise pass together and fail together.
+    """
+
+    def _collect(self, out_dir, verdicts=((False, False, False, False),
+                                          (True, True, True, False))):
+        from collect import CollectingChallenger, collect
+        from recorder import Recorder
+        from twinkle_agentic.challenger.code import CodePrompts
+
+        explorer = _ScriptedCodeExplorer(_CODE_PROBLEMS, verdicts)
+        prompts = CodePrompts(system='S', from_scratch='INVENT', solver_system='SS',
+                              solver_user=_SOLVE_MARK + ' {problem}')
+        recorder = Recorder(out_dir)
+        seen = []
+        challenger = CollectingChallenger(
+            prompts, explorer, envs=[LocalEnv()], solver_rollouts=4,
+            keep_pass_band=(1, 3), two_step=False, seed=1, attempt_sink=seen.append)
+        try:
+            metrics = collect(_CodeArgs(), challenger, recorder)
+        finally:
+            recorder.close()
+        return challenger, metrics, seen
+
+    def test_a_kept_problem_arrives_as_one_group_of_every_attempt(self):
+        out = tempfile.mkdtemp(prefix='codecollect_test_')
+        try:
+            _ch, metrics, seen = self._collect(out)
+            with open(os.path.join(out, 'trajs', 'index.jsonl'), encoding='utf-8') as f:
+                records = [json.loads(line) for line in f if line.strip()]
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+        self.assertEqual(metrics['counts']['kept'], 1)
+        self.assertEqual(metrics['counts']['groups'], 1)
+        # Four members from four rollouts: a group short of one attempt is a group
+        # whose advantage was computed against a mean it never had.
+        self.assertEqual(len(records), 4)
+        self.assertEqual({r['side'] for r in records}, {'code'})
+        self.assertEqual({r['group_id'] for r in records}, {0})
+        # Three passes and one failure, which is what n_pass=3 of 4 means.
+        self.assertEqual(sorted(r['reward'] for r in records), [0.0, 1.0, 1.0, 1.0])
+        # Both problems' attempts reach the audit file, including the eight that
+        # measured a problem the band then dropped: that file exists for the
+        # question of why something measured zero.
+        self.assertEqual(len(seen), 8)
+        self.assertNotIn('attempt', seen[0],
+                         'the audit line carries the verdict, not the tokens')
+
+    def test_a_problem_outside_the_band_does_not_keep_its_attempts(self):
+        out = tempfile.mkdtemp(prefix='codeband_test_')
+        try:
+            challenger, _metrics, _seen = self._collect(out)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+        # Empty, not 'holds one problem': the kept problem's attempts were taken by
+        # collect and the dropped problem's were released when its count came in.
+        # Four attempts of a 24-turn episode is a gigabyte a round, so this is the
+        # difference between a loop that runs and one that runs out of memory.
+        self.assertEqual(challenger._attempts, {})
+
+    def test_the_index_loads_back_as_a_code_group_with_a_gradient(self):
+        import train as T
+
+        out = tempfile.mkdtemp(prefix='codeload_test_')
+        try:
+            self._collect(out)
+            groups, skipped = T.load(out, sides='both,code', max_length=1024)
+            notes = T.score(groups)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+        self.assertEqual(dict(skipped), {}, 'every attempt written should be trainable')
+        self.assertEqual(len(groups), 1)
+        # (side, group_id), not (side, group_id, proposal_idx): one problem is one
+        # group here, and keying on a proposal index that is always 0 would work by
+        # accident rather than by agreement with what collect writes.
+        self.assertEqual(groups[0]['key'], ('code', 0))
+        self.assertEqual(groups[0]['side'], 'code')
+        self.assertEqual(dict(notes), {}, 'a group inside the band has to have a gradient')
+        advantages = [m['advantage'] for m in groups[0]['members']]
+        self.assertTrue(any(abs(a) > 1e-9 for a in advantages), advantages)
+
+    def test_sides_wanted_reads_the_three_sides_out_of_one_switch(self):
+        import train as T
+
+        self.assertEqual(T.sides_wanted('both'), ('propose', 'solve'))
+        self.assertEqual(T.sides_wanted('both,code'), ('propose', 'solve', 'code'))
+        self.assertEqual(T.sides_wanted('code'), ('code', ))
+        # Repeats collapse rather than doubling a side's share of the step.
+        self.assertEqual(T.sides_wanted('code, code ,solve'), ('code', 'solve'))
 
 
 if __name__ == '__main__':

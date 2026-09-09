@@ -18,9 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
-from twinkle_agentic.envs import EnvTool
 from twinkle_agentic.harness import MsAgentHarness
-from twinkle_agentic.tools.tool_manager import ToolManager
 from twinkle_agentic.verifier.result_check import (CheckContext, checks_from_dicts,
                                                   run_checks)
 
@@ -134,7 +132,7 @@ def build_episode(task: Dict[str, Any], cfg: SandboxConfig) -> Tuple[Any, Any, A
     # they are not, scores 0 for a reason that has nothing to do with the task.
     setup = task.get('setup_script')
     if setup:
-        exit_code, output = env.runner()(setup, 'python')
+        exit_code, output = env.run_script(setup)
         if exit_code != 0:
             raise RuntimeError(f'[{task.get("id")}] setup_script failed '
                                f'(exit {exit_code}): {output[-400:]}')
@@ -143,9 +141,9 @@ def build_episode(task: Dict[str, Any], cfg: SandboxConfig) -> Tuple[Any, Any, A
     # The executor's own schemas, not the harness's (which are now empty by
     # construction). Advertising what will run is the whole point of sourcing
     # them from the sandbox.
-    schemas = env.tool_schemas()
+    schemas = env.tools()
     trajectory['tools'] = schemas
-    tool_manager = ToolManager(EnvTool.from_schemas(env, schemas))
+    tool_manager = env.tool_manager(schemas)
     return harness, env, tool_manager, trajectory
 
 
@@ -189,7 +187,7 @@ def score_episode(task: Dict[str, Any], env: RemoteMsAgentToolEnv,
     """
     check_script = task.get('check_script')
     if check_script:
-        exit_code, output = env.runner()(check_script, 'python')
+        exit_code, output = env.run_script(check_script)
         if exit_code != 0:
             logger.debug(f'[{task.get("id")}] check_script failed (exit {exit_code}): '
                          f'{output[-200:]}')
@@ -204,7 +202,7 @@ def score_episode(task: Dict[str, Any], env: RemoteMsAgentToolEnv,
     ctx = CheckContext(
         workspace=env.download_workspace(snapshot_dir),
         final_answer=final_answer,
-        runner=env.runner(),
+        env=env,
     )
     report = run_checks(task['_checks'], ctx, mode=cfg.score_mode)
     if not report.all_passed:

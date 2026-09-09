@@ -4,7 +4,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import cjk_ratio, is_agent_row, msg_content_text, msg_has_media, normalize_tool_calls
+from twinkle_agentic.utils.message_utils import is_agent_row, msg_content_text, msg_has_media, normalize_tool_calls
+from twinkle_agentic.utils.text_utils import cjk_ratio
 
 # ── Language detection ────────────────────────────────────────────────────────
 
