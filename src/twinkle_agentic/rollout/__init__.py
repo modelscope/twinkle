@@ -2,6 +2,7 @@
 from .api_sampler import APISampler
 from .base import Rollout
 from .bridge import extend_with_bridge
+from .ledger import TurnLedger
 from .multi_turn import MultiTurnRollout
 
-__all__ = ['APISampler', 'MultiTurnRollout', 'Rollout', 'extend_with_bridge']
+__all__ = ['APISampler', 'MultiTurnRollout', 'Rollout', 'TurnLedger', 'extend_with_bridge']

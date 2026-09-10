@@ -20,10 +20,11 @@ import unittest
 _REPO = os.path.join(os.path.dirname(__file__), '..', '..')
 sys.path.insert(0, os.path.join(_REPO, 'src'))
 # The RSI wiring lives in cookbook, not in the framework: it is one deployment's
-# choice of sandbox backend, and the tests follow it there.
+# choice of sandbox backend, and the tests follow it there. The in-sandbox runtime
+# is the exception -- it moved into the framework as
+# twinkle_agentic.envs.sandbox_server, since nothing in it is RSI's.
 _COOKBOOK = os.path.join(_REPO, 'cookbook', 'rsi', 'agentic')
 sys.path.insert(0, _COOKBOOK)
-sys.path.insert(0, os.path.join(_COOKBOOK, 'sandbox_server'))
 # recorder.py sits one level up, shared with the code half.
 sys.path.insert(0, os.path.dirname(_COOKBOOK))
 # The code half itself, appended rather than inserted: both halves have a
@@ -31,16 +32,28 @@ sys.path.insert(0, os.path.dirname(_COOKBOOK))
 sys.path.append(os.path.join(os.path.dirname(_COOKBOOK), 'code'))
 
 from remote_tool_env import RemoteMsAgentToolEnv  # noqa: E402
-from tool_server import (ToolRuntime, _usable_llm,  # noqa: E402
-                         _without_internal_args, _without_llm_args)
 from twinkle_agentic.envs.base import Env, StepResult  # noqa: E402
 from twinkle_agentic.envs.env_tool import EnvTool  # noqa: E402
-from twinkle_agentic.envs.local import LocalEnv  # noqa: E402
+from twinkle_agentic.envs.localenv import LocalEnv  # noqa: E402
+from twinkle_agentic.envs.sandbox_server.runtime_msagent import (  # noqa: E402
+    _INTERNAL_ARGS, _LLM_BACKED_ARGS, _usable_llm, _without_args, Runtime as ToolRuntime)
 from twinkle_agentic.tools.tool_manager import ToolManager  # noqa: E402
 from twinkle_agentic.verifier.result_check import (Check, CheckContext,  # noqa: E402
                                                    checks_from_dicts, run_checks)
 
 AGENT_CONFIG = os.path.join(_COOKBOOK, 'rsi_agent.yaml')
+
+
+# The runtime withdraws both kinds of argument through one `_without_args`; these
+# name which set each call is about, so a test still says what it is testing.
+def _without_llm_args(schema):
+    names = _LLM_BACKED_ARGS.get((schema.get('function') or {}).get('name'))
+    return _without_args(schema, names) if names else schema
+
+
+def _without_internal_args(schema):
+    return _without_args(schema, _INTERNAL_ARGS)
+
 
 # ms-agent namespaces tools as ``{server}---{tool}``; keep that here so the
 # tests exercise the same name resolution production hits.
@@ -100,7 +113,7 @@ class FakeSandbox:
         self.killed = True
 
     def handle(self, command, background=False):
-        if background or 'tool_server.py' in command or command.startswith('tail '):
+        if background or 'runtime_msagent.py' in command or command.startswith('tail '):
             return _Result()
         if command.startswith('find '):
             prefix = '/workspace/'

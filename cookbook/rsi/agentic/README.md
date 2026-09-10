@@ -111,7 +111,7 @@ sandbox.py         the sandbox as a resource: clear, snapshot, run a script
 prompts.py         every string sent to a model
 episode.py         how an episode is built and scored, shared with eval.py
 remote_tool_env.py the transport to one microVM, paired with sandbox_server/
-sandbox_server/    the image and the in-sandbox tool server it talks to
+sandbox_server/    the sandbox host: install.sh, serve.sh, and tool_server.py
 eval.py            held-out pass rate on tasks the trainer never saw
 rsi_agent.yaml     the ms-agent config both sides' openings are shaped by
 ```
@@ -174,6 +174,41 @@ Everything is in this directory. `sandbox.py` takes its transport from
 `remote_tool_env.py`, which is paired with the tool server in `sandbox_server/`,
 and the solver's opening from `episode.solver_harness`, which `eval.py` uses too —
 so a task's `n_pass` here and its `pass@k` there are measured against one opening.
+
+## The sandbox host
+
+Everything under `sandbox_server/` runs on the machine that hosts the microVMs,
+not on the trainer. Two commands, once each:
+
+```bash
+sh install.sh                  # AgentENV + the template, from Dockerfile
+sh install.sh --via=sandbox    # same template, built inside a live sandbox
+sh serve.sh                    # the server, plus the reaper
+```
+
+`--via` only matters for the network: `aenv build` hands the Dockerfile to a
+template builder whose VM downloaded at 33 KB/s here against a sandbox's 5.4
+MB/s, so a six-minute build reads as a hung one. `--via=sandbox` installs inside
+a live sandbox and snapshots it instead. Same template name either way, which is
+what the trainer's `AENV_TEMPLATE` (default `twinkle-rsi-msagent`) refers to. A
+snapshot carries the filesystem but not the image config, so `ENV`/`WORKDIR` from
+the Dockerfile are replaced by their filesystem equivalents.
+
+`serve.sh` also starts the reaper, and that is not optional housekeeping:
+AgentENV *persists* a sandbox when it ends -- a closed sandbox is a paused one,
+~1GB each -- so every episode leaks a gigabyte and a full disk turns into boots
+that fail with `No space left on device` and a whole batch scoring zero, which
+reads like hard tasks rather than a broken host. It deletes only paused
+sandboxes with the template's alias, every `REAP_INTERVAL` seconds (120), logging
+to `/tmp/aenv-reap.log`. `REAP=0` turns it off, `REAP_ONLY=1` runs it alone,
+`STOP_ONLY=1` stops both.
+
+`tool_server.py` needs no command of its own: `remote_tool_env.py` uploads it
+into each sandbox and starts it there, once per episode, so editing the tool
+line-up in `rsi_agent.yaml` is a trainer restart rather than a template rebuild.
+It serves `/health`, `/tools` and `/call` on port 8900 out of ms-agent's own
+`ToolManager` -- no tool is reimplemented, because in RL any divergence between
+the training and serving tools gets exploited and only shows up after deployment.
 
 ## Running it
 

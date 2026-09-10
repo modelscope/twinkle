@@ -12,7 +12,7 @@ returns a :class:`CheckReport` whose ``score`` is the reward.
 Checks that need to *run* something (``shell`` / ``python``) run inside the
 episode's :class:`~twinkle_agentic.envs.base.Env`, so they see exactly the state
 the agent left behind -- hand over the sandbox the episode acted in. Without one
-they fall back to a :class:`~twinkle_agentic.envs.local.LocalEnv` over
+they fall back to a :class:`~twinkle_agentic.envs.localenv.LocalEnv` over
 ``workspace``, which is only correct when the episode itself ran locally.
 """
 import json
@@ -136,7 +136,7 @@ def _local_env(workspace: str) -> 'Env':
     """Run checks in ``workspace`` on this machine.
 
     The fallback for a :class:`CheckContext` with no env. It is a
-    :class:`~twinkle_agentic.envs.local.LocalEnv`, so a check that falls back to
+    :class:`~twinkle_agentic.envs.localenv.LocalEnv`, so a check that falls back to
     here and a check that runs in a sandbox go through one interface -- and the
     process isolation (own session, killpg on timeout, capped address space)
     lives in one place instead of being restated by every caller that needs it.
@@ -144,7 +144,7 @@ def _local_env(workspace: str) -> 'Env':
     # Imported here, not at module scope: the env package pulls in twinkle's
     # remote-class machinery, and a task declaring only file_* checks should not
     # pay a second of import time for an environment it never runs anything in.
-    from ..envs.local import LocalEnv
+    from ..envs.localenv import LocalEnv
     return LocalEnv(workspace=workspace or '.', command_timeout=DEFAULT_TIMEOUT,
                     memory_limit_gb=_MEM_LIMIT_GB)
 

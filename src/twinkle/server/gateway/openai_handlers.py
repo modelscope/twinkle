@@ -24,7 +24,8 @@ import httpx
 
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
+from .openai_bridge import (TOKENS_HEADER, make_error, translate_chat_request, translate_response,
+                            translate_stream_chunk, wants_tokens)
 
 logger = get_logger()
 
@@ -105,7 +106,12 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
             sampler_data = json.loads(response.body)
             request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-            openai_response = translate_response(sampler_data, model, request_id)
+            # Token ids only when asked for, because they are large and no OpenAI
+            # client has a use for them. The caller that does is one training on
+            # what this endpoint served -- see openai_bridge's module docstring.
+            openai_response = translate_response(
+                sampler_data, model, request_id,
+                include_tokens=wants_tokens(request.headers.get(TOKENS_HEADER)))
             resp_headers = {}
             replica_id = response.headers.get('x-twinkle-replica-id')
             if replica_id:

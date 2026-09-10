@@ -116,6 +116,12 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
         sample_models.append(
             types.SampleResponseModel(
                 sequences=sequences,
+                # The prompt's own ids, which is what makes a reply served over
+                # HTTP trainable: paired with a sequence's tokens they are the
+                # exact ids the model ran on, so a caller never has to re-encode
+                # the text and hope the tokenizer agrees with itself.
+                prompt_token_ids=(list(response.prompt_token_ids)
+                                  if response.prompt_token_ids is not None else None),
                 prompt_logprobs=response.prompt_logprobs,
                 topk_prompt_logprobs=response.topk_prompt_logprobs,
             ))

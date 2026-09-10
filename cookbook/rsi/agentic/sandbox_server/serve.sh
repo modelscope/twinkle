@@ -1,13 +1,17 @@
 #!/bin/sh
-# Start the AgentENV server that hosts the RSI sandboxes.
+# Start the AgentENV server that hosts the RSI sandboxes, plus the reaper that
+# keeps its disk from filling up.
 #
 # Usage:
 #     sh serve.sh                       # foreground, binds 127.0.0.1:8000
 #     API_ADDR=0.0.0.0:8000 sh serve.sh # listen on all interfaces
 #     NOHUP=1 sh serve.sh               # background, logs to /tmp/aenv-server.log
 #     RUST_LOG=agentenv=debug sh serve.sh   # verbose, to watch a template build
-#     STOP_ONLY=1 sh serve.sh           # shut down without starting again
+#     REAP=0 sh serve.sh                # server only, no reaper
+#     REAP_ONLY=1 sh serve.sh           # reaper only, in the foreground
+#     STOP_ONLY=1 sh serve.sh           # shut both down without starting again
 set -eu
+SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 REPO_ROOT="${REPO_ROOT:-$HOME/AgentENV}"
 # Read by the server itself, not by this script.
 export API_ADDR="${API_ADDR:-127.0.0.1:8000}"
@@ -40,14 +44,67 @@ AENV_RUNTIME_PATH="${AENV_RUNTIME_PATH:-/run/aenv}"
 # with RUST_LOG=agentenv=debug before a build you need to watch.
 RUST_LOG="${RUST_LOG:-agentenv=info,envd=info,uvm_ublk=info}"
 
-if [ ! -r "$AENV_CONFIG_PATH" ]; then
-    echo "Config not readable: $AENV_CONFIG_PATH" >&2
-    echo "Seed it from the repo (install.sh does this for you):" >&2
-    echo "    sudo install -d -o aenv -g aenv \$(dirname $AENV_CONFIG_PATH)" >&2
-    echo "    sudo install -o aenv -g aenv -m 0644 \\" >&2
-    echo "        $REPO_ROOT/config/default.toml $AENV_CONFIG_PATH" >&2
-    exit 1
-fi
+# AgentENV persists a sandbox when it ends rather than discarding it: a paused
+# sandbox, ~1GB of memory and disk image under
+# /var/lib/aenv/persisted-sandboxes/artifacts. Closing it from the client does
+# not change that -- a closed sandbox is a paused one -- so every episode leaks a
+# gigabyte and a GRPO step leaks batch_size x num_generations of them. The
+# failure is not graceful: boots start returning "500: ... No space left on
+# device" and every episode in the batch scores zero, which reads like a hard
+# task rather than a broken host. Hence the reaper, for the length of a run.
+REAP="${REAP:-1}"
+REAP_ALIAS="${REAP_ALIAS:-twinkle-rsi-msagent}"
+REAP_INTERVAL="${REAP_INTERVAL:-120}"
+REAP_LOG="${REAP_LOG:-/tmp/aenv-reap.log}"
+REAP_PID_FILE="${REAP_PID_FILE:-/tmp/aenv-reap.pid}"
+
+# Only *paused* sandboxes with this alias: a running one may be an episode in
+# flight, and another alias belongs to another experiment. `aenv list` answers
+# JSON; a server restarting mid-sweep answers something else, which is not worth
+# dying over -- the next sweep sees the same sandboxes.
+reap_ids() {
+    aenv list 2>/dev/null | python3 -c 'import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+for row in rows:
+    if row.get("state") == "paused" and row.get("alias") == sys.argv[1]:
+        print(row["sandboxID"])' "$REAP_ALIAS"
+}
+
+reap_loop() {
+    while : ; do
+        reaped=0
+        for id in $(reap_ids || true); do
+            aenv delete "$id" >/dev/null 2>&1 || true
+            reaped=$((reaped + 1))
+        done
+        echo "$(date +%H:%M:%S) reaped=$reaped free=$(df -h / | tail -1 | awk '{print $4}')"
+        sleep "$REAP_INTERVAL"
+    done
+}
+
+start_reaper() {
+    stop_reaper
+    echo "Starting the reaper (alias $REAP_ALIAS, every ${REAP_INTERVAL}s) -> $REAP_LOG"
+    # This same script in REAP_ONLY mode, so there is one copy of the loop. No
+    # setsid: staying in this process group is what makes Ctrl-C on a foreground
+    # server take the reaper with it, and nohup covers the terminal closing.
+    nohup env REAP_ONLY=1 REAP_ALIAS="$REAP_ALIAS" REAP_INTERVAL="$REAP_INTERVAL" \
+        sh "$SCRIPT" >"$REAP_LOG" 2>&1 </dev/null &
+    echo $! >"$REAP_PID_FILE"
+}
+
+stop_reaper() {
+    [ -f "$REAP_PID_FILE" ] || return 0
+    pid=$(cat "$REAP_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping the reaper (pid: $pid)"
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$REAP_PID_FILE"
+}
 
 # Stop whatever is already running, so this script is a restart rather than a
 # "port already in use" failure. Match the binary path, not this script's name:
@@ -84,11 +141,30 @@ stop_running() {
     fi
 }
 
-stop_running
+# The detached copy lands here; nothing below this point runs for it.
+if [ "${REAP_ONLY:-0}" = 1 ]; then
+    reap_loop
+fi
 
-if [ "${STOP_ONLY:-0}" = "1" ]; then
+stop_running
+stop_reaper
+
+if [ "${STOP_ONLY:-0}" = 1 ]; then
     echo "Stopped."
     exit 0
+fi
+
+if [ ! -r "$AENV_CONFIG_PATH" ]; then
+    echo "Config not readable: $AENV_CONFIG_PATH" >&2
+    echo "Seed it from the repo (install.sh does this for you):" >&2
+    echo "    sudo install -d -o aenv -g aenv \$(dirname $AENV_CONFIG_PATH)" >&2
+    echo "    sudo install -o aenv -g aenv -m 0644 \\" >&2
+    echo "        $REPO_ROOT/config/default.toml $AENV_CONFIG_PATH" >&2
+    exit 1
+fi
+
+if [ "$REAP" = 1 ]; then
+    start_reaper
 fi
 
 cd "$REPO_ROOT"

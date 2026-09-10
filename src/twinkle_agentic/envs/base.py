@@ -5,6 +5,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
+from twinkle.utils import get_logger
+from twinkle_agentic.utils.leases import Leases
+
+logger = get_logger()
 
 # What :meth:`Env.run_script` returns when it had to kill the script. 124 is
 # what GNU ``timeout`` uses, so a caller that logs the number is logging
@@ -107,6 +111,58 @@ class StepResult:
     reward: float = 0.0
     done: bool = False
     info: Dict[str, Any] = field(default_factory=dict)
+
+
+class ToolBackend(ABC):
+    """The tools an environment advertises and executes, as its own object.
+
+    An environment owns a machine: it boots one, runs things in it, throws it
+    away. *Which* tools live on that machine is a separate question, and the
+    answer is whichever agent framework the policy will be served behind -- so
+    it is handed in rather than fixed by the environment. Supporting one more
+    framework is then one more of these and no change to any environment.
+
+    The names are this object's to choose. Whatever :meth:`tools` advertises is
+    what :meth:`call` is handed back, so a framework that namespaces its tools
+    decides here whether the model ever sees the namespace: the side that knows
+    the convention is the side that translates it, and nothing above this class
+    has to learn the spelling.
+    """
+
+    @abstractmethod
+    def install(self, env: 'Env') -> None:
+        """Make the tools usable in an environment that was just reset.
+
+        Called with a freshly built machine, which is the only moment whatever
+        this needs -- a server process, an uploaded script -- can be put there.
+        Raising is right: tools that never came up answer every call with an
+        error, and an episode that scores zero for that reason is
+        indistinguishable from a hard task.
+        """
+
+    @abstractmethod
+    def tools(self) -> List[ToolInfo]:
+        """The schemas to advertise, read after :meth:`install`."""
+
+    @abstractmethod
+    def call(self, env: 'Env', calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[str]:
+        """Run one turn's calls and return one observation each, in order.
+
+        A batch rather than a call at a time, so a backend that can run a turn's
+        calls together keeps doing what it would do in production. Failure is an
+        observation, not an exception: a dead backend has to come back as
+        something the episode survives.
+        """
+
+    def healthy(self, env: 'Env') -> bool:
+        """Do the tools answer right now? Default: nothing of its own to lose.
+
+        Asked alongside the environment's own health check, because the two can
+        disagree -- a machine that answers while the tool runtime on it has died
+        is a machine no episode can use, and one that reports itself healthy is
+        never rebuilt.
+        """
+        return True
 
 
 class Env(ABC):
@@ -265,3 +321,41 @@ class Env(ABC):
 
     def __exit__(self, *args):
         self.close()
+
+
+class EnvLeases(Leases[Env]):
+    """Lend one environment to one job for the whole life of that job.
+
+    A job that acts in an environment is also verified in it, so it needs the
+    same one from start to end -- but only that it be its own: nothing about a
+    job says *which* environment it wants. A lease is therefore the whole of the
+    routing question, and :class:`~twinkle_agentic.utils.leases.Leases` is the
+    whole of the scheduler; what an environment adds is what cleaning one means.
+    """
+
+    def __init__(self, envs: Sequence[Env]):
+        super().__init__(envs)
+        self.n_recovered = 0
+
+    def _prepare(self, env: Env) -> Env:
+        """Hand over an empty workspace, standing the environment up if need be.
+
+        The lease boundary is also the only moment at which recovery is safe:
+        throwing the workspace away is what the next job wanted anyway, whereas
+        doing it mid-job would swap the state being judged for an empty
+        directory.
+        """
+        try:
+            env.clear()
+            return env
+        except Exception as exc:  # noqa: BLE001 -- the reason is logged, the fix is below
+            logger.warning(f'[{type(self).__name__}] {type(env).__name__} could not clean itself '
+                           f'({type(exc).__name__}: {exc}); recovering it')
+        # Gone and re-established, or still there and not to be trusted: one of
+        # the two is why clear() failed, and ensure_ready() reports which.
+        if not env.ensure_ready():
+            env.rebuild()
+        env.clear()
+        with self._lock:
+            self.n_recovered += 1
+        return env

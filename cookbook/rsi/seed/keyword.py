@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Keywords per direction: generate, de-duplicate, store, read back.
+"""Topics per direction: generate, de-duplicate, store, draw, hand one group over.
 
 A keyword is a *topic* to build a task around, not a task statement, which is
 why over-length replies are dropped rather than stored.
@@ -13,15 +13,16 @@ from twinkle.utils import get_logger
 from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.utils.code_utils import strip_reasoning
 from twinkle_agentic.utils.message_utils import assistant_text
+from .base import Seeder
 
 logger = get_logger()
 
-__all__ = ['KEYWORD_MAX_LEN', 'KeywordGenerator']
+__all__ = ['KEYWORD_MAX_LEN', 'KeywordSeeder']
 
 KEYWORD_MAX_LEN = 60
 
 
-class KeywordGenerator:
+class KeywordSeeder(Seeder):
     """Keyword combinations drawn from one list per direction.
 
     ``keywords_group_size`` of the directions are active at a time and one draw
@@ -34,6 +35,10 @@ class KeywordGenerator:
     the keywords themselves is flat, so a keyword one direction produced is never
     handed to another.
 
+    As a seeder it hands the challenger one drawn combination per round, and
+    ``None`` once every combination has been spent -- which, with ``recycle``
+    left off, is how a run stops repeating itself.
+
     Args:
         query: what the keywords have to satisfy -- one entry per direction. Must
             be at least ``keywords_group_size`` of them.
@@ -42,6 +47,7 @@ class KeywordGenerator:
         num_keywords: a direction's budget; past it, it is retired.
         keywords_group_size: how many keywords one draw combines.
         system_prompt: overrides the built-in one.
+        seed_template: overrides what a drawn group is handed over as.
         recycle: once every direction is spent, hand out the same combinations
             again instead of returning None.
         rollout_kwargs: passed to ``MultiTurnRollout``. ``template`` is required;
@@ -62,6 +68,10 @@ class KeywordGenerator:
 
     _user_prompt = 'Give {k} distinct topics that satisfy:\n{query}'
 
+    # Topics, not an instruction: what to do with them is the challenger's own
+    # prompt, which this is appended to.
+    _seed_template = 'Build it around these topics: {keywords}'
+
     def __init__(
         self,
         query: Sequence[str],
@@ -71,6 +81,7 @@ class KeywordGenerator:
         num_keywords: int = 64,
         keywords_group_size: int = 3,
         system_prompt: Optional[str] = None,
+        seed_template: Optional[str] = None,
         sampling_params: Optional[SamplingParams] = None,
         recycle: bool = False,
         **rollout_kwargs: Any,
@@ -86,6 +97,7 @@ class KeywordGenerator:
         self.keywords_group_size = keywords_group_size
         self.recycle = recycle
         self.system_prompt = system_prompt or self._default_prompt
+        self._seed_template = seed_template or self._seed_template
         # Built on the first call rather than here, so a fully cached run needs no backend.
         self._backend = backend
         self._rollout_kwargs = dict(rollout_kwargs, sampling_params=sampling_params, max_turns=1)
@@ -103,6 +115,15 @@ class KeywordGenerator:
         self._odometer = [0] * keywords_group_size
         self._drawn: Set[Tuple[str, ...]] = set()
         self._recycled = False
+
+    # -------------------------------------------------------------------- seed
+
+    def __call__(self) -> Optional[str]:
+        """One drawn combination, rendered. None once the pool is spent."""
+        groups = self.get_keywords(1)
+        if not groups:
+            return None
+        return self._seed_template.format(keywords=', '.join(groups[0]))
 
     # ------------------------------------------------------------------- get
 

@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .base import AgentHarness
+from .base import AgentHarness, HarnessLeases
 
 __all__ = [
     'AgentHarness',
+    'HarnessLeases',
     'MsAgentHarness',
 ]
 

@@ -110,6 +110,17 @@ class Template:
         return parser.parse_errors(decoded) if parser else []
 
     @property
+    def tool_call_stop(self) -> Optional[str]:
+        """The string a caller stops generation at to hold a reply to one tool call.
+
+        Cannot be answered by ``detect``, which needs the reply that does not
+        exist yet, so each template names its own format. None means the format
+        has no closing marker -- ReAct and a bare call list end where the reply
+        does -- and a caller then lets the reply run to its end.
+        """
+        return None
+
+    @property
     def tokenizer(self):
         tokenizer = self.processor
         if hasattr(tokenizer, 'tokenizer'):

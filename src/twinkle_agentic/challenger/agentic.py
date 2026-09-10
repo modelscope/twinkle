@@ -1,23 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Agentic challenger: act in a sandbox, verify the result, then describe it."""
 import math
-import random
 import re
+import threading
 import uuid
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import SamplingParams, Trajectory, attach_user_data, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse
 from twinkle.utils import get_logger
 from twinkle_agentic.envs import Env
+from twinkle_agentic.harness import AgentHarness, HarnessLeases
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.rollout import APISampler, MultiTurnRollout
-from twinkle_agentic.summarizer import Summarizer
 from twinkle_agentic.utils.code_utils import parse_fenced_code, strip_reasoning
-from twinkle_agentic.utils.message_utils import assistant_text, msg_content_text, normalize_tool_calls
-from .base import Challenger, _parallel
-from .keyword import KeywordGenerator
+from twinkle_agentic.utils.message_utils import assistant_text
+from .base import Challenger
 from .recorder import RolloutRecorder
 
 __all__ = ['AgenticChallenger', 'parse_problem_statement']
@@ -90,6 +90,23 @@ class _ProposalResult:
     outcome: str = ''
     n_pass: Optional[int] = None
     reward: float = 0.0
+    attempts: List[Tuple[Trajectory, bool]] = field(default_factory=list)
+
+
+@dataclass
+class _Unit:
+    """One prompt's worth of work: its proposals, and the attempts they earn.
+
+    Held together by a count of jobs rather than by a barrier, because its jobs do
+    not start together: a proposal that lands early has its attempts queued while
+    its siblings are still proposing. The last job to finish, of either kind, is
+    the one that scores the unit.
+    """
+
+    group_id: str
+    proposals: List[Optional[_ProposalResult]]
+    pending: int
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class AgenticChallenger(Challenger):
@@ -99,6 +116,20 @@ class AgenticChallenger(Challenger):
     ``api`` generates only the appended check-script and problem-statement turns;
     those turns retain the masking semantics selected by ``api_appended_as`` in
     ``rollout_kwargs``.
+
+    What a unit of work proposes *about* is not this class's business: ``seed_fn``
+    is asked once per unit and whatever it returns is appended to the opening
+    instruction. So a run adds a kind of variety -- a keyword pool, earlier
+    trajectories, a difficulty ladder -- by passing a different callable, not by
+    growing a parameter here per kind. Nothing back means propose from scratch,
+    which is also what no ``seed_fn`` at all means.
+
+    ``harness_factory`` decides what an attempt *opens* with. Given one, every
+    attempt leases a harness of its own and starts from whatever that framework
+    puts in front of a query, so the policy is trained behind the agent it will
+    be served behind; the plain ``solver_system_prompt`` below is what stands in
+    when there is none. The proposing side never uses one: proposing is a
+    training-only role, and its opening is this class's own by design.
     """
 
     _system = ('You invent tasks for another agent to solve. You have a sandbox and '
@@ -106,14 +137,10 @@ class AgenticChallenger(Challenger):
                'to verify it and to describe it.')
     _from_scratch = ('Choose a task worth doing in this sandbox and do it now, using '
                      'your tools. Do not describe it yet.')
-    _from_keywords = ('Choose a task around these topics and do it now, using your '
-                      'tools. Do not describe it yet.\n\nTopics: {keywords}')
-    _from_seed = ('Here is an earlier task:\n\n{seed}\n\nDo something in the same '
-                  'spirit but different, using your tools now. Do not describe it yet.')
-    _from_seed_keywords = ('Here is an earlier task:\n\n{seed}\n\nDo something in the same '
-                           'spirit but different, may be more complex and interesting and meaningful, '
-                           'around these topics, using your tools now. Do not describe it yet.\n\n'
-                           'Topics: {keywords}')
+    # The seed is appended rather than woven in: it says what to build around, this
+    # says what to do with it, and neither has to know how the other is phrased.
+    _from_seed = ('Choose a task worth doing in this sandbox and do it now, using your '
+                  'tools. Do not describe it yet.\n\n{seed}')
     _check_followup = ('Stop working. This is the workspace you produced:\n\n{final_state}\n\n'
                        'Write a {language} script that verifies this end state, as a fenced '
                        '{language} code block and nothing else. It must exit with a non-zero status '
@@ -131,6 +158,11 @@ class AgenticChallenger(Challenger):
                          'would have to be told to produce what you produced, and nothing about how you '
                          'did it. Name the files to create and quote any input data verbatim. Do not '
                          'reveal values your check script computes. Reply with the statement only.')
+    # The statement says what to produce, not that producing it is the job. Without
+    # this a solver answers with a description of the work and the check script,
+    # reading a workspace nobody touched, fails it.
+    _solver_system = ('You solve tasks in a workspace using your tools. Do the work -- create the '
+                      'files the task asks for. Do not just describe what you would do.')
 
 
     def __init__(
@@ -139,24 +171,23 @@ class AgenticChallenger(Challenger):
         *,
         api: Optional[Any] = None,
         use_api: bool = False,
-        keyword_generator: Optional[KeywordGenerator] = None,
-        trajectory_seed: Optional[List[Trajectory]] = None,
-        summarizer: Optional[Summarizer] = None,
+        seed_fn: Optional[Callable[[], Optional[str]]] = None,
         system_prompt: Optional[str] = None,
         from_scratch_prompt: Optional[str] = None,
-        from_keywords_prompt: Optional[str] = None,
         from_seed_prompt: Optional[str] = None,
-        from_seed_keywords_prompt: Optional[str] = None,
         check_followup_prompt: Optional[str] = None,
         check_retry_followup_prompt: Optional[str] = None,
         check_parse_error_prompt: Optional[str] = None,
         problem_followup_prompt: Optional[str] = None,
+        solver_system_prompt: Optional[str] = None,
         check_retries: int = 1,
         problem_max_chars: int = 8192,
         check_language: str = 'python',
         parse_check_fn: Optional[Callable[[str], Optional[str]]] = None,
+        brittle_check_fn: Optional[Callable[[str], Optional[str]]] = None,
         pass_rate_target: float = 0.2,
         envs: Sequence[Env] = (),
+        harness_factory: Optional[Callable[[], AgentHarness]] = None,
         num_challenger_rollouts: int = 8,
         num_solver_rollouts: int = 8,
         pass_band: Tuple[float, float] = (1.0, 7.0),
@@ -190,15 +221,10 @@ class AgenticChallenger(Challenger):
         backend_is_api = isinstance(backend, (API, APISampler))
         if use_api and api is None and not backend_is_api:
             raise ValueError('use_api=True requires api= when backend is a sampler')
-        self.keyword_generator = keyword_generator
-        self.trajectory_seed = list(trajectory_seed or ())
-        self.summarizer = summarizer
+        self.seed_fn = seed_fn
         self._system = self._system if system_prompt is None else system_prompt
         self._from_scratch = self._from_scratch if from_scratch_prompt is None else from_scratch_prompt
-        self._from_keywords = self._from_keywords if from_keywords_prompt is None else from_keywords_prompt
         self._from_seed = self._from_seed if from_seed_prompt is None else from_seed_prompt
-        self._from_seed_keywords = (self._from_seed_keywords if from_seed_keywords_prompt is None else
-                                    from_seed_keywords_prompt)
         self._check_followup = self._check_followup if check_followup_prompt is None else check_followup_prompt
         self._check_retry_followup = (self._check_retry_followup if check_retry_followup_prompt is None else
                                       check_retry_followup_prompt)
@@ -206,77 +232,66 @@ class AgenticChallenger(Challenger):
                                    check_parse_error_prompt)
         self._problem_followup = (self._problem_followup if problem_followup_prompt is None else
                                   problem_followup_prompt)
+        self._solver_system = self._solver_system if solver_system_prompt is None else solver_system_prompt
         self._check_retries = check_retries
         self._problem_max_chars = problem_max_chars
         self._check_language = check_language.strip().lower()
         self._parse_check_fn = parse_check_fn
+        self._brittle_check_fn = brittle_check_fn
         self._pass_rate_target = pass_rate_target
         self._pass_rate_width = pass_rate_width
         self.checker = checker
         self.followup_params = followup_params
-        self.rng = random.Random()
         self.use_api = use_api
         self.save_failed_rollouts = save_failed_rollouts
         self._recorder = RolloutRecorder(save_dir) if save_dir else None
-        self._round_proposals: List[_ProposalResult] = []
-        self._backend = backend
-        self._rollout_kwargs = dict(rollout_kwargs)
+        kwargs = dict(rollout_kwargs)
         if api is not None:
-            self._rollout_kwargs['api'] = api
+            kwargs['api'] = api
         if use_api:
-            self._rollout_kwargs['response_callback'] = _api_followup_response
-        self._rollout: Optional[MultiTurnRollout] = None
-        self._tool_schemas = self.env().tools() or None
+            kwargs['response_callback'] = _api_followup_response
+        # Every job shares one rollout, built here rather than on first use:
+        # building it needs nothing a job has, so building it up front spares the
+        # jobs a race over who gets to -- one they would all lose but one.
+        self._rollout = MultiTurnRollout(backend, **kwargs)
+        self._tally = threading.Lock()
+        # One harness per concurrent job, for the reason there is one environment
+        # per job: a harness carries the wrapped framework's memory and context,
+        # so two attempts sharing one would read each other's.
+        self._harnesses = (HarnessLeases(harness_factory, len(self.envs))
+                           if harness_factory is not None else None)
 
-    def _rollout_instance(self) -> MultiTurnRollout:
-        if self._rollout is None:
-            self._rollout = MultiTurnRollout(self._backend, **self._rollout_kwargs)
-        return self._rollout
-
-    def _tool_manager(self, slot: int) -> Optional[Any]:
-        env = self.env(slot)
+    def _tool_manager(self, env: Env) -> Optional[Any]:
         return env.tool_manager() if env.tools() else None
 
-    def _summary(self, trajectory: Trajectory) -> str:
-        turns: List[str] = []
-        for message in trajectory.get('messages') or []:
-            if not isinstance(message, dict):
-                continue
-            role = message.get('role') or ''
-            if role == 'system':
-                continue
-            parts = [msg_content_text(message).strip()]
-            for call in normalize_tool_calls(message) or ():
-                fn = call.get('function') or {}
-                if isinstance(fn, dict) and fn.get('name'):
-                    parts.append(f"calls {fn['name']}({fn.get('arguments') or ''})")
-            body = '\n'.join(part for part in parts if part)
-            if body:
-                turns.append(f'{role}: {body}')
-        text = '\n'.join(turns)
-        if not text:
-            return ''
-        return self.summarizer(text) if self.summarizer is not None else text
+    @staticmethod
+    def _with_tools(prompt: Trajectory, env: Env) -> Trajectory:
+        """A copy of ``prompt`` advertising the tools this environment executes.
+
+        Read off the environment in hand, per job, rather than once at
+        construction: an environment that stands its tool runtime up on first use
+        has nothing to report before it is leased, and taking the schemas from
+        the side that will run them is what keeps the contract in the prompt and
+        the code behind it from drifting apart.
+        """
+        tools = env.tools()
+        if not tools:
+            return prompt
+        prompt = dict(prompt)
+        prompt['tools'] = list(tools)
+        return prompt
 
     def _build_challenge_prompt(self) -> Optional[Trajectory]:
-        keywords: List[str] = []
-        if self.keyword_generator is not None:
-            groups = self.keyword_generator.get_keywords(1)
-            if not groups:
-                return None
-            keywords = groups[0]
-        seed = ''
-        if self.trajectory_seed:
-            seed = self._summary(self.rng.choice(self.trajectory_seed))
-        block = ', '.join(keywords)
-        if seed and keywords:
-            user = self._from_seed_keywords.format(seed=seed, keywords=block)
-        elif seed:
-            user = self._from_seed.format(seed=seed)
-        elif keywords:
-            user = self._from_keywords.format(keywords=block)
-        else:
-            user = self._from_scratch
+        """The opening turn of a unit of work, with whatever the seeder offered appended.
+
+        Never None: a seeder with nothing left to offer costs this unit a plainer
+        prompt, not the run. What ends a run is ``max_empty_rounds``, which counts
+        units that produced nothing trainable -- the honest measure, since a seed
+        is inspiration and a unit can succeed without one.
+        """
+        seed = (self.seed_fn() if self.seed_fn is not None else None) or ''
+        seed = seed.strip()
+        user = self._from_seed.format(seed=seed) if seed else self._from_scratch
         prompt: Trajectory = {
             'messages': [
                 {
@@ -289,33 +304,51 @@ class AgenticChallenger(Challenger):
                 },
             ],
         }
-        if self._tool_schemas:
-            prompt['tools'] = self._tool_schemas
-        return attach_user_data(prompt, keywords=keywords, seeded=bool(seed))
+        return attach_user_data(prompt, seed=seed)
 
-    def _explore(self, prompt: Trajectory) -> List[Trajectory]:
-        group_id = uuid.uuid4().hex
-        proposals: List[_ProposalResult] = []
-        remaining = self.num_challenger_rollouts
-        while remaining > 0:
-            wave = min(self.n_slots, remaining)
-            proposals.extend(_parallel(lambda slot: self._run_episode(prompt, slot), wave))
-            remaining -= wave
-        for proposal in proposals:
-            proposal.group_id = group_id
-        self._round_proposals = proposals
-        return [proposal.task for proposal in proposals if proposal.task is not None]
+    def _launch(self) -> bool:
+        """Queue one prompt's proposing episodes."""
+        prompt = self._build_challenge_prompt()
+        if prompt is None:
+            return False
+        unit = _Unit(group_id=uuid.uuid4().hex,
+                     proposals=[None] * self.num_challenger_rollouts,
+                     pending=self.num_challenger_rollouts)
+        for index in range(self.num_challenger_rollouts):
+            self._submit(lambda env, i=index: self._propose(unit, i, prompt, env))
+        return True
 
-    def _run_episode(self, prompt: Trajectory, slot: int) -> _ProposalResult:
-        self.env(slot).clear()
-        state: Dict[str, Any] = {'slot': slot}
+    def _propose(self, unit: _Unit, index: int, prompt: Trajectory, env: Env) -> None:
+        """One proposing episode, and the attempts it earns by producing a task.
+
+        The attempts are queued from here rather than once the unit has finished
+        proposing: a task can be solved the moment it exists, and waiting for its
+        siblings is what leaves environments idle at the end of every round.
+        """
+        try:
+            result = self._episode(prompt, env)
+            result.group_id = unit.group_id
+            unit.proposals[index] = result
+            if result.task is not None and self.num_solver_rollouts:
+                # Counted in before this job is counted out, or the unit reads as
+                # finished with its attempts not yet asked for.
+                with unit.lock:
+                    unit.pending += self.num_solver_rollouts
+                for _ in range(self.num_solver_rollouts):
+                    self._submit(lambda solver_env, r=result: self._solve(unit, r, solver_env))
+        finally:
+            self._job_done(unit)
+
+    def _episode(self, prompt: Trajectory, env: Env) -> _ProposalResult:
+        prompt = self._with_tools(prompt, env)
+        state: Dict[str, Any] = {'env': env}
         kwargs: Dict[str, Any] = {
             'followup_fn': lambda trajectory, n_before: self._followup(state, trajectory, n_before),
         }
-        manager = self._tool_manager(slot)
+        manager = self._tool_manager(env)
         if manager is not None:
             kwargs['tool_manager'] = manager
-        explored = self._rollout_instance()([prompt], **kwargs)
+        explored = self._rollout([prompt], **kwargs)
         if not explored:
             self._reject(state, 'rollout_no_output')
             return _ProposalResult(dict(prompt), reason='rollout_no_output')
@@ -323,6 +356,46 @@ class AgenticChallenger(Challenger):
         task = self._build_query(state, trajectory)
         reason, detail = state.get('reject', ('', ''))
         return _ProposalResult(trajectory, task=task, reason=reason, detail=detail)
+
+    def _solve(self, unit: _Unit, proposal: _ProposalResult, env: Env) -> None:
+        """One attempt at one task, graded in the environment that made it."""
+        try:
+            with self._lease_harness() as harness:
+                kwargs: Dict[str, Any] = {}
+                if harness is not None:
+                    kwargs['harness'] = harness
+                manager = self._tool_manager(env)
+                if manager is not None:
+                    kwargs['tool_manager'] = manager
+                attempts = self._rollout([self._solver_prompt(proposal.task, env, harness)], **kwargs)
+            if attempts:
+                passed = self._judge(proposal.task, env)
+                with unit.lock:
+                    proposal.attempts.append((attempts[0], passed))
+        finally:
+            self._job_done(unit)
+
+    @contextmanager
+    def _lease_harness(self) -> Iterator[Optional[AgentHarness]]:
+        """The harness this attempt owns, or None when no factory was given.
+
+        Held for the rollout only. The check that grades the attempt afterwards
+        reads the workspace, not the conversation, so keeping the harness for it
+        would only make the next attempt wait.
+        """
+        if self._harnesses is None:
+            yield None
+            return
+        with self._harnesses.lease() as harness:
+            yield harness
+
+    def _job_done(self, unit: _Unit) -> None:
+        """Count one job out, and score the unit if it was the last one."""
+        with unit.lock:
+            unit.pending -= 1
+            if unit.pending:
+                return
+        self._score(unit)
 
     def _followup(self, state: Dict[str, Any], trajectory: Trajectory,
                   n_before: int) -> Optional[Tuple[str, Optional[SamplingParams]]]:
@@ -335,9 +408,9 @@ class AgenticChallenger(Challenger):
         return followup, self.followup_params
 
     def _build_test_case(self, state: Dict[str, Any], reply: Optional[str]) -> Optional[str]:
-        slot = state['slot']
+        env: Env = state['env']
         if reply is None:
-            snapshot, error = self.env(slot).snapshot()
+            snapshot, error = env.snapshot()
             state['snapshot'] = snapshot
             if not snapshot.strip():
                 state['reject'] = ('snapshot_unavailable' if error else 'empty_workspace', error)
@@ -358,11 +431,18 @@ class AgenticChallenger(Challenger):
             state['reject'] = ('check_parse_fail', reply)
             return None
         state['script'] = script
-        exit_code, output = self.env(slot).run_script(script, interpreter=self._check_language)
+        # Read off the script before it is run, because passing on the author's own
+        # workspace is exactly what hides this defect: a check that pins a file's
+        # size or quotes a script's source passes for its author and fails every
+        # correct reproduction. The reason goes back the way a failed assertion
+        # does, since it is the same kind of fault.
+        brittle = self._brittle_check_fn(script) if self._brittle_check_fn is not None else None
+        exit_code, output = (1, brittle) if brittle else env.run_script(
+            script, interpreter=self._check_language)
         if exit_code == 0:
             state['checked'] = True
             return self._problem_followup
-        after = self.env(slot).snapshot()[0]
+        after = env.snapshot()[0]
         state.setdefault('attempts', []).append(f'--- attempt {attempt}: exit {exit_code} ---\n{output}\n'
                                                 f'--- check script ---\n{script}')
         if attempt <= self._check_retries:
@@ -396,8 +476,7 @@ class AgenticChallenger(Challenger):
                 'content': statement
             }]},
             check_script=state['script'],
-            keywords=user_data_get(explored.get('user_data'), 'keywords', []),
-            seeded=user_data_get(explored.get('user_data'), 'seeded', False),
+            seed=user_data_get(explored.get('user_data'), 'seed', ''),
         )
         if self.checker is not None and not self.checker(task):
             return self._reject(state, 'rejected_by_checker')
@@ -409,17 +488,37 @@ class AgenticChallenger(Challenger):
                     f"{f' -- {detail[:400]}' if detail else ''}")
         return None
 
-    def _solver_prompt(self, task: Trajectory) -> Trajectory:
-        prompt: Trajectory = {'messages': [dict(message) for message in task.get('messages') or []]}
-        if self._tool_schemas:
-            prompt['tools'] = self._tool_schemas
-        return prompt
+    def _solver_prompt(self, task: Trajectory, env: Env,
+                       harness: Optional[AgentHarness] = None) -> Trajectory:
+        """The opening one attempt starts from: the statement, plus how to read it.
 
-    def _judge(self, task: Trajectory, slot: int) -> bool:
+        With a harness the opening is *its* -- system prompt, memory, whatever the
+        framework puts in front of a query -- because the policy is deployed
+        behind that framework, and a second phrasing invented here is one it would
+        never meet again.
+
+        The tools come from the environment either way, overriding whatever the
+        harness advertises. A harness on the training host is built without a tool
+        runtime of its own, since standing one up here would execute the model's
+        commands in the trainer's own process, so the schemas that mean anything
+        are the ones the environment will honour.
+        """
+        statement = next((message.get('content', '') for message in task.get('messages') or []
+                          if isinstance(message, dict) and message.get('role') == 'user'), '')
+        if harness is not None:
+            prompt = harness.start(statement)
+        else:
+            messages: List[Dict[str, Any]] = [{'role': 'user', 'content': statement}]
+            if self._solver_system:
+                messages.insert(0, {'role': 'system', 'content': self._solver_system})
+            prompt = {'messages': messages}
+        return self._with_tools(prompt, env)
+
+    def _judge(self, task: Trajectory, env: Env) -> bool:
         script = user_data_get(task.get('user_data'), 'check_script', '')
         if not script:
             return False
-        return self.env(slot).run_script(script, interpreter=self._check_language)[0] == 0
+        return env.run_script(script, interpreter=self._check_language)[0] == 0
 
     def challenger_reward(self, n_pass: Optional[int]) -> float:
         """Reward tasks near the target solver pass rate; unmeasured failures score zero."""
@@ -429,8 +528,7 @@ class AgenticChallenger(Challenger):
         variance = 2.0 * self._pass_rate_width**2
         return math.exp(-(gap * gap) / variance)
 
-    def _record_proposals(self) -> None:
-        proposals, self._round_proposals = self._round_proposals, []
+    def _record_proposals(self, proposals: List[_ProposalResult]) -> None:
         if self._recorder is None:
             return
         for index, proposal in enumerate(proposals):
@@ -458,54 +556,92 @@ class AgenticChallenger(Challenger):
                            if proposal.n_pass is not None and self.num_solver_rollouts else None),
                 statement=statement,
                 check_script=user_data_get(task_data, 'check_script', ''),
-                keywords=user_data_get(proposal.trajectory.get('user_data'), 'keywords', []),
-                seeded=user_data_get(proposal.trajectory.get('user_data'), 'seeded', False),
+                seed=user_data_get(proposal.trajectory.get('user_data'), 'seed', ''),
             )
 
-    def _filter_difficulty(self, tasks: List[Trajectory]) -> List[Trajectory]:
-        successful = [proposal for proposal in self._round_proposals if proposal.task is not None]
-        if len(successful) != len(tasks):
-            raise RuntimeError('proposal/task alignment failed before difficulty filtering')
-        if not tasks or not self.num_solver_rollouts:
-            for proposal in successful:
-                proposal.outcome = 'kept'
-            self._record_proposals()
-            return tasks
+    def _score(self, unit: _Unit) -> None:
+        """Grade a finished unit and hand over whatever is trainable in it.
 
-        passes = [0] * len(tasks)
-        plan = [i for i in range(len(tasks)) for _ in range(self.num_solver_rollouts)]
-        rollout = self._rollout_instance()
-        for start in range(0, len(plan), self.n_slots):
-            wave = plan[start:start + self.n_slots]
-            _parallel(lambda slot: self.env(slot).clear(), len(wave))
-            prompts = [self._solver_prompt(tasks[i]) for i in wave]
-            kwargs: Dict[str, Any] = {}
-            managers = [self._tool_manager(slot) for slot in range(len(wave))]
-            if any(manager is not None for manager in managers):
-                kwargs['tool_manager'] = managers
-            attempts = rollout(prompts, **kwargs)
-            if len(attempts) != len(prompts):
-                raise RuntimeError(f'rollout returned {len(attempts)} attempts for '
-                                   f'{len(prompts)} prompts; expected one per prompt')
-            verdicts = _parallel(lambda slot: self._judge(tasks[wave[slot]], slot), len(wave))
-            for slot, passed in enumerate(verdicts):
-                if passed:
-                    passes[wave[slot]] += 1
-
+        Difficulty is counted here rather than measured: the attempts have already
+        run, each in an environment of its own, and how many of them passed is what
+        puts a task inside the band or outside it.
+        """
+        proposals = [proposal for proposal in unit.proposals if proposal is not None]
         low, high = self.pass_band
-        measured = [
-            attach_user_data(task, n_pass=n_pass, n_rollouts=self.num_solver_rollouts)
-            for task, n_pass in zip(tasks, passes)
-        ]
-        kept: List[Trajectory] = []
-        for proposal, task, n_pass in zip(successful, measured, passes):
-            proposal.task = task
+        kept = 0
+        for proposal in proposals:
+            if proposal.task is None:
+                continue
+            if not self.num_solver_rollouts:
+                proposal.outcome = 'kept'
+                kept += 1
+                continue
+            n_pass = sum(1 for _, passed in proposal.attempts if passed)
+            proposal.task = attach_user_data(proposal.task, n_pass=n_pass, n_rollouts=self.num_solver_rollouts)
             proposal.n_pass = n_pass
             proposal.reward = self.challenger_reward(n_pass)
             if low <= n_pass <= high:
                 proposal.outcome = 'kept'
-                kept.append(task)
+                kept += 1
             else:
                 proposal.outcome = 'outside_band'
-        self._record_proposals()
-        return kept
+        verified = sum(1 for proposal in proposals if proposal.task is not None)
+        with self._tally:
+            self.n_proposed += len(proposals)
+            self.n_kept += kept
+            logger.info(f'[{type(self).__name__}] {len(proposals)} episodes, {verified} verified, '
+                        f'{kept} in band (cumulative {self.n_kept}/{self.n_proposed})')
+        self._record_proposals(proposals)
+        self._complete(*self._groups(proposals))
+
+    def _groups(self, proposals: List[_ProposalResult]) -> Tuple[List[List[Trajectory]], List[List[Trajectory]]]:
+        """One proposing group, and the attempts on at most one of the tasks it kept.
+
+        Every proposal is in the proposing group, the rejected ones included: their
+        zero reward is what the rest of the group is measured against. Only one task
+        per unit hands over its attempts, the one whose pass rate landed closest to
+        the target -- the tasks of a unit share a seed and a prompt, so training on
+        several of them buys correlated data with a batch slot that another unit's
+        would have filled better. A unit whose proposals all fell outside the band
+        hands over none.
+        """
+        challenger: List[Trajectory] = []
+        solver: List[Tuple[float, List[Trajectory]]] = []
+        for index, proposal in enumerate(proposals):
+            trajectory = dict(proposal.trajectory)
+            trajectory['rewards'] = proposal.reward
+            challenger.append(
+                attach_user_data(
+                    trajectory,
+                    side='propose',
+                    group_id=proposal.group_id,
+                    proposal_index=index,
+                    outcome=proposal.outcome or ('rejected' if proposal.reason else 'kept'),
+                    n_pass=proposal.n_pass))
+            if proposal.outcome != 'kept':
+                continue
+            group: List[Trajectory] = []
+            for attempt, passed in proposal.attempts:
+                episode = dict(attempt)
+                episode['rewards'] = 1.0 if passed else 0.0
+                group.append(
+                    attach_user_data(
+                        episode,
+                        side='solve',
+                        group_id=f'{proposal.group_id}:{index}',
+                        proposal_index=index,
+                        passed=passed))
+            if group:
+                solver.append((proposal.reward, group))
+        best = max(solver, key=lambda entry: entry[0], default=None)
+        return [challenger] if challenger else [], [best[1]] if best is not None else []
+
+    def close(self) -> None:
+        """Workers and environments first, harnesses after.
+
+        In that order because ``super().close()`` is what waits the jobs out, and
+        a harness must not be released while a job could still be holding it.
+        """
+        super().close()
+        if self._harnesses is not None:
+            self._harnesses.close()

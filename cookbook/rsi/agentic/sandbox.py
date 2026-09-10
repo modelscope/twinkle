@@ -138,7 +138,7 @@ class Sandbox(Env):
     adds is RSI's policy rather than a transport: which script empties a
     workspace, which one reads it back and in what format, and what to do when
     either fails. That split is why the same policy works over a microVM and over
-    :class:`~twinkle_agentic.envs.local.LocalEnv` -- and why a caller holding a
+    :class:`~twinkle_agentic.envs.localenv.LocalEnv` -- and why a caller holding a
     slot does not need to know which it has.
 
     Not thread-safe on purpose. A slot belongs to whoever holds it, and the pool

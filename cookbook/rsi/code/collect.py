@@ -20,7 +20,7 @@ problem's asserts, milliseconds, and the stage makes ``candidates x rollouts`` o
 them per round -- through a microVM that would be the dominant cost of the
 iteration, and the 32 slots are worth more to the agentic half, whose episodes
 cannot run anywhere else. That choice is one argument: the ``envs`` this half is
-built with are :class:`~twinkle_agentic.envs.local.LocalEnv`, and handing it
+built with are :class:`~twinkle_agentic.envs.localenv.LocalEnv`, and handing it
 ``sandbox.open_pool``'s slots instead is the whole change if the trade ever does.
 """
 import os

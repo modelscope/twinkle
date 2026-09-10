@@ -64,7 +64,6 @@ max_chat_round: 9999
 
 # Never wait on a human: training runs unattended.
 interactive: false
-permission_mode: auto
 
 # How long ms-agent waits around one tool call. Written down rather than left to
 # its default (tool_manager.py TOOL_CALL_TIMEOUT, 120s, overridable by the
@@ -144,6 +143,10 @@ tools:
 # `rm -rf build/*` are both refused) or write a task that starts from a mess that
 # has to be cleaned up.
 permission:
+  # Never wait on a human for a confirm. The nested key is the one
+  # PermissionConfig.from_dict reads; a top-level `permission_mode` is not read
+  # by anything.
+  mode: auto
   # Drops the default blacklist wholesale: curl, wget, ssh, scp, rsync, nc,
   # netcat. (Whether the microVM actually has a route out is a separate
   # question from whether the command is allowed to run.)

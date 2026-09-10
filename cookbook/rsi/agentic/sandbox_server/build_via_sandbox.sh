@@ -1,41 +1,8 @@
 #!/bin/sh
-# Build the sandbox template by installing inside a live sandbox and snapshotting
-# it, instead of `aenv build`.
-#
-# Why this exists. On 2026-08-23 three `aenv build` attempts failed or stalled on
-# this host, and the reason turned out to be download speed rather than anything
-# in the Dockerfile. Measured the same minute, from inside a sandbox:
-#
-#     deb.debian.org                33 KB/s
-#     mirrors.aliyun.com/debian    5.4 MB/s
-#     host, same aliyun file         12 MB/s
-#     sandbox disk write            639 MB/s
-#
-# The build VM was pulling apt's 9.6MB package index at that first rate, which
-# reads exactly like a hang: the server logs "template build started" and then
-# nothing at all until the build ends. A sandbox, by contrast, installs the whole
-# list in about six minutes.
-#
-# The Dockerfile now points apt at the same mirror, so `install.sh` should work
-# again -- but this path is kept because it is the one that has been verified end
-# to end, and because it needs no template builder at all.
-#
-# Keep the two package lists here identical to the Dockerfile's. They are
-# duplicated rather than shared because this script needs shell lines a sandbox
-# can run and the Dockerfile needs one instruction per line.
-#
-# What a snapshot does not carry: the image config. `ENV PYTHONUNBUFFERED=1`,
-# `ENV PIP_INDEX_URL=...` and `WORKDIR /workspace` from the Dockerfile do not
-# survive, so the steps below write the equivalents into the filesystem
-# (/etc/pip.conf, /workspace) and remote_tool_env.py starts the runtime with
-# `python -u`.
-#
-# Usage, on the environment host:
-#     sh build_via_sandbox.sh                       # snapshot named twinkle-rsi-msagent
-#     NAME=twinkle-rsi-msagent-v2 sh build_via_sandbox.sh   # a second name, to verify first
 set -eu
 
 NAME="${NAME:-twinkle-rsi-msagent}"
+# BASE_IMAGE="python:3.11-slim"
 BASE_IMAGE="${BASE_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}"
 # 65536 is not a preference: `aenv start --cold` refuses a virtual size smaller
 # than the base image's ("shrinking is disabled"), and that base is 64GiB.

@@ -12,7 +12,7 @@ from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .api_sampler import APIGenerationError, APISampler
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
-from .bridge import _to_plain, extend_with_bridge
+from .ledger import TurnLedger
 
 
 ResponseCallback = Callable[..., SampledSequence]
@@ -379,19 +379,22 @@ class MultiTurnRollout(Rollout):
             if live.get('tools'):
                 to_encode['tools'] = list(live['tools'])
 
-        pif = _to_plain(self.template.encode(to_encode, add_generation_prompt=True))
-        pif.setdefault('messages', list(to_encode.get('messages') or []))
-        if 'tools' in to_encode:
-            pif['tools'] = list(to_encode.get('tools') or [])
-        elif tool_manager is not None:
-            pif['tools'] = list(tool_manager.tool_infos() or [])
+        # The token account for this episode. Every id the trajectory ends up
+        # trained on passes through it; what stays in this function is the policy
+        # that decides when to add one. See ``ledger.py``.
+        ledger = TurnLedger(self.template, label=f'trajectory {index}',
+                            max_tokens=self.max_trajectory_tokens)
+        # A trajectory that named no tools advertises the manager's, so the prompt
+        # lists what can actually be dispatched.
+        opening_tools = None
+        if 'tools' not in to_encode and tool_manager is not None:
+            opening_tools = list(tool_manager.tool_infos() or [])
+        ledger.open(to_encode, tools=opening_tools)
         if live is not None:
-            live['messages'] = list(pif.get('messages') or [])
+            live['messages'] = ledger.messages
 
-        logprobs: List[Any] = []
         stop_reason: Optional[str] = None
         generation_error: Optional[str] = None
-        turns = 0
         truncated = False
         params = ctx['sampling_params']
         # Consecutive turns that made no progress, the calls already issued, and
@@ -425,23 +428,22 @@ class MultiTurnRollout(Rollout):
             is no room for another stage", which is a cut trajectory rather than
             a caller that had nothing more to ask.
             """
-            nonlocal pif, live, followups, budget, params, truncated
+            nonlocal live, followups, budget, params, truncated
             if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
             followup = followup_fn(
-                self._as_trajectory(trajectory, pif, logprobs, turns, stop_reason, truncated), followups)
+                ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason,
+                             truncated=truncated), followups)
             if followup is None:
                 return False
             text, next_params = self._unpack_followup(followup)
-            extended = extend_with_bridge(pif, [{'role': 'user', 'content': text}], self.template)
-            if extended is None:
+            if not ledger.observe([{'role': 'user', 'content': text}]):
                 truncated = True
                 return False
-            pif = extended
             # Follow-up stages are answers, so an API must not see tool schemas.
-            pif['tools'] = []
+            ledger.input_feature['tools'] = []
             if live is not None:
-                live['messages'] = list(extended.get('messages') or [])
+                live['messages'] = ledger.messages
             followups += 1
             budget += 1
             if next_params is not None:
@@ -452,7 +454,7 @@ class MultiTurnRollout(Rollout):
             spent += 1
 
             if spent > 1:
-                pif, live, dropped = self._harness_before_generate(pif, live, harness)
+                live, dropped = self._harness_before_generate(ledger, live, harness)
                 if dropped:
                     truncated = True
                     break
@@ -464,11 +466,11 @@ class MultiTurnRollout(Rollout):
                     self.sampler,
                     self.api,
                     params,
-                    input_feature=pif,
+                    input_feature=ledger.input_feature,
                     adapter_kwargs=adapter_kwargs,
                     trajectory=trajectory,
                     trajectory_index=index,
-                    turn=turns + 1,
+                    turn=ledger.turns + 1,
                     followups=followups,
                 )
             except APIGenerationError as exc:
@@ -479,20 +481,9 @@ class MultiTurnRollout(Rollout):
             if not isinstance(seq, SampledSequence):
                 raise TypeError(f'response_callback must return SampledSequence, got '
                                 f'{type(seq).__name__}')
-            turns += 1
 
-            if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
-                raise RuntimeError(f'Sampler returned a SampledSequence without '
-                                   f'new_input_feature.input_ids for trajectory '
-                                   f'{index}; cannot continue multi-turn.')
-
-            pif = _to_plain(dict(seq.new_input_feature))
-            if seq.logprobs is not None:
-                if len(seq.logprobs) != len(seq.tokens):
-                    raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not '
-                                       f'match sampled token count ({len(seq.tokens)}) '
-                                       f'at turn {turns} (trajectory {index})')
-                logprobs.extend(seq.logprobs)
+            ledger.record(seq)
+            pif = ledger.input_feature
             stop_reason = seq.stop_reason
 
             msgs = pif.get('messages') or []
@@ -547,8 +538,7 @@ class MultiTurnRollout(Rollout):
                 break
 
             # 3a. Sequence-length cap.
-            if (self.max_trajectory_tokens is not None
-                    and len(pif.get('input_ids') or []) >= self.max_trajectory_tokens):
+            if ledger.full():
                 truncated = True
                 break
 
@@ -562,13 +552,11 @@ class MultiTurnRollout(Rollout):
                 parse_errors = ([] if followups else self.template.tool_call_errors(seq.decoded or ''))
                 if parse_errors and malformed_turns < self.max_malformed_retries:
                     malformed_turns += 1
-                    extended = extend_with_bridge(pif, [_malformed_tool_message(parse_errors)], self.template)
-                    if extended is None:
+                    if not ledger.observe([_malformed_tool_message(parse_errors)]):
                         truncated = True
                         break
-                    pif = extended
                     if live is not None:
-                        live['messages'] = list(extended.get('messages') or [])
+                        live['messages'] = ledger.messages
                     continue
                 # The episode is over as far as the model is concerned. Give the
                 # caller one chance to say otherwise -- see ``followup_fn`` for
@@ -577,7 +565,7 @@ class MultiTurnRollout(Rollout):
                     continue
                 break
 
-            if turns >= self.max_turns:
+            if ledger.turns >= self.max_turns:
                 # Out of tool turns, not out of episode: the stages that read the
                 # end state can still run on what was built.
                 tool_stop = 'max_turns'
@@ -604,15 +592,14 @@ class MultiTurnRollout(Rollout):
                     stuck_turns = 0
 
             tool_messages, live = self._tool_messages_after(pif, live, harness, observations, tool_calls)
-            extended = extend_with_bridge(pif, tool_messages, self.template)
-            overflowed = extended is None
+            overflowed = not ledger.observe(tool_messages)
             if overflowed:
                 # Trajectory exceeded max_length.
                 truncated = True
             else:
-                pif = extended
+                pif = ledger.input_feature
                 if live is not None:
-                    live['messages'] = list(extended.get('messages') or [])
+                    live['messages'] = ledger.messages
             # Checked after the messages are appended, so the turns that ended
             # the episode are in the trajectory the caller reads.
             if self.stop_after_stuck_turns and stuck_turns >= self.stop_after_stuck_turns:
@@ -627,37 +614,22 @@ class MultiTurnRollout(Rollout):
             if overflowed:
                 break
 
-        if logprobs:
-            labels = pif.get('labels') or []
-            completion_mask = pif.get('completion_mask')
-            if completion_mask is None:
-                expected = sum(1 for label in labels if label != -100)
-            elif len(completion_mask) != len(labels):
-                raise RuntimeError(f'completion_mask/labels misaligned for trajectory {index}: '
-                                   f'{len(completion_mask)} != {len(labels)}')
-            else:
-                expected = sum(1 for label, flag in zip(labels, completion_mask) if label != -100 and flag)
-            if len(logprobs) != expected:
-                raise RuntimeError(f'logprobs/policy-token alignment failed for trajectory {index}: '
-                                   f'{len(logprobs)} logprobs vs {expected} positions selected by '
-                                   '(labels != -100) & completion_mask.')
-
         # 5. Merge pif fields into the trajectory dict at TOP LEVEL so downstream
         #    consumers (VLLMSampler with ``'input_ids' in inputs``) see an encoded
-        #    InputFeature and skip re-encoding.
-        out = dict(trajectory)
-        out.update(pif)
-        out['messages'] = list(pif.get('messages') or out.get('messages', []))
-        out['logprobs'] = logprobs if logprobs else None
-        out['turns'] = turns
-        out['stop_reason'] = stop_reason
-        out['truncated'] = truncated
-        # ``truncated`` says something was cut off; these two say what ended the
-        # tool-calling part, which is a different question -- an episode can run
-        # out of turns, be handed a follow-up stage, and finish it.
-        out['stuck_stop'] = stuck_stop
-        out['tool_stop'] = tool_stop
-        out['followups'] = followups
+        #    InputFeature and skip re-encoding. The ledger audits its own account
+        #    on the way out -- one logprob per trainable token, or it raises.
+        out = ledger.merge(
+            trajectory,
+            turns=ledger.turns,
+            stop_reason=stop_reason,
+            truncated=truncated,
+            # ``truncated`` says something was cut off; these two say what ended
+            # the tool-calling part, which is a different question -- an episode
+            # can run out of turns, be handed a follow-up stage, and finish it.
+            stuck_stop=stuck_stop,
+            tool_stop=tool_stop,
+            followups=followups,
+        )
         if generation_error is not None:
             out['error'] = generation_error
         return out
@@ -685,43 +657,29 @@ class MultiTurnRollout(Rollout):
             obs[i] = '' if content is None else str(content)
         return obs
 
-    @staticmethod
-    def _as_trajectory(traj: Trajectory, pif: Dict[str, Any], logprobs: List[Any], turns: int,
-                       stop_reason: Optional[str], truncated: bool) -> Trajectory:
-        """The episode so far, shaped like the value ``__call__`` returns.
-
-        Handed to ``followup_fn`` so the callback reads an episode the same way
-        every other consumer does -- ``messages`` complete, token fields present --
-        rather than having to know this loop's local variables.
-        """
-        out = dict(traj)
-        out.update(pif)
-        out['messages'] = list(pif.get('messages') or traj.get('messages') or [])
-        out['logprobs'] = logprobs if logprobs else None
-        out['turns'] = turns
-        out['stop_reason'] = stop_reason
-        out['truncated'] = truncated
-        return out
-
     def _harness_before_generate(
         self,
-        pif: Dict[str, Any],
+        ledger: TurnLedger,
         live: Optional[Trajectory],
         harness: Optional[AgentHarness],
-    ) -> Tuple[Dict[str, Any], Optional[Trajectory], bool]:
-        """Run before_generate; bridge append-only deltas. ``dropped`` if encode fails."""
+    ) -> Tuple[Optional[Trajectory], bool]:
+        """Run before_generate; bridge append-only deltas. ``dropped`` if encode fails.
+
+        A harness that rewrote earlier turns rather than appending gets its rewrite
+        ignored: the ids for those turns are already banked, and re-encoding them
+        would replace tokens that have logprobs attached with tokens that do not.
+        """
         if harness is None or live is None:
-            return pif, live, False
-        live['messages'] = list(pif.get('messages') or [])
+            return live, False
+        live['messages'] = ledger.messages
         live = harness.before_generate(live)
-        delta = _append_only_delta(pif.get('messages') or [], live.get('messages') or [])
+        delta = _append_only_delta(ledger.messages, live.get('messages') or [])
         if not delta:
-            return pif, live, False
-        extended = extend_with_bridge(pif, delta, self.template)
-        if extended is None:
-            return pif, live, True
-        live['messages'] = list(extended.get('messages') or [])
-        return extended, live, False
+            return live, False
+        if not ledger.observe(delta):
+            return live, True
+        live['messages'] = ledger.messages
+        return live, False
 
     @staticmethod
     def _merge_assistant_metadata(pif: Dict[str, Any], live: Trajectory) -> None:

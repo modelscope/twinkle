@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .agentic import AgenticChallenger, parse_problem_statement
-from .base import Challenger
-from .keyword import KEYWORD_MAX_LEN, KeywordGenerator
+from .base import ChallengeBatch, Challenger
 
 __all__ = [
     'AgenticChallenger',
+    'ChallengeBatch',
     'Challenger',
-    'KEYWORD_MAX_LEN',
-    'KeywordGenerator',
     'parse_problem_statement',
 ]
