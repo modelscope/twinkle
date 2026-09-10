@@ -136,6 +136,8 @@ class LossArgs:
     sft_weight: float = 1.0
     entropy_coef: float = 0.0
     value_clip: float = 0.2
+    epsilon_low: float = 0.3
+    detach_importance_weight: bool = True
     ignore_index: int = -100
 
 
@@ -213,6 +215,11 @@ class RLArgs:
     kl_coef: float = 0.0
     normalize_advantages: bool = True
     critic_learning_rate: float = 1e-5
+    critic_updates_per_actor_update: int = 2
+    sao_alpha: float = 1.5
+    sao_policy_lambda_adaptive: bool = True
+    sao_critic_lambda: float = 1.0
+    freeze_critic_attention: bool = True
 
 
 @dataclass

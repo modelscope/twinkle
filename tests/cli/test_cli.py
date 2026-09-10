@@ -334,6 +334,26 @@ class TestCLIEndToEnd:
         assert args.rl.critic_learning_rate == pytest.approx(2e-5)
         assert args.loss.value_clip == pytest.approx(0.1)
 
+    def test_cli_sao_fields(self):
+        args = CLI.from_args(argv=[
+            '--num-generations', '1',
+            '--epsilon-low', '0.3',
+            '--epsilon-high', '5.0',
+            '--no-detach-importance-weight',
+            '--critic-updates-per-actor-update', '2',
+            '--sao-alpha', '1.5',
+            '--sao-critic-lambda', '1.0',
+            '--no-freeze-critic-attention',
+        ])
+        assert args.rl.num_generations == 1
+        assert args.loss.epsilon_low == pytest.approx(0.3)
+        assert args.loss.epsilon_high == pytest.approx(5.0)
+        assert args.loss.detach_importance_weight is False
+        assert args.rl.critic_updates_per_actor_update == 2
+        assert args.rl.sao_alpha == pytest.approx(1.5)
+        assert args.rl.sao_critic_lambda == pytest.approx(1.0)
+        assert args.rl.freeze_critic_attention is False
+
     def test_use_megatron_true_flips_strategy(self):
         args = CLI.from_args(argv=['--use_megatron', 'true'])
         assert args.model.strategy == 'native_fsdp'

@@ -60,3 +60,35 @@ class PPOValueLoss(Loss):
         mask_f = mask.to(values.dtype)
         loss = (per_token_loss * mask_f).sum() / mask_f.sum().clamp(min=1.0)
         return LossOutput(loss=loss, num_tokens=0)
+
+
+class SAOValueLoss(Loss):
+    """Masked MSE critic loss used by the SAO baseline."""
+
+    require_logps = False
+    require_values = True
+
+    def __init__(self, ignore_index: int = -100, **kwargs):
+        self.ignore_index = ignore_index
+        self._aligner = GRPOLoss(ignore_index=ignore_index)
+
+    def __call__(self, inputs: Dict, outputs: Dict, *, returns=None, **kwargs) -> LossOutput:
+        import torch
+
+        labels = torch.as_tensor(inputs.get('labels'))
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        mask = labels != self.ignore_index
+        values = outputs.get('values')
+        assert values is not None, "outputs must contain 'values'"
+        if values.dim() == 3 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
+        if values.dim() == 1:
+            values = values.unsqueeze(0)
+        if values.shape != mask.shape:
+            raise AssertionError(f'values/mask shape mismatch: values={tuple(values.shape)} mask={tuple(mask.shape)}')
+        assert returns is not None, 'returns are required for SAO value loss'
+        returns = self._aligner._pad_and_align_to_batch(returns, mask, values.device, values.dtype)
+        mask_f = mask.to(values.dtype)
+        loss = ((values.float() - returns.detach().float()).square() * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+        return LossOutput(loss=loss, num_tokens=0)

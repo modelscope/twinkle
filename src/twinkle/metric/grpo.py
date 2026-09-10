@@ -377,6 +377,19 @@ class PPOMetric(GRPOMetric):
     """PPO policy metric; shares token-level ratio and clipping statistics with GRPO."""
 
 
+class SAOMetric(GRPOMetric):
+    """SAO metric; trust rejection is unconditional on advantage sign."""
+
+    def _accumulate_clip(self, log_ratio, advantages, mask, mask_f):
+        import torch
+        ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
+        is_low = ratio <= 1 - self.epsilon
+        is_high = ratio >= 1 + self.epsilon_high
+        self.sum_clip_low += float((is_low.float() * mask_f).sum().item())
+        self.sum_clip_high += float((is_high.float() * mask_f).sum().item())
+        self.clip_n_total += float(mask_f.sum().item())
+
+
 class GSPOMetric(GRPOMetric):
     """GRPOMetric variant for GSPO: clip applies to per-sequence geometric-mean ratio."""
 
