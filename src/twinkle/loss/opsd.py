@@ -50,9 +50,14 @@ class OPSDLoss(GRPOLoss):
       the student loss mask) — ``_pad_and_align_to_batch`` scatters it onto the response
       positions. The teacher and student prompts differ in length, so the full-sequence
       (right-padded) form must NOT be used here.
-    * The divergence direction (this k3 form corresponds to KL(student || teacher)) should be
-      re-confirmed against the official code release before treating it as final; it is exposed
-      via ``reverse`` for a quick swap without touching call sites.
+    * Divergence direction (``reverse=True``, ``r = teacher - student``) matches the paper's
+      sampled-token policy-gradient reward ``r_n = log p_T - log p_S``, maximised over the
+      student's rollout (Zhao et al., Policy-Gradient Perspective): teacher-preferred tokens
+      pull the student up. Confirmed against the paper; ``reverse`` stays exposed for a quick
+      swap without touching call sites. Note this k3 surrogate (``exp(r) - r - 1``) shares only
+      the gradient DIRECTION with the paper, not its functional form: the paper's headline loss
+      is a full-vocabulary generalized JSD_beta (needs logits), and its PG form is linear in
+      ``r``. This is the lighter sampled-token v1, deliberately logits-free.
     """
 
     require_logps = True
