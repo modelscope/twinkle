@@ -238,6 +238,13 @@ class ChallengerArgs:
     # here. Empty trains against the env's built-in tools and this repo's own
     # prompt. Sandboxed runs only: the agent needs a machine of its own.
     agent_config: str = ''
+    # How that agent config is run, and both stay selectable:
+    #   'external' -- the agent is its own program inside the sandbox and calls
+    #     back to the policy endpoint below (needs a reachable agent_endpoint_host).
+    #   'harness'  -- the agent's message/tool lifecycle drives twinkle's local
+    #     rollout loop instead, generating through the local sampler; no endpoint
+    #     is bound and only a forward tunnel to the sandbox tools is needed.
+    agent_runner: str = 'external'
     # Where the policy endpoint the agent calls should bind. The agent runs inside
     # the sandbox, so loopback is the sandbox itself and the requests never arrive:
     # this has to be an address of the training host that the sandbox can route to.

@@ -171,6 +171,7 @@ class MultiTurnRollout(Rollout):
         sampler=None,
         template: Optional[Template] = None,
         tool_manager: Optional[ToolManager] = None,
+        harness=None,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
@@ -233,6 +234,14 @@ class MultiTurnRollout(Rollout):
             self.api = None
         self.response_callback = response_callback or _default_response_callback
         self.tool_manager = tool_manager
+        # An optional AgentHarness (a pool exposing ``.lease()``, or a 1:1 list)
+        # that shapes messages each turn. The ledger still owns every token id;
+        # the harness only reshapes the message view and this turn's tool
+        # framing, so a framework agent (ms-agent, ...) can drive this loop
+        # locally without this class knowing which framework it is. This is the
+        # forward-tunnel alternative to ``ExternalRollout``'s reverse endpoint;
+        # both stay selectable and general.
+        self.harness = harness
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
         # its adapter into the sampler directly, but evaluating a saved one has no
         # such channel: without this, an eval script would silently measure the
@@ -334,9 +343,31 @@ class MultiTurnRollout(Rollout):
             'tool_managers': self._broadcast(
                 kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
             'followup_fn': kwargs.get('followup_fn', self.followup_fn),
+            'harnesses': self._resolve_harness(kwargs.get('harness', self.harness), n),
         }
 
+    def _resolve_harness(self, harness, n: int) -> List[Any]:
+        """One harness per episode. A pool is shared and leased per thread; a
+        bare harness carries per-episode state and cannot be shared across
+        parallel threads, so n>1 needs a pool or a 1:1 list."""
+        if harness is None:
+            return [None] * n
+        if hasattr(harness, 'lease'):
+            return [harness] * n
+        return self._broadcast(harness, n, name='harness', per_trajectory=True)
+
     def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+        # A harness from a pool is leased for the episode and returned after, so
+        # its per-episode state (an agent's memory, say) never leaks into the
+        # next one. Anything else is used as passed.
+        harness = ctx['harnesses'][index]
+        if harness is not None and hasattr(harness, 'lease'):
+            with harness.lease() as leased:
+                return self._run_episode(trajectory, index, ctx, leased)
+        return self._run_episode(trajectory, index, ctx, harness)
+
+    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any],
+                     harness=None) -> Trajectory:
         tool_manager: ToolManager = ctx['tool_managers'][index]
         followup_fn = ctx['followup_fn']
         adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
@@ -349,6 +380,10 @@ class MultiTurnRollout(Rollout):
                             max_tokens=self.max_trajectory_tokens)
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
+        # A harness may shape the opening (system prompt, tool schema) before
+        # the one encode of the episode; after that it is append-only (below).
+        if harness is not None:
+            trajectory = harness.before_generate(trajectory)
         opening_tools = None
         if 'tools' not in trajectory and tool_manager is not None:
             opening_tools = list(tool_manager.tool_infos() or [])
@@ -472,6 +507,12 @@ class MultiTurnRollout(Rollout):
                         last_msg['content'] = seq.decoded or ''
                     last_msg.pop('tool_calls', None)
 
+            # Let the harness normalize the assistant turn's message metadata
+            # (tool-call ids, content shape) without touching the tokens the
+            # ledger just banked.
+            if harness is not None:
+                self._harness_after_generate(harness, pif, seq.decoded or '', tool_calls)
+
             # 3. Termination conditions
             # A reply cut off at ``max_tokens`` is truncated in exactly the sense
             # the flag names, and consumers read the flag to tell a trajectory
@@ -536,7 +577,11 @@ class MultiTurnRollout(Rollout):
                 else:
                     stuck_turns = 0
 
-            tool_messages = _default_tool_messages(tool_calls, observations)
+            if harness is not None:
+                tool_messages = self._harness_tool_messages(
+                    harness, ledger.input_feature, observations, tool_calls)
+            else:
+                tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
             if overflowed:
                 # Trajectory exceeded max_length.
@@ -578,6 +623,37 @@ class MultiTurnRollout(Rollout):
         return out
 
     # ------------------------------------------------------------------ private
+
+    @staticmethod
+    def _harness_after_generate(harness, pif: Dict[str, Any], decoded: str, tool_calls) -> None:
+        """Swap the harness-shaped assistant message onto the banked turn.
+
+        The ledger owns the ids; only the human-readable last message is
+        replaced. The harness is handed the turns *before* this reply and
+        appends its own normalized assistant, whose shaped form we take back.
+        """
+        msgs = list(pif.get('messages') or [])
+        if not msgs:
+            return
+        prior = msgs[:-1]
+        shaped = harness.after_generate(
+            {'messages': list(prior), 'tools': pif.get('tools')}, decoded, tool_calls)
+        shaped_msgs = (shaped or {}).get('messages') or []
+        if len(shaped_msgs) > len(prior):
+            pif['messages'][-1] = shaped_msgs[len(prior)]
+
+    @staticmethod
+    def _harness_tool_messages(harness, pif: Dict[str, Any], observations, tool_calls):
+        """This turn's tool messages, framed by the harness (append-only tail).
+
+        Falls back to the default framing when the harness appended nothing.
+        """
+        prior = list(pif.get('messages') or [])
+        shaped = harness.after_tools(
+            {'messages': list(prior), 'tools': pif.get('tools')}, observations, tool_calls)
+        shaped_msgs = (shaped or {}).get('messages') or []
+        tail = shaped_msgs[len(prior):]
+        return tail or _default_tool_messages(tool_calls, observations)
 
     @staticmethod
     def _run_tools(tool_manager: ToolManager, tool_calls: List[Dict[str, Any]]) -> List[str]:
