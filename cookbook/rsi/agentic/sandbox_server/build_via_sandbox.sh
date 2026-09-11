@@ -89,5 +89,8 @@ aenv snapshot create "$SID" --name "$NAME"
 aenv delete "$SID" >/dev/null 2>&1 || true
 
 echo
-echo "Verify from the training host, which reaches it by the same name:"
-echo "    AENV_TEMPLATE=$NAME  # then run the boot check in README.md ('Verify a sandbox boots')"
+echo "Smoke-test it (any host with the aenv CLI pointed at this server; the trainer"
+echo "selects the same name via --sandbox-template):"
+echo "    SID=\$(aenv start --cold $NAME -d --timeout 120 | tail -1 | tr -d '\r')"
+echo "    aenv exec \"\$SID\" python -c 'print(1 + 1)'   # expect 2"
+echo "    aenv delete \"\$SID\""

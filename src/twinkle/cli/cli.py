@@ -272,9 +272,8 @@ class ChallengerArgs:
     # The stop string stays in the output, or every turn would train on an
     # unclosed block.
     one_call_per_reply: bool = True
-    # Only the appended check-script and statement turns go to the API backend.
-    use_api: bool = False
-    # The API backend those turns use. Empty model keeps the whole loop local.
+    # The API backend for the appended check-script and statement turns; an empty
+    # model keeps the whole loop local and those turns on the policy being trained.
     api_model: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_MODEL', ''))
     api_base: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_BASE_URL', ''))
     api_key: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_API_KEY', ''))

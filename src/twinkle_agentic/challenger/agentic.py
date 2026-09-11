@@ -12,7 +12,6 @@ from twinkle.data_format.sampling import SampledSequence, SampleResponse
 from twinkle.utils import get_logger
 from twinkle_agentic.envs import Env
 from twinkle_agentic.protocol.api_sampler import APISampler
-from twinkle_agentic.protocol.base import API
 from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.utils.code_utils import parse_fenced_code, strip_reasoning
 from twinkle_agentic.utils.message_utils import assistant_text
@@ -70,7 +69,7 @@ def _api_followup_response(
     """Use the API for appended stages and the primary backend otherwise."""
     if followups:
         if api is None:
-            raise ValueError('use_api=True requires an API backend')
+            raise ValueError('a follow-up stage was routed to the API but none was configured')
         return api(input_feature, sampling_params, **adapter_kwargs)
     if sampler is not None:
         return _sample_one(sampler, input_feature, sampling_params, adapter_kwargs)
@@ -111,8 +110,8 @@ class _Unit:
 class AgenticChallenger(Challenger):
     """Invent tool-using tasks by doing, checking, and describing them.
 
-    ``backend`` drives exploration and solver attempts. When ``use_api`` is true,
-    ``api`` generates only the appended check-script and problem-statement turns;
+    ``backend`` drives exploration and solver attempts. When an ``api`` backend is
+    given, it generates only the appended check-script and problem-statement turns;
     those turns retain the masking semantics selected by ``api_appended_as`` in
     ``rollout_kwargs``.
 
@@ -171,7 +170,6 @@ class AgenticChallenger(Challenger):
         backend: Any,
         *,
         api: Optional[Any] = None,
-        use_api: bool = False,
         seed_fn: Optional[Callable[[], Optional[str]]] = None,
         system_prompt: Optional[str] = None,
         from_scratch_prompt: Optional[str] = None,
@@ -217,11 +215,8 @@ class AgenticChallenger(Challenger):
             raise ValueError(f'pass_rate_target must be in [0, 1], got {pass_rate_target}')
         if pass_rate_width <= 0:
             raise ValueError(f'pass_rate_width must be positive, got {pass_rate_width}')
-        if use_api and rollout_kwargs.get('response_callback') is not None:
-            raise ValueError('use_api=True cannot be combined with response_callback')
-        backend_is_api = isinstance(backend, (API, APISampler))
-        if use_api and api is None and not backend_is_api:
-            raise ValueError('use_api=True requires api= when backend is a sampler')
+        if api is not None and rollout_kwargs.get('response_callback') is not None:
+            raise ValueError('api= routes the appended turns and cannot be combined with response_callback')
         self.seed_fn = seed_fn
         self._system = self._system if system_prompt is None else system_prompt
         self._from_scratch = self._from_scratch if from_scratch_prompt is None else from_scratch_prompt
@@ -243,13 +238,14 @@ class AgenticChallenger(Challenger):
         self._pass_rate_width = pass_rate_width
         self.checker = checker
         self.followup_params = followup_params
-        self.use_api = use_api
         self.save_failed_rollouts = save_failed_rollouts
         self._recorder = RolloutRecorder(save_dir) if save_dir else None
         kwargs = dict(rollout_kwargs)
+        # A separate API backend takes only the appended check/statement turns;
+        # the acting turns stay on the policy. No api, no split -- the default
+        # callback keeps every turn on the backend.
         if api is not None:
             kwargs['api'] = api
-        if use_api:
             kwargs['response_callback'] = _api_followup_response
         # Every job shares one rollout, built here rather than on first use:
         # building it needs nothing a job has, so building it up front spares the

@@ -141,12 +141,22 @@ class TurnLedger:
                                f'cannot continue multi-turn.')
         self._pif = _to_plain(dict(seq.new_input_feature))
         self._turns += 1
-        if seq.logprobs is not None:
-            if len(seq.logprobs) != len(seq.tokens):
-                raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match '
-                                   f'sampled token count ({len(seq.tokens)}) at turn '
-                                   f'{self._turns} ({self.label})')
-            self._logprobs.extend(seq.logprobs)
+        self._extend_logprobs(seq)
+
+    def _extend_logprobs(self, seq: SampledSequence) -> None:
+        """Append one generation's logprobs -- one per sampled token, or raise.
+
+        The check that keeps an account honest: a logprob array slipped by a
+        token trains against the wrong positions and nothing else would notice.
+        ``None`` means the run was unsampled, which is allowed.
+        """
+        if seq.logprobs is None:
+            return
+        if len(seq.logprobs) != len(seq.tokens):
+            raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match '
+                               f'sampled token count ({len(seq.tokens)}) at turn '
+                               f'{self._turns} ({self.label})')
+        self._logprobs.extend(seq.logprobs)
 
     def observe(self, messages: Sequence[Dict[str, Any]]) -> bool:
         """Append messages the model did not write: tool results, a new question.
@@ -217,12 +227,7 @@ class TurnLedger:
             pif['messages'] = list(messages)
         self._pif = pif
         self._turns += 1
-        if seq.logprobs is not None:
-            if len(seq.logprobs) != len(seq.tokens):
-                raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match '
-                                   f'sampled token count ({len(seq.tokens)}) at turn '
-                                   f'{self._turns} ({self.label})')
-            self._logprobs.extend(seq.logprobs)
+        self._extend_logprobs(seq)
         return True
 
     # ---------------------------------------------------------------- closing

@@ -577,7 +577,6 @@ def main():
         problem_max_chars=args.challenger.problem_max_chars,
         brittle_check_fn=brittle_check_reason,
         api=api,
-        use_api=args.challenger.use_api,
         save_dir=SAVE_DIR,
         save_failed_rollouts=args.challenger.save_failed_rollouts,
         # Passed through to the challenger's own MultiTurnRollout.
