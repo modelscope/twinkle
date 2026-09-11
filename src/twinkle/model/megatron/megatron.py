@@ -1632,7 +1632,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 return base_layer_name
             return name
 
-        is_peft_format = (adapter_name != _default_adapter_name)
         if base_sync_done and adapter_name:
             # The first base model synchronization finished, and is lora training
             if merge_and_sync:
@@ -1683,7 +1682,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 _print_weight_example(names)
 
             def weight_generator():
-                if is_peft_format and (not merge_and_sync):
+                # Add the ``.base_layer.`` suffix whenever the sampler runs with
+                # ``enable_lora`` (``merge_and_sync=False``).  ``_add_base_layer_suffix``
+                # self-guards via ``model_keys``, so it only renames params vLLM
+                # actually exposes as ``*WithLoRA`` and is a no-op for full-param.
+                if not merge_and_sync:
                     yield from _raw_weights(True)
                 else:
                     yield from _raw_weights(False)

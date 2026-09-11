@@ -1837,10 +1837,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
-            else:
-                if 'conv1d.weight' in name:
-                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
-                        name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
+            return name
+
+        def _add_base_layer_suffix(name):
+            # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
+            # only their ``.base_layer.*`` param, even when PEFT does not target
+            # them on the training side (e.g. linear-attn ``conv1d`` /
+            # ``in_proj_qkvz``).  Rename to match whenever the sampler exposes
+            # the ``.base_layer.`` variant.
+            base_layer_name = None
+            if name.endswith('.weight'):
+                base_layer_name = f'{name[:-7]}.base_layer.weight'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            elif name.endswith('.bias'):
+                base_layer_name = f'{name[:-5]}.base_layer.bias'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            if 'experts' in name and base_layer_name is not None:
+                return base_layer_name
             return name
 
         def _print_weight_example(names):
@@ -1885,11 +1900,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     _print_weight_example(names)
 
         else:
-            # First full base-model sync.  Whether to keep ``.base_layer.``
-            # depends on whether the sampler uses ``enable_lora``:
-            #   merge_and_sync=True  → enable_lora=False → strip .base_layer
-            #   merge_and_sync=False → enable_lora=True  → keep .base_layer
-            keep_base_layer = not merge_and_sync
+            # First full base-model sync.  When the sampler runs with
+            # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
+            # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
+            # (detected via ``model_keys``); otherwise send canonical names.
+            add_base_layer = not merge_and_sync
             state_dict = model.state_dict()
 
             def weight_generator():
@@ -1898,7 +1913,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    name = _normalize(name, keep_base_layer=keep_base_layer)
+                    name = _normalize(name, keep_base_layer=False)
+                    if add_base_layer:
+                        name = _add_base_layer_suffix(name)
                     names.append(name)
                     yield name, tensor
                 _print_weight_example(names)
