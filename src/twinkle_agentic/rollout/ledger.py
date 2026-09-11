@@ -8,9 +8,10 @@ of them the policy produced, and the logprob for each of those. This file is the
 second one, and only the second one.
 
 They are split because the policy is not shared and the bookkeeping is. An agent
-that ships as its own program drives its own loop (see ``harness/base.py``, "Who
-drives"), so none of the turn accounting above applies to it -- but the account
-below applies unchanged, because it is what makes a run trainable at all:
+that ships as its own program drives its own loop and reaches the policy over
+HTTP (see ``endpoint.py``), so none of the turn accounting above applies to it --
+but the account below applies unchanged, because it is what makes a run trainable
+at all:
 
     the tokens trained on are the tokens the sampler returned
 
@@ -20,23 +21,25 @@ transcript can differ from what was sampled -- and every logprob then belongs to
 a position that has moved. The gradient is still computed, against the wrong
 tokens, and nothing raises. That is why :meth:`record` takes a ``SampledSequence``
 and reads ``new_input_feature`` off it rather than encoding anything, and why
-:meth:`graft` -- the entry point for a caller that supplies messages instead of
-driving turns -- refuses a history that does not extend what is already banked
-rather than re-encoding to make it fit.
+:meth:`graft` -- the entry point for an episode driven from outside -- compares
+prompt ids against what is already banked and refuses a prompt that does not
+extend it, rather than re-encoding to make it fit.
 """
+import threading
 from typing import Any, Dict, List, Optional, Sequence
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
-from .bridge import _to_plain, extend_with_bridge
+from twinkle_agentic.utils.token_utils import _to_plain, append_ids, extend_with_bridge
 
 
 class TurnLedger:
     """Token ids, labels and logprobs for one episode, and nothing else.
 
-    Not thread-safe and not meant to be: one ledger belongs to one episode, the
-    way a harness does.
+    Not thread-safe and not meant to be: one ledger belongs to one episode, and
+    an episode runs in one thread. See :class:`LedgerBook` for the many-episode
+    case, which is a lock around this and not a change to it.
 
     Usage is one :meth:`open`, then :meth:`record` after each generation and
     :meth:`observe` for each thing appended that the model did not write, then
@@ -161,54 +164,65 @@ class TurnLedger:
     def adopt(self, input_feature: Dict[str, Any]) -> None:
         """Take an already-encoded feature as the current state.
 
-        For the one caller that legitimately rebuilds it: a harness that rewrote
-        history before the first generation, which has to be re-encoded because
-        there is no append that expresses it. Called after a generation instead,
-        this is how a run silently starts training on drifted ids.
+        For the one caller that legitimately rebuilds it: an opening rewritten
+        before the first generation, which has to be re-encoded because there is
+        no append that expresses it. Called after a generation instead, this is
+        how a run silently starts training on drifted ids.
         """
         self._pif = _to_plain(dict(input_feature))
 
-    def graft(self, messages: Sequence[Dict[str, Any]], *,
-              tools: Optional[List[Dict[str, Any]]] = None) -> bool:
-        """Extend the account with a history that arrived whole, not turn by turn.
+    def graft(self, prompt_token_ids: Sequence[int], seq: SampledSequence, *,
+              messages: Optional[Sequence[Dict[str, Any]]] = None) -> bool:
+        """Bank one round of an episode this loop did not drive.
 
-        For a driver that is not this loop -- an agent process that runs its own
-        turns and hands over the conversation it has accumulated. The prefix it
-        sends must be the prefix already banked, message for message; what is new
-        is appended as observations, and appended *masked*, because a caller
-        supplying messages is by definition not supplying sampled tokens. The
-        model's own replies still enter through :meth:`record`, from the sampler
-        that produced them.
+        An agent running as its own program resends the whole conversation on
+        every call, as text, and never sends token ids back. It does not have to:
+        the prompt it resends is encoded on the way in to be sampled at all, and
+        *those* ids are the real ones -- what the model ran on, not a
+        reconstruction. So the account is kept on this side, one call at a time,
+        and each call is checked against it: ``prompt_token_ids`` must begin with
+        every id already banked.
 
-        False, and nothing changed, when the history is not an extension of what
-        is banked -- the caller edited or summarised earlier turns, and there is
-        no way to represent that as an append. What to do about it is the caller's
-        call, and there is only one honest option: bank the episode as it stands
-        and start a fresh ledger. Stitching the new history onto the old ids
-        produces a trajectory that never existed, which is the failure this whole
-        file is arranged to prevent.
+        What the prompt adds beyond that is whatever happened out there between
+        the two calls -- a tool result, a file the agent read, a question it asked
+        itself -- and it is appended masked, because none of it is the policy's
+        writing. ``seq.tokens`` is, and is appended trainable.
+
+        False, and nothing changed, when the prompt does not extend what is
+        banked. The agent compacted or rewrote its history, which no append can
+        express. The only honest response is to keep the episode as it stands and
+        open a fresh ledger for what follows: splicing the new prompt onto the old
+        ids would produce a trajectory that never existed.
+
+        ``messages`` is recorded for whoever reads the episode afterwards -- a
+        trace, a reward function -- and has no bearing on the ids.
         """
-        banked = self.messages
-        supplied = list(messages)
-        if len(supplied) < len(banked):
+        banked = list(self._pif.get('input_ids') or [])
+        prompt = list(prompt_token_ids)
+        if len(prompt) < len(banked) or prompt[:len(banked)] != banked:
             return False
-        for mine, theirs in zip(banked, supplied):
-            if mine != theirs:
+        pif: Optional[Dict[str, Any]] = self._pif
+        observed = prompt[len(banked):]
+        if observed:
+            pif = append_ids(pif, observed, self.template, trainable=False)
+            if pif is None:
                 return False
-        appended = supplied[len(banked):]
-        if not appended:
-            if tools is not None:
-                self._pif['tools'] = list(tools)
-            return True
-        if not banked:
-            # Nothing to extend: this is the opening, and the tokens for it have
-            # to come from an encode like any other opening.
-            self.open({'messages': supplied}, tools=tools)
-            return True
-        if not self.observe(appended):
+        if not seq.tokens:
+            raise RuntimeError(f'the endpoint returned an empty continuation for {self.label}; '
+                               'there is nothing to train on and nothing to append.')
+        pif = append_ids(pif, list(seq.tokens), self.template, trainable=True)
+        if pif is None:
             return False
-        if tools is not None:
-            self._pif['tools'] = list(tools)
+        if messages is not None:
+            pif['messages'] = list(messages)
+        self._pif = pif
+        self._turns += 1
+        if seq.logprobs is not None:
+            if len(seq.logprobs) != len(seq.tokens):
+                raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match '
+                                   f'sampled token count ({len(seq.tokens)}) at turn '
+                                   f'{self._turns} ({self.label})')
+            self._logprobs.extend(seq.logprobs)
         return True
 
     # ---------------------------------------------------------------- closing
@@ -235,9 +249,9 @@ class TurnLedger:
         trains perfectly well against the wrong tokens. Nothing downstream can
         notice, because both arrays are the length they are supposed to be.
 
-        Skipped when nothing was sampled -- an episode assembled by hand has no
-        logprobs to align, and demanding them would fail the very case
-        ``graft`` exists to serve.
+        Skipped when nothing was sampled -- an episode that never got a reply has
+        no logprobs to align, and demanding them would turn an empty run into a
+        crash.
         """
         if not self._logprobs:
             return
@@ -257,4 +271,94 @@ class TurnLedger:
                                'by (labels != -100) & completion_mask.')
 
 
-__all__ = ['TurnLedger']
+class LedgerBook:
+    """Ledgers filed under a key, for episodes whose turns arrive unannounced.
+
+    A ledger belongs to an episode, but an externally driven episode has no loop
+    here to hold one: rounds arrive one HTTP request at a time, interleaved with
+    every other episode in the batch, and the only thing tying a request to an
+    episode is the key it came in under. This keeps the accounts and does the
+    filing.
+
+    A key can end up with more than one ledger, and that is the interesting part.
+    An agent is free to compact or rewrite its own history -- summarise the first
+    twenty turns into a paragraph, drop a file it no longer needs -- and when it
+    does, the next prompt is not an extension of what is banked. There is no
+    append that expresses it and no honest way to splice the two. So the ledger in
+    hand is left exactly as it is, complete up to the last round that did fit, and
+    a fresh one takes over from the rewritten history. One episode becomes two
+    trajectories, which is what actually happened.
+
+    Thread-safe, because the requests are: one lock per key so that concurrent
+    episodes do not wait on each other, and the key registry guarded separately
+    so two first-requests cannot each create an account.
+    """
+
+    def __init__(self, template: Template, *, max_tokens: Optional[int] = None) -> None:
+        """
+        Args:
+            template: one template for every account here, for the reason
+                :class:`TurnLedger` gives: two would disagree about special tokens.
+            max_tokens: passed to each ledger as its length limit.
+        """
+        self.template = template
+        self.max_tokens = max_tokens
+        self._filed: Dict[str, List[TurnLedger]] = {}
+        self._locks: Dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def __contains__(self, key: str) -> bool:
+        with self._guard:
+            return key in self._filed
+
+    def bank(self, key: str, prompt_token_ids: Sequence[int], seq: SampledSequence, *,
+             messages: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[TurnLedger]:
+        """Record one round against ``key``, opening or splitting as needed.
+
+        A key seen for the first time gets an empty account, and the whole prompt
+        the agent sent -- its system prompt, its tool descriptions, the task -- is
+        appended masked. That is correct rather than convenient: none of it is the
+        policy's writing, and we did not compose it.
+
+        Returns the ledger the round landed in, or None when it landed nowhere:
+        the sequence no longer fits the template's length limit. The caller should
+        let the agent carry on -- it has its own reasons to stop, and killing its
+        request over our bookkeeping teaches it nothing -- while knowing that what
+        follows is not being recorded.
+        """
+        ledgers, lock = self._file(key)
+        with lock:
+            current = ledgers[-1]
+            if current.graft(prompt_token_ids, seq, messages=messages):
+                return current
+            fresh = self._ledger(key, len(ledgers))
+            if not fresh.graft(prompt_token_ids, seq, messages=messages):
+                return None
+            ledgers.append(fresh)
+            return fresh
+
+    def close(self, key: str) -> List[TurnLedger]:
+        """Take the accounts for ``key`` away, in the order they were opened.
+
+        Removed, not just read: the key is done, and a request arriving under it
+        afterwards is a new episode that reused a name, not a continuation of one
+        already handed to the trainer. Empty list for a key that never banked
+        anything -- an agent that failed to make a single call.
+        """
+        with self._guard:
+            self._locks.pop(key, None)
+            return self._filed.pop(key, [])
+
+    def _file(self, key: str) -> tuple:
+        with self._guard:
+            if key not in self._filed:
+                self._filed[key] = [self._ledger(key, 0)]
+                self._locks[key] = threading.Lock()
+            return self._filed[key], self._locks[key]
+
+    def _ledger(self, key: str, part: int) -> TurnLedger:
+        label = key if part == 0 else f'{key}#{part}'
+        return TurnLedger(self.template, label=label, max_tokens=self.max_tokens)
+
+
+__all__ = ['LedgerBook', 'TurnLedger']

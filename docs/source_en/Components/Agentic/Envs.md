@@ -223,7 +223,7 @@ Compared with the OpenEnv adapters:
 
 OpenEnv's `coding_env` runs on smolagents' `LocalPythonExecutor`, **an AST interpreter rather than an OS-level sandbox**. It does not handle `decorator_list` at all, so **decorators are silently ignored**: `@patch` has no effect, the test does not error, and the reward comes out as a plausible-looking wrong number. Such silent errors are harder to diagnose than a crash. It is a good fit for enforcing an import allowlist, but not for executing adversarial code. When tests rely on decorators, or the model must write files, install packages, or spawn subprocesses, use `AgentEnv`.
 
-Three things must be in place before training (all one-time, outside the training loop): the AgentENV server is deployed, a template is built (`aenv pull ubuntu:22.04 --name my-env`), and `pip install e2b` has been run on the training side.
+Three things must be in place before training (all one-time, outside the training loop): the AgentENV server is deployed, a template is built (`aenv pull ubuntu:22.04 --name my-env`), and `pip install 'e2b>=2.7'` has been run on the training side (2.7 is the first version that takes the endpoint as an argument rather than only from the environment).
 
 ```python
 from twinkle_agentic.envs import AgentEnv
@@ -244,6 +244,7 @@ env.close()                                # Kills the sandbox
 | `template` | `str` | AgentENV template name/ID. Required — build it first via `aenv build` / `aenv pull`. |
 | `api_url` | `str` | Server or gateway base URL. Falls back to `E2B_API_URL`. |
 | `api_key` | `str` | Any non-empty string works, since AgentENV performs no authorization. Falls back to `E2B_API_KEY`, defaulting to `'dummy'`. |
+| `sandbox_url` | `str` | The data plane, for a deployment whose sandbox gateway answers on a different host than the API. Defaults to `api_url`. |
 | `sandbox_timeout` | `int` | Sandbox idle timeout in seconds, default 300. Idle sandboxes are **paused**, not killed, and auto-resume on access. |
 | `command_timeout` | `int` | Per-command timeout in seconds, default 120. |
 | `setup_commands` | `List[str]` | Commands run once after each `reset`; their output becomes the reset observation. |

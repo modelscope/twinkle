@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
+from twinkle_agentic.rollout.trace import TraceWriter
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
 
@@ -823,16 +824,6 @@ def test_rejects_sampler_without_continous_work(template, tool_manager):
         MultiTurnRollout(sampler=SlicingSampler(), template=template, tool_manager=tool_manager)
 
 
-def test_rejects_one_harness_shared_by_a_batch(sampler, template, tool_manager):
-    """Episodes run in parallel threads, so a stateful harness cannot be shared."""
-    from twinkle_agentic.harness.base import AgentHarness
-
-    rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, harness=AgentHarness())
-    with pytest.raises(ValueError, match='harness holds per-episode state'):
-        rollout([_user_traj('A'), _user_traj('B')])
-
-
 # =============================================================================
 # Tests: defensive guards
 # =============================================================================
@@ -989,19 +980,19 @@ def test_single_trajectory_dict_rejected(make_rollout):
 
 
 # =============================================================================
-# Tests: trace_dir (per-rollout JSON dump + callback filtering)
+# Tests: TraceWriter (per-rollout JSON dump + predicate filtering)
 # =============================================================================
 def _list_trace_files(trace_dir):
     return sorted(p.name for p in trace_dir.iterdir() if p.suffix == '.json')
 
 
 def test_trace_dir_is_created_and_empty_by_default(tmp_path, sampler, template, tool_manager):
-    """Constructor creates the directory eagerly; no files until a rollout runs."""
+    """The writer creates the directory eagerly; no files until a rollout runs."""
     trace_dir = tmp_path / 'trace'
     assert not trace_dir.exists()
 
     MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, tracer=TraceWriter(str(trace_dir)))
     assert trace_dir.is_dir()
     assert _list_trace_files(trace_dir) == []
 
@@ -1010,7 +1001,7 @@ def test_trace_dir_writes_one_file_per_rollout(tmp_path, sampler, template, tool
     """Single trajectory -> single JSON file (regardless of turn count)."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, tracer=TraceWriter(str(trace_dir)))
     sampler.queue(_tool_call_text('search', {'q': 'x'}))
     sampler.queue('final answer', stop_reason='stop')
 
@@ -1028,7 +1019,7 @@ def test_trace_dir_json_is_pretty_printed_and_well_formed(tmp_path, sampler, tem
     """Dumped JSON is multi-line (indent=2) and carries the documented keys."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, tracer=TraceWriter(str(trace_dir)))
     sampler.queue('final answer', stop_reason='stop')
 
     rollout([_user_traj('hello')])
@@ -1049,28 +1040,27 @@ def test_trace_dir_json_is_pretty_printed_and_well_formed(tmp_path, sampler, tem
     assert isinstance(rec['trajectory'].get('messages'), list)
 
 
-def test_trace_dir_trace_callback_filters_storage(tmp_path, sampler, template, tool_manager):
-    """``trace_callback`` returning False suppresses the dump entirely."""
+def test_trace_should_store_filters_storage(tmp_path, sampler, template, tool_manager):
+    """``should_store`` returning False suppresses the dump entirely."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
         sampler=sampler,
         template=template,
         tool_manager=tool_manager,
         max_turns=2,
-        trace_dir=str(trace_dir),
-        trace_callback=lambda traj: False)
+        tracer=TraceWriter(str(trace_dir), should_store=lambda traj: False))
     sampler.queue('ok', stop_reason='stop')
 
     rollout([_user_traj('hi')])
     assert _list_trace_files(trace_dir) == []
 
 
-def test_trace_dir_success_callback_drives_filename_prefix(tmp_path, sampler, template, tool_manager):
+def test_trace_is_success_drives_filename_prefix(tmp_path, sampler, template, tool_manager):
     """True -> ``ok-*.json``, False -> ``fail-*.json``, split across batch."""
     trace_dir = tmp_path / 'trace'
 
     # Success is decided by a cheap rule on the last assistant message
-    # content; ``store`` accepts everything.
+    # content; the writer stores everything.
     def _is_success(traj):
         for msg in reversed(traj.get('messages', []) or []):
             if msg.get('role') == 'assistant':
@@ -1082,8 +1072,7 @@ def test_trace_dir_success_callback_drives_filename_prefix(tmp_path, sampler, te
         template=template,
         tool_manager=tool_manager,
         max_turns=2,
-        trace_dir=str(trace_dir),
-        success_callback=_is_success)
+        tracer=TraceWriter(str(trace_dir), is_success=_is_success))
     sampler.queue_for('A', 'good answer', stop_reason='stop')
     sampler.queue_for('B', 'bad answer', stop_reason='stop')
 
@@ -1099,7 +1088,7 @@ def test_trace_dir_batch_writes_one_file_per_trajectory(tmp_path, sampler, templ
     """Batch of N trajectories -> N files (never per-turn records)."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, tracer=TraceWriter(str(trace_dir)))
     # Traj 0: stops turn 1. Traj 1: tool-calls turn 1, stops turn 2.
     sampler.queue_for('A', 'done0', stop_reason='stop')
     sampler.queue_for('B', _tool_call_text('search', {'q': 'y'}))
@@ -1113,7 +1102,7 @@ def test_trace_dir_batch_writes_one_file_per_trajectory(tmp_path, sampler, templ
 
 
 def test_trace_dir_none_disables_tracing(tmp_path, sampler, template, tool_manager):
-    """Default ``trace_dir=None`` never touches the filesystem."""
+    """Default ``tracer=None`` never touches the filesystem."""
     trace_dir = tmp_path / 'never'
     assert not trace_dir.exists()
 
@@ -1121,7 +1110,7 @@ def test_trace_dir_none_disables_tracing(tmp_path, sampler, template, tool_manag
     sampler.queue('ok', stop_reason='stop')
     rollout([_user_traj('hi')])
 
-    assert rollout.trace_dir is None
+    assert rollout.tracer is None
     assert not trace_dir.exists()
 
 
@@ -1129,7 +1118,7 @@ def test_trace_dir_truncation_marked_on_max_turns(tmp_path, sampler, template, t
     """A rollout hitting ``max_turns`` records ``truncated=True``."""
     trace_dir = tmp_path / 'trunc'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, tracer=TraceWriter(str(trace_dir)))
     # Two tool-call turns -> the second hits max_turns cap.
     sampler.queue(_tool_call_text('search', {'q': 'a'}))
     sampler.queue(_tool_call_text('search', {'q': 'b'}))
@@ -1146,7 +1135,7 @@ def test_trace_dir_uses_user_data_id_in_filename(tmp_path, sampler, template, to
     """Filenames prefer ``user_data['id']`` (sanitised) over the fallback."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, tracer=TraceWriter(str(trace_dir)))
     sampler.queue('ok', stop_reason='stop')
 
     traj = _user_traj('hi')
@@ -1287,7 +1276,7 @@ class ThinkAwareTokenizer(FakeTokenizer):
 
 def test_appending_a_user_turn_keeps_the_history_ids_and_adds_only_the_new_block():
     """The delta is the new user block plus the generation prompt, nothing else."""
-    from twinkle_agentic.rollout.bridge import extend_with_bridge
+    from twinkle_agentic.utils.token_utils import extend_with_bridge
 
     template = FakeTemplate(ThinkAwareTokenizer())
     messages = [{'role': 'user', 'content': 'do work'},
@@ -1309,7 +1298,7 @@ def test_appending_a_user_turn_keeps_the_history_ids_and_adds_only_the_new_block
 
 def test_a_template_that_really_reorders_history_still_raises():
     """The fallback must not paper over a template that rewrites message blocks."""
-    from twinkle_agentic.rollout.bridge import extend_with_bridge
+    from twinkle_agentic.utils.token_utils import extend_with_bridge
 
     class ReorderingTokenizer(FakeTokenizer):
         """Puts the message count up front, so every append rewrites the start."""

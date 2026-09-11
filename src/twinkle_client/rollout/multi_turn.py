@@ -15,7 +15,7 @@ Design notes:
     * The ``tool_manager`` type is reused directly from
       ``twinkle_agentic.tools.tool_manager.ToolManager`` (imported, not copied).
     * Bridge-token stitching is reused from
-      ``twinkle_agentic.rollout.bridge.extend_with_bridge``.
+      ``twinkle_agentic.utils.token_utils.extend_with_bridge``.
 """
 import dataclasses
 from typing import Any, Dict, List, Optional
@@ -23,8 +23,8 @@ from typing import Any, Dict, List, Optional
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template.base import Template
-from twinkle_agentic.rollout.bridge import extend_with_bridge
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.utils.token_utils import extend_with_bridge
 from twinkle_client.sampler import vLLMSampler
 
 

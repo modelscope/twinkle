@@ -1,15 +1,14 @@
 # ms-agent config for agentic RSI training.
 #
-# Read by both halves of the setup, which is the point:
-#
-#   * the training host loads it to build a MsAgentHarness for message shaping
-#     only -- the entry script drops `llm:` and `tools:` from the merged config
-#     first, so no tool is ever constructed next to the trainer;
-#   * remote_tool_env.py uploads this same file into each sandbox, where
-#     sandbox_server/tool_server.py loads it and does construct the tools.
-#
-# So the tool line-up below describes what runs in the microVM. Editing it takes
+# Read in one place only: inside the sandbox, by the `ms-agent run` the solver
+# episode starts there (`--agent-config` on rsi_grpo.py names this file, and
+# MsAgent passes it through as `--config`). Nothing on the training host reads it,
+# so everything below describes what happens in the microVM. Editing it takes
 # effect on the next episode; no image rebuild is involved.
+#
+# The training host contributes exactly two things, as OPENAI_BASE_URL and
+# OPENAI_API_KEY: the endpoint serving the policy being trained, and the key that
+# names the episode. Both are read by the `llm:` section at the bottom.
 
 prompt:
   # Replaces ms-agent's BASE_AGENT_PROMPT (prompting/builtin.py) for the SOLVER
@@ -58,8 +57,10 @@ personalization:
   # machine-specific context into every training prompt.
   enabled: false
 
-# One turn == one sampler call. MultiTurnRollout's max_turns is the real limit;
-# this only stops ms-agent from imposing a lower one.
+# One turn == one request to the endpoint == one sampler call. The agent decides
+# when it is done, so nothing here counts turns on its behalf: the only bound on
+# an episode is `--agent-timeout`, which kills the process. This value only stops
+# ms-agent from imposing a lower limit of its own.
 max_chat_round: 9999
 
 # Never wait on a human: training runs unattended.
@@ -68,12 +69,10 @@ interactive: false
 # How long ms-agent waits around one tool call. Written down rather than left to
 # its default (tool_manager.py TOOL_CALL_TIMEOUT, 120s, overridable by the
 # TOOL_CALL_TIMEOUT environment variable) so the sandbox does not inherit a
-# number from whatever shell started it. It has to stay below what
-# remote_tool_env allows the whole turn (command_timeout, 180s), which in turn is
-# below the transport's budget: the innermost layer should be the one that times
-# out, because it is the only one that knows which call was slow. When they were
-# equal, one command that never returns made every call in the turn read as an
-# unreachable runtime.
+# number from whatever shell started it. It has to stay well below
+# `--agent-timeout`, the only outer bound: the innermost layer should be the one
+# that times out, because it is the only one that knows which call was slow. Hit
+# the outer one instead and the whole episode dies with no attribution.
 tool_call_timeout: 120
 
 # Path *inside the sandbox*. One microVM per episode already isolates
@@ -84,20 +83,26 @@ output_dir: /workspace
 callbacks: []
 
 tools:
-  # `file_system` is NOT listed here and is nevertheless on. ms-agent's own
-  # ms_agent/agent/agent.yaml declares it (write_file, read_file, edit_file,
-  # grep, glob) and LLMAgent merges this file *over* that one, so omitting a key
-  # inherits it rather than dropping it. Measured: the merged config's tools are
-  # ['file_system', 'code_executor', 'todo_list'], and /tools advertises all ten
-  # of those tools to the model. In armA2shellV6's 128 proposing calls,
-  # file_system took 63 (43 of them write_file) against code_executor's 58.
+  # `file_system` is declared here rather than inherited, and that is because of
+  # the `llm:` section at the bottom: LLMAgent merges ms-agent's own
+  # ms_agent/agent/agent.yaml under this file ONLY when this file has no `llm:`
+  # key (llm_agent.py:248). With one, this file is the whole config, and an
+  # omitted tool is a dropped tool rather than an inherited one.
   #
-  # So the paragraph that used to be here -- claiming the five were removed to
-  # stop write_file being the path of least resistance -- described a state that
-  # never existed, through the arms named A2shell*, whose whole premise was
-  # "shell and python only". Turning it off takes an explicit
-  # `file_system: {enabled: false}`, which _tool_on (tool_manager.py:47) reads.
-  # Left on for now, deliberately and with the effect known.
+  # It is wanted on. In armA2shellV6's 128 proposing calls file_system took 63 of
+  # them (43 write_file) against code_executor's 58, so removing it would remove
+  # the majority of what the model reaches for. (The paragraph that used to be
+  # here claimed the five were removed to stop write_file being the path of least
+  # resistance -- that described a state that never existed, through every arm
+  # named A2shell*, whose premise was "shell and python only".)
+  file_system:
+    mcp: false
+    include:
+      - write_file
+      - read_file
+      - edit_file
+      - grep
+      - glob
   code_executor:
     mcp: false
     # python_env means "run in this process's machine", and that machine is the
@@ -123,25 +128,31 @@ tools:
     plan_filename: .ms_agent/plan.json
     plan_md_filename: .ms_agent/plan.md
 
-# Every refusal ms-agent applies to a shell command, turned off. `allow_network`
-# and the two list-valued keys are read by LLMAgent.prepare_runtime (llm_agent.py
-# builds PermissionConfig.from_dict off this section) and take effect in the
-# sandbox, where tool_server.py loads this same file.
-#
-# The last two keys are different: ms-agent's SafetyConfig does NOT implement
-# them, and from_dict ignores unknown keys without a word, so on their own they
-# would be dead letters. tool_server.py reads them itself and applies the two
-# relaxations as a runtime patch (_patch_permission) inside the sandbox --
-# ms-agent is a harness twinkle supports, so it is used as released rather than
-# forked. The startup line reports which ones took effect.
+# The refusals ms-agent applies to a shell command, relaxed as far as a config
+# can. Read by LLMAgent.prepare_runtime, which builds PermissionConfig.from_dict
+# off this section.
 #
 # The reason is what the refusals cost here rather than what they protect: this
 # runs in a microVM that is reset once per episode and holds nothing but the
 # workspace, while each refusal rules out a whole family of tasks the model could
 # otherwise pose. `curl`/`wget` blocked means no task can fetch a source tarball
-# or a dataset; the rm rules mean it cannot clear a directory (`rm -rf *` and
-# `rm -rf build/*` are both refused) or write a task that starts from a mess that
-# has to be cleaned up.
+# or a dataset.
+#
+# Two refusals survive this section, because SafetyConfig has no key for either
+# and from_dict drops what it does not know without a word:
+#
+#   * is_dangerous_removal_path refuses `*`, anything ending in `/*`, `/`, a
+#     direct child of `/` (which `/workspace` is), and the home directory;
+#   * a glob anywhere in a write or create path is refused on its own ("Glob
+#     patterns not allowed in write operations") -- not specific to rm, so
+#     `cp src/* dst/` goes the same way. (`chmod +x bin/*` does not: chmod's
+#     arguments are not extracted as write paths.)
+#
+# So `rm -rf build/*` is refused however empty the lists below are, and no task
+# can start from a mess that has to be cleaned up. This used to be patched at
+# runtime by an in-sandbox tool server twinkle owned; the agent now runs as
+# released ms-agent, so the only honest fix is upstream, and until then the two
+# keys that asked for it are gone rather than sitting here doing nothing.
 permission:
   # Never wait on a human for a confirm. The nested key is the one
   # PermissionConfig.from_dict reads; a top-level `permission_mode` is not read
@@ -157,37 +168,39 @@ permission:
     # means "use the defaults".
     patterns: []
     # Same, for the configurable half of the rm/rmdir path check: `*`, `/*`,
-    # `/`, `~`. Left empty rather than removed to say the intent out loud;
-    # unrestricted_removal below bypasses the whole check, this list included,
-    # and tool_server.py warns at startup if the two ever disagree.
+    # `/`, `~`. Emptied rather than removed to say the intent out loud, and it
+    # is only the configurable half -- see the paragraph above for the rest.
     dangerous_removal_paths: []
-    # And the half that a config cannot reach, which is why this one needs the
-    # runtime patch: the refusals written into is_dangerous_removal_path for
-    # `*`, anything ending in `/*`, `/`, a direct child of `/` (which
-    # `/workspace` is), and the home directory.
-    unrestricted_removal: true
-    # A separate refusal, found by running commands through SafetyGuard rather
-    # than by reading the config: a glob anywhere in a write or create path is
-    # denied on its own ("Glob patterns not allowed in write operations"), which
-    # is what actually stopped `rm -rf build/*` after the two lists above were
-    # emptied. It is not specific to rm -- `cp src/* dst/` is refused by the same
-    # check. (`chmod +x bin/*` is NOT: measured through SafetyGuard, chmod's
-    # arguments are not extracted as write paths, so it was already allowed.)
-    # Patched by widening the path that is scope-checked to the directory the
-    # glob expands inside, so a glob still cannot reach outside the workspace --
-    # `cp /etc/* /workspace/` stays denied, now for being out of scope.
-    allow_write_globs: true
 
 # Web search is deliberately absent. ms-agent's `web_search` key only provides
 # fetch_page (retrieve a known URL); a real query-a-search-engine tool needs
 # EXA_API_KEY / SERPAPI_API_KEY and is wired separately from the plain tool
 # list. Add it here once that is decided; until then no task should need it.
 
-# No `llm:` section on purpose, and note that omitting it is not the same as
-# disabling it: ms-agent merges this file over its own ms_agent/agent/agent.yaml,
-# which declares `service: modelscope`. The tool server treats a section with no
-# credentials as absent, drops it, and then withdraws the one argument that
-# needed it (read_file's `abbreviate`, an LLM-written file summary) from the
-# advertised schema -- so the model is never offered a tool argument that cannot
-# work. Put a real `llm:` here, with a key reachable from the sandbox, to get
-# that argument back.
+# The policy being trained, reached over HTTP. `service: openai` is what makes
+# ms-agent read OPENAI_BASE_URL / OPENAI_API_KEY from the environment, which is
+# how the two values the trainer sets arrive: the endpoint in front of the live
+# sampler, and the key that identifies this episode's account. Neither is written
+# here -- an endpoint is bound per run and a key is minted per episode -- and
+# leaving them blank is what lets the environment supply them.
+#
+# The model name is not a choice: the endpoint serves whatever the trainer is
+# updating and ignores this field, so it exists only because ms-agent requires
+# one. Do not point it at a real provider's model as a fallback; a config that
+# quietly answers from another model trains the policy on tokens it never wrote.
+#
+# No `generation_config` on purpose. ms-agent's own default asks for
+# temperature 0.3, and this file no longer inherits it (see `tools:` above): a
+# request that names no temperature gets the trainer's own sampling parameters,
+# which is what a rollout has to be sampled at.
+llm:
+  service: openai
+  model: twinkle-policy
+  openai_api_key:
+  openai_base_url:
+  # Raised from ms-agent's 300s read timeout, which is sized for a hosted
+  # provider. This endpoint is one sampler answering every concurrent episode as
+  # the requests arrive, so a queued generation waits behind the others; a client
+  # that gives up at 300s abandons a turn the sampler is still producing, and the
+  # episode reads as a dead endpoint.
+  timeout: 1200

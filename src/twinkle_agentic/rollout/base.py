@@ -1,15 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
-import os
-import re
-import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from twinkle.data_format import Trajectory, user_data_get
+from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
-from .bridge import _to_plain
+from .trace import TraceWriter
 
 # Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
 # path takes the first three from the sampler itself; the API path has to name
@@ -27,10 +23,11 @@ MAX_FOLLOWUPS = 20
 class Rollout(ABC):
     """A batch of trajectories in, the same batch with the model's turns appended.
 
-    The concrete multi-turn loop may source each assistant turn from a local
-    sampler or an HTTP endpoint. Everything independent of that choice lives
-    here: option validation, spreading a per-call argument over the batch, the
-    thread pool that runs episodes, and trace dumping.
+    The concrete subclass may source each assistant turn from a local sampler or
+    an HTTP endpoint, or not drive the turns at all and let an agent program drive
+    them against an endpoint of ours. Everything independent of that choice lives
+    here: option validation, spreading a per-call argument over the batch, and
+    the thread pool that runs episodes.
 
     One episode per thread, and a subclass only writes the episode. Both
     backends are latency-bound on something that is not the caller's CPU -- an
@@ -46,9 +43,7 @@ class Rollout(ABC):
     # method it inherited.
     max_turns: int = 1
     sampling_params: Optional[SamplingParams] = None
-    trace_dir: Optional[str] = None
-    trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None
-    success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None
+    tracer: Optional[TraceWriter] = None
     concurrency: Optional[int] = None
 
     # ------------------------------------------------------------------ setup
@@ -56,14 +51,17 @@ class Rollout(ABC):
     def _init_common(
         self,
         *,
-        max_turns: int,
+        max_turns: int = 1,
         sampling_params: Optional[SamplingParams] = None,
         concurrency: Optional[int] = None,
-        trace_dir: Optional[str] = None,
-        trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
-        success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        tracer: Optional[TraceWriter] = None,
     ) -> None:
-        """Validate and store the options every multi-turn rollout takes."""
+        """Validate and store the options every rollout takes.
+
+        ``max_turns`` bounds a loop this class drives. A subclass that does not
+        drive one -- an episode run by an agent program, which stops when it
+        decides it is done -- leaves it alone.
+        """
         if max_turns < 1:
             raise ValueError(f'max_turns must be >= 1, got {max_turns}')
         sp = sampling_params or SamplingParams()
@@ -80,11 +78,7 @@ class Rollout(ABC):
         # None means one thread per trajectory. A cap below the batch size costs
         # throughput rather than buying safety, so it has to be asked for.
         self.concurrency = concurrency
-        self.trace_dir = trace_dir
-        self.trace_callback = trace_callback
-        self.success_callback = success_callback
-        if trace_dir:
-            os.makedirs(trace_dir, exist_ok=True)
+        self.tracer = tracer
 
     # ------------------------------------------------------------------- drive
 
@@ -117,8 +111,8 @@ class Rollout(ABC):
                     outs[futures[fut]] = fut.result()
 
         result: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
-        if self.trace_dir:
-            self._write_rollout_traces(result, global_step=kwargs.get('global_step'))
+        if self.tracer is not None:
+            self.tracer.write(result, global_step=kwargs.get('global_step'))
         return result
 
     @abstractmethod
@@ -176,120 +170,3 @@ class Rollout(ABC):
                              f'{n} trajectories running in parallel threads: pass a list '
                              f'of {n}, one per trajectory.')
         return [arg] * n
-
-    # ------------------------------------------------------------------ trace
-
-    _TRACE_SKIP_KEYS = (
-        'input_ids',
-        'labels',
-        'completion_mask',
-        'attention_mask',
-        'position_ids',
-        'logprobs',
-        'pixel_values',
-        'image_grid_thw',
-        'mm_token_type_ids',
-    )
-
-    @classmethod
-    def _serialize_for_trace(cls, traj: Dict[str, Any]) -> Dict[str, Any]:
-        """Drop tensor-like / oversized fields; keep messages + metadata.
-
-        Trace files are for human forensics; raw token ids, labels and
-        image buffers would bloat the file by orders of magnitude without
-        adding diagnostic value (the chat-template rendering of
-        ``messages`` already captures the textual content).
-        """
-        slim = {k: v for k, v in traj.items() if k not in cls._TRACE_SKIP_KEYS}
-        return _to_plain(slim)
-
-    @staticmethod
-    def _extract_ground_truth(traj: Dict[str, Any]) -> str:
-        """Pull ``ground_truth`` out of packed ``user_data``."""
-        return user_data_get(traj.get('user_data'), 'ground_truth', '') or ''
-
-    @staticmethod
-    def _resolve_traj_id(traj: Dict[str, Any], fallback_idx: int) -> str:
-        """Stable-ish trajectory id for filenames.
-
-        Prefers an explicit ``id`` / ``prompt_id`` key in ``user_data``
-        (sanitised for filesystem safety); else falls back to
-        ``{timestamp_ms}-{fallback_idx}`` so concurrent rollouts do not
-        overwrite each other's files.
-        """
-        for key in ('id', 'prompt_id'):
-            val = user_data_get(traj.get('user_data'), key)
-            if val not in (None, ''):
-                safe = re.sub(r'[^A-Za-z0-9_\-.]+', '_', str(val))[:64]
-                if safe:
-                    return safe
-        return f'{int(time.time() * 1000)}-{fallback_idx}'
-
-    def _build_trace_record(
-        self,
-        traj: Dict[str, Any],
-        *,
-        idx: int,
-        success: bool,
-    ) -> Dict[str, Any]:
-        """Assemble one trace record. Subclasses override to add fields.
-
-        ``idx`` is the trajectory's position in the rollout output list,
-        so subclasses can correlate the record with any per-call state
-        they stashed on ``self`` during ``__call__``.
-        """
-        return {
-            'trajectory': self._serialize_for_trace(traj),
-            'ground_truth': self._extract_ground_truth(traj),
-            'stop_reason': traj.get('stop_reason'),
-            'truncated': bool(traj.get('truncated')),
-            'success': success,
-        }
-
-    def _write_rollout_traces(
-        self,
-        outs: List[Dict[str, Any]],
-        *,
-        global_step: Optional[int] = None,
-    ) -> None:
-        """Dump one pretty-printed JSON file per selected trajectory.
-
-        ``trace_callback`` (if set) decides WHETHER to store;
-        ``success_callback`` (if set) decides the filename prefix
-        (``ok-`` vs ``fail-``). Defaults: store-all / mark-fail.
-
-        Observability must never break training -- any I/O or encoding
-        problem on a single trajectory is swallowed so the remaining
-        dumps and the optimisation loop continue unaffected.
-        """
-        if not self.trace_dir:
-            return
-        for idx, traj in enumerate(outs):
-            try:
-                should_store = True
-                if self.trace_callback is not None:
-                    try:
-                        should_store = bool(self.trace_callback(traj))
-                    except Exception:
-                        should_store = False
-                if not should_store:
-                    continue
-
-                success = False
-                if self.success_callback is not None:
-                    try:
-                        success = bool(self.success_callback(traj))
-                    except Exception:
-                        success = False
-
-                record = self._build_trace_record(traj, idx=idx, success=success)
-                prefix = 'ok' if success else 'fail'
-                # global_step prefix lets file listings sort by training step.
-                step_tag = f'step{int(global_step):06d}-' if global_step is not None else ''
-                fname = f'{step_tag}{prefix}-{self._resolve_traj_id(traj, idx)}.json'
-                path = os.path.join(self.trace_dir, fname)
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(record, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                # Per-trajectory failure never aborts the loop.
-                pass

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for :func:`twinkle_agentic.rollout.bridge.extend_with_bridge`.
+"""Unit tests for :func:`twinkle_agentic.utils.token_utils.extend_with_bridge`.
 
 These tests target the pure, ``self``-free bridge-stitching function directly
 (rather than through ``MultiTurnRollout``). They exercise:
@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from twinkle_agentic.rollout.bridge import extend_with_bridge
+from twinkle_agentic.utils.token_utils import extend_with_bridge
 
 
 # =============================================================================

@@ -6,33 +6,19 @@ Pure functions that translate between OpenAI API shapes and Twinkle's
 internal SampleRequest/SampleResponseModelList types. No FastAPI or
 server dependency — fully unit-testable in isolation.
 
-One field is deliberately not OpenAI's: ``x_twinkle_tokens``, off unless the
-caller asks for it by header. The sampler already knows the token ids it emitted
-and the logprob of each; dropping them on the way out means anything that wants
-to *train* on what this endpoint served has to re-tokenize the text, and a
-tokenizer is free to encode the same string differently depending on what precedes
-it. The ids then drift from what was sampled and every logprob refers to a
-position that has moved -- silently, because the arrays are still the right
-length. Handing the ids over instead is what lets an agent that drives itself
-through this endpoint (a CLI harness -- see ``twinkle_agentic/harness/base.py``,
-"Who drives") be trained on token-for-token.
+The response is OpenAI's shape and nothing else. Training on what an endpoint
+served needs the token ids the sampler emitted, not the text re-tokenized -- but
+that is not this gateway's job: a rollout that trains on an agent's own requests
+serves them itself (``twinkle_agentic.rollout.PolicyEndpoint``), in the trainer's
+process, and reports each round through a callback. An extra field here would be a
+second, weaker way to do the same thing, over a hop that has already lost the
+sampler's own objects.
 """
 from __future__ import annotations
 
 import time
 import uuid
 from typing import Any
-
-#: Request header that asks for ``x_twinkle_tokens`` on every choice. A header
-#: rather than a body field: the body is OpenAI's shape, and clients that
-#: validate it against the published schema would reject an extra key. Any of
-#: ``1``/``true``/``yes`` turns it on.
-TOKENS_HEADER = 'x-twinkle-tokens'
-
-
-def wants_tokens(value: str | None) -> bool:
-    """Does this :data:`TOKENS_HEADER` value ask for token ids?"""
-    return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -99,16 +85,8 @@ def translate_response(
     sampler_response: dict[str, Any],
     model: str,
     request_id: str | None = None,
-    include_tokens: bool = False,
 ) -> dict[str, Any]:
-    """Translate a SampleResponseModelList dict to an OpenAI ChatCompletion dict.
-
-    Args:
-        include_tokens: attach ``x_twinkle_tokens`` to every choice -- the ids the
-            sampler emitted, their logprobs, and the prompt ids they continue.
-            See the module docstring for why anything that trains on this
-            endpoint needs them. Non-streaming only: an SSE chunk carries text.
-    """
+    """Translate a SampleResponseModelList dict to an OpenAI ChatCompletion dict."""
     if request_id is None:
         request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
 
@@ -136,15 +114,6 @@ def translate_response(
                 },
                 'finish_reason': finish_reason,
             }
-            if include_tokens:
-                # The prompt ids ride along on each choice rather than at the top
-                # level: what a caller needs is one self-contained continuation,
-                # and pairing ids with the prompt they extend is the whole point.
-                choice['x_twinkle_tokens'] = {
-                    'tokens': list(tokens),
-                    'logprobs': seq.get('logprobs'),
-                    'prompt_token_ids': list(prompt_token_ids) if prompt_token_ids else None,
-                }
             choices.append(choice)
 
     return {

@@ -4,17 +4,16 @@ import math
 import re
 import threading
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import SamplingParams, Trajectory, attach_user_data, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse
 from twinkle.utils import get_logger
 from twinkle_agentic.envs import Env
-from twinkle_agentic.harness import AgentHarness, HarnessLeases
+from twinkle_agentic.protocol.api_sampler import APISampler
 from twinkle_agentic.protocol.base import API
-from twinkle_agentic.rollout import APISampler, MultiTurnRollout
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.utils.code_utils import parse_fenced_code, strip_reasoning
 from twinkle_agentic.utils.message_utils import assistant_text
 from .base import Challenger
@@ -124,12 +123,14 @@ class AgenticChallenger(Challenger):
     growing a parameter here per kind. Nothing back means propose from scratch,
     which is also what no ``seed_fn`` at all means.
 
-    ``harness_factory`` decides what an attempt *opens* with. Given one, every
-    attempt leases a harness of its own and starts from whatever that framework
-    puts in front of a query, so the policy is trained behind the agent it will
-    be served behind; the plain ``solver_system_prompt`` below is what stands in
-    when there is none. The proposing side never uses one: proposing is a
-    training-only role, and its opening is this class's own by design.
+    ``solver_rollout`` decides how an attempt is *run*. Left out, attempts go
+    through the same loop the proposing side uses: this class writes the opening,
+    generates, dispatches the environment's tools, appends the results. Given one,
+    that whole job is handed over -- to :class:`~..rollout.external.ExternalRollout`
+    for an agent that ships as its own program, or to anything else that answers
+    ``(trajectories, env=..., tool_manager=...) -> List[Trajectory]`` and returns
+    one trained episode per prompt. The proposing side never uses it: proposing is
+    a training-only role, and its loop is this class's own by design.
     """
 
     _system = ('You invent tasks for another agent to solve. You have a sandbox and '
@@ -187,7 +188,7 @@ class AgenticChallenger(Challenger):
         brittle_check_fn: Optional[Callable[[str], Optional[str]]] = None,
         pass_rate_target: float = 0.2,
         envs: Sequence[Env] = (),
-        harness_factory: Optional[Callable[[], AgentHarness]] = None,
+        solver_rollout: Optional[Any] = None,
         num_challenger_rollouts: int = 8,
         num_solver_rollouts: int = 8,
         pass_band: Tuple[float, float] = (1.0, 7.0),
@@ -254,12 +255,11 @@ class AgenticChallenger(Challenger):
         # building it needs nothing a job has, so building it up front spares the
         # jobs a race over who gets to -- one they would all lose but one.
         self._rollout = MultiTurnRollout(backend, **kwargs)
+        # Attempts run through the same loop unless a caller handed one over.
+        # Not owned either way: a rollout passed in was built by the caller and is
+        # the caller's to close, and the one built here is closed as itself.
+        self._solver_rollout = solver_rollout if solver_rollout is not None else self._rollout
         self._tally = threading.Lock()
-        # One harness per concurrent job, for the reason there is one environment
-        # per job: a harness carries the wrapped framework's memory and context,
-        # so two attempts sharing one would read each other's.
-        self._harnesses = (HarnessLeases(harness_factory, len(self.envs))
-                           if harness_factory is not None else None)
 
     def _tool_manager(self, env: Env) -> Optional[Any]:
         return env.tool_manager() if env.tools() else None
@@ -358,36 +358,25 @@ class AgenticChallenger(Challenger):
         return _ProposalResult(trajectory, task=task, reason=reason, detail=detail)
 
     def _solve(self, unit: _Unit, proposal: _ProposalResult, env: Env) -> None:
-        """One attempt at one task, graded in the environment that made it."""
+        """One attempt at one task, graded in the environment that made it.
+
+        Both the environment and its tool manager go to the rollout, and which of
+        the two it reads is its own business: a loop driven here dispatches through
+        the manager, an agent that runs as a program is handed the environment to
+        run in. Neither has to be told which kind it is talking to.
+        """
         try:
-            with self._lease_harness() as harness:
-                kwargs: Dict[str, Any] = {}
-                if harness is not None:
-                    kwargs['harness'] = harness
-                manager = self._tool_manager(env)
-                if manager is not None:
-                    kwargs['tool_manager'] = manager
-                attempts = self._rollout([self._solver_prompt(proposal.task, env, harness)], **kwargs)
+            kwargs: Dict[str, Any] = {'env': env}
+            manager = self._tool_manager(env)
+            if manager is not None:
+                kwargs['tool_manager'] = manager
+            attempts = self._solver_rollout([self._solver_prompt(proposal.task, env)], **kwargs)
             if attempts:
                 passed = self._judge(proposal.task, env)
                 with unit.lock:
                     proposal.attempts.append((attempts[0], passed))
         finally:
             self._job_done(unit)
-
-    @contextmanager
-    def _lease_harness(self) -> Iterator[Optional[AgentHarness]]:
-        """The harness this attempt owns, or None when no factory was given.
-
-        Held for the rollout only. The check that grades the attempt afterwards
-        reads the workspace, not the conversation, so keeping the harness for it
-        would only make the next attempt wait.
-        """
-        if self._harnesses is None:
-            yield None
-            return
-        with self._harnesses.lease() as harness:
-            yield harness
 
     def _job_done(self, unit: _Unit) -> None:
         """Count one job out, and score the unit if it was the last one."""
@@ -488,31 +477,20 @@ class AgenticChallenger(Challenger):
                     f"{f' -- {detail[:400]}' if detail else ''}")
         return None
 
-    def _solver_prompt(self, task: Trajectory, env: Env,
-                       harness: Optional[AgentHarness] = None) -> Trajectory:
+    def _solver_prompt(self, task: Trajectory, env: Env) -> Trajectory:
         """The opening one attempt starts from: the statement, plus how to read it.
 
-        With a harness the opening is *its* -- system prompt, memory, whatever the
-        framework puts in front of a query -- because the policy is deployed
-        behind that framework, and a second phrasing invented here is one it would
-        never meet again.
-
-        The tools come from the environment either way, overriding whatever the
-        harness advertises. A harness on the training host is built without a tool
-        runtime of its own, since standing one up here would execute the model's
-        commands in the trainer's own process, so the schemas that mean anything
-        are the ones the environment will honour.
+        The tools come from the environment, since the schemas that mean anything
+        are the ones the environment will honour. A rollout that brings its own
+        agent brings its own opening too and reads only the statement out of this,
+        which costs it the unused keys and nothing else.
         """
         statement = next((message.get('content', '') for message in task.get('messages') or []
                           if isinstance(message, dict) and message.get('role') == 'user'), '')
-        if harness is not None:
-            prompt = harness.start(statement)
-        else:
-            messages: List[Dict[str, Any]] = [{'role': 'user', 'content': statement}]
-            if self._solver_system:
-                messages.insert(0, {'role': 'system', 'content': self._solver_system})
-            prompt = {'messages': messages}
-        return self._with_tools(prompt, env)
+        messages: List[Dict[str, Any]] = [{'role': 'user', 'content': statement}]
+        if self._solver_system:
+            messages.insert(0, {'role': 'system', 'content': self._solver_system})
+        return self._with_tools({'messages': messages}, env)
 
     def _judge(self, task: Trajectory, env: Env) -> bool:
         script = user_data_get(task.get('user_data'), 'check_script', '')
@@ -637,11 +615,12 @@ class AgenticChallenger(Challenger):
         return [challenger] if challenger else [], [best[1]] if best is not None else []
 
     def close(self) -> None:
-        """Workers and environments first, harnesses after.
+        """Workers and environments first, then a solver rollout that holds something.
 
         In that order because ``super().close()`` is what waits the jobs out, and
-        a harness must not be released while a job could still be holding it.
+        a rollout must not have its endpoint pulled while a job could still be
+        driving an agent against it.
         """
         super().close()
-        if self._harnesses is not None:
-            self._harnesses.close()
+        if self._solver_rollout is not self._rollout and hasattr(self._solver_rollout, 'close'):
+            self._solver_rollout.close()

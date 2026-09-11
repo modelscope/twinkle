@@ -596,11 +596,11 @@ def test_sampler_network_error_propagates_unchanged():
 
 def test_dependencies_are_reused_not_reimplemented():
     """ClientMultiTurnRollout imports (does not copy) ToolManager & extend_with_bridge."""
-    import twinkle_agentic.rollout.bridge as bridge_mod
     import twinkle_agentic.tools.tool_manager as tool_manager_mod
+    import twinkle_agentic.utils.token_utils as token_utils_mod
     import twinkle_client.rollout.multi_turn as m
 
     # Same object identity => the symbols are imported from the shared core-lib
     # modules rather than re-defined locally.
     assert m.ToolManager is tool_manager_mod.ToolManager
-    assert m.extend_with_bridge is bridge_mod.extend_with_bridge
+    assert m.extend_with_bridge is token_utils_mod.extend_with_bridge

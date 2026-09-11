@@ -1,21 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Shared, pure template-space stitching logic for multi-turn rollouts.
+"""Growing a token sequence one turn at a time, in template space.
 
-This module hosts ``self``-free functions that grow a running ``InputFeature``
-(``pif``) one turn at a time, all measuring what a turn adds by diffing rendered
-chat-template output rather than by pasting special tokens together:
+``self``-free functions that extend a running ``InputFeature`` (``pif``), all
+measuring what a turn adds by diffing rendered chat-template output rather than
+by pasting special tokens together -- which is what makes them hold for any chat
+template:
 
+* :func:`append_ids` grows the sequence by raw ids, trainable or not.
 * :func:`extend_with_bridge` appends tool messages and the next generation
   prompt as ``-100`` "bridge" tokens.
 * :func:`encode_appended_turn` returns the tokens an assistant turn written
-  outside the sampler (an API, a human) contributes.
+  outside the sampler (an API, an agent, a human) contributes.
 
-The bridge logic was lifted verbatim from ``MultiTurnRollout._extend_with_bridge``
-and ``MultiTurnRollout._append_bridge_tokens``; every ``self.template`` access was
-rewritten to use the ``template`` parameter. It is shared between the
-core-library ``MultiTurnRollout`` and the client-side rollout so the two paths
-cannot drift. No Ray decorators (``@remote_function`` / ``@remote_class``) are
-applied here.
+They live here rather than on a rollout because several callers need the same
+answers -- the core-library ``MultiTurnRollout``, the client-side one, and the
+ledger an external agent's rounds are booked into -- and a second copy of this
+arithmetic is a second set of off-by-one bugs. No Ray decorators
+(``@remote_function`` / ``@remote_class``) are applied here.
 """
 
 
@@ -184,7 +185,7 @@ def extend_with_bridge(
     if not bridge_ids:
         raise RuntimeError(f'Bridge text tokenised to empty id list: {bridge_text!r}')
 
-    new_pif = _append_bridge_tokens(pif, bridge_ids, template)
+    new_pif = append_ids(pif, bridge_ids, template, trainable=False)
     if new_pif is None:
         # Trajectory exceeds max_length and strategy is 'delete'
         return None
@@ -192,18 +193,30 @@ def extend_with_bridge(
     return new_pif
 
 
-def _append_bridge_tokens(
+def append_ids(
     pif: Dict[str, Any],
-    bridge_ids: List[int],
+    ids: List[int],
     template: Template,
+    *,
+    trainable: bool,
 ) -> Optional[Dict[str, Any]]:
-    """Append bridge tokens with labels = -100.
+    """Grow the sequence by ``ids``; ``trainable`` says whose tokens they are.
 
     Mirrors the unroll-append-reroll pattern of
     :meth:`Template.concat_input_feature` so that ``labels`` and
     ``completion_mask`` semantics stay consistent with the sampler-produced
-    pif. Bridge tokens are nobody's completion -- neither scored nor
-    log-prob-bearing -- so both fields are appended as zeros.
+    pif.
+
+    ``trainable=False`` is an observation -- a tool result, a bridge to the next
+    generation prompt, anything the environment put in front of the model. It is
+    nobody's completion, neither scored nor log-prob-bearing, so labels are
+    ``-100`` and the mask is 0.
+
+    ``trainable=True`` is the policy's own continuation, and each id is its own
+    label: in input order position ``i`` is trained to produce ``input_ids[i]``,
+    which the post pipeline then shifts. Callers pass ids the sampler emitted --
+    never ids re-encoded from text, which is the drift this module exists to
+    avoid.
 
     Shallow copy is deliberately used: every mutation below is a
     top-level key reassignment, never an in-place change to nested
@@ -213,22 +226,25 @@ def _append_bridge_tokens(
     """
     result = dict(pif)
 
-    input_ids = list(result['input_ids'])
+    input_ids = list(result.get('input_ids') or [])
     labels = list(result.get('labels') or [])
     # labels arrive in output/shifted order (post _roll_labels). Unroll by
     # one position (shift right by 1) to get back to input order.
     if labels:
         if len(labels) != len(input_ids):
             raise RuntimeError(f'labels length ({len(labels)}) != input_ids length '
-                               f'({len(input_ids)}); cannot safely append bridge tokens.')
+                               f'({len(input_ids)}); cannot safely append tokens.')
         labels = labels[-1:] + labels[:-1]
     else:
         labels = [-100] * len(input_ids)
+    # Written back before the mask is read off it, so an empty account -- the
+    # first call of an externally driven episode -- is a valid starting point.
+    result['input_ids'] = input_ids
     completion_mask = template._prefix_completion_mask(result, labels)
 
-    input_ids = input_ids + list(bridge_ids)
-    labels = labels + [-100] * len(bridge_ids)
-    completion_mask = completion_mask + [0] * len(bridge_ids)
+    input_ids = input_ids + list(ids)
+    labels = labels + (list(ids) if trainable else [-100] * len(ids))
+    completion_mask = completion_mask + [1 if trainable else 0] * len(ids)
 
     result['input_ids'] = input_ids
     result['labels'] = labels
@@ -241,7 +257,7 @@ def _append_bridge_tokens(
             mm = torch.as_tensor(mm)
         # Pad along the last (sequence) dim — handles 1D [T] and 2D [1, T] uniformly.
         leading_shape = mm.shape[:-1]
-        pad = torch.zeros((*leading_shape, len(bridge_ids)), dtype=mm.dtype, device=mm.device)
+        pad = torch.zeros((*leading_shape, len(ids)), dtype=mm.dtype, device=mm.device)
         result['mm_token_type_ids'] = torch.cat([mm, pad], dim=-1)
 
     # Replay the post pipeline: refresh attention_mask / position_ids /

@@ -1,18 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import re
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
-from twinkle_agentic.harness.base import AgentHarness
+from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .api_sampler import APIGenerationError, APISampler
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
 from .ledger import TurnLedger
+from .trace import TraceWriter
 
 
 ResponseCallback = Callable[..., SampledSequence]
@@ -42,21 +42,6 @@ def _default_response_callback(sampler, api, sampling_params, *, input_feature, 
     if not isinstance(sequence, SampledSequence):
         raise TypeError(f'expected SampledSequence, got {type(sequence).__name__}')
     return sequence
-
-
-def _append_only_delta(
-    old_messages: List[Dict[str, Any]],
-    new_messages: List[Dict[str, Any]],
-) -> Optional[List[Dict[str, Any]]]:
-    """Return newly appended messages, or None if ``new`` rewrote history."""
-    old = list(old_messages or [])
-    new = list(new_messages or [])
-    if len(new) < len(old):
-        return None
-    for a, b in zip(old, new):
-        if a != b:
-            return None
-    return new[len(old):]
 
 
 def is_error_observation(observation: str) -> bool:
@@ -147,36 +132,36 @@ class MultiTurnRollout(Rollout):
 
     Per-trajectory loop::
 
-        harness.before_generate     # append-only after the first encode
         response_callback(...)      # sampler or API -> SampledSequence
-        harness.after_generate
         ToolManager.call_many       # this turn's calls, one Env round trip
-        harness.after_tools         # format observations as tool messages
         extend_with_bridge          # labels=-100; never decode-reencode history
 
     Each trajectory runs its whole loop in its own thread. The callback may route
     each turn to the sampler or the API adapter; either can overlap with other
     trajectories while its thread waits on a GPU worker, endpoint, or sandbox.
 
+    Every part of the loop except the generation is optional. Without a
+    ``tool_manager`` nothing is dispatched and a reply that calls a tool simply
+    ends the episode; without a ``followup_fn`` nothing is asked afterwards. All
+    of them absent is a single-turn sampling pass, and that is a supported way to
+    use this rather than a degenerate one.
+
+    This drives the conversation itself. An agent that ships as its own program
+    cannot be driven this way and belongs in
+    :class:`~.external.ExternalRollout`.
+
     A supplied sampler must declare ``sample`` with ``enable_continous_work``.
     Without it, ``slice_dp`` spreads each single-request call over every worker
     and raises on ranks that receive nothing.
 
     Shared state: ``sampler``, API client and ``template`` are read-only during a
-    rollout and safe to share. A ``harness`` is not -- an ms-agent one delegates to an
-    ``LLMAgent`` that holds memory and context of its own -- so a batch of more
-    than one trajectory has to be given a 1:1 list of them; a single instance is
-    refused rather than shared.
+    rollout and safe to share.
 
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: :class:`SamplingParams` for every episode.
         * ``response_callback``: chooses a backend for each assistant turn and
           returns one :class:`SampledSequence`.
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
-        * ``harness``: a 1:1 list of :class:`AgentHarness` (a single instance
-          only for a batch of one). Framework specifics (ms-agent
-          system/memory/tool-message shape) live in the harness subclass, not
-          here.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
     """
@@ -190,10 +175,7 @@ class MultiTurnRollout(Rollout):
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
         concurrency: Optional[int] = None,
-        trace_dir: Optional[str] = None,
-        trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
-        success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
-        harness: Optional[AgentHarness] = None,
+        tracer: Optional[TraceWriter] = None,
         adapter_path: Optional[str] = None,
         use_base_model: bool = False,
         stop_after_stuck_turns: int = 0,
@@ -233,9 +215,7 @@ class MultiTurnRollout(Rollout):
             max_turns=max_turns,
             sampling_params=sampling_params,
             concurrency=concurrency,
-            trace_dir=trace_dir,
-            trace_callback=trace_callback,
-            success_callback=success_callback)
+            tracer=tracer)
         self.sampler = sampler
         self.template = template
         if isinstance(api, APISampler):
@@ -253,7 +233,6 @@ class MultiTurnRollout(Rollout):
             self.api = None
         self.response_callback = response_callback or _default_response_callback
         self.tool_manager = tool_manager
-        self.harness = harness
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
         # its adapter into the sampler directly, but evaluating a saved one has no
         # such channel: without this, an eval script would silently measure the
@@ -354,30 +333,14 @@ class MultiTurnRollout(Rollout):
             'response_callback': response_callback,
             'tool_managers': self._broadcast(
                 kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
-            'harnesses': self._broadcast(
-                kwargs.get('harness', self.harness), n, name='harness', per_trajectory=True),
             'followup_fn': kwargs.get('followup_fn', self.followup_fn),
         }
 
     def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
         tool_manager: ToolManager = ctx['tool_managers'][index]
-        harness: Optional[AgentHarness] = ctx['harnesses'][index]
         followup_fn = ctx['followup_fn']
         adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
         response_callback: ResponseCallback = ctx['response_callback']
-
-        # 1. First before_generate happens *before* encode so memory/system
-        #    injection is in the initial prefix (not a later rewrite).
-        live: Optional[Trajectory] = None
-        to_encode = trajectory
-        if harness is not None:
-            live = dict(trajectory)
-            live['messages'] = list(live.get('messages') or [])
-            live = harness.before_generate(live)
-            to_encode = dict(trajectory)
-            to_encode['messages'] = list(live.get('messages') or [])
-            if live.get('tools'):
-                to_encode['tools'] = list(live['tools'])
 
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
@@ -387,11 +350,9 @@ class MultiTurnRollout(Rollout):
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         opening_tools = None
-        if 'tools' not in to_encode and tool_manager is not None:
+        if 'tools' not in trajectory and tool_manager is not None:
             opening_tools = list(tool_manager.tool_infos() or [])
-        ledger.open(to_encode, tools=opening_tools)
-        if live is not None:
-            live['messages'] = ledger.messages
+        ledger.open(trajectory, tools=opening_tools)
 
         stop_reason: Optional[str] = None
         generation_error: Optional[str] = None
@@ -428,7 +389,7 @@ class MultiTurnRollout(Rollout):
             is no room for another stage", which is a cut trajectory rather than
             a caller that had nothing more to ask.
             """
-            nonlocal live, followups, budget, params, truncated
+            nonlocal followups, budget, params, truncated
             if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
             followup = followup_fn(
@@ -442,8 +403,6 @@ class MultiTurnRollout(Rollout):
                 return False
             # Follow-up stages are answers, so an API must not see tool schemas.
             ledger.input_feature['tools'] = []
-            if live is not None:
-                live['messages'] = ledger.messages
             followups += 1
             budget += 1
             if next_params is not None:
@@ -452,12 +411,6 @@ class MultiTurnRollout(Rollout):
 
         while spent < budget:
             spent += 1
-
-            if spent > 1:
-                live, dropped = self._harness_before_generate(ledger, live, harness)
-                if dropped:
-                    truncated = True
-                    break
 
             # 2. One request. The callback chooses the local sampler or the API
             # adapter, but both paths return exactly one SampledSequence.
@@ -519,12 +472,6 @@ class MultiTurnRollout(Rollout):
                         last_msg['content'] = seq.decoded or ''
                     last_msg.pop('tool_calls', None)
 
-            if live is not None:
-                live['messages'] = list(msgs)
-            if harness is not None and live is not None:
-                live = harness.after_generate(live, seq.decoded or '', tool_calls or [])
-                self._merge_assistant_metadata(pif, live)
-
             # 3. Termination conditions
             # A reply cut off at ``max_tokens`` is truncated in exactly the sense
             # the flag names, and consumers read the flag to tell a trajectory
@@ -555,8 +502,6 @@ class MultiTurnRollout(Rollout):
                     if not ledger.observe([_malformed_tool_message(parse_errors)]):
                         truncated = True
                         break
-                    if live is not None:
-                        live['messages'] = ledger.messages
                     continue
                 # The episode is over as far as the model is concerned. Give the
                 # caller one chance to say otherwise -- see ``followup_fn`` for
@@ -576,8 +521,8 @@ class MultiTurnRollout(Rollout):
 
             malformed_turns = 0
 
-            # 4. This turn's calls, then the harness formats the observations
-            #    into tool messages (append-only bridge).
+            # 4. This turn's calls, appended as an append-only bridge of tool
+            #    messages the model did not write.
             if tool_manager is None:
                 raise ValueError('the model emitted tool_calls but this trajectory has no ToolManager')
             observations = self._run_tools(tool_manager, tool_calls)
@@ -591,15 +536,13 @@ class MultiTurnRollout(Rollout):
                 else:
                     stuck_turns = 0
 
-            tool_messages, live = self._tool_messages_after(pif, live, harness, observations, tool_calls)
+            tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
             if overflowed:
                 # Trajectory exceeded max_length.
                 truncated = True
             else:
                 pif = ledger.input_feature
-                if live is not None:
-                    live['messages'] = ledger.messages
             # Checked after the messages are appended, so the turns that ended
             # the episode are in the trajectory the caller reads.
             if self.stop_after_stuck_turns and stuck_turns >= self.stop_after_stuck_turns:
@@ -656,67 +599,3 @@ class MultiTurnRollout(Rollout):
         for i, content in enumerate(contents[:len(tool_calls)]):
             obs[i] = '' if content is None else str(content)
         return obs
-
-    def _harness_before_generate(
-        self,
-        ledger: TurnLedger,
-        live: Optional[Trajectory],
-        harness: Optional[AgentHarness],
-    ) -> Tuple[Optional[Trajectory], bool]:
-        """Run before_generate; bridge append-only deltas. ``dropped`` if encode fails.
-
-        A harness that rewrote earlier turns rather than appending gets its rewrite
-        ignored: the ids for those turns are already banked, and re-encoding them
-        would replace tokens that have logprobs attached with tokens that do not.
-        """
-        if harness is None or live is None:
-            return live, False
-        live['messages'] = ledger.messages
-        live = harness.before_generate(live)
-        delta = _append_only_delta(ledger.messages, live.get('messages') or [])
-        if not delta:
-            return live, False
-        if not ledger.observe(delta):
-            return live, True
-        live['messages'] = ledger.messages
-        return live, False
-
-    @staticmethod
-    def _merge_assistant_metadata(pif: Dict[str, Any], live: Trajectory) -> None:
-        """Copy tool_calls / reasoning onto the sampled assistant message.
-
-        Content is left untouched so the token-id chain stays valid.
-        """
-        pif_msgs = pif.get('messages') or []
-        if not pif_msgs or pif_msgs[-1].get('role') != 'assistant':
-            return
-        last_asst = None
-        for m in reversed(live.get('messages') or []):
-            if m.get('role') == 'assistant':
-                last_asst = m
-                break
-        if last_asst is None:
-            return
-        dst = pif_msgs[-1]
-        for key in ('tool_calls', 'reasoning_content', 'name'):
-            if last_asst.get(key) and not dst.get(key):
-                dst[key] = last_asst[key]
-
-    def _tool_messages_after(
-        self,
-        pif: Dict[str, Any],
-        live: Optional[Trajectory],
-        harness: Optional[AgentHarness],
-        observations: List[str],
-        tool_calls: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], Optional[Trajectory]]:
-        fallback = _default_tool_messages(tool_calls, observations)
-        if harness is None or live is None:
-            return fallback, live
-        old = list(pif.get('messages') or [])
-        live['messages'] = list(old)
-        live = harness.after_tools(live, observations, tool_calls)
-        delta = _append_only_delta(old, live.get('messages') or [])
-        if not delta:
-            return fallback, live
-        return delta, live

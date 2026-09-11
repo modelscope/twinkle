@@ -231,12 +231,22 @@ class ChallengerArgs:
     # Idle seconds before the host may pause a sandbox. Wider than max_turns of
     # generation plus the difficulty pass, or a slot is reclaimed mid-episode.
     sandbox_timeout: int = 900
-    # An agent framework's own config, which makes the episode look the way that
-    # framework serves it: its tools run inside the sandbox and its harness writes
-    # the opening messages, so training advertises the tool set deployment has
-    # rather than the env's built-in three. Sandboxed runs only -- there is no
-    # runtime to install in a local workspace. Empty keeps both halves off.
+    # An agent framework's own config, passed to that framework's CLI. Given one,
+    # a solver attempt is that program run to completion on the task: it owns its
+    # loop, its tools and its context, and the policy is trained on the requests it
+    # made -- so training sees the agent deployment runs rather than a loop written
+    # here. Empty trains against the env's built-in tools and this repo's own
+    # prompt. Sandboxed runs only: the agent needs a machine of its own.
     agent_config: str = ''
+    # Where the policy endpoint the agent calls should bind. The agent runs inside
+    # the sandbox, so loopback is the sandbox itself and the requests never arrive:
+    # this has to be an address of the training host that the sandbox can route to.
+    # Empty is loopback, which is right only when the agent runs on this machine.
+    agent_endpoint_host: str = ''
+    agent_endpoint_port: int = 0
+    # Seconds before an agent process is killed. The only bound on an attempt --
+    # the agent decides when it is done, so max_turns does not apply to it.
+    agent_timeout: int = 1800
     save_dir: str = 'output/rsi/proposals'
     save_failed_rollouts: bool = True
     max_turns: int = 8

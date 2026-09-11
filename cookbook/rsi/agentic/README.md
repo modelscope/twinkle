@@ -1,179 +1,53 @@
-# agentic — RSI self-play where one trajectory is one request
+# agentic — the sandbox host, and the agent that runs inside it
 
-One model plays both roles. It builds something in a sandbox, then writes a task
-description for what it built, then tries to redo that task from the description
-alone. How often it succeeds is what scores the description: a task the solver
-passes sometimes is worth training on, one it always or never passes is not.
+Two things live here, and neither is a training script:
 
-This replaced an earlier version of the same method whose difference was
-scheduling: there a round of proposals moved through the pipeline as a batch and
-every stage waited for the slowest member. Here each trajectory is its own request
-from start to finish, and the only place anything waits is the last step, deciding
-whether a group of eight is worth keeping. (The old version was retired to
-`.temp/agentic_legacy`; nothing here imports from it.)
-
-## Three resources, three queues
-
-| resource | how many at once | who queues on it |
+| path | what it is | who reads it |
 |---|---|---|
-| sandbox | `--sandbox-slots` microVMs (32) | one job owns one slot from the workspace clear to its last check |
-| vLLM | `enable_continous_work` routes each request to the least busy worker | every build turn and every solver turn, one trajectory per request |
-| API | `--api-concurrency` (32) | check scripts, problem statements, the rubric |
+| `sandbox_server/` | how to stand up the machine that hosts the microVMs | you, once per host |
+| `rsi_agent.yaml` | the agent's own config | `ms-agent run`, inside each microVM |
 
-There is one FIFO job queue and one thread per sandbox slot, so a slot is never
-idle while there is work. A build that finishes hands its statement to eight
-solver jobs, releases its slot, and returns — it never waits for its own solvers,
-which is what would deadlock a pool against itself. Rubric jobs go to a separate
-pool because they need no sandbox.
+The training entry point is `cookbook/rsi/rsi_grpo.py`, one level up. It is what
+starts a run; this directory is what a run needs to already exist.
 
-A batch of one is a first-class vLLM call here. `challenge.py` refuses to start if
-the sampler does not advertise `enable_continous_work`, because without it a batch
-of one is padded up to the worker count and most of every generation is thrown
-away.
-
-## One proposal, three stages
-
-1. **Build.** Local model, sandbox tools, one tool call per reply, up to
-   `--max-turns`. This is the trainable part: the trajectory keeps exactly the
-   tokens the local model produced.
-2. **Check script.** The workspace is read back byte for byte and appended to a
-   *copy* of the build conversation; qwen3.8-max writes a python script that
-   asserts the end state. It is rejected on the syntax tree if it pins file sizes,
-   checksums or a script's source text, then run in the sandbox. One rewrite.
-3. **Problem statement.** Same copy, one more API reply: input data verbatim,
-   everything derived given as the rule that produces it.
-
-Stages 2 and 3 run on the API so the check and the statement are written with the
-whole build history in view without adding untrained tokens to the sample.
-
-## Groups, and the one place things wait
-
-A group is `--group-size` (8) proposals sharing one keyword draw and one prompt.
-That is what makes it a GRPO group: a proposal's advantage is its reward minus the
-mean over the others answering the same prompt.
-
-- Each proposal's task gets `--solver-rollouts` (8) attempts. `n_pass` is how many
-  passed, with the denominator fixed at 8 — a truncated attempt is a failed
-  attempt, the same as one whose assertions failed.
-- Once all eight builds are in, the eight statements are scored for novelty
-  *against each other* plus the closest entries in the task bank. Waiting for all
-  eight costs nothing: the slots are held by other groups' jobs the whole time. If
-  a statement still has no verdict after `--novelty-tries` (3), the group is
-  dropped and its queued solver attempts are skipped.
-- **The group is kept when at least one proposal has `n_pass` in `[1, 7]`.** The
-  other seven may be anything, including builds that produced no task at all;
-  they train with the reward they earned, which for those is 0.
-- From a kept group the highest-reward in-band proposal is selected, and its eight
-  solver attempts are what the solver side trains on. The unselected proposals'
-  attempts were measured and are reported, but not trained on.
-
-Eight kept groups give 64 proposing and 64 solving trajectories: one training step.
-
-## Reward
-
-Proposing side, unchanged from where it was measured:
-
-```
-reward = exp(-(n_pass/8 - 0.2)^2 / (2 * 0.3^2)) * (floor + (1-floor) * novelty)
-reward = 0                                       when n_pass is 0 or unmeasured
+```bash
+python cookbook/rsi/rsi_grpo.py \
+    --sandbox-template twinkle-rsi-msagent \
+    --sandbox-api-url http://<host>:<port> \
+    --agent-config cookbook/rsi/agentic/rsi_agent.yaml \
+    --agent-endpoint-host <this machine, as the sandbox can reach it>
 ```
 
-The gaussian peaks at a pass rate of 0.2, not 0.5: a proposal only teaches the
-solver something when the solver mostly cannot do it yet. The floor at
-`n_pass <= 0` is load-bearing — the gaussian at p=0 is 0.801, higher than the
-0.607 it gives a proposal half the attempts solve, so without the gate the best
-thing a proposer could do is write tasks nobody can finish.
+Drop `--agent-config` and the solver runs through twinkle's own loop against the
+environment's built-in tools instead — same tasks, same grading, no agent process.
+Drop `--sandbox-template` too and the workspaces are local directories, which has
+no isolation: fine for a check that is a few asserts, wrong for training a policy
+to run commands it wrote itself.
 
-Note that being out of band does not zero the reward. A task everybody solves
-still earns about 0.03. Out of band decides whether the task is delivered to the
-solver side; it does not zero the proposer's score.
-
-`floor` defaults to 1, which makes the novelty term exactly 1.0 — the score is
-still judged and still written to `novelty_scores.jsonl`, it just does not move a
-reward. Measured on iter1's 27 proposals: judged against their own siblings 24 of
-27 scored exactly 0.0, which is the right answer (a keyword draw produces eight
-paraphrases of one task) and also a useless one, since a term constant across the
-group contributes nothing after GRPO subtracts the group mean. Labelling each
-task's shape on its own instead does separate proposals within a group, but the
-label changed between sampled repeats on 10 of 27 statements. `NOVELTY_FLOOR=0.5`
-puts it back in.
-
-Solving side: 1.0 if the check exits 0, else 0.0.
-
-## Files
+## Which process runs where
 
 ```
-run.sh             start or continue a run: the GPU split, the guards, the env
-rsi.py             the loop: one resident process, collect -> step -> sync, forever
-challenge.py       collect: the queues, the three job bodies, the group decision
-train.py           one GRPO step over what was collected, as a library rsi.py calls
-sandbox.py         the sandbox as a resource: clear, snapshot, run a script
-prompts.py         every string sent to a model
-episode.py         how an episode is built and scored, shared with eval.py
-remote_tool_env.py the transport to one microVM, paired with sandbox_server/
-sandbox_server/    the sandbox host: install.sh, serve.sh, and tool_server.py
-eval.py            held-out pass rate on tasks the trainer never saw
-rsi_agent.yaml     the ms-agent config both sides' openings are shaped by
+training host                                    microVM (one per env slot)
+-----------------------------------------------  ----------------------------
+vLLM sampler ── PolicyEndpoint (HTTP) ◄──────────── ms-agent run
+                     │                                  │ shell, python, files
+                     └── LedgerBook ── trajectories      └── /workspace
 ```
 
-The trainer and the sampler are two disjoint device groups in one Ray job -- 2 and
-6 GPUs by default -- and both stay resident for the whole run. After each step the
-new weights go to the live vLLM engines over NCCL (`CheckpointEngineManager`), so
-nothing is restarted and nothing round-trips through the filesystem. `loop.sh`,
-which used to run a fresh `challenge.py` and `train.py` per iteration, is retired
-under `.temp/retired_rsi/`: it spent 11 minutes per iteration on startup, re-read
-the checkpoint once per GPU, and -- the reason it had to go -- passed the model
-between iterations as bf16 weights only, which threw away the fp32 master weights
-and the Adam moments every time. Measured on v3 after 12 iterations at lr 1e-6:
-98.54% of the 4.02 B weights were still bit-identical to the base model, and the
-largest change anywhere was 2.289e-05, one bf16 step at that magnitude.
+The agent is not called turn by turn. It is started, it works, it exits, and what
+trains is the requests it made on the way: the endpoint serves them from the live
+sampler and reports each one, and the accounts assemble them into trajectories.
+Which episode a request belongs to is decided by its API key, minted per episode.
 
-Output under `<root>/<tag>/iter<n>`:
+Two consequences worth knowing before the first run:
 
-```
-trajs/*.npz            input_ids / labels / logprobs
-trajs/index.jsonl      one line per trained trajectory: side, group, reward, messages
-groups.jsonl           one line per decided group, kept or not, and why
-tasks.jsonl            the statements and check scripts delivered
-rejected.jsonl         every build that produced no task, and how its episode ended
-solver_attempts.jsonl  every attempt: the check's output and the workspace it left
-novelty_scores.jsonl   the rubric, all three dimensions and all nine verdicts
-keyword_gen.jsonl      every keyword call, prompt and reply verbatim
-keywords.jsonl         the keyword bank, carried between iterations
-challenge_metrics.json this collection as numbers: scalars, raw counters, histograms
-train_summary.json     what the step actually trained, and what it skipped
-```
-
-Only `trajs/` is read again — by `train.py`. The rest is written for reading after
-the fact: `solver_attempts.jsonl` is the only thing that answers whether a task at
-`n_pass=0` was unsolvable or the solver gave up, and `novelty_scores.jsonl` records
-usefulness and complexity, which are scored by the same call but reach no reward.
-
-`challenge_metrics.json` is the exception: `train.py` reads its `scalars` section and
-sends it to swanlab together with the training metrics, so one chart carries both
-halves of an iteration. It is computed by reading `groups.jsonl` back rather than
-from the live objects, so it cannot disagree with the audit file beside it, and the
-same function recomputes it for a directory that finished hours ago. Three sections:
-
-* `scalars` — fixed keys, every value a number. What goes up. Includes
-  `solve_pass_rate`, the accuracy: passes over every solver attempt that ran. Read
-  it as a property of the pair, not of the model — the tasks change every iteration,
-  so a rise can be the solver improving or the proposer getting easier, and
-  `n_pass_in_band_rate` next to it is what separates those.
-* `counts` — the raw counters, dynamic keys and all. `group_dropped:rubric_error`
-  exists only in a run where that happened, so these stay in the file and are not
-  uploaded: a chart that appears halfway through a run reads as a change in the run.
-* `distributions` — the `n_pass`, build-outcome and novelty histograms behind the
-  means, because a mean `n_pass` of 4 is a different collection depending on whether
-  it came from eights and zeros or from fours.
-
-Nothing is truncated in these files. They are read to check whether a reward was
-deserved, which a shortened statement cannot answer.
-
-Everything is in this directory. `sandbox.py` takes its transport from
-`remote_tool_env.py`, which is paired with the tool server in `sandbox_server/`,
-and the solver's opening from `episode.solver_harness`, which `eval.py` uses too —
-so a task's `n_pass` here and its `pass@k` there are measured against one opening.
+* **`--agent-endpoint-host` is not optional with `--agent-config`.** Inside the
+  microVM `127.0.0.1` is the microVM, so the default bind is an endpoint the agent
+  cannot reach. It has to be an address of the training host that the sandbox
+  network routes to.
+* **The endpoint is in the trainer's own process, on purpose.** Point the agent at
+  a model served anywhere else and every generation is off-policy by however far
+  the two copies have drifted, with nothing reporting it.
 
 ## The sandbox host
 
@@ -189,132 +63,44 @@ sh serve.sh                    # the server, plus the reaper
 `--via` only matters for the network: `aenv build` hands the Dockerfile to a
 template builder whose VM downloaded at 33 KB/s here against a sandbox's 5.4
 MB/s, so a six-minute build reads as a hung one. `--via=sandbox` installs inside
-a live sandbox and snapshots it instead. Same template name either way, which is
-what the trainer's `AENV_TEMPLATE` (default `twinkle-rsi-msagent`) refers to. A
+a live sandbox and snapshots it instead. Same template name either way (`TEMPLATE`,
+default `twinkle-rsi-msagent`), which is what `--sandbox-template` refers to. A
 snapshot carries the filesystem but not the image config, so `ENV`/`WORKDIR` from
 the Dockerfile are replaced by their filesystem equivalents.
 
+The template carries ms-agent itself (`pip install -e /opt/ms-agent` in the
+Dockerfile), so `--agent-config` needs no upload and no install step at episode
+time: the command the trainer sends is `ms-agent run` against a binary already
+there. Editing `rsi_agent.yaml` is a trainer restart, not an image rebuild — the
+file is passed in per episode.
+
 `serve.sh` also starts the reaper, and that is not optional housekeeping:
-AgentENV *persists* a sandbox when it ends -- a closed sandbox is a paused one,
-~1GB each -- so every episode leaks a gigabyte and a full disk turns into boots
+AgentENV *persists* a sandbox when it ends — a closed sandbox is a paused one,
+~1GB each — so every episode leaks a gigabyte and a full disk turns into boots
 that fail with `No space left on device` and a whole batch scoring zero, which
 reads like hard tasks rather than a broken host. It deletes only paused
 sandboxes with the template's alias, every `REAP_INTERVAL` seconds (120), logging
 to `/tmp/aenv-reap.log`. `REAP=0` turns it off, `REAP_ONLY=1` runs it alone,
 `STOP_ONLY=1` stops both.
 
-`tool_server.py` needs no command of its own: `remote_tool_env.py` uploads it
-into each sandbox and starts it there, once per episode, so editing the tool
-line-up in `rsi_agent.yaml` is a trainer restart rather than a template rebuild.
-It serves `/health`, `/tools` and `/call` on port 8900 out of ms-agent's own
-`ToolManager` -- no tool is reimplemented, because in RL any divergence between
-the training and serving tools gets exploited and only shows up after deployment.
+## rsi_agent.yaml
 
-## Running it
+Every line in it is commented with why it says what it says; read the file rather
+than a summary of it. The three that decide whether a run works at all:
 
-```bash
-export E2B_API_KEY=...              # sandbox host
-export SANDBOX_API_URL=http://...   # sandbox host address, with port
-export LLM_BACKUP_API_KEY=...       # dashscope
-export LLM_BACKUP_MODEL=...         # the judge, e.g. qwen3.8-max
-export LLM_BACKUP_BASE_URL=...      # its endpoint
-TAG=v5 bash cookbook/rsi/agentic/run.sh
-```
+* `llm.service: openai` — what makes ms-agent read `OPENAI_BASE_URL` /
+  `OPENAI_API_KEY` from the environment, which is how the endpoint and the
+  episode's key arrive. Both are left blank in the file on purpose.
+* `tools:` — the line-up the model is offered. Declared in full, because a config
+  with an `llm:` section no longer inherits ms-agent's own defaults.
+* `permission:` — the refusals, relaxed as far as a config can reach. Two of them
+  cannot be reached from a config at all, and the file says which and why.
 
-That is the whole command: everything a run needs is either one of those five
-variables or a default in the code, and nothing has to be remembered on the command
-line. `run.sh` sets up the process — the GPU split (`MODEL_GPUS` / `SAMPLER_GPUS`,
-2 and 6), the allocator, the guard against starting on top of another job, the
-checkpoint directory (`CKPT_DIR`, on `/mnt/data2` rather than the NAS because it is
-7.6 GB per iteration), the swanlab mode (`SWANLAB_MODE`, see below) — and passes
-anything else through to `rsi.py`, so
-`TAG=v5 bash cookbook/rsi/agentic/run.sh --iterations 1 --keep-groups 4` works.
-`python cookbook/rsi/agentic/rsi.py --tag v5` directly is the same thing without
-those checks and without those process settings.
+## Known limitation
 
-`--iterations 0`, the default, runs until killed. Restarting the same `--tag`
-continues it: iterations are counted by the `iteration.done` marker, which is
-written after the checkpoint, and the loop picks up from `$CKPT_DIR/model`. The
-optimizer is state that only exists in memory, so it is checkpointed every
-`--save-optimizer-every` iterations (5); a crash between two of those resumes with
-the weights and with Adam at zero moments. Note that resuming from a checkpoint
-that *does* carry optimizer state also restores that checkpoint's learning rate:
-Megatron's scheduler prefers the checkpointed value over the class value, so a
-restart with a different `--lr` keeps the old one and only says so in an INFO line.
-
-Charts land in swanlab project `twinkle-rsi-selfplay`, one experiment named after
-`--tag`, one step per iteration, pushed to the cloud. `swanlab.init` happens once at
-startup, before the GPUs are touched, and it is not guarded: a dashboard that will
-not accept this client stops the run in the first second rather than after the first
-iteration. The per-iteration upload is not guarded either — the numbers are in
-`challenge_metrics.json` and `train_summary.json` either way, but a connection that
-worked at startup and fails mid-run is worth stopping on. The project name is part
-of this: the older `twinkle-rsi-agentic` project answers `POST /api/project` with
-422 for the client here (0.7.17), while a project this client creates itself works,
-so the default was moved rather than the client upgraded. `SWANLAB_MODE=local`
-writes `swanlog/` for `swanlab watch` instead. Resume is by `id=tag`: a second run
-under the same tag appends to that curve, a new tag starts a new one.
-`--swanlab-mode disabled` turns it off, `--swanlab-project` moves it.
-
-Verified on this machine at swanlab 0.9.2: three separate processes with the same
-tag at steps 1, 2, 3 landed on one run (the second and third print `disabled in
-resume mode`). Resume works only in `online` mode — in `local` mode each process
-made its own run directory instead.
-
-## Settings that shape what gets produced
-
-Every one of these changes either the model's output or how it is scored. The
-origin column says where the value came from; nothing marked *inherited* has been
-re-measured under this scheduler.
-
-| setting | value | origin |
-|---|---|---|
-| `--keep-groups` / `--group-size` / `--solver-rollouts` | 8 / 8 / 8 | decided for this pipeline |
-| keep rule: ≥1 proposal with `n_pass ∈ [1,7]` | — | decided for this pipeline |
-| truncated solver attempt counts as a failure, denominator fixed at 8 | — | decided for this pipeline |
-| a build cut off at `--propose-max-tokens` writes no check and no statement | — | restored from the old pipeline, which skipped both stages after a length cut |
-| rubric failure after 3 tries drops the whole group | — | decided for this pipeline |
-| `--max-build-files` | 4 | inherited: every run since it was added has passed this. It is text in the system prompt. |
-| `--api-thinking-budget` | 4096 | inherited from the retired `loop.sh` |
-| `--propose-max-tokens` / `--max-turns` / `--stop-after-stuck-turns` | 8192 / 24 / 2 | inherited |
-| `--one-call-per-reply` | on | inherited |
-| `--check-retries` / `--check-max-tokens` | 1 / 8192 | inherited |
-| `--problem-max-tokens` / `--problem-max-chars` | 4096 / 8192 | inherited |
-| `--solver-max-tokens` / `--solver-max-turns` | 8192 / 24 | inherited |
-| temperature / top_p, both sides | 1.0 / 0.95 | inherited |
-| `--novelty-floor` | 1 | decided after measuring: the term was constant across the group at floor 0.5, so it only scaled the whole reward down |
-| `--task-bank-refs` / `--novelty-tries` | 5 / 3 | inherited |
-| `--keywords-n` / `--keyword-gen-calls` / `--keyword-temp` | 128 / 8 / 1.3 | inherited |
-| `--snapshot-max-files` / `-per-file` / `-budget` | 50 / 600 / 6000 | inherited |
-| `--sandbox-slots` | 32 | inherited: a probe once held 96, but not reliably for a whole run |
-| lr / one optimizer step / `GRPOLoss(epsilon=0.2, beta=0.0)` | 5e-6 | one step per iteration is the whole of what an iteration moves; 1e-6 was inherited from the era when the bf16 round trip rounded it away anyway |
-| `MICRO_BATCH_SIZE=1`, `padding_free=False` | — | inherited, forced by an OOM at 2 |
-
-Prompt texts are byte-identical to the ones the old pipeline sent — verified
-string by string — minus the seed and single-model follow-up strings, which this
-pipeline never sends.
-
-## What has been checked, and what has not
-
-Checked offline, `.tmp_analysis/test_agentic.py` — the real scheduler, group
-state machine, job bodies, rubric loop and writers against fake vLLM/sandbox/API.
-25 checks, all passing: 8 kept groups produce exactly 64 + 64, zero-reward
-proposals are still written, only the selected proposal's attempts are, a group
-with nothing in band is dropped, a rubric that never returns a verdict drops the
-whole group after 3 tries and skips its queued solver jobs, a length-cut build
-writes no check and no statement, `solver_attempts.jsonl` has one line per
-attempt (400 of them, 243 failures, each with the check's output and the workspace
-it left), and `novelty_scores.jsonl` logs all three dimensions on every retry.
-`train.py` then reads the same directory back as 16 groups of 8, 128
-trajectories, nothing skipped, every group centred by `GRPOAdvantage`.
-
-Two ways the run could hang were found by that test and fixed rather than worked
-around: an exception inside the rubric job (whose future nobody reads) left its
-group waiting for a verdict forever, and an exception while writing a decided
-group's output skipped the launch of its replacement topic. Both now log and let
-the run continue, and `run()` additionally stops with a message if it ever goes
-quiet without reaching its target.
-
-Not checked: anything requiring a GPU or a sandbox. No end-to-end run has been
-done, so there are no wall-clock, keep-rate or `n_pass` numbers under this
-scheduler, and none of the inherited settings above have been re-measured.
+`rm -rf build/*` and `cp src/* dst/` are refused by ms-agent regardless of this
+config: a glob in a write path is denied outright, and so is removal of a direct
+child of `/`. So no task can be posed that starts from a directory needing a
+clean-up. This was previously patched at runtime by an in-sandbox tool server
+twinkle owned and maintained; the agent now runs as released ms-agent, so the fix
+belongs upstream.

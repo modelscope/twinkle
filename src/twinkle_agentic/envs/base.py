@@ -7,6 +7,7 @@ from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
 from twinkle_agentic.utils.leases import Leases
+from .snapshot import list_workspace
 
 logger = get_logger()
 
@@ -113,58 +114,6 @@ class StepResult:
     info: Dict[str, Any] = field(default_factory=dict)
 
 
-class ToolBackend(ABC):
-    """The tools an environment advertises and executes, as its own object.
-
-    An environment owns a machine: it boots one, runs things in it, throws it
-    away. *Which* tools live on that machine is a separate question, and the
-    answer is whichever agent framework the policy will be served behind -- so
-    it is handed in rather than fixed by the environment. Supporting one more
-    framework is then one more of these and no change to any environment.
-
-    The names are this object's to choose. Whatever :meth:`tools` advertises is
-    what :meth:`call` is handed back, so a framework that namespaces its tools
-    decides here whether the model ever sees the namespace: the side that knows
-    the convention is the side that translates it, and nothing above this class
-    has to learn the spelling.
-    """
-
-    @abstractmethod
-    def install(self, env: 'Env') -> None:
-        """Make the tools usable in an environment that was just reset.
-
-        Called with a freshly built machine, which is the only moment whatever
-        this needs -- a server process, an uploaded script -- can be put there.
-        Raising is right: tools that never came up answer every call with an
-        error, and an episode that scores zero for that reason is
-        indistinguishable from a hard task.
-        """
-
-    @abstractmethod
-    def tools(self) -> List[ToolInfo]:
-        """The schemas to advertise, read after :meth:`install`."""
-
-    @abstractmethod
-    def call(self, env: 'Env', calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[str]:
-        """Run one turn's calls and return one observation each, in order.
-
-        A batch rather than a call at a time, so a backend that can run a turn's
-        calls together keeps doing what it would do in production. Failure is an
-        observation, not an exception: a dead backend has to come back as
-        something the episode survives.
-        """
-
-    def healthy(self, env: 'Env') -> bool:
-        """Do the tools answer right now? Default: nothing of its own to lose.
-
-        Asked alongside the environment's own health check, because the two can
-        disagree -- a machine that answers while the tool runtime on it has died
-        is a machine no episode can use, and one that reports itself healthy is
-        never rebuilt.
-        """
-        return True
-
-
 class Env(ABC):
     """Base class for RL execution environments.
 
@@ -185,6 +134,27 @@ class Env(ABC):
     #: one that was rebuilt never, and that is invisible from the outputs alone.
     #: Stays at zero for an environment that cannot be lost.
     n_recoveries = 0
+
+    #: What :meth:`snapshot` shows of the workspace: how many files to name, how
+    #: many bytes of each body, how many bytes of bodies in total, and which
+    #: directories not to walk into. Class attributes rather than constructor
+    #: arguments because they are a truncation budget, not a description of the
+    #: environment -- a caller that needs different numbers says so once, in a
+    #: subclass, rather than at every construction site.
+    snapshot_max_files = 40
+    snapshot_per_file = 2000
+    snapshot_budget = 20000
+    snapshot_skip = ('__pycache__', '.git', '.ipynb_checkpoints')
+
+    @property
+    def workspace(self) -> Optional[str]:
+        """The directory this environment keeps between calls, or None.
+
+        None is the honest answer for an environment that holds nothing -- and
+        what makes :meth:`snapshot` and :meth:`clear` correct by default for one:
+        there is no state to read back and none to throw away.
+        """
+        return None
 
     def reset(self, trajectory: Optional[Trajectory] = None) -> StepResult:
         return StepResult()
@@ -279,11 +249,13 @@ class Env(ABC):
         when it means "I could not look" produces tasks whose only true assertion
         is that nothing happened.
 
-        The default is the honest answer for an environment that keeps nothing:
-        there is no end state to read back, which is why an env used only to run
-        one-shot checks does not have to implement this.
+        The default lists :attr:`workspace` from inside the environment, and is
+        ``('', '')`` for one that has no workspace -- the honest answer when there
+        is no end state to read back. Truncation is set by the ``snapshot_*``
+        class attributes.
         """
-        return '', ''
+        return list_workspace(self, max_files=self.snapshot_max_files, per_file=self.snapshot_per_file,
+                              budget=self.snapshot_budget, skip=self.snapshot_skip)
 
     def tools(self) -> List[ToolInfo]:
         return []

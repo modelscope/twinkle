@@ -547,8 +547,8 @@ To add a backend: write `_xxx.py` (providing `NAME`, `SYSTEM_PROMPT`, `TOOL_SCHE
 |---|---|
 | `/dev/kvm is not accessible` | The runtime account is not in the kvm group, or the host has no KVM. Run `sudo server --setup-host --runtime-user aenv --runtime-group aenv`, then restart |
 | `ublk_drv is not loaded` | Run `sudo modprobe ublk_drv`; kernels older than 6.8 need an upgrade |
-| `ImportError: AgentEnv requires the E2B SDK` | `pip install e2b` |
-| `Invalid API key format: expected "e2b_"` | Client-side validation in the e2b SDK. `AgentEnv` already sets `E2B_VALIDATE_API_KEY=false` by default, so a persisting error means it was explicitly overridden to `true` |
+| `ImportError: AgentEnv requires the E2B SDK` | `pip install 'e2b>=2.7'` |
+| `Invalid API key format: expected "e2b_"` | Client-side validation an older e2b SDK performs before it ever sends a request. Upgrade to `e2b>=2.7`, where the check is gone and the `validate_api_key=False` that `AgentEnv` passes is ignored |
 | `400: template xxx not found` | The template was not created, or the build has not reached ready. Check the state with `aenv template list` |
 | `alias 'xxx' already points to ...` | Aliases cannot be rebound; run `aenv template delete xxx` first |
 | `pip install` fails inside the sandbox | Egress is blocked by policy, or the current network cannot reach PyPI; pre-install in the template instead |

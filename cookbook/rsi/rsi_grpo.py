@@ -48,10 +48,11 @@ from twinkle.model import TransformersModel  # noqa: E402
 from twinkle.processor import InputProcessor  # noqa: E402
 from twinkle.sampler import vLLMSampler  # noqa: E402
 from twinkle.template import Qwen3_5Template  # noqa: E402
+from twinkle_agentic.agents import MsAgent  # noqa: E402
 from twinkle_agentic.challenger import AgenticChallenger, ChallengeBatch  # noqa: E402
-from twinkle_agentic.envs import AgentEnv, LocalEnv, RemoteTools  # noqa: E402
-from twinkle_agentic.harness import AgentHarness  # noqa: E402
+from twinkle_agentic.envs import AgentEnv, LocalEnv  # noqa: E402
 from twinkle_agentic.protocol.openai import OpenAI  # noqa: E402
+from twinkle_agentic.rollout import ExternalRollout  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check import brittle_check_reason  # noqa: E402
@@ -131,16 +132,26 @@ SANDBOX_TEMPLATE = args.challenger.sandbox_template
 SANDBOX_API_URL = args.challenger.sandbox_api_url
 SANDBOX_TIMEOUT = args.challenger.sandbox_timeout
 
-# An agent framework's config makes the episode look the way that framework serves
-# it, on both halves at once: its tools run inside the sandbox, and its harness
-# writes the opening messages on this host. Off, the policy trains against the
-# env's built-in three tools and a prompt this file wrote -- serviceable, and not
-# what anything deploys. Sandboxed runs only: there is no runtime to install in a
-# local directory.
+# An agent framework's config hands the solving half over to that framework's own
+# program: it is started on the task, works until it decides it is done, and the
+# policy is trained on the requests it made to the endpoint this process serves.
+# That is the agent deployment runs, tools and context management included. Off,
+# the solver runs on the loop in this repo against the env's built-in three tools
+# -- serviceable, and not what anything deploys. The proposing half is unaffected
+# either way: it needs to interrupt the conversation to ask for a check script,
+# which is exactly what an agent that owns its loop will not allow.
+# Sandboxed runs only: the agent needs a machine of its own to work in.
 AGENT_CONFIG = args.challenger.agent_config
+AGENT_ENDPOINT_HOST = args.challenger.agent_endpoint_host
+AGENT_ENDPOINT_PORT = args.challenger.agent_endpoint_port
+AGENT_TIMEOUT = args.challenger.agent_timeout
 if AGENT_CONFIG and not SANDBOX_TEMPLATE:
-    raise SystemExit('--agent-config needs --sandbox-template: the framework\'s tools run '
-                     'inside the sandbox, and a local workspace has nowhere to put them')
+    raise SystemExit('--agent-config needs --sandbox-template: the agent runs commands it '
+                     'wrote itself, and a local workspace is the trainer\'s own process tree')
+if AGENT_CONFIG and not AGENT_ENDPOINT_HOST:
+    raise SystemExit('--agent-config needs --agent-endpoint-host: the agent calls the policy '
+                     'from inside the sandbox, where loopback is the sandbox itself. Give the '
+                     'address of this host that the sandbox can reach.')
 
 KEYWORD_PATH = args.challenger.keyword_path
 KEYWORD_QUERIES = [
@@ -152,132 +163,6 @@ KEYWORD_QUERIES = [
 
 # One audit line per trained trajectory, next to the proposals it came from.
 REWARD_DUMP = os.path.join(SAVE_DIR, 'rewards.jsonl') if SAVE_DIR else ''
-
-
-# Run inside the env, so the same listing comes back from a local directory and
-# from a directory inside a microVM. Written to stdout in one write: the caller
-# reads the whole stream, and a partial line would read as a truncated file body.
-_SNAPSHOT_SCRIPT = '''
-import os, sys
-root, max_files, per_file, budget, skip = {root!r}, {max_files}, {per_file}, {budget}, {skip!r}
-rows = []
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in skip]
-    for name in sorted(filenames):
-        path = os.path.join(dirpath, name)
-        try:
-            rows.append((os.path.relpath(path, root), os.path.getsize(path), path))
-        except OSError:
-            pass
-rows.sort()
-rows = rows[:max_files]
-lines = ['%s %d' % (rel, size) for rel, size, _ in rows]
-for rel, _, path in rows:
-    if budget <= 0:
-        break
-    try:
-        with open(path, encoding='utf-8') as handle:
-            text = handle.read(per_file + 1)
-    except (OSError, UnicodeDecodeError):
-        continue  # binary or unreadable: the listing already names it
-    if '\\x00' in text:
-        continue
-    body = text[:per_file]
-    budget -= len(body)
-    trailing = len(body) - len(body.rstrip('\\n'))
-    if len(text) > len(body):
-        suffix = ' (first %d bytes)' % per_file
-    elif trailing == 0:
-        suffix = ' (no newline at end)'
-    else:
-        suffix = ' (ends with %d newline character(s))' % trailing
-    # One trailing newline is dropped because the join puts it back. What must not
-    # happen is stripping them all: the header states the count, and a body shown
-    # shorter than the size column contradicts it.
-    lines += ['', '--- %s%s ---' % (rel, suffix), body[:-1] if body.endswith('\\n') else body]
-sys.stdout.write('\\n'.join(lines).strip())
-'''
-
-
-class WorkspaceListing:
-    """A workspace listing as the snapshot, which is what the challenger grades from.
-
-    ``Env.snapshot`` defaults to "there is no end state", the honest answer for an
-    env that keeps nothing between calls. A challenger given that rejects every
-    episode as ``empty_workspace``, so a persistent workspace has to answer it.
-
-    The listing is produced by a script run in the env, not off this process's
-    filesystem, so a local slot and a sandboxed one describe themselves the same
-    way. File bodies go out byte for byte and the trailing-newline count is stated
-    either way: a listing that tidies up is not ground truth, and a check script
-    written against a tidied listing fails on the very state it was written from.
-    """
-
-    max_files = 40
-    per_file = 2000
-    budget = 20000
-    skip = ('__pycache__', '.git', '.ipynb_checkpoints')
-
-    def snapshot(self) -> Tuple[str, str]:
-        root = self.workspace
-        if not root:
-            return '', ''
-        exit_code, output = self.run_script(
-            _SNAPSHOT_SCRIPT.format(root=root, max_files=self.max_files, per_file=self.per_file,
-                                    budget=self.budget, skip=self.skip))
-        if exit_code != 0:
-            # Reported, not raised: the caller rejects the episode on an error
-            # string, and a listing that failed says nothing about the episode.
-            return '', f'could not list {root}: {output}'
-        return output.strip(), ''
-
-
-class WorkspaceEnv(WorkspaceListing, LocalEnv):
-    """A local directory per slot. Fine for a check that is a few asserts."""
-
-
-class SandboxEnv(WorkspaceListing, AgentEnv):
-    """A microVM per slot, which is the only shape that isolates what it runs."""
-
-    def clear(self) -> None:
-        """Empty the workspace, rebuilding the sandbox first if it has gone away.
-
-        Called before every episode, which is the one moment losing the workspace
-        costs nothing -- so an idle slot the host reclaimed is replaced here,
-        rather than surfacing later as an episode that failed for no stated reason.
-        """
-        self.ensure_ready()
-        super().clear()
-
-
-def solver_harness() -> AgentHarness:
-    """A harness that only shapes messages: no llm, no tools.
-
-    What it is for is the opening -- system prompt, and the shape the framework
-    writes a tool result in. The tools themselves are the sandbox's (see
-    :class:`RemoteTools`), and the llm is the policy being trained, so both
-    sections come out before anything is constructed.
-
-    Popping them matters as much as omitting them from the yaml does not: ms-agent
-    merges its own agent.yaml underneath ours, which declares file_system and
-    code_executor, so leaving ``tools`` in place would stand a live shell executor
-    up *on the trainer host* with the run's own filesystem in reach. Popping after
-    the merge leaves zero tools -- and the system prompt byte-identical, because
-    ms-agent does not fold the tool list into it.
-
-    Called once per episode by ``HarnessLeases``, which is why it is cheap: with
-    neither section there is no runtime to stand up and no pip check to run.
-    """
-    from omegaconf import OmegaConf, open_dict
-
-    from twinkle_agentic.harness import MsAgentHarness
-
-    harness = MsAgentHarness(config=OmegaConf.load(AGENT_CONFIG))
-    with open_dict(harness.agent.config):
-        harness.agent.config.pop('llm', None)
-        harness.agent.config.pop('tools', None)
-    harness.prepare()
-    return harness
 
 
 def create_seed_trajectories() -> List[Trajectory]:
@@ -649,27 +534,38 @@ def main():
     # many jobs run at once; the sandboxed ones boot on first use, from the clear()
     # the pool does before handing one over.
     if SANDBOX_TEMPLATE:
-        # One backend per env, never one shared: a backend answers `.tools()` with
-        # the schemas the machine it was installed in reported, so sharing one
-        # would describe one sandbox and dispatch into another.
         envs = [
-            SandboxEnv(template=SANDBOX_TEMPLATE, api_url=SANDBOX_API_URL or None,
-                       sandbox_timeout=SANDBOX_TIMEOUT, command_timeout=120,
-                       tool_backend=(RemoteTools(runtime='msagent', config=AGENT_CONFIG)
-                                     if AGENT_CONFIG else None),
-                       metadata={'run': 'rsi_grpo', 'slot': str(i)})
+            AgentEnv(template=SANDBOX_TEMPLATE, api_url=SANDBOX_API_URL or None,
+                     sandbox_timeout=SANDBOX_TIMEOUT, command_timeout=120,
+                     metadata={'run': 'rsi_grpo', 'slot': str(i)})
             for i in range(NUM_ENVS)
         ]
     else:
         envs = [
-            WorkspaceEnv(workspace=os.path.join(WORKSPACE_ROOT, f'slot_{i}'), command_timeout=120)
+            LocalEnv(workspace=os.path.join(WORKSPACE_ROOT, f'slot_{i}'), command_timeout=120)
             for i in range(NUM_ENVS)
         ]
+    # The solving half, when an agent program owns it. The endpoint it serves lives
+    # in this process on purpose: it answers out of the sampler the trainer syncs,
+    # so what the agent talked to is what the gradient updates. Same decoding
+    # settings as the proposing half, logprobs included -- GRPO needs the rollout
+    # logprobs, and an agent has no way to ask for them.
+    solver_rollout = None
+    if AGENT_CONFIG:
+        solver_rollout = ExternalRollout(
+            sampler,
+            MsAgent(config=AGENT_CONFIG),
+            template=rollout_template,
+            sampling_params=sampling_params,
+            timeout=AGENT_TIMEOUT,
+            endpoint_host=AGENT_ENDPOINT_HOST,
+            endpoint_port=AGENT_ENDPOINT_PORT,
+        )
     challenger = AgenticChallenger(
         sampler,
         envs=envs,
         seed_fn=create_seeder(sampler, rollout_template, sampling_params),
-        harness_factory=solver_harness if AGENT_CONFIG else None,
+        solver_rollout=solver_rollout,
         num_challenger_rollouts=CHALLENGER_ROLLOUTS,
         num_solver_rollouts=DIFFICULTY_ROLLOUTS,
         pass_band=PASS_BAND,

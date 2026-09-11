@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Literal, Optional
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence, SamplingParams, StopReason
 from twinkle.template import Template
+from twinkle_agentic.utils.token_utils import _to_plain, encode_appended_turn
 
-from ..protocol.base import API
-from .bridge import _to_plain, encode_appended_turn
+from .base import API
 
 _FINISH_TO_STOP: Dict[Optional[str], StopReason] = {
     'stop': 'stop',

@@ -11,7 +11,8 @@ client and can be instantiated directly inside rollout workers.
 Prerequisites (done once, outside training):
     1. Deploy the AgentENV server (single node) or gateway+scheduler cluster.
     2. Build a template, e.g. ``aenv pull ubuntu:22.04 --name my-env``.
-    3. ``pip install e2b`` on the training side.
+    3. ``pip install 'e2b>=2.7'`` on the training side (the version that takes
+       the endpoint as an argument rather than only from the environment).
 
 Usage::
 
@@ -24,12 +25,12 @@ import os
 import posixpath
 import shlex
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import (DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult, ToolBackend,
+from .base import (DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult,
                    format_command_output, truncate_observation)
 
 logger = get_logger()
@@ -63,9 +64,10 @@ def _require_e2b():
         from e2b import Sandbox
     except ImportError as e:
         raise ImportError('AgentEnv requires the E2B SDK to talk to an AgentENV server:\n'
-                          '  pip install e2b\n'
-                          'Then point it at your deployment via api_url/api_key or the '
-                          'E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY environment variables.') from e
+                          "  pip install 'e2b>=2.7'\n"
+                          'Then point it at your deployment via the api_url/api_key/sandbox_url '
+                          'arguments, or the E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY '
+                          'environment variables.') from e
     return Sandbox
 
 
@@ -77,7 +79,8 @@ class AgentEnv(Env):
           one from ``template``; AgentENV's scheduler picks the node.
         * ``step``   -> execute a tool inside the sandbox (sticky-routed to
           the owning node via the sandbox id header, handled by the SDK).
-        * ``clear``  -> empty the workspace, keeping the sandbox.
+        * ``clear``  -> empty the workspace, keeping the sandbox; boot one if
+          there is none yet, so a slot comes up on first use.
         * ``close``  -> kill the sandbox.
 
     Everything an episode does happens under ``workspace``: tool calls run there
@@ -94,13 +97,6 @@ class AgentEnv(Env):
     subclassing. Tool errors never raise; they come back as observations so
     the rollout loop can continue or let the model recover.
 
-    A whole tool line-up can also come from elsewhere: pass a
-    :class:`~twinkle_agentic.envs.base.ToolBackend` and the sandbox is still
-    this class's business while the tools become that object's. That is how a
-    policy is trained behind the same tools it will be served behind -- the
-    framework's own, executed by the framework, rather than a local imitation of
-    them.
-
     Note: rewards are not produced by the sandbox. Keep the default
     ``evaluate`` (zeros) and score trajectories with a separate reward
     function, or subclass and override ``step``/``evaluate``.
@@ -110,6 +106,7 @@ class AgentEnv(Env):
                  template: str,
                  api_url: Optional[str] = None,
                  api_key: Optional[str] = None,
+                 sandbox_url: Optional[str] = None,
                  workspace: str = '/workspace',
                  sandbox_timeout: int = 300,
                  command_timeout: int = 120,
@@ -118,18 +115,18 @@ class AgentEnv(Env):
                  metadata: Optional[Dict[str, str]] = None,
                  refresh_timeout: bool = True,
                  include_default_tools: bool = True,
-                 tool_backend: Optional[ToolBackend] = None,
                  **kwargs):
         """
         Args:
             template: AgentENV template name/ID (``aenv pull ... --name <template>``).
-            api_url: AgentENV server or gateway base URL. Falls back to the
-                ``E2B_API_URL`` environment variable.
+            api_url: AgentENV server or gateway base URL, the control plane.
+                Omit to leave it to the SDK, which reads ``E2B_API_URL``.
             api_key: API key; AgentENV accepts any non-empty string on a
-                trusted network. Falls back to ``E2B_API_KEY``. Client-side
-                format validation is disabled by default because AgentENV does
-                not issue ``e2b_``-prefixed keys; set
-                ``E2B_VALIDATE_API_KEY=true`` to re-enable it.
+                trusted network. Omit to read ``E2B_API_KEY``, falling back to
+                a placeholder, since the SDK requires a key to be present.
+            sandbox_url: the data plane, for a deployment whose sandbox gateway
+                answers on a different host than the API. Defaults to
+                ``api_url``: one host serves both unless told otherwise.
             workspace: absolute path inside the sandbox that every tool call and
                 script runs in, created on reset. One directory, so that what an
                 episode writes is what a check reads back.
@@ -145,31 +142,30 @@ class AgentEnv(Env):
             include_default_tools: Expose the built-in run_command /
                 write_file / read_file tools. Set False to expose only
                 tools registered via ``register_tool``/``register_command_tool``.
-            tool_backend: where the tools come from, when they are not this
-                class's own. Installed into every fresh sandbox, asked for the
-                schemas that go into the prompt, and handed every call the model
-                makes. The built-ins step aside while one is set: advertising
-                three tools the served framework does not have is the very
-                mismatch a backend is there to remove.
         """
         if not template:
             raise ValueError("AgentEnv requires 'template'. Build one first, e.g. "
                              '`aenv pull ubuntu:22.04 --name my-env`.')
-        # The E2B SDK reads its endpoint config from env vars; explicit args win.
+        # Where this deployment lives travels with the instance, as arguments to
+        # the SDK, rather than through the E2B_* environment variables the SDK
+        # would otherwise read: those are process-global, so two AgentEnvs
+        # pointing at different deployments would overwrite each other and the
+        # last one constructed would decide for all of them. A key left out is
+        # left for the SDK to resolve, so a deployment configured entirely
+        # through the environment keeps working. Passed once, at create: the
+        # sandbox keeps this configuration for every later call on it.
+        self._api_params: Dict[str, Any] = {
+            'api_key': api_key or os.environ.get('E2B_API_KEY') or 'dummy',
+            # AgentENV issues no e2b-format keys, and the SDK used to assert a
+            # key matched ``e2b_[0-9a-f]+`` before it ever sent a request, which
+            # rejects placeholders like 'dummy'. Newer SDKs dropped the check
+            # and ignore this.
+            'validate_api_key': False,
+        }
         if api_url:
-            os.environ['E2B_API_URL'] = api_url
-            os.environ.setdefault('E2B_SANDBOX_URL', api_url)
-        if api_key:
-            os.environ['E2B_API_KEY'] = api_key
-        os.environ.setdefault('E2B_API_KEY', 'dummy')
-        os.environ.setdefault('E2B_ACCESS_TOKEN', 'dummy')
-        # AgentENV has no authorization, so any non-empty key works — but the
-        # SDK client-side asserts the key matches ``e2b_[0-9a-f]+`` before it
-        # ever sends a request, which rejects placeholders like 'dummy'. The
-        # SDK exposes this opt-out for exactly this case (deployments that do
-        # not issue e2b-format keys); set E2B_VALIDATE_API_KEY=true to restore
-        # validation when pointing at e2b.dev itself.
-        os.environ.setdefault('E2B_VALIDATE_API_KEY', 'false')
+            self._api_params['api_url'] = api_url
+        if sandbox_url or api_url:
+            self._api_params['sandbox_url'] = sandbox_url or api_url
 
         self._template = template
         self._workspace = workspace
@@ -180,7 +176,6 @@ class AgentEnv(Env):
         self._metadata = metadata
         self._refresh_timeout = refresh_timeout
         self._include_default_tools = include_default_tools
-        self._tool_backend = tool_backend
         self._custom_tools: List[ToolInfo] = []
         self._custom_handlers: Dict[str, Callable[['AgentEnv', Dict[str, Any]], str]] = {}
         self._sandbox = None
@@ -246,6 +241,7 @@ class AgentEnv(Env):
             timeout=self._sandbox_timeout,
             envs=self._sandbox_envs,
             metadata=self._metadata,
+            **self._api_params,
         )
         setup_output = []
         # Before the setup commands, because they are written against it, and
@@ -257,10 +253,6 @@ class AgentEnv(Env):
             result = self.run_command({'command': cmd})
             setup_output.append(result)
         logger.info(f'AgentEnv sandbox created: {self.sandbox_id} (template={self._template})')
-        if self._tool_backend is not None:
-            # After the setup commands, which are what a template is finished off
-            # with: a backend that installs a runtime needs the machine complete.
-            self._tool_backend.install(self)
         return StepResult(
             observation='\n'.join(setup_output) if setup_output else '',
             reward=0.0,
@@ -275,10 +267,6 @@ class AgentEnv(Env):
         try:
             if tool_name in self._custom_handlers:
                 observation = self._custom_handlers[tool_name](self, arguments)
-            elif self._tool_backend is not None:
-                # Unknown names included: the backend owns the tool line-up, so
-                # it is also the only side that can say what was available.
-                observation = self._tool_backend.call(self, [(tool_name, arguments)])[0]
             elif self._include_default_tools and tool_name == 'run_command':
                 observation = self.run_command(arguments)
             elif self._include_default_tools and tool_name == 'write_file':
@@ -296,31 +284,6 @@ class AgentEnv(Env):
             # loop (max_turns) bounds retries.
             logger.warning(f'AgentEnv step error (sandbox={self.sandbox_id}): {e}')
             return StepResult(observation=f'Error: {e}', reward=0.0, done=False, info={'error': str(e)})
-
-    def step_batch(self, calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[StepResult]:
-        """A whole turn's calls, handed to the backend together where there is one.
-
-        One round trip instead of several, and a backend whose framework runs a
-        turn's calls concurrently goes on doing that -- serialising here would
-        train the policy against timing production does not have. Registered
-        handlers stay local and keep their position in the batch.
-        """
-        calls = list(calls)
-        if self._tool_backend is None or self._sandbox is None or not calls:
-            return super().step_batch(calls)
-        results: List[Optional[StepResult]] = [None] * len(calls)
-        remote = []
-        for index, (name, args) in enumerate(calls):
-            if name in self._custom_handlers:
-                results[index] = self.step(name, args or {})
-            else:
-                remote.append((index, name, args or {}))
-        if remote:
-            observations = self._tool_backend.call(self, [(name, args) for _, name, args in remote])
-            for (index, _, _), observation in zip(remote, observations):
-                results[index] = StepResult(observation=observation, info={'sandbox_id': self.sandbox_id})
-            self._touch()
-        return [result if result is not None else StepResult(observation='') for result in results]
 
     def run_script(self, source: str, interpreter: str = 'python',
                    timeout: Optional[int] = None) -> Tuple[int, str]:
@@ -360,8 +323,17 @@ class AgentEnv(Env):
         time. Raising is per :meth:`Env.clear` -- a caller that clears before
         every job depends on this, and the failure it guards against is a job
         inheriting the previous one's files, invisible downstream.
+
+        With no sandbox yet, this boots one: :meth:`Env.clear` promises an
+        environment ready for the next episode, and returning without a sandbox
+        would hand over one whose every call answers ``call reset() first``. So
+        this is also where a slot first comes up, from the clear its owner does
+        before handing it out -- nobody has to know to call :meth:`reset`.
         """
         if self._sandbox is None:
+            # A fresh microVM is already empty, and reset() runs the setup
+            # commands the workspace is supposed to start with.
+            self.reset()
             return
         exit_code, output = self.run_script(_CLEAR_WORKSPACE.format(root=self._workspace))
         if exit_code != 0:
@@ -369,23 +341,16 @@ class AgentEnv(Env):
                                f'{self.sandbox_id}: {output}')
 
     def healthy(self) -> bool:
-        """Does the sandbox answer right now, tools included?
+        """Does the sandbox answer right now?
 
         A command rather than a status field: AgentENV pauses an idle sandbox and
         resumes it on access, so what matters is whether it can be reached and
         made to run something, not what a list API last recorded about it.
-
-        A backend is asked as well, because the two can disagree: a sandbox that
-        runs commands while the tool runtime inside it has died is a sandbox that
-        reports itself healthy and is therefore never rebuilt, leaving every call
-        of every remaining episode to fail the same way.
         """
         if self._sandbox is None:
             return False
         exit_code, _ = self._execute('true', None, timeout=10)
-        if exit_code != 0:
-            return False
-        return self._tool_backend is None or self._tool_backend.healthy(self)
+        return exit_code == 0
 
     def ensure_ready(self) -> bool:
         """Re-establish the sandbox if it has gone away. True if it did."""
@@ -409,16 +374,12 @@ class AgentEnv(Env):
     def tools(self) -> List[ToolInfo]:
         """What the model is told it can call here.
 
-        A backend replaces the line-up rather than adding to it: its whole
-        purpose is that the advertised contract is the served framework's, and a
-        run_command bolted on beside it is a tool production does not have.
-        Registered handlers still stand, since a caller adding one is naming a
-        tool this env is to execute itself.
+        Registered handlers stand alongside the defaults and take precedence over
+        one of the same name, since a caller adding one is naming a tool this env
+        is to execute itself.
         """
         tools: List[ToolInfo] = []
-        if self._tool_backend is not None:
-            tools.extend(self._tool_backend.tools())
-        elif self._include_default_tools:
+        if self._include_default_tools:
             custom_names = set(self._custom_handlers)
             tools.extend(t for t in DEFAULT_TOOLS if t['function']['name'] not in custom_names)
         tools.extend(self._custom_tools)

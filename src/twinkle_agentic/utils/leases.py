@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Lending a fixed set of scarce resources out, one per job.
 
-Both halves of an episode need a resource of their own for its whole duration:
-an :class:`~twinkle_agentic.envs.base.Env` to act in, and an
-:class:`~twinkle_agentic.harness.base.AgentHarness` to shape its messages. The
-routing question is the same for both -- *any* free one will do, but not one
-another job is holding -- so it is answered once, here.
+Some resources cannot be shared for the duration of a job: an
+:class:`~twinkle_agentic.envs.base.Env` is a working directory with state in it,
+and two jobs in it at once are two jobs editing each other's files. The routing
+question is always the same -- *any* free one will do, but not one another job is
+holding -- so it is answered once, here.
 """
 import queue
 import threading
