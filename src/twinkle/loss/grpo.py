@@ -84,16 +84,9 @@ class GRPOLoss(Loss):
         per_token_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
         """
-        Compute per-token loss with PPO double-sided clipping.
+        Compute per-token loss with PPO clipping.
 
-        Standard PPO clip is one-sided: it only bounds the loss when
-        advantage > 0 and ratio > 1+eps.  When advantage < 0 and ratio > 1+eps
-        (policy moved AWAY from the old action on its own), the loss is
-        unbounded upward, causing gradient explosions.
-
-        This implementation clips the ratio from BOTH sides regardless of
-        advantage sign, bounding the per-token loss to at most
-        (1+eps_high) * |advantage|.
+        Override this method in subclasses for different loss formulations.
 
         Args:
             ratio: [batch, seq_len] importance sampling ratio
@@ -107,14 +100,7 @@ class GRPOLoss(Loss):
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
-        # Double-sided clip: use max for positive advantage, min for negative.
-        # Equivalent to: always take the MORE conservative (smaller magnitude) loss.
-        per_token_loss = torch.where(
-            advantages >= 0,
-            -torch.min(loss1, loss2),  # positive adv: standard PPO clip
-            -torch.max(loss1, loss2),  # negative adv: clip the OTHER side
-        )
-        return per_token_loss
+        return -torch.min(loss1, loss2)
 
     def _aggregate_loss(
         self,
