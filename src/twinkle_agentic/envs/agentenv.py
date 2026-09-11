@@ -21,11 +21,12 @@ Usage::
     result = env.step('run_command', {'command': 'echo hello'})
     env.close()
 """
+import json
 import os
 import posixpath
 import shlex
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
@@ -39,6 +40,22 @@ logger = get_logger()
 # -- by a snapshot, by a check that lists it -- and a stray _script.py in there
 # reads as something the episode created.
 _SCRIPT_DIR = '/tmp/twinkle_scripts'
+
+
+def _as_file_content(content: Any) -> Union[str, bytes]:
+    """Coerce a ``write_file`` payload to something the sandbox FS accepts.
+
+    A model calling ``write_file`` routinely hands back structured content -- a
+    dict or list, not a string -- while e2b's ``files.write`` takes only
+    str/bytes/IO. That is a data shape, not a failure: JSON-encode containers
+    and stringify everything else so the write lands rather than sinking the
+    whole step (and, downstream, the episode as ``empty_workspace``).
+    """
+    if isinstance(content, (str, bytes)):
+        return content
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False, indent=2)
+    return str(content)
 
 # Emptied entry by entry and then asserted empty, rather than `rm -rf`: a clear
 # that silently did nothing hands the next episode the previous one's files,
@@ -270,7 +287,7 @@ class AgentEnv(Env):
             elif self._include_default_tools and tool_name == 'run_command':
                 observation = self.run_command(arguments)
             elif self._include_default_tools and tool_name == 'write_file':
-                self._sandbox.files.write(self._resolve(arguments['path']), arguments.get('content', ''))
+                self._sandbox.files.write(self._resolve(arguments['path']), _as_file_content(arguments.get('content', '')))
                 observation = f"File written: {arguments['path']}"
             elif self._include_default_tools and tool_name == 'read_file':
                 observation = truncate_observation(str(self._sandbox.files.read(self._resolve(arguments['path']))))
