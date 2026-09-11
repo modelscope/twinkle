@@ -25,6 +25,7 @@ Usage:
 import collections
 import json
 import os
+import posixpath
 import sys
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -54,6 +55,41 @@ from twinkle_agentic.envs import AgentEnv, LocalEnv  # noqa: E402
 from twinkle_agentic.protocol.openai import OpenAI  # noqa: E402
 from twinkle_agentic.harness import HarnessLeases, MsAgentHarness  # noqa: E402
 from twinkle_agentic.rollout import ExternalRollout, MultiTurnRollout  # noqa: E402
+
+
+def workspace_guard(workspace: str = '/workspace'):
+    """RSI acceptance rule as an AgentEnv ``pre_tool_call`` gate.
+
+    Writing outside the workspace is a legitimate AgentEnv ability, so forbidding
+    it is not the env's job; here it is a property of *this task*. The check only
+    reads ``workspace``, so a file written to an absolute path elsewhere (/tmp,
+    /app, ...) is invisible to it and scores as empty. Refuse such a path with a
+    tool error the model can act on, rather than let it pass silently. Gates
+    write_file's ``path`` and a run_command ``cwd``; reads and everything else
+    pass through.
+    """
+    ws = posixpath.normpath(workspace)
+
+    def reject(path):
+        if not path:
+            return None
+        p = str(path)
+        resolved = posixpath.normpath(p if p.startswith('/') else posixpath.join(ws, p))
+        if resolved == ws or resolved.startswith(ws + '/'):
+            return None
+        return (f'Error: refused {path!r} -- it is outside the workspace {ws!r}. '
+                f'Put everything under {ws} (a relative path, or an absolute path '
+                f'beginning with {ws}/); files written elsewhere are invisible to '
+                f'the task check and do not count.')
+
+    def pre_tool_call(tool_name, arguments):
+        if tool_name == 'write_file':
+            return reject(arguments.get('path'))
+        if tool_name == 'run_command':
+            return reject(arguments.get('cwd')) if arguments.get('cwd') else None
+        return None
+
+    return pre_tool_call
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check import brittle_check_reason  # noqa: E402
@@ -552,6 +588,7 @@ def main():
         envs = [
             AgentEnv(template=SANDBOX_TEMPLATE, api_url=SANDBOX_API_URL or None,
                      sandbox_timeout=SANDBOX_TIMEOUT, command_timeout=120,
+                     pre_tool_call=workspace_guard(),
                      metadata={'run': 'rsi_grpo', 'slot': str(i)})
             for i in range(NUM_ENVS)
         ]

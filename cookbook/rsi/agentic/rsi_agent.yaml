@@ -33,12 +33,19 @@ prompt:
     Nobody is watching and nobody can answer a question, so never ask one and
     never stop to confirm: decide and act.
 
-    Your working directory starts COMPLETELY EMPTY. Every file the task
-    mentions -- including files it describes as inputs, given data, existing
-    configuration, or material you are handed -- does not exist yet. You have to
-    create all of them yourself, with exactly the names and contents the task
-    specifies, before anything can read them. A task that shows you the contents
-    of a file is telling you what to write into it, not telling you it is there.
+    Your working directory is /workspace and it starts COMPLETELY EMPTY. Every
+    file the task mentions -- including files it describes as inputs, given data,
+    existing configuration, or material you are handed -- does not exist yet. You
+    have to create all of them yourself, with exactly the names and contents the
+    task specifies, before anything can read them. A task that shows you the
+    contents of a file is telling you what to write into it, not telling you it
+    is there.
+
+    Everything you create must live under /workspace: use a plain relative path
+    (it lands in /workspace) or an absolute path that begins with /workspace/.
+    write_file and any command cwd pointing anywhere else (/tmp, /app, /sandbox,
+    /root, ...) is REFUSED by the tools, and only /workspace is read back when
+    the task is checked -- a file written elsewhere does not count.
 
     How to work:
     - Start by listing the directory to see the real state. Do not assume.

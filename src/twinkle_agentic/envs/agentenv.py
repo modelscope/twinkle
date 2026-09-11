@@ -132,6 +132,7 @@ class AgentEnv(Env):
                  metadata: Optional[Dict[str, str]] = None,
                  refresh_timeout: bool = True,
                  include_default_tools: bool = True,
+                 pre_tool_call: Optional[Callable[[str, Dict[str, Any]], Optional[str]]] = None,
                  **kwargs):
         """
         Args:
@@ -159,6 +160,13 @@ class AgentEnv(Env):
             include_default_tools: Expose the built-in run_command /
                 write_file / read_file tools. Set False to expose only
                 tools registered via ``register_tool``/``register_command_tool``.
+            pre_tool_call: Optional ``(tool_name, arguments) -> Optional[str]``
+                gate run before every :meth:`step` dispatch. Return a string to
+                refuse the call -- it becomes the tool observation and the tool
+                does not run -- or None to let it through. The single choke
+                point for a per-run policy (e.g. confining writes to the
+                workspace); internal calls (reset's mkdir, run_script) bypass
+                step and are never gated. Off by default.
         """
         if not template:
             raise ValueError("AgentEnv requires 'template'. Build one first, e.g. "
@@ -193,6 +201,7 @@ class AgentEnv(Env):
         self._metadata = metadata
         self._refresh_timeout = refresh_timeout
         self._include_default_tools = include_default_tools
+        self._pre_tool_call = pre_tool_call
         self._custom_tools: List[ToolInfo] = []
         self._custom_handlers: Dict[str, Callable[['AgentEnv', Dict[str, Any]], str]] = {}
         self._sandbox = None
@@ -282,6 +291,11 @@ class AgentEnv(Env):
             return StepResult(observation='Error: sandbox not initialized, call reset() first.', done=True)
         arguments = arguments or {}
         try:
+            if self._pre_tool_call is not None:
+                refusal = self._pre_tool_call(tool_name, arguments)
+                if refusal is not None:
+                    return StepResult(observation=refusal, reward=0.0, done=False,
+                                      info={'sandbox_id': self.sandbox_id})
             if tool_name in self._custom_handlers:
                 observation = self._custom_handlers[tool_name](self, arguments)
             elif self._include_default_tools and tool_name == 'run_command':
