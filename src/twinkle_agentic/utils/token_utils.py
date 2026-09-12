@@ -238,7 +238,7 @@ def append_ids(
     # Written back before the mask is read off it, so an empty account -- the
     # first call of an externally driven episode -- is a valid starting point.
     result['input_ids'] = input_ids
-    completion_mask = template._prefix_completion_mask(result, labels)
+    completion_mask = Template._prefix_completion_mask(result, labels)
 
     input_ids = input_ids + list(ids)
     labels = labels + (list(ids) if trainable else [-100] * len(ids))

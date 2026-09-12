@@ -717,10 +717,18 @@ class InputProcessor:
                 # accelerator, and a CPU fill would break the cat inside the collate below.
                 reference = input_ids if isinstance(input_ids, torch.Tensor) else None
                 length = reference.shape[-1] if reference is not None else len(input_ids)
-                feat[key] = torch.full((length, ),
-                                       pad_value,
-                                       dtype=torch.long,
-                                       device=reference.device if reference is not None else None)
+                device = reference.device if reference is not None else None
+                # completion_mask is the one field with a derivation rule: every other layer
+                # (template, grpo, metric, ledger) reads "absent" as "whatever is scored is the
+                # policy's own completion", so a zero fill would silently drop the row from the
+                # loss instead of aligning it with the rest of the batch.
+                labels = feat.get('labels') if key == 'completion_mask' else None
+                if labels is not None:
+                    labels = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(np.asarray(labels))
+                    if labels.shape[-1] == length:
+                        feat[key] = (labels.reshape(-1) != -100).to(dtype=torch.long, device=device)
+                        continue
+                feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
         # Work on local copies so squeezing doesn't mutate the caller's original samples.

@@ -136,6 +136,13 @@ class FakeTemplate:
                 labels = labels[1:] + labels[:1]
             pif['input_ids'] = input_ids
             pif['labels'] = labels
+            # completion_mask lives on the labels' index space, so the real
+            # _roll_labels rolls it the same way; a stub that skipped this would
+            # drift out of input order after the first append.
+            mask = pif.get('completion_mask')
+            if mask is not None:
+                mask = list(mask)
+                pif['completion_mask'] = mask[1:] + mask[:1]
             pif['attention_mask'] = [1] * len(input_ids)
             pif['position_ids'] = list(range(len(input_ids)))
             pif['length'] = len(input_ids)
@@ -189,10 +196,19 @@ class FakeTemplate:
             labels = labels[-1:] + labels[:-1]
         else:
             labels = [-100] * len(prompt_ids)
+        # Same provenance bookkeeping the real concat_input_feature does: the
+        # sampled tokens are the policy's own completion, so the mask gets 1s.
+        mask = result.get('completion_mask')
+        if mask is None:
+            mask = [0 if label == -100 else 1 for label in labels]
+        else:
+            mask = list(mask)
+            mask = mask[-1:] + mask[:-1]
         input_ids = prompt_ids + list(new_tokens)
         labels = labels + list(new_tokens)  # assistant tokens trainable
         result['input_ids'] = input_ids
         result['labels'] = labels
+        result['completion_mask'] = mask + [1] * len(new_tokens)
         result = self._invoke_post_pipeline([result])[0]
         response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         messages = list(result.get('messages') or [])
