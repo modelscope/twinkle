@@ -134,11 +134,15 @@ class TestSelectiveLogSoftmax:
         assert torch.allclose(entropy[0], manual_entropy, atol=1e-5)
 
     def test_bfloat16_fallback(self):
+        torch.manual_seed(42)
         logits = torch.randn(4, 20, dtype=torch.bfloat16)
         index = torch.randint(0, 20, (4,))
         result = selective_log_softmax(logits, index)
         expected = torch.gather(logits.float().log_softmax(-1), -1, index.unsqueeze(-1)).squeeze(-1)
-        assert torch.allclose(result.float(), expected, atol=1e-2)
+        # The fallback keeps the softmax in bfloat16, whose ULP around these
+        # magnitudes is already ~3e-2, so compare against the float reference at
+        # bfloat16 resolution rather than float32's.
+        assert torch.allclose(result.float(), expected, atol=5e-2)
 
 
 class TestPadAndStackTensors:
