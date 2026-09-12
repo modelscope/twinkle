@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Persistent proposer trajectories for challenger training and diagnosis."""
 import json
+import numpy as np
 import os
 import threading
 import uuid
 from typing import Any, Dict, List
-
-import numpy as np
 
 _TOKEN_FIELDS = ('input_ids', 'labels', 'completion_mask', 'attention_mask', 'position_ids')
 

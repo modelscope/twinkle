@@ -55,8 +55,7 @@ class TurnLedger:
     which rebuilt them.
     """
 
-    def __init__(self, template: Template, *, label: str = 'trajectory',
-                 max_tokens: Optional[int] = None) -> None:
+    def __init__(self, template: Template, *, label: str = 'trajectory', max_tokens: Optional[int] = None) -> None:
         """
         Args:
             template: encodes the opening turn and every bridge after it. One
@@ -181,7 +180,10 @@ class TurnLedger:
         """
         self._pif = _to_plain(dict(input_feature))
 
-    def graft(self, prompt_token_ids: Sequence[int], seq: SampledSequence, *,
+    def graft(self,
+              prompt_token_ids: Sequence[int],
+              seq: SampledSequence,
+              *,
               messages: Optional[Sequence[Dict[str, Any]]] = None) -> bool:
         """Bank one round of an episode this loop did not drive.
 
@@ -268,8 +270,7 @@ class TurnLedger:
             raise RuntimeError(f'completion_mask/labels misaligned for {self.label}: '
                                f'{len(completion_mask)} != {len(labels)}')
         else:
-            expected = sum(1 for label, flag in zip(labels, completion_mask)
-                           if label != -100 and flag)
+            expected = sum(1 for label, flag in zip(labels, completion_mask) if label != -100 and flag)
         if len(self._logprobs) != expected:
             raise RuntimeError(f'logprobs/policy-token alignment failed for {self.label}: '
                                f'{len(self._logprobs)} logprobs vs {expected} positions selected '
@@ -316,7 +317,11 @@ class LedgerBook:
         with self._guard:
             return key in self._filed
 
-    def bank(self, key: str, prompt_token_ids: Sequence[int], seq: SampledSequence, *,
+    def bank(self,
+             key: str,
+             prompt_token_ids: Sequence[int],
+             seq: SampledSequence,
+             *,
              messages: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[TurnLedger]:
         """Record one round against ``key``, opening or splitting as needed.
 

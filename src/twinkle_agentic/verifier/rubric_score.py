@@ -118,8 +118,7 @@ class Criterion:
 CRITERIA: List[Criterion] = [
     # -- novelty: three independent axes, judged only against the reference set ----
     Criterion(
-        'novelty',
-        'This task has a different SHAPE from every reference task. Shapes: (a) write '
+        'novelty', 'This task has a different SHAPE from every reference task. Shapes: (a) write '
         'given input files verbatim, then produce a derived file from them; (b) write '
         'a script that demonstrates a defect and a second that fixes it; (c) build a '
         'database or structured store and populate it; (d) run something and report '
@@ -127,51 +126,45 @@ CRITERIA: List[Criterion] = [
         'not in this list. Two tasks of the same shape are the same task here EVEN IF '
         'they are about different subject matter -- a different domain, file format or '
         'vocabulary does not make a different shape',
-        is_hard=True, needs_references=True),
+        is_hard=True,
+        needs_references=True),
     Criterion(
-        'novelty',
-        'Solving this needs machinery that no reference task needs -- a different one '
+        'novelty', 'Solving this needs machinery that no reference task needs -- a different one '
         'of: plain text handling, tabular data, binary formats, a database, threads or '
         'processes, subprocesses, sockets, the filesystem layout itself, timing',
-        is_hard=False, needs_references=True),
+        is_hard=False,
+        needs_references=True),
     Criterion(
-        'novelty',
-        'The FORM of the end state differs from every reference: one text file, several '
+        'novelty', 'The FORM of the end state differs from every reference: one text file, several '
         'files, a database file, a program that must run correctly, or a directory tree',
-        is_hard=False, needs_references=True),
+        is_hard=False,
+        needs_references=True),
     # -- usefulness: the hard criterion kept as-is, it separated 29 from 159 and the
     #    calls held up on inspection.
     Criterion(
-        'usefulness',
-        'The end state is something a person would want for its own sake, not only as '
+        'usefulness', 'The end state is something a person would want for its own sake, not only as '
         'an exercise',
         is_hard=True),
     Criterion(
-        'usefulness',
-        'The statement says what the end state must be and leaves how to reach it to '
+        'usefulness', 'The statement says what the end state must be and leaves how to reach it to '
         'the solver, rather than dictating the code or commands to write',
         is_hard=False),
     Criterion(
-        'usefulness',
-        'The task would still be worth doing if the input were a thousand times larger',
-        is_hard=False),
+        'usefulness', 'The task would still be worth doing if the input were a thousand times larger', is_hard=False),
     # -- complexity: the hard criterion asks for a countable property of the task.
     #    Asking instead whether 'the obvious untested attempt would fail' made the
     #    judge guess at a counterfactual and it flipped on 13% of re-runs -- the worst
     #    of the nine, and it carries weight 3.
     Criterion(
-        'complexity',
-        'Reaching the end state takes at least three steps that depend on each other, '
+        'complexity', 'Reaching the end state takes at least three steps that depend on each other, '
         'where a later step needs the result of an earlier one',
         is_hard=True),
     Criterion(
-        'complexity',
-        'Reaching a passing state means choosing between at least two plausible '
+        'complexity', 'Reaching a passing state means choosing between at least two plausible '
         'approaches, of which at least one does not work',
         is_hard=False),
     Criterion(
-        'complexity',
-        'Passing requires computing something: writing the expected output as a '
+        'complexity', 'Passing requires computing something: writing the expected output as a '
         'literal would not satisfy the check',
         is_hard=False),
 ]
@@ -214,26 +207,24 @@ class RubricResult:
 # spread 0.041 -> 0.100 over the same 60 tasks. What actually stopped the judge from
 # answering criterion 1 with a shape name ('1: f', which cost 2 of 188 tasks their
 # novelty score) is the paragraph below forbidding it.
-_SYSTEM = (
-    'You judge a programming task that was generated automatically, before it is used '
-    'to train a model.\n\n'
-    'The task has two parts. The STATEMENT is everything a solver sees: it starts in an '
-    'empty directory, cannot ask questions, and never sees the check. The CHECK is a '
-    'python script run against the solver\'s directory afterwards, where exit 0 means '
-    'passed. The check is shown to you because it is what the task really demands, '
-    'which the statement can understate.\n\n'
-    'For each numbered criterion output one line:\n\n'
-    '    <index>: PASS   or   <index>: FAIL\n\n'
-    'PASS and FAIL are the only two words you may write after the index. Some criteria '
-    'list categories to compare by; those are there to define the question, never to be '
-    'answered with -- naming a category instead of a verdict makes the line unusable.\n\n'
-    'Judge every criterion independently and literally, against this task only. A '
-    '[Hard Rule] is FAIL unless it is unambiguously satisfied. Do not explain, do not '
-    'restate the criterion, output only the verdict lines in order and then stop.\n')
+_SYSTEM = ('You judge a programming task that was generated automatically, before it is used '
+           'to train a model.\n\n'
+           'The task has two parts. The STATEMENT is everything a solver sees: it starts in an '
+           'empty directory, cannot ask questions, and never sees the check. The CHECK is a '
+           'python script run against the solver\'s directory afterwards, where exit 0 means '
+           'passed. The check is shown to you because it is what the task really demands, '
+           'which the statement can understate.\n\n'
+           'For each numbered criterion output one line:\n\n'
+           '    <index>: PASS   or   <index>: FAIL\n\n'
+           'PASS and FAIL are the only two words you may write after the index. Some criteria '
+           'list categories to compare by; those are there to define the question, never to be '
+           'answered with -- naming a category instead of a verdict makes the line unusable.\n\n'
+           'Judge every criterion independently and literally, against this task only. A '
+           '[Hard Rule] is FAIL unless it is unambiguously satisfied. Do not explain, do not '
+           'restate the criterion, output only the verdict lines in order and then stop.\n')
 
 
-def _applicable(references: Sequence[str],
-                criteria: Sequence[Criterion] = CRITERIA) -> List[Criterion]:
+def _applicable(references: Sequence[str], criteria: Sequence[Criterion] = CRITERIA) -> List[Criterion]:
     return [c for c in criteria if references or not c.needs_references]
 
 
@@ -256,8 +247,7 @@ def build_rubric_prompt(
     quoted verbatim, which is the bulk of a statement here.
     """
     items = _applicable(references, criteria)
-    lines = [f'{i + 1}. {c.text} [{"Hard Rule" if c.is_hard else "Principle"}]'
-             for i, c in enumerate(items)]
+    lines = [f'{i + 1}. {c.text} [{"Hard Rule" if c.is_hard else "Principle"}]' for i, c in enumerate(items)]
     parts = ['## Criteria\n' + '\n'.join(lines) + '\n']
     if references:
         parts.append('\n## Reference tasks (for the novelty criteria only)\n')
@@ -267,14 +257,12 @@ def build_rubric_prompt(
     if check:
         parts.append('\n## Check\n' + check + '\n')
     parts.append(f'\nNow output {len(items)} verdict lines, in order.')
-    return [{'role': 'system', 'content': _SYSTEM},
-            {'role': 'user', 'content': ''.join(parts)}]
+    return [{'role': 'system', 'content': _SYSTEM}, {'role': 'user', 'content': ''.join(parts)}]
 
 
 # Same tolerant form the previous verifier parsed, so a reply written as '1) yes' or
 # '1. FAIL' is read rather than thrown away.
-_VERDICT_RE = re.compile(r'^\s*(\d+)\s*[:.)]\s*(pass|fail|true|false|yes|no|1|0)\b',
-                         re.IGNORECASE)
+_VERDICT_RE = re.compile(r'^\s*(\d+)\s*[:.)]\s*(pass|fail|true|false|yes|no|1|0)\b', re.IGNORECASE)
 _TRUE = {'pass', 'true', 'yes', '1'}
 
 
@@ -296,8 +284,7 @@ def parse_verdicts(raw: str, n: int) -> List[Optional[bool]]:
     return out
 
 
-def _aggregate(items: Sequence[Criterion],
-               rates: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
+def _aggregate(items: Sequence[Criterion], rates: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
     """Weighted PASS fraction per dimension; ``None`` when nothing was judged."""
     totals: Dict[str, List[float]] = {}
     for crit, rate in zip(items, rates):
@@ -306,8 +293,7 @@ def _aggregate(items: Sequence[Criterion],
         weight = HARD_WEIGHT if crit.is_hard else PRINCIPLE_WEIGHT
         got, tot = totals.setdefault(crit.dimension, [0.0, 0.0])
         totals[crit.dimension] = [got + weight * rate, tot + weight]
-    return {dim: (totals[dim][0] / totals[dim][1] if dim in totals else None)
-            for dim in DIMENSIONS}
+    return {dim: (totals[dim][0] / totals[dim][1] if dim in totals else None) for dim in DIMENSIONS}
 
 
 def _undecided(scores: Dict[str, Optional[float]], margin: float) -> bool:
@@ -335,12 +321,13 @@ def _get_client(model: Optional[str] = None):
         return _client
     from twinkle_agentic.protocol.openai import OpenAI
     client = OpenAI(
-        model=model or os.environ.get('RUBRIC_MODEL')
-        or os.environ.get('LLM_BACKUP_MODEL', 'qwen3.8-max'),
+        model=model or os.environ.get('RUBRIC_MODEL') or os.environ.get('LLM_BACKUP_MODEL', 'qwen3.8-max'),
         api_key=os.environ.get('LLM_BACKUP_API_KEY'),
         base_url=os.environ.get('LLM_BACKUP_BASE_URL'),
-        client_kwargs={'timeout': float(os.environ.get('LLM_BACKUP_TIMEOUT', '120')),
-                       'max_retries': int(os.environ.get('LLM_BACKUP_MAX_RETRIES', '2'))},
+        client_kwargs={
+            'timeout': float(os.environ.get('LLM_BACKUP_TIMEOUT', '120')),
+            'max_retries': int(os.environ.get('LLM_BACKUP_MAX_RETRIES', '2'))
+        },
     )
     if model is None:
         with _client_lock:
@@ -389,13 +376,9 @@ def score_task(
 
     for attempt in range(max(1, max_votes)):
         params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature if attempt == 0 else 1.0,
-            top_p=0.95,
-            num_samples=1)
+            max_tokens=max_tokens, temperature=temperature if attempt == 0 else 1.0, top_p=0.95, num_samples=1)
         try:
-            message = api({'messages': messages}, params,
-                          **({'extra_body': extra_body} if extra_body else {}))
+            message = api({'messages': messages}, params, **({'extra_body': extra_body} if extra_body else {}))
         except Exception as e:  # noqa
             if not votes:
                 result.error = f'{type(e).__name__}: {e}'
@@ -442,8 +425,7 @@ def score_tasks(
     """
 
     def _one(task: Dict[str, Any]) -> RubricResult:
-        return score_task(task.get('statement') or '', task.get('check') or '',
-                          task.get('references') or (), **kwargs)
+        return score_task(task.get('statement') or '', task.get('check') or '', task.get('references') or (), **kwargs)
 
     if workers <= 1:
         return [_one(t) for t in tasks]

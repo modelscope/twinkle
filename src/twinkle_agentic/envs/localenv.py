@@ -41,8 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import (DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult, format_command_output,
-                   truncate_observation)
+from .base import DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult, format_command_output, truncate_observation
 
 logger = get_logger()
 
@@ -92,8 +91,7 @@ class LocalEnv(Env):
     # Env interface
     # ------------------------------------------------------------------
 
-    def run_script(self, source: str, interpreter: str = 'python',
-                   timeout: Optional[int] = None) -> Tuple[int, str]:
+    def run_script(self, source: str, interpreter: str = 'python', timeout: Optional[int] = None) -> Tuple[int, str]:
         timeout = self._command_timeout if timeout is None else timeout
         # The script file is never written into the workspace. A persistent
         # workspace gets read back -- by a snapshot, or by a check that lists the
@@ -228,10 +226,16 @@ class LocalEnv(Env):
                 resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
 
         try:
-            proc = subprocess.Popen(argv, cwd=cwd, env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, errors='replace',
-                                    start_new_session=True, preexec_fn=_limit)
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors='replace',
+                start_new_session=True,
+                preexec_fn=_limit)
         except Exception as e:  # noqa
             # A spawn failure is the host's problem, not the script's, and it
             # comes back as a failed run so one bad call cannot end a whole pass.

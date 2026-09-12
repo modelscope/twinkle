@@ -24,8 +24,7 @@ import httpx
 
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from .openai_bridge import (make_error, translate_chat_request, translate_response,
-                            translate_stream_chunk)
+from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
 
 logger = get_logger()
 

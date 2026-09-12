@@ -12,7 +12,6 @@ from twinkle_agentic.utils.message_utils import assistant_text
 if TYPE_CHECKING:
     from twinkle.data_format import SamplingParams, Trajectory  # noqa: F401
 
-
 DEFAULT_USER_PROMPT_TEMPLATE = """\
 Compress the following text as much as possible while preserving all key information.
 
@@ -108,8 +107,7 @@ class Summarizer:
     # ------------------------------------------------------------------
     # public entry point (pre/post processing, NOT decorated)
     # ------------------------------------------------------------------
-    def __call__(self, text: str, system: str = None, query: str = None,
-                 sampling_params: Any = None) -> str:
+    def __call__(self, text: str, system: str = None, query: str = None, sampling_params: Any = None) -> str:
         system = system or self.system_prompt
         budget = max(self.min_budget_chars, math.ceil(len(text) / self.compression_ratio))
         if budget >= len(text):
@@ -125,7 +123,7 @@ class Summarizer:
     # ------------------------------------------------------------------
     # student sampling (decorated with llm_backup)
     # ------------------------------------------------------------------
-    @llm_backup(key_params=["query"])
+    @llm_backup(key_params=['query'])
     def _sample(self, trajectory, sampling_params, query: str = None) -> str:
         """Student model: trajectory + sampling_params -> raw text.
 
@@ -158,15 +156,13 @@ class Summarizer:
         self._special_tokens_cache = tuple(dict.fromkeys(tokens))
         return self._special_tokens_cache
 
-
     # ------------------------------------------------------------------
     # static helpers
     # ------------------------------------------------------------------
     _CODE_FENCE_RE = re.compile(r'^```[a-zA-Z]*\s*\n(.*?)\n```\s*$', re.DOTALL)
 
     @staticmethod
-    def _make_trajectory(system: str, user_template: str, text: str,
-                         budget: int, query: str | None = None) -> dict:
+    def _make_trajectory(system: str, user_template: str, text: str, budget: int, query: str | None = None) -> dict:
         """Build a trajectory dict for sampler / API."""
         user = user_template.replace('{budget}', str(budget))
         user = user.replace('{text}', text)
@@ -177,8 +173,14 @@ class Summarizer:
             user = user.replace('{query}', q_text)
         return {
             'messages': [
-                {'role': 'system', 'content': system},
-                {'role': 'user', 'content': user},
+                {
+                    'role': 'system',
+                    'content': system
+                },
+                {
+                    'role': 'user',
+                    'content': user
+                },
             ],
         }
 
@@ -190,8 +192,7 @@ class Summarizer:
 
     @staticmethod
     def _postprocess(raw: str, original: str, special_tokens: tuple[str, ...]) -> str | None:
-        text = Summarizer._strip_special_tokens(
-            Summarizer._strip_code_fences(raw), special_tokens).strip()
+        text = Summarizer._strip_special_tokens(Summarizer._strip_code_fences(raw), special_tokens).strip()
         if not text or not Summarizer._has_alnum(text):
             return None
         if len(text) >= len(original):

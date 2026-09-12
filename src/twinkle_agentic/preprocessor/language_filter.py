@@ -83,13 +83,14 @@ class LanguageFilter(Filter):
         except Exception:
             return None
 
-    def _user_text(self, row: Dict[str, Any]) -> str:
+    def _user_text(self, row: dict[str, Any]) -> str:
         messages = row.get('messages') or []
-        parts = [_strip_injections(msg_content_text(m)) for m in messages
-                 if isinstance(m, dict) and m.get('role') == 'user']
+        parts = [
+            _strip_injections(msg_content_text(m)) for m in messages if isinstance(m, dict) and m.get('role') == 'user'
+        ]
         return '\n'.join(p for p in parts if p).strip()
 
-    def _detect(self, text: str) -> Optional[str]:
+    def _detect(self, text: str) -> str | None:
         if self._identifier is not None:
             try:
                 lang, _prob = self._identifier.classify(text)
@@ -99,7 +100,7 @@ class LanguageFilter(Filter):
         # heuristic fallback: CJK ratio -> zh, else en
         return 'zh' if cjk_ratio(text) > self.cjk_threshold else 'en'
 
-    def keep(self, row: Dict[str, Any]) -> bool:
+    def keep(self, row: dict[str, Any]) -> bool:
         text = self._user_text(row)
         if len(text) < self.min_chars:
             return True  # too short to judge reliably
@@ -108,7 +109,7 @@ class LanguageFilter(Filter):
             return self.keep_undetected
         return lang.lower() in self.allowed
 
-    def drop_reason(self, row: Dict[str, Any]) -> str:
+    def drop_reason(self, row: dict[str, Any]) -> str:
         text = self._user_text(row)
         lang = self._detect(text) if len(text) >= self.min_chars else None
         return f'language_{lang or "undetected"}'

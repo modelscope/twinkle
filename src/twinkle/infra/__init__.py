@@ -307,7 +307,6 @@ def _get_workers(workers, execute):
 # charged to the discarded one are never given back.
 _CW_CREATE_LOCK = threading.Lock()
 
-
 # Prefix of the awaitable companion generated for a continuous-work method. The
 # companion is what the driver actually calls on the worker; see
 # ``_make_worker_async_companion``.
@@ -754,8 +753,7 @@ def _prepare_lazy_collect(args, kwargs):
         return args, kwargs
 
 
-def remote_class(execute: Literal['first', 'peer', 'all'] = 'all',
-                 max_concurrency: Optional[int] = None):
+def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurrency: Optional[int] = None):
     """Patch each class used in remote clusters with this decorator.
 
     Use this decorator to wrap your class to enable it to execute in a remote cluster.
@@ -1057,7 +1055,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _cw_barrier(self, func.__name__)
                         if enable_continous_work and not RayHelper.has_ref(args, kwargs):
                             assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
-                                             'which exists for collectives that must run in lock step.')
+                                              'which exists for collectives that must run in lock step.')
                             _workers = _get_workers(self._actors, execute)
                             _batch_len = _cw_batch_len(args, kwargs)
                             if _batch_len:

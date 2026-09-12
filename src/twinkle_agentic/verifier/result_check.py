@@ -105,8 +105,7 @@ class CheckReport:
         return self.n_total > 0 and self.n_passed == self.n_total
 
     def failures(self) -> List[str]:
-        return [(o.check.description or o.check.kind) + ': ' + o.detail
-                for o in self.outcomes if not o.passed]
+        return [(o.check.description or o.check.kind) + ': ' + o.detail for o in self.outcomes if not o.passed]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -145,8 +144,7 @@ def _local_env(workspace: str) -> 'Env':
     # remote-class machinery, and a task declaring only file_* checks should not
     # pay a second of import time for an environment it never runs anything in.
     from ..envs.localenv import LocalEnv
-    return LocalEnv(workspace=workspace or '.', command_timeout=DEFAULT_TIMEOUT,
-                    memory_limit_gb=_MEM_LIMIT_GB)
+    return LocalEnv(workspace=workspace or '.', command_timeout=DEFAULT_TIMEOUT, memory_limit_gb=_MEM_LIMIT_GB)
 
 
 def checks_from_dicts(raw: Sequence[Dict[str, Any]]) -> List[Check]:
@@ -215,10 +213,9 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
             return CheckOutcome(check, False, str(e))
         there = os.path.exists(full)
         want = (kind == 'file_exists')
-        return CheckOutcome(check, there == want,
-                            '' if there == want else
-                            (f'{check.path} does not exist' if want
-                             else f'{check.path} should not exist'))
+        return CheckOutcome(
+            check, there == want, '' if there == want else
+            (f'{check.path} does not exist' if want else f'{check.path} should not exist'))
 
     if kind in ('file_contains', 'file_equals', 'file_json'):
         text, err = _read_text(ctx.workspace, check.path)
@@ -227,16 +224,14 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
         if kind == 'file_contains':
             if check.pattern:
                 ok = re.search(check.pattern, text, re.S) is not None
-                return CheckOutcome(check, ok, '' if ok else
-                                    f'{check.path} does not match /{check.pattern}/')
+                return CheckOutcome(check, ok, '' if ok else f'{check.path} does not match /{check.pattern}/')
             ok = _norm(check.value) in text
-            return CheckOutcome(check, ok, '' if ok else
-                                f'{check.path} does not contain {_norm(check.value)!r}')
+            return CheckOutcome(check, ok, '' if ok else f'{check.path} does not contain {_norm(check.value)!r}')
         if kind == 'file_equals':
             ok = text.strip() == _norm(check.value)
-            return CheckOutcome(check, ok, '' if ok else
-                                f'{check.path} is {text.strip()[:120]!r}, '
-                                f'expected {_norm(check.value)[:120]!r}')
+            return CheckOutcome(
+                check, ok, '' if ok else f'{check.path} is {text.strip()[:120]!r}, '
+                f'expected {_norm(check.value)[:120]!r}')
         try:
             doc = json.loads(text)
         except json.JSONDecodeError as e:
@@ -245,19 +240,16 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
         if not found:
             return CheckOutcome(check, False, f'{check.path} has no key {check.key!r}')
         ok = got == check.value if not isinstance(check.value, str) else _norm(got) == _norm(check.value)
-        return CheckOutcome(check, ok, '' if ok else
-                            f'{check.path}:{check.key} is {got!r}, expected {check.value!r}')
+        return CheckOutcome(check, ok, '' if ok else f'{check.path}:{check.key} is {got!r}, expected {check.value!r}')
 
     if kind in ('shell', 'python'):
         env = ctx.env or _local_env(ctx.workspace)
         try:
             code, out = env.run_script(check.code, kind, check.timeout)
         except Exception as e:  # noqa
-            return CheckOutcome(check, False,
-                                f'{type(env).__name__} raised {type(e).__name__}: {e}')
+            return CheckOutcome(check, False, f'{type(env).__name__} raised {type(e).__name__}: {e}')
         if code != check.expect_exit:
-            return CheckOutcome(check, False,
-                                f'exit {code} (expected {check.expect_exit}); output: {out[-300:]}')
+            return CheckOutcome(check, False, f'exit {code} (expected {check.expect_exit}); output: {out[-300:]}')
         if check.pattern and re.search(check.pattern, out or '', re.S) is None:
             return CheckOutcome(check, False, f'output does not match /{check.pattern}/')
         if check.value is not None and _norm(check.value) not in (out or ''):
@@ -267,16 +259,14 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
     answer = ctx.final_answer or ''
     if kind == 'answer_contains':
         ok = _norm(check.value) in answer
-        return CheckOutcome(check, ok, '' if ok else
-                            f'final answer does not contain {_norm(check.value)!r}')
+        return CheckOutcome(check, ok, '' if ok else f'final answer does not contain {_norm(check.value)!r}')
     if kind == 'answer_equals':
         ok = answer.strip() == _norm(check.value)
-        return CheckOutcome(check, ok, '' if ok else
-                            f'final answer is {answer.strip()[:120]!r}, '
-                            f'expected {_norm(check.value)[:120]!r}')
+        return CheckOutcome(
+            check, ok, '' if ok else f'final answer is {answer.strip()[:120]!r}, '
+            f'expected {_norm(check.value)[:120]!r}')
     ok = re.search(check.pattern, answer, re.S) is not None
-    return CheckOutcome(check, ok, '' if ok else
-                        f'final answer does not match /{check.pattern}/')
+    return CheckOutcome(check, ok, '' if ok else f'final answer does not match /{check.pattern}/')
 
 
 def run_checks(

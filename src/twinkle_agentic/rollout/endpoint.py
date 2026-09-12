@@ -219,8 +219,8 @@ class PolicyEndpoint:
         self.port = sock.getsockname()[1]
         self._socket = sock
         self._server = uvicorn.Server(uvicorn.Config(self._build_app(), log_level='warning'))
-        self._thread = threading.Thread(target=self._server.run, kwargs={'sockets': [sock]},
-                                        name=f'policy-endpoint-{self.port}', daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.run, kwargs={'sockets': [sock]}, name=f'policy-endpoint-{self.port}', daemon=True)
         self._thread.start()
         deadline = time.monotonic() + _STARTUP_TIMEOUT
         while not self._server.started:
@@ -259,7 +259,6 @@ class PolicyEndpoint:
 
     def _build_app(self) -> Any:
         from contextlib import asynccontextmanager
-
         from fastapi import Body, FastAPI, Header
         from fastapi.responses import StreamingResponse
 

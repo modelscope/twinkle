@@ -31,8 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import (DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult,
-                   format_command_output, truncate_observation)
+from .base import DEFAULT_TOOLS, TIMEOUT_EXIT_CODE, Env, StepResult, format_command_output, truncate_observation
 
 logger = get_logger()
 
@@ -56,6 +55,7 @@ def _as_file_content(content: Any) -> Union[str, bytes]:
     if isinstance(content, (dict, list)):
         return json.dumps(content, ensure_ascii=False, indent=2)
     return str(content)
+
 
 # Emptied entry by entry and then asserted empty, rather than `rm -rf`: a clear
 # that silently did nothing hands the next episode the previous one's files,
@@ -273,8 +273,11 @@ class AgentEnv(Env):
         # Before the setup commands, because they are written against it, and
         # because commands.run(cwd=...) fails outright on a missing directory --
         # a template without this path would otherwise break every call.
-        self.run_command({'command': f'mkdir -p {shlex.quote(self._workspace)} '
-                                     f'{shlex.quote(_SCRIPT_DIR)}', 'cwd': '/'})
+        self.run_command({
+            'command': f'mkdir -p {shlex.quote(self._workspace)} '
+            f'{shlex.quote(_SCRIPT_DIR)}',
+            'cwd': '/'
+        })
         for cmd in self._setup_commands:
             result = self.run_command({'command': cmd})
             setup_output.append(result)
@@ -294,14 +297,14 @@ class AgentEnv(Env):
             if self._pre_tool_call is not None:
                 refusal = self._pre_tool_call(tool_name, arguments)
                 if refusal is not None:
-                    return StepResult(observation=refusal, reward=0.0, done=False,
-                                      info={'sandbox_id': self.sandbox_id})
+                    return StepResult(observation=refusal, reward=0.0, done=False, info={'sandbox_id': self.sandbox_id})
             if tool_name in self._custom_handlers:
                 observation = self._custom_handlers[tool_name](self, arguments)
             elif self._include_default_tools and tool_name == 'run_command':
                 observation = self.run_command(arguments)
             elif self._include_default_tools and tool_name == 'write_file':
-                self._sandbox.files.write(self._resolve(arguments['path']), _as_file_content(arguments.get('content', '')))
+                self._sandbox.files.write(
+                    self._resolve(arguments['path']), _as_file_content(arguments.get('content', '')))
                 observation = f"File written: {arguments['path']}"
             elif self._include_default_tools and tool_name == 'read_file':
                 observation = truncate_observation(str(self._sandbox.files.read(self._resolve(arguments['path']))))
@@ -316,8 +319,7 @@ class AgentEnv(Env):
             logger.warning(f'AgentEnv step error (sandbox={self.sandbox_id}): {e}')
             return StepResult(observation=f'Error: {e}', reward=0.0, done=False, info={'error': str(e)})
 
-    def run_script(self, source: str, interpreter: str = 'python',
-                   timeout: Optional[int] = None) -> Tuple[int, str]:
+    def run_script(self, source: str, interpreter: str = 'python', timeout: Optional[int] = None) -> Tuple[int, str]:
         """Run a whole script in the workspace; returns ``(exit_code, output)``.
 
         The verifier's path, as opposed to :meth:`step`. Both land in the same

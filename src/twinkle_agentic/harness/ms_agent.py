@@ -35,7 +35,6 @@ from typing import Any, Dict, List, Optional, Union
 from twinkle import requires
 from twinkle.data_format import Trajectory
 from twinkle.utils import run_sync
-
 from .base import AgentHarness
 
 
@@ -80,9 +79,8 @@ class MsAgentHarness(AgentHarness):
         **agent_kwargs,
     ):
         requires('ms-agent')
-        from omegaconf import DictConfig, OmegaConf
-
         from ms_agent.agent.llm_agent import LLMAgent
+        from omegaconf import DictConfig, OmegaConf
 
         if agent is not None:
             self.agent = agent
@@ -189,7 +187,7 @@ class MsAgentHarness(AgentHarness):
         self,
         trajectory: Trajectory,
         decoded: str,
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> Trajectory:
         messages = self._dicts_to_messages(trajectory.get('messages') or [])
         response = self._assistant_message(decoded, tool_calls, messages)
@@ -202,8 +200,8 @@ class MsAgentHarness(AgentHarness):
     def after_tools(
         self,
         trajectory: Trajectory,
-        observations: List[str],
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        observations: list[str],
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> Trajectory:
         """Format Env observations as ms-agent ``role=tool`` messages.
 
@@ -219,7 +217,7 @@ class MsAgentHarness(AgentHarness):
             tc = calls[i] if i < len(calls) else {}
             tid = tc.get('id') or str(uuid.uuid4())[:8]
             name = tc.get('tool_name') or ''
-            kwargs: Dict[str, Any] = {
+            kwargs: dict[str, Any] = {
                 'role': 'tool',
                 'content': formatted.text,
                 'tool_call_id': tid,
@@ -229,8 +227,7 @@ class MsAgentHarness(AgentHarness):
             # resources/extra; older versions carried the fields below on
             # the object. Forward whichever exist so Message never gets a
             # kwarg it cannot take.
-            for _field in ('resources', 'tool_detail', 'hook_attachments',
-                           'is_error'):
+            for _field in ('resources', 'tool_detail', 'hook_attachments', 'is_error'):
                 _value = getattr(formatted, _field, None)
                 if _value is not None:
                     kwargs[_field] = _value
@@ -288,7 +285,7 @@ class MsAgentHarness(AgentHarness):
         if hasattr(agent, 'prepare_knowledge_search'):
             await agent.prepare_knowledge_search()
 
-    def tool_schemas(self) -> List[Dict[str, Any]]:
+    def tool_schemas(self) -> list[dict[str, Any]]:
         """ms-agent's own tool list, OpenAI-shaped.
 
         This is the list that reaches the prompt. Feed the same list to
@@ -319,15 +316,15 @@ class MsAgentHarness(AgentHarness):
         return Message(role='assistant', content=decoded or '', tool_calls=ms_calls)
 
     @staticmethod
-    def _last_assistant_calls(messages) -> List[Dict[str, Any]]:
+    def _last_assistant_calls(messages) -> list[dict[str, Any]]:
         for msg in reversed(messages):
             if getattr(msg, 'role', None) == 'assistant':
                 return list(getattr(msg, 'tool_calls', None) or [])
         return []
 
     @staticmethod
-    def _ms_tool_calls(tool_calls: Optional[List[Any]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def _ms_tool_calls(tool_calls: list[Any] | None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for tc in tool_calls or []:
             if not isinstance(tc, dict):
                 continue
@@ -355,13 +352,13 @@ class MsAgentHarness(AgentHarness):
         return out
 
     @staticmethod
-    def _messages_to_dicts(messages) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def _messages_to_dicts(messages) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for msg in messages:
             if isinstance(msg, dict):
                 out.append(dict(msg))
                 continue
-            d: Dict[str, Any] = {
+            d: dict[str, Any] = {
                 'role': msg.role,
                 'content': msg.content if msg.content is not None else '',
             }
@@ -377,7 +374,7 @@ class MsAgentHarness(AgentHarness):
         return out
 
     @staticmethod
-    def _dicts_to_messages(messages: List[Dict[str, Any]]):
+    def _dicts_to_messages(messages: list[dict[str, Any]]):
         from ms_agent.llm.utils import Message
 
         out = []
@@ -385,7 +382,7 @@ class MsAgentHarness(AgentHarness):
             if not isinstance(m, dict):
                 out.append(m)
                 continue
-            kwargs: Dict[str, Any] = {
+            kwargs: dict[str, Any] = {
                 'role': m.get('role') or 'user',
                 'content': m.get('content') if m.get('content') is not None else '',
             }
@@ -402,8 +399,8 @@ class MsAgentHarness(AgentHarness):
         return out
 
 
-def _ms_calls_to_openai(tool_calls: List[Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def _ms_calls_to_openai(tool_calls: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for tc in tool_calls or []:
         if not isinstance(tc, dict):
             continue
@@ -529,18 +526,17 @@ def patch_ms_agent_python_executor() -> bool:
         if root:
             os.makedirs(root, exist_ok=True)
             os.chdir(root)
-        return await original(self, single_namespace_source(code),
-                              description=description, timeout=timeout)
+        return await original(self, single_namespace_source(code), description=description, timeout=timeout)
 
     setattr(python_executor, _SINGLE_NS_FLAG, True)
     LocalCodeExecutionTool.python_executor = python_executor
     return True
 
 
-def _ms_tools_to_openai(raw: Union[Dict[str, Any], List[Any], None]) -> List[Dict[str, Any]]:
+def _ms_tools_to_openai(raw: dict[str, Any] | list[Any] | None) -> list[dict[str, Any]]:
     if not raw:
         return []
-    items: List[Any] = []
+    items: list[Any] = []
     if isinstance(raw, dict):
         for v in raw.values():
             if isinstance(v, list):
@@ -551,7 +547,7 @@ def _ms_tools_to_openai(raw: Union[Dict[str, Any], List[Any], None]) -> List[Dic
         items = raw
     else:
         return []
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for t in items:
         if not isinstance(t, dict):
             continue

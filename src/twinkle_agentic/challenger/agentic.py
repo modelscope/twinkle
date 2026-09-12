@@ -164,7 +164,6 @@ class AgenticChallenger(Challenger):
     _solver_system = ('You solve tasks in a workspace using your tools. Do the work -- create the '
                       'files the task asks for. Do not just describe what you would do.')
 
-
     def __init__(
         self,
         backend: Any,
@@ -222,12 +221,12 @@ class AgenticChallenger(Challenger):
         self._from_scratch = self._from_scratch if from_scratch_prompt is None else from_scratch_prompt
         self._from_seed = self._from_seed if from_seed_prompt is None else from_seed_prompt
         self._check_followup = self._check_followup if check_followup_prompt is None else check_followup_prompt
-        self._check_retry_followup = (self._check_retry_followup if check_retry_followup_prompt is None else
-                                      check_retry_followup_prompt)
-        self._check_parse_error = (self._check_parse_error if check_parse_error_prompt is None else
-                                   check_parse_error_prompt)
-        self._problem_followup = (self._problem_followup if problem_followup_prompt is None else
-                                  problem_followup_prompt)
+        self._check_retry_followup = (
+            self._check_retry_followup if check_retry_followup_prompt is None else check_retry_followup_prompt)
+        self._check_parse_error = (
+            self._check_parse_error if check_parse_error_prompt is None else check_parse_error_prompt)
+        self._problem_followup = (
+            self._problem_followup if problem_followup_prompt is None else problem_followup_prompt)
         self._solver_system = self._solver_system if solver_system_prompt is None else solver_system_prompt
         self._check_retries = check_retries
         self._problem_max_chars = problem_max_chars
@@ -307,9 +306,10 @@ class AgenticChallenger(Challenger):
         prompt = self._build_challenge_prompt()
         if prompt is None:
             return False
-        unit = _Unit(group_id=uuid.uuid4().hex,
-                     proposals=[None] * self.num_challenger_rollouts,
-                     pending=self.num_challenger_rollouts)
+        unit = _Unit(
+            group_id=uuid.uuid4().hex,
+            proposals=[None] * self.num_challenger_rollouts,
+            pending=self.num_challenger_rollouts)
         for index in range(self.num_challenger_rollouts):
             self._submit(lambda env, i=index: self._propose(unit, i, prompt, env))
         return True
@@ -404,8 +404,9 @@ class AgenticChallenger(Challenger):
 
         attempt = state.get('check_attempts', 0) + 1
         state['check_attempts'] = attempt
-        script = (self._parse_check_fn(reply) if self._parse_check_fn is not None else
-                  parse_fenced_code(reply, language_tags=None))
+        script = (
+            self._parse_check_fn(reply) if self._parse_check_fn is not None else parse_fenced_code(
+                reply, language_tags=None))
         if script is None:
             if attempt <= self._check_retries:
                 return self._check_retry_followup.format(
@@ -422,8 +423,7 @@ class AgenticChallenger(Challenger):
         # correct reproduction. The reason goes back the way a failed assertion
         # does, since it is the same kind of fault.
         brittle = self._brittle_check_fn(script) if self._brittle_check_fn is not None else None
-        exit_code, output = (1, brittle) if brittle else env.run_script(
-            script, interpreter=self._check_language)
+        exit_code, output = (1, brittle) if brittle else env.run_script(script, interpreter=self._check_language)
         if exit_code == 0:
             state['checked'] = True
             return self._problem_followup
@@ -481,8 +481,10 @@ class AgenticChallenger(Challenger):
         agent brings its own opening too and reads only the statement out of this,
         which costs it the unused keys and nothing else.
         """
-        statement = next((message.get('content', '') for message in task.get('messages') or []
-                          if isinstance(message, dict) and message.get('role') == 'user'), '')
+        statement = next(
+            (message.get('content', '')
+             for message in task.get('messages') or [] if isinstance(message, dict) and message.get('role') == 'user'),
+            '')
         messages: List[Dict[str, Any]] = [{'role': 'user', 'content': statement}]
         if self._solver_system:
             messages.insert(0, {'role': 'system', 'content': self._solver_system})

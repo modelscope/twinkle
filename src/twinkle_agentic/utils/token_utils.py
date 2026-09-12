@@ -19,7 +19,6 @@ arithmetic is a second set of off-by-one bugs. No Ray decorators
 (``@remote_function`` / ``@remote_class``) are applied here.
 """
 
-
 import numpy as np
 from typing import Any, Dict, List, Optional
 
@@ -175,8 +174,7 @@ def extend_with_bridge(
     messages_before = list(pif.get('messages') or [])
     messages_after = messages_before + list(tool_messages)
 
-    bridge_text = _delta_text(
-        template, messages_before, tool_messages, gen_prompt_before=False, gen_prompt_after=True)
+    bridge_text = _delta_text(template, messages_before, tool_messages, gen_prompt_before=False, gen_prompt_after=True)
     if not bridge_text:
         raise RuntimeError('Bridge text computation returned empty string; '
                            'tool turn would add no tokens (template misconfiguration?).')

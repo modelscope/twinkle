@@ -175,8 +175,7 @@ class Env(ABC):
         """
         return [self.step(name, args or {}) for name, args in calls]
 
-    def run_script(self, source: str, interpreter: str = 'python',
-                   timeout: Optional[int] = None) -> Tuple[int, str]:
+    def run_script(self, source: str, interpreter: str = 'python', timeout: Optional[int] = None) -> Tuple[int, str]:
         """Run a whole script here; returns ``(exit_code, output)``.
 
         The execution path a *verifier* takes, as opposed to :meth:`step`, which
@@ -254,8 +253,12 @@ class Env(ABC):
         is no end state to read back. Truncation is set by the ``snapshot_*``
         class attributes.
         """
-        return list_workspace(self, max_files=self.snapshot_max_files, per_file=self.snapshot_per_file,
-                              budget=self.snapshot_budget, skip=self.snapshot_skip)
+        return list_workspace(
+            self,
+            max_files=self.snapshot_max_files,
+            per_file=self.snapshot_per_file,
+            budget=self.snapshot_budget,
+            skip=self.snapshot_skip)
 
     def tools(self) -> List[ToolInfo]:
         return []

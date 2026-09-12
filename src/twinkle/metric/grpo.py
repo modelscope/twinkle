@@ -348,10 +348,9 @@ class GRPOMetric(Metric):
                 # so the gradients were right all along and only the panel went blank.
                 # align_logps_to_mask now shares that branch; accept anything it can align.
                 import torch as _torch  # noqa: F811
-                usable = (_torch.is_tensor(old_logps)
-                          and old_logps.dim() == logps_mb.dim()
-                          and old_logps.shape[0] == logps_mb.shape[0]
-                          and old_logps.shape[-1] >= logps_mb.shape[-1])
+                usable = (
+                    _torch.is_tensor(old_logps) and old_logps.dim() == logps_mb.dim()
+                    and old_logps.shape[0] == logps_mb.shape[0] and old_logps.shape[-1] >= logps_mb.shape[-1])
                 if usable:
                     old_slice = old_logps
                 else:
@@ -369,8 +368,8 @@ class GRPOMetric(Metric):
             adv_mb = flat_adv[cursor:cursor + num_seq_est] if flat_adv is not None else None
             smp_mb = flat_sampler[cursor:cursor + num_seq_est] if flat_sampler is not None else None
             gsi_base = self._gsi_cursor
-            advanced = self._accumulate_mb(labels, logps_mb, old_slice, ent_mb, adv_mb,
-                                           gsi_base=gsi_base, sampler_slice=smp_mb)
+            advanced = self._accumulate_mb(
+                labels, logps_mb, old_slice, ent_mb, adv_mb, gsi_base=gsi_base, sampler_slice=smp_mb)
             self._gsi_cursor += advanced
             cursor += advanced
 

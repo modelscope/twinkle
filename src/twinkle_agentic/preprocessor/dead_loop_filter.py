@@ -201,18 +201,17 @@ class DeadLoopFilter(Preprocessor):
                 # degenerate free-text; run the stuck-text detector on assistant
                 # turns that carry real text (skip pure tool-call turns whose empty
                 # content would misfire the detector), instead of skipping the row.
-                asst_msgs = [m for m in asst_msgs
-                             if msg_content_text(m).strip()
-                             or (m.get('reasoning_content') or m.get('thinking') or '').strip()]
+                asst_msgs = [
+                    m for m in asst_msgs
+                    if msg_content_text(m).strip() or (m.get('reasoning_content') or m.get('thinking') or '').strip()
+                ]
             if not asst_msgs:
                 out.append(row)
                 continue
-            stuck_turns = sum(
-                1 for m in asst_msgs
-                if self._is_stuck(
-                    msg_content_text(m).strip(),
-                    (m.get('reasoning_content') or m.get('thinking') or '').strip(),
-                ))
+            stuck_turns = sum(1 for m in asst_msgs if self._is_stuck(
+                msg_content_text(m).strip(),
+                (m.get('reasoning_content') or m.get('thinking') or '').strip(),
+            ))
             min_stuck = self._agent_min_stuck_turns if agent else 1
             if stuck_turns >= min_stuck:
                 dropped.append(dict(row, drop_reason='dead_loop'))

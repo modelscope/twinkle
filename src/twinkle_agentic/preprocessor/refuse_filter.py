@@ -183,7 +183,10 @@ class RefuseFilter(Preprocessor):
             that the model then overrides, so scanning them raises false positives.
     """
 
-    def __init__(self, check_window: int = 600, *, scan_all_assistants: bool = True,
+    def __init__(self,
+                 check_window: int = 600,
+                 *,
+                 scan_all_assistants: bool = True,
                  scan_reasoning: bool = False) -> None:
         super().__init__()
         self._check_window = check_window

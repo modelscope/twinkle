@@ -58,8 +58,7 @@ class BracketDslParser(ToolCallParser):
     def _skip_spans(text: str) -> List[Tuple[int, int]]:
         """Regions where a call list is quoted code or private thought, not a call."""
         text = text or ''
-        return (BracketDslParser._fenced_spans(text)
-                + [m.span() for m in BracketDslParser._THINK_RE.finditer(text)])
+        return (BracketDslParser._fenced_spans(text) + [m.span() for m in BracketDslParser._THINK_RE.finditer(text)])
 
     @staticmethod
     def _in_spans(index: int, spans: List[Tuple[int, int]]) -> bool:

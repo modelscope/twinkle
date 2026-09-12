@@ -42,9 +42,7 @@ def merge_dropped_shards(dropped_log_path: str) -> None:
     if not dropped_log_path:
         return
     import glob
-    shards = sorted(
-        p for p in glob.glob(f'{dropped_log_path}.*')
-        if not p.endswith('.lock'))
+    shards = sorted(p for p in glob.glob(f'{dropped_log_path}.*') if not p.endswith('.lock'))
     if not shards:
         return
     os.makedirs(os.path.dirname(os.path.abspath(dropped_log_path)) or '.', exist_ok=True)
@@ -60,8 +58,7 @@ def merge_dropped_shards(dropped_log_path: str) -> None:
                 pass
 
 
-def run_quality_pipeline(dataset, pipeline: 'QualityPreprocessor', *,
-                         num_proc: int = 1, **map_kwargs):
+def run_quality_pipeline(dataset, pipeline: 'QualityPreprocessor', *, num_proc: int = 1, **map_kwargs):
     """Run a ``drop_mode='mark'`` pipeline as map(equal-length) + filter(keep).
 
     This is the ghost-proof way to run a filtering pipeline: ``map`` never
@@ -96,8 +93,7 @@ class QualityPreprocessor(Preprocessor):
     #: Column name for the keep flag emitted in ``drop_mode='mark'``.
     KEEP_FLAG = '_keep'
 
-    def __init__(self, pipeline: List[Callable], dropped_log_path: str = '',
-                 drop_mode: str = 'inline'):
+    def __init__(self, pipeline: List[Callable], dropped_log_path: str = '', drop_mode: str = 'inline'):
         super().__init__()
         if drop_mode not in ('inline', 'mark'):
             raise ValueError("drop_mode must be 'inline' or 'mark'")

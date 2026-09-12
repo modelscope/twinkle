@@ -51,16 +51,16 @@ class DistillationRegistry:
             state.call_count += 1
             return state.call_count
 
-    def add_record(self, key: str, student_result: Any, teacher_result: Any, match: bool,
-                   trajectory: Any = None):
+    def add_record(self, key: str, student_result: Any, teacher_result: Any, match: bool, trajectory: Any = None):
         with self._lock:
             state = self._states[key]
-            state.dataset.append(EvalRecord(
-                student_result=student_result,
-                teacher_result=teacher_result,
-                match=match,
-                trajectory=trajectory,
-            ))
+            state.dataset.append(
+                EvalRecord(
+                    student_result=student_result,
+                    teacher_result=teacher_result,
+                    match=match,
+                    trajectory=trajectory,
+                ))
         # File IO deliberately outside the registry lock so a slow disk never
         # stalls confidence bookkeeping for other keys.
         _maybe_dump(key, trajectory, student_result, teacher_result, match)
@@ -91,8 +91,7 @@ _teacher_lock = threading.Lock()
 _dump_lock = threading.Lock()
 
 
-def _maybe_dump(key: str, trajectory: Any, student_result: Any,
-                teacher_result: Any, match: bool) -> None:
+def _maybe_dump(key: str, trajectory: Any, student_result: Any, teacher_result: Any, match: bool) -> None:
     """Append one raw (input -> teacher output) record as JSONL when the env var
     ``LLM_BACKUP_DUMP_PATH`` is set. Off by default: no path -> nothing written,
     behaviour is identical to before.
@@ -136,6 +135,7 @@ def _get_teacher_api():
         if _teacher_api is not None:
             return _teacher_api
         from twinkle_agentic.protocol.openai import OpenAI
+
         # Bound per-request latency: without a timeout a single hung request blocks
         # the calling worker for the SDK default (~600s) x retries. Overridable via
         # env for slow/large-prompt endpoints.
@@ -145,7 +145,10 @@ def _get_teacher_api():
             model=os.environ.get('LLM_BACKUP_MODEL', 'qwen3.7-max'),
             api_key=os.environ.get('LLM_BACKUP_API_KEY'),
             base_url=os.environ.get('LLM_BACKUP_BASE_URL'),
-            client_kwargs={'timeout': timeout, 'max_retries': max_retries},
+            client_kwargs={
+                'timeout': timeout,
+                'max_retries': max_retries
+            },
         )
         return _teacher_api
 
@@ -162,8 +165,7 @@ def _call_teacher(trajectory, sampling_params) -> str:
 # ---------------------------------------------------------------------------
 # Key building
 # ---------------------------------------------------------------------------
-def _build_key(func_name: str, args: tuple, kwargs: dict,
-               param_names: List[str], key_params: Sequence[str]) -> str:
+def _build_key(func_name: str, args: tuple, kwargs: dict, param_names: List[str], key_params: Sequence[str]) -> str:
     """Build a unique key from specified parameter values."""
     key_parts = [func_name]
     for i, name in enumerate(param_names):
@@ -176,7 +178,7 @@ def _build_key(func_name: str, args: tuple, kwargs: dict,
         if name not in param_names[:len(args)] and name in kwargs:
             if f"{name}={_serialize_value(kwargs[name])}" not in key_parts:
                 key_parts.append(f"{name}={_serialize_value(kwargs[name])}")
-    raw_key = "|".join(key_parts)
+    raw_key = '|'.join(key_parts)
     return hashlib.md5(raw_key.encode()).hexdigest()
 
 
@@ -204,7 +206,7 @@ def llm_backup(
     key_params: Sequence[str],
     comparator: Optional[Callable[[Any, Any], bool]] = None,
     sample_rate: float = 0.2,
-    refresh_env_var: str = "LLM_BACKUP_REFRESH_INTERVAL",
+    refresh_env_var: str = 'LLM_BACKUP_REFRESH_INTERVAL',
     default_refresh_interval: int = 50,
 ):
     """Decorator for progressive distillation from teacher API to student model.
@@ -303,7 +305,7 @@ def llm_backup_async(
     key_params: Sequence[str],
     comparator: Optional[Callable[[Any, Any], bool]] = None,
     sample_rate: float = 0.2,
-    refresh_env_var: str = "LLM_BACKUP_REFRESH_INTERVAL",
+    refresh_env_var: str = 'LLM_BACKUP_REFRESH_INTERVAL',
     default_refresh_interval: int = 50,
 ):
     """Async version of llm_backup. Same semantics."""

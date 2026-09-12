@@ -204,8 +204,7 @@ class HardFilter(Preprocessor):
         if self._max_rounds:
             rounds = min(len(user_msgs), len(asst_msgs))
             if is_agent_row(messages):
-                cap = (self._agent_max_rounds if self._agent_max_rounds is not None
-                       else self._max_rounds * 10)
+                cap = (self._agent_max_rounds if self._agent_max_rounds is not None else self._max_rounds * 10)
             else:
                 cap = self._max_rounds
             if cap is not None and rounds > cap:

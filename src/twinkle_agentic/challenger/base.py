@@ -251,8 +251,8 @@ class Challenger(ABC):
         challenger, solver = unit
         added = 0
         dropped = 0
-        for into, groups, want in ((pending.challenger, challenger, want_challenger),
-                                   (pending.solver, solver, want_solver)):
+        for into, groups, want in ((pending.challenger, challenger, want_challenger), (pending.solver, solver,
+                                                                                       want_solver)):
             for group in groups:
                 if len(into) >= want:
                     dropped += 1

@@ -93,7 +93,11 @@ class TraceWriter:
         """The trajectory minus its tensors: messages and metadata."""
         return _to_plain({k: v for k, v in trajectory.items() if k not in cls.SKIP_KEYS})
 
-    def filename(self, trajectory: Dict[str, Any], *, index: int, success: bool,
+    def filename(self,
+                 trajectory: Dict[str, Any],
+                 *,
+                 index: int,
+                 success: bool,
                  global_step: Optional[int] = None) -> str:
         """``[step-]{ok|fail}-{id}.json``.
 
@@ -130,9 +134,8 @@ class TraceWriter:
                     continue
                 success = self._ask(self.is_success, trajectory, default=False)
                 record = self.record(trajectory, index=index, success=success)
-                path = os.path.join(
-                    self.directory,
-                    self.filename(trajectory, index=index, success=success, global_step=global_step))
+                path = os.path.join(self.directory,
+                                    self.filename(trajectory, index=index, success=success, global_step=global_step))
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(record, f, ensure_ascii=False, indent=2, default=str)
             except Exception as exc:

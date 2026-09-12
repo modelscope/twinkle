@@ -72,8 +72,7 @@ class OPSDLoss(GRPOLoss):
     ):
         # epsilon is unused (no PPO ratio here) but kept in the ctor so the shared
         # ``set_loss(epsilon=..., beta=...)`` call site does not need special-casing.
-        super().__init__(epsilon=kwargs.pop('epsilon', 0.2), beta=beta,
-                         ignore_index=ignore_index, **kwargs)
+        super().__init__(epsilon=kwargs.pop('epsilon', 0.2), beta=beta, ignore_index=ignore_index, **kwargs)
         self.reverse = reverse
 
     def _aggregate_loss(self, per_token_loss, loss_mask, **kwargs):

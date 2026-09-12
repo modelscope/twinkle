@@ -14,7 +14,6 @@ from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
 from .ledger import TurnLedger
 from .trace import TraceWriter
 
-
 ResponseCallback = Callable[..., SampledSequence]
 
 
@@ -116,10 +115,9 @@ def _malformed_tool_message(errors: List[str]) -> Dict[str, Any]:
     return {
         'role':
         'tool',
-        'content':
-        ('Your tool call was not run: ' + reason + '. Send the call again. Inside '
-         'a JSON string a backslash has to be written as \\\\ and a line break as '
-         '\\n; a single quote needs no backslash at all.'),
+        'content': ('Your tool call was not run: ' + reason + '. Send the call again. Inside '
+                    'a JSON string a backslash has to be written as \\\\ and a line break as '
+                    '\\n; a single quote needs no backslash at all.'),
     }
 
 
@@ -201,22 +199,17 @@ class MultiTurnRollout(Rollout):
             if sample is None:
                 raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
             if not getattr(sample, '_enable_continous_work', False):
-                raise ValueError(
-                    f'{type(sampler).__name__}.sample must be declared with '
-                    'enable_continous_work=True: this rollout samples one trajectory per '
-                    'call, and a slice_dp sampler raises when a worker gets nothing from '
-                    'a batch of one.')
+                raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
+                                 'enable_continous_work=True: this rollout samples one trajectory per '
+                                 'call, and a slice_dp sampler raises when a worker gets nothing from '
+                                 'a batch of one.')
         if adapter_path and use_base_model:
             raise ValueError('adapter_path and use_base_model=True ask for opposite '
                              'weights; the sampler would drop the adapter silently.')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
                              f'{max_trajectory_tokens}')
-        self._init_common(
-            max_turns=max_turns,
-            sampling_params=sampling_params,
-            concurrency=concurrency,
-            tracer=tracer)
+        self._init_common(max_turns=max_turns, sampling_params=sampling_params, concurrency=concurrency, tracer=tracer)
         self.sampler = sampler
         self.template = template
         if isinstance(api, APISampler):
@@ -226,8 +219,7 @@ class MultiTurnRollout(Rollout):
                 raise ValueError('MultiTurnRollout and APISampler must share the same template instance')
             self.api = api
         elif api is not None:
-            self.api = APISampler(
-                api, template, appended_as=api_appended_as, api_kwargs=api_kwargs)
+            self.api = APISampler(api, template, appended_as=api_appended_as, api_kwargs=api_kwargs)
         else:
             if api_kwargs:
                 raise ValueError('api_kwargs requires an API backend')
@@ -340,8 +332,7 @@ class MultiTurnRollout(Rollout):
             'sampling_params': sampling_params,
             'adapter_kwargs': adapter_kwargs,
             'response_callback': response_callback,
-            'tool_managers': self._broadcast(
-                kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
+            'tool_managers': self._broadcast(kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
             'followup_fn': kwargs.get('followup_fn', self.followup_fn),
             'harnesses': self._resolve_harness(kwargs.get('harness', self.harness), n),
         }
@@ -366,8 +357,7 @@ class MultiTurnRollout(Rollout):
                 return self._run_episode(trajectory, index, ctx, leased)
         return self._run_episode(trajectory, index, ctx, harness)
 
-    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any],
-                     harness=None) -> Trajectory:
+    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any], harness=None) -> Trajectory:
         tool_manager: ToolManager = ctx['tool_managers'][index]
         followup_fn = ctx['followup_fn']
         adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
@@ -376,8 +366,7 @@ class MultiTurnRollout(Rollout):
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
         # that decides when to add one. See ``ledger.py``.
-        ledger = TurnLedger(self.template, label=f'trajectory {index}',
-                            max_tokens=self.max_trajectory_tokens)
+        ledger = TurnLedger(self.template, label=f'trajectory {index}', max_tokens=self.max_trajectory_tokens)
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         # A harness may shape the opening (system prompt, tool schema) before
@@ -428,8 +417,7 @@ class MultiTurnRollout(Rollout):
             if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
             followup = followup_fn(
-                ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason,
-                             truncated=truncated), followups)
+                ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated), followups)
             if followup is None:
                 return False
             text, next_params = self._unpack_followup(followup)
@@ -578,8 +566,7 @@ class MultiTurnRollout(Rollout):
                     stuck_turns = 0
 
             if harness is not None:
-                tool_messages = self._harness_tool_messages(
-                    harness, ledger.input_feature, observations, tool_calls)
+                tool_messages = self._harness_tool_messages(harness, ledger.input_feature, observations, tool_calls)
             else:
                 tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
@@ -636,8 +623,7 @@ class MultiTurnRollout(Rollout):
         if not msgs:
             return
         prior = msgs[:-1]
-        shaped = harness.after_generate(
-            {'messages': list(prior), 'tools': pif.get('tools')}, decoded, tool_calls)
+        shaped = harness.after_generate({'messages': list(prior), 'tools': pif.get('tools')}, decoded, tool_calls)
         shaped_msgs = (shaped or {}).get('messages') or []
         if len(shaped_msgs) > len(prior):
             pif['messages'][-1] = shaped_msgs[len(prior)]
@@ -649,8 +635,7 @@ class MultiTurnRollout(Rollout):
         Falls back to the default framing when the harness appended nothing.
         """
         prior = list(pif.get('messages') or [])
-        shaped = harness.after_tools(
-            {'messages': list(prior), 'tools': pif.get('tools')}, observations, tool_calls)
+        shaped = harness.after_tools({'messages': list(prior), 'tools': pif.get('tools')}, observations, tool_calls)
         shaped_msgs = (shaped or {}).get('messages') or []
         tail = shaped_msgs[len(prior):]
         return tail or _default_tool_messages(tool_calls, observations)

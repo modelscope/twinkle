@@ -57,8 +57,7 @@ sys.stdout.write('\\n'.join(lines).strip())
 '''
 
 
-def list_workspace(env: Any, *, max_files: int, per_file: int, budget: int,
-                   skip: Sequence[str]) -> Tuple[str, str]:
+def list_workspace(env: Any, *, max_files: int, per_file: int, budget: int, skip: Sequence[str]) -> Tuple[str, str]:
     """The environment's workspace as ``(listing, error)``; both empty when it has none.
 
     Takes anything with a ``workspace`` and a ``run_script``, so it is as usable

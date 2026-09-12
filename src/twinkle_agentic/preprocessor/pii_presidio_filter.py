@@ -94,6 +94,7 @@ def _build_stub_nlp_engine(languages: Sequence[str]):
     from presidio_analyzer.nlp_engine import NlpArtifacts, NlpEngine
 
     class _StubNlp(NlpEngine):
+
         def __init__(self, langs):
             self._langs = list(langs)
 
@@ -104,8 +105,8 @@ def _build_stub_nlp_engine(languages: Sequence[str]):
             return True
 
         def process_text(self, text, language):
-            return NlpArtifacts(entities=[], tokens=[], tokens_indices=[],
-                                lemmas=[], nlp_engine=self, language=language)
+            return NlpArtifacts(
+                entities=[], tokens=[], tokens_indices=[], lemmas=[], nlp_engine=self, language=language)
 
         def process_batch(self, texts, language, **kwargs):
             for t in texts:
@@ -297,8 +298,7 @@ class PIIPresidioFilter(Preprocessor):
         if not _faker_available():
             if self._default_strategy is Strategy.REPLACE:
                 self._default_strategy = Strategy.MASK
-            self._strategy = {k: (Strategy.MASK if v is Strategy.REPLACE else v)
-                              for k, v in self._strategy.items()}
+            self._strategy = {k: (Strategy.MASK if v is Strategy.REPLACE else v) for k, v in self._strategy.items()}
 
         self._score_threshold = score_threshold
         self._roles = set(roles)

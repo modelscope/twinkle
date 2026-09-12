@@ -28,7 +28,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template.base import Template
-
 from .base import STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
 from .endpoint import PolicyEndpoint, Round
 from .ledger import LedgerBook
