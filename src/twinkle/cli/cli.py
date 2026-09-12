@@ -216,6 +216,106 @@ class RLArgs:
 
 
 @dataclass
+class ChallengerArgs:
+    """Self-improvement loop: the challenger proposes tasks, the policy trains on them."""
+    # One env per concurrent job. The challenger builds a task in one workspace and
+    # the solver is graded in the same one, so this bounds both.
+    num_envs: int = 8
+    workspace_root: str = 'output/rsi/workspaces'
+    # A template name switches every env to a sandbox, one microVM per slot, and
+    # workspace_root is then ignored -- the workspace lives inside the VM. Empty
+    # keeps the envs local, which has no isolation: fine for a check that is a few
+    # asserts, not for training a policy to run commands it wrote itself.
+    sandbox_template: str = ''
+    sandbox_api_url: str = ''
+    # Idle seconds before the host may pause a sandbox. Wider than max_turns of
+    # generation plus the difficulty pass, or a slot is reclaimed mid-episode.
+    sandbox_timeout: int = 900
+    # An agent framework's own config, passed to that framework's CLI. Given one,
+    # a solver attempt is that program run to completion on the task: it owns its
+    # loop, its tools and its context, and the policy is trained on the requests it
+    # made -- so training sees the agent deployment runs rather than a loop written
+    # here. Empty trains against the env's built-in tools and this repo's own
+    # prompt. Sandboxed runs only: the agent needs a machine of its own.
+    agent_config: str = ''
+    # How that agent config is run, and both stay selectable:
+    #   'external' -- the agent is its own program inside the sandbox and calls
+    #     back to the policy endpoint below (needs a reachable agent_endpoint_host).
+    #   'harness'  -- the agent's message/tool lifecycle drives twinkle's local
+    #     rollout loop instead, generating through the local sampler; no endpoint
+    #     is bound and only a forward tunnel to the sandbox tools is needed.
+    agent_runner: str = 'external'
+    # Where the policy endpoint the agent calls should bind. The agent runs inside
+    # the sandbox, so loopback is the sandbox itself and the requests never arrive:
+    # this has to be an address of the training host that the sandbox can route to.
+    # Empty is loopback, which is right only when the agent runs on this machine.
+    agent_endpoint_host: str = ''
+    agent_endpoint_port: int = 0
+    # Seconds before an agent process is killed. The only bound on an attempt --
+    # the agent decides when it is done, so max_turns does not apply to it.
+    agent_timeout: int = 1800
+    save_dir: str = 'output/rsi/proposals'
+    save_failed_rollouts: bool = True
+    max_turns: int = 8
+    max_empty_rounds: int = 0
+    # Rollouts spent proposing, then rollouts spent measuring how hard the proposal is.
+    num_challenger_rollouts: int = 8
+    num_solver_rollouts: int = 8
+    # The solving side's share of a batch. The rest goes to the proposing side, both
+    # rounded to whole groups, so every batch of a run has the same composition.
+    solver_ratio: float = 0.5
+    # Pass counts, not ratios: a task no attempt solves is unverifiable, a task every
+    # attempt solves teaches nothing. Both bounds must be <= num_solver_rollouts.
+    pass_band: list[int] = field(default_factory=lambda: [1, 7])
+    # Reward shaping over the measured pass rate: a bell centred on the target.
+    pass_rate_target: float = 0.2
+    pass_rate_width: float = 0.3
+    # The check script the proposal is verified with, and how many rewrites it gets
+    # when its own script fails on its own workspace.
+    check_language: str = 'python'
+    check_retries: int = 1
+    problem_max_chars: int = 8192
+    # Stop generation at the end of a tool call, so a reply carries exactly one.
+    # The stop string stays in the output, or every turn would train on an
+    # unclosed block.
+    one_call_per_reply: bool = True
+    # The API backend for the appended check-script and statement turns; an empty
+    # model keeps the whole loop local and those turns on the policy being trained.
+    api_model: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_MODEL', ''))
+    api_base: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_BASE_URL', ''))
+    api_key: str = field(default_factory=lambda: os.environ.get('LLM_BACKUP_API_KEY', ''))
+    # Requests in flight, capped at the client rather than by the caller's threads.
+    api_concurrency: int = 32
+    # Reasoning tokens an API turn may spend, sent as extra_body when > 0. Not zero
+    # by default: a reasoning model left uncapped spends thousands of them on a
+    # reply of a few lines, and the calls then time out under concurrency.
+    api_thinking_budget: int = 4096
+    # Keyword directions the challenger draws topics from.
+    keyword_path: str = 'output/rsi/keywords.jsonl'
+    num_keywords: int = 64
+    keywords_group_size: int = 3
+    keyword_recycle: bool = False
+    # Seeds are optional inspiration for the challenger, not training data.
+    seed_dataset: str = ''
+    seed_subset: str = ''
+    seed_split: str = 'train'
+    seed_limit: int = 512
+
+
+@dataclass
+class ReportArgs:
+    """Where metrics go. Flat here, nested by get_report_args() for create_metrics_reporter."""
+    # An empty project keeps the backend off: there is no useful default dashboard
+    # to upload a run to. An empty experiment falls back to the run id.
+    swanlab_project: str = ''
+    swanlab_experiment: str = ''
+    swanlab_mode: Literal['local', 'cloud', 'offline', 'disabled'] = 'local'
+    swanlab_log_dir: str = 'outputs/swanlab'
+    # The jsonl sink, off until a path is given.
+    metrics_path: str | None = None
+
+
+@dataclass
 class CheckpointArgs:
     save_optimizer: bool = True
     merge_and_sync: bool = True
@@ -407,6 +507,8 @@ class Args:
     infra: InfraArgs = field(default_factory=InfraArgs)
     server: ServerArgs = field(default_factory=ServerArgs)
     rl: RLArgs = field(default_factory=RLArgs)
+    challenger: ChallengerArgs = field(default_factory=ChallengerArgs)
+    report: ReportArgs = field(default_factory=ReportArgs)
     checkpoint: CheckpointArgs = field(default_factory=CheckpointArgs)
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -461,6 +563,28 @@ class Args:
 
     def get_rl_args(self) -> dict[str, Any]:
         return self._to_dict(self.rl)
+
+    def get_challenger_args(self) -> dict[str, Any]:
+        return self._to_dict(self.challenger)
+
+    def get_report_args(self) -> dict[str, Any]:
+        swanlab: dict[str, Any] = {
+            'enabled': bool(self.report.swanlab_project),
+            'project': self.report.swanlab_project,
+            'mode': self.report.swanlab_mode,
+            'log_dir': self.report.swanlab_log_dir,
+        }
+        # Absent, not None: the reporter reads this with a run-id default, which a
+        # present-but-empty key would shadow.
+        if self.report.swanlab_experiment:
+            swanlab['name'] = self.report.swanlab_experiment
+        return {
+            'jsonl': {
+                'enabled': bool(self.report.metrics_path),
+                'path': self.report.metrics_path,
+            },
+            'swanlab': swanlab,
+        }
 
     def get_checkpoint_args(self) -> dict[str, Any]:
         return self._to_dict(self.checkpoint)

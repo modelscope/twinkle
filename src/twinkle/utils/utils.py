@@ -1,10 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
+import concurrent.futures
 import fnmatch
 import glob
 import inspect
 import os
 import shutil
 from functools import lru_cache
+from typing import Any, Callable
 
 
 def deep_getattr(obj, attr: str, default=None):
@@ -131,3 +134,21 @@ def get_runtime_meta() -> str:
         f'- **Rank**: `{rank}/{world_size}` (local_rank=`{local_rank}`)',
     ]
     return '\n'.join(lines)
+
+
+def run_sync(async_fn: Callable[..., Any], *args, **kwargs):
+    """Run an async function from sync code.
+
+    ``async_fn`` must be a *callable that returns a coroutine*, not an
+    already-created coroutine (those are bound to the creating loop).
+    """
+
+    def _go():
+        return asyncio.run(async_fn(*args, **kwargs))
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _go()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_go).result()

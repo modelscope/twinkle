@@ -545,8 +545,8 @@ sh run_openenv.sh --batch-size 8 --num-generations 16 --max-steps 500
 |---|---|
 | `/dev/kvm is not accessible` | 运行账户不在 kvm 组，或宿主机无 KVM。执行 `sudo server --setup-host --runtime-user aenv --runtime-group aenv` 后重启 |
 | `ublk_drv is not loaded` | 执行 `sudo modprobe ublk_drv`；内核 < 6.8 需升级 |
-| `ImportError: AgentEnv requires the E2B SDK` | `pip install e2b` |
-| `Invalid API key format: expected "e2b_"` | e2b SDK 的客户端本地校验。`AgentEnv` 已默认设置 `E2B_VALIDATE_API_KEY=false`，仍报错说明被显式覆盖为 `true` |
+| `ImportError: AgentEnv requires the E2B SDK` | `pip install 'e2b>=2.7'` |
+| `Invalid API key format: expected "e2b_"` | 旧版 e2b SDK 在发请求前做的客户端本地校验。升级到 `e2b>=2.7`：该校验已移除，`AgentEnv` 传入的 `validate_api_key=False` 会被忽略 |
 | `400: template xxx not found` | 模板未创建，或 build 未达到 ready。用 `aenv template list` 查看状态 |
 | `alias 'xxx' already points to ...` | 别名不可改绑，需先执行 `aenv template delete xxx` |
 | 沙箱内 `pip install` 失败 | 出口网络被策略拦截，或当前网络不可达 PyPI；改为在模板里预装 |

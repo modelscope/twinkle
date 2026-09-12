@@ -51,7 +51,7 @@ htmlcov/
 .tox/
 .coverage
 .coverage.*
-.cache
+.cache*
 nosetests.xml
 coverage.xml
 *.cover
@@ -61,7 +61,7 @@ coverage.xml
 # Translations
 *.mo
 *.pot
-
+deepmath_103k
 # Django stuff:
 *.log
 local_settings.py

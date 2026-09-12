@@ -402,6 +402,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
+            # Not a model argument; restored below so the loss can read it.
+            completion_mask = batch.pop('completion_mask', None)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
@@ -410,6 +412,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**batch)
 
             batch['labels'] = labels
+            if completion_mask is not None:
+                batch['completion_mask'] = completion_mask
             logps = None
             unpacked_logits = None
             entropies = None
@@ -440,6 +444,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         if entropies is not None:
                             entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
                     batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
+                    if completion_mask is not None:
+                        # Same index space as labels, so it needs the same CP reassembly.
+                        batch['completion_mask'] = processor.postprocess_tensor_cp(
+                            completion_mask, cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
@@ -1624,7 +1632,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 return base_layer_name
             return name
 
-        is_peft_format = (adapter_name != _default_adapter_name)
         if base_sync_done and adapter_name:
             # The first base model synchronization finished, and is lora training
             if merge_and_sync:
@@ -1675,7 +1682,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 _print_weight_example(names)
 
             def weight_generator():
-                if is_peft_format and (not merge_and_sync):
+                # Add the ``.base_layer.`` suffix whenever the sampler runs with
+                # ``enable_lora`` (``merge_and_sync=False``).  ``_add_base_layer_suffix``
+                # self-guards via ``model_keys``, so it only renames params vLLM
+                # actually exposes as ``*WithLoRA`` and is a no-op for full-param.
+                if not merge_and_sync:
                     yield from _raw_weights(True)
                 else:
                     yield from _raw_weights(False)

@@ -34,11 +34,12 @@ def test_fla_does_not_flip_flag_when_fla_missing(monkeypatch):
     spec = importlib.util.spec_from_loader('torch_npu', loader=None)
     fake_npu = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, 'torch_npu', fake_npu)
-    # Force the fla-backed operator import to fail. twinkle.kernel.ops.fla.npu
-    # imports ``fla.modules.convolution`` and ``fla.ops.gated_delta_rule``
-    # lazily inside ``apply_qwen3_5_fla``; stubbing the top-level ``fla`` package
-    # as None makes both imports raise ImportError.
-    monkeypatch.setitem(sys.modules, 'fla', None)
+    # Force the fla-backed operator import to fail. Stubbing the top-level ``fla``
+    # package is not enough on a host where fla is installed: once a submodule is
+    # in sys.modules, ``from fla.x.y import z`` resolves straight from the cache
+    # without ever touching the parent, so the submodules are stubbed as None too.
+    for fla_mod in ('fla', 'fla.modules', 'fla.modules.convolution', 'fla.ops', 'fla.ops.gated_delta_rule'):
+        monkeypatch.setitem(sys.modules, fla_mod, None)
 
     original_flag = tui.is_flash_linear_attention_available
     try:

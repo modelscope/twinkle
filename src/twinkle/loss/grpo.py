@@ -73,8 +73,8 @@ class GRPOLoss(Loss):
         """
         import torch
         log_ratio = per_token_logps - per_token_old_logps
-        # Clamp for numerical stability
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+        # Clamp for numerical stability (±5 bounds ratio to [exp(-5), exp(5)] ≈ [0.007, 148])
+        log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
         return log_ratio
 
     def _compute_per_token_loss(
@@ -125,6 +125,17 @@ class GRPOLoss(Loss):
         # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
+
+    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
+        """Token denominator reported in ``LossOutput.num_tokens``.
+
+        0 (default) => framework uses the PER-TOKEN-MEAN accumulation path, where each
+        micro/dp group is equal-weighted. Subclasses that want a strict GLOBAL token-mean
+        (the SUM-loss path in transformers.py / megatron.py) return ``Σmask`` instead, so
+        the accumulated gradient is divided by the global token count and the result is
+        invariant to how the batch is split into micro/dp groups.
+        """
+        return 0
 
     def _pad_and_align_to_batch(
         self,
@@ -202,6 +213,39 @@ class GRPOLoss(Loss):
 
         return result
 
+    def _resolve_loss_mask(self, inputs: Dict, labels: 'torch.Tensor') -> 'torch.Tensor':
+        """Positions this loss may score: trainable *and* log-prob-bearing.
+
+        ``labels`` alone answers "should this token be scored", which is all SFT
+        needs. A policy-gradient loss also needs a sampling log-prob per token to
+        form an importance ratio, and a turn produced outside the sampled policy
+        (an API, a human, a replayed demonstration) has none. Such turns carry
+        ``completion_mask == 0``: excluded here, yet still trainable for SFT.
+
+        A feature without ``completion_mask`` predates the field, and there every
+        trainable token was the policy's own, so the mask degenerates to
+        ``labels != ignore_index`` and old trajectories train exactly as before.
+        """
+        import torch
+        trainable = (labels != self.ignore_index).bool()
+        completion_mask = inputs.get('completion_mask')
+        if completion_mask is None:
+            return trainable
+        if not torch.is_tensor(completion_mask):
+            completion_mask = torch.as_tensor(completion_mask)
+        completion_mask = completion_mask.to(trainable.device)
+        if completion_mask.dim() == 1:
+            completion_mask = completion_mask.unsqueeze(0)
+        if completion_mask.shape != trainable.shape:
+            raise ValueError(f'completion_mask shape {tuple(completion_mask.shape)} does not match labels shape '
+                             f'{tuple(trainable.shape)}. A misaligned mask would apply importance ratios to '
+                             'the wrong tokens, so it is refused rather than broadcast.')
+        loss_mask = trainable & completion_mask.bool()
+        if self.enable_sampling_replay and not bool((loss_mask == trainable).all()):
+            raise ValueError('sampling replay does not support turns generated outside the sampled policy: '
+                             'they are trainable but have no sampling mask to replay against.')
+        return loss_mask
+
     def __call__(
         self,
         inputs: Dict,
@@ -244,7 +288,7 @@ class GRPOLoss(Loss):
         logps = outputs.get('logps')
         if self.enable_sampling_replay and logps is None:
             raise RuntimeError('sampling replay logps must be computed by the model forward')
-        loss_mask = (labels != self.ignore_index).bool()
+        loss_mask = self._resolve_loss_mask(inputs, labels)
         if logps is None:
             logits = outputs.get('logits')
             if logits.shape[1] != labels.shape[1]:
@@ -315,7 +359,7 @@ class GRPOLoss(Loss):
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
-        return LossOutput(loss=loss, num_tokens=0)
+        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
 
 class PPOLoss(GRPOLoss):
@@ -367,7 +411,7 @@ class GSPOLoss(GRPOLoss):
         """Sequence-level importance sampling: use mean log ratio."""
         import torch
         log_ratio = per_token_logps - per_token_old_logps
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+        log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
         seq_level_log_weights = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
         return seq_level_log_weights
 
@@ -456,20 +500,58 @@ class BNPOLoss(GRPOLoss):
     BNPO (Batch-Normalized Policy Optimization) Loss.
 
     Normalizes by total completion tokens across batch.
+
+    ``token_mean_scope``:
+      'micro' (default, matches verl/SEAM): per-(micro÷dp)-group token-mean,
+        equal-weighted across groups (``num_tokens=0`` => PER-TOKEN-MEAN accumulation).
+        This is what verl actually does -- see verl/workers/actor/dp_actor.py: pg_loss =
+        agg_loss(..., 'token-mean') is ``masked_mean`` computed WITHIN each micro-batch,
+        then ``loss = policy_loss * (1/gradient_accumulation)`` before ``backward()``.
+        So verl's effective gradient is the equal-weighted mean of per-micro token-means,
+        NOT a global token-mean.
+      'global': return the UN-normalized token sum and report ``num_tokens=Σmask``, so the
+        framework's SUM-loss path divides the accumulated gradient by the GLOBAL token
+        count => strict token-mean, invariant to micro/dp splitting.
+
+    Why 'global' is NOT the default, despite being the "textbook" token-mean
+    (measured on skill2lora E13, 2026-08-01):
+      Group-relative advantages cancel exactly per group (mean A = 0), but the
+      TOKEN-weighted mean does not: it equals -cov(len, A)/mean(len). With
+      corr(len, A) = -0.42 (long skill-gen responses hit the 8192 budget, lose their
+      closing tag, and score 0), 'global' yields a per-token pg_loss of +0.031 versus
+      verl/SEAM's +3.2e-4 -- a ~100x coherent "emit fewer tokens" gradient. Under
+      'global', E13 collapsed its <think> from 3977 to 1942 tokens in 25 updates
+      (SEAM: -17% in 76 updates) and overshot the optimum: corr(len, correct) flipped
+      from -0.42 to +0.23 while reward fell 0.816 -> 0.734. 'micro' localizes the
+      normalization, so the length coupling largely cancels (it degenerates to
+      sequence-mean as the micro size approaches 1).
     """
 
+    def __init__(self, *args, token_mean_scope: str = 'micro', **kwargs):
+        super().__init__(*args, **kwargs)
+        assert token_mean_scope in ('global', 'micro'), \
+            f'token_mean_scope must be global|micro, got {token_mean_scope!r}'
+        self.token_mean_scope = token_mean_scope
+        # 'global' 返回的是 token 和（梯度在下游按 num_tokens=Σmask 归一）。必须同步告诉展示层
+        # 这是 sum-reduction，否则 LossMetric（metric/loss.py）不会除以 num_tokens，会把每个 micro 的
+        # token 和当均值直接平均，展示出一个被 token 数放大的巨大 loss（梯度不受影响，纯展示失真）。
+        self.reduction = 'sum' if token_mean_scope == 'global' else 'mean'
+
     def micro_batch_scale(self, inputs, indices):
-        token_counts = []
-        for model_input in inputs:
-            labels = model_input['labels']
-            if hasattr(labels, 'ne'):
-                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
-            else:
-                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
-        total_tokens = sum(token_counts)
-        if total_tokens == 0:
-            return 0.0
-        return sum(token_counts[index] for index in indices) / total_tokens
+        """The weight one micro-batch carries, which has to follow ``token_mean_scope``.
+
+        'global' already returns the token SUM and reports ``num_tokens=Σmask``, so the
+        global division happens downstream; scaling here as well would divide twice. Same
+        contract as ``CrossEntropyLoss(reduction='sum')``.
+
+        'micro' *is* the equal-weighted mean of per-micro token-means, so the inherited
+        sample fraction is its weight. A token fraction would make the micro losses sum to
+        the global token-mean and erase the distinction this scope exists to make -- which
+        is the +3.2e-4 vs +0.031 per-token pg_loss measured above.
+        """
+        if self.token_mean_scope == 'global':
+            return 1.0
+        return super().micro_batch_scale(inputs, indices)
 
     def _aggregate_loss(
         self,
@@ -477,8 +559,18 @@ class BNPOLoss(GRPOLoss):
         loss_mask: 'torch.Tensor',
         **kwargs,
     ) -> 'torch.Tensor':
-        """Sum over all tokens, divide by total token count."""
-        return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+        """global: return the token SUM (the global division is done downstream via
+        num_tokens=Σmask). micro (legacy): local token-mean, later equal-weighted across
+        micro/dp groups."""
+        summed = (per_token_loss * loss_mask).sum()
+        if self.token_mean_scope == 'global':
+            return summed
+        return summed / loss_mask.sum().clamp(min=1.0)
+
+    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
+        if self.token_mean_scope == 'global':
+            return loss_mask.sum().clamp(min=1.0)
+        return 0
 
 
 class DRGRPOLoss(GRPOLoss):

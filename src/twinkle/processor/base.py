@@ -608,9 +608,10 @@ class InputProcessor:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
-        Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
-        from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
-        Keys that are ``None`` are silently skipped.
+        Unpacks ``labels``, ``completion_mask`` and any present output keys
+        (``logps``, ``logits``) from ``[1, total_tokens, ...]`` to
+        ``[num_sequences, max_seq_len, ...]``. Keys that are ``None`` are silently
+        skipped.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op.
@@ -627,23 +628,29 @@ class InputProcessor:
 
         from copy import copy
 
-        # Collect output keys to unpack: (key, pad_value)
-        output_keys = []
-        for key, pad_val in [('logps', 0), ('values', 0), ('entropies', 0), ('logits', 0)]:
-            if outputs and outputs.get(key) is not None:
-                output_keys.append((key, pad_val))
+        # (key, tensor, pad_value) for everything that must come back as
+        # [num_sequences, max_seq_len]. completion_mask shares the labels' index
+        # space, so leaving it packed would hand the loss two differently shaped
+        # views of the same sequence.
+        input_specs = [('labels', labels, -100)]
+        if inputs.get('completion_mask') is not None:
+            input_specs.append(('completion_mask', inputs['completion_mask'], self.padding_map['completion_mask']))
+        output_specs = [(key, outputs[key], 0) for key in ('logps', 'values', 'entropies', 'logits')
+                        if outputs and outputs.get(key) is not None]
 
-        all_tensors = [labels] + [outputs[k] for k, _ in output_keys]
-        all_pads = [-100] + [p for _, p in output_keys]
-        unpacked = self._unpack_by_position_ids(position_ids, *all_tensors, padding_values=all_pads)
+        specs = input_specs + output_specs
+        unpacked = iter(
+            self._unpack_by_position_ids(
+                position_ids, *[tensor for _, tensor, _ in specs], padding_values=[pad for _, _, pad in specs]))
 
         inputs = copy(inputs)
-        inputs['labels'] = unpacked[0]
+        for key, _, _ in input_specs:
+            inputs[key] = next(unpacked)
 
-        if output_keys:
+        if output_specs:
             outputs = copy(outputs)
-            for i, (key, _) in enumerate(output_keys):
-                outputs[key] = unpacked[i + 1]
+            for key, _, _ in output_specs:
+                outputs[key] = next(unpacked)
 
         return inputs, outputs
 
@@ -710,10 +717,18 @@ class InputProcessor:
                 # accelerator, and a CPU fill would break the cat inside the collate below.
                 reference = input_ids if isinstance(input_ids, torch.Tensor) else None
                 length = reference.shape[-1] if reference is not None else len(input_ids)
-                feat[key] = torch.full((length, ),
-                                       pad_value,
-                                       dtype=torch.long,
-                                       device=reference.device if reference is not None else None)
+                device = reference.device if reference is not None else None
+                # completion_mask is the one field with a derivation rule: every other layer
+                # (template, grpo, metric, ledger) reads "absent" as "whatever is scored is the
+                # policy's own completion", so a zero fill would silently drop the row from the
+                # loss instead of aligning it with the rest of the batch.
+                labels = feat.get('labels') if key == 'completion_mask' else None
+                if labels is not None:
+                    labels = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(np.asarray(labels))
+                    if labels.shape[-1] == length:
+                        feat[key] = (labels.reshape(-1) != -100).to(dtype=torch.long, device=device)
+                        continue
+                feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
         # Work on local copies so squeezing doesn't mutate the caller's original samples.

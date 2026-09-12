@@ -22,6 +22,23 @@ class ToolCallParser(ABC):
     def clean(self, text: str) -> str:
         """Strip parser-specific markup; return plain content text."""
 
+    def parse_errors(self, text: str) -> List[str]:
+        """Why markup this parser recognised produced no call.
+
+        ``detect`` saying yes while ``parse`` returns nothing means the model did
+        try to call a tool and the markup did not survive parsing. Without this
+        the caller cannot tell that apart from a reply that called nothing, so it
+        ends the episode and the model is never told its call was dropped.
+        Measured on one challenger run: 6 of 59 episodes ended that way, each
+        with a well-formed ``<tool_call>`` block whose JSON carried a Python-style
+        ``\\'`` escape or a raw newline.
+
+        One string per block that failed, carrying the parser's own reason (for a
+        JSON block, the ``json.JSONDecodeError`` text). Default empty: a parser
+        whose ``parse`` is the same regex as its ``detect`` cannot fail this way.
+        """
+        return []
+
     def extract_tool_result(self, text: str) -> Optional[str]:
         """If ``text`` is a tool-result message of this protocol, return the
         body with the protocol-specific prefix stripped; otherwise return ``None``.

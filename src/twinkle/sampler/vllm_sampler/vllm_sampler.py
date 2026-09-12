@@ -36,7 +36,10 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-@remote_class()
+_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+
+
+@remote_class(max_concurrency=_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
@@ -278,7 +281,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -493,49 +496,77 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
-    def load_full_weights_from_path(self, path: str) -> int:
+    def load_full_weights_from_path(self, path: Optional[str] = None) -> int:
         """Load a full (non-LoRA) HF checkpoint into the engine's base model.
 
-        Used by full-parameter training: the saved checkpoint is a plain HF
-        directory (no ``adapter_config.json``), so it replaces the sampler's
-        base weights instead of being loaded as a LoRA adapter. Idempotent:
-        repeated calls with the same resolved path are skipped.
+        Unlike :meth:`receive_weights`, this does **not** involve the training model:
+        weights are read from disk and streamed straight into vLLM. That is what lets
+        a sampler be restored to a known checkpoint without a trainer round-trip --
+        no ``save``/``load`` on the training model, so training weights and optimizer
+        state are never touched. Full-parameter training uses the same entry point:
+        its checkpoint is a plain HF directory (no ``adapter_config.json``), so it
+        replaces the base weights instead of loading as a LoRA adapter.
+
+        Weights are yielded **lazily** one tensor at a time (never materialising a full
+        state dict) because ``VLLMEngine.update_weights`` accepts a generator and packs
+        tensors into fixed-size transfer buckets itself. Tensors stay on CPU, so the
+        engine takes its shared-memory path rather than CUDA IPC.
+
+        Names are passed through untouched: safetensors files already store canonical
+        HF names, which is exactly what the worker's ``model.load_weights()`` expects
+        (it does the q/k/v -> qkv and gate/up -> gate_up stacking internally).
+
+        Idempotent: repeated calls with the same resolved path are skipped.
+
+        Args:
+            path: Local checkpoint dir or a hub model id. Defaults to the ``model_id``
+                the sampler was constructed with, i.e. the original pretrained weights.
 
         Returns:
-            1 if weights were (re)loaded, 0 if the path was already loaded.
+            1 if weights were (re)loaded, 0 if that path was already loaded.
         """
         import glob
         import json
-        import os
+        from safetensors import safe_open
 
-        resolved = HubOperation.download_model(model_id_or_path=path)
+        path = path or self.model_id
+        resolved = path if os.path.exists(path) else HubOperation.download_model(path)
         if getattr(self, '_loaded_full_weights_path', None) == resolved:
             return 0
 
-        from safetensors import safe_open
+        # Resolve the shard list eagerly so a bad path fails here rather than
+        # part-way through streaming tensors into a live engine.
+        index_path = os.path.join(resolved, 'model.safetensors.index.json')
+        if os.path.exists(index_path):
+            with open(index_path, encoding='utf-8') as f:
+                weight_map = json.load(f)['weight_map']
+            shards = [os.path.join(resolved, s) for s in sorted(set(weight_map.values()))]
+        else:
+            shards = sorted(glob.glob(os.path.join(resolved, '*.safetensors')))
+        if not shards:
+            raise FileNotFoundError(f'No .safetensors weights found under {resolved}')
 
-        def _weight_iter():
-            index = os.path.join(resolved, 'model.safetensors.index.json')
-            if os.path.exists(index):
-                with open(index) as f:
-                    shards = sorted(set(json.load(f)['weight_map'].values()))
-                files = [os.path.join(resolved, s) for s in shards]
-            else:
-                files = sorted(glob.glob(os.path.join(resolved, '*.safetensors')))
-            for fp in files:
-                with safe_open(fp, framework='pt', device='cpu') as f:
-                    for key in f.keys():
-                        yield key, f.get_tensor(key)
+        def _iter_weights():
+            # safe_open + get_tensor reads one tensor at a time (mmap-backed), so peak
+            # host memory is a single tensor rather than the whole shard.
+            for shard in shards:
+                with safe_open(shard, framework='pt', device='cpu') as f:
+                    for name in f.keys():
+                        yield name, f.get_tensor(name)
 
         async def _load():
-            await self.engine.update_weights(_weight_iter(), peft_config=None, base_sync_done=False)
-            # A full base-model swap invalidates any previously synced LoRA.
+            await self.engine.update_weights(_iter_weights(), peft_config=None, base_sync_done=False)
+            # A base-model swap invalidates any previously synced LoRA adapter,
+            # mirroring the `not base_sync_done` branch of receive_weights().
             self.engine.invalidate_synced_lora()
 
         logger.info(f'Loading full-parameter weights into sampler base model from {resolved}')
         self._run_in_loop(_load())
         self._loaded_full_weights_path = resolved
+        # Prefixes cached under the previous weights would decode against a model
+        # that no longer exists; drop them before the next sample().
         self.reset_prefix_cache()
+        logger.info(f'Reloaded base weights from {resolved} ({len(shards)} shard(s))')
         return 1
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)

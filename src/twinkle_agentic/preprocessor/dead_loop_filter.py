@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import cjk_ratio, is_agent_row, msg_content_text
+from twinkle_agentic.utils.message_utils import is_agent_row, msg_content_text
+from twinkle_agentic.utils.text_utils import cjk_ratio
 
 # ── Hesitation-marker regexes ─────────────────────────────────────────────────
 #
@@ -155,6 +156,7 @@ class DeadLoopFilter(Preprocessor):
         think_hesitation_density_threshold: float = 15.0,
         think_cascade_threshold: int = 20,
         think_repetition_threshold: float = 0.65,
+        agent_min_stuck_turns: int = 2,
     ) -> None:
         super().__init__()
         # Two threshold profiles: laxer inside <think> reasoning (free to ramble),
@@ -175,6 +177,7 @@ class DeadLoopFilter(Preprocessor):
             ngram_size=ngram_size,
             ngram_min_words=ngram_min_words,
         )
+        self._agent_min_stuck_turns = max(1, int(agent_min_stuck_turns))
 
     def _is_stuck(self, text: str, reasoning: str = '') -> bool:
         think_part, response_part = _split_think(text)
@@ -189,18 +192,28 @@ class DeadLoopFilter(Preprocessor):
         dropped: List[Dict[str, Any]] = []
         for row in rows:
             messages = row.get('messages') or []
-            if is_agent_row(messages):
-                out.append(row)
-                continue
+            agent = is_agent_row(messages)
             asst_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'assistant']
+            if agent:
+                # For agent rows, tool-call loops are caught by the deterministic
+                # per-round check_no_repeated_calls in TrajectoryScorer (D7) — not
+                # here — to avoid duplicating loop logic. But agents ALSO emit
+                # degenerate free-text; run the stuck-text detector on assistant
+                # turns that carry real text (skip pure tool-call turns whose empty
+                # content would misfire the detector), instead of skipping the row.
+                asst_msgs = [
+                    m for m in asst_msgs
+                    if msg_content_text(m).strip() or (m.get('reasoning_content') or m.get('thinking') or '').strip()
+                ]
             if not asst_msgs:
                 out.append(row)
                 continue
-            if any(
-                    self._is_stuck(
-                        msg_content_text(m).strip(),
-                        (m.get('reasoning_content') or m.get('thinking') or '').strip(),
-                    ) for m in asst_msgs):
+            stuck_turns = sum(1 for m in asst_msgs if self._is_stuck(
+                msg_content_text(m).strip(),
+                (m.get('reasoning_content') or m.get('thinking') or '').strip(),
+            ))
+            min_stuck = self._agent_min_stuck_turns if agent else 1
+            if stuck_turns >= min_stuck:
                 dropped.append(dict(row, drop_reason='dead_loop'))
             else:
                 out.append(row)
