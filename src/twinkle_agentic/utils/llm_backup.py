@@ -171,13 +171,13 @@ def _build_key(func_name: str, args: tuple, kwargs: dict, param_names: List[str]
     for i, name in enumerate(param_names):
         if name in key_params:
             if i < len(args):
-                key_parts.append(f"{name}={_serialize_value(args[i])}")
+                key_parts.append(f'{name}={_serialize_value(args[i])}')
             elif name in kwargs:
-                key_parts.append(f"{name}={_serialize_value(kwargs[name])}")
+                key_parts.append(f'{name}={_serialize_value(kwargs[name])}')
     for name in key_params:
         if name not in param_names[:len(args)] and name in kwargs:
-            if f"{name}={_serialize_value(kwargs[name])}" not in key_parts:
-                key_parts.append(f"{name}={_serialize_value(kwargs[name])}")
+            if f'{name}={_serialize_value(kwargs[name])}' not in key_parts:
+                key_parts.append(f'{name}={_serialize_value(kwargs[name])}')
     raw_key = '|'.join(key_parts)
     return hashlib.md5(raw_key.encode()).hexdigest()
 
