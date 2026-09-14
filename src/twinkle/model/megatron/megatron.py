@@ -324,11 +324,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             # Compatible with DPO
             micro_batch_size = min(2, len(inputs))
         unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+        # No config in the Megatron stack declares ``attention_mask_type``, so this
+        # lookup always fell through to None and the processor could never tell that
+        # the task is causal. Default it for decoder-only causal_lm.
+        attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
+        if attention_mask_type is None and task == 'causal_lm':
+            attention_mask_type = 'causal'
         inputs = processor(
             inputs,
             micro_batch_size=micro_batch_size,
             variable_seq_lengths=self.variable_seq_lengths,
-            attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
+            attention_mask_type=attention_mask_type,
         )
 
         # Get parallelism settings for sequence padding and splitting
