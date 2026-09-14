@@ -413,6 +413,72 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         from twinkle.server.sampler.backends import stream_to_queue
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
+    @remote_function(dispatch='all', execute='first', collect='first', lazy_collect=False)
+    def sample_sequences_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
+        """Engine-level per-sequence streaming (local mode).
+
+        Schedules ALL inputs concurrently in this actor's event loop — the
+        same batching behaviour as ``sample``, so the vLLM engine keeps
+        batching the whole batch — and pushes one ``(index, SampleResponse)``
+        event onto ``queue`` as each sequence finishes (completion order),
+        followed by a ``(None, None)`` sentinel.
+
+        Local-mode counterpart of the server's ``stream_sample_to_data_plane``:
+        call it from the driver on a worker thread while draining the queue on
+        the main path. ``index`` is the global input index, so per-sequence
+        reward submission and index alignment work like the server's
+        StreamSample events.
+
+        Note: with multiple sampler DP workers only the first actor executes
+        (``execute='first'``); this targets the default SAMPLER_GPUS=1
+        deployment.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        elif isinstance(sampling_params, dict):
+            sampling_params = SamplingParams.from_dict(sampling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        logprobs_only = False
+        if sampling_params.max_tokens == 0:
+            sampling_params = copy(sampling_params)
+            sampling_params.max_tokens = 1
+            logprobs_only = True
+
+        encoded_inputs = []
+        for feat in inputs_list:
+            if 'input_ids' not in feat:
+                encoded_inputs.append(self.encode_trajectory_for_vllm(feat, adapter_name))
+            else:
+                encoded_inputs.append(feat)
+        multi_modal_data_list = [self._extract_multi_modal_data(f) for f in encoded_inputs]
+
+        lora_request = None
+        if adapter_path is not None:
+            logger.info(f'Loading LoRA from {adapter_path}')
+            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
+            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
+            if lora_request is None:
+                logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '
+                               'sampling will proceed without LoRA')
+
+        async def runner():
+            async def generate(idx, feat, multi_modal_data):
+                response = await self._sample_single(
+                    feat, sampling_params, lora_request=lora_request,
+                    multi_modal_data=multi_modal_data, logprobs_only=logprobs_only)
+                # ray queue puts can block; keep the actor event loop free.
+                await asyncio.to_thread(queue.put, (idx, response))
+
+            tasks = [
+                asyncio.ensure_future(generate(idx, feat, mm))
+                for idx, (feat, mm) in enumerate(zip(encoded_inputs, multi_modal_data_list))
+            ]
+            await asyncio.gather(*tasks)
+            await asyncio.to_thread(queue.put, (None, None))
+
+        self._run_in_loop(runner())
+
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:
         """

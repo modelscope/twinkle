@@ -96,9 +96,11 @@ from .training import (
 from .checkpoint import ResolvedLoadPath
 from .component import (
     DataAppendRequest,
+    DataCreateRequest,
     DataGetRequest,
     DataPlaneSampleRequest,
     DataPutRequest,
+    DataPutRowsRequest,
     DataRef,
     DataReleaseRequest,
     DataRowsResponse,
