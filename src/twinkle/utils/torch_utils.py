@@ -59,6 +59,72 @@ def pad_sequence_to_length(
     return F.pad(tensor, pad_tuple, mode='constant', value=pad_value)
 
 
+_CHUNKED_SELECTIVE_LOG_SOFTMAX = None
+
+
+def _chunked_selective_log_softmax_function():
+    """Lazily build the autograd function used by :func:`selective_log_softmax`.
+
+    ``torch`` is imported lazily throughout this module, so the ``Function``
+    subclass cannot live at module scope. It is built once and cached.
+    """
+    global _CHUNKED_SELECTIVE_LOG_SOFTMAX
+    if _CHUNKED_SELECTIVE_LOG_SOFTMAX is not None:
+        return _CHUNKED_SELECTIVE_LOG_SOFTMAX
+    import torch
+
+    class ChunkedSelectiveLogSoftmax(torch.autograd.Function):
+        """One chunk of ``selective_log_softmax`` that recomputes in backward.
+
+        The wide FP32 upcast is a forward-only temporary: only the original
+        dtype chunk and its labels are saved, so no full-vocab FP32 copy of the
+        activation stays resident until the backward pass.
+        """
+
+        @staticmethod
+        def forward(ctx, logits, labels, compute_dtype, return_entropy):
+            chunk = logits.to(compute_dtype)
+            logsumexp = torch.logsumexp(chunk, dim=-1)
+            selected = torch.gather(chunk, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            logps = selected - logsumexp
+            ctx.save_for_backward(logits, labels)
+            ctx.compute_dtype = compute_dtype
+            ctx.return_entropy = return_entropy
+            if not return_entropy:
+                return logps
+            probabilities = torch.softmax(chunk, dim=-1)
+            return logps, logsumexp - (probabilities * chunk).sum(dim=-1)
+
+        @staticmethod
+        def backward(ctx, *grad_outputs):
+            logits, labels = ctx.saved_tensors
+            compute_dtype = ctx.compute_dtype
+            chunk = logits.to(compute_dtype)
+            probabilities = torch.softmax(chunk, dim=-1)
+            grad_logits = torch.zeros_like(chunk)
+
+            grad_logps = grad_outputs[0]
+            if grad_logps is not None:
+                grad_logps = grad_logps.to(compute_dtype).unsqueeze(-1)
+                # d/dz (z[label] - logsumexp(z)) = onehot(label) - softmax(z)
+                grad_logits.scatter_add_(dim=-1, index=labels.unsqueeze(-1), src=grad_logps)
+                grad_logits.sub_(probabilities * grad_logps)
+
+            if ctx.return_entropy:
+                grad_entropy = grad_outputs[1]
+                if grad_entropy is not None:
+                    grad_entropy = grad_entropy.to(compute_dtype).unsqueeze(-1)
+                    # H(z) = logsumexp(z) - sum(softmax(z) * z)
+                    # dH/dz = softmax(z) * (E_p[z] - z)
+                    expected = (probabilities * chunk).sum(dim=-1, keepdim=True)
+                    grad_logits.add_(probabilities * (grad_entropy * (expected - chunk)))
+
+            return grad_logits.to(logits.dtype), None, None, None
+
+    _CHUNKED_SELECTIVE_LOG_SOFTMAX = ChunkedSelectiveLogSoftmax
+    return _CHUNKED_SELECTIVE_LOG_SOFTMAX
+
+
 def selective_log_softmax(logits, index, return_entropy: bool = False):
     """
     refer: trl/trainer/utils
@@ -85,7 +151,6 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
         If ``return_entropy`` is True, returns ``(per_token_logps, per_token_entropy)``.
     """
     import torch
-    import torch.nn.functional as F
 
     try:
         from megatron.core import parallel_state as mpu
@@ -100,40 +165,34 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
     except (ImportError, AssertionError, OSError):
         pass
 
-    if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    vocab_size = logits.shape[-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_index = index.reshape(-1)
+    compute_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
+    element_size = torch.empty((), dtype=compute_dtype).element_size()
+    temporary_bytes = 32 << 20 if return_entropy else 64 << 20
+    chunk_rows = max(1, temporary_bytes // (vocab_size * element_size))
+    chunk_function = _chunked_selective_log_softmax_function()
+
+    logps = []
+    entropies = []
+    for start in range(0, flat_logits.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, flat_logits.shape[0])
+        result = chunk_function.apply(
+            flat_logits[start:stop],
+            flat_index[start:stop],
+            compute_dtype,
+            return_entropy,
+        )
         if return_entropy:
-            # Per-row loop mirrors the logsumexp path below, to keep peak memory bounded.
-            logsumexp_values = []
-            per_token_entropy = []
-            for row_logits in logits:
-                row_lse = torch.logsumexp(row_logits, dim=-1)
-                logsumexp_values.append(row_lse)
-                # H = lse - E_p[x] = lse - sum(exp(x - lse) * x)
-                row_p = torch.exp(row_logits - row_lse.unsqueeze(-1))
-                per_token_entropy.append(row_lse - (row_p * row_logits).sum(dim=-1))
-            logsumexp_values = torch.stack(logsumexp_values)
-            per_token_entropy = torch.stack(per_token_entropy)
-            per_token_logps = selected_logits - logsumexp_values
-            return per_token_logps, per_token_entropy
-        # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
-    else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
-        per_token_logps = []
-        per_token_entropy = [] if return_entropy else None
-        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            per_token_logps.append(row_per_token_logps)
-            if return_entropy:
-                # row_logps is already stable; softmax reuses the same numerics.
-                row_p = torch.exp(row_logps)
-                per_token_entropy.append(-(row_p * row_logps).sum(dim=-1))
-        per_token_logps = torch.stack(per_token_logps)
-        if return_entropy:
-            return per_token_logps, torch.stack(per_token_entropy)
+            chunk_logps, chunk_entropies = result
+            logps.append(chunk_logps)
+            entropies.append(chunk_entropies)
+        else:
+            logps.append(result)
+    per_token_logps = torch.cat(logps).reshape(index.shape)
+    if return_entropy:
+        return per_token_logps, torch.cat(entropies).reshape(index.shape)
     return per_token_logps
 
 
