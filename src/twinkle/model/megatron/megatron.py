@@ -401,7 +401,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
+            # reduce_loss() detaches the logits into the per-microbatch report dict,
+            # which pins every microbatch's full-vocab logits until they are cat'ed
+            # and dropped below. Mirrors the guard in TransformersModel.forward.
+            reported_logits = output_tensor if return_logits else None
+            return self.strategy.reduce_loss(losses, counts, reported_logits, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -529,9 +533,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
-                    if 'logits' in loss_dict:
+                    if loss_dict.get('logits') is not None:
                         logits.append(loss_dict['logits'])
-                    if 'logps' in loss_dict:
+                    if loss_dict.get('logps') is not None:
                         logps.append(loss_dict['logps'])
                     if 'num_tokens' in loss_dict:
                         count += loss_dict['num_tokens']
