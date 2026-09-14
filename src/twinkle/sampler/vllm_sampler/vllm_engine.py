@@ -13,6 +13,7 @@ from twinkle.data_format.sampling import SampledSequence, SampleResponse, Sampli
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
+from twinkle.utils.parallel import PosixFileLock
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
@@ -346,10 +347,11 @@ class VLLMEngine(BaseSamplerEngine):
         engine_args = AsyncEngineArgs(**filtered_engine_config)
         vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
 
-        engine = AsyncLLM.from_vllm_config(
-            vllm_config=vllm_config,
-            usage_context=UsageContext.OPENAI_API_SERVER,
-        )
+        with PosixFileLock('/tmp/twinkle-vllm-engine-init.lock'):
+            engine = AsyncLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=UsageContext.OPENAI_API_SERVER,
+            )
 
         logger.info(f'VLLMEngine initialized: model={self.model_id}')
         return engine

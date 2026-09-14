@@ -13,7 +13,8 @@ def _hold_startup_lock(lock_path: str, acquired, release) -> None:
             raise TimeoutError('test did not release vLLM startup lock')
 
 
-def _acquire_startup_lock(lock_path: str, acquired) -> None:
+def _acquire_startup_lock(lock_path: str, started, acquired) -> None:
+    started.set()
     with PosixFileLock(lock_path):
         acquired.set()
 
@@ -25,15 +26,17 @@ def test_vllm_engine_startup_is_serialized(tmp_path):
     lock_path = str(tmp_path / 'vllm-engine-init.lock')
     first_acquired = context.Event()
     release_first = context.Event()
+    second_started = context.Event()
     second_acquired = context.Event()
     first = context.Process(target=_hold_startup_lock, args=(lock_path, first_acquired, release_first))
-    second = context.Process(target=_acquire_startup_lock, args=(lock_path, second_acquired))
+    second = context.Process(target=_acquire_startup_lock, args=(lock_path, second_started, second_acquired))
 
     try:
         first.start()
         assert first_acquired.wait(timeout=5)
 
         second.start()
+        assert second_started.wait(timeout=5)
         assert not second_acquired.wait(timeout=0.2)
 
         release_first.set()

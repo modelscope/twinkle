@@ -15,7 +15,6 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
 from twinkle.utils import Platform
-from twinkle.utils.parallel import PosixFileLock
 
 logger = get_logger()
 
@@ -104,8 +103,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         # Create engine in the background event loop so all async operations
         # (including vLLM's internal background tasks) run in the same loop
-        with PosixFileLock('/tmp/twinkle-vllm-engine-init.lock'):
-            self.engine: VLLMEngine = self._run_in_loop(self._create_engine_async(VLLMEngine, model_id, engine_kwargs))
+        self.engine: VLLMEngine = self._run_in_loop(self._create_engine_async(VLLMEngine, model_id, engine_kwargs))
         # fix: On NPU, monkey_patch_model can trigger Triton compatibility errors and abort sampler init.
         # fix: Explicitly skip this patch on NPU and keep it for non-NPU paths only.
         # NPU platform may trigger triton errors with monkey_patch_model
