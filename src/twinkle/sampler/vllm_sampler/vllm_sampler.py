@@ -17,6 +17,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
 from twinkle.utils import Platform
+from twinkle.utils.parallel import PosixFileLock
 
 logger = get_logger()
 
@@ -31,15 +32,9 @@ def _vllm_engine_startup_lock(lock_path: str | None = None) -> Iterator[None]:
     The lock is held only until the engine reports ready and is automatically
     released if the actor exits.
     """
-    import fcntl
-
     path = lock_path or os.path.join(tempfile.gettempdir(), 'twinkle-vllm-engine-init.lock')
-    with open(path, 'a+', encoding='utf-8') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with PosixFileLock(path):
+        yield
 
 
 def _convert_ndarray_to_list(obj: Any) -> Any:
