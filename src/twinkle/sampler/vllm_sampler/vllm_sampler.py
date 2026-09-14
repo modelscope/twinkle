@@ -3,11 +3,9 @@ import asyncio
 import atexit
 import numpy as np
 import os
-import tempfile
 import threading
-from contextlib import contextmanager
 from copy import copy
-from typing import Any, Dict, Iterator, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
@@ -20,21 +18,6 @@ from twinkle.utils import Platform
 from twinkle.utils.parallel import PosixFileLock
 
 logger = get_logger()
-
-
-@contextmanager
-def _vllm_engine_startup_lock(lock_path: str | None = None) -> Iterator[None]:
-    """Serialize local vLLM engine startup across sampler actors.
-
-    vLLM selects the TCP port for its internal TP workers with a
-    check-then-bind sequence.  Two samplers created concurrently in one pod
-    can select the same port, causing one engine to fail with ``EADDRINUSE``.
-    The lock is held only until the engine reports ready and is automatically
-    released if the actor exits.
-    """
-    path = lock_path or os.path.join(tempfile.gettempdir(), 'twinkle-vllm-engine-init.lock')
-    with PosixFileLock(path):
-        yield
 
 
 def _convert_ndarray_to_list(obj: Any) -> Any:
@@ -121,7 +104,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         # Create engine in the background event loop so all async operations
         # (including vLLM's internal background tasks) run in the same loop
-        with _vllm_engine_startup_lock():
+        with PosixFileLock('/tmp/twinkle-vllm-engine-init.lock'):
             self.engine: VLLMEngine = self._run_in_loop(self._create_engine_async(VLLMEngine, model_id, engine_kwargs))
         # fix: On NPU, monkey_patch_model can trigger Triton compatibility errors and abort sampler init.
         # fix: Explicitly skip this patch on NPU and keep it for non-NPU paths only.

@@ -3,18 +3,18 @@ import os
 
 import pytest
 
-from twinkle.sampler.vllm_sampler.vllm_sampler import _vllm_engine_startup_lock
+from twinkle.utils.parallel import PosixFileLock
 
 
 def _hold_startup_lock(lock_path: str, acquired, release) -> None:
-    with _vllm_engine_startup_lock(lock_path):
+    with PosixFileLock(lock_path):
         acquired.set()
         if not release.wait(timeout=5):
             raise TimeoutError('test did not release vLLM startup lock')
 
 
 def _acquire_startup_lock(lock_path: str, acquired) -> None:
-    with _vllm_engine_startup_lock(lock_path):
+    with PosixFileLock(lock_path):
         acquired.set()
 
 
