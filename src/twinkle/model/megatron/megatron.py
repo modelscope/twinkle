@@ -324,11 +324,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             # Compatible with DPO
             micro_batch_size = min(2, len(inputs))
         unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+        # No config in the Megatron stack declares ``attention_mask_type``, so this
+        # lookup always fell through to None and the processor could never tell that
+        # the task is causal. Default it for decoder-only causal_lm.
+        attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
+        if attention_mask_type is None and task == 'causal_lm':
+            attention_mask_type = 'causal'
         inputs = processor(
             inputs,
             micro_batch_size=micro_batch_size,
             variable_seq_lengths=self.variable_seq_lengths,
-            attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
+            attention_mask_type=attention_mask_type,
         )
 
         # Get parallelism settings for sequence padding and splitting
@@ -395,7 +401,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
+            # reduce_loss() detaches the logits into the per-microbatch report dict,
+            # which pins every microbatch's full-vocab logits until they are cat'ed
+            # and dropped below. Mirrors the guard in TransformersModel.forward.
+            reported_logits = output_tensor if return_logits else None
+            return self.strategy.reduce_loss(losses, counts, reported_logits, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -523,9 +533,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
-                    if 'logits' in loss_dict:
+                    if loss_dict.get('logits') is not None:
                         logits.append(loss_dict['logits'])
-                    if 'logps' in loss_dict:
+                    if loss_dict.get('logps') is not None:
                         logps.append(loss_dict['logps'])
                     if 'num_tokens' in loss_dict:
                         count += loss_dict['num_tokens']

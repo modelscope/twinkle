@@ -144,6 +144,68 @@ class TestSelectiveLogSoftmax:
         # bfloat16 resolution rather than float32's.
         assert torch.allclose(result.float(), expected, atol=5e-2)
 
+    def test_bfloat16_does_not_quantize_large_negative_logps(self):
+        # A peaked row pushes the selected log-prob to ~-100.3, where the
+        # bfloat16 ULP is 0.5. Computing the softmax in float32 and only then
+        # selecting keeps the result at float32 resolution.
+        vocab_size = 4096
+        logits = torch.zeros(2, vocab_size, dtype=torch.bfloat16)
+        logits[:, 0] = 100.0
+        logits[:, 1] = -0.3
+        index = torch.ones(2, dtype=torch.long)
+
+        result = selective_log_softmax(logits, index)
+        expected = torch.gather(
+            logits.double().log_softmax(-1), -1, index.unsqueeze(-1)).squeeze(-1)
+
+        assert torch.allclose(result.double(), expected, atol=1e-3)
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_backward_saves_no_extra_full_vocab_activation(self, dtype, return_entropy):
+        # Every tensor handed to save_for_backward stays resident from the end of
+        # forward until backward runs, so a per-row copy of the vocabulary is as
+        # expensive as materializing the whole log_softmax. Recomputing in
+        # backward must keep nothing wider than the labels.
+        rows, vocab_size = 8, 512
+        logits = torch.randn(rows, vocab_size, dtype=dtype, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        logits_storage = logits.untyped_storage().data_ptr()
+        extra_storages = {}
+
+        def pack(tensor):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() != logits_storage:
+                extra_storages[storage.data_ptr()] = storage.nbytes()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index, return_entropy=return_entropy)
+
+        outputs = result if return_entropy else (result, )
+        torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
+
+        vocab_bytes = vocab_size * logits.element_size()
+        assert all(size < vocab_bytes for size in extra_storages.values())
+
+    def test_scales_with_chunks_not_with_rows(self):
+        # The per-row Python loop issued one save per row per intermediate, i.e.
+        # thousands of tiny kernel launches at production sequence lengths.
+        rows, vocab_size = 512, 512
+        logits = torch.randn(rows, vocab_size, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        save_calls = []
+
+        def pack(tensor):
+            save_calls.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index)
+        result.sum().backward()
+
+        assert len(save_calls) <= 32
+
 
 class TestPadAndStackTensors:
 
