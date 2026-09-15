@@ -99,6 +99,47 @@ def _build_rollout_rows_and_tags(
     return rows, tags
 
 
+def _sample_model_to_row(
+    model: types.SampleResponseModel,
+    *,
+    group_id: str,
+    prompt_index: int,
+    generation_idx: int,
+    policy_version: int | None,
+    adapter_uri: str | None,
+) -> tuple[dict, dict]:
+    """Convert one generated sequence into a single TQ row and its tag.
+
+    The row layout must stay identical to ``_build_rollout_rows_and_tags`` so
+    incremental writes land on the same global keys, where the global row index
+    is ``prompt_index * num_samples + generation_idx``.  ``model`` carries a
+    single sequence (``collect_ready_samples`` pops per-sequence responses).
+    """
+    sequence = model.sequences[0]
+    sampled_logprobs = [
+        0.0 if not position else float(position[0][1]) for position in (sequence.logprobs or [])
+    ]
+    row = {
+        'train_input': sequence.new_input_feature,
+        'sampled_logprobs': sampled_logprobs,
+        'tokens': sequence.tokens,
+        'decoded': sequence.decoded,
+        'stop_reason': sequence.stop_reason,
+        'prompt_logprobs': model.prompt_logprobs,
+        'topk_prompt_logprobs': model.topk_prompt_logprobs,
+    }
+    tag = {
+        'record_type': 'sample',
+        'group_id': group_id,
+        'prompt_index': prompt_index,
+        'generation_idx': generation_idx,
+        'rollout_status': 'ROLLOUT_DONE',
+        'rollout_policy_version': policy_version,
+        'rollout_adapter_uri': adapter_uri,
+    }
+    return row, tag
+
+
 def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
@@ -179,6 +220,123 @@ async def _await_generation(
                 await asyncio.to_thread(sampler.cancel_generation, submission_id)
             except Exception:
                 logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
+
+async def _poll_generation_events(
+    sampler,
+    submission_id: str,
+):
+    """Poll generation status, yielding each round's flattened DP worker states.
+
+    The final round (all workers completed) is yielded as well, then the
+    generator returns. Poll cancellations raised by Ray are retried; worker
+    failures propagate immediately so the caller can cancel the submission.
+    """
+    poll_interval = 0.01
+    while True:
+        try:
+            states = _submission_states(
+                await asyncio.to_thread(sampler.get_generation_status, submission_id))
+        except Exception as error:
+            # A pending read-only actor call can be cancelled by Ray while
+            # the generation submitted just above remains alive.  Treating
+            # that as a generation failure makes the finally block discard
+            # otherwise valid rollout work.  Retry only Ray's explicit task
+            # cancellation; actor death and application errors must still
+            # propagate immediately.
+            from ray.exceptions import TaskCancelledError
+            if not isinstance(error, TaskCancelledError):
+                raise
+            logger.warning(
+                'Generation status poll was cancelled; retrying submission %s',
+                submission_id,
+            )
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 0.25)
+            continue
+        failed = next(
+            (state for state in states if state.get('status') not in ('running', 'completed')),
+            None,
+        )
+        if failed is not None:
+            error = failed.get('error') or failed.get('status', 'unknown failure')
+            raise RuntimeError(f'generation {submission_id} failed: {error}')
+        yield states
+        if states and all(state.get('status') == 'completed' for state in states):
+            return
+        await asyncio.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.5, 0.25)
+
+async def _stream_sample_events(
+    sampler,
+    data_plane,
+    *,
+    submission_id: str,
+    ref: types.DataRef,
+    num_samples: int,
+    total: int,
+    group_ids: list[str],
+    policy_version: int | None,
+    adapter_uri: str | None,
+):
+    """Yield NDJSON lines for the incremental sampling endpoint.
+
+    Emits one ``progress`` line per completed sequence (row layout matches
+    ``_build_rollout_rows_and_tags`` and is written in place via ``put_rows``),
+    then a ``ref`` line with the fully-filled DataRef.  On failure it cancels
+    the generation, releases the ref and yields an ``error`` line.
+    """
+    written: set[int] = set()
+    try:
+        async for states in _poll_generation_events(sampler, submission_id):
+            new_indices: list[int] = []
+            for state in states:
+                if not isinstance(state, dict):
+                    continue
+                for index in state.get('completed_indices', []):
+                    if index not in written:
+                        written.add(index)
+                        new_indices.append(index)
+            if not new_indices:
+                continue
+            responses = await asyncio.to_thread(
+                sampler.collect_ready_samples, submission_id, new_indices)
+            models = _to_sample_response_models([response for _, response in responses])
+            for (index, _response), model in zip(responses, models):
+                prompt_index, generation_idx = divmod(index, num_samples)
+                row, tag = _sample_model_to_row(
+                    model,
+                    group_id=group_ids[prompt_index],
+                    prompt_index=prompt_index,
+                    generation_idx=generation_idx,
+                    policy_version=policy_version,
+                    adapter_uri=adapter_uri,
+                )
+                ref = await data_plane.put_rows(
+                    ref,
+                    [json_safe(row)],
+                    [index],
+                    tags=[json_safe(tag)],
+                )
+                yield json.dumps({
+                    'event': 'progress',
+                    'index': index,
+                    'row': json_safe(row),
+                    'ref': ref.model_dump(),
+                    'done': len(written),
+                    'total': total,
+                }) + '\n'
+        yield json.dumps({'event': 'ref', 'ref': ref.model_dump()}) + '\n'
+    except Exception as error:
+        logger.error(traceback.format_exc())
+        try:
+            await asyncio.to_thread(sampler.cancel_generation, submission_id)
+        except Exception:
+            logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
+        try:
+            await data_plane.release(ref)
+        except Exception:
+            logger.warning('Failed to release streaming ref %s', ref.ref_id, exc_info=True)
+        yield json.dumps({'event': 'error', 'error': str(error)}) + '\n'
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -349,6 +507,104 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             kind='rollout',
             tags=tags,
         )
+
+    @app.post('/twinkle/sample_to_data_plane_stream')
+    async def sample_to_data_plane_stream(
+            request: Request,
+            body: types.DataPlaneSampleRequest,
+            self: SamplerManagement = Depends(self_fn),
+    ) -> StreamingResponse:
+        """Generate completions and stream each finished sequence as NDJSON.
+
+        Lines:
+          ``{"event":"progress","index":..,"row":{..},"done":N,"total":M}``
+          per completed sequence (row layout matches ``_build_rollout_rows_and_tags``
+          so the pre-allocated ref is filled incrementally in place),
+          then ``{"event":"ref","ref":{..}}`` once every sequence has been
+          written.  Failures surface as ``{"event":"error","error":".."}`` and
+          release the pre-allocated ref.
+        """
+        token = await self._on_request_start(request)
+        if not self.data_plane.enabled:
+            raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
+        if not callable(getattr(self.sampler, 'submit_generation', None)) or not callable(
+                getattr(self.sampler, 'collect_ready_samples', None)):
+            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async')
+
+        adapter_path = None
+        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
+        if body.adapter_uri:
+            from twinkle.server.checkpoint import create_checkpoint_manager
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+
+        inputs = (
+            await self.data_plane.get(body.input_ref)
+            if body.input_ref is not None else body.inputs
+        )
+        if isinstance(inputs, list) and inputs:
+            first = inputs[0]
+            if isinstance(first, dict) and 'input_ids' in first:
+                inputs = [InputFeature(**item) for item in inputs]
+            else:
+                inputs = [Trajectory(**item) for item in inputs]
+        elif isinstance(inputs, dict):
+            inputs = [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
+
+        input_count = len(inputs) if isinstance(inputs, list) else 1
+        params_dict = dict(body.sampling_params or {})
+        params_dict['num_samples'] = body.num_samples
+        params = SamplingParams.from_dict(params_dict)
+        submission_id = uuid.uuid4().hex
+        total = input_count * body.num_samples
+        resolved_group_ids = body.group_ids or [uuid.uuid4().hex for _ in range(input_count)]
+        if len(resolved_group_ids) != input_count:
+            raise ValueError(
+                f'group_ids contains {len(resolved_group_ids)} values for {input_count} sampler inputs')
+
+        async def _admit():
+            await asyncio.to_thread(
+                self.sampler.submit_generation,
+                submission_id,
+                inputs,
+                params,
+                adapter_name=full_adapter_name,
+                adapter_path=adapter_path,
+            )
+            return submission_id
+
+        inline_inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = (
+            body.input_ref.num_tokens
+            if body.input_ref is not None else
+            sum(len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict))
+        )
+        await run_task(
+            self.schedule_task_and_wait(
+                _admit,
+                model_id=full_adapter_name or None,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='sample_admission',
+            ))
+
+        ref = await self.data_plane.create(total, kind='rollout')
+
+        async def _stream():
+            async for line in _stream_sample_events(
+                self.sampler,
+                self.data_plane,
+                submission_id=submission_id,
+                ref=ref,
+                num_samples=body.num_samples,
+                total=total,
+                group_ids=resolved_group_ids,
+                policy_version=body.policy_version,
+                adapter_uri=body.adapter_uri,
+            ):
+                yield line
+
+        return StreamingResponse(_stream(), media_type='application/x-ndjson')
 
     @app.post('/twinkle/unload_adapter_paths')
     async def unload_adapter_paths(
