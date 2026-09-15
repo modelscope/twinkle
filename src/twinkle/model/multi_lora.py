@@ -193,12 +193,14 @@ class MultiLora:
                 _before(_module)
         else:
             _before(self.module)
-        yield adapter_name
-        if isinstance(self.module, list):
-            for _module in self.module:
-                _after(_module)
-        else:
-            _after(self.module)
+        try:
+            yield adapter_name
+        finally:
+            if isinstance(self.module, list):
+                for _module in self.module:
+                    _after(_module)
+            else:
+                _after(self.module)
         # self.deactivate_adapter()
 
     def check_length(self, inputs: InputFeature):

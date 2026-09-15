@@ -2,6 +2,7 @@ import copy
 import sys
 import types
 
+import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 from peft.utils import set_peft_model_state_dict
@@ -43,6 +44,42 @@ class FakeModel(nn.Module):
 
     def forward(self, x, expert_idx=0):
         return self.mlp.experts(x, expert_idx=expert_idx)
+
+
+class FakePeftModule:
+
+    def __init__(self, peft_config, active_adapter):
+        self.peft_config = peft_config
+        self.active_adapter = active_adapter
+
+
+def test_save_context_restores_peft_state_when_load_fails():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    original_config = {'lora_0': object(), 'lora_1': object()}
+    modules = [
+        FakePeftModule(original_config, 'lora_1'),
+        FakePeftModule(original_config, 'lora_0'),
+    ]
+    multi_lora = MultiLora(max_loras=2, max_r=4)
+    multi_lora.module = modules
+    multi_lora.loras = [
+        LoraTenant(
+            index=0,
+            adapter_name='lora_0',
+            config=_make_target_cfg(),
+            tenant_adapter_name='tenant',
+            tenant_config=_make_target_cfg(),
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match='load failed'):
+        with multi_lora.save_context('tenant') as adapter_name:
+            assert adapter_name == 'lora_0'
+            raise RuntimeError('load failed')
+
+    assert [module.peft_config for module in modules] == [original_config, original_config]
+    assert [module.active_adapter for module in modules] == ['lora_1', 'lora_0']
 
 
 def test_peft_target_parameter_key_shapes_for_3d_experts():
