@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import traceback
-import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from tinker import types
@@ -29,17 +28,16 @@ logger = get_logger()
 def _sampled_sequence(*, stop_reason, tokens, logprobs):
     return types.SampledSequence(
         stop_reason=stop_reason,
-        sequence_id=uuid.uuid4().hex,
-        _tokens_list=tokens,
-        _logprobs_list=logprobs,
+        tokens=tokens,
+        logprobs=logprobs,
     )
 
 
 def _sample_response(*, sequences, prompt_logprobs, topk_prompt_logprobs):
     return types.SampleResponse(
         sequences=sequences,
-        _prompt_logprobs_list=prompt_logprobs,
-        _topk_prompt_logprobs_list=topk_prompt_logprobs,
+        prompt_logprobs=prompt_logprobs,
+        topk_prompt_logprobs=topk_prompt_logprobs,
     )
 
 

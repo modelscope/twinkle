@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import sys
 import types as pytypes
 from collections.abc import Callable, Mapping, Sequence
@@ -155,11 +156,11 @@ def _type_contract(annotation: Any, seen: frozenset[str] = frozenset()) -> Any:
 
 
 def _parameter_contract(field: Any) -> dict[str, Any]:
-    annotation = getattr(field.field_info, 'annotation', field.type_)
+    field_info = field.field_info
     return {
         'name': field.alias,
-        'required': bool(field.required),
-        'schema': _type_contract(annotation),
+        'required': bool(field_info.is_required()),
+        'schema': _type_contract(field_info.annotation),
     }
 
 
@@ -188,7 +189,8 @@ def _extract_app_surface(app: FastAPI) -> dict[str, Any]:
             'statusCode': route.status_code or 200,
         }
         for method in sorted(route.methods & _HTTP_METHODS):
-            paths.setdefault(route.path, {})[method] = operation
+            client_path = re.sub(r'{([^}:]+):[^}]+}', r'{\1}', route.path)
+            paths.setdefault(client_path, {})[method] = operation
     return {'paths': paths}
 
 

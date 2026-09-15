@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
@@ -67,6 +69,7 @@ class _SamplerManagement:
         self.enabled = True
         self.scheduled = []
         self.put_rows = None
+        self._task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
 
     async def _on_request_start(self, _request):
         return 'token'
@@ -74,6 +77,9 @@ class _SamplerManagement:
     async def schedule_task_and_wait(self, task, **kwargs):
         self.scheduled.append(kwargs)
         return await task()
+
+    async def call_backend(self, fn, /, *args, admit=True, **kwargs):
+        return fn(*args, **kwargs)
 
     def submit_generation(self, submission_id, inputs, params, **kwargs):
         self.submission_id = submission_id

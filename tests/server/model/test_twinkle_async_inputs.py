@@ -63,6 +63,9 @@ class _SchedulingManagement:
         self.scheduled.append(kwargs)
         return await task()
 
+    async def call_backend(self, fn, /, *args, admit=True, **kwargs):
+        return fn(*args, **kwargs)
+
 
 @pytest.mark.asyncio
 async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -> None:

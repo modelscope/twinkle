@@ -417,27 +417,6 @@
               "required": true,
               "schema": {
                 "$defs": {
-                  "DmelChunk": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "dmel": {
-                        "format": "binary",
-                        "title": "Dmel",
-                        "type": "string"
-                      },
-                      "type": {
-                        "const": "dmel",
-                        "default": "dmel",
-                        "title": "Type",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "dmel"
-                    ],
-                    "title": "DmelChunk",
-                    "type": "object"
-                  },
                   "EncodedTextChunk": {
                     "additionalProperties": false,
                     "properties": {
@@ -558,9 +537,6 @@
                             },
                             {
                               "$ref": "#/$defs/ImageChunk"
-                            },
-                            {
-                              "$ref": "#/$defs/DmelChunk"
                             }
                           ]
                         },
@@ -690,18 +666,6 @@
                     "default": null,
                     "title": "Prompt Logprobs"
                   },
-                  "record_stability_info": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Record Stability Info"
-                  },
                   "sampling_params": {
                     "$ref": "#/$defs/SamplingParams"
                   },
@@ -732,11 +696,6 @@
                   "topk_prompt_logprobs": {
                     "default": 0,
                     "title": "Topk Prompt Logprobs",
-                    "type": "integer"
-                  },
-                  "topk_sample_logprobs": {
-                    "default": 0,
-                    "title": "Topk Sample Logprobs",
                     "type": "integer"
                   },
                   "type": {
@@ -1112,30 +1071,59 @@
               "name": "body",
               "required": true,
               "schema": {
-                "properties": {
-                  "forward_input": {
+                "$defs": {
+                  "Datum": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "loss_fn_inputs": {
+                        "additionalProperties": {
+                          "$ref": "#/$defs/TensorData"
+                        },
+                        "title": "Loss Fn Inputs",
+                        "type": "object"
+                      },
+                      "model_input": {
+                        "$ref": "#/$defs/ModelInput"
+                      }
+                    },
+                    "required": [
+                      "loss_fn_inputs",
+                      "model_input"
+                    ],
+                    "title": "Datum",
+                    "type": "object"
+                  },
+                  "EncodedTextChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "tokens": {
+                        "items": {
+                          "type": "integer"
+                        },
+                        "title": "Tokens",
+                        "type": "array"
+                      },
+                      "type": {
+                        "const": "encoded_text",
+                        "default": "encoded_text",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tokens"
+                    ],
+                    "title": "EncodedTextChunk",
+                    "type": "object"
+                  },
+                  "ForwardBackwardInput": {
+                    "additionalProperties": false,
                     "properties": {
                       "data": {
                         "items": {
-                          "properties": {
-                            "loss_fn_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            },
-                            "loss_fn_inputs": {
-                              "pythonType": "'LossFnInputs'"
-                            },
-                            "model_input": {
-                              "pythonType": "'ModelInput'"
-                            },
-                            "model_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            }
-                          },
-                          "required": [
-                            "model_input"
-                          ],
-                          "type": "object"
+                          "$ref": "#/$defs/Datum"
                         },
+                        "title": "Data",
                         "type": "array"
                       },
                       "loss_fn": {
@@ -1145,36 +1133,202 @@
                           "ppo",
                           "cispo",
                           "dro"
-                        ]
+                        ],
+                        "title": "Loss Fn",
+                        "type": "string"
                       },
                       "loss_fn_config": {
                         "anyOf": [
                           {
                             "additionalProperties": {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "string"
-                                }
-                              ]
+                              "type": "number"
                             },
                             "type": "object"
                           },
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "default": null,
+                        "title": "Loss Fn Config"
                       }
                     },
                     "required": [
                       "data",
                       "loss_fn"
                     ],
+                    "title": "ForwardBackwardInput",
                     "type": "object"
                   },
+                  "ImageAssetPointerChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "location": {
+                        "title": "Location",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image_asset_pointer",
+                        "default": "image_asset_pointer",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "location"
+                    ],
+                    "title": "ImageAssetPointerChunk",
+                    "type": "object"
+                  },
+                  "ImageChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "format": "binary",
+                        "title": "Data",
+                        "type": "string"
+                      },
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image",
+                        "default": "image",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "format"
+                    ],
+                    "title": "ImageChunk",
+                    "type": "object"
+                  },
+                  "ModelInput": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "chunks": {
+                        "items": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/EncodedTextChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageAssetPointerChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageChunk"
+                            }
+                          ]
+                        },
+                        "title": "Chunks",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "chunks"
+                    ],
+                    "title": "ModelInput",
+                    "type": "object"
+                  },
+                  "TensorData": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "items": {
+                              "type": "number"
+                            },
+                            "type": "array"
+                          }
+                        ],
+                        "title": "Data"
+                      },
+                      "dtype": {
+                        "enum": [
+                          "int64",
+                          "float32"
+                        ],
+                        "title": "Dtype",
+                        "type": "string"
+                      },
+                      "shape": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Shape"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "dtype"
+                    ],
+                    "title": "TensorData",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "forward_input": {
+                    "$ref": "#/$defs/ForwardBackwardInput"
+                  },
                   "model_id": {
+                    "title": "Model Id",
                     "type": "string"
                   },
                   "seq_id": {
@@ -1185,13 +1339,16 @@
                       {
                         "type": "null"
                       }
-                    ]
+                    ],
+                    "default": null,
+                    "title": "Seq Id"
                   }
                 },
                 "required": [
                   "forward_input",
                   "model_id"
                 ],
+                "title": "ForwardRequest",
                 "type": "object"
               }
             }
@@ -1213,30 +1370,59 @@
               "name": "body",
               "required": true,
               "schema": {
-                "properties": {
-                  "forward_backward_input": {
+                "$defs": {
+                  "Datum": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "loss_fn_inputs": {
+                        "additionalProperties": {
+                          "$ref": "#/$defs/TensorData"
+                        },
+                        "title": "Loss Fn Inputs",
+                        "type": "object"
+                      },
+                      "model_input": {
+                        "$ref": "#/$defs/ModelInput"
+                      }
+                    },
+                    "required": [
+                      "loss_fn_inputs",
+                      "model_input"
+                    ],
+                    "title": "Datum",
+                    "type": "object"
+                  },
+                  "EncodedTextChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "tokens": {
+                        "items": {
+                          "type": "integer"
+                        },
+                        "title": "Tokens",
+                        "type": "array"
+                      },
+                      "type": {
+                        "const": "encoded_text",
+                        "default": "encoded_text",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tokens"
+                    ],
+                    "title": "EncodedTextChunk",
+                    "type": "object"
+                  },
+                  "ForwardBackwardInput": {
+                    "additionalProperties": false,
                     "properties": {
                       "data": {
                         "items": {
-                          "properties": {
-                            "loss_fn_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            },
-                            "loss_fn_inputs": {
-                              "pythonType": "'LossFnInputs'"
-                            },
-                            "model_input": {
-                              "pythonType": "'ModelInput'"
-                            },
-                            "model_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            }
-                          },
-                          "required": [
-                            "model_input"
-                          ],
-                          "type": "object"
+                          "$ref": "#/$defs/Datum"
                         },
+                        "title": "Data",
                         "type": "array"
                       },
                       "loss_fn": {
@@ -1246,36 +1432,202 @@
                           "ppo",
                           "cispo",
                           "dro"
-                        ]
+                        ],
+                        "title": "Loss Fn",
+                        "type": "string"
                       },
                       "loss_fn_config": {
                         "anyOf": [
                           {
                             "additionalProperties": {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "string"
-                                }
-                              ]
+                              "type": "number"
                             },
                             "type": "object"
                           },
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "default": null,
+                        "title": "Loss Fn Config"
                       }
                     },
                     "required": [
                       "data",
                       "loss_fn"
                     ],
+                    "title": "ForwardBackwardInput",
                     "type": "object"
                   },
+                  "ImageAssetPointerChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "location": {
+                        "title": "Location",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image_asset_pointer",
+                        "default": "image_asset_pointer",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "location"
+                    ],
+                    "title": "ImageAssetPointerChunk",
+                    "type": "object"
+                  },
+                  "ImageChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "format": "binary",
+                        "title": "Data",
+                        "type": "string"
+                      },
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image",
+                        "default": "image",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "format"
+                    ],
+                    "title": "ImageChunk",
+                    "type": "object"
+                  },
+                  "ModelInput": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "chunks": {
+                        "items": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/EncodedTextChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageAssetPointerChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageChunk"
+                            }
+                          ]
+                        },
+                        "title": "Chunks",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "chunks"
+                    ],
+                    "title": "ModelInput",
+                    "type": "object"
+                  },
+                  "TensorData": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "items": {
+                              "type": "number"
+                            },
+                            "type": "array"
+                          }
+                        ],
+                        "title": "Data"
+                      },
+                      "dtype": {
+                        "enum": [
+                          "int64",
+                          "float32"
+                        ],
+                        "title": "Dtype",
+                        "type": "string"
+                      },
+                      "shape": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Shape"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "dtype"
+                    ],
+                    "title": "TensorData",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "forward_backward_input": {
+                    "$ref": "#/$defs/ForwardBackwardInput"
+                  },
                   "model_id": {
+                    "title": "Model Id",
                     "type": "string"
                   },
                   "seq_id": {
@@ -1286,13 +1638,16 @@
                       {
                         "type": "null"
                       }
-                    ]
+                    ],
+                    "default": null,
+                    "title": "Seq Id"
                   }
                 },
                 "required": [
                   "forward_backward_input",
                   "model_id"
                 ],
+                "title": "ForwardBackwardRequest",
                 "type": "object"
               }
             }
@@ -1358,18 +1713,6 @@
               "SupportedModel": {
                 "description": "Information about a model supported by the server.",
                 "properties": {
-                  "max_context_length": {
-                    "anyOf": [
-                      {
-                        "type": "integer"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Max Context Length"
-                  },
                   "model_name": {
                     "anyOf": [
                       {
@@ -1381,30 +1724,6 @@
                     ],
                     "default": null,
                     "title": "Model Name"
-                  },
-                  "sampleable": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Sampleable"
-                  },
-                  "trainable": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Trainable"
                   }
                 },
                 "title": "SupportedModel",
@@ -1466,41 +1785,9 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
-                  "base_model": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Base Model"
-                  },
                   "model_id": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Model Id"
-                  },
-                  "model_seq_id": {
-                    "anyOf": [
-                      {
-                        "type": "integer"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Model Seq Id"
+                    "title": "Model Id",
+                    "type": "string"
                   },
                   "optimizer": {
                     "title": "Optimizer",
@@ -1522,51 +1809,15 @@
                     "default": null,
                     "title": "Seq Id"
                   },
-                  "session_id": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Session Id"
-                  },
                   "type": {
                     "const": "load_weights",
                     "default": "load_weights",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": true,
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
-                  },
-                  "weights_access_token": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Weights Access Token"
                   }
                 },
                 "required": [
+                  "model_id",
                   "path",
                   "optimizer"
                 ],
@@ -1743,11 +1994,6 @@
                     "title": "Model Id",
                     "type": "string"
                   },
-                  "overwrite": {
-                    "default": false,
-                    "title": "Overwrite",
-                    "type": "boolean"
-                  },
                   "path": {
                     "anyOf": [
                       {
@@ -1789,21 +2035,6 @@
                     "default": "save_weights",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -1890,21 +2121,6 @@
                     "default": "save_weights_for_sampler",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -2235,10 +2451,6 @@
                     "title": "Platform",
                     "type": "string"
                   },
-                  "process_uuid": {
-                    "title": "Process Uuid",
-                    "type": "string"
-                  },
                   "sdk_version": {
                     "title": "Sdk Version",
                     "type": "string"
@@ -2252,8 +2464,7 @@
                   "events",
                   "platform",
                   "sdk_version",
-                  "session_id",
-                  "process_uuid"
+                  "session_id"
                 ],
                 "title": "TelemetrySendRequest",
                 "type": "object"
@@ -2317,8 +2528,7 @@
                   "checkpoint_type": {
                     "enum": [
                       "training",
-                      "sampler",
-                      "external"
+                      "sampler"
                     ],
                     "title": "Checkpoint Type",
                     "type": "string"
@@ -2361,21 +2571,6 @@
                   "tinker_path": {
                     "title": "Tinker Path",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -2549,8 +2744,7 @@
                   "checkpoint_type": {
                     "enum": [
                       "training",
-                      "sampler",
-                      "external"
+                      "sampler"
                     ],
                     "title": "Checkpoint Type",
                     "type": "string"
@@ -2593,21 +2787,6 @@
                   "tinker_path": {
                     "title": "Tinker Path",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -2738,8 +2917,7 @@
                   "checkpoint_type": {
                     "enum": [
                       "training",
-                      "sampler",
-                      "external"
+                      "sampler"
                     ],
                     "title": "Checkpoint Type",
                     "type": "string"
@@ -2782,21 +2960,6 @@
                   "tinker_path": {
                     "title": "Tinker Path",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -2862,7 +3025,7 @@
           "statusCode": 200
         }
       },
-      "/training_runs/{run_id}/checkpoints/{checkpoint_id:path}": {
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
         "DELETE": {
           "body": [],
           "cookies": [],
@@ -2890,7 +3053,7 @@
           "statusCode": 200
         }
       },
-      "/training_runs/{run_id}/checkpoints/{checkpoint_id:path}/publish": {
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}/publish": {
         "POST": {
           "body": [],
           "cookies": [],
@@ -2956,7 +3119,7 @@
           "statusCode": 200
         }
       },
-      "/twinkle/checkpoint_path/{run_id}/{checkpoint_id:path}": {
+      "/twinkle/checkpoint_path/{run_id}/{checkpoint_id}": {
         "GET": {
           "body": [],
           "cookies": [],
@@ -3692,7 +3855,7 @@
           "statusCode": 200
         }
       },
-      "/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id:path}": {
+      "/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
         "DELETE": {
           "body": [],
           "cookies": [],
@@ -4080,21 +4243,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -4114,30 +4262,59 @@
               "name": "body",
               "required": true,
               "schema": {
-                "properties": {
-                  "forward_input": {
+                "$defs": {
+                  "Datum": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "loss_fn_inputs": {
+                        "additionalProperties": {
+                          "$ref": "#/$defs/TensorData"
+                        },
+                        "title": "Loss Fn Inputs",
+                        "type": "object"
+                      },
+                      "model_input": {
+                        "$ref": "#/$defs/ModelInput"
+                      }
+                    },
+                    "required": [
+                      "loss_fn_inputs",
+                      "model_input"
+                    ],
+                    "title": "Datum",
+                    "type": "object"
+                  },
+                  "EncodedTextChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "tokens": {
+                        "items": {
+                          "type": "integer"
+                        },
+                        "title": "Tokens",
+                        "type": "array"
+                      },
+                      "type": {
+                        "const": "encoded_text",
+                        "default": "encoded_text",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tokens"
+                    ],
+                    "title": "EncodedTextChunk",
+                    "type": "object"
+                  },
+                  "ForwardBackwardInput": {
+                    "additionalProperties": false,
                     "properties": {
                       "data": {
                         "items": {
-                          "properties": {
-                            "loss_fn_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            },
-                            "loss_fn_inputs": {
-                              "pythonType": "'LossFnInputs'"
-                            },
-                            "model_input": {
-                              "pythonType": "'ModelInput'"
-                            },
-                            "model_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            }
-                          },
-                          "required": [
-                            "model_input"
-                          ],
-                          "type": "object"
+                          "$ref": "#/$defs/Datum"
                         },
+                        "title": "Data",
                         "type": "array"
                       },
                       "loss_fn": {
@@ -4147,36 +4324,202 @@
                           "ppo",
                           "cispo",
                           "dro"
-                        ]
+                        ],
+                        "title": "Loss Fn",
+                        "type": "string"
                       },
                       "loss_fn_config": {
                         "anyOf": [
                           {
                             "additionalProperties": {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "string"
-                                }
-                              ]
+                              "type": "number"
                             },
                             "type": "object"
                           },
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "default": null,
+                        "title": "Loss Fn Config"
                       }
                     },
                     "required": [
                       "data",
                       "loss_fn"
                     ],
+                    "title": "ForwardBackwardInput",
                     "type": "object"
                   },
+                  "ImageAssetPointerChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "location": {
+                        "title": "Location",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image_asset_pointer",
+                        "default": "image_asset_pointer",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "location"
+                    ],
+                    "title": "ImageAssetPointerChunk",
+                    "type": "object"
+                  },
+                  "ImageChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "format": "binary",
+                        "title": "Data",
+                        "type": "string"
+                      },
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image",
+                        "default": "image",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "format"
+                    ],
+                    "title": "ImageChunk",
+                    "type": "object"
+                  },
+                  "ModelInput": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "chunks": {
+                        "items": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/EncodedTextChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageAssetPointerChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageChunk"
+                            }
+                          ]
+                        },
+                        "title": "Chunks",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "chunks"
+                    ],
+                    "title": "ModelInput",
+                    "type": "object"
+                  },
+                  "TensorData": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "items": {
+                              "type": "number"
+                            },
+                            "type": "array"
+                          }
+                        ],
+                        "title": "Data"
+                      },
+                      "dtype": {
+                        "enum": [
+                          "int64",
+                          "float32"
+                        ],
+                        "title": "Dtype",
+                        "type": "string"
+                      },
+                      "shape": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Shape"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "dtype"
+                    ],
+                    "title": "TensorData",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "forward_input": {
+                    "$ref": "#/$defs/ForwardBackwardInput"
+                  },
                   "model_id": {
+                    "title": "Model Id",
                     "type": "string"
                   },
                   "seq_id": {
@@ -4187,13 +4530,16 @@
                       {
                         "type": "null"
                       }
-                    ]
+                    ],
+                    "default": null,
+                    "title": "Seq Id"
                   }
                 },
                 "required": [
                   "forward_input",
                   "model_id"
                 ],
+                "title": "ForwardRequest",
                 "type": "object"
               }
             }
@@ -4220,21 +4566,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -4254,30 +4585,59 @@
               "name": "body",
               "required": true,
               "schema": {
-                "properties": {
-                  "forward_backward_input": {
+                "$defs": {
+                  "Datum": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "loss_fn_inputs": {
+                        "additionalProperties": {
+                          "$ref": "#/$defs/TensorData"
+                        },
+                        "title": "Loss Fn Inputs",
+                        "type": "object"
+                      },
+                      "model_input": {
+                        "$ref": "#/$defs/ModelInput"
+                      }
+                    },
+                    "required": [
+                      "loss_fn_inputs",
+                      "model_input"
+                    ],
+                    "title": "Datum",
+                    "type": "object"
+                  },
+                  "EncodedTextChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "tokens": {
+                        "items": {
+                          "type": "integer"
+                        },
+                        "title": "Tokens",
+                        "type": "array"
+                      },
+                      "type": {
+                        "const": "encoded_text",
+                        "default": "encoded_text",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tokens"
+                    ],
+                    "title": "EncodedTextChunk",
+                    "type": "object"
+                  },
+                  "ForwardBackwardInput": {
+                    "additionalProperties": false,
                     "properties": {
                       "data": {
                         "items": {
-                          "properties": {
-                            "loss_fn_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            },
-                            "loss_fn_inputs": {
-                              "pythonType": "'LossFnInputs'"
-                            },
-                            "model_input": {
-                              "pythonType": "'ModelInput'"
-                            },
-                            "model_input_spans": {
-                              "pythonType": "'Optional[ProvenanceSpans]'"
-                            }
-                          },
-                          "required": [
-                            "model_input"
-                          ],
-                          "type": "object"
+                          "$ref": "#/$defs/Datum"
                         },
+                        "title": "Data",
                         "type": "array"
                       },
                       "loss_fn": {
@@ -4287,36 +4647,202 @@
                           "ppo",
                           "cispo",
                           "dro"
-                        ]
+                        ],
+                        "title": "Loss Fn",
+                        "type": "string"
                       },
                       "loss_fn_config": {
                         "anyOf": [
                           {
                             "additionalProperties": {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "string"
-                                }
-                              ]
+                              "type": "number"
                             },
                             "type": "object"
                           },
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "default": null,
+                        "title": "Loss Fn Config"
                       }
                     },
                     "required": [
                       "data",
                       "loss_fn"
                     ],
+                    "title": "ForwardBackwardInput",
                     "type": "object"
                   },
+                  "ImageAssetPointerChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "location": {
+                        "title": "Location",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image_asset_pointer",
+                        "default": "image_asset_pointer",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "location"
+                    ],
+                    "title": "ImageAssetPointerChunk",
+                    "type": "object"
+                  },
+                  "ImageChunk": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "format": "binary",
+                        "title": "Data",
+                        "type": "string"
+                      },
+                      "expected_tokens": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Expected Tokens"
+                      },
+                      "format": {
+                        "enum": [
+                          "png",
+                          "jpeg"
+                        ],
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "image",
+                        "default": "image",
+                        "title": "Type",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "format"
+                    ],
+                    "title": "ImageChunk",
+                    "type": "object"
+                  },
+                  "ModelInput": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "chunks": {
+                        "items": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/EncodedTextChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageAssetPointerChunk"
+                            },
+                            {
+                              "$ref": "#/$defs/ImageChunk"
+                            }
+                          ]
+                        },
+                        "title": "Chunks",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "chunks"
+                    ],
+                    "title": "ModelInput",
+                    "type": "object"
+                  },
+                  "TensorData": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "items": {
+                              "type": "number"
+                            },
+                            "type": "array"
+                          }
+                        ],
+                        "title": "Data"
+                      },
+                      "dtype": {
+                        "enum": [
+                          "int64",
+                          "float32"
+                        ],
+                        "title": "Dtype",
+                        "type": "string"
+                      },
+                      "shape": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "default": null,
+                        "title": "Shape"
+                      }
+                    },
+                    "required": [
+                      "data",
+                      "dtype"
+                    ],
+                    "title": "TensorData",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "forward_backward_input": {
+                    "$ref": "#/$defs/ForwardBackwardInput"
+                  },
                   "model_id": {
+                    "title": "Model Id",
                     "type": "string"
                   },
                   "seq_id": {
@@ -4327,13 +4853,16 @@
                       {
                         "type": "null"
                       }
-                    ]
+                    ],
+                    "default": null,
+                    "title": "Seq Id"
                   }
                 },
                 "required": [
                   "forward_backward_input",
                   "model_id"
                 ],
+                "title": "ForwardBackwardRequest",
                 "type": "object"
               }
             }
@@ -4360,21 +4889,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -4545,41 +5059,9 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
-                  "base_model": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Base Model"
-                  },
                   "model_id": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Model Id"
-                  },
-                  "model_seq_id": {
-                    "anyOf": [
-                      {
-                        "type": "integer"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Model Seq Id"
+                    "title": "Model Id",
+                    "type": "string"
                   },
                   "optimizer": {
                     "title": "Optimizer",
@@ -4601,51 +5083,15 @@
                     "default": null,
                     "title": "Seq Id"
                   },
-                  "session_id": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Session Id"
-                  },
                   "type": {
                     "const": "load_weights",
                     "default": "load_weights",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": true,
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
-                  },
-                  "weights_access_token": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Weights Access Token"
                   }
                 },
                 "required": [
+                  "model_id",
                   "path",
                   "optimizer"
                 ],
@@ -4676,21 +5122,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -4808,21 +5239,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -4847,11 +5263,6 @@
                   "model_id": {
                     "title": "Model Id",
                     "type": "string"
-                  },
-                  "overwrite": {
-                    "default": false,
-                    "title": "Overwrite",
-                    "type": "boolean"
                   },
                   "path": {
                     "anyOf": [
@@ -4894,21 +5305,6 @@
                     "default": "save_weights",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -4941,21 +5337,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -5034,21 +5415,6 @@
                     "default": "save_weights_for_sampler",
                     "title": "Type",
                     "type": "string"
-                  },
-                  "user_metadata": {
-                    "anyOf": [
-                      {
-                        "additionalProperties": {
-                          "type": "string"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "User Metadata"
                   }
                 },
                 "required": [
@@ -5081,21 +5447,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -5158,21 +5509,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [
@@ -6948,27 +7284,6 @@
               "required": true,
               "schema": {
                 "$defs": {
-                  "DmelChunk": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "dmel": {
-                        "format": "binary",
-                        "title": "Dmel",
-                        "type": "string"
-                      },
-                      "type": {
-                        "const": "dmel",
-                        "default": "dmel",
-                        "title": "Type",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "dmel"
-                    ],
-                    "title": "DmelChunk",
-                    "type": "object"
-                  },
                   "EncodedTextChunk": {
                     "additionalProperties": false,
                     "properties": {
@@ -7089,9 +7404,6 @@
                             },
                             {
                               "$ref": "#/$defs/ImageChunk"
-                            },
-                            {
-                              "$ref": "#/$defs/DmelChunk"
                             }
                           ]
                         },
@@ -7221,18 +7533,6 @@
                     "default": null,
                     "title": "Prompt Logprobs"
                   },
-                  "record_stability_info": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null,
-                    "title": "Record Stability Info"
-                  },
                   "sampling_params": {
                     "$ref": "#/$defs/SamplingParams"
                   },
@@ -7263,11 +7563,6 @@
                   "topk_prompt_logprobs": {
                     "default": 0,
                     "title": "Topk Prompt Logprobs",
-                    "type": "integer"
-                  },
-                  "topk_sample_logprobs": {
-                    "default": 0,
-                    "title": "Topk Sample Logprobs",
                     "type": "integer"
                   },
                   "type": {
@@ -7308,21 +7603,6 @@
               "request_id": {
                 "title": "Request Id",
                 "type": "string"
-              },
-              "sample_sequence_ids": {
-                "anyOf": [
-                  {
-                    "items": {
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "title": "Sample Sequence Ids"
               }
             },
             "required": [

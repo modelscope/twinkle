@@ -75,5 +75,4 @@ async def test_tinker_asample_allows_base_model_session_without_model_path():
 
     assert isinstance(response, types.SampleResponse)
     assert response.sequences[0].tokens == [1, 2]
-    assert response.sequences[0].sequence_id
     assert management.sampler.adapter_paths == [None]

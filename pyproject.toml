@@ -44,7 +44,7 @@ client = [
   "plotext>=5.2.0",
   "openai>=1.0.0",
   "httpx>=0.25.0",
-  "tinker==0.29.0; python_version >= '3.11'",
+  "tinker==0.16.1",
 ]
 server = [
   "redis>=5.0",
