@@ -53,11 +53,14 @@ class ComputeWorker:
         config: TaskQueueConfig,
         task_metrics: TaskMetrics | None,
         deployment_name: str,
+        on_backend_timeout: 'Callable[[], Any] | None' = None,
     ) -> None:
         self._state = state
         self._config = config
         self._task_metrics = task_metrics
         self._deployment_name = deployment_name
+        # Optional coroutine-returning callback fired on a backend timeout (R3#2).
+        self._on_backend_timeout = on_backend_timeout
 
         self.task_queues: dict[str, asyncio.Queue] = {}
         self.queue_order: Deque[str] = deque()
@@ -270,6 +273,13 @@ class ComputeWorker:
                          f'type={task_type}, queue_key={queue_key}')
             # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server (R5#8).
             await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=504)
+            # Probe actor liveness after a timeout so an operator learns the replica's
+            # state without waiting for a second request to also time out (R3#2).
+            if self._on_backend_timeout is not None:
+                try:
+                    await self._on_backend_timeout()
+                except Exception:
+                    logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
         except BackendBusyError as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start
@@ -322,11 +332,28 @@ class ComputeWorker:
                 await self._fail_timed_out_task(task, queue_wait, q)
                 continue  # try the next queue
 
+            # A record already in a Terminal_State (e.g. written 'failed' by the
+            # state-hygiene orphan handling) must not be executed again (R3#8).
+            if task.persist_status and await self._is_record_terminal(task.request_id):
+                logger.info(f'[ComputeWorker] Task {task.request_id} already terminal on dequeue; skipping.')
+                q.task_done()
+                continue
+
             # Execute the task (serial: stops after the first execution)
             await self._execute_task(task, queue_key, q)
             return True
 
         return False
+
+    async def _is_record_terminal(self, request_id: str) -> bool:
+        """True if the future record already holds a Terminal_State."""
+        try:
+            record = await self._state.get_future(request_id)
+        except Exception:
+            return False
+        if not record:
+            return False
+        return record.get('status') in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value)
 
     # ------------------------------------------------------------------
     # Main worker loop

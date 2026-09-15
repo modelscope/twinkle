@@ -129,6 +129,9 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
 
         # Initialize task queue mixin
         self._init_task_queue(queue_config, deployment_name='Sampler')
+        # Bound every ray.get on this backend by the effective execution timeout
+        # (applies to both sync=True and sync=False dispatch). T4.1.
+        self.sampler._ray_get_timeout = self._task_queue_config.effective_execution_timeout
 
     async def shutdown(self) -> None:
         cancel_all = getattr(self.sampler, 'cancel_all_generations', None)

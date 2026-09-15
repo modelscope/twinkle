@@ -72,7 +72,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     ) -> dict:
         """Deep health probe: pings underlying model actors to verify liveness."""
         result = await self.check_model_health()
-        if not result['healthy']:
+        if self._model_unhealthy or not result['healthy']:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=503, content=result)
         return result

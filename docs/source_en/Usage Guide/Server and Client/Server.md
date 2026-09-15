@@ -450,3 +450,33 @@ twinkle-server check-config -c server_config.yaml
 | `use_megatron: false` | `backend: transformers` |
 
 Additionally, this refactor introduces two new top-level fields — `telemetry` and `persistence` — which did not exist before. Add them as needed.
+
+## Execution time bounds
+
+Every backend call has a configuration-computable time bound. The single source of
+the bound is the *effective execution timeout* `T`: it equals `execution_timeout`
+from the task-queue config, or `3600s` when `execution_timeout` is set to `0`
+("no configured limit"; a startup warning is logged). `T` drives both the
+`ray.get` timeout on the backend and the `asyncio.wait_for` around each task —
+there is no second, independently tunable timeout. The default `execution_timeout`
+is `1800s`.
+
+Two distinct bounds follow, and they must not be collapsed into one number:
+
+| Bound | Expression | Meaning |
+|-------|------------|---------|
+| Record-terminal bound | `queue_timeout + T` | After this, a task's future record is guaranteed to be in a terminal state (`completed`/`failed`). Use it for alerting thresholds and client polling total-timeout. |
+| Resource-release bound | `Collect_Width × T` | After this, the executor thread and the in-flight model-actor call for that task are guaranteed to have finished. Use it for capacity planning. |
+
+`Collect_Width = len(self._actors) = world_size = tp × pp × dp` — the number of
+futures each `remote_function` collection waits on per call. Evidence:
+`LazyCollect._get_result` iterates `self._futures`, which come from
+`_get_workers(self._actors, execute)` (`infra/__init__.py`), covering every actor —
+not just the data-parallel width. On a `tp=8` deployment the resource-release bound
+is therefore `8 × T`, not `T`.
+
+The **difference** between the two bounds (`Collect_Width × T − (queue_timeout + T)`)
+is the longest time the per-replica Admission_Gate can stay closed after a timeout:
+the record is already terminal, but a leaked executor thread may still hold the gate
+until its `ray.get` returns or raises. During that window newly arriving tasks fail
+fast with a `Server`/503 error rather than queueing behind the stuck call.

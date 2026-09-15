@@ -131,11 +131,19 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
+        # Health status bit, set when a post-timeout probe finds the model actor
+        # unreachable; auto-cleared by the next successful probe (R3#3).
+        self._model_unhealthy = False
 
         # Initialize mixins
         # ModelManagement opts into the Admission_Gate (collective mis-pairing +
         # queue-bypassing _cleanup_adapter); SamplerManagement does not.
-        self._init_task_queue(queue_config, deployment_name='Model', enable_admission_gate=True)
+        self._init_task_queue(
+            queue_config, deployment_name='Model', enable_admission_gate=True,
+            on_backend_timeout=self._probe_after_timeout)
+        # Bound every ray.get on this backend by the effective execution timeout
+        # (applies to both sync=True and sync=False dispatch). T4.1.
+        self.model._ray_get_timeout = self._task_queue_config.effective_execution_timeout
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -183,9 +191,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     async def check_model_health(self) -> dict:
         """Probe model actors liveness via a lightweight ping.
 
-        Returns a dict with 'healthy' (bool) and 'detail' (str).
-        If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
-        will raise RayActorError, signalling the watchdog to restart.
+        Returns a dict with 'healthy' (bool) and 'detail' (str). A successful probe
+        clears the unhealthy status bit; a failed probe sets it (R3#3).
 
         The ping goes through the Blocking_Call_Boundary with ``admit=False`` so it
         never blocks the event loop yet never queues behind the Admission_Gate --
@@ -194,10 +201,22 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         try:
             result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
+                self._model_unhealthy = False
                 return {'healthy': True, 'detail': 'model actors alive'}
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
         except Exception as e:
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
+
+    def mark_unhealthy(self) -> None:
+        """Flag the deployment unhealthy; /healthz returns 503 until a probe recovers it."""
+        self._model_unhealthy = True
+
+    async def _probe_after_timeout(self) -> None:
+        """Fired by ComputeWorker on a backend timeout: probe and log liveness (R3#2)."""
+        result = await self.check_model_health()
+        logger.warning('[Model] post-timeout liveness probe: %s', result)
 
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):

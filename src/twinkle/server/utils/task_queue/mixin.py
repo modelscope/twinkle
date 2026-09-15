@@ -58,6 +58,7 @@ class TaskQueueMixin:
         deployment_name: str = '',
         *,
         enable_admission_gate: bool = False,
+        on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
@@ -69,6 +70,10 @@ class TaskQueueMixin:
         (:meth:`call_backend`). ``ModelManagement`` enables it; ``SamplerManagement``
         does not (vllm sampler owns its own concurrency and the weight-update /
         generation mutual exclusion is covered by infra ``_cw_barrier``).
+
+        ``on_backend_timeout`` is an optional coroutine invoked once whenever a task
+        fails with a Ray_Get_Timeout / execution timeout, used by ModelManagement to
+        probe actor liveness (R3#2).
         """
         self._task_queue_config = config if config is not None else TaskQueueConfig()
         if self._task_queue_config.execution_timeout == 0:
@@ -94,6 +99,7 @@ class TaskQueueMixin:
             config=self._task_queue_config,
             task_metrics=self._task_metrics,
             deployment_name=deployment_name,
+            on_backend_timeout=on_backend_timeout,
         )
 
         # Blocking_Call_Boundary: a dedicated thread pool that moves every backend
