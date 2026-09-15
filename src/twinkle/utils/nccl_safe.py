@@ -58,8 +58,8 @@ def nccl_safe_megatron(func):
             tb = traceback.format_exc()
             if len(tb) > _TRACEBACK_LIMIT:
                 tb = tb[-_TRACEBACK_LIMIT:]
-            logger.error('[nccl_safe_megatron] %s in %s on global rank %s:\n%s', type(exc).__name__, func.__name__,
-                         _global_rank(), tb)
+            logger.error('[nccl_safe_megatron] %s in %s on global rank %s:\n%s',
+                         type(exc).__name__, func.__name__, _global_rank(), tb)
             raise
 
     return wrapper

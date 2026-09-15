@@ -53,7 +53,7 @@ class ComputeWorker:
         config: TaskQueueConfig,
         task_metrics: TaskMetrics | None,
         deployment_name: str,
-        on_backend_timeout: 'Callable[[], Any] | None' = None,
+        on_backend_timeout: Callable[[], Any] | None = None,
     ) -> None:
         self._state = state
         self._config = config

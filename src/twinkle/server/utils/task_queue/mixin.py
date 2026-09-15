@@ -108,8 +108,7 @@ class TaskQueueMixin:
         # would let one leak block the whole queue forever.
         self._backend_executor = ThreadPoolExecutor(thread_name_prefix='twinkle-backend')
         # per-replica Admission_Gate; opt-in per deployment.
-        self._backend_admission: asyncio.Semaphore | None = (
-            asyncio.Semaphore(1) if enable_admission_gate else None)
+        self._backend_admission: asyncio.Semaphore | None = (asyncio.Semaphore(1) if enable_admission_gate else None)
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
 
@@ -144,9 +143,8 @@ class TaskQueueMixin:
         # check-then-acquire is race-free for a Semaphore(1): if not locked here,
         # acquire succeeds synchronously.
         if sem.locked():
-            raise BackendBusyError(
-                'This replica is waiting for a timed-out backend call to exit; '
-                'refusing to queue behind it.')
+            raise BackendBusyError('This replica is waiting for a timed-out backend call to exit; '
+                                   'refusing to queue behind it.')
         await sem.acquire()
 
         def _work() -> Any:

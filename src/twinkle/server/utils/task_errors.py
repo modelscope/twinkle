@@ -7,7 +7,7 @@ state (R5). This module owns the two entry points that produce/repair it.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any
 
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
@@ -30,14 +30,14 @@ def task_error_payload(
     request_id: str,
     error_code: int = 500,
     category: ErrorCategory = ErrorCategory.Server,
-    traceback_text: Optional[str] = None,
+    traceback_text: str | None = None,
 ) -> dict[str, Any]:
     """Build an ``ErrorPayload`` and return it as a JSON-safe dict for storage.
 
     Traceback splitting and length trimming happen here so over-long text is never
     written to State_Backend. A ``User`` category carries no traceback (R5#6).
     """
-    tb: Optional[str] = None
+    tb: str | None = None
     if category != ErrorCategory.User and traceback_text:
         tb = _trim_traceback(traceback_text)
     payload = ErrorPayload(

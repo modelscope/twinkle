@@ -493,15 +493,19 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 while True:
                     remaining = total_timeout - (loop.time() - start)
                     if remaining <= 0:
-                        yield json.dumps(
-                            {'error': 'sample_stream exceeded the execution time bound', 'category': 'Server'}) + '\n'
+                        yield json.dumps({
+                            'error': 'sample_stream exceeded the execution time bound',
+                            'category': 'Server'
+                        }) + '\n'
                         break
                     try:
                         item = await asyncio.wait_for(
                             loop.run_in_executor(None, q.get), timeout=min(single_get_timeout, remaining))
                     except asyncio.TimeoutError:
-                        yield json.dumps(
-                            {'error': 'sample_stream timed out waiting for the next token', 'category': 'Server'}) + '\n'
+                        yield json.dumps({
+                            'error': 'sample_stream timed out waiting for the next token',
+                            'category': 'Server'
+                        }) + '\n'
                         break
                     if item == STREAM_SENTINEL:
                         break

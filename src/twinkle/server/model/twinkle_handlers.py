@@ -110,7 +110,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             inputs = _parse_inputs(body.inputs)
             ret = await self.call_backend(
                 self.model.forward,
-                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                inputs=inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -197,7 +199,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             inputs = _parse_inputs(body.inputs)
             ret = await self.call_backend(
                 self.model.forward_only,
-                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                inputs=inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -306,7 +310,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                         inputs[key] = torch.tensor(inputs[key])
             ret = await self.call_backend(
                 self.model.forward_backward,
-                inputs=all_inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                inputs=all_inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -451,7 +457,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             ret = await self.call_backend(
                 self.model.get_train_configs,
-                adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         return await run_task(
@@ -467,7 +474,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             await self.call_backend(
                 self.model.set_loss,
-                body.loss_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                body.loss_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_loss'))
 
@@ -485,7 +494,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             await self.call_backend(
                 self.model.set_optimizer,
-                body.optimizer_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                body.optimizer_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_optimizer'))
@@ -504,7 +515,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             await self.call_backend(
                 self.model.set_lr_scheduler,
-                body.scheduler_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                body.scheduler_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_lr_scheduler'))
@@ -727,7 +740,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             patch_cls = deserialize_object(body.patch_cls)
             await self.call_backend(
                 self.model.apply_patch,
-                patch_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                patch_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='apply_patch'))
 
@@ -767,7 +782,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             await self.call_backend(
                 self.model.set_template,
-                body.template_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                body.template_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_template'))
 
@@ -785,7 +802,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             await self.call_backend(
                 self.model.set_processor,
-                body.processor_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+                body.processor_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_processor'))

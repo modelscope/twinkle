@@ -137,9 +137,7 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str,
-                         workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]],
-                         timeout=None):
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], timeout=None):
         """Execute method and return results.
 
         ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are

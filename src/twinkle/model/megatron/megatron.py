@@ -444,8 +444,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
                 if completion_mask is not None:
                     # Same index space as labels, so it needs the same CP reassembly.
-                    batch['completion_mask'] = processor.postprocess_tensor_cp(
-                        completion_mask, cu_seqlens=cu_seqlens_q)
+                    batch['completion_mask'] = processor.postprocess_tensor_cp(completion_mask, cu_seqlens=cu_seqlens_q)
                 if 'position_ids' in batch:
                     pos = batch['position_ids']
                     if pos.dim() == 3:

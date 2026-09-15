@@ -139,7 +139,9 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         # ModelManagement opts into the Admission_Gate (collective mis-pairing +
         # queue-bypassing _cleanup_adapter); SamplerManagement does not.
         self._init_task_queue(
-            queue_config, deployment_name='Model', enable_admission_gate=True,
+            queue_config,
+            deployment_name='Model',
+            enable_admission_gate=True,
             on_backend_timeout=self._probe_after_timeout)
         # Bound every ray.get on this backend by the effective execution timeout
         # (applies to both sync=True and sync=False dispatch). T4.1.

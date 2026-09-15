@@ -1047,6 +1047,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     else:
                         # This is the driver
                         from ._ray import RayHelper
+
                         # Resolve the effective ray.get timeout before choosing execute_method:
                         # the decorator's explicit value wins, the instance attribute is the
                         # fallback. ``is not None`` (not ``or``) so that a decorator ``timeout=0``

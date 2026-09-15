@@ -151,8 +151,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 datum_list = body.forward_input.data
                 loss_fn_config = body.forward_input.loss_fn_config or {}
                 output, loss = await self.call_backend(
-                    self.model.tinker_forward_only,
-                    inputs=datum_list, adapter_name=model_adapter, **loss_fn_config)
+                    self.model.tinker_forward_only, inputs=datum_list, adapter_name=model_adapter, **loss_fn_config)
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type='CrossEntropyLossReturn',
                     loss_fn_outputs=output,
@@ -196,7 +195,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 loss_fn_config = body.forward_backward_input.loss_fn_config or {}
                 output, loss = await self.call_backend(
                     self.model.tinker_forward_backward,
-                    inputs=datum_list, adapter_name=model_adapter, loss_fn=loss_fn, **loss_fn_config)
+                    inputs=datum_list,
+                    adapter_name=model_adapter,
+                    loss_fn=loss_fn,
+                    **loss_fn_config)
                 output_type = ('ImportanceSamplingLossReturn'
                                if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn')
                 self.set_resource_state(adapter_name, 'grad_ready', True)
@@ -243,7 +245,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if not self.get_resource_state(adapter_name, 'grad_ready', False):
                     raise RuntimeError(f'No accumulated gradients for adapter={adapter_name}; '
                                        'call forward_backward before optim_step')
-                await self.call_backend(self.model.tinker_step, adam_params=body.adam_params, adapter_name=model_adapter)
+                await self.call_backend(
+                    self.model.tinker_step, adam_params=body.adam_params, adapter_name=model_adapter)
                 self.set_resource_state(adapter_name, 'grad_ready', False)
                 metrics = await self.call_backend(
                     self.model.tinker_calculate_metric, is_training=True, adapter_name=model_adapter)
@@ -275,7 +278,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=False)
                 await self.call_backend(
                     self.model.save,
-                    name=checkpoint_name, output_dir=save_dir, adapter_name=model_adapter, save_optimizer=True)
+                    name=checkpoint_name,
+                    output_dir=save_dir,
+                    adapter_name=model_adapter,
+                    save_optimizer=True)
                 tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=False)
                 return types.SaveWeightsResponse(path=tinker_path, type='save_weights')
             except Exception:
