@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Substituted when execution_timeout is left at 0 ("no configured limit").
+_ZERO_EXECUTION_TIMEOUT_FALLBACK: float = 3600.0
+
 
 class TaskQueueConfig(BaseModel):
     """Configuration for task queue and rate limiting.
@@ -20,7 +23,9 @@ class TaskQueueConfig(BaseModel):
         tps_limit: Maximum input tokens per second per user token. ``0`` disables.
         window_seconds: Sliding window for rate-limit calculations. Must be > 0.
         queue_timeout: Maximum time a task can wait in queue (seconds).
-        execution_timeout: Maximum time a task can execute (seconds). 0 means no limit.
+        execution_timeout: Maximum time a task can execute (seconds). ``0`` means "no
+            configured limit"; a finite bound of 3600s is substituted instead of
+            unbounded waiting (see ``effective_execution_timeout``).
         enabled: Whether rate limiting is enabled.
         token_cleanup_multiplier: Multiplier for token cleanup threshold.
         token_cleanup_interval: How often to run cleanup task (seconds).
@@ -33,8 +38,22 @@ class TaskQueueConfig(BaseModel):
     tps_limit: float = Field(default=16000.0, ge=0)
     window_seconds: float = Field(default=1.0, gt=0)
     queue_timeout: float = Field(default=300.0, ge=0)
-    execution_timeout: float = Field(default=120.0, ge=0)
+    execution_timeout: float = Field(default=1800.0, ge=0)
     enabled: bool = True
     token_cleanup_multiplier: float = Field(default=10.0, ge=0)
     token_cleanup_interval: float = Field(default=60.0, ge=0)
     max_input_tokens: int = Field(default=16000, ge=1)
+
+    @property
+    def effective_execution_timeout(self) -> float:
+        """The single source of the execution time bound.
+
+        ``0`` is not rejected (that would fail existing deployments); it is read
+        as "no configured limit" and replaced by a finite fallback so the bound
+        is always positive. This value feeds both ``_ray_get_timeout`` and the
+        ComputeWorker's ``asyncio.wait_for`` -- there is no second, independently
+        configurable timeout.
+        """
+        if self.execution_timeout > 0:
+            return self.execution_timeout
+        return _ZERO_EXECUTION_TIMEOUT_FALLBACK

@@ -114,7 +114,7 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, timeout=10)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

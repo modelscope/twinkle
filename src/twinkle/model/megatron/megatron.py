@@ -883,7 +883,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def save(self,
              name: Optional[str] = None,
              output_dir: Optional[str] = None,
@@ -1486,7 +1486,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,

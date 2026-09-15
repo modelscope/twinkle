@@ -58,6 +58,10 @@ class TaskQueueMixin:
         config.
         """
         self._task_queue_config = config if config is not None else TaskQueueConfig()
+        if self._task_queue_config.execution_timeout == 0:
+            logger.warning(
+                '[TaskQueue] execution_timeout=0: a finite %.0fs bound has replaced unbounded waiting '
+                '(deployment=%s).', self._task_queue_config.effective_execution_timeout, deployment_name or 'unknown')
         self._deployment_name = deployment_name
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
 

@@ -102,7 +102,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def tinker_load(self, checkpoint_dir: str, **kwargs):
         """Load checkpoint with token-based isolation support."""
         token = kwargs.pop('token', None)
@@ -135,7 +135,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, timeout=10)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

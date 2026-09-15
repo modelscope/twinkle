@@ -232,10 +232,9 @@ class ComputeWorker:
                              f'type={task_type}, queue_key={queue_key}')
                 with traced_operation(handler_span_name, attrs=handler_attrs):
                     coro = task.coro_factory()
-                    if self._config.execution_timeout > 0:
-                        result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
-                    else:
-                        result = await coro
+                    # effective_execution_timeout is always positive (0 -> finite fallback),
+                    # so wait_for is always in effect.
+                    result = await asyncio.wait_for(coro, timeout=self._config.effective_execution_timeout)
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             if task.persist_status:
@@ -250,7 +249,7 @@ class ComputeWorker:
         except asyncio.TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
-            error = (f'Execution timeout exceeded: {self._config.execution_timeout}s, '
+            error = (f'Execution timeout exceeded: {self._config.effective_execution_timeout}s, '
                      f'actual execution time: {exec_time:.2f}s')
             logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
                          f'type={task_type}, queue_key={queue_key}')

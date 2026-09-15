@@ -996,7 +996,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
         lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
-        timeout: Timeout in seconds for ray.get() when collecting results. Instance attribute ``_ray_get_timeout`` overrides this.
+        timeout: Timeout in seconds for ray.get() when collecting results. The decorator's
+            explicitly declared value takes priority; the instance attribute ``_ray_get_timeout``
+            is the fallback for methods that declare none (``timeout if timeout is not None
+            else instance``).
         enable_continous_work: Route each request to the least busy worker instead
             of slicing the batch over all of them, and return the results in the
             caller's order. This is what lets a batch smaller than the worker
@@ -1044,7 +1047,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     else:
                         # This is the driver
                         from ._ray import RayHelper
-                        execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                        # Resolve the effective ray.get timeout before choosing execute_method:
+                        # the decorator's explicit value wins, the instance attribute is the
+                        # fallback. ``is not None`` (not ``or``) so that a decorator ``timeout=0``
+                        # is honored instead of falling back to unbounded waiting.
+                        _rgt = timeout if timeout is not None else getattr(self, '_ray_get_timeout', None)
+                        execute_method = RayHelper.execute_all_async if not sync else functools.partial(
+                            RayHelper.execute_all_sync, timeout=_rgt)
                         # Only classes whose workers run methods side by side need
                         # this; elsewhere Ray already orders calls per actor.
                         _concurrent_actor = bool(getattr(self, '_max_concurrency', None))
@@ -1060,8 +1069,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _batch_len = _cw_batch_len(args, kwargs)
                             if _batch_len:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
-                                                           _batch_len,
-                                                           getattr(self, '_ray_get_timeout', None) or timeout)
+                                                           _batch_len, _rgt)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -1079,7 +1087,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         # busy.
                         _tracked_refs = _cw_register(self, func.__name__, result) if _concurrent_actor else []
                         # This is a result future, call it to get the actual result
-                        _rgt = getattr(self, '_ray_get_timeout', None) or timeout
                         result_func = RayHelper.do_get_and_collect_func(
                             _collect_func, collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = _lazy_collect
@@ -1090,13 +1097,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         if func.__name__ == '__len__':
                             # Get the first result and ignore the `lazy_collect`
                             import ray
-                            return ray.get(result[0])
+                            return ray.get(result[0], timeout=_rgt)
 
                         if func.__name__ == '__next__':
                             import ray
                             for _res in result:
                                 # raise when any worker raises StopIteration
-                                stop = ray.get(_res[1])
+                                stop = ray.get(_res[1], timeout=_rgt)
                                 if stop:
                                     raise StopIteration()
                             result = [_res[0] for _res in result]
