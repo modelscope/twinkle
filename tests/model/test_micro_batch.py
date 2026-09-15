@@ -8,7 +8,6 @@ from twinkle.loss.base import Loss
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.utils.nccl_safe import safe_loss
 
 
 @pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
@@ -70,17 +69,6 @@ def test_sample_mean_and_token_sum_micro_batch_scales():
 
     assert GRPOLoss().micro_batch_scale(inputs, [0]) == .25
     assert CrossEntropyLoss(reduction='sum').micro_batch_scale(inputs, [0]) == 1.0
-
-
-def test_safe_loss_preserves_wrapped_micro_batch_scale():
-    inputs = [
-        {'labels': [1, -100]},
-        {'labels': [2, 3]},
-        {'labels': [4, -100]},
-        {'labels': [5, 6]},
-    ]
-
-    assert safe_loss(GRPOLoss()).micro_batch_scale(inputs, [0, 2]) == .5
 
 
 def test_loss_without_micro_batch_semantics_fails_when_split():

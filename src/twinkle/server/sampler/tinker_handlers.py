@@ -19,9 +19,26 @@ if TYPE_CHECKING:
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.utils import get_template_for_model
+from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _sampled_sequence(*, stop_reason, tokens, logprobs):
+    return types.SampledSequence(
+        stop_reason=stop_reason,
+        tokens=tokens,
+        logprobs=logprobs,
+    )
+
+
+def _sample_response(*, sequences, prompt_logprobs, topk_prompt_logprobs):
+    return types.SampleResponse(
+        sequences=sequences,
+        prompt_logprobs=prompt_logprobs,
+        topk_prompt_logprobs=topk_prompt_logprobs,
+    )
 
 
 def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -52,9 +69,9 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Set template for sampler based on model type
                 template = get_template_for_model(self.model_id)
-                self.sampler.set_template(template, model_id=self.model_id)
+                await self.call_backend(self.sampler.set_template, template, model_id=self.model_id)
                 # Reset prefix cache for new weights
-                self.sampler.reset_prefix_cache()
+                await self.call_backend(self.sampler.reset_prefix_cache)
 
                 # Get model_path from body or sampling session
                 model_path = body.model_path
@@ -71,10 +88,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Base-model sampling is valid when no model_path was provided.
                 if adapter_uri and not os.path.exists(adapter_uri):
-                    return types.RequestFailedResponse(
-                        error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
 
                 # Convert tinker SamplingParams to twinkle SamplingParams if needed
                 sampling_params = None
@@ -96,9 +110,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                     if os.path.exists(os.path.join(adapter_uri, 'adapter_config.json')):
                         lora_path = adapter_uri
                     else:
-                        self.sampler.load_full_weights_from_path(adapter_uri)
+                        await self.call_backend(self.sampler.load_full_weights_from_path, adapter_uri)
 
-                responses = self.sampler.sample(
+                responses = await self.call_backend(
+                    self.sampler.sample,
                     inputs=[prompt_inputs] * body.num_samples,
                     sampling_params=sampling_params,
                     adapter_path=lora_path,
@@ -119,22 +134,19 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                             if flattened and len(flattened) == len(seq.logprobs):
                                 logprobs = flattened
                         tinker_sequences.append(
-                            types.SampledSequence(
+                            _sampled_sequence(
                                 stop_reason=seq.stop_reason,
                                 tokens=list(seq.tokens),
                                 logprobs=logprobs,
                             ))
-                return types.SampleResponse(
+                return _sample_response(
                     sequences=tinker_sequences,
                     prompt_logprobs=responses[0].prompt_logprobs,
                     topk_prompt_logprobs=responses[0].topk_prompt_logprobs,
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         input_tokens = len(body.prompt.to_ints())
         return await self.schedule_task(

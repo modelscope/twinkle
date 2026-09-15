@@ -8,18 +8,22 @@ and continuous batching internally.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import time
 import traceback
 import uuid
 from collections.abc import Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from twinkle.server.telemetry.middleware import get_task_metrics
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.errors import ErrorCategory
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
@@ -50,16 +54,38 @@ class TaskQueueMixin:
 
     state: ServerState
 
-    def _init_task_queue(self, config: TaskQueueConfig | None = None, deployment_name: str = '') -> None:
+    def _init_task_queue(
+        self,
+        config: TaskQueueConfig | None = None,
+        deployment_name: str = '',
+        *,
+        enable_admission_gate: bool = False,
+        on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        collect_width: int = 1,
+    ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
         ``config`` must be a typed :class:`TaskQueueConfig` (the launcher
         passes the instance straight through). ``None`` constructs a default
         config.
+
+        ``enable_admission_gate`` turns on the per-replica Admission_Gate
+        (:meth:`call_backend`). ``ModelManagement`` enables it; ``SamplerManagement``
+        does not (vllm sampler owns its own concurrency and the weight-update /
+        generation mutual exclusion is covered by infra ``_cw_barrier``).
+
+        ``on_backend_timeout`` runs after a backend timeout. ``collect_width`` is the
+        number of actor results a backend call may collect and determines the persisted
+        future deadline.
         """
         self._task_queue_config = config if config is not None else TaskQueueConfig()
+        if self._task_queue_config.execution_timeout == 0:
+            logger.warning(
+                '[TaskQueue] execution_timeout=0: a finite %.0fs bound has replaced unbounded waiting '
+                '(deployment=%s).', self._task_queue_config.effective_execution_timeout, deployment_name or 'unknown')
         self._deployment_name = deployment_name
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
+        self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
 
         self._rate_limiter = RateLimiter(
             rps_limit=self._task_queue_config.rps_limit,
@@ -77,9 +103,94 @@ class TaskQueueMixin:
             config=self._task_queue_config,
             task_metrics=self._task_metrics,
             deployment_name=deployment_name,
+            on_backend_timeout=on_backend_timeout,
         )
 
+        self._backend_executor = ThreadPoolExecutor(thread_name_prefix='twinkle-backend')
+        self._backend_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='twinkle-backend-probe')
+        self._backend_admission: asyncio.Lock | None = asyncio.Lock() if enable_admission_gate else None
+        self._backend_poisoned = asyncio.Event()
         self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    async def _acquire_backend_gate(self, gate: asyncio.Lock) -> None:
+        if self._backend_poisoned.is_set():
+            raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
+        if not gate.locked():
+            await gate.acquire()
+        else:
+            acquire_task = asyncio.create_task(gate.acquire())
+            poison_task = asyncio.create_task(self._backend_poisoned.wait())
+            try:
+                done, _ = await asyncio.wait((acquire_task, poison_task), return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                acquire_task.cancel()
+                poison_task.cancel()
+                await asyncio.gather(acquire_task, poison_task, return_exceptions=True)
+                if acquire_task.done() and not acquire_task.cancelled() and acquire_task.result():
+                    gate.release()
+                raise
+            if poison_task in done and self._backend_poisoned.is_set():
+                if acquire_task.done() and not acquire_task.cancelled() and acquire_task.result():
+                    gate.release()
+                else:
+                    acquire_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await acquire_task
+                raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
+            poison_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poison_task
+            await acquire_task
+        if self._backend_poisoned.is_set():
+            gate.release()
+            raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
+
+    async def call_backend(self, fn: Callable[..., Any], /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
+        """Run one backend call outside the event loop.
+
+        Normal model calls serialize through the admission gate. If the awaiting
+        task times out while its thread is still running, the gate is poisoned:
+        waiters fail immediately until that thread exits. Health probes bypass the
+        gate and use a reserved executor thread. Sampler deployments disable the
+        gate because their backend owns request concurrency.
+        """
+        loop = asyncio.get_running_loop()
+        gate = self._backend_admission if admit else None
+        if gate is not None:
+            await self._acquire_backend_gate(gate)
+
+        executor = self._backend_executor if admit else self._backend_probe_executor
+        try:
+            concurrent_future = executor.submit(functools.partial(fn, *args, **kwargs))
+        except Exception:
+            if gate is not None and gate.locked():
+                gate.release()
+            raise
+
+        if gate is not None:
+
+            def release_gate(_future) -> None:
+
+                def release() -> None:
+                    self._backend_poisoned.clear()
+                    if gate.locked():
+                        gate.release()
+
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(release)
+
+            concurrent_future.add_done_callback(release_gate)
+
+        try:
+            return await asyncio.wrap_future(concurrent_future, loop=loop)
+        except asyncio.CancelledError:
+            if gate is not None and concurrent_future.running():
+                self._backend_poisoned.set()
+            raise
+
+    def _future_deadline(self) -> float:
+        ttl = getattr(self, '_future_absolute_ttl', self._task_queue_config.absolute_future_ttl(1))
+        return time.time() + ttl
 
     @staticmethod
     def _queue_key(model_id: str | None, token: str | None) -> str:
@@ -108,7 +219,13 @@ class TaskQueueMixin:
             return None
 
         async def reject(error_msg: str, queue_state: str) -> dict[str, Any]:
-            error_payload = {'error': error_msg, 'category': 'User'}
+            error_code = 429 if queue_state == QueueState.PAUSED_RATE_LIMIT.value else 400
+            error_payload = task_error_payload(
+                error_msg,
+                request_id=request_id,
+                error_code=error_code,
+                category=ErrorCategory.User,
+            )
             if persist_failure:
                 await self.state.store_future_status(
                     request_id,
@@ -117,6 +234,7 @@ class TaskQueueMixin:
                     result=error_payload,
                     queue_state=queue_state,
                     queue_state_reason=error_msg,
+                    replica_id=getattr(self, 'replica_id', None),
                 )
                 return {'request_id': request_id, 'model_id': model_id}
             # Private marker consumed by schedule_task_and_wait().  It is not
@@ -192,6 +310,8 @@ class TaskQueueMixin:
                 TaskStatus.PENDING.value,
                 model_id,
                 queue_state=QueueState.ACTIVE.value,
+                replica_id=getattr(self, 'replica_id', None),
+                absolute_deadline=self._future_deadline(),
             )
 
         queue_key = self._queue_key(model_id=model_id, token=token)
@@ -342,6 +462,8 @@ class TaskQueueMixin:
             TaskStatus.RUNNING.value,
             model_id,
             queue_state=QueueState.ACTIVE.value,
+            replica_id=getattr(self, 'replica_id', None),
+            absolute_deadline=self._future_deadline(),
         )
 
         async def _run() -> None:
@@ -355,8 +477,13 @@ class TaskQueueMixin:
                     queue_state=QueueState.ACTIVE.value,
                 )
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
-            except Exception:
-                error_payload = task_error_payload(traceback.format_exc())
+            except Exception as exc:
+                error_payload = task_error_payload(
+                    f'{type(exc).__name__}: {exc}',
+                    request_id=request_id,
+                    error_code=500,
+                    traceback_text=traceback.format_exc(),
+                )
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,
@@ -413,4 +540,9 @@ class TaskQueueMixin:
         """Gracefully shut down the compute queue and release resources."""
         await self._rate_limiter.stop_cleanup_task()
         await self._compute_worker.stop()
+        # Do not wait on threads that may be leaked on a timed-out backend call.
+        if getattr(self, '_backend_executor', None) is not None:
+            self._backend_executor.shutdown(wait=False, cancel_futures=True)
+        if getattr(self, '_backend_probe_executor', None) is not None:
+            self._backend_probe_executor.shutdown(wait=False, cancel_futures=True)
         logger.debug('[TaskQueue] Task queue shutdown complete')

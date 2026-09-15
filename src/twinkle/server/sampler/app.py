@@ -7,7 +7,6 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
-import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
@@ -103,12 +102,12 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.sampler_type = sampler_type
         self.model_id = model_id
         replica_context = serve.get_replica_context()
-        replica_id = replica_context.replica_id.unique_id
+        self.replica_id = replica_context.replica_id.unique_id
 
         sampler_kwargs: dict[str, Any] = {
             'model_id': model_id,
             'remote_group': self.device_group.name,
-            'instance_id': replica_id,
+            'instance_id': self.replica_id,
         }
         if sampler_type != 'mock':
             sampler_kwargs.update(
@@ -127,14 +126,25 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
 
-        # Initialize task queue mixin
-        self._init_task_queue(queue_config, deployment_name='Sampler')
+        actors = getattr(self.sampler, '_actors', None)
+        self._init_task_queue(
+            queue_config,
+            deployment_name='Sampler',
+            collect_width=len(actors) if actors else 1,
+        )
+        self.sampler._ray_get_timeout = self._task_queue_config.effective_execution_timeout
 
     async def shutdown(self) -> None:
-        cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
-        if callable(cancel_all):
-            await asyncio.to_thread(cancel_all)
-        await self.data_plane.close()
+        try:
+            cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+            if callable(cancel_all):
+                await self.call_backend(cancel_all)
+        finally:
+            try:
+                await self.state.unregister_replica(self.replica_id)
+            finally:
+                await self.shutdown_task_queue()
+                await self.data_plane.close()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -146,9 +156,9 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
-        token = get_token_from_request(request)
-        return token
+        return get_token_from_request(request)
 
 
 def build_sampler_app(model_id: str,

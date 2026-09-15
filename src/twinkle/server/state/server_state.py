@@ -289,6 +289,8 @@ class ServerState:
         result: Any = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
+        replica_id: str | None = None,
+        absolute_deadline: float | None = None,
     ) -> None:
         """Store task status with optional result.
 
@@ -317,6 +319,8 @@ class ServerState:
             result=result,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
+            replica_id=replica_id,
+            absolute_deadline=absolute_deadline,
         )
 
     # ----- Configuration Management -----
@@ -370,7 +374,9 @@ class ServerState:
         models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
         samplings_removed = await self._sampling_mgr.cleanup_expired(
             cutoff_time, expired_session_ids=expired_session_ids)
-        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time)
+
+        alive_replica_ids = await self._model_mgr.get_alive_replica_ids(self.expiration_timeout)
+        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time, alive_replica_ids=alive_replica_ids)
 
         return {
             'sessions': sessions_removed,
@@ -378,6 +384,10 @@ class ServerState:
             'sampling_sessions': samplings_removed,
             'futures': futures_removed,
         }
+
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        """Refresh a replica's liveness timestamp in the shared registry (R4#6)."""
+        await self._model_mgr.touch_replica_last_seen(replica_id)
 
     async def _cleanup_loop(self) -> None:
         """Background task that periodically cleans up expired resources.

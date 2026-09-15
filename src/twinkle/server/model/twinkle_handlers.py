@@ -8,13 +8,11 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 """
 from __future__ import annotations
 
-import asyncio
 import torch
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pathlib import Path
-from peft import LoraConfig
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -29,7 +27,6 @@ from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_
                                         select_output_rows)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -71,8 +68,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self: ModelManagement = Depends(self_fn),
     ) -> dict:
         """Deep health probe: pings underlying model actors to verify liveness."""
-        result = self.check_model_health()
-        if not result['healthy']:
+        result = await self.check_model_health()
+        if self._model_unhealthy or not result['healthy']:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=503, content=result)
         return result
@@ -108,8 +105,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             inputs = _parse_inputs(body.inputs)
-            ret = self.model.forward(
-                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.forward,
+                inputs=inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -139,7 +139,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
-            ret = self.model.forward(
+            ret = await self.call_backend(
+                self.model.forward,
                 inputs=_parse_inputs(raw_inputs),
                 adapter_name=adapter_name,
                 **kwargs,
@@ -193,8 +194,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             inputs = _parse_inputs(body.inputs)
-            ret = self.model.forward_only(
-                inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.forward_only,
+                inputs=inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -222,7 +226,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             inputs = _parse_inputs(raw_inputs)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
-            ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **kwargs)
+            ret = await self.call_backend(self.model.forward_only, inputs=inputs, adapter_name=adapter_name, **kwargs)
             if body.output_ref is not None:
                 rows = select_output_rows(
                     ret,
@@ -257,7 +261,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.calculate_loss(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.calculate_loss, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         return await run_task(
@@ -271,7 +276,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.backward(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.backward, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='backward'))
 
@@ -299,8 +305,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 for key in inputs:
                     if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
                         inputs[key] = torch.tensor(inputs[key])
-            ret = self.model.forward_backward(
-                inputs=all_inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.forward_backward,
+                inputs=all_inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -330,7 +339,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.assert_resource_exists(adapter_name)
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
-            ret = self.model.forward_backward(
+            ret = await self.call_backend(
+                self.model.forward_backward,
                 inputs=_parse_inputs(raw_inputs),
                 adapter_name=adapter_name,
                 **kwargs,
@@ -361,7 +371,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.clip_grad_norm(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.clip_grad_norm, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': str(ret)}
 
         return await run_task(
@@ -375,7 +386,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.step(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.step, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='step'))
 
@@ -387,7 +399,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.zero_grad(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.zero_grad, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='zero_grad'))
 
@@ -399,7 +412,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.lr_step(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.lr_step, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='lr_step'))
 
@@ -415,7 +429,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.clip_grad_and_step(
+            await self.call_backend(
+                self.model.clip_grad_and_step,
                 max_grad_norm=body.max_grad_norm,
                 norm_type=body.norm_type,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -437,8 +452,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.get_train_configs(
-                adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.get_train_configs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
             return {'result': ret}
 
         return await run_task(
@@ -452,8 +469,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_loss(
-                body.loss_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.set_loss,
+                body.loss_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_loss'))
 
@@ -469,8 +489,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_optimizer(
-                body.optimizer_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.set_optimizer,
+                body.optimizer_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_optimizer'))
@@ -487,8 +510,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_lr_scheduler(
-                body.scheduler_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.set_lr_scheduler,
+                body.scheduler_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_lr_scheduler'))
@@ -510,7 +536,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
             # For sampler weights the actual data is always written to 'latest/'.
             model_save_name = 'latest' if body.is_sampler else checkpoint_name
-            checkpoint_dir = self.model.save(
+            checkpoint_dir = await self.call_backend(
+                self.model.save,
                 name=model_save_name,
                 output_dir=save_dir,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -530,7 +557,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             resolved = checkpoint_manager.resolve_load_path(body.name)
-            self.model.load(
+            await self.call_backend(
+                self.model.load,
                 name=resolved.checkpoint_name,
                 output_dir=resolved.checkpoint_dir,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -556,7 +584,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             checkpoint_dir = (
                 Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
                 if resolved.checkpoint_dir else body.name)
-            ret = self.model.resume_from_checkpoint(
+            ret = await self.call_backend(
+                self.model.resume_from_checkpoint,
                 checkpoint_dir,
                 resume_only_model=body.resume_only_model,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -588,11 +617,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                     checkpoint_manager.get_ckpt_dir(model_id=model_id_to_load, checkpoint_id=checkpoint_id))
             else:
                 checkpoint_dir = body.checkpoint_dir
-            # Run blocking upload in thread pool so the event loop is not blocked.
-            # async_upload is intentionally ignored here: the task queue + client polling
-            # already provide the fire-and-forget / wait semantics without holding the
-            # HTTP connection open for the full duration of the upload.
-            await asyncio.to_thread(
+            await self.call_backend(
                 self.model.upload_to_hub,
                 checkpoint_dir=checkpoint_dir,
                 hub_model_id=body.hub_model_id,
@@ -640,6 +665,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raise HTTPException(status_code=400, detail=str(exc))
 
         async def _task():
+            from peft import LoraConfig
+
+            from twinkle_client.common.serialize import deserialize_object
             config = deserialize_object(body.config)
             extra_kwargs = body.model_extra or {}
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
@@ -682,7 +710,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                     # No PEFT adapter to add; the default optimizer group is used.
                     self.set_resource_state(adapter_name, 'grad_ready', False)
                 else:
-                    self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
+                    await self.call_backend(self.model.add_adapter_to_model, adapter_name, config, **extra_kwargs)
             except Exception:
                 self.unregister_resource(adapter_name)
                 await self.state.unload_model(adapter_name)
@@ -703,11 +731,15 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
+            from twinkle_client.common.serialize import deserialize_object
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             patch_cls = deserialize_object(body.patch_cls)
-            self.model.apply_patch(
-                patch_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.apply_patch,
+                patch_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='apply_patch'))
 
@@ -721,10 +753,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
+            from twinkle_client.common.serialize import deserialize_object
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             metric_cls = deserialize_object(body.metric_cls)
-            self.model.add_metric(
+            await self.call_backend(
+                self.model.add_metric,
                 metric_cls,
                 is_training=body.is_training,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -744,8 +778,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_template(
-                body.template_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.set_template,
+                body.template_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_template'))
 
@@ -761,8 +798,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            self.model.set_processor(
-                body.processor_cls, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            await self.call_backend(
+                self.model.set_processor,
+                body.processor_cls,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **extra_kwargs)
 
         await run_task(
             self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_processor'))
@@ -779,7 +819,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.calculate_metric(
+            ret = await self.call_backend(
+                self.model.calculate_metric,
                 is_training=body.is_training,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 **extra_kwargs)
@@ -800,7 +841,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.get_state_dict(adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
+            ret = await self.call_backend(
+                self.model.get_state_dict, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
         return await run_task(

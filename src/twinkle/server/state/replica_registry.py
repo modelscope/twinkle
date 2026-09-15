@@ -1,26 +1,26 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Backend-backed registry of replica capacity.
+"""Backend-backed registry of replica capacity and liveness.
 
-Each entry persists to ``replica::<replica_id>::max_loras`` in the configured
-:class:`StateBackend` (Redis or the actor-wrapped RayActorBackend), so every
-Ray Serve worker sees one consistent view of the cluster's capacity even
-though each worker holds its own ``ServerState`` instance.
-
-The registry knows *only* about declared capacity. The current loaded-model
-count is derived by querying the persisted ``model::*`` records directly —
-nothing here caches that count, so concurrent writes from different workers
-cannot drift into an inconsistent local index.
+Capacity and ``last_seen`` use separate keys so sampler liveness does not alter
+the model-capacity data shape.
 """
 from __future__ import annotations
+
+import time
 
 from .backend.base import StateBackend
 
 REPLICA_PREFIX = 'replica::'
 _MAX_LORAS_SUFFIX = '::max_loras'
+_LAST_SEEN_SUFFIX = '::last_seen'
 
 
 def _make_key(replica_id: str) -> str:
     return f'{REPLICA_PREFIX}{replica_id}{_MAX_LORAS_SUFFIX}'
+
+
+def _last_seen_key(replica_id: str) -> str:
+    return f'{REPLICA_PREFIX}{replica_id}{_LAST_SEEN_SUFFIX}'
 
 
 def _replica_id_from_key(key: str) -> str | None:
@@ -30,7 +30,7 @@ def _replica_id_from_key(key: str) -> str | None:
 
 
 class ReplicaRegistry:
-    """Read/write replica capacity through the shared :class:`StateBackend`."""
+    """Read/write replica capacity and liveness through the shared backend."""
 
     def __init__(self, backend: StateBackend) -> None:
         self._backend = backend
@@ -42,6 +42,36 @@ class ReplicaRegistry:
     async def unregister(self, replica_id: str) -> None:
         """Remove the capacity entry for ``replica_id`` (idempotent)."""
         await self._backend.delete(_make_key(replica_id))
+        await self._backend.delete(_last_seen_key(replica_id))
+
+    async def touch_last_seen(self, replica_id: str) -> None:
+        """Refresh the replica's liveness timestamp (separate key from max_loras)."""
+        await self._backend.set(_last_seen_key(replica_id), time.time())
+
+    async def get_last_seen(self, replica_id: str) -> float | None:
+        """Return the replica's last-seen unix time, or ``None`` if never refreshed."""
+        value = await self._backend.get(_last_seen_key(replica_id))
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def get_all_last_seen(self) -> dict[str, float]:
+        """Return every replica's last-seen timestamp."""
+        keys = await self._backend.keys(f'{REPLICA_PREFIX}*{_LAST_SEEN_SUFFIX}')
+        out: dict[str, float] = {}
+        for key in keys:
+            if not key.startswith(REPLICA_PREFIX) or not key.endswith(_LAST_SEEN_SUFFIX):
+                continue
+            rid = key[len(REPLICA_PREFIX):-len(_LAST_SEEN_SUFFIX)]
+            value = await self._backend.get(key)
+            try:
+                out[rid] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def get_max_loras(self, replica_id: str) -> int | None:
         """Return the declared capacity, or ``None`` if the replica is unknown."""

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.utils.task_errors import error_payload_from_stored
 from twinkle.server.utils.task_queue import QueueState
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
@@ -119,8 +120,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             }
 
         if status == 'failed':
-            result = record.get('result', {})
-            return {'error': result.get('error', 'Unknown error'), 'category': result.get('category', 'Server')}
+            payload = error_payload_from_stored(record.get('result'), request_id=request_id)
+            return payload.model_dump(mode='json', exclude_none=True)
 
         result = record.get('result')
         if result is None:

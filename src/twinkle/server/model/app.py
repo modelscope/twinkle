@@ -7,7 +7,8 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+import asyncio
+from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
 from typing import Any
@@ -131,9 +132,18 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
+        self._model_unhealthy = False
+        self._health_probe_task = None
 
-        # Initialize mixins
-        self._init_task_queue(queue_config, deployment_name='Model')
+        actors = getattr(self.model, '_actors', None)
+        self._init_task_queue(
+            queue_config,
+            deployment_name='Model',
+            enable_admission_gate=True,
+            on_backend_timeout=self._probe_after_timeout,
+            collect_width=len(actors) if actors else 1,
+        )
+        self.model._ray_get_timeout = self._task_queue_config.effective_execution_timeout
         self._init_adapter_manager(**(adapter_config or {}))
         await self._register_replica_on_startup()
         # Note: countdown task is started lazily in _ensure_sticky()
@@ -152,6 +162,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """Register this replica's capacity before Ray Serve marks it ready."""
         if not self._replica_registered:
             await self.state.register_replica(self.replica_id, self.max_loras)
+            await self.state.touch_replica_last_seen(self.replica_id)
             self._replica_registered = True
 
     @serve.multiplexed(max_num_models_per_replica=5)
@@ -166,9 +177,11 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
-        token = get_token_from_request(request)
-        return token
+        if self._model_unhealthy:
+            raise HTTPException(status_code=503, detail='Model actors are unavailable')
+        return get_token_from_request(request)
 
     async def shutdown(self) -> None:
         """Explicit async cleanup — called via FastAPI shutdown event."""
@@ -176,32 +189,49 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             await self.state.unregister_replica(self.replica_id)
         except Exception:
             pass
+        await self.shutdown_task_queue()
         await self.data_plane.close()
 
-    def check_model_health(self) -> dict:
-        """Probe model actors liveness via a lightweight ping.
-
-        Returns a dict with 'healthy' (bool) and 'detail' (str).
-        If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
-        will raise RayActorError, signalling the watchdog to restart.
-        """
+    async def _run_model_health_probe(self) -> dict:
         try:
-            result = self.model.ping()
+            result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
+                self._model_unhealthy = False
                 return {'healthy': True, 'detail': 'model actors alive'}
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
         except Exception as e:
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
+
+    async def check_model_health(self) -> dict:
+        """Run one coalesced actor probe outside the event loop."""
+        current = getattr(self, '_health_probe_task', None)
+        if current is None or current.done():
+            self._health_probe_task = asyncio.create_task(self._run_model_health_probe())
+        return await asyncio.shield(self._health_probe_task)
+
+    def mark_unhealthy(self) -> None:
+        """Flag the deployment unhealthy; /healthz returns 503 until a probe recovers it."""
+        self._model_unhealthy = True
+
+    async def _probe_after_timeout(self) -> None:
+        """Fired by ComputeWorker on a backend timeout: probe and log liveness (R3#2)."""
+        result = await self.check_model_health()
+        logger.warning('[Model] post-timeout liveness probe: %s', result)
 
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):
-            self.clear_resource_state(adapter_name)
             if self.train_mode == 'full':
                 # No PEFT adapter to remove; restore clean base weights so the
                 # next tenant does not inherit this tenant's trained weights.
-                self.model.reload_initial_weights()
+                # Takes the Admission_Gate: this path is driven by the background
+                # countdown and never enters Task_Queue, so the gate is what keeps
+                # it from colliding with an in-flight training call.
+                await self.call_backend(self.model.reload_initial_weights)
             else:
-                self.model.remove_adapter(adapter_name)
+                await self.call_backend(self.model.remove_adapter, adapter_name)
+            self.clear_resource_state(adapter_name)
             self.unregister_resource(adapter_name)
             await self.state.unload_model(adapter_name)
 

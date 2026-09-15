@@ -73,8 +73,10 @@ class _SaveWeightsDummyManagement:
         pass
 
     async def schedule_task(self, task, **kwargs):
-        # Actually execute the task to test response logic
         return await task()
+
+    async def call_backend(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
 
 
 @pytest.mark.asyncio

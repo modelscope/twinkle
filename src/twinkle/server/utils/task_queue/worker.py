@@ -12,20 +12,28 @@ import asyncio
 import time
 import traceback
 from collections import deque
-from typing import TYPE_CHECKING, Any, Deque
+from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.errors import ErrorCategory
 from .config import TaskQueueConfig
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
     from twinkle.server.telemetry.middleware import TaskMetrics
 
 logger = get_logger()
+
+# Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server (R5#8).
+try:
+    from ray.exceptions import GetTimeoutError as _RayGetTimeout
+    _TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (asyncio.TimeoutError, _RayGetTimeout)
+except Exception:  # pragma: no cover - ray always present in server runtime
+    _TIMEOUT_EXCEPTIONS = (asyncio.TimeoutError, )
 
 
 class ComputeWorker:
@@ -46,11 +54,14 @@ class ComputeWorker:
         config: TaskQueueConfig,
         task_metrics: TaskMetrics | None,
         deployment_name: str,
+        on_backend_timeout: Callable[[], Any] | None = None,
     ) -> None:
         self._state = state
         self._config = config
         self._task_metrics = task_metrics
         self._deployment_name = deployment_name
+        # Optional coroutine-returning callback fired on a backend timeout (R3#2).
+        self._on_backend_timeout = on_backend_timeout
 
         self.task_queues: dict[str, asyncio.Queue] = {}
         self.queue_order: Deque[str] = deque()
@@ -141,14 +152,24 @@ class ComputeWorker:
         error: str,
         queue_state: str,
         queue_state_reason: str | None = None,
+        *,
+        error_code: int = 500,
+        category: ErrorCategory = ErrorCategory.Server,
+        traceback_text: str | None = None,
     ) -> None:
-        """Store FAILED status with a standardised error payload."""
+        """Store FAILED status with a standardised ``ErrorPayload``."""
         if task.persist_status:
             await self._state.store_future_status(
                 task.request_id,
                 TaskStatus.FAILED.value,
                 task.model_id,
-                result=task_error_payload(error),
+                result=task_error_payload(
+                    error,
+                    request_id=task.request_id,
+                    error_code=error_code,
+                    category=category,
+                    traceback_text=traceback_text,
+                ),
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
             )
@@ -232,10 +253,9 @@ class ComputeWorker:
                              f'type={task_type}, queue_key={queue_key}')
                 with traced_operation(handler_span_name, attrs=handler_attrs):
                     coro = task.coro_factory()
-                    if self._config.execution_timeout > 0:
-                        result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
-                    else:
-                        result = await coro
+                    # effective_execution_timeout is always positive (0 -> finite fallback),
+                    # so wait_for is always in effect.
+                    result = await asyncio.wait_for(coro, timeout=self._config.effective_execution_timeout)
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             if task.persist_status:
@@ -247,21 +267,50 @@ class ComputeWorker:
                     queue_state=QueueState.ACTIVE.value,
                 )
             self._complete_result(task, result)
-        except asyncio.TimeoutError:
+        except _TIMEOUT_EXCEPTIONS:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
-            error = (f'Execution timeout exceeded: {self._config.execution_timeout}s, '
+            error = (f'Backend call timed out (bound {self._config.effective_execution_timeout}s), '
                      f'actual execution time: {exec_time:.2f}s')
             logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
                          f'type={task_type}, queue_key={queue_key}')
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
-        except Exception:
+            # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server (R5#8).
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=504)
+            # Probe actor liveness after a timeout so an operator learns the replica's
+            # state without waiting for a second request to also time out (R3#2).
+            if self._on_backend_timeout is not None:
+                try:
+                    await self._on_backend_timeout()
+                except Exception:
+                    logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
+        except UserTaskError as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start
-            error = traceback.format_exc()
+            await self._store_task_failed(
+                task,
+                f'{type(exc).__name__}: {exc}',
+                QueueState.UNKNOWN.value,
+                error_code=400,
+                category=ErrorCategory.User,
+            )
+        except BackendBusyError as exc:
+            task_status = 'failed'
+            exec_time = time.monotonic() - exec_start
+            error = str(exc)
+            logger.error(f'[ComputeWorker] Task {task.request_id} REFUSED (admission gate held) after '
+                         f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
+            # Gate held by a leaked timed-out call -> 503/Server (R2#4).
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=503)
+        except Exception as exc:
+            task_status = 'failed'
+            exec_time = time.monotonic() - exec_start
+            # error is a single-line summary; the full traceback goes only to the
+            # traceback field, never into `error` (R5#7).
+            error = f'{type(exc).__name__}: {exc}'
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
+            await self._store_task_failed(
+                task, error, QueueState.ACTIVE.value, error_code=500, traceback_text=traceback.format_exc())
         finally:
             q.task_done()
             self._record_execution_time(task_type, exec_time)
@@ -296,11 +345,28 @@ class ComputeWorker:
                 await self._fail_timed_out_task(task, queue_wait, q)
                 continue  # try the next queue
 
+            # A record already in a Terminal_State (e.g. written 'failed' by the
+            # state-hygiene orphan handling) must not be executed again (R3#8).
+            if task.persist_status and await self._is_record_terminal(task.request_id):
+                logger.info(f'[ComputeWorker] Task {task.request_id} already terminal on dequeue; skipping.')
+                q.task_done()
+                continue
+
             # Execute the task (serial: stops after the first execution)
             await self._execute_task(task, queue_key, q)
             return True
 
         return False
+
+    async def _is_record_terminal(self, request_id: str) -> bool:
+        """True if the future record already holds a Terminal_State."""
+        try:
+            record = await self._state.get_future(request_id)
+        except Exception:
+            return False
+        if not record:
+            return False
+        return record.get('status') in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value)
 
     # ------------------------------------------------------------------
     # Main worker loop
