@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import functools
-from datetime import datetime
+import time
 from typing import Any
 
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .base import BaseManager
-from .models import FutureRecord
+from .models import FutureRecord, _now_iso
 
 logger = get_logger()
 
@@ -112,7 +112,7 @@ class FutureManager(BaseManager[FutureRecord]):
         if result is not None and hasattr(result, 'model_dump'):
             result = result.model_dump()
 
-        now = datetime.now().isoformat()
+        now = _now_iso()
         await self._backend.update_atomic(
             self._make_key(request_id),
             functools.partial(
@@ -162,10 +162,7 @@ class FutureManager(BaseManager[FutureRecord]):
             counted here; they are removed on a later pass once terminal).
         """
         all_records = await self.get_all()
-        # Use the same clock convention as the stored timestamps (_parse_timestamp on
-        # an ISO string) so the age computation is not skewed by _now_iso writing
-        # local time while _parse_timestamp reads naive ISO as UTC.
-        now = self._parse_timestamp(datetime.now().isoformat())
+        now = time.time()
         expired_ids: list[str] = []
         for request_id, record in all_records.items():
             if record.status in _TERMINAL_STATUSES:

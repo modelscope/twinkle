@@ -5,7 +5,7 @@ Spec: T5.6 / R9#5 / R9#6 / Property 6 / Property 7. Uses the Ray-free FileBacken
 """
 from __future__ import annotations
 
-from datetime import datetime
+import time
 from unittest import mock
 
 import pytest
@@ -20,11 +20,6 @@ def manager(tmp_path):
     return FutureManager(backend, expiration_timeout=300.0)
 
 
-def _clock(manager) -> float:
-    """Now under the same convention the stored ISO timestamps use."""
-    return manager._parse_timestamp(datetime.now().isoformat())
-
-
 async def _store(manager, request_id, status, *, replica_id=None):
     await manager.store_status(request_id, status, model_id='m1', replica_id=replica_id)
 
@@ -33,7 +28,7 @@ async def _store(manager, request_id, status, *, replica_id=None):
 async def test_non_terminal_with_live_replica_is_kept(manager):
     await _store(manager, 'r1', 'running', replica_id='replica-A')
     removed = await manager.cleanup_expired(
-        cutoff_time=_clock(manager) + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
     assert removed == 0
     rec = await manager.get('r1')
     assert rec is not None and rec.status == 'running'
@@ -42,7 +37,7 @@ async def test_non_terminal_with_live_replica_is_kept(manager):
 @pytest.mark.asyncio
 async def test_non_terminal_orphan_is_failed_not_deleted(manager):
     await _store(manager, 'r2', 'running', replica_id='dead-replica')
-    await manager.cleanup_expired(cutoff_time=_clock(manager) + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
     rec = await manager.get('r2')
     assert rec is not None  # NOT deleted (Property 6)
     assert rec.status == 'failed'
@@ -53,7 +48,7 @@ async def test_non_terminal_orphan_is_failed_not_deleted(manager):
 async def test_non_terminal_over_absolute_ttl_is_failed(manager):
     await _store(manager, 'r3', 'running', replica_id='replica-A')
     # absolute_ttl=0 makes any positive age exceed the bound.
-    await manager.cleanup_expired(cutoff_time=_clock(manager) + 10, alive_replica_ids={'replica-A'}, absolute_ttl=0.0)
+    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=0.0)
     rec = await manager.get('r3')
     assert rec is not None and rec.status == 'failed'
 
@@ -62,7 +57,7 @@ async def test_non_terminal_over_absolute_ttl_is_failed(manager):
 async def test_terminal_expired_is_deleted(manager):
     await _store(manager, 'r4', 'completed', replica_id='replica-A')
     removed = await manager.cleanup_expired(
-        cutoff_time=_clock(manager) + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
     assert removed == 1
     assert await manager.get('r4') is None
 
@@ -93,3 +88,18 @@ async def test_replica_id_set_at_creation_not_overwritten(manager):
     await manager.store_status('r7', 'running', model_id='m1', replica_id='replica-B')
     rec = await manager.get('r7')
     assert rec.replica_id == 'replica-A'  # creation value preserved
+
+
+@pytest.mark.asyncio
+async def test_stored_timestamps_align_with_wall_clock_regardless_of_host_tz(manager):
+    """Writer (_now_iso), reader (_parse_timestamp) and time.time() must agree.
+
+    A record written now must parse to within a second of time.time() on any host,
+    not skewed by the host's UTC offset (the former naive-local / read-as-UTC bug).
+    """
+    before = time.time()
+    await _store(manager, 'r8', 'running', replica_id='replica-A')
+    after = time.time()
+    rec = await manager.get('r8')
+    parsed = manager._parse_timestamp(rec.created_at)
+    assert before - 1 <= parsed <= after + 1
