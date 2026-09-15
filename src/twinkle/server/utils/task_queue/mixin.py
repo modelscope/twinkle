@@ -359,8 +359,13 @@ class TaskQueueMixin:
                     queue_state=QueueState.ACTIVE.value,
                 )
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
-            except Exception:
-                error_payload = task_error_payload(traceback.format_exc())
+            except Exception as exc:
+                error_payload = task_error_payload(
+                    f'{type(exc).__name__}: {exc}',
+                    request_id=request_id,
+                    error_code=500,
+                    traceback_text=traceback.format_exc(),
+                )
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,

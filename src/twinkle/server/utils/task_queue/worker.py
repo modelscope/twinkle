@@ -27,6 +27,13 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 
+# Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server (R5#8).
+try:
+    from ray.exceptions import GetTimeoutError as _RayGetTimeout
+    _TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (asyncio.TimeoutError, _RayGetTimeout)
+except Exception:  # pragma: no cover - ray always present in server runtime
+    _TIMEOUT_EXCEPTIONS = (asyncio.TimeoutError, )
+
 
 class ComputeWorker:
     """Serial background worker that processes GPU compute tasks.
@@ -141,14 +148,22 @@ class ComputeWorker:
         error: str,
         queue_state: str,
         queue_state_reason: str | None = None,
+        *,
+        error_code: int = 500,
+        traceback_text: str | None = None,
     ) -> None:
-        """Store FAILED status with a standardised error payload."""
+        """Store FAILED status with a standardised ``ErrorPayload``."""
         if task.persist_status:
             await self._state.store_future_status(
                 task.request_id,
                 TaskStatus.FAILED.value,
                 task.model_id,
-                result=task_error_payload(error),
+                result=task_error_payload(
+                    error,
+                    request_id=task.request_id,
+                    error_code=error_code,
+                    traceback_text=traceback_text,
+                ),
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
             )
@@ -246,21 +261,25 @@ class ComputeWorker:
                     queue_state=QueueState.ACTIVE.value,
                 )
             self._complete_result(task, result)
-        except asyncio.TimeoutError:
+        except _TIMEOUT_EXCEPTIONS:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
-            error = (f'Execution timeout exceeded: {self._config.effective_execution_timeout}s, '
+            error = (f'Backend call timed out (bound {self._config.effective_execution_timeout}s), '
                      f'actual execution time: {exec_time:.2f}s')
             logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
                          f'type={task_type}, queue_key={queue_key}')
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
-        except Exception:
+            # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server (R5#8).
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=504)
+        except Exception as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start
-            error = traceback.format_exc()
+            # error is a single-line summary; the full traceback goes only to the
+            # traceback field, never into `error` (R5#7).
+            error = f'{type(exc).__name__}: {exc}'
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value)
+            await self._store_task_failed(
+                task, error, QueueState.ACTIVE.value, error_code=500, traceback_text=traceback.format_exc())
         finally:
             q.task_done()
             self._record_execution_time(task_type, exec_time)
