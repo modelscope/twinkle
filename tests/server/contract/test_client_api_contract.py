@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Zero-wire-change contract guard (T8.1 / R8 / Property 10).
 
-Re-exports the OpenAPI surface of all four apps and compares it field-by-field with
-the baseline captured before this spec's implementation (T0.1). The diff must be
-empty. Also asserts the load-bearing invariants: ``schedule_task_and_wait`` still
+Exports the request/response surface of all five apps and compares it field-by-field with
+the canonical baseline. The diff must be empty. Also asserts the load-bearing
+invariants: ``schedule_task_and_wait`` still
 exists and the only client-side additions are ``types/base.py`` and ``types/errors.py``.
 """
 from __future__ import annotations
@@ -13,11 +13,12 @@ import pytest
 from tests.server.contract.client_api_harness import extract_full_surface, load_baseline
 
 
-def test_openapi_surface_matches_baseline():
+def test_wire_surface_matches_baseline():
     current = extract_full_surface()
     baseline = load_baseline()
+    assert set(current) == {'data_plane', 'gateway', 'model', 'processor', 'sampler'}
     assert current == baseline, (
-        'Client-facing OpenAPI surface changed vs the pre-implementation baseline; '
+        'Client-facing wire surface changed vs the canonical baseline; '
         'this spec must be zero-wire-change. Diffing apps: '
         f'{[a for a in set(current) | set(baseline) if current.get(a) != baseline.get(a)]}')
 

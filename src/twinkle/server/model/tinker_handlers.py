@@ -10,9 +10,8 @@ from __future__ import annotations
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
-from peft import LoraConfig
 from tinker import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import ModelManagement
@@ -20,6 +19,7 @@ if TYPE_CHECKING:
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.exceptions import FullModeBusyError
 from twinkle.server.utils import get_template_for_model
+from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -45,17 +45,11 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             try:
                 # Validate lora_config against the deployment's train_mode up front.
                 if self.is_full_mode and body.lora_config:
-                    return types.RequestFailedResponse(
-                        error='This deployment runs in full-parameter (exclusive) mode; do not pass '
-                        'lora_config. Use create_full_training_client (or omit lora_config).',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError('This deployment runs in full-parameter (exclusive) mode; do not pass '
+                                        'lora_config. Use create_full_training_client (or omit lora_config).')
                 if (not self.is_full_mode) and (not body.lora_config):
-                    return types.RequestFailedResponse(
-                        error='This deployment runs in LoRA mode; lora_config is required. '
-                        'Use create_lora_training_client.',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError('This deployment runs in LoRA mode; lora_config is required. '
+                                        'Use create_lora_training_client.')
                 # Exclusive full-parameter training: reject early (before touching
                 # state) if another tenant already holds the deployment.
                 if self.is_full_mode:
@@ -75,7 +69,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                     await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=model_adapter)
                     self.set_resource_state(adapter_name, 'grad_ready', False)
                 else:
-                    # TODO: Make LoraConfig more flexible
+                    from peft import LoraConfig
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
                     self.register_resource(adapter_name, token, session_id=body.session_id)
                     await self.call_backend(
@@ -89,17 +83,13 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 training_run_manager.save(_model_id, body)
                 return types.CreateModelResponse(model_id=_model_id)
             except FullModeBusyError as e:
-                # Nothing was registered yet (check runs before register_model).
-                return types.RequestFailedResponse(error=str(e), category=types.RequestErrorCategory.User)
+                raise UserTaskError(str(e)) from e
             except Exception:
                 if _model_id:
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
                     await self._cleanup_adapter(adapter_name)
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_create_adapter, token=token, task_type='create_model')
 
@@ -159,10 +149,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         datum_list = body.forward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
@@ -209,10 +196,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         datum_list = body.forward_backward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
@@ -253,10 +237,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 return types.OptimStepResponse(metrics=metrics)
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_optim, model_id=body.model_id, token=token, task_type='optim_step')
 
@@ -286,10 +267,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 return types.SaveWeightsResponse(path=tinker_path, type='save_weights')
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_save, model_id=body.model_id, token=token, task_type='save_weights')
 
@@ -334,10 +312,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                         path=tinker_path, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(
             _do_save_for_sampler, model_id=body.model_id, token=token, task_type='save_weights_for_sampler')
@@ -365,9 +340,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_load, model_id=body.model_id, token=token, task_type='load_weights')

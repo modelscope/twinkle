@@ -4,10 +4,10 @@
 Twinkle <-> tinker exception mapping (verified, kept here so a future new exception
 class can be lined up against its tinker counterpart):
 
-- tinker ``RequestFailedError`` (``tinker/_exceptions.py:176-196``; carries
+- Tinker 0.29.0 ``RequestFailedError`` (``tinker/_exceptions.py``; carries
   ``message`` / ``request_id`` / ``category``) is the "the task completed in a failed
-  terminal state" exception. Its ``category`` uses the same three values as
-  :class:`ErrorCategory` (``Unknown`` / ``Server`` / ``User``).
+  terminal state" exception. Its wire values are ``unknown`` / ``server`` /
+  ``user``, matching :class:`ErrorCategory`; legacy TitleCase values are normalized.
 
 ``twinkle_client/utils/patch_tinker.py`` shows two SDKs can coexist in one process,
 so a semantically-equal but differently-named exception must be lookup-able.
@@ -15,7 +15,7 @@ so a semantically-equal but differently-named exception must be lookup-able.
 from __future__ import annotations
 
 from enum import StrEnum
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from typing import Any, Literal, Optional
 
 from .base import ResponseModel
@@ -29,9 +29,9 @@ QueueStateLiteral = Literal['active', 'paused_rate_limit', 'paused_capacity', 'u
 class ErrorCategory(StrEnum):
     """Error attribution. Matches tinker's ``RequestErrorCategory``."""
 
-    Unknown = 'Unknown'
-    Server = 'Server'
-    User = 'User'
+    Unknown = 'unknown'
+    Server = 'server'
+    User = 'user'
 
 
 class ErrorPayload(ResponseModel):
@@ -53,3 +53,16 @@ class ErrorPayload(ResponseModel):
     request_id: str
     traceback: Optional[str] = Field(default=None, max_length=65536)
     details: Optional[list[dict[str, Any]]] = None
+
+    @field_validator('category', mode='before')
+    @classmethod
+    def normalize_legacy_category(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower()
+        return value
+
+    @model_validator(mode='after')
+    def traceback_is_server_only(self) -> 'ErrorPayload':
+        if self.traceback is not None and self.category is not ErrorCategory.Server:
+            raise ValueError('traceback is only valid for server errors')
+        return self

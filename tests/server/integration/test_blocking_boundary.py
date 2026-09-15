@@ -9,24 +9,34 @@ deliberately slow plain callable -- no GPU, Megatron, or Ray involved.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin
-from twinkle.server.utils.task_queue.types import BackendBusyError
+ray = pytest.importorskip('ray')
+
+from twinkle.server.utils.task_queue.mixin import TaskQueueMixin  # noqa: E402
+from twinkle.server.utils.task_queue.types import BackendBusyError  # noqa: E402
 
 
 class _Harness(TaskQueueMixin):
     """Minimal holder exposing the real call_backend with a chosen gate setting."""
 
-    def __init__(self, gate_enabled: bool) -> None:
-        self._backend_executor = ThreadPoolExecutor(thread_name_prefix='twinkle-backend')
-        self._backend_admission = asyncio.Semaphore(1) if gate_enabled else None
+    def __init__(self, gate_enabled: bool, *, max_workers: int | None = None) -> None:
+        self._backend_executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix='twinkle-backend')
+        self._backend_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='twinkle-backend-probe')
+        self._backend_admission = asyncio.Lock() if gate_enabled else None
+        self._backend_poisoned = asyncio.Event()
 
     def close(self) -> None:
-        self._backend_executor.shutdown(wait=False)
+        self._backend_executor.shutdown(wait=False, cancel_futures=True)
+        self._backend_probe_executor.shutdown(wait=False, cancel_futures=True)
 
 
 @pytest.mark.asyncio
@@ -47,6 +57,62 @@ async def test_healthz_style_probe_responsive_during_slow_backend():
         assert elapsed < 5.0
         await slow
     finally:
+        h.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_gate_contention_waits_instead_of_failing():
+    h = _Harness(gate_enabled=True)
+    try:
+        first = asyncio.create_task(h.call_backend(lambda: (time.sleep(0.2), 'first')[1]))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(h.call_backend(lambda: 'second'))
+        assert await first == 'first'
+        assert await second == 'second'
+    finally:
+        h.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gate_waiter_does_not_steal_lock():
+    h = _Harness(gate_enabled=True)
+    release = threading.Event()
+
+    def wait_for_release():
+        while not release.is_set():
+            time.sleep(0.01)
+
+    try:
+        first = asyncio.create_task(h.call_backend(wait_for_release))
+        await asyncio.sleep(0.05)
+        waiter = asyncio.create_task(h.call_backend(lambda: 'cancelled'))
+        await asyncio.sleep(0.05)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await first
+        assert await h.call_backend(lambda: 'next') == 'next'
+    finally:
+        release.set()
+        h.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_backend_call_releases_gate():
+    h = _Harness(gate_enabled=True, max_workers=1)
+    release_worker = threading.Event()
+    occupied = h._backend_executor.submit(release_worker.wait)
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(h.call_backend(lambda: 'never-started'), timeout=0.05)
+        await asyncio.sleep(0)
+        assert not h._backend_admission.locked()
+        release_worker.set()
+        occupied.result(timeout=5)
+        assert await h.call_backend(lambda: 'next') == 'next'
+    finally:
+        release_worker.set()
         h.close()
 
 
@@ -79,6 +145,49 @@ async def test_gate_held_by_leaked_call_fast_fails_next_task():
         assert entered['count'] == 1
     finally:
         h.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_times_out_while_same_serial_actor_is_busy():
+
+    @ray.remote
+    class SerialActor:
+
+        def slow(self):
+            time.sleep(1.0)
+
+        def ping(self):
+            return True
+
+    started_ray = not ray.is_initialized()
+    if started_ray:
+        ray.init(num_cpus=1, logging_level='ERROR')
+    actor = SerialActor.remote()
+    h = _Harness(gate_enabled=True)
+    app = FastAPI()
+
+    @app.get('/healthz')
+    async def healthz():
+        try:
+            await h.call_backend(lambda: ray.get(actor.ping.remote(), timeout=0.2), admit=False)
+            return {'healthy': True}
+        except ray.exceptions.GetTimeoutError:
+            return JSONResponse(status_code=503, content={'healthy': False})
+
+    try:
+        slow = asyncio.create_task(h.call_backend(lambda: ray.get(actor.slow.remote(), timeout=2)))
+        await asyncio.sleep(0.1)
+        start = time.monotonic()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.get('/healthz')
+        assert response.status_code == 503
+        assert time.monotonic() - start < 5
+        await slow
+    finally:
+        h.close()
+        ray.kill(actor)
+        if started_ray:
+            ray.shutdown()
 
 
 @pytest.mark.asyncio

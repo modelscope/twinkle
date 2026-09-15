@@ -20,4 +20,8 @@ backend's internals: the **dispatch path** (that a call reaches the backend via
 
 Tests that need to prove validation or NCCL behavior are the GPU-gated end-to-end tests
 under `tests/server/integration/test_nccl_safe_*_e2e.py` (run only with
-`TWINKLE_TEST_GPU_E2E=1` against a real server).
+`TWINKLE_TEST_GPU_E2E=1` against a real server configured with the test execution timeout).
+
+The contract suite covers all five apps and recursively snapshots request and response
+types. Tinker compatibility assertions follow the 0.29.0 SDK wire values. The blocking
+boundary suite uses a real serial Ray actor for the health-probe timing case.

@@ -15,8 +15,6 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING
 
-from twinkle_client.common.serialize import deserialize_object
-
 if TYPE_CHECKING:
     from .app import SamplerManagement
 
@@ -24,8 +22,9 @@ import numpy as np
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
-from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
+from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.json_utils import json_safe
@@ -132,31 +131,55 @@ def _submission_states(value) -> list[dict]:
     return value if isinstance(value, list) else [value]
 
 
-async def _await_generation(
-    sampler,
-    submission_id: str,
-):
-    """Poll an admitted generation without occupying the sampler admission queue."""
-    collected = False
+async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, single_get_timeout: float = 60.0):
+    loop = asyncio.get_running_loop()
+    start = loop.time()
     try:
+        while True:
+            remaining = total_timeout - (loop.time() - start)
+            if remaining <= 0:
+                payload = task_error_payload(
+                    'sample_stream exceeded the execution time bound', request_id=request_id, error_code=504)
+                yield json.dumps(payload) + '\n'
+                break
+            try:
+                item = await asyncio.wait_for(
+                    loop.run_in_executor(None, q.get), timeout=min(single_get_timeout, remaining))
+            except asyncio.TimeoutError:
+                payload = task_error_payload(
+                    'sample_stream timed out waiting for the next token', request_id=request_id, error_code=504)
+                yield json.dumps(payload) + '\n'
+                break
+            if item == sentinel:
+                break
+            if isinstance(item, Exception):
+                payload = task_error_payload(f'{type(item).__name__}: {item}', request_id=request_id, error_code=500)
+                yield json.dumps(payload) + '\n'
+                break
+            delta, reason = item
+            yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
+    finally:
+        try:
+            q.shutdown(force=True)
+        except Exception:
+            pass
+
+
+async def _await_generation(service: SamplerManagement, submission_id: str, timeout: float):
+    """Poll one admitted generation through the backend boundary."""
+    collected = False
+
+    async def poll():
+        nonlocal collected
         poll_interval = 0.01
         while True:
             try:
-                states = _submission_states(await asyncio.to_thread(sampler.get_generation_status, submission_id))
+                states = _submission_states(await service.call_backend(service.sampler.get_generation_status,
+                                                                       submission_id))
             except Exception as error:
-                # A pending read-only actor call can be cancelled by Ray while
-                # the generation submitted just above remains alive.  Treating
-                # that as a generation failure makes the finally block discard
-                # otherwise valid rollout work.  Retry only Ray's explicit task
-                # cancellation; actor death and application errors must still
-                # propagate immediately.
                 from ray.exceptions import TaskCancelledError
                 if not isinstance(error, TaskCancelledError):
                     raise
-                logger.warning(
-                    'Generation status poll was cancelled; retrying submission %s',
-                    submission_id,
-                )
                 await asyncio.sleep(poll_interval)
                 poll_interval = min(poll_interval * 1.5, 0.25)
                 continue
@@ -168,15 +191,19 @@ async def _await_generation(
                 error = failed.get('error') or failed.get('status', 'unknown failure')
                 raise RuntimeError(f'generation {submission_id} failed: {error}')
             if states and all(state.get('status') == 'completed' for state in states):
-                responses = await asyncio.to_thread(sampler.collect_generation, submission_id)
+                responses = await service.call_backend(service.sampler.collect_generation, submission_id)
                 collected = True
                 return responses
             await asyncio.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.5, 0.25)
+
+    try:
+        return await asyncio.wait_for(poll(), timeout=timeout)
     finally:
         if not collected:
             try:
-                await asyncio.to_thread(sampler.cancel_generation, submission_id)
+                await asyncio.wait_for(
+                    service.call_backend(service.sampler.cancel_generation, submission_id), timeout=4.0)
             except Exception:
                 logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
 
@@ -315,7 +342,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         submission_id = uuid.uuid4().hex
 
         async def _admit():
-            await asyncio.to_thread(
+            await self.call_backend(
                 self.sampler.submit_generation,
                 submission_id,
                 inputs,
@@ -338,7 +365,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 task_type='sample_admission',
             ))
 
-        responses = await _await_generation(self.sampler, submission_id)
+        responses = await _await_generation(self, submission_id, self._task_queue_config.effective_execution_timeout)
         rows, tags = _build_rollout_rows_and_tags(
             _to_sample_response_models(responses),
             group_ids=body.group_ids,
@@ -368,7 +395,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             resolved_paths.append(adapter_path)
         unload = getattr(self.sampler, 'unload_adapter_paths', None)
         if unload is not None:
-            unload(resolved_paths)
+            await self.call_backend(unload, resolved_paths)
         return {'status': 'ok'}
 
     @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
@@ -407,6 +434,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             body: types.ApplyPatchRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> None:
+        from twinkle_client.common.serialize import deserialize_object
         extra_kwargs = body.model_extra or {}
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
@@ -465,14 +493,16 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         from .backends import STREAM_SENTINEL
 
-        q = Queue(maxsize=128)
+        request_id = f'req_{uuid.uuid4().hex}'
         actors = self.sampler._actors
         if not actors:
-            # No available sampler actor -> structured error, not an IndexError (R4#12).
+
             async def _no_actor_generator():
-                yield json.dumps({'error': 'No available sampler actor', 'category': 'Server'}) + '\n'
+                payload = task_error_payload('No available sampler actor', request_id=request_id, error_code=503)
+                yield json.dumps(payload) + '\n'
 
             return StreamingResponse(_no_actor_generator(), media_type='application/x-ndjson')
+        q = Queue(maxsize=128)
         actor = actors[0]
         actor.sample_stream_to_queue.remote(
             q,
@@ -482,45 +512,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             adapter_path=adapter_path,
         )
 
-        # Two time bounds (R4#10-11): a per-get bound and a total-lifetime bound.
-        single_get_timeout = 60.0
-        total_timeout = self._task_queue_config.effective_execution_timeout
-
-        async def _stream_generator():
-            loop = asyncio.get_event_loop()
-            start = loop.time()
-            try:
-                while True:
-                    remaining = total_timeout - (loop.time() - start)
-                    if remaining <= 0:
-                        yield json.dumps({
-                            'error': 'sample_stream exceeded the execution time bound',
-                            'category': 'Server'
-                        }) + '\n'
-                        break
-                    try:
-                        item = await asyncio.wait_for(
-                            loop.run_in_executor(None, q.get), timeout=min(single_get_timeout, remaining))
-                    except asyncio.TimeoutError:
-                        yield json.dumps({
-                            'error': 'sample_stream timed out waiting for the next token',
-                            'category': 'Server'
-                        }) + '\n'
-                        break
-                    if item == STREAM_SENTINEL:
-                        break
-                    if isinstance(item, Exception):
-                        yield json.dumps({'error': str(item)}) + '\n'
-                        break
-                    delta, reason = item
-                    yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
-            finally:
-                # The run_in_executor(None, q.get) thread is NOT cancelled when
-                # wait_for times out; shutting the ray Queue down makes the blocked
-                # get() raise so the thread exits and the pool returns to baseline.
-                try:
-                    q.shutdown(force=True)
-                except Exception:
-                    pass
-
-        return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')
+        return StreamingResponse(
+            _stream_queue(
+                q,
+                STREAM_SENTINEL,
+                request_id,
+                self._task_queue_config.effective_execution_timeout,
+            ),
+            media_type='application/x-ndjson',
+        )

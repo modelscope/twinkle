@@ -52,6 +52,9 @@ class _DummyManagement:
     async def schedule_task(self, task, **kwargs):
         return await task()
 
+    async def call_backend(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
 
 @pytest.mark.asyncio
 async def test_tinker_asample_allows_base_model_session_without_model_path():
@@ -71,4 +74,6 @@ async def test_tinker_asample_allows_base_model_session_without_model_path():
     response = await route.endpoint(request, body, management)
 
     assert isinstance(response, types.SampleResponse)
+    assert response.sequences[0].tokens == [1, 2]
+    assert response.sequences[0].sequence_id
     assert management.sampler.adapter_paths == [None]

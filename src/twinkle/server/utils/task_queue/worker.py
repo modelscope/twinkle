@@ -12,14 +12,15 @@ import asyncio
 import time
 import traceback
 from collections import deque
-from typing import TYPE_CHECKING, Any, Deque
+from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.errors import ErrorCategory
 from .config import TaskQueueConfig
-from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus
+from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -153,6 +154,7 @@ class ComputeWorker:
         queue_state_reason: str | None = None,
         *,
         error_code: int = 500,
+        category: ErrorCategory = ErrorCategory.Server,
         traceback_text: str | None = None,
     ) -> None:
         """Store FAILED status with a standardised ``ErrorPayload``."""
@@ -165,6 +167,7 @@ class ComputeWorker:
                     error,
                     request_id=task.request_id,
                     error_code=error_code,
+                    category=category,
                     traceback_text=traceback_text,
                 ),
                 queue_state=queue_state,
@@ -280,6 +283,16 @@ class ComputeWorker:
                     await self._on_backend_timeout()
                 except Exception:
                     logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
+        except UserTaskError as exc:
+            task_status = 'failed'
+            exec_time = time.monotonic() - exec_start
+            await self._store_task_failed(
+                task,
+                f'{type(exc).__name__}: {exc}',
+                QueueState.UNKNOWN.value,
+                error_code=400,
+                category=ErrorCategory.User,
+            )
         except BackendBusyError as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start

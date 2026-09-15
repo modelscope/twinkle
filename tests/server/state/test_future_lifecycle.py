@@ -20,15 +20,21 @@ def manager(tmp_path):
     return FutureManager(backend, expiration_timeout=300.0)
 
 
-async def _store(manager, request_id, status, *, replica_id=None):
-    await manager.store_status(request_id, status, model_id='m1', replica_id=replica_id)
+async def _store(manager, request_id, status, *, replica_id=None, absolute_deadline=None):
+    await manager.store_status(
+        request_id,
+        status,
+        model_id='m1',
+        replica_id=replica_id,
+        absolute_deadline=absolute_deadline,
+    )
 
 
 @pytest.mark.asyncio
 async def test_non_terminal_with_live_replica_is_kept(manager):
     await _store(manager, 'r1', 'running', replica_id='replica-A')
     removed = await manager.cleanup_expired(
-        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     assert removed == 0
     rec = await manager.get('r1')
     assert rec is not None and rec.status == 'running'
@@ -37,19 +43,27 @@ async def test_non_terminal_with_live_replica_is_kept(manager):
 @pytest.mark.asyncio
 async def test_non_terminal_orphan_is_failed_not_deleted(manager):
     await _store(manager, 'r2', 'running', replica_id='dead-replica')
-    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     rec = await manager.get('r2')
     assert rec is not None  # NOT deleted (Property 6)
     assert rec.status == 'failed'
-    assert rec.result['category'] == 'Server'
+    assert rec.result['category'] == 'server'
 
 
 @pytest.mark.asyncio
-async def test_non_terminal_over_absolute_ttl_is_failed(manager):
-    await _store(manager, 'r3', 'running', replica_id='replica-A')
-    # absolute_ttl=0 makes any positive age exceed the bound.
-    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=0.0)
+async def test_non_terminal_past_absolute_deadline_is_failed(manager):
+    await _store(manager, 'r3', 'running', replica_id='replica-A', absolute_deadline=time.time() - 1)
+    await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     rec = await manager.get('r3')
+    assert rec is not None and rec.status == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_without_deadline_uses_expiration_timeout(manager):
+    await _store(manager, 'legacy', 'running', replica_id=None)
+    with mock.patch('twinkle.server.state.future_manager.time.time', return_value=time.time() + 301):
+        await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids=set())
+    rec = await manager.get('legacy')
     assert rec is not None and rec.status == 'failed'
 
 
@@ -57,7 +71,7 @@ async def test_non_terminal_over_absolute_ttl_is_failed(manager):
 async def test_terminal_expired_is_deleted(manager):
     await _store(manager, 'r4', 'completed', replica_id='replica-A')
     removed = await manager.cleanup_expired(
-        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'}, absolute_ttl=None)
+        cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     assert removed == 1
     assert await manager.get('r4') is None
 
@@ -83,11 +97,14 @@ async def test_terminal_to_terminal_same_is_dropped_without_warning(manager):
 
 
 @pytest.mark.asyncio
-async def test_replica_id_set_at_creation_not_overwritten(manager):
-    await _store(manager, 'r7', 'pending', replica_id='replica-A')
-    await manager.store_status('r7', 'running', model_id='m1', replica_id='replica-B')
+async def test_replica_id_and_deadline_set_at_creation_not_overwritten(manager):
+    deadline = time.time() + 100
+    await _store(manager, 'r7', 'pending', replica_id='replica-A', absolute_deadline=deadline)
+    await manager.store_status(
+        'r7', 'running', model_id='m1', replica_id='replica-B', absolute_deadline=time.time() + 999)
     rec = await manager.get('r7')
-    assert rec.replica_id == 'replica-A'  # creation value preserved
+    assert rec.replica_id == 'replica-A'
+    assert rec.absolute_deadline == deadline
 
 
 @pytest.mark.asyncio

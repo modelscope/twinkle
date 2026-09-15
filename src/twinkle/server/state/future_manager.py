@@ -29,6 +29,7 @@ def _future_record_transform(
     queue_state: str | None,
     queue_state_reason: str | None,
     replica_id: str | None,
+    absolute_deadline: float | None,
     now: str,
 ) -> dict | None:
     """Atomic transform body for :meth:`FutureManager.store_status`.
@@ -57,6 +58,7 @@ def _future_record_transform(
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
             replica_id=replica_id,
+            absolute_deadline=absolute_deadline,
             created_at=now,
             updated_at=now,
         )
@@ -79,10 +81,7 @@ def _future_record_transform(
 
 
 class FutureManager(BaseManager[FutureRecord]):
-    """Manages async task futures / request statuses.
-
-    Expiry is based on `updated_at` (falls back to `created_at`).
-    """
+    """Manage future state, terminal retention, and immutable task deadlines."""
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
         super().__init__(backend, 'future::', FutureRecord, expiration_timeout)
@@ -99,6 +98,7 @@ class FutureManager(BaseManager[FutureRecord]):
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
+        absolute_deadline: float | None = None,
     ) -> None:
         """Create or update a future record with the latest status.
 
@@ -125,6 +125,7 @@ class FutureManager(BaseManager[FutureRecord]):
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
                 replica_id=replica_id,
+                absolute_deadline=absolute_deadline,
                 now=now,
             ),
         )
@@ -136,14 +137,13 @@ class FutureManager(BaseManager[FutureRecord]):
         cutoff_time: float,
         *,
         alive_replica_ids: set[str] | None = None,
-        absolute_ttl: float | None = None,
     ) -> int:
         """Expire future records without ever deleting a non-terminal one.
 
         Processing matrix (design §5.2):
 
-        | status       | replica alive | over absolute_ttl | action            |
-        |--------------|---------------|-------------------|-------------------|
+        | status       | replica alive | past deadline | action            |
+        |--------------|---------------|---------------|-------------------|
         | Terminal     | —             | ts < cutoff       | delete            |
         | non-Terminal | yes           | no                | keep (untouched)  |
         | non-Terminal | yes           | yes               | write ``failed``  |
@@ -153,9 +153,6 @@ class FutureManager(BaseManager[FutureRecord]):
             cutoff_time: Unix timestamp; terminal records older than it are deleted.
             alive_replica_ids: replicas currently considered alive. ``None`` disables
                 the orphan check (every non-terminal record is treated as owned).
-            absolute_ttl: seconds; a non-terminal record whose ``created_at`` is older
-                than this (regardless of ``updated_at``) is failed. ``None`` disables
-                the absolute-survival bound.
 
         Returns:
             Number of terminal records removed (records written ``failed`` are not
@@ -188,20 +185,21 @@ class FutureManager(BaseManager[FutureRecord]):
                     replica_id=replica_id,
                 )
                 continue
-            if absolute_ttl is not None:
-                created = self._parse_timestamp(record.created_at)
-                if (now - created) > absolute_ttl:
-                    await self.store_status(
-                        request_id,
-                        'failed',
-                        record.model_id,
-                        result=task_error_payload(
-                            'Task exceeded the absolute survival bound without reaching a terminal state.',
-                            request_id=request_id,
-                            error_code=500,
-                        ),
-                        replica_id=replica_id,
-                    )
+            deadline = record.absolute_deadline
+            if deadline is None:
+                deadline = self._parse_timestamp(record.created_at) + self.expiration_timeout
+            if now > deadline:
+                await self.store_status(
+                    request_id,
+                    'failed',
+                    record.model_id,
+                    result=task_error_payload(
+                        'Task exceeded the absolute survival bound without reaching a terminal state.',
+                        request_id=request_id,
+                        error_code=500,
+                    ),
+                    replica_id=replica_id,
+                )
 
         for request_id in expired_ids:
             await self.remove(request_id)

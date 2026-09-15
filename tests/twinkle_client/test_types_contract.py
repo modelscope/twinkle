@@ -4,14 +4,9 @@
 - T6.2 / R7#9: ``QueueStateLiteral`` value set equals the server ``QueueState`` enum.
 - T6.3 / R7#7: naming disambiguation guard.
 
-Note on T6.3 scope (agreed deviation from the literal wording): ``twinkle_client`` is
-a tinker-compatible client and already shares many public class names with
-``tinker.types`` at HEAD (``ForwardRequest``, ``SampleRequest``, ``Checkpoint`` ...),
-so a literal "the two modules' public export names are disjoint" assertion cannot
-hold and twinkle's names are intentionally NOT renamed. Instead this guard enforces
-the invariant the ruling actually targets: no ``src/twinkle/**`` module may bind a
-tinker type and a twinkle_client type to the *same local name* (tinker must be
-aliased when both coexist) -- which is what makes a review diff misread possible.
+The two SDKs already share public names. The contract freezes that legacy set and
+rejects new collisions while requiring explicit aliases when both SDKs are imported
+in one module.
 """
 from __future__ import annotations
 
@@ -24,6 +19,26 @@ from twinkle.server.utils.task_queue.types import QueueState
 from twinkle_client.types.errors import QueueStateLiteral
 
 _TWINKLE_SRC = pathlib.Path(twinkle.__file__).resolve().parent
+_LEGACY_PUBLIC_NAME_OVERLAP = frozenset({
+    'Checkpoint',
+    'CheckpointsListResponse',
+    'CreateModelRequest',
+    'CreateSessionRequest',
+    'CreateSessionResponse',
+    'Cursor',
+    'ForwardRequest',
+    'GetServerCapabilitiesResponse',
+    'HealthResponse',
+    'LoraConfig',
+    'SampleRequest',
+    'SessionHeartbeatRequest',
+    'SessionHeartbeatResponse',
+    'SupportedModel',
+    'TrainingRun',
+    'TrainingRunsResponse',
+    'WeightsInfoResponse',
+    'checkpoint',
+})
 
 
 def test_queue_state_literal_matches_server_enum():
@@ -64,6 +79,18 @@ def _binding_collisions(tree: ast.AST) -> set[str]:
                 bound = alias.asname or alias.name.split('.')[0]
                 (tinker_names if origin == 'tinker' else twinkle_names).add(bound)
     return tinker_names & twinkle_names
+
+
+def test_public_name_overlap_does_not_grow():
+    import tinker.types
+    import twinkle_client.types
+
+    overlap = {
+        name
+        for name in set(dir(tinker.types)) & set(dir(twinkle_client.types))
+        if not name.startswith('_')
+    }
+    assert overlap == _LEGACY_PUBLIC_NAME_OVERLAP
 
 
 def test_no_tinker_twinkle_same_name_binding():

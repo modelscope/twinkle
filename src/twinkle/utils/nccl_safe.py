@@ -55,11 +55,19 @@ def nccl_safe_megatron(func):
             return func(self, *args, **kwargs)
         except Exception as exc:
             import traceback
+            rank = _global_rank()
+            context = f'twinkle backend method={func.__name__}, global_rank={rank}'
+            if hasattr(exc, 'add_note'):
+                exc.add_note(context)
+            elif exc.args:
+                exc.args = (f'{exc.args[0]} [{context}]', *exc.args[1:])
+            else:
+                exc.args = (context, )
             tb = traceback.format_exc()
             if len(tb) > _TRACEBACK_LIMIT:
                 tb = tb[-_TRACEBACK_LIMIT:]
             logger.error('[nccl_safe_megatron] %s in %s on global rank %s:\n%s',
-                         type(exc).__name__, func.__name__, _global_rank(), tb)
+                         type(exc).__name__, func.__name__, rank, tb)
             raise
 
     return wrapper

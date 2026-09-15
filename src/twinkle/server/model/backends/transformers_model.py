@@ -13,7 +13,6 @@ Both handle tinker (Datum-based I/O) via /tinker/* endpoints and twinkle-native
 (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
 from tinker import types
-from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
@@ -111,7 +110,7 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False, timeout=10)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

@@ -11,7 +11,6 @@ wrappers:
 """
 import torch
 from tinker import types
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
@@ -135,7 +134,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False, timeout=10)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

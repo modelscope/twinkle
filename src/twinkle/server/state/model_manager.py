@@ -118,9 +118,9 @@ class ModelManager(BaseManager[ModelRecord]):
         last_seen = await self._replicas.get_all_last_seen()
         now = time.time()
         alive: set[str] = set()
-        for rid in registered:
+        for rid in set(registered) | set(last_seen):
             ls = last_seen.get(rid)
-            if ls is None or (now - ls) <= liveness_threshold:
+            if (ls is None and rid in registered) or (ls is not None and (now - ls) <= liveness_threshold):
                 alive.add(rid)
         return alive
 

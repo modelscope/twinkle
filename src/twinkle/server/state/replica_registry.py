@@ -1,15 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Backend-backed registry of replica capacity.
+"""Backend-backed registry of replica capacity and liveness.
 
-Each entry persists to ``replica::<replica_id>::max_loras`` in the configured
-:class:`StateBackend` (Redis or the actor-wrapped RayActorBackend), so every
-Ray Serve worker sees one consistent view of the cluster's capacity even
-though each worker holds its own ``ServerState`` instance.
-
-The registry knows *only* about declared capacity. The current loaded-model
-count is derived by querying the persisted ``model::*`` records directly —
-nothing here caches that count, so concurrent writes from different workers
-cannot drift into an inconsistent local index.
+Capacity and ``last_seen`` use separate keys so sampler liveness does not alter
+the model-capacity data shape.
 """
 from __future__ import annotations
 
@@ -37,7 +30,7 @@ def _replica_id_from_key(key: str) -> str | None:
 
 
 class ReplicaRegistry:
-    """Read/write replica capacity through the shared :class:`StateBackend`."""
+    """Read/write replica capacity and liveness through the shared backend."""
 
     def __init__(self, backend: StateBackend) -> None:
         self._backend = backend

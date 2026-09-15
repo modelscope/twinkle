@@ -11,7 +11,7 @@ def test_task_error_payload_builds_error_payload_dict():
     assert payload['category'] == ErrorCategory.Server.value
     assert payload['error_code'] == 500
     assert payload['request_id'] == 'req_1'
-    assert payload['traceback'] is None
+    assert 'traceback' not in payload
 
 
 def test_task_error_payload_user_category_drops_traceback():
@@ -19,7 +19,13 @@ def test_task_error_payload_user_category_drops_traceback():
         'bad input', request_id='req_2', error_code=400, category=ErrorCategory.User, traceback_text='Traceback...')
 
     assert payload['category'] == ErrorCategory.User.value
-    assert payload['traceback'] is None
+    assert 'traceback' not in payload
+
+
+def test_error_summary_is_single_line():
+    payload = task_error_payload(
+        'RuntimeError: boom\n  File "/server/path.py", line 1', request_id='req-lines')
+    assert payload['error'] == 'RuntimeError: boom'
 
 
 def test_error_payload_from_stored_backfills_two_field_legacy():

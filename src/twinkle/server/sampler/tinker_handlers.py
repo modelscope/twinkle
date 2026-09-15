@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import traceback
+import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from tinker import types
@@ -19,9 +20,27 @@ if TYPE_CHECKING:
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.utils import get_template_for_model
+from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _sampled_sequence(*, stop_reason, tokens, logprobs):
+    return types.SampledSequence(
+        stop_reason=stop_reason,
+        sequence_id=uuid.uuid4().hex,
+        _tokens_list=tokens,
+        _logprobs_list=logprobs,
+    )
+
+
+def _sample_response(*, sequences, prompt_logprobs, topk_prompt_logprobs):
+    return types.SampleResponse(
+        sequences=sequences,
+        _prompt_logprobs_list=prompt_logprobs,
+        _topk_prompt_logprobs_list=topk_prompt_logprobs,
+    )
 
 
 def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -71,10 +90,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Base-model sampling is valid when no model_path was provided.
                 if adapter_uri and not os.path.exists(adapter_uri):
-                    return types.RequestFailedResponse(
-                        error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
 
                 # Convert tinker SamplingParams to twinkle SamplingParams if needed
                 sampling_params = None
@@ -120,22 +136,19 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                             if flattened and len(flattened) == len(seq.logprobs):
                                 logprobs = flattened
                         tinker_sequences.append(
-                            types.SampledSequence(
+                            _sampled_sequence(
                                 stop_reason=seq.stop_reason,
                                 tokens=list(seq.tokens),
                                 logprobs=logprobs,
                             ))
-                return types.SampleResponse(
+                return _sample_response(
                     sequences=tinker_sequences,
                     prompt_logprobs=responses[0].prompt_logprobs,
                     topk_prompt_logprobs=responses[0].topk_prompt_logprobs,
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         input_tokens = len(body.prompt.to_ints())
         return await self.schedule_task(

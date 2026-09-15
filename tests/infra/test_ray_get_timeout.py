@@ -10,9 +10,9 @@ import pytest
 
 ray = pytest.importorskip('ray')
 
-import twinkle.infra as infra
-from twinkle.infra._ray.ray_helper import RayHelper
-from twinkle.infra import remote_function
+import twinkle.infra as infra  # noqa: E402
+from twinkle.infra import remote_function  # noqa: E402
+from twinkle.infra._ray.ray_helper import RayHelper  # noqa: E402
 
 
 @ray.remote
@@ -23,6 +23,14 @@ class _Sleeper:
         import time
         time.sleep(seconds)
         return seconds
+
+    def slow_batch(self, seconds: list[float]):
+        import time
+        time.sleep(seconds[0])
+        return seconds
+
+    def _twinkle_async_slow_batch(self, seconds: list[float]):
+        return self.slow_batch(seconds)
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -101,6 +109,19 @@ def test_instance_timeout_is_fallback_when_decorator_absent():
     driver._ray_get_timeout = 0.3
     with pytest.raises(ray.exceptions.GetTimeoutError):
         wrapped(driver, 2.0)
+
+
+def test_continuous_work_timeout_zero_is_not_treated_as_falsy():
+
+    def slow_batch(self, seconds):
+        return seconds
+
+    wrapped = remote_function(
+        dispatch='all', collect='first', timeout=0, enable_continous_work=True)(slow_batch)
+    driver = _make_driver()
+    driver._ray_get_timeout = 100.0
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        wrapped(driver, [1.0])
 
 
 def test_decorator_timeout_zero_is_not_treated_as_falsy():

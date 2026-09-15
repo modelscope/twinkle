@@ -9,7 +9,7 @@ still succeeds.
 
 Prerequisites:
     1. Ray cluster running with GPUs (2 for model DP/TP)
-    2. Twinkle server started (no fault-tolerance env switch exists any more)
+    2. Twinkle server started with queue_config.execution_timeout=30
 
 Usage (pytest, requires TWINKLE_TEST_GPU_E2E=1):
     TWINKLE_TEST_GPU_E2E=1 pytest tests/server/integration/test_nccl_safe_tinker_e2e.py -v
@@ -29,7 +29,8 @@ pytestmark = pytest.mark.skipif(
 
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
 SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
-TIMEOUT = 120
+EXECUTION_TIMEOUT = float(os.environ.get('TWINKLE_TEST_EXECUTION_TIMEOUT', '30'))
+TIMEOUT = EXECUTION_TIMEOUT + 15
 
 
 def _init_client():
@@ -71,17 +72,38 @@ def test_failure_is_terminal_then_valid_request_succeeds():
     necessary, not optional.
     """
     from tinker import types
+    from tinker._exceptions import RequestFailedError
     tc = _init_client()
 
     # Deliberately malformed: logprobs length inconsistent with the completion.
     bad = [_make_datum(bad_logprobs_len=5) for _ in range(4)]
     start = time.time()
-    with pytest.raises(Exception):  # RequestFailedError or a raised failed terminal
-        tc.forward_backward(bad, 'importance_sampling').result()
+    with pytest.raises(RequestFailedError) as caught:
+        tc.forward_backward(bad, 'importance_sampling').result(timeout=TIMEOUT)
+    assert caught.value.category is types.RequestErrorCategory.Server
     assert time.time() - start < TIMEOUT, 'malformed request must fail fast, not hang (NCCL)'
 
     # Recovery: a subsequent valid request on the same deployment must succeed.
     good = [_make_datum() for _ in range(4)]
     result = tc.forward_backward(good, 'importance_sampling').result()
+    assert result is not None
+    tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
+
+
+def test_partial_rank_failure_is_terminal_then_recovers():
+    from tinker import types
+    from tinker._exceptions import RequestFailedError
+    tc = _init_client()
+
+    batch = [_make_datum() for _ in range(4)]
+    batch[0] = _make_datum(bad_logprobs_len=5)
+    start = time.time()
+    with pytest.raises(RequestFailedError) as caught:
+        tc.forward_backward(batch, 'importance_sampling').result(timeout=TIMEOUT)
+    assert caught.value.category is types.RequestErrorCategory.Server
+    assert 'global_rank=' in str(caught.value)
+    assert time.time() - start < TIMEOUT
+
+    result = tc.forward_backward([_make_datum() for _ in range(4)], 'importance_sampling').result()
     assert result is not None
     tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()

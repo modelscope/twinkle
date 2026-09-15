@@ -29,25 +29,27 @@ def task_error_payload(
     *,
     request_id: str,
     error_code: int = 500,
-    category: ErrorCategory = ErrorCategory.Server,
+    category: ErrorCategory | str = ErrorCategory.Server,
     traceback_text: str | None = None,
 ) -> dict[str, Any]:
     """Build an ``ErrorPayload`` and return it as a JSON-safe dict for storage.
 
     Traceback splitting and length trimming happen here so over-long text is never
-    written to State_Backend. A ``User`` category carries no traceback (R5#6).
+    written to State_Backend. A ``user`` category carries no traceback.
     """
-    tb: str | None = None
-    if category != ErrorCategory.User and traceback_text:
-        tb = _trim_traceback(traceback_text)
+    if isinstance(category, str):
+        category = ErrorCategory(category.lower())
+    tb = _trim_traceback(traceback_text) if category is ErrorCategory.Server and traceback_text else None
+    lines = str(error).splitlines()
+    summary = (lines[0] if lines else '')[:_ERROR_MAX]
     payload = ErrorPayload(
-        error=error[:_ERROR_MAX],
+        error=summary,
         category=category,
         error_code=error_code,
         request_id=request_id,
         traceback=tb,
     )
-    return payload.model_dump(mode='json')
+    return payload.model_dump(mode='json', exclude_none=True)
 
 
 def error_payload_from_stored(stored: Any, *, request_id: str) -> ErrorPayload:
@@ -58,8 +60,14 @@ def error_payload_from_stored(stored: Any, *, request_id: str) -> ErrorPayload:
     the caller-supplied value / ``Unknown`` so a rolling upgrade never raises
     ``pydantic.ValidationError``.
     """
-    data = dict(stored) if isinstance(stored, Mapping) else {'error': str(stored)}
+    if isinstance(stored, Mapping):
+        data = dict(stored)
+    else:
+        data = {'error': 'Unknown error' if stored is None else str(stored)}
     data.setdefault('category', ErrorCategory.Unknown)
     data.setdefault('error_code', 500)
     data.setdefault('request_id', request_id)
+    category = str(data['category']).lower()
+    if category != ErrorCategory.Server.value:
+        data.pop('traceback', None)
     return ErrorPayload.model_validate(data)

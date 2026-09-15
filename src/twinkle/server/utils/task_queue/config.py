@@ -11,8 +11,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Substituted when execution_timeout is left at 0 ("no configured limit").
+# Finite bounds used when configuration omits a limit and by long-running methods.
 _ZERO_EXECUTION_TIMEOUT_FALLBACK: float = 3600.0
+_MAX_DECLARED_BACKEND_TIMEOUT: float = 3600.0
+_ABSOLUTE_TTL_MULTIPLIER: int = 2
 
 
 class TaskQueueConfig(BaseModel):
@@ -57,3 +59,9 @@ class TaskQueueConfig(BaseModel):
         if self.execution_timeout > 0:
             return self.execution_timeout
         return _ZERO_EXECUTION_TIMEOUT_FALLBACK
+
+    def absolute_future_ttl(self, collect_width: int) -> float:
+        """Conservative lifetime for a non-terminal future record."""
+        ray_timeout = max(self.effective_execution_timeout, _MAX_DECLARED_BACKEND_TIMEOUT)
+        resource_bound = max(1, collect_width) * ray_timeout
+        return _ABSOLUTE_TTL_MULTIPLIER * (self.queue_timeout + resource_bound)

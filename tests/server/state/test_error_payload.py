@@ -5,6 +5,9 @@ Spec: T2.4 / R9#7 / R8#5.
 """
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from twinkle.server.utils.task_errors import error_payload_from_stored, task_error_payload
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
@@ -41,7 +44,13 @@ def test_user_category_carries_no_traceback():
         category=ErrorCategory.User, traceback_text='Traceback (most recent call last): ...')
 
     assert payload['category'] == ErrorCategory.User.value
-    assert payload['traceback'] is None
+    assert 'traceback' not in payload
+
+
+def test_error_category_matches_tinker_wire_values():
+    from tinker.types import RequestErrorCategory
+
+    assert {item.value for item in RequestErrorCategory} == {item.value for item in ErrorCategory}
 
 
 def test_tinker_sdk_parses_six_field_like_two_field():
@@ -54,10 +63,35 @@ def test_tinker_sdk_parses_six_field_like_two_field():
     from tinker.types import RequestFailedResponse
 
     two = {'error': 'boom', 'category': 'server'}
-    six = {**two, 'error_code': 504, 'request_id': 'req_9', 'traceback': None, 'details': None}
+    six = task_error_payload('boom', request_id='req_9', error_code=504)
 
     parsed_six = RequestFailedResponse.model_validate(six)
     parsed_two = RequestFailedResponse.model_validate(two)
 
     assert parsed_six.error == parsed_two.error
     assert parsed_six.category == parsed_two.category
+
+
+def test_legacy_title_case_category_is_normalized():
+    payload = error_payload_from_stored({'error': 'boom', 'category': 'Server'}, request_id='req_10')
+    assert payload.category is ErrorCategory.Server
+    assert payload.category.value == 'server'
+
+
+@pytest.mark.parametrize('category', [ErrorCategory.User, ErrorCategory.Unknown])
+def test_non_server_traceback_is_rejected(category):
+    with pytest.raises(ValidationError):
+        ErrorPayload(
+            error='bad input',
+            category=category,
+            error_code=400,
+            request_id='req_11',
+            traceback='server stack',
+        )
+
+
+def test_legacy_unknown_traceback_is_removed():
+    payload = error_payload_from_stored(
+        {'error': 'legacy', 'category': 'Unknown', 'traceback': 'old stack'}, request_id='req_12')
+    assert payload.category is ErrorCategory.Unknown
+    assert payload.traceback is None

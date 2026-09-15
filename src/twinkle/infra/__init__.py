@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
-from .collectors import collect_tensor_dict
+from .collectors import collect_tensor_dict as collect_tensor_dict
 
 logger = get_logger()
 
@@ -530,7 +530,7 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
     try:
         ordered: List[Any] = [None] * batch_len
         for _, indices, ref in submitted:
-            part = ray.get(ref, timeout=ray_get_timeout) if ray_get_timeout else ray.get(ref)
+            part = ray.get(ref, timeout=ray_get_timeout) if ray_get_timeout is not None else ray.get(ref)
             if not isinstance(part, (list, tuple)) or len(part) != len(indices):
                 raise TypeError(f'{func_name}: enable_continous_work needs one result per request, but a worker given '
                                 f'{len(indices)} request(s) returned {type(part).__name__} of length '
@@ -740,7 +740,6 @@ def _get_device_mesh_param(args, kwargs):
 def _prepare_lazy_collect(args, kwargs):
     # if a worker received an actor handle,
     # lazy collect should be false to prevent any outer function receives an object ref
-    from ._ray import RayHelper
     if not os.environ.get('WORKER_NAME'):
         # If this is a driver
         return args, kwargs

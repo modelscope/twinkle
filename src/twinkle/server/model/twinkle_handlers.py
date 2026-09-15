@@ -8,13 +8,11 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 """
 from __future__ import annotations
 
-import asyncio
 import torch
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pathlib import Path
-from peft import LoraConfig
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -29,7 +27,6 @@ from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_
                                         select_output_rows)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -620,11 +617,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                     checkpoint_manager.get_ckpt_dir(model_id=model_id_to_load, checkpoint_id=checkpoint_id))
             else:
                 checkpoint_dir = body.checkpoint_dir
-            # Run blocking upload in thread pool so the event loop is not blocked.
-            # async_upload is intentionally ignored here: the task queue + client polling
-            # already provide the fire-and-forget / wait semantics without holding the
-            # HTTP connection open for the full duration of the upload.
-            await asyncio.to_thread(
+            await self.call_backend(
                 self.model.upload_to_hub,
                 checkpoint_dir=checkpoint_dir,
                 hub_model_id=body.hub_model_id,
@@ -672,6 +665,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raise HTTPException(status_code=400, detail=str(exc))
 
         async def _task():
+            from peft import LoraConfig
+
+            from twinkle_client.common.serialize import deserialize_object
             config = deserialize_object(body.config)
             extra_kwargs = body.model_extra or {}
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
@@ -735,6 +731,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
+            from twinkle_client.common.serialize import deserialize_object
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             patch_cls = deserialize_object(body.patch_cls)
@@ -756,6 +753,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
+            from twinkle_client.common.serialize import deserialize_object
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             metric_cls = deserialize_object(body.metric_cls)

@@ -4,6 +4,7 @@ import pytest
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
 from twinkle.server.utils.task_queue.mixin import TaskQueueMixin
+from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.server.utils.task_queue.worker import ComputeWorker
 
 
@@ -57,7 +58,7 @@ async def test_preflight_rejects_batch_without_per_dp_multiple():
 
     assert result == {'request_id': 'req1', 'model_id': 'model1'}
     _, kwargs = queue.state.records[-1]
-    assert kwargs['result']['category'] == 'User'
+    assert kwargs['result']['category'] == 'user'
     assert 'Batch size 2 must be divisible by 4' in kwargs['result']['error']
 
 
@@ -93,6 +94,7 @@ async def test_background_task_tracks_status():
     await asyncio.sleep(0)
 
     assert [args[1] for args, _ in queue.state.records] == ['running', 'completed']
+    assert queue.state.records[0][1]['absolute_deadline'] > 0
     assert queue.state.records[-1][1]['result'] == {'ok': True}
 
 
@@ -122,6 +124,7 @@ async def test_schedule_task_and_wait_returns_large_result_without_persisting_it
 @pytest.mark.asyncio
 async def test_polling_schedule_task_still_persists_its_result():
     queue = _DummyQueue()
+    queue.replica_id = 'replica-1'
     queue.enable_compute_worker()
     result = {'value': 42}
 
@@ -142,6 +145,9 @@ async def test_polling_schedule_task_still_persists_its_result():
     finally:
         await queue._compute_worker.stop()
 
+    pending = next(kwargs for args, kwargs in queue.state.records if args[1] == 'pending')
+    assert pending['replica_id'] == 'replica-1'
+    assert pending['absolute_deadline'] > 0
     assert completed[-1]['result'] is result
 
 
@@ -165,6 +171,28 @@ async def test_schedule_task_and_wait_propagates_failure_without_persisting_it()
         await queue._compute_worker.stop()
 
     assert queue.state.records == []
+
+
+@pytest.mark.asyncio
+async def test_user_task_error_is_stored_as_user_failure():
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+
+    async def work():
+        raise UserTaskError('invalid request')
+
+    try:
+        await queue.schedule_task(work, model_id='model1', token='token1')
+        for _ in range(100):
+            failed = [kwargs for args, kwargs in queue.state.records if args[1] == 'failed']
+            if failed:
+                break
+            await asyncio.sleep(0)
+    finally:
+        await queue._compute_worker.stop()
+
+    assert failed[-1]['result']['category'] == 'user'
+    assert 'traceback' not in failed[-1]['result']
 
 
 @pytest.mark.asyncio

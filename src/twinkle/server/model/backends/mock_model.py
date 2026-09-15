@@ -240,7 +240,7 @@ class TwinkleCompatMockModel:
     def has_adapter(self, adapter_name: str) -> bool:
         return adapter_name in self._adapters
 
-    @remote_function(collect='first', lazy_collect=False, timeout=10)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

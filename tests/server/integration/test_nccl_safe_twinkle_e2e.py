@@ -8,7 +8,7 @@ subsequent valid request on the same deployment still succeeds.
 
 Prerequisites:
     1. Ray cluster running with GPUs (2 for model DP/TP)
-    2. Twinkle server started (no fault-tolerance env switch exists any more)
+    2. Twinkle server started with queue_config.execution_timeout=30
 
 Usage (pytest, requires TWINKLE_TEST_GPU_E2E=1):
     TWINKLE_TEST_GPU_E2E=1 pytest tests/server/integration/test_nccl_safe_twinkle_e2e.py -v
@@ -28,7 +28,8 @@ pytestmark = pytest.mark.skipif(
 
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
 SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
-TIMEOUT = 120
+EXECUTION_TIMEOUT = float(os.environ.get('TWINKLE_TEST_EXECUTION_TIMEOUT', '30'))
+TIMEOUT = EXECUTION_TIMEOUT + 15
 ADAPTER_NAME = 'loud-failure-test'
 
 
@@ -79,9 +80,10 @@ def test_failure_is_terminal_then_valid_request_succeeds():
 
     bad_features, bad_old_logps, bad_adv = _make_inputs(bad_old_logps_len=5)
     start = time.time()
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as caught:
         model.forward_backward(
             inputs=bad_features, adapter_name=ADAPTER_NAME, old_logps=bad_old_logps, advantages=bad_adv)
+    assert 'global_rank=' in str(caught.value)
     assert time.time() - start < TIMEOUT, 'malformed request must fail fast, not hang (NCCL)'
 
     good_features, good_old_logps, good_adv = _make_inputs()
