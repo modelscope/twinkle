@@ -53,5 +53,9 @@ class FutureRecord(BaseModel):
     result: Any = None
     queue_state: str | None = None
     queue_state_reason: str | None = None
+    # Replica that produced the record; filled at creation and never overwritten by a
+    # later status update. ``None`` (pre-upgrade record) means "ownership unknown" and
+    # is only subject to the absolute survival bound (see FutureManager.cleanup_expired).
+    replica_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)

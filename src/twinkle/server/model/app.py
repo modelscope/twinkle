@@ -144,6 +144,15 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         # Bound every ray.get on this backend by the effective execution timeout
         # (applies to both sync=True and sync=False dispatch). T4.1.
         self.model._ray_get_timeout = self._task_queue_config.effective_execution_timeout
+        # Inject the execution bounds used by state hygiene to compute the absolute
+        # survival TTL for non-terminal future records (T5.3). Collect_Width =
+        # world_size = len(self._actors).
+        _actors = getattr(self.model, '_actors', None)
+        self.state.set_execution_bounds(
+            queue_timeout=self._task_queue_config.queue_timeout,
+            execution_timeout=self._task_queue_config.effective_execution_timeout,
+            collect_width=len(_actors) if _actors else 1,
+        )
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -176,6 +185,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
         await self._ensure_replica_registered()
+        await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
         return token

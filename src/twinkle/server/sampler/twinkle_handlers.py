@@ -466,7 +466,14 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         from .backends import STREAM_SENTINEL
 
         q = Queue(maxsize=128)
-        actor = self.sampler._actors[0]
+        actors = self.sampler._actors
+        if not actors:
+            # No available sampler actor -> structured error, not an IndexError (R4#12).
+            async def _no_actor_generator():
+                yield json.dumps({'error': 'No available sampler actor', 'category': 'Server'}) + '\n'
+
+            return StreamingResponse(_no_actor_generator(), media_type='application/x-ndjson')
+        actor = actors[0]
         actor.sample_stream_to_queue.remote(
             q,
             inputs_parsed,
@@ -475,16 +482,41 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             adapter_path=adapter_path,
         )
 
+        # Two time bounds (R4#10-11): a per-get bound and a total-lifetime bound.
+        single_get_timeout = 60.0
+        total_timeout = self._task_queue_config.effective_execution_timeout
+
         async def _stream_generator():
             loop = asyncio.get_event_loop()
-            while True:
-                item = await loop.run_in_executor(None, q.get)
-                if item == STREAM_SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    yield json.dumps({'error': str(item)}) + '\n'
-                    break
-                delta, reason = item
-                yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
+            start = loop.time()
+            try:
+                while True:
+                    remaining = total_timeout - (loop.time() - start)
+                    if remaining <= 0:
+                        yield json.dumps(
+                            {'error': 'sample_stream exceeded the execution time bound', 'category': 'Server'}) + '\n'
+                        break
+                    try:
+                        item = await asyncio.wait_for(
+                            loop.run_in_executor(None, q.get), timeout=min(single_get_timeout, remaining))
+                    except asyncio.TimeoutError:
+                        yield json.dumps(
+                            {'error': 'sample_stream timed out waiting for the next token', 'category': 'Server'}) + '\n'
+                        break
+                    if item == STREAM_SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        yield json.dumps({'error': str(item)}) + '\n'
+                        break
+                    delta, reason = item
+                    yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
+            finally:
+                # The run_in_executor(None, q.get) thread is NOT cancelled when
+                # wait_for times out; shutting the ray Queue down makes the blocked
+                # get() raise so the thread exits and the pool returns to baseline.
+                try:
+                    q.shutdown(force=True)
+                except Exception:
+                    pass
 
         return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')

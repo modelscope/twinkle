@@ -39,6 +39,10 @@ LEADER_KEY = 'cleanup_leader'  # actual backend key: '<key_prefix>cleanup_leader
 LEASE_TTL = 30  # seconds — leader loses the lease after this without a renew
 LEASE_RENEW = 10  # seconds — must be < LEASE_TTL/2 so two missed renews still beat the TTL
 
+# Integer multiple of (queue_timeout + resource-release bound) used as the absolute
+# survival bound for a non-terminal record; the margin absorbs scheduling slack.
+_ABSOLUTE_TTL_MULTIPLIER = 2
+
 
 def _renew_if_owner(current: str | None, *, owner: str) -> str | None:
     """``update_atomic`` transform: only re-write the lease if it is still mine."""
@@ -86,6 +90,13 @@ class ServerState:
         self.cleanup_interval = cleanup_interval
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_running = False
+
+        # Execution bounds injected by ModelManagement after _init_task_queue
+        # (see set_execution_bounds). Used to compute the absolute survival bound
+        # for non-terminal future records. All None => absolute bound disabled.
+        self._queue_timeout: float | None = None
+        self._effective_execution_timeout: float | None = None
+        self._collect_width: int | None = None
 
         # Leader election + metrics-publish loop state. ``metrics_update_interval``
         # is a typed parameter (a misspelled key now fails loudly rather than
@@ -289,6 +300,7 @@ class ServerState:
         result: Any = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
+        replica_id: str | None = None,
     ) -> None:
         """Store task status with optional result.
 
@@ -317,6 +329,7 @@ class ServerState:
             result=result,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
+            replica_id=replica_id,
         )
 
     # ----- Configuration Management -----
@@ -370,7 +383,15 @@ class ServerState:
         models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
         samplings_removed = await self._sampling_mgr.cleanup_expired(
             cutoff_time, expired_session_ids=expired_session_ids)
-        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time)
+
+        # State hygiene for future records (design §5.2): protect non-terminal
+        # records owned by a live replica, fail orphans, and enforce the absolute
+        # survival bound. Alive set comes from ReplicaRegistry; absolute_ttl is
+        # computed only when the execution bounds were injected.
+        alive_replica_ids = await self._model_mgr.get_alive_replica_ids(self.expiration_timeout)
+        absolute_ttl = self._absolute_survival_ttl()
+        futures_removed = await self._future_mgr.cleanup_expired(
+            cutoff_time, alive_replica_ids=alive_replica_ids, absolute_ttl=absolute_ttl)
 
         return {
             'sessions': sessions_removed,
@@ -378,6 +399,28 @@ class ServerState:
             'sampling_sessions': samplings_removed,
             'futures': futures_removed,
         }
+
+    def set_execution_bounds(self, *, queue_timeout: float, execution_timeout: float, collect_width: int) -> None:
+        """Inject the execution bounds used to compute the absolute survival TTL.
+
+        Called by ModelManagement after ``_init_task_queue``. ``ServerState`` is a
+        shared instance obtained via ``get_server_state()``, so these cannot be
+        constructor arguments; a setter is the injection path (design §5.2).
+        """
+        self._queue_timeout = queue_timeout
+        self._effective_execution_timeout = execution_timeout
+        self._collect_width = collect_width
+
+    def _absolute_survival_ttl(self) -> float | None:
+        """``k * (queue_timeout + Collect_Width * T)`` or ``None`` if not injected."""
+        if (self._queue_timeout is None or self._effective_execution_timeout is None or self._collect_width is None):
+            return None
+        resource_release_bound = self._collect_width * self._effective_execution_timeout
+        return _ABSOLUTE_TTL_MULTIPLIER * (self._queue_timeout + resource_release_bound)
+
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        """Refresh a replica's liveness timestamp in the shared registry (R4#6)."""
+        await self._model_mgr.touch_replica_last_seen(replica_id)
 
     async def _cleanup_loop(self) -> None:
         """Background task that periodically cleans up expired resources.

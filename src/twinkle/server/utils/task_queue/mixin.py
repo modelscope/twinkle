@@ -197,6 +197,7 @@ class TaskQueueMixin:
                     result=error_payload,
                     queue_state=queue_state,
                     queue_state_reason=error_msg,
+                    replica_id=getattr(self, 'replica_id', None),
                 )
                 return {'request_id': request_id, 'model_id': model_id}
             # Private marker consumed by schedule_task_and_wait().  It is not
@@ -272,6 +273,7 @@ class TaskQueueMixin:
                 TaskStatus.PENDING.value,
                 model_id,
                 queue_state=QueueState.ACTIVE.value,
+                replica_id=getattr(self, 'replica_id', None),
             )
 
         queue_key = self._queue_key(model_id=model_id, token=token)
@@ -422,6 +424,7 @@ class TaskQueueMixin:
             TaskStatus.RUNNING.value,
             model_id,
             queue_state=QueueState.ACTIVE.value,
+            replica_id=getattr(self, 'replica_id', None),
         )
 
         async def _run() -> None:
