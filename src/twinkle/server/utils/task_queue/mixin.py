@@ -8,10 +8,12 @@ and continuous batching internally.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 import traceback
 import uuid
 from collections.abc import Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from twinkle.server.telemetry.middleware import get_task_metrics
@@ -19,7 +21,7 @@ from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
@@ -50,12 +52,23 @@ class TaskQueueMixin:
 
     state: ServerState
 
-    def _init_task_queue(self, config: TaskQueueConfig | None = None, deployment_name: str = '') -> None:
+    def _init_task_queue(
+        self,
+        config: TaskQueueConfig | None = None,
+        deployment_name: str = '',
+        *,
+        enable_admission_gate: bool = False,
+    ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
         ``config`` must be a typed :class:`TaskQueueConfig` (the launcher
         passes the instance straight through). ``None`` constructs a default
         config.
+
+        ``enable_admission_gate`` turns on the per-replica Admission_Gate
+        (:meth:`call_backend`). ``ModelManagement`` enables it; ``SamplerManagement``
+        does not (vllm sampler owns its own concurrency and the weight-update /
+        generation mutual exclusion is covered by infra ``_cw_barrier``).
         """
         self._task_queue_config = config if config is not None else TaskQueueConfig()
         if self._task_queue_config.execution_timeout == 0:
@@ -83,7 +96,64 @@ class TaskQueueMixin:
             deployment_name=deployment_name,
         )
 
+        # Blocking_Call_Boundary: a dedicated thread pool that moves every backend
+        # call off the event loop. Deliberately NOT max_workers=1 -- a call that
+        # leaks past its wait_for timeout keeps its thread; capping at one worker
+        # would let one leak block the whole queue forever.
+        self._backend_executor = ThreadPoolExecutor(thread_name_prefix='twinkle-backend')
+        # per-replica Admission_Gate; opt-in per deployment.
+        self._backend_admission: asyncio.Semaphore | None = (
+            asyncio.Semaphore(1) if enable_admission_gate else None)
+
         self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    async def call_backend(self, fn: Callable[..., Any], /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
+        """The only place a Blocking_Backend_Call leaves the event loop.
+
+        Covers every backend call in this replica process -- not just handlers.
+        "Does it enter Task_Queue" is deliberately NOT the exemption test: what this
+        boundary protects is event-loop responsiveness, orthogonal to queueing.
+        ``check_model_health()``'s ping, ``_cleanup_adapter()``'s two calls (driven
+        by a countdown, never queued) and the non-queued sampler endpoints are
+        exactly the calls that test would have missed.
+
+        The Admission_Gate it takes when ``admit=True`` guards against collective
+        mis-pairing (a task issued to the same actors while a timed-out call is
+        still in flight) and against queue-bypassing paths (``_cleanup_adapter``) --
+        NOT GPU parallelism (Ray already serialises calls per actor). ``admit=False``
+        skips the gate: it is for liveness probes only, because the moment a probe
+        matters most is while a call is stuck, and that is exactly when the gate is
+        held by the stuck thread; a probe touches no collective. The sampler side
+        does not enable the gate -- infra ``_cw_barrier`` already covers it.
+
+        When the gate is held by a leaked (timed-out) call, a new admitting call
+        fails fast with :class:`BackendBusyError` instead of queueing behind it.
+        """
+        loop = asyncio.get_running_loop()
+        sem = self._backend_admission if admit else None
+        if sem is None:
+            return await loop.run_in_executor(self._backend_executor, functools.partial(fn, *args, **kwargs))
+
+        # asyncio.Semaphore.acquire() does not yield when the gate is free, so this
+        # check-then-acquire is race-free for a Semaphore(1): if not locked here,
+        # acquire succeeds synchronously.
+        if sem.locked():
+            raise BackendBusyError(
+                'This replica is waiting for a timed-out backend call to exit; '
+                'refusing to queue behind it.')
+        await sem.acquire()
+
+        def _work() -> Any:
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                # Release only when the thread truly finishes. A wait_for timeout
+                # cancels the awaiting coroutine but NOT this thread; releasing on
+                # cancellation would free the gate while the backend call is still
+                # in flight (Property 4).
+                loop.call_soon_threadsafe(sem.release)
+
+        return await loop.run_in_executor(self._backend_executor, _work)
 
     @staticmethod
     def _queue_key(model_id: str | None, token: str | None) -> str:
@@ -422,4 +492,7 @@ class TaskQueueMixin:
         """Gracefully shut down the compute queue and release resources."""
         await self._rate_limiter.stop_cleanup_task()
         await self._compute_worker.stop()
+        # Do not wait on threads that may be leaked on a timed-out backend call.
+        if getattr(self, '_backend_executor', None) is not None:
+            self._backend_executor.shutdown(wait=False)
         logger.debug('[TaskQueue] Task queue shutdown complete')

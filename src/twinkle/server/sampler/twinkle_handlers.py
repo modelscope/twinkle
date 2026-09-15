@@ -231,13 +231,13 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
                 # Reset prefix cache only when new weights are loaded
-                self.sampler.reset_prefix_cache()
+                await self.call_backend(self.sampler.reset_prefix_cache)
                 # LoRA adapter dir (has adapter_config.json) vs full-parameter
                 # HF checkpoint. Full checkpoints replace the sampler base model.
                 if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
                     adapter_path = resolved_uri
                 elif resolved_uri:
-                    self.sampler.load_full_weights_from_path(resolved_uri)
+                    await self.call_backend(self.sampler.load_full_weights_from_path, resolved_uri)
 
             # Parse inputs
             inputs = body.inputs
@@ -259,7 +259,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params = SamplingParams.from_dict(body.sampling_params)
 
             # Sample
-            responses = self.sampler.sample(
+            responses = await self.call_backend(
+                self.sampler.sample,
                 inputs,
                 params,
                 adapter_name=full_adapter_name,
@@ -379,7 +380,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """Set the chat template for encoding Trajectory inputs."""
         extra_kwargs = body.model_extra or {}
         with traced_operation('sampler.set_template'):
-            self.sampler.set_template(body.template_cls, **extra_kwargs)
+            await self.call_backend(self.sampler.set_template, body.template_cls, **extra_kwargs)
         return types.SetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
@@ -396,7 +397,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
-            self.sampler.add_adapter_to_sampler(full_adapter_name, config)
+            await self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)
 
@@ -409,7 +410,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         extra_kwargs = body.model_extra or {}
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
-            self.sampler.apply_patch(patch_cls, **extra_kwargs)
+            await self.call_backend(self.sampler.apply_patch, patch_cls, **extra_kwargs)
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(
@@ -437,11 +438,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-            self.sampler.reset_prefix_cache()
+            await self.call_backend(self.sampler.reset_prefix_cache)
             if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
                 adapter_path = resolved_uri
             elif resolved_uri:
-                self.sampler.load_full_weights_from_path(resolved_uri)
+                await self.call_backend(self.sampler.load_full_weights_from_path, resolved_uri)
 
         inputs = body.inputs
         if isinstance(inputs, list):

@@ -26,6 +26,16 @@ class TaskStatus(Enum):
     RATE_LIMITED = 'rate_limited'  # Task rejected due to rate limiting
 
 
+class BackendBusyError(RuntimeError):
+    """Raised when the per-replica Admission_Gate is held by a leaked backend call.
+
+    A new backend call arriving while the gate is closed (its holder is a call that
+    already exceeded ``asyncio.wait_for`` but whose executor thread has not yet
+    returned) fails fast with this error instead of queueing behind it. The worker
+    maps it to ``ErrorPayload(category='Server', error_code=503)``.
+    """
+
+
 class QueueState(Enum):
     """Queue state for tinker client compatibility.
 

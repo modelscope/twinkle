@@ -19,7 +19,7 @@ from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -270,6 +270,14 @@ class ComputeWorker:
                          f'type={task_type}, queue_key={queue_key}')
             # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server (R5#8).
             await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=504)
+        except BackendBusyError as exc:
+            task_status = 'failed'
+            exec_time = time.monotonic() - exec_start
+            error = str(exc)
+            logger.error(f'[ComputeWorker] Task {task.request_id} REFUSED (admission gate held) after '
+                         f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
+            # Gate held by a leaked timed-out call -> 503/Server (R2#4).
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=503)
         except Exception as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start

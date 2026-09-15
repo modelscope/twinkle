@@ -133,7 +133,9 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self._replica_registered = False
 
         # Initialize mixins
-        self._init_task_queue(queue_config, deployment_name='Model')
+        # ModelManagement opts into the Admission_Gate (collective mis-pairing +
+        # queue-bypassing _cleanup_adapter); SamplerManagement does not.
+        self._init_task_queue(queue_config, deployment_name='Model', enable_admission_gate=True)
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -178,15 +180,19 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             pass
         await self.data_plane.close()
 
-    def check_model_health(self) -> dict:
+    async def check_model_health(self) -> dict:
         """Probe model actors liveness via a lightweight ping.
 
         Returns a dict with 'healthy' (bool) and 'detail' (str).
         If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
         will raise RayActorError, signalling the watchdog to restart.
+
+        The ping goes through the Blocking_Call_Boundary with ``admit=False`` so it
+        never blocks the event loop yet never queues behind the Admission_Gate --
+        the moment a probe matters most is while a call is stuck holding the gate.
         """
         try:
-            result = self.model.ping()
+            result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
                 return {'healthy': True, 'detail': 'model actors alive'}
             return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
@@ -199,9 +205,12 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             if self.train_mode == 'full':
                 # No PEFT adapter to remove; restore clean base weights so the
                 # next tenant does not inherit this tenant's trained weights.
-                self.model.reload_initial_weights()
+                # Takes the Admission_Gate: this path is driven by the background
+                # countdown and never enters Task_Queue, so the gate is what keeps
+                # it from colliding with an in-flight training call.
+                await self.call_backend(self.model.reload_initial_weights)
             else:
-                self.model.remove_adapter(adapter_name)
+                await self.call_backend(self.model.remove_adapter, adapter_name)
             self.unregister_resource(adapter_name)
             await self.state.unload_model(adapter_name)
 
