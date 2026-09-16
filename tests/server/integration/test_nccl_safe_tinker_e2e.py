@@ -68,6 +68,23 @@ def _make_datum(seq_len=64, completion_len=32, *, bad_logprobs_len=None):
     )
 
 
+def _assert_recovery_terminal(tc) -> None:
+    """Require success on Megatron; Transformers may fail loudly after DDP poisoning."""
+    from tinker import types
+    from tinker._exceptions import RequestFailedError
+
+    request = tc.forward_backward([_make_datum() for _ in range(4)], 'importance_sampling')
+    if BACKEND == 'megatron':
+        assert request.result() is not None
+        tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
+        return
+    try:
+        assert request.result(timeout=TIMEOUT) is not None
+        tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
+    except RequestFailedError as exc:
+        assert exc.category is types.RequestErrorCategory.Server
+
+
 def test_failure_is_terminal_then_valid_request_succeeds():
     """A malformed request fails loudly (terminal), a subsequent valid one succeeds.
 
@@ -88,23 +105,10 @@ def test_failure_is_terminal_then_valid_request_succeeds():
     assert caught.value.category is types.RequestErrorCategory.Server
     assert time.time() - start < TIMEOUT, 'malformed request must fail fast, not hang (NCCL)'
 
-    # Recovery: megatron commits the DDP reducer inside its fused forward_backward, so
-    # a subsequent valid request must succeed. The tinker transformers path runs
-    # forward()/loss/backward() separately; a mid-iteration loss failure leaves DDP's
-    # reducer half-finished and poisons the next request, so the spec only guarantees a
-    # *terminal* response there (R6#14), not success. (tinker 0.16.1 exposes no GA knob.)
-    good = [_make_datum() for _ in range(4)]
-    if BACKEND == 'megatron':
-        result = tc.forward_backward(good, 'importance_sampling').result()
-        assert result is not None
-        tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
-    else:
-        try:
-            result = tc.forward_backward(good, 'importance_sampling').result(timeout=TIMEOUT)
-            assert result is not None
-            tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
-        except RequestFailedError as exc:
-            assert exc.category is types.RequestErrorCategory.Server
+    # Megatron must recover successfully. Tinker's Transformers path executes
+    # forward/loss/backward separately; after a mid-iteration failure, R6#14 only
+    # guarantees that the next request reaches a terminal state.
+    _assert_recovery_terminal(tc)
 
 
 def test_partial_rank_failure_is_terminal_then_recovers():
@@ -124,18 +128,4 @@ def test_partial_rank_failure_is_terminal_then_recovers():
         assert 'global_rank=' in str(caught.value)
     assert time.time() - start < TIMEOUT
 
-    # See the recovery note above: success is required only where forward_backward
-    # commits the DDP reducer atomically (megatron). On transformers a terminal
-    # loud failure is acceptable (spec R6#14) -- the guarantee is no hang.
-    if BACKEND == 'megatron':
-        result = tc.forward_backward([_make_datum() for _ in range(4)], 'importance_sampling').result()
-        assert result is not None
-        tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
-    else:
-        try:
-            result = tc.forward_backward([_make_datum() for _ in range(4)],
-                                         'importance_sampling').result(timeout=TIMEOUT)
-            assert result is not None
-            tc.optim_step(types.AdamParams(learning_rate=1e-5)).result()
-        except RequestFailedError as exc:
-            assert exc.category is types.RequestErrorCategory.Server
+    _assert_recovery_terminal(tc)
