@@ -31,6 +31,12 @@ SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
 EXECUTION_TIMEOUT = float(os.environ.get('TWINKLE_TEST_EXECUTION_TIMEOUT', '30'))
 TIMEOUT = EXECUTION_TIMEOUT + 15
 ADAPTER_NAME = 'loud-failure-test'
+# The `global_rank=` attribution is added by `nccl_safe_megatron`, which decorates
+# only the Megatron backend; the transformers backend's forward_backward carries no
+# such annotation (its former silent-degradation decorator was removed by R6#3). Gate the
+# rank-attribution assertion on the backend so this file is safe to run under the
+# integration-e2e SKILL's TWINKLE_TEST_BACKEND=transformers path.
+BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'megatron')
 
 
 def _init_client():
@@ -43,7 +49,11 @@ def _init_client():
     model.add_adapter_to_model(
         adapter_name=ADAPTER_NAME,
         config=LoraConfig(r=16, target_modules=['q_proj', 'v_proj']),
-        gradient_accumulation_steps=1,
+        # GA>=2 (repo convention, see e2e_helpers): with GA=1 every backward syncs
+        # DDP immediately, so a mid-iteration failure can leave the reducer
+        # half-finished and poison the next request. GA=2 runs accumulation steps
+        # under no_sync, keeping the recovery request clean.
+        gradient_accumulation_steps=2,
     )
     model.set_loss('GRPOLoss', init_args={'epsilon': 0.2})
     model.set_optimizer('Adam', lr=1e-5)
@@ -83,7 +93,13 @@ def test_failure_is_terminal_then_valid_request_succeeds():
     with pytest.raises(Exception) as caught:
         model.forward_backward(
             inputs=bad_features, adapter_name=ADAPTER_NAME, old_logps=bad_old_logps, advantages=bad_adv)
-    assert 'global_rank=' in str(caught.value)
+    message = str(caught.value)
+    # The failure must be loud and descriptive (not a silent zero-loss success):
+    # the deliberate old_logps/completion length mismatch surfaces on both backends.
+    assert 'mismatch' in message, message
+    # Megatron additionally attributes the failure to a global rank via nccl_safe_megatron.
+    if BACKEND == 'megatron':
+        assert 'global_rank=' in message, message
     assert time.time() - start < TIMEOUT, 'malformed request must fail fast, not hang (NCCL)'
 
     good_features, good_old_logps, good_adv = _make_inputs()

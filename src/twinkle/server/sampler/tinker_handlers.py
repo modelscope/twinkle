@@ -99,6 +99,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         top_p=body.sampling_params.top_p,
                         top_k=body.sampling_params.top_k,
                         stop=body.sampling_params.stop,
+                        # tinker 0.16.1 has no SamplingParams.logprobs field, but its
+                        # SampledSequence contract and GRPO training require one
+                        # chosen-token logprob per generated token.
+                        logprobs=1,
                     )
 
                 # A resolved checkpoint is either a LoRA adapter dir (has
@@ -131,8 +135,12 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                                 flattened = [float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list]
                             except (IndexError, TypeError):
                                 flattened = []
-                            if flattened and len(flattened) == len(seq.logprobs):
+                            if len(flattened) == len(seq.tokens):
                                 logprobs = flattened
+                            else:
+                                raise RuntimeError(
+                                    f'Sampler returned {len(flattened)} logprobs for {len(seq.tokens)} generated '
+                                    'tokens; refusing to return a misaligned Tinker SampledSequence.')
                         tinker_sequences.append(
                             _sampled_sequence(
                                 stop_reason=seq.stop_reason,

@@ -251,6 +251,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             else:
                 feat['input_ids'] = response.prompt_token_ids
                 feat['labels'] = [-100] * len(response.prompt_token_ids)
+        # A sampling prompt (e.g. a tinker ModelInput) carries input_ids but no labels;
+        # concat_input_feature would then derive a zero-length prefix completion_mask
+        # and raise. The prompt is pure context, so materialise aligned all-context
+        # labels when they are missing or length-mismatched. Present, aligned labels are
+        # left untouched (preserving provenance), and the logprobs-only path -- which
+        # never concatenates -- is not touched.
+        if not logprobs_only and 'input_ids' in feat and len(feat.get('labels') or []) != len(feat['input_ids']):
+            feat['labels'] = [-100] * len(feat['input_ids'])
         sequences = []
         for seq in response.sequences:
             if logprobs_only:

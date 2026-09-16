@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Shared Ray runtime + per-test isolation for ``tests/server`` (state, cli, ...).
+"""Shared Ray runtime, per-test isolation, and evidence boundaries.
 
 ``RayActorBackend`` is a forwarding wrapper around a detached Ray actor;
 instantiating one without an initialized Ray runtime raises
@@ -12,6 +12,15 @@ canonical actor (``twinkle_state_actor``) by design — that is the whole point
 of the actor wrapper. To keep tests independent we clear that actor's store
 before each test function. Tests that pin a non-default ``key_prefix`` get
 their own actor; this fixture intentionally leaves those alone.
+
+Evidence boundary (spec T8.4 / R9#10): every mock-model backend method accepts
+``**kwargs`` without argument validation, and the mock enters no real collective.
+A mock-backed test therefore proves neither request/argument validation nor NCCL
+behavior (asymmetric failure, collective mis-pairing, ReduceScatter, etc.). It may
+prove only backend dispatch, task-queue behavior, timeout/admission mechanisms,
+and event-loop responsiveness. Validation and NCCL claims require the GPU-gated
+``test_nccl_safe_*_e2e.py`` tests against a real server. The contract suite covers
+all five apps; Tinker compatibility follows the pinned 0.16.1 SDK wire values.
 """
 from __future__ import annotations
 
