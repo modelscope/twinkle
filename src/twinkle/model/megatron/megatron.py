@@ -1347,7 +1347,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Save config on global rank 0 only (avoid concurrent writers).
         if is_global_zero:
             self.hf_config.save_pretrained(output_dir)
-            if isinstance(model[0], PeftModel):
+            # Only write an adapter_config when actually saving a PEFT adapter.
+            # merge_lora saves the merged full weights with adapter_name='' while the
+            # model is still PeftModel-wrapped; indexing peft_config[''] there raises KeyError.
+            if is_peft_format and isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
                 target_modules = config.target_modules
                 config.target_modules = 'all-linear'

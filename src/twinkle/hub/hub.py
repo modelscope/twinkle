@@ -299,7 +299,7 @@ class MSHub(HubOperation):
     @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:
         requires('modelscope')
-        from modelscope import HubApi
+        from modelscope.hub.api import HubApi
         if token is None:
             token = os.environ.get('MODELSCOPE_API_TOKEN')
         if token:
@@ -311,8 +311,7 @@ class MSHub(HubOperation):
     @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
         requires('modelscope')
-        from modelscope import HubApi
-        from modelscope.hub.api import ModelScopeConfig
+        from modelscope.hub.api import HubApi, ModelScopeConfig
         from modelscope.hub.constants import ModelVisibility
         assert repo_id is not None, 'Please enter a valid hub_model_id'
 
