@@ -5,4 +5,5 @@ Advantage
 
    Advantage.md
    GRPOAdvantage.md
+   GroupAdmissionPolicy.md
    RLOOAdvantage.md
