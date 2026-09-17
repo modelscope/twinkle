@@ -13,6 +13,7 @@ Twinkle DOCUMENTATION
    Usage Guide/Installation.md
    Usage Guide/Server and Client/index.rst
    Usage Guide/NPU-Support.md
+   Usage Guide/XPU-Support.md
    Usage Guide/Train-as-a-Service.md
    Usage Guide/Agentic-RL-Deployment-and-Training.md
    Usage Guide/Agentic-Evaluator.md
