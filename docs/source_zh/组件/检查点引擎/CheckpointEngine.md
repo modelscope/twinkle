@@ -39,7 +39,7 @@ class CheckpointEngine(ABC):
 
 ## 可用的检查点引擎
 
-Twinkle 提供了两种检查点引擎实现:
+Twinkle 提供了三种检查点引擎实现:
 
 ### NCCLCheckpointEngine
 
@@ -61,10 +61,21 @@ Twinkle 提供了两种检查点引擎实现:
 
 详见: [HCCLCheckpointEngine](HCCLCheckpointEngine.md)
 
+### XCCLCheckpointEngine
+
+使用 BKCL（XCCL）在昆仑芯 XPU 上进行权重传输的检查点引擎。
+
+- XPU 支持: 在 cuda-alike XPU 路线上作为 NCCLCheckpointEngine 的直替
+- relay 兜底: 通过 stateless `ProcessGroupXCCL` 加 socket 中继处理重复的 local device index
+- 兼容接口: 继承 `NCCLCheckpointEngine`，复用分桶与元数据握手
+
+详见: [XCCLCheckpointEngine](XCCLCheckpointEngine.md)
+
 ## 如何选择
 
 - **NCCLCheckpointEngine**: 适用于 GPU 环境,提供最高的传输性能
 - **HCCLCheckpointEngine**: 适用于昇腾 NPU 环境
+- **XCCLCheckpointEngine**: 适用于昆仑芯 XPU 环境（自动选择）
 
 > 检查点引擎是 RLHF 训练基础设施的关键组件,确保训练器和采样器使用一致的模型权重。
 > 目前的同步分为merge_and_sync=True/False两种情况，为True时将lora合并仅基模并同步，为False时仅同步lora权重。另外，多租户直接附加lora文件到vLLM上，在merge_and_sync=False，或使用多租户时，

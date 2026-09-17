@@ -67,10 +67,14 @@ class CheckpointEngineManager:
 
     @staticmethod
     def decide_backend_engine(platform: Optional[str] = None) -> 'CheckpointEngine':
-        if Platform.get_platform(platform).__name__ == 'GPU':
+        platform_name = Platform.get_platform(platform).__name__
+        if platform_name in ('GPU', 'XPU'):
+            if platform_name == 'XPU':
+                from twinkle.checkpoint_engine import XCCLCheckpointEngine
+                return XCCLCheckpointEngine
             from twinkle.checkpoint_engine import NCCLCheckpointEngine
             return NCCLCheckpointEngine
-        elif Platform.get_platform(platform).__name__ == 'NPU':
+        elif platform_name == 'NPU':
             from twinkle.checkpoint_engine import HCCLCheckpointEngine
             return HCCLCheckpointEngine
         else:
