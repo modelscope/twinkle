@@ -3,13 +3,16 @@
 import queue
 import threading
 from abc import ABC, abstractmethod
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
+from twinkle.advantage.group_admission import GroupAdmissionPolicy
 from twinkle.data_format import Trajectory
 from twinkle.utils import get_logger
 from twinkle_agentic.envs import Env, EnvLeases
+from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
 
@@ -56,13 +59,14 @@ class Challenger(ABC):
     """
 
     def __init__(
-            self,
-            *,
-            envs: Sequence[Env],
-            num_challenger_rollouts: int = 8,
-            num_solver_rollouts: int = 8,
-            pass_band: Tuple[float, float] = (1.0, 7.0),
-            max_empty_rounds: int = 0,
+        self,
+        *,
+        envs: Sequence[Env],
+        num_challenger_rollouts: int = 8,
+        num_solver_rollouts: int = 8,
+        pass_band: Tuple[float, float] = (1.0, 7.0),
+        max_empty_rounds: int = 0,
+        group_admission_policy: Optional[GroupAdmissionPolicy] = None,
     ):
         if not envs:
             raise ValueError('envs is empty: a challenger needs a workspace to act in and grade')
@@ -85,6 +89,7 @@ class Challenger(ABC):
         self.num_solver_rollouts = num_solver_rollouts
         self.pass_band = pass_band
         self.max_empty_rounds = max_empty_rounds
+        self.group_admission_policy = group_admission_policy
         self.n_proposed = 0
         self.n_kept = 0
         # One worker per environment, which is what makes a lease never block: a
@@ -127,12 +132,46 @@ class Challenger(ABC):
         Called from the job that finished the unit, so it must not block: it drops
         the groups in a queue and returns to the pool.
         """
-        proposing = [group for group in challenger if self._has_spread(group)]
-        solving = [group for group in solver if self._has_spread(group)]
-        flat = len(challenger) - len(proposing) + len(solver) - len(solving)
-        if flat:
-            logger.info(f'[{type(self).__name__}] dropped {flat} groups whose rewards were all equal')
+        reasons: Counter[str] = Counter()
+        proposing = self._admitted_groups(challenger, reasons)
+        solving = self._admitted_groups(solver, reasons)
+        if reasons:
+            detail = ', '.join(f'{reason}={count}' for reason, count in sorted(reasons.items()))
+            logger.info(f'[{type(self).__name__}] dropped {sum(reasons.values())} groups: {detail}')
         self._finished.put((proposing, solving))
+
+    def _admitted_groups(
+        self,
+        groups: Sequence[List[Trajectory]],
+        rejection_reasons: Counter[str],
+    ) -> List[List[Trajectory]]:
+        """Apply admission atomically and return only complete accepted groups.
+
+        Challenger historically drops groups with no reward spread. That remains
+        the default invariant; an optional shared policy can add resolution-aware
+        reward and near-duplicate checks without changing the refill lifecycle.
+        """
+        admitted = []
+        for group in groups:
+            if not self._has_spread(group):
+                rejection_reasons['exact_dead'] += 1
+                continue
+            if self.group_admission_policy is None:
+                admitted.append(group)
+                continue
+
+            completions = None
+            if self.group_admission_policy.config.max_mean_pairwise_similarity is not None:
+                completions = [assistant_text(member) for member in group]
+            decision = self.group_admission_policy.evaluate(
+                [float(member.get('rewards') or 0.0) for member in group],
+                completions=completions,
+            )
+            if decision.admitted:
+                admitted.append(group)
+            else:
+                rejection_reasons[decision.primary_rejection_reason or 'policy'] += 1
+        return admitted
 
     @staticmethod
     def _has_spread(group: List[Trajectory]) -> bool:
