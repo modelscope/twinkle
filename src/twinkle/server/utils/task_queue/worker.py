@@ -14,6 +14,7 @@ import traceback
 from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
+from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
@@ -291,6 +292,26 @@ class ComputeWorker:
                          f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
             # Gate held by a leaked timed-out call -> 503/Server.
             await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=503)
+        except TwinkleServerError as exc:
+            # A typed server error carries its own status + category (e.g.
+            # ResourceNotFoundError = 404/User from a deferred
+            # assert_resource_exists). Honour them instead of collapsing every
+            # such failure to 500/Server. Only Server-category errors keep a
+            # traceback; a User rejection does not.
+            task_status = 'failed'
+            exec_time = time.monotonic() - exec_start
+            is_server = exc.category is ErrorCategory.Server
+            if is_server:
+                logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
+                             f'type={task_type}:\n{traceback.format_exc(limit=3)}')
+            await self._store_task_failed(
+                task,
+                f'{type(exc).__name__}: {exc}',
+                QueueState.ACTIVE.value,
+                error_code=exc.error_code,
+                category=exc.category,
+                traceback_text=traceback.format_exc() if is_server else None,
+            )
         except Exception as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start

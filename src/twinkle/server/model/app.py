@@ -20,7 +20,7 @@ from twinkle.server.exceptions import FullModeBusyError
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
-from twinkle.server.utils.lifecycle import AdapterManagerMixin
+from twinkle.server.utils.session_resource import AdapterManagerMixin
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
@@ -262,9 +262,9 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """
         if not self.is_full_mode:
             return
-        for rid, info in self._resource_records.items():
-            if rid != adapter_name and not info.get('expiring'):
-                raise FullModeBusyError(rid)
+        holder = self.find_active_resource(exclude=adapter_name)
+        if holder is not None:
+            raise FullModeBusyError(holder)
 
     async def _on_adapter_expired(self, adapter_name: str) -> None:
         self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')

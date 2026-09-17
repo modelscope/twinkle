@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
 
+from twinkle.server.exceptions import ResourceNotFoundError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -210,15 +211,33 @@ class SessionResourceMixin:
             return
         info['state'] = {}
 
+    def find_active_resource(self, exclude: str | None = None) -> str | None:
+        """Return the id of an active (registered, not expiring) resource, if any.
+
+        "Active" means present in the records and not marked ``expiring``.
+        ``exclude`` (a resource id) is skipped so a caller can ask "is any *other*
+        resource active?" — e.g. a tenant re-issuing against its own resource must
+        not count itself. Returns the first matching id, or ``None`` when none is
+        active. This is the owner-side query that lets callers avoid reaching into
+        the private ``_resource_records`` dict.
+        """
+        for rid, info in self._resource_records.items():
+            if rid != exclude and not info.get('expiring'):
+                return rid
+        return None
+
     def assert_resource_exists(self, resource_id: str) -> None:
         """Validate that a resource exists and is not expiring.
 
         Raises:
-            AssertionError: If resource not found or expiring.
+            ResourceNotFoundError: 404/User — resource absent or expiring. Raised
+                (not ``assert``-ed) so the check is classified as a user-facing
+                404 rather than collapsing to a 500, and so it survives
+                ``python -O`` (which strips ``assert`` statements).
         """
         info = self._resource_records.get(resource_id)
-        assert resource_id and info is not None and not info.get('expiring'), \
-            f'{self._resource_type} {resource_id} not found'
+        if not (resource_id and info is not None and not info.get('expiring')):
+            raise ResourceNotFoundError(f'{self._resource_type} {resource_id} not found')
 
     @abstractmethod
     async def _on_resource_expired(self, resource_id: str) -> None:

@@ -21,9 +21,10 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle_client.types as types
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.data_format import SamplingParams
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
+from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name, to_backend_inputs
+from twinkle.server.sampler.weights import resolve_sampler_weights
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
@@ -234,33 +235,15 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
-                import os
-
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-                # Reset prefix cache only when new weights are loaded
+                # Reset prefix cache only when new weights are loaded.
                 await self.call_backend(self.sampler.reset_prefix_cache)
-                # LoRA adapter dir (has adapter_config.json) vs full-parameter
-                # HF checkpoint. Full checkpoints replace the sampler base model.
-                if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
-                    adapter_path = resolved_uri
-                elif resolved_uri:
-                    await self.call_backend(self.sampler.load_full_weights_from_path, resolved_uri)
+                adapter_path = await resolve_sampler_weights(self, resolved_uri)
 
-            # Parse inputs
-            inputs = body.inputs
-            if isinstance(inputs, list) and inputs:
-                first = inputs[0]
-                if isinstance(first, dict) and 'input_ids' in first:
-                    inputs = [InputFeature(**item) for item in inputs]
-                else:
-                    inputs = [Trajectory(**item) for item in inputs]
-            elif isinstance(inputs, dict):
-                if 'input_ids' in inputs:
-                    inputs = [InputFeature(**inputs)]
-                else:
-                    inputs = [Trajectory(**inputs)]
+            # Parse inputs (shared seam; batch form)
+            inputs = to_backend_inputs(body.inputs)
 
             # Build sampling params
             params = None
@@ -304,14 +287,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
 
         inputs = (await self.data_plane.get(body.input_ref) if body.input_ref is not None else body.inputs)
-        if isinstance(inputs, list) and inputs:
-            first = inputs[0]
-            if isinstance(first, dict) and 'input_ids' in first:
-                inputs = [InputFeature(**item) for item in inputs]
-            else:
-                inputs = [Trajectory(**item) for item in inputs]
-        elif isinstance(inputs, dict):
-            inputs = [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
+        inputs = to_backend_inputs(inputs)
 
         params_dict = dict(body.sampling_params or {})
         params_dict['num_samples'] = body.num_samples
@@ -431,29 +407,19 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
         if body.adapter_uri:
-            import os
-
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
             await self.call_backend(self.sampler.reset_prefix_cache)
-            if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
-                adapter_path = resolved_uri
-            elif resolved_uri:
-                await self.call_backend(self.sampler.load_full_weights_from_path, resolved_uri)
+            adapter_path = await resolve_sampler_weights(self, resolved_uri)
 
-        inputs = body.inputs
-        if isinstance(inputs, list):
-            if len(inputs) != 1:
-                raise HTTPException(status_code=400, detail='Streaming only supports a single input')
-            inputs = inputs[0]
-        if isinstance(inputs, dict):
-            if 'input_ids' in inputs:
-                inputs_parsed = InputFeature(**inputs)
-            else:
-                inputs_parsed = Trajectory(**inputs)
-        else:
-            inputs_parsed = inputs
+        # Streaming accepts exactly one input; the shared seam enforces that and
+        # returns a single parsed object. Its ValueError maps to the same 400 this
+        # endpoint has always returned.
+        try:
+            inputs_parsed = to_backend_inputs(body.inputs, single=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         params = None
         if body.sampling_params:

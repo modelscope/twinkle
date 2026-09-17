@@ -58,7 +58,8 @@ server = [
 test = [
   "hypothesis>=6.0",
   "pytest",
-  "pytest-asyncio"
+  "pytest-asyncio",
+  "grimp>=3.0"
 ]
 docs = [
   "sphinx>=5.3.0,<6.0.0",

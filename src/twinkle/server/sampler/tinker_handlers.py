@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.sampler.weights import resolve_sampler_weights
 from twinkle.server.utils import get_template_for_model
 from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
@@ -70,7 +71,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 # Set template for sampler based on model type
                 template = get_template_for_model(self.model_id)
                 await self.call_backend(self.sampler.set_template, template, model_id=self.model_id)
-                # Reset prefix cache for new weights
+                # Reset prefix cache unconditionally on every tinker request (by
+                # design): the tinker dialect does not signal whether weights
+                # changed, so it always invalidates. This differs from the twinkle
+                # endpoints, which reset only when an adapter_uri is supplied.
                 await self.call_backend(self.sampler.reset_prefix_cache)
 
                 # Get model_path from body or sampling session
@@ -105,16 +109,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         logprobs=1,
                     )
 
-                # A resolved checkpoint is either a LoRA adapter dir (has
-                # adapter_config.json) or a full-parameter HF checkpoint. Full
-                # checkpoints are loaded into the sampler base model instead of
-                # being passed as a LoRA adapter.
-                lora_path = None
-                if adapter_uri:
-                    if os.path.exists(os.path.join(adapter_uri, 'adapter_config.json')):
-                        lora_path = adapter_uri
-                    else:
-                        await self.call_backend(self.sampler.load_full_weights_from_path, adapter_uri)
+                # LoRA adapter dir vs full-parameter checkpoint (shared helper);
+                # a full checkpoint is loaded into the base model and yields no
+                # LoRA path.
+                lora_path = await resolve_sampler_weights(self, adapter_uri)
 
                 responses = await self.call_backend(
                     self.sampler.sample,

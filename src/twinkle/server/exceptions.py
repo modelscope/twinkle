@@ -133,6 +133,19 @@ class RateLimitExceededError(RequestRejectedError):
     category = ErrorCategory.User
 
 
+class ResourceNotFoundError(RequestRejectedError):
+    """A well-formed request names a resource (adapter / session) that is absent.
+
+    Distinct from a malformed request (400): the request itself is valid but the
+    referenced resource does not exist or is expiring, so it is a 404 on the
+    Decision_Boundary left. Raised (never ``assert``-ed) so the check survives
+    ``python -O`` and is classified as user-facing rather than a 500.
+    """
+
+    error_code = 404
+    category = ErrorCategory.User
+
+
 class FullModeBusyError(RequestRejectedError):
     """A full-parameter (exclusive) model deployment already has a holder.
 

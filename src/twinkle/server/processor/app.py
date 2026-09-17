@@ -22,7 +22,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.utils.lifecycle import ProcessorManagerMixin
+from twinkle.server.utils.session_resource import ProcessorManagerMixin
 from .twinkle_handlers import _register_processor_routes
 
 logger = get_logger()

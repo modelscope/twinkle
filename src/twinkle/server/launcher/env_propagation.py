@@ -33,9 +33,21 @@ def build_persistence_env_vars() -> dict[str, str]:
     return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
 
 
+def build_server_state_env_vars() -> dict[str, str]:
+    """Collect ServerState-policy env vars from ``os.environ`` for worker propagation.
+
+    Read inside each worker by ``ServerStateArgs.from_env()`` (via
+    ``get_server_state``) so the configured quota / expiry / metrics interval is
+    applied everywhere, not only in the gateway that first built the state.
+    """
+    from twinkle.server.config.application_spec import SERVER_STATE_ENV_KEYS
+    return {k: os.environ[k] for k in SERVER_STATE_ENV_KEYS if k in os.environ}
+
+
 def build_propagated_env_vars() -> dict[str, str]:
     """Aggregate all env vars that must reach Ray worker processes."""
     merged: dict[str, str] = {}
     merged.update(build_telemetry_env_vars())
     merged.update(build_persistence_env_vars())
+    merged.update(build_server_state_env_vars())
     return merged

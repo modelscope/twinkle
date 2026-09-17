@@ -40,7 +40,7 @@ from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.errors import ErrorPayload
+from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
 logger = get_logger()
 
@@ -164,10 +164,21 @@ def build_deployment_app(
     async def catch_unhandled_exceptions(request: Request, call_next):
         try:
             return await call_next(request)
-        except Exception:
-            error = traceback.format_exc()
-            logger.error(error)
-            return JSONResponse(status_code=500, content={'detail': error})
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error(tb)
+            # Unify the last-resort 500 with the rest of the wire: an
+            # ``ErrorPayload`` body (Server category keeps the traceback) instead
+            # of the legacy ``{'detail': <traceback>}`` shape.
+            request_id = getattr(request.state, 'request_id', None) or ''
+            payload = ErrorPayload(
+                error=(str(exc) or exc.__class__.__name__),
+                category=ErrorCategory.Server,
+                error_code=500,
+                request_id=request_id,
+                traceback=tb,
+            )
+            return JSONResponse(status_code=500, content=payload.model_dump(mode='json', exclude_none=True))
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):

@@ -11,10 +11,23 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
+import os
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
+
+# Env var keys the launcher sets from the gateway ``server_config`` so that any
+# Ray worker (model / sampler / processor), not just the gateway, applies the
+# configured ServerState policy instead of ``get_server_state``'s hardcoded
+# defaults. Only the four *policy* fields are propagated; ``actor_name`` is a
+# per-process cache key, not a cross-worker policy, so it is excluded.
+SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
+    'TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT',
+    'TWINKLE_SERVER_STATE_CLEANUP_INTERVAL',
+    'TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT',
+    'TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL',
+)
 
 # ---------- shared helpers ------------------------------------------------- #
 
@@ -95,6 +108,47 @@ class ServerStateArgs(_ArgsBase):
     metrics_update_interval: float | None = None
     actor_name: str | None = None
 
+    def to_env_vars(self) -> dict[str, str]:
+        """Serialize the policy fields to env vars for Ray-worker propagation.
+
+        Mirrors :meth:`PersistenceConfig.to_env_vars`. Only the four policy
+        fields are emitted (``actor_name`` is a per-process cache key, not a
+        policy); unset (``None``) fields are skipped so the worker falls back to
+        ``ServerState``'s own defaults.
+        """
+        env: dict[str, str] = {}
+        if self.expiration_timeout is not None:
+            env['TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT'] = str(self.expiration_timeout)
+        if self.cleanup_interval is not None:
+            env['TWINKLE_SERVER_STATE_CLEANUP_INTERVAL'] = str(self.cleanup_interval)
+        if self.per_token_model_limit is not None:
+            env['TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT'] = str(self.per_token_model_limit)
+        if self.metrics_update_interval is not None:
+            env['TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL'] = str(self.metrics_update_interval)
+        return env
+
+    @classmethod
+    def from_env(cls) -> ServerStateArgs | None:
+        """Reconstruct policy fields from launcher-set env vars.
+
+        Returns ``None`` when no ``TWINKLE_SERVER_STATE_*`` key is set, so a
+        caller can distinguish "no env-configured policy" from "explicitly
+        configured to a default value". Only policy fields are populated;
+        ``actor_name`` stays ``None``.
+        """
+        exp = os.environ.get('TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT')
+        clean = os.environ.get('TWINKLE_SERVER_STATE_CLEANUP_INTERVAL')
+        limit = os.environ.get('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT')
+        interval = os.environ.get('TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL')
+        if exp is None and clean is None and limit is None and interval is None:
+            return None
+        return cls(
+            expiration_timeout=float(exp) if exp is not None else None,
+            cleanup_interval=float(clean) if clean is not None else None,
+            per_token_model_limit=int(limit) if limit is not None else None,
+            metrics_update_interval=float(interval) if interval is not None else None,
+        )
+
 
 class ServerArgs(_ArgsBase):
     """Args for the gateway ``server`` deployment."""
@@ -106,12 +160,17 @@ class ServerArgs(_ArgsBase):
 
 
 class ProcessorArgs(_ArgsBase):
-    """Args for the ``processor`` deployment."""
+    """Args for the ``processor`` deployment.
+
+    A processor deployment has no task queue, so there is deliberately no
+    ``queue_config`` field here: with ``extra='forbid'`` a YAML that sets
+    ``processor.args.queue_config`` now fails validation with the offending path
+    instead of being silently ignored.
+    """
 
     ncpu_proc_per_node: int | None = None
     device_group: dict[str, Any] | None = None
     device_mesh: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
 class DataPlaneArgs(_ArgsBase):

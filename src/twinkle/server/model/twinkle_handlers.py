@@ -172,7 +172,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
             ret = await self.call_backend(
-                self.model.forward, inputs=to_backend_inputs(raw_inputs), adapter_name=adapter_name, **kwargs)
+                self.model.forward,
+                inputs=to_backend_inputs(raw_inputs),
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **kwargs)
             return {'result': ret}
 
         return await run_submit(
@@ -187,7 +190,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             inputs = to_backend_inputs(raw_inputs)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
-            ret = await self.call_backend(self.model.forward_only, inputs=inputs, adapter_name=adapter_name, **kwargs)
+            ret = await self.call_backend(
+                self.model.forward_only,
+                inputs=inputs,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **kwargs)
             if body.output_ref is not None:
                 rows = select_output_rows(ret, batch_size=len(inputs), output_fields=body.output_fields)
                 output_ref = await self.data_plane.append(body.output_ref, rows)
@@ -211,7 +218,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
             ret = await self.call_backend(
-                self.model.forward_backward, inputs=to_backend_inputs(raw_inputs), adapter_name=adapter_name, **kwargs)
+                self.model.forward_backward,
+                inputs=to_backend_inputs(raw_inputs),
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **kwargs)
             return {'result': ret}
 
         return await run_submit(

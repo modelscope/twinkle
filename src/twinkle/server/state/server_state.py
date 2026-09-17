@@ -617,14 +617,21 @@ class ServerState:
 
 _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 
+# ServerState policy defaults. Used when neither an explicit argument nor a
+# launcher-propagated env var (``ServerStateArgs.from_env``) supplies a value.
+_DEFAULT_EXPIRATION_TIMEOUT = 86400.0  # 24 hours in seconds
+_DEFAULT_CLEANUP_INTERVAL = 3600.0  # 1 hour in seconds
+_DEFAULT_PER_TOKEN_MODEL_LIMIT = 30
+_DEFAULT_METRICS_UPDATE_INTERVAL = 15.0
+
 
 def get_server_state(actor_name: str = 'twinkle_server_state',
                      backend: StateBackend | None = None,
                      persistence_config: PersistenceConfig | None = None,
-                     expiration_timeout: float = 86400.0,
-                     cleanup_interval: float = 3600.0,
-                     per_token_model_limit: int = 30,
-                     metrics_update_interval: float = 15.0) -> ServerState:
+                     expiration_timeout: float | None = None,
+                     cleanup_interval: float | None = None,
+                     per_token_model_limit: int | None = None,
+                     metrics_update_interval: float | None = None) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
     Within one process the same ``actor_name`` returns the same cached instance
@@ -655,6 +662,28 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     if cached is not None:
         return cached
 
+    # Resolve the ServerState policy: an explicit argument wins, else the
+    # launcher-propagated env (so a non-gateway worker honours the operator's
+    # YAML instead of the hardcoded default), else the module default.
+    from twinkle.server.config.application_spec import ServerStateArgs
+    env_policy = ServerStateArgs.from_env()
+
+    def _resolve(explicit, env_value, default):
+        if explicit is not None:
+            return explicit
+        if env_value is not None:
+            return env_value
+        return default
+
+    expiration_timeout = _resolve(expiration_timeout, getattr(env_policy, 'expiration_timeout', None),
+                                  _DEFAULT_EXPIRATION_TIMEOUT)
+    cleanup_interval = _resolve(cleanup_interval, getattr(env_policy, 'cleanup_interval', None),
+                                _DEFAULT_CLEANUP_INTERVAL)
+    per_token_model_limit = _resolve(per_token_model_limit, getattr(env_policy, 'per_token_model_limit', None),
+                                     _DEFAULT_PER_TOKEN_MODEL_LIMIT)
+    metrics_update_interval = _resolve(metrics_update_interval, getattr(env_policy, 'metrics_update_interval', None),
+                                       _DEFAULT_METRICS_UPDATE_INTERVAL)
+
     state = ServerState(
         backend=backend,
         persistence_config=persistence_config,
@@ -664,6 +693,10 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
         metrics_update_interval=metrics_update_interval,
     )
     _PROCESS_STATE_CACHE[actor_name] = state
+    logger.info(
+        'ServerState policy in effect: per_token_model_limit=%s expiration_timeout=%s '
+        'cleanup_interval=%s metrics_update_interval=%s (resolution: explicit>env>default)', per_token_model_limit,
+        expiration_timeout, cleanup_interval, metrics_update_interval)
     # Cleanup task is started by the deployment's FastAPI ``lifespan`` hook
     # via ``await state.start_cleanup_task()`` — that's the single async
     # entry point each worker has, so we don't need any sync-context

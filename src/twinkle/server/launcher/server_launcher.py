@@ -223,6 +223,23 @@ class ServerLauncher:
             os.environ[k] = v
         logger.info(f'Persistence backend configured: mode={persistence.mode}')
 
+        # Export the gateway ``server`` application's ServerState policy (quota /
+        # expiry / cleanup / metrics interval) to env vars for the same reason:
+        # so every worker's first ``get_server_state()`` applies the configured
+        # values instead of the hardcoded defaults. Without this the model worker
+        # that enforces ``per_token_model_limit`` runs on the default (30),
+        # silently ignoring the YAML value.
+        server_specs = [a for a in self.config.applications if a.import_path == 'server']
+        if len(server_specs) > 1:
+            logger.warning(f'{len(server_specs)} "server" applications declared; using the first '
+                           'for ServerState policy env propagation.')
+        if server_specs:
+            server_state_env = server_specs[0].args.server_config.to_env_vars()
+            for k, v in server_state_env.items():
+                os.environ[k] = v
+            if server_state_env:
+                logger.info(f'ServerState policy exported to worker env: {server_state_env}')
+
         model_alias_map = build_model_alias_map(self.config.applications)
         if model_alias_map:
             os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(model_alias_map, ensure_ascii=False)

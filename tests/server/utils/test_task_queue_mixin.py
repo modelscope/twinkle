@@ -1,5 +1,4 @@
 import asyncio
-
 import pytest
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
@@ -148,11 +147,7 @@ async def test_polling_schedule_task_still_persists_its_result():
     try:
         await queue.schedule_task(work, model_id='model1', token='token1')
         for _ in range(100):
-            completed = [
-                kwargs
-                for args, kwargs in queue.state.records
-                if args[1] == 'completed'
-            ]
+            completed = [kwargs for args, kwargs in queue.state.records if args[1] == 'completed']
             if completed:
                 break
             await asyncio.sleep(0)
@@ -209,6 +204,34 @@ async def test_user_task_error_is_stored_as_user_failure():
         await queue._compute_worker.stop()
 
     assert failed[-1]['result']['category'] == 'user'
+    assert 'traceback' not in failed[-1]['result']
+
+
+@pytest.mark.asyncio
+async def test_typed_server_error_keeps_its_status_and_category():
+    """A TwinkleServerError (e.g. ResourceNotFoundError) must keep its own 404/user
+    classification instead of collapsing to a generic 500/server."""
+    from twinkle.server.exceptions import ResourceNotFoundError
+
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+
+    async def work():
+        raise ResourceNotFoundError('adapter foo not found')
+
+    try:
+        await queue.schedule_task(work, model_id='model1', token='token1')
+        for _ in range(100):
+            failed = [kwargs for args, kwargs in queue.state.records if args[1] == 'failed']
+            if failed:
+                break
+            await asyncio.sleep(0)
+    finally:
+        await queue._compute_worker.stop()
+
+    assert failed[-1]['result']['error_code'] == 404
+    assert failed[-1]['result']['category'] == 'user'
+    # A user rejection carries no traceback.
     assert 'traceback' not in failed[-1]['result']
 
 

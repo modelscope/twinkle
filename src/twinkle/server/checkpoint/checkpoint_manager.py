@@ -29,7 +29,6 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
     Subclasses must implement:
     - path_prefix property
-    - path_field_name property
     - _create_checkpoint method
     - _parse_checkpoint method
     - _create_checkpoints_response method
@@ -52,12 +51,6 @@ class BaseCheckpointManager(BaseFileManager, ABC):
     @abstractmethod
     def path_prefix(self) -> str:
         """Return the path prefix (e.g., 'twinkle://')."""
-        pass
-
-    @property
-    @abstractmethod
-    def path_field_name(self) -> str:
-        """Return the field name for the path (e.g., 'twinkle_path' or 'tinker_path')."""
         pass
 
     @abstractmethod

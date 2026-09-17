@@ -510,7 +510,13 @@ class TaskQueueMixin:
         self._event_loop.call_soon_threadsafe(_schedule)
 
     def get_queue_stats(self) -> dict[str, Any]:
-        """Return current compute queue statistics."""
+        """Return current compute queue statistics.
+
+        Not exposed over HTTP yet: no endpoint reads these three ``*_stats``
+        helpers. Kept as the intended data source for a future observability
+        endpoint; if that endpoint never lands, delete them instead of leaving
+        them as dead reflection.
+        """
         return {
             'queue_size':
             sum(q.qsize() for q in self._compute_worker.task_queues.values()),
@@ -526,11 +532,11 @@ class TaskQueueMixin:
         }
 
     def get_rate_limit_stats(self, token: str) -> dict[str, Any]:
-        """Return rate-limiting stats for a user token."""
+        """Return rate-limiting stats for a user token. Not exposed over HTTP yet (see get_queue_stats)."""
         return self._rate_limiter.get_stats(token)
 
     def get_rate_limiter_memory_stats(self) -> dict[str, Any]:
-        """Return memory usage statistics from the rate limiter."""
+        """Return memory usage statistics from the rate limiter. Not exposed over HTTP yet (see get_queue_stats)."""
         return self._rate_limiter.get_memory_stats()
 
     async def shutdown_task_queue(self) -> None:

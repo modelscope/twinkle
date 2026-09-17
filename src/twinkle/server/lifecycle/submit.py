@@ -23,8 +23,25 @@ from twinkle_client.types.lifecycle import TaskEnvelope
 # --------------------------------------------------------------------------- #
 
 
-def to_backend_inputs(inputs: Any) -> Any:
-    """Seam A: convert raw dict/list inputs to InputFeature / Trajectory objects."""
+def to_backend_inputs(inputs: Any, *, single: bool = False) -> Any:
+    """Seam A: convert raw dict/list inputs to InputFeature / Trajectory objects.
+
+    With ``single=False`` (default) a *batch* is returned: a list of parsed objects
+    for a list input, a one-element list for a single dict, and the value unchanged
+    otherwise. With ``single=True`` exactly one parsed object is returned (the
+    streaming path accepts only one input): a list must contain exactly one element
+    or a ``ValueError`` is raised, a dict is parsed to a single object, and anything
+    else is passed through. Element typing is unchanged: a dict with ``input_ids``
+    becomes an ``InputFeature``, otherwise a ``Trajectory``.
+    """
+    if single:
+        if isinstance(inputs, list):
+            if len(inputs) != 1:
+                raise ValueError('Streaming only supports a single input')
+            inputs = inputs[0]
+        if isinstance(inputs, dict):
+            return InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+        return inputs
     if isinstance(inputs, list) and inputs:
         first = inputs[0]
         if isinstance(first, dict) and 'input_ids' in first:

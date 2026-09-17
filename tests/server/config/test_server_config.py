@@ -246,8 +246,34 @@ def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
         ApplicationSpec.model_validate({
             'name': 'data-plane',
             'import_path': 'data_plane',
-            'args': {'unknown': True},
+            'args': {
+                'unknown': True
+            },
         })
+
+
+def test_processor_queue_config_is_rejected() -> None:
+    # A processor deployment has no task queue; queue_config was silently ignored
+    # before and now fails validation (F013 / P009) naming the offending field.
+    ApplicationSpec.model_validate({
+        'name': 'processor',
+        'import_path': 'processor',
+        'args': {
+            'ncpu_proc_per_node': 1
+        },
+    })
+    with pytest.raises(ValidationError) as exc:
+        ApplicationSpec.model_validate({
+            'name': 'processor',
+            'import_path': 'processor',
+            'args': {
+                'ncpu_proc_per_node': 1,
+                'queue_config': {
+                    'rps_limit': 4
+                }
+            },
+        })
+    assert 'queue_config' in str(exc.value)
 
 
 def test_cookbook_examples_load() -> None:

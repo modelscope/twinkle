@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import httpx
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from typing import Any
 
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
 from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
 logger = get_logger()
 
@@ -144,7 +146,19 @@ class ServiceProxy:
             )
         except Exception as e:
             logger.error('Proxy error: %s', str(e), exc_info=True)
-            return Response(content=f'Proxy Error: {str(e)}', status_code=502)
+            # The gateway could not reach the upstream deployment. Return the
+            # unified ``ErrorPayload`` (502/Server) instead of a plain-text body
+            # so every gateway failure has the same wire shape. Upstream error
+            # responses are passed through unchanged above, preserving their own
+            # ErrorPayload body.
+            request_id = request.headers.get(H_REQUEST_ID) or request.headers.get(H_REQUEST_ID_LEGACY) or ''
+            payload = ErrorPayload(
+                error=f'Proxy Error: {str(e)}',
+                category=ErrorCategory.Server,
+                error_code=502,
+                request_id=request_id,
+            )
+            return JSONResponse(status_code=502, content=payload.model_dump(mode='json', exclude_none=True))
 
     async def proxy_request_stream(
         self,
