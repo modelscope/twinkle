@@ -59,9 +59,11 @@ class _SchedulingManagement:
             return rows
         return [{field: row[field] for field in fields} for row in rows]
 
-    async def schedule_task_and_wait(self, task, **kwargs):
-        self.scheduled.append(kwargs)
-        return await task()
+    async def submit_and_peek(self, coro_factory, *, model_id=None, token=None, task_type=None, **schedule_kwargs):
+        self.scheduled.append(schedule_kwargs)
+        result = await coro_factory()
+        from twinkle_client.types.lifecycle import TaskEnvelope
+        return TaskEnvelope(request_id='req-test', status='completed', result=result)
 
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):
         return fn(*args, **kwargs)

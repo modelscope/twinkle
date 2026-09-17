@@ -2,7 +2,7 @@
 """Construction and backward-compatible reading of failure payloads.
 
 ``ErrorPayload`` is the single representation of a failure both on the wire and in
-state (R5). This module owns the two entry points that produce/repair it.
+state. This module owns the two entry points that produce/repair it.
 """
 from __future__ import annotations
 

@@ -18,11 +18,9 @@ import functools
 import os
 import pytest
 import pytest_asyncio
-import tempfile
 import uuid
 from typing import Any
 
-from twinkle.server.state.backend.file_backend import FileBackend
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
@@ -71,13 +69,6 @@ def _replace_with(current: Any | None, *, value: Any) -> Any:
     return value
 
 
-def _file_backend() -> FileBackend:
-    f = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
-    f.close()
-    os.unlink(f.name)
-    return FileBackend(f.name)
-
-
 def _redis_backend():
     from twinkle.server.state.backend.redis_backend import RedisBackend
 
@@ -87,12 +78,6 @@ def _redis_backend():
 @pytest.fixture
 def memory_backend() -> RayActorBackend:
     return RayActorBackend()
-
-
-@pytest.fixture
-def file_backend():
-    backend = _file_backend()
-    yield backend
 
 
 @pytest_asyncio.fixture
@@ -156,40 +141,6 @@ async def test_memory_set_nx_with_ttl(memory_backend) -> None:
     assert await memory_backend.set_nx('lease', 'other', ttl=1) is False
     await asyncio.sleep(1.1)
     assert await memory_backend.set_nx('lease', 'next', ttl=1) is True
-
-
-# ---------- File backend ------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_file_update_atomic_read_transform_write(file_backend) -> None:
-    await file_backend.set('k', 5)
-    result = await file_backend.update_atomic('k', functools.partial(_increment_or_init, delta=3))
-    assert result == 8
-    assert await file_backend.get('k') == 8
-
-
-@pytest.mark.asyncio
-async def test_file_update_atomic_none_is_noop(file_backend) -> None:
-    await file_backend.set('k', 42)
-    result = await file_backend.update_atomic('k', _no_op)
-    assert result == 42
-
-
-@pytest.mark.asyncio
-async def test_file_update_atomic_respects_ttl(file_backend) -> None:
-    await file_backend.update_atomic('leased', functools.partial(_replace_with, value='holder'), ttl=1)
-    assert await file_backend.get('leased') == 'holder'
-    await asyncio.sleep(1.1)
-    assert await file_backend.get('leased') is None
-
-
-@pytest.mark.asyncio
-async def test_file_set_nx_with_ttl(file_backend) -> None:
-    assert await file_backend.set_nx('lease', 'owner', ttl=1) is True
-    assert await file_backend.set_nx('lease', 'other', ttl=1) is False
-    await asyncio.sleep(1.1)
-    assert await file_backend.set_nx('lease', 'next', ttl=1) is True
 
 
 # ---------- Redis backend ------------------------------------------------ #

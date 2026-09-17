@@ -189,7 +189,7 @@ def _extract_app_surface(app: FastAPI) -> dict[str, Any]:
             'statusCode': route.status_code or 200,
         }
         for method in sorted(route.methods & _HTTP_METHODS):
-            client_path = re.sub(r'{([^}:]+):[^}]+}', r'{\1}', route.path)
+            client_path = _client_path(route.path)
             paths.setdefault(client_path, {})[method] = operation
     return {'paths': paths}
 
@@ -203,9 +203,64 @@ def extract_full_surface() -> dict[str, Any]:
     return surface
 
 
-# ----- Baseline I/O -------------------------------------------------------- #
+def _client_path(route_path: str) -> str:
+    """Strip FastAPI path-converter suffixes so ``{id:path}`` reads as ``{id}``."""
+    return re.sub(r'{([^}:]+):[^}]+}', r'{\1}', route_path)
 
+
+def _model_name(annotation: Any) -> str | None:
+    """A stable, human-readable name for a request/response model annotation."""
+    if annotation is None:
+        return None
+    return getattr(annotation, '__qualname__', None) or repr(annotation)
+
+
+def extract_route_inventory() -> dict[str, dict[str, Any]]:
+    """A compact, reviewable projection of the wire surface.
+
+    One entry per route -- ``"<METHOD> <path>" -> {response, body, statusCode}`` --
+    naming the model classes instead of inlining their field schemas.
+
+    This is the projection that gets committed. A route appearing, disappearing, or
+    changing its response/body model shows up as a few readable lines in a PR diff,
+    whereas the full field-level surface is ~8k lines and nobody reads that diff.
+    The trade-off is explicit: this catches route-level and model-level changes, not
+    field-level drift inside a model.
+    """
+    inventory: dict[str, dict[str, Any]] = {}
+    for name, builder in APP_BUILDERS.items():
+        app = builder()
+        routes: dict[str, Any] = {}
+        for route in app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            client_path = _client_path(route.path)
+            body = [_model_name(field.field_info.annotation) for field in route.dependant.body_params]
+            for method in sorted(route.methods & _HTTP_METHODS):
+                routes[f'{method} {client_path}'] = {
+                    'response': _model_name(route.response_model),
+                    'body': body,
+                    'statusCode': route.status_code or 200,
+                }
+        inventory[name] = routes
+    return inventory
+
+
+# ----- Snapshot I/O -------------------------------------------------------- #
+
+# The full field-level surface (:func:`extract_full_surface`). A GENERATED artifact,
+# deliberately NOT committed: an 8k-line diff on every intentional wire change is noise
+# nobody reads. Being regenerated from the code under test, it cannot by itself detect an
+# unintended change -- ``ROUTES_PATH`` is the guard that can. Keep that asymmetry in mind
+# before treating a green baseline test as evidence of anything.
 BASELINE_PATH = Path(__file__).parent / 'client_api_baseline.json'
+
+# The compact route inventory (:func:`extract_route_inventory`). COMMITTED to git: this
+# is the actual regression guard, so it has to stay tracked for the guard to mean
+# anything.
+ROUTES_PATH = Path(__file__).parent / 'client_api_routes.json'
+
+_REGEN_HINT = 'Regenerate with: python -m tests.server.contract.update_baseline'
 
 
 def write_baseline(path: Path | None = None) -> Path:
@@ -216,6 +271,28 @@ def write_baseline(path: Path | None = None) -> Path:
     return p
 
 
+def write_route_inventory(path: Path | None = None) -> Path:
+    """Snapshot the compact route inventory to ``client_api_routes.json``."""
+    p = Path(path) if path is not None else ROUTES_PATH
+    p.write_text(json.dumps(extract_route_inventory(), indent=2, sort_keys=True) + '\n')
+    return p
+
+
 def load_baseline(path: Path | None = None) -> dict[str, Any]:
+    """Load the generated full surface, failing with a fix hint rather than a bare OSError."""
     p = Path(path) if path is not None else BASELINE_PATH
+    if not p.is_file():
+        raise FileNotFoundError(f'Contract baseline missing: {p}\n'
+                                f'It is a generated artifact and is deliberately not committed. '
+                                f'{_REGEN_HINT}')
+    return json.loads(p.read_text())
+
+
+def load_route_inventory(path: Path | None = None) -> dict[str, Any]:
+    """Load the committed route inventory, failing loudly if it went missing."""
+    p = Path(path) if path is not None else ROUTES_PATH
+    if not p.is_file():
+        raise FileNotFoundError(f'Committed route inventory missing: {p}\n'
+                                f'This file IS tracked by git -- restore it instead of regenerating '
+                                f'blindly, or the guard silently becomes a tautology. {_REGEN_HINT}')
     return json.loads(p.read_text())

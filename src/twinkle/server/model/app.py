@@ -216,7 +216,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self._model_unhealthy = True
 
     async def _probe_after_timeout(self) -> None:
-        """Fired by ComputeWorker on a backend timeout: probe and log liveness (R3#2)."""
+        """Fired by ComputeWorker on a backend timeout: probe and log liveness."""
         result = await self.check_model_health()
         logger.warning('[Model] post-timeout liveness probe: %s', result)
 

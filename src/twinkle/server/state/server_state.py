@@ -280,6 +280,35 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
+    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int) -> str | None:
+        """Idempotency claim for a client seq_id.
+
+        Atomically records ``dedup_key -> request_id`` if unseen and returns ``None``
+        (caller proceeds to enqueue). If the key already exists, returns the prior
+        ``request_id`` so the caller can return that task's envelope instead of
+        enqueuing a duplicate. ``ttl`` bounds the dedup window.
+        """
+        if await self._backend.set_nx(dedup_key, request_id, ttl=ttl):
+            return None
+        return await self._backend.get(dedup_key)
+
+    async def release_seq(self, dedup_key: str) -> None:
+        """Drop a seq dedup claim (used when the claimed request never enqueued, e.g.
+        preflight rejected it) so a retry can be admitted rather than see a phantom."""
+        await self._backend.delete(dedup_key)
+
+    async def cancel_future(self, request_id: str) -> dict[str, Any]:
+        """Best-effort cancel: drop the task iff it has not started running.
+
+        Returns ``{'cancelled': bool, 'state': str}`` where ``state`` is the task's
+        status after the attempt (``cancelled`` if just dropped or already cancelled,
+        ``running``/``completed``/``failed`` if too late, ``not_found`` if unknown).
+        """
+        status = await self._future_mgr.cancel_if_pending(request_id)
+        if status is None:
+            return {'cancelled': False, 'state': 'not_found'}
+        return {'cancelled': status == 'cancelled', 'state': status}
+
     async def store_future_status(
         self,
         request_id: str,
@@ -300,13 +329,12 @@ class ServerState:
         - RUNNING: Task currently executing
         - COMPLETED: Task completed successfully (result required)
         - FAILED: Task failed with error (result contains error payload)
-        - RATE_LIMITED: Task rejected due to rate limiting (reason required)
 
         Args:
             request_id: Unique identifier for the request.
-            status: Task status string (pending/queued/running/completed/failed/rate_limited).
+            status: Task status string (pending/queued/running/completed/failed).
             model_id: Optional associated model_id.
-            reason: Optional reason string (used for rate_limited status).
+            reason: Optional reason string.
             result: Optional result data (used for completed/failed status).
             queue_state: Optional queue state for tinker client (active/paused_rate_limit/paused_capacity).
             queue_state_reason: Optional reason for the queue state.
@@ -386,7 +414,7 @@ class ServerState:
         }
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:
-        """Refresh a replica's liveness timestamp in the shared registry (R4#6)."""
+        """Refresh a replica's liveness timestamp in the shared registry."""
         await self._model_mgr.touch_replica_last_seen(replica_id)
 
     async def _cleanup_loop(self) -> None:

@@ -35,16 +35,36 @@ from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
+from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.errors import ErrorPayload
 
 logger = get_logger()
 
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
 OnShutdown = Callable[[Any], Awaitable[None]]
+
+
+async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError) -> JSONResponse:
+    """Map a TwinkleServerError to a structured response, fields at the top level.
+
+    Status code is the exception's ``error_code``; the body is an ``ErrorPayload``
+    (``error`` / ``category`` / ``error_code`` / ``request_id``) placed at the top
+    level rather than nested under ``detail``. A Decision_Boundary-left rejection
+    (``category=user``) carries no traceback.
+    """
+    request_id = getattr(request.state, 'request_id', None) or ''
+    payload = ErrorPayload(
+        error=(str(exc) or exc.__class__.__name__),
+        category=exc.category,
+        error_code=exc.error_code,
+        request_id=request_id,
+    )
+    return JSONResponse(status_code=exc.error_code, content=payload.model_dump(mode='json', exclude_none=True))
 
 
 def get_servable() -> Any:
@@ -122,6 +142,8 @@ def build_deployment_app(
         await asyncio.to_thread(flush_telemetry_safely)
 
     app = FastAPI(lifespan=lifespan, **(fastapi_kwargs or {}))
+
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
 
     # Registration order matters: FastAPI runs middleware LIFO, so the LAST
     # registered wraps the outermost layer. Register cleanup (if any) first so

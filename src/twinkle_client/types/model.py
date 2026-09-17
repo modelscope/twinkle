@@ -19,6 +19,8 @@ class CreateRequest(BaseModel):
 class ForwardRequest(BaseModel):
     inputs: Any
     adapter_name: str
+    # Optional monotonic dedup key; only set by grad-mutating client calls (forward_backward).
+    seq_id: Optional[int] = None
 
     class Config:
         extra = 'allow'
@@ -37,6 +39,8 @@ class DataPlaneForwardRequest(BaseModel):
     input_field: str | None = None
     kwarg_fields: Dict[str, str] = Field(default_factory=dict)
     adapter_name: str
+    # Optional monotonic dedup key; only set by grad-mutating data-plane calls.
+    seq_id: Optional[int] = None
 
     class Config:
         extra = 'allow'
@@ -55,6 +59,8 @@ class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
 
 class AdapterRequest(BaseModel):
     adapter_name: str
+    # Optional monotonic dedup key; only set by grad-mutating client calls (backward/step/lr_step).
+    seq_id: Optional[int] = None
 
     class Config:
         extra = 'allow'
@@ -176,6 +182,8 @@ class ClipGradAndStepRequest(BaseModel):
     adapter_name: str
     max_grad_norm: float = 1.0
     norm_type: int = 2
+    # Optional monotonic dedup key; set by the grad-mutating clip_grad_and_step call.
+    seq_id: Optional[int] = None
 
     class Config:
         extra = 'allow'
@@ -238,11 +246,6 @@ class ClipGradNormResponse(BaseModel):
 class GetTrainConfigsResponse(BaseModel):
     """Response for /get_train_configs endpoint (returns str)."""
     result: str
-
-
-class GetStateDictResponse(BaseModel):
-    """Response for /get_state_dict endpoint (returns Dict)."""
-    result: Dict[str, Any]
 
 
 class CalculateMetricResponse(BaseModel):
@@ -311,18 +314,6 @@ class SetTemplateResponse(OkResponse):
 class SetProcessorResponse(OkResponse):
     """Response for /set_processor endpoint."""
     pass
-
-
-class UploadToHubResponse(BaseModel):
-    """Response for /upload_to_hub endpoint."""
-    request_id: str
-
-
-class UploadStatusResponse(BaseModel):
-    """Response for /upload_status/{request_id} endpoint."""
-    request_id: str
-    status: str  # pending / queued / running / completed / failed
-    error: Optional[str] = None
 
 
 class ClipGradAndStepResponse(OkResponse):

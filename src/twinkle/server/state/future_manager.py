@@ -14,7 +14,7 @@ from .models import FutureRecord, _now_iso
 logger = get_logger()
 
 # Status sets used by the do-not-regress guard inside the atomic transform.
-_TERMINAL_STATUSES = frozenset({'completed', 'failed'})
+_TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
 _NON_TERMINAL_STATUSES = frozenset({'pending', 'queued', 'running'})
 
 
@@ -80,6 +80,25 @@ def _future_record_transform(
     return updated
 
 
+_CANCELLABLE_STATUSES = frozenset({'pending', 'queued'})
+
+
+def _cancel_if_not_started_transform(existing: dict | None, *, payload: dict, now: str) -> dict | None:
+    """Atomic transform: cancel iff the task has not started (pending/queued).
+
+    Returns ``None`` (no change) for running/terminal/missing records so a task
+    already executing is never interrupted -- cancel is best-effort on the queue.
+    """
+    status = existing.get('status') if existing is not None else None
+    if status not in _CANCELLABLE_STATUSES:
+        return None
+    updated = dict(existing)
+    updated['status'] = 'cancelled'
+    updated['result'] = payload
+    updated['updated_at'] = now
+    return updated
+
+
 class FutureManager(BaseManager[FutureRecord]):
     """Manage future state, terminal retention, and immutable task deadlines."""
 
@@ -130,6 +149,21 @@ class FutureManager(BaseManager[FutureRecord]):
             ),
         )
 
+    async def cancel_if_pending(self, request_id: str) -> str | None:
+        """Cancel a task iff it has not started; return the resulting status.
+
+        Writes a terminal ``cancelled`` record (carrying a user ErrorPayload) only
+        when the current status is pending/queued -- a running task is left alone.
+        Returns the record's status after the attempt, or ``None`` if there is no
+        record for ``request_id``.
+        """
+        payload = {'error': 'Task cancelled by client', 'category': 'user', 'error_code': 499}
+        result = await self._backend.update_atomic(
+            self._make_key(request_id),
+            functools.partial(_cancel_if_not_started_transform, payload=payload, now=_now_iso()),
+        )
+        return result.get('status') if result else None
+
     # ----- Cleanup -----
 
     async def cleanup_expired(
@@ -140,7 +174,7 @@ class FutureManager(BaseManager[FutureRecord]):
     ) -> int:
         """Expire future records without ever deleting a non-terminal one.
 
-        Processing matrix (design §5.2):
+        Processing matrix:
 
         | status       | replica alive | past deadline | action            |
         |--------------|---------------|---------------|-------------------|

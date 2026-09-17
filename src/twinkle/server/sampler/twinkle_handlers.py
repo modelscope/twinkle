@@ -22,10 +22,11 @@ import numpy as np
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
-from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.json_utils import json_safe
 
@@ -51,11 +52,8 @@ def _serialize_input_feature(feature: dict) -> dict:
 
 
 def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Build a stable per-session adapter name, falling back to request_id for older clients."""
-    if adapter_name is None or adapter_name == '':
-        return None
-    owner_id = get_session_id_from_request(request) or request.state.request_id
-    return owner_id + '-' + adapter_name
+    """Per-session adapter name; delegates to the shared lifecycle resolver."""
+    return resolve_twinkle_adapter_name(request, adapter_name)
 
 
 def _build_rollout_rows_and_tags(
@@ -215,30 +213,14 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    async def run_task(coro):
-        """Await a schedule_task_and_wait coroutine and surface any exception as a
-        structured HTTP 500 response so the client receives the full traceback instead
-        of an opaque connection-level error.
-
-        Note: HTTPException is re-raised directly to preserve its status code and detail.
-        """
-        try:
-            return await coro
-        except HTTPException:
-            raise
-        except Exception:
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=traceback.format_exc())
-
     @app.post('/twinkle/create', response_model=types.CreateResponse)
     async def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> types.CreateResponse:
         """Health check / session creation endpoint."""
         return types.CreateResponse()
 
-    @app.post('/twinkle/sample', response_model=types.SampleResponseModelList)
-    async def sample(
-        request: Request, body: types.SampleRequest,
-        self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
+    @app.post('/twinkle/sample', response_model=types.TaskEnvelope)
+    async def sample(request: Request, body: types.SampleRequest,
+                     self: SamplerManagement = Depends(self_fn)) -> types.TaskEnvelope:
         """Sample completions from the model.
 
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
@@ -293,26 +275,21 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-            return types.SampleResponseModelList(samples=_to_sample_response_models(responses))
+            return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
 
         # Calculate metrics for queue scheduling
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
         input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
-        return await run_task(
-            self.schedule_task_and_wait(
-                _task,
-                token=token,
-                input_tokens=input_tokens,
-                task_type='sample',
-            ))
+        return await self.submit_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
 
-    @app.post('/twinkle/sample_to_data_plane', response_model=types.DataRef)
+    @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(
             request: Request,
             body: types.DataPlaneSampleRequest,
             self: SamplerManagement = Depends(self_fn),
-    ) -> types.DataRef:
-        """Generate a complete group, store it server-side, and return its DataRef."""
+    ) -> types.TaskEnvelope:
+        """Generate a complete group, store it server-side, and return a Task_Envelope
+        whose result is the stored group's DataRef."""
         token = await self._on_request_start(request)
         if not self.data_plane.enabled:
             raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
@@ -341,7 +318,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         params = SamplingParams.from_dict(params_dict)
         submission_id = uuid.uuid4().hex
 
-        async def _admit():
+        async def _generate_and_store():
+            # vLLM async engine owns generation concurrency, so the whole
+            # admit -> await -> store sequence runs as one background future
+            # (outside the serial compute queue) and its result is the DataRef.
             await self.call_backend(
                 self.sampler.submit_generation,
                 submission_id,
@@ -350,33 +330,19 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-            return submission_id
+            responses = await _await_generation(self, submission_id,
+                                                self._task_queue_config.effective_execution_timeout)
+            rows, tags = _build_rollout_rows_and_tags(
+                _to_sample_response_models(responses),
+                group_ids=body.group_ids,
+                policy_version=body.policy_version,
+                adapter_uri=body.adapter_uri,
+            )
+            ref = await self.data_plane.put([json_safe(item) for item in rows], kind='rollout', tags=tags)
+            return ref.model_dump()
 
-        inline_inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
-        input_tokens = (
-            body.input_ref.num_tokens if body.input_ref is not None else sum(
-                len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict)))
-        await run_task(
-            self.schedule_task_and_wait(
-                _admit,
-                model_id=full_adapter_name or None,
-                token=token,
-                input_tokens=input_tokens,
-                task_type='sample_admission',
-            ))
-
-        responses = await _await_generation(self, submission_id, self._task_queue_config.effective_execution_timeout)
-        rows, tags = _build_rollout_rows_and_tags(
-            _to_sample_response_models(responses),
-            group_ids=body.group_ids,
-            policy_version=body.policy_version,
-            adapter_uri=body.adapter_uri,
-        )
-        return await self.data_plane.put(
-            [json_safe(item) for item in rows],
-            kind='rollout',
-            tags=tags,
-        )
+        return await self.submit_background_and_peek(
+            _generate_and_store, model_id=full_adapter_name or None, task_type='sample_to_data_plane')
 
     @app.post('/twinkle/unload_adapter_paths')
     async def unload_adapter_paths(
@@ -417,7 +383,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             self: SamplerManagement = Depends(self_fn),
     ) -> types.AddAdapterResponse:
         """Add a LoRA adapter to the sampler."""
-        assert body.adapter_name, 'You need to specify a valid `adapter_name`'
+        # Raised, not asserted: decidable from the request body alone, so it owes the caller
+        # a real 400 rather than an AssertionError surfacing as a 500 -- and a bare assert
+        # would vanish under `python -O`, letting an empty adapter_name reach the backend.
+        if not body.adapter_name:
+            raise RequestRejectedError('`adapter_name` is required and must be non-empty.')
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
 
         from peft import LoraConfig

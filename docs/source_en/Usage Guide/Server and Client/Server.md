@@ -183,10 +183,10 @@ telemetry:
   otlp_endpoint: http://localhost:4317
 
 # Persistence: storage backend for ServerState (sessions, models, futures, etc.)
-#   mode: memory | file | redis
+#   mode: memory | redis
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
+  mode: redis
+  redis_url: redis://localhost:6379/0
 
 # Application list: Each entry defines a service component deployed on the Server
 applications:
@@ -350,7 +350,7 @@ The difference from the Megatron backend is only in the `backend` parameter of t
 | `proxy_location` | HTTP proxy location (`EveryNode` or `HeadOnly`) |
 | `http_options` | HTTP listener config (`host`, `port`) |
 | `telemetry` | Observability config (`enabled`, `otlp_endpoint`) |
-| `persistence` | State persistence config (`mode`, `file_path`, `redis_url`) |
+| `persistence` | State persistence config (`mode`, `redis_url`) |
 | `applications` | Application component list |
 
 > The config file uses strict validation (`extra='forbid'`). Any misspelled field name will be rejected before startup. Use `twinkle-server check-config -c xxx.yaml` to detect errors early.
@@ -418,8 +418,7 @@ Storage backend for ServerState (sessions, models, futures, etc.).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | str | `memory` | `memory` / `file` / `redis` |
-| `file_path` | str | — | Required for `file` mode, JSON file path |
+| `mode` | str | `memory` | `memory` / `redis` |
 | `redis_url` | str | — | Required for `redis` mode, e.g. `redis://localhost:6379` |
 | `key_prefix` | str | `""` | Optional global key prefix |
 

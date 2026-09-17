@@ -8,7 +8,6 @@ self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at 
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types
@@ -19,8 +18,8 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
 from twinkle.server.utils.task_errors import error_payload_from_stored
-from twinkle.server.utils.task_queue import QueueState
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 
@@ -83,8 +82,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                               self: GatewayServer = Depends(self_fn)) -> Any:
         """Retrieve the result of an async task with long polling."""
         request_id = body.request_id
-        max_wait = float(os.environ.get('TWINKLE_LONG_POLL_TIMEOUT', '30'))
-        poll_interval = float(os.environ.get('TWINKLE_POLL_INTERVAL', '0.5'))
+        max_wait = long_poll_window()
+        poll_interval = retrieve_poll_interval()
         start = asyncio.get_running_loop().time()
 
         while True:
@@ -92,7 +91,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
             if record is not None:
                 status = record.get('status')
-                if status not in ('pending', 'queued', 'running', 'rate_limited'):
+                if status not in ('pending', 'queued', 'running'):
                     break
 
             # ``record is None`` here means the future hasn't been written yet
@@ -111,13 +110,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             await asyncio.sleep(poll_interval)
 
         status = record.get('status')
-
-        if status == 'rate_limited':
-            return {
-                'type': 'try_again',
-                'queue_state': QueueState.PAUSED_RATE_LIMIT.value,
-                'queue_state_reason': record.get('reason', 'Rate limit exceeded')
-            }
 
         if status == 'failed':
             payload = error_payload_from_stored(record.get('result'), request_id=request_id)

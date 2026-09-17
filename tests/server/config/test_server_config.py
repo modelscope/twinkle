@@ -25,10 +25,6 @@ from twinkle.server.launcher import ServerLauncher
 _PERSISTENCE_VARIANTS = st.one_of(
     st.fixed_dictionaries({'mode': st.just('memory')}),
     st.fixed_dictionaries({
-        'mode': st.just('file'),
-        'file_path': st.just('/tmp/state.json')
-    }),
-    st.fixed_dictionaries({
         'mode': st.just('redis'),
         'redis_url': st.just('redis://localhost:6379/0')
     }),
@@ -84,13 +80,6 @@ def test_redis_mode_missing_url() -> None:
         ServerConfig.model_validate({'persistence': {'mode': 'redis'}})
     msg = str(exc.value)
     assert 'persistence.redis_url' in msg or 'redis_url' in msg
-
-
-def test_file_mode_missing_path() -> None:
-    with pytest.raises(ValidationError) as exc:
-        ServerConfig.model_validate({'persistence': {'mode': 'file'}})
-    msg = str(exc.value)
-    assert 'persistence.file_path' in msg or 'file_path' in msg
 
 
 @settings(max_examples=100)

@@ -32,6 +32,10 @@ class TaskQueueConfig(BaseModel):
         token_cleanup_multiplier: Multiplier for token cleanup threshold.
         token_cleanup_interval: How often to run cleanup task (seconds).
         max_input_tokens: Maximum allowed input tokens per request.
+        inline_fast_path_timeout: Upper bound (seconds) on how long submit briefly
+            polls the record so a millisecond-scale control-plane op (step / zero_grad)
+            completes in a single HTTP round trip instead of forcing a retrieve.
+            Must remain < Long_Poll_Window.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -45,6 +49,7 @@ class TaskQueueConfig(BaseModel):
     token_cleanup_multiplier: float = Field(default=10.0, ge=0)
     token_cleanup_interval: float = Field(default=60.0, ge=0)
     max_input_tokens: int = Field(default=16000, ge=1)
+    inline_fast_path_timeout: float = Field(default=0.05, gt=0)
 
     @property
     def effective_execution_timeout(self) -> float:

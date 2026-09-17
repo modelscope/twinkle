@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .model import (
     AddAdapterRequest,
-    AddAdapterResponse,
     AddMetricRequest,
     AddMetricResponse,
     AdapterRequest,
@@ -23,7 +22,6 @@ from .model import (
     ForwardRequest,
     ForwardResponse,
     GetStateDictRequest,
-    GetStateDictResponse,
     GetTrainConfigsResponse,
     LoadRequest,
     LoadResponse,
@@ -46,8 +44,6 @@ from .model import (
     StepResponse,
     TrainingProgressResponse,
     UploadToHubRequest,
-    UploadToHubResponse,
-    UploadStatusResponse,
     ZeroGradResponse,
 )
 from .processor import (
@@ -94,6 +90,7 @@ from .training import (
 )
 
 from .checkpoint import ResolvedLoadPath
+from .lifecycle import CancelRequest, CancelResponse, RetrieveFutureRequest, TaskEnvelope, TaskStatus, TERMINAL_STATUSES
 from .component import (
     DataAppendRequest,
     DataGetRequest,

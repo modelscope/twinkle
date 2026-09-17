@@ -2,7 +2,8 @@ import asyncio
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
-from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
+from twinkle_client.types.sampler import (AddAdapterResponse, SampleResponseModel, SampleResponseModelList,
+                                          SetTemplateResponse)
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature, SamplingParams
 from twinkle_client.common.json_utils import json_safe
@@ -48,6 +49,17 @@ class vLLMSampler:
             json_data=kwargs
         )
         response.raise_for_status()
+
+    @staticmethod
+    def _await_task(response, model_cls):
+        """Resolve a Submit_Endpoint response through the Client_Future_Layer.
+
+        Blocks until the task is terminal and returns the deserialized ``model_cls``
+        result (or ``None``), raising ``TaskFailedError`` on a failed terminal state.
+        Keeps every public method's synchronous signature unchanged.
+        """
+        from twinkle_client._future import resolve_response
+        return resolve_response(response, model_cls)
 
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> AddAdapterResponse:
         """Add a new adapter to the sampler."""
@@ -99,8 +111,7 @@ class vLLMSampler:
             url=f'{self.server_url}/sample',
             json_data=json_data
         )
-        response.raise_for_status()
-        return [SampleResponseModel(**r) for r in response.json()['samples']]
+        return self._await_task(response, SampleResponseModelList).samples
 
     def sample_to_data_plane(
         self,
@@ -128,8 +139,7 @@ class vLLMSampler:
             url=f'{self.server_url}/sample_to_data_plane',
             json_data=json_safe(body),
         )
-        response.raise_for_status()
-        return DataRef(**response.json())
+        return self._await_task(response, DataRef)
 
     async def asample(
         self,
@@ -188,7 +198,7 @@ class vLLMSampler:
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())
-    
+
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
         response = http_post(

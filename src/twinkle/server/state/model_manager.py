@@ -103,11 +103,11 @@ class ModelManager(BaseManager[ModelRecord]):
         await self._replicas.unregister(replica_id)
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:
-        """Refresh a replica's liveness timestamp (R4#6)."""
+        """Refresh a replica's liveness timestamp."""
         await self._replicas.touch_last_seen(replica_id)
 
     async def get_alive_replica_ids(self, liveness_threshold: float) -> set[str]:
-        """Return replicas considered alive (R4#7, R4#8).
+        """Return replicas considered alive.
 
         A replica is alive when it has a ``last_seen`` within ``liveness_threshold``,
         OR when it has a ``max_loras`` entry but no ``last_seen`` yet (registered

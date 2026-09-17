@@ -19,8 +19,7 @@ telemetry:
   otlp_endpoint: http://localhost:4317
 
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
+  mode: memory
 
 applications:
 

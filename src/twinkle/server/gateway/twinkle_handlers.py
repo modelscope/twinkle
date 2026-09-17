@@ -6,6 +6,8 @@ All endpoints are prefixed /twinkle/* and registered via _register_twinkle_route
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from typing import TYPE_CHECKING
@@ -15,8 +17,11 @@ if TYPE_CHECKING:
 
 import twinkle_client.types as types
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager, validate_user_path
+from twinkle.server.lifecycle.envelope import envelope_from_record
+from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.lifecycle import TERMINAL_STATUSES
 
 logger = get_logger()
 
@@ -100,6 +105,62 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         if not alive:
             raise HTTPException(status_code=404, detail='Unknown session')
         return types.SessionHeartbeatResponse()
+
+    @app.post('/twinkle/retrieve_future', response_model=types.TaskEnvelope)
+    async def retrieve_future(
+            request: Request,
+            body: types.RetrieveFutureRequest,
+            self: GatewayServer = Depends(self_fn),
+    ) -> types.TaskEnvelope:
+        """Long-poll a twinkle-native task to a terminal state.
+
+        Returns 200 for every outcome except a request_id that stayed invisible for
+        a whole window -- the HTTP call succeeded, it successfully reported the
+        task's state. Unlike the tinker endpoint next door, ``completed`` with a
+        null result is a valid success (step / zero_grad / lr_step all return None),
+        so this handler never raises the tinker endpoint's
+        ``HTTPException(500, 'Task completed but no result found')``.
+
+        A fixed interval, not exponential backoff: measured on real hardware, a
+        0.05->1.0s doubling schedule is ~22% SLOWER per step because its interval
+        grows fastest across the 0.5-1.2s band where data-plane tasks actually
+        finish. See ``poll_config`` for the numbers.
+        """
+        request_id = body.request_id
+        deadline = time.monotonic() + long_poll_window()
+        interval = retrieve_poll_interval()
+        record = None
+
+        while True:
+            record = await self.state.get_future(request_id)
+            if record is not None and record.get('status') in TERMINAL_STATUSES:
+                return envelope_from_record(request_id, record)
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(interval)
+
+        if record is None:
+            # A whole window with no record: this endpoint knows how long it
+            # waited, which is why the missing-record decision lives here rather
+            # than in the caller. Cross-replica visibility lag is folded into the
+            # wait loop above instead of short-circuiting to 404.
+            raise HTTPException(status_code=404, detail=f'request_id {request_id} not found or expired')
+        return envelope_from_record(request_id, record)
+
+    @app.post('/twinkle/cancel', response_model=types.CancelResponse)
+    async def cancel_future(
+            request: Request,
+            body: types.CancelRequest,
+            self: GatewayServer = Depends(self_fn),
+    ) -> types.CancelResponse:
+        """Best-effort cancel of a not-yet-started task.
+
+        Drops the task from the compute queue only if it has not begun running; a
+        running or already-terminal task is reported but never interrupted, so cancel
+        can never corrupt in-flight GPU/optimizer state.
+        """
+        result = await self.state.cancel_future(body.request_id)
+        return types.CancelResponse(**result)
 
     @app.get('/twinkle/training_runs', response_model=types.TrainingRunsResponse)
     async def get_training_runs(request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:

@@ -17,10 +17,13 @@ from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
+from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
+from twinkle.server.lifecycle.envelope import envelope_from_record
+from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.telemetry.middleware import get_task_metrics
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.errors import ErrorCategory
+from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
 from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus
@@ -37,7 +40,7 @@ class TaskQueueMixin:
 
     Execution paths
     ---------------
-    1. Compute queue (schedule_task / schedule_task_and_wait):
+    1. Compute queue (schedule_task / submit_and_peek):
        Single background worker, serial execution, round-robin across queues.
        Use for GPU operations: forward, backward, step, save, load, etc.
 
@@ -83,6 +86,18 @@ class TaskQueueMixin:
             logger.warning(
                 '[TaskQueue] execution_timeout=0: a finite %.0fs bound has replaced unbounded waiting '
                 '(deployment=%s).', self._task_queue_config.effective_execution_timeout, deployment_name or 'unknown')
+        # The Inline_Fast_Path window must stay strictly under Long_Poll_Window: a
+        # submit that peeks longer than a retrieve would wait makes no sense (D4).
+        # Raised, not asserted -- `python -O` strips asserts and would drop this
+        # invariant silently.
+        _inline = self._task_queue_config.inline_fast_path_timeout
+        _window = long_poll_window()
+        if _inline >= _window:
+            raise ConfigError(
+                'inline_fast_path_timeout',
+                _inline,
+                message=(f'inline_fast_path_timeout ({_inline}s) must be < Long_Poll_Window '
+                         f'({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT.'))
         self._deployment_name = deployment_name
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
         self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
@@ -202,74 +217,43 @@ class TaskQueueMixin:
 
     async def _perform_preflight_checks(
         self,
-        request_id: str,
         model_id: str | None,
         token: str | None,
         input_tokens: int,
         batch_size: int | None = None,
         data_world_size: int | None = None,
         batch_size_multiple: int | None = None,
-        persist_failure: bool = True,
-    ) -> dict[str, Any] | None:
+    ) -> None:
         """Run rate-limit and validation checks before queuing a task.
 
-        Returns None if all checks pass, or an error-response dict on failure.
+        Returns ``None`` when every check passes. On failure it RAISES a
+        ``RequestRejectedError`` subclass -- the Decision_Boundary is this line, and
+        raising before any ``store_future_status`` call is what guarantees zero
+        future writes for a rejected request (Property 3). It writes no FAILED
+        record and returns no ``_error`` marker.
         """
         if not token or not self._task_queue_config.enabled:
-            return None
-
-        async def reject(error_msg: str, queue_state: str) -> dict[str, Any]:
-            error_code = 429 if queue_state == QueueState.PAUSED_RATE_LIMIT.value else 400
-            error_payload = task_error_payload(
-                error_msg,
-                request_id=request_id,
-                error_code=error_code,
-                category=ErrorCategory.User,
-            )
-            if persist_failure:
-                await self.state.store_future_status(
-                    request_id,
-                    TaskStatus.FAILED.value,
-                    model_id,
-                    result=error_payload,
-                    queue_state=queue_state,
-                    queue_state_reason=error_msg,
-                    replica_id=getattr(self, 'replica_id', None),
-                )
-                return {'request_id': request_id, 'model_id': model_id}
-            # Private marker consumed by schedule_task_and_wait().  It is not
-            # returned by the public polling-style schedule_task() API.
-            return {
-                'request_id': request_id,
-                'model_id': model_id,
-                '_error': error_msg,
-            }
+            return
 
         if input_tokens > self._task_queue_config.max_input_tokens:
-            error_msg = (f'Input tokens ({input_tokens}) exceed maximum allowed '
-                         f'({self._task_queue_config.max_input_tokens})')
-            return await reject(error_msg, QueueState.UNKNOWN.value)
+            raise InputTokensExceededError(f'Input tokens ({input_tokens}) exceed maximum allowed '
+                                           f'({self._task_queue_config.max_input_tokens})')
 
         if batch_size is not None and data_world_size is not None:
             if batch_size < data_world_size:
-                error_msg = (f'Batch size {batch_size} must be >= data world size {data_world_size}')
-                return await reject(error_msg, QueueState.UNKNOWN.value)
+                raise BatchSizeError(f'Batch size {batch_size} must be >= data world size {data_world_size}')
             if batch_size_multiple is not None:
                 required_multiple = data_world_size * batch_size_multiple
                 if batch_size % required_multiple != 0:
-                    error_msg = (f'Batch size {batch_size} must be divisible by {required_multiple} '
-                                 f'so each data-parallel shard gets a multiple of '
-                                 f'{batch_size_multiple} examples')
-                    return await reject(error_msg, QueueState.UNKNOWN.value)
+                    raise BatchSizeError(f'Batch size {batch_size} must be divisible by {required_multiple} '
+                                         f'so each data-parallel shard gets a multiple of '
+                                         f'{batch_size_multiple} examples')
 
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
             if self._task_metrics:
                 self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
-            error_msg = f'Rate limit exceeded: {reason}'
-            return await reject(error_msg, QueueState.PAUSED_RATE_LIMIT.value)
-
-        return None
+            raise RateLimitExceededError(f'Rate limit exceeded: {reason}')
 
     async def _schedule_task(
         self,
@@ -281,38 +265,33 @@ class TaskQueueMixin:
         data_world_size: int | None = None,
         batch_size_multiple: int | None = None,
         task_type: str | None = None,
-        *,
-        completion: asyncio.Future[Any] | None = None,
-        persist_status: bool,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Common enqueue path for polling and in-process wait callers."""
-        request_id = f'req_{uuid.uuid4().hex}'
+        """Common enqueue path. Always persists status: the future record is the
+        single delivery channel for both result and failure."""
+        request_id = request_id or f'req_{uuid.uuid4().hex}'
 
-        preflight_result = await self._perform_preflight_checks(
-            request_id=request_id,
+        # Decision_Boundary: raises RequestRejectedError before any state write.
+        await self._perform_preflight_checks(
             model_id=model_id,
             token=token,
             input_tokens=input_tokens,
             batch_size=batch_size,
             data_world_size=data_world_size,
             batch_size_multiple=batch_size_multiple,
-            persist_failure=persist_status,
         )
-        if preflight_result is not None:
-            return preflight_result
 
         if self._event_loop is None:
             self._event_loop = asyncio.get_running_loop()
 
-        if persist_status:
-            await self.state.store_future_status(
-                request_id,
-                TaskStatus.PENDING.value,
-                model_id,
-                queue_state=QueueState.ACTIVE.value,
-                replica_id=getattr(self, 'replica_id', None),
-                absolute_deadline=self._future_deadline(),
-            )
+        await self.state.store_future_status(
+            request_id,
+            TaskStatus.PENDING.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+            replica_id=getattr(self, 'replica_id', None),
+            absolute_deadline=self._future_deadline(),
+        )
 
         queue_key = self._queue_key(model_id=model_id, token=token)
         self._compute_worker.ensure_queue_registered(queue_key)
@@ -328,16 +307,13 @@ class TaskQueueMixin:
                 input_tokens=input_tokens,
                 task_type=task_type,
                 created_at=time.monotonic(),
-                completion=completion,
-                persist_status=persist_status,
             ))
-        if persist_status:
-            await self.state.store_future_status(
-                request_id,
-                TaskStatus.QUEUED.value,
-                model_id,
-                queue_state=QueueState.ACTIVE.value,
-            )
+        await self.state.store_future_status(
+            request_id,
+            TaskStatus.QUEUED.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
         logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
                     f'model_id={model_id}, queue_key={queue_key}, '
                     f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
@@ -360,6 +336,7 @@ class TaskQueueMixin:
         data_world_size: int | None = None,
         batch_size_multiple: int | None = None,
         task_type: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a GPU compute task through the serial compute queue.
 
@@ -388,46 +365,66 @@ class TaskQueueMixin:
             data_world_size=data_world_size,
             batch_size_multiple=batch_size_multiple,
             task_type=task_type,
-            persist_status=True,
+            request_id=request_id,
         )
 
-    async def schedule_task_and_wait(
+    # Poll cadence *inside* the Inline_Fast_Path window. Much smaller than the window
+    # itself so a task that finishes early is noticed promptly; the window bound
+    # (config.inline_fast_path_timeout) is what actually caps submit latency.
+    _INLINE_FAST_PATH_POLL = 0.005
+
+    async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope:
+        """Poll a record up to the Inline_Fast_Path window; return a terminal envelope
+        if it settled, else a non-terminal envelope with ``fallback_status``."""
+        deadline = time.monotonic() + self._task_queue_config.inline_fast_path_timeout
+        record = None
+        while time.monotonic() < deadline:
+            record = await self.state.get_future(request_id)
+            if record is not None and record.get('status') in TERMINAL_STATUSES:
+                return envelope_from_record(request_id, record)
+            await asyncio.sleep(self._INLINE_FAST_PATH_POLL)
+        return envelope_from_record(request_id, record, fallback_status=fallback_status)
+
+    async def submit_and_peek(
         self,
         coro_factory: Callable[[], Coroutine],
+        *,
         model_id: str | None = None,
         token: str | None = None,
-        input_tokens: int = 0,
-        batch_size: int | None = None,
-        data_world_size: int | None = None,
-        batch_size_multiple: int | None = None,
         task_type: str | None = None,
-    ) -> Any:
-        """Schedule a compute task and block until it completes.
+        request_id: str | None = None,
+        **schedule_kwargs: Any,
+    ) -> TaskEnvelope:
+        """Enqueue a task, then briefly wait so a fast op finishes in one round trip.
 
-        Twinkle-side counterpart to schedule_task(). Enqueues the task through
-        the same serial worker but delivers the result through an in-process
-        Future. Large model outputs therefore never enter ServerState.
-
-        Raises:
-            RuntimeError: If the task fails or scheduling is rejected.
+        Exceeding the window is not an error: the caller polls
+        ``/twinkle/retrieve_future`` instead. That is what makes this loop
+        fundamentally different from the deleted in-process blocking wait -- it owes
+        nothing to failure handling, so it needs no terminal write, no missing-record
+        branch, and no race with the worker. A terminal record inside the window is
+        returned as a terminal envelope (success or failure); a window that elapses
+        still non-terminal returns a non-terminal envelope carrying ``queue_state``.
         """
-        completion = asyncio.get_running_loop().create_future()
-        task_ref = await self._schedule_task(
-            coro_factory,
-            model_id=model_id,
-            token=token,
-            input_tokens=input_tokens,
-            batch_size=batch_size,
-            data_world_size=data_world_size,
-            batch_size_multiple=batch_size_multiple,
-            task_type=task_type,
-            completion=completion,
-            persist_status=False,
-        )
-        if error := task_ref.get('_error'):
-            completion.cancel()
-            raise RuntimeError(error)
-        return await completion
+        ref = await self.schedule_task(
+            coro_factory, model_id=model_id, token=token, task_type=task_type, request_id=request_id, **schedule_kwargs)
+        return await self._peek_terminal(ref['request_id'], fallback_status='pending')
+
+    async def submit_background_and_peek(
+        self,
+        coro_factory: Callable[[], Coroutine],
+        *,
+        model_id: str | None = None,
+        task_type: str | None = None,
+    ) -> TaskEnvelope:
+        """Fire-and-forget variant of :meth:`submit_and_peek` for pure-I/O tasks.
+
+        Uses ``schedule_background_task`` (outside the serial compute queue) but returns
+        the same Task_Envelope, so ``upload_to_hub`` shares the retrieve/future machinery
+        instead of its own status endpoint. The task is already RUNNING on return, so the
+        non-terminal fallback is ``running``.
+        """
+        ref = await self.schedule_background_task(coro_factory, model_id=model_id, task_type=task_type)
+        return await self._peek_terminal(ref['request_id'], fallback_status='running')
 
     async def schedule_background_task(
         self,

@@ -1,0 +1,628 @@
+{
+  "data_plane": {
+    "POST /twinkle/append": {
+      "body": [
+        "DataAppendRequest"
+      ],
+      "response": "DataRef",
+      "statusCode": 200
+    },
+    "POST /twinkle/get": {
+      "body": [
+        "DataGetRequest"
+      ],
+      "response": "DataRowsResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/put": {
+      "body": [
+        "DataPutRequest"
+      ],
+      "response": "DataRef",
+      "statusCode": 200
+    },
+    "POST /twinkle/release": {
+      "body": [
+        "DataReleaseRequest"
+      ],
+      "response": "dict",
+      "statusCode": 200
+    }
+  },
+  "gateway": {
+    "DELETE /training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+      "body": [],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "DELETE /twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+      "body": [],
+      "response": "DeleteCheckpointResponse",
+      "statusCode": 200
+    },
+    "GET /get_server_capabilities": {
+      "body": [],
+      "response": "GetServerCapabilitiesResponse",
+      "statusCode": 200
+    },
+    "GET /healthz": {
+      "body": [],
+      "response": "HealthResponse",
+      "statusCode": 200
+    },
+    "GET /models": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
+    "GET /training_runs": {
+      "body": [],
+      "response": "TrainingRunsResponse",
+      "statusCode": 200
+    },
+    "GET /training_runs/{run_id}": {
+      "body": [],
+      "response": "TrainingRun",
+      "statusCode": 200
+    },
+    "GET /training_runs/{run_id}/checkpoints": {
+      "body": [],
+      "response": "CheckpointsListResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/capacity_info": {
+      "body": [],
+      "response": "CapacityInfoResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/checkpoint_path/{run_id}/{checkpoint_id}": {
+      "body": [],
+      "response": "CheckpointPathResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/get_server_capabilities": {
+      "body": [],
+      "response": "GetServerCapabilitiesResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/healthz": {
+      "body": [],
+      "response": "HealthResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/healthz/deep": {
+      "body": [],
+      "response": "dict",
+      "statusCode": 200
+    },
+    "GET /twinkle/status": {
+      "body": [],
+      "response": "dict",
+      "statusCode": 200
+    },
+    "GET /twinkle/training_runs": {
+      "body": [],
+      "response": "TrainingRunsResponse",
+      "statusCode": 200
+    },
+    "GET /twinkle/training_runs/{run_id}": {
+      "body": [],
+      "response": "TrainingRun",
+      "statusCode": 200
+    },
+    "GET /twinkle/training_runs/{run_id}/checkpoints": {
+      "body": [],
+      "response": "CheckpointsListResponse",
+      "statusCode": 200
+    },
+    "POST /asample": {
+      "body": [
+        "SampleRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /chat/completions": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
+    "POST /create_model": {
+      "body": [
+        "CreateModelRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /create_sampling_session": {
+      "body": [
+        "CreateSamplingSessionRequest"
+      ],
+      "response": "CreateSamplingSessionResponse",
+      "statusCode": 200
+    },
+    "POST /create_session": {
+      "body": [
+        "CreateSessionRequest"
+      ],
+      "response": "CreateSessionResponse",
+      "statusCode": 200
+    },
+    "POST /forward": {
+      "body": [
+        "ForwardRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /forward_backward": {
+      "body": [
+        "ForwardBackwardRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /get_info": {
+      "body": [
+        "GetInfoRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /load_weights": {
+      "body": [
+        "LoadWeightsRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /optim_step": {
+      "body": [
+        "OptimStepRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /retrieve_future": {
+      "body": [
+        "FutureRetrieveRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /save_weights": {
+      "body": [
+        "SaveWeightsRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /save_weights_for_sampler": {
+      "body": [
+        "SaveWeightsForSamplerRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /session_heartbeat": {
+      "body": [
+        "SessionHeartbeatRequest"
+      ],
+      "response": "SessionHeartbeatResponse",
+      "statusCode": 200
+    },
+    "POST /telemetry": {
+      "body": [
+        "TelemetrySendRequest"
+      ],
+      "response": "TelemetryResponse",
+      "statusCode": 200
+    },
+    "POST /training_runs/{run_id}/checkpoints/{checkpoint_id}/publish": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
+    "POST /twinkle/cancel": {
+      "body": [
+        "CancelRequest"
+      ],
+      "response": "CancelResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/create_session": {
+      "body": [
+        "CreateSessionRequest"
+      ],
+      "response": "CreateSessionResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/retrieve_future": {
+      "body": [
+        "RetrieveFutureRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/session_heartbeat": {
+      "body": [
+        "SessionHeartbeatRequest"
+      ],
+      "response": "SessionHeartbeatResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/weights_info": {
+      "body": [
+        "WeightsInfoRequest"
+      ],
+      "response": "WeightsInfoResponse",
+      "statusCode": 200
+    },
+    "POST /unload_model": {
+      "body": [
+        "UnloadModelRequest"
+      ],
+      "response": "Any",
+      "statusCode": 200
+    },
+    "POST /weights_info": {
+      "body": [
+        "dict"
+      ],
+      "response": "WeightsInfoResponse",
+      "statusCode": 200
+    }
+  },
+  "model": {
+    "GET /healthz": {
+      "body": [],
+      "response": "dict",
+      "statusCode": 200
+    },
+    "POST /tinker/create_model": {
+      "body": [
+        "CreateModelRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/forward": {
+      "body": [
+        "ForwardRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/forward_backward": {
+      "body": [
+        "ForwardBackwardRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/get_info": {
+      "body": [
+        "GetInfoRequest"
+      ],
+      "response": "GetInfoResponse",
+      "statusCode": 200
+    },
+    "POST /tinker/load_weights": {
+      "body": [
+        "LoadWeightsRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/optim_step": {
+      "body": [
+        "OptimStepRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/save_weights": {
+      "body": [
+        "SaveWeightsRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/save_weights_for_sampler": {
+      "body": [
+        "SaveWeightsForSamplerRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /tinker/unload_model": {
+      "body": [
+        "UnloadModelRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /twinkle/add_adapter_to_model": {
+      "body": [
+        "AddAdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/add_metric": {
+      "body": [
+        "AddMetricRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/apply_patch": {
+      "body": [
+        "ApplyPatchRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/backward": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/calculate_loss": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/calculate_metric": {
+      "body": [
+        "CalculateMetricRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/clip_grad_and_step": {
+      "body": [
+        "ClipGradAndStepRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/clip_grad_norm": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/create": {
+      "body": [
+        "CreateRequest"
+      ],
+      "response": "CreateResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward": {
+      "body": [
+        "ForwardRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward_backward": {
+      "body": [
+        "ForwardRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward_backward_from_data_plane": {
+      "body": [
+        "DataPlaneForwardRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward_from_data_plane": {
+      "body": [
+        "DataPlaneForwardRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward_only": {
+      "body": [
+        "ForwardOnlyRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/forward_only_from_data_plane": {
+      "body": [
+        "DataPlaneForwardOnlyRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/get_train_configs": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/load": {
+      "body": [
+        "LoadRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/lr_step": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/remove_adapter": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/resume_from_checkpoint": {
+      "body": [
+        "ResumeFromCheckpointRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/save": {
+      "body": [
+        "SaveRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_loss": {
+      "body": [
+        "SetLossRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_lr_scheduler": {
+      "body": [
+        "SetLrSchedulerRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_optimizer": {
+      "body": [
+        "SetOptimizerRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_processor": {
+      "body": [
+        "SetProcessorRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_template": {
+      "body": [
+        "SetTemplateRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/step": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/upload_to_hub": {
+      "body": [
+        "UploadToHubRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/zero_grad": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    }
+  },
+  "processor": {
+    "POST /twinkle/call": {
+      "body": [
+        "ProcessorCallRequest"
+      ],
+      "response": "ProcessorCallResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/create": {
+      "body": [
+        "ProcessorCreateRequest"
+      ],
+      "response": "ProcessorCreateResponse",
+      "statusCode": 200
+    }
+  },
+  "sampler": {
+    "POST /tinker/asample": {
+      "body": [
+        "SampleRequest"
+      ],
+      "response": "UntypedAPIFuture",
+      "statusCode": 200
+    },
+    "POST /twinkle/add_adapter_to_sampler": {
+      "body": [
+        "AddAdapterRequest"
+      ],
+      "response": "AddAdapterResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/apply_patch": {
+      "body": [
+        "ApplyPatchRequest"
+      ],
+      "response": null,
+      "statusCode": 200
+    },
+    "POST /twinkle/create": {
+      "body": [],
+      "response": "CreateResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/sample": {
+      "body": [
+        "SampleRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/sample_stream": {
+      "body": [
+        "SampleRequest"
+      ],
+      "response": null,
+      "statusCode": 200
+    },
+    "POST /twinkle/sample_to_data_plane": {
+      "body": [
+        "DataPlaneSampleRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
+    "POST /twinkle/set_template": {
+      "body": [
+        "SetTemplateRequest"
+      ],
+      "response": "SetTemplateResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/unload_adapter_paths": {
+      "body": [
+        "UnloadAdapterPathsRequest"
+      ],
+      "response": "dict",
+      "statusCode": 200
+    }
+  }
+}

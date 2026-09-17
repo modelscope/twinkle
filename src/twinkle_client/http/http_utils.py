@@ -1,8 +1,15 @@
 import requests
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
+from twinkle_client.exceptions import TwinkleHTTPError
 from .headers import build_routing_headers
 from .utils import get_api_key, get_base_url, get_request_id, get_session_id
+
+# Single shared HTTP timeout for every client request (was three separate 600s).
+# Must be <= 120 and strictly greater than the server Long_Poll_Window (default 30),
+# so a retrieve that waits a full window still completes within the timeout and, being
+# < a typical 60s gateway idle limit, survives the gateway.
+_HTTP_TIMEOUT = 90
 
 
 def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -49,36 +56,45 @@ def _serialize_params(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_response(response: requests.Response) -> requests.Response:
-    """
-    Handle common response processing.
-
-    Args:
-        response: Response object
-
-    Returns:
-        Response object
+    """Handle common response processing.
 
     Raises:
-        StopIteration: When server returns HTTP 410 (iterator exhausted)
-        requests.HTTPError: When server returns a 4xx/5xx error, with the
-            server-side ``detail`` field (full traceback) included in the
-            exception message so callers don't need to inspect the response body.
+        StopIteration: When server returns HTTP 410 (iterator exhausted).
+        TwinkleHTTPError: When the server returns a 4xx/5xx (other than 410). It
+            inherits ``requests.HTTPError`` so existing ``except`` clauses keep
+            working, and carries the server's top-level ``error_code`` / ``category``
+            / ``request_id`` when present. When those fields are absent (FastAPI's
+            built-in 404/405, or a gateway passthrough), it falls back to ``detail``
+            with ``category='Unknown'``.
     """
-    # Convert HTTP 410 Gone to StopIteration
-    # This indicates an iterator has been exhausted
+    # Convert HTTP 410 Gone to StopIteration (an iterator has been exhausted).
     if response.status_code == 410:
         raise StopIteration(response.json().get('detail', 'Iterator exhausted'))
 
     if not response.ok:
         try:
-            detail = response.json().get('detail', response.text)
+            body = response.json()
         except Exception:
-            detail = response.text
+            body = None
+        if isinstance(body, dict):
+            category = body.get('category', 'Unknown')
+            error_code = body.get('error_code')
+            request_id = body.get('request_id')
+            summary = body.get('error') or body.get('detail') or response.text
+        else:
+            category, error_code, request_id, summary = 'Unknown', None, None, response.text
         http_error_msg = (
             f'{response.status_code} Error for url: {response.url}\n'
-            f'Server detail:\n{detail}'
+            f'Server detail:\n{summary}'
         )
-        raise requests.HTTPError(http_error_msg, response=response)
+        raise TwinkleHTTPError(
+            http_error_msg,
+            response=response,
+            status_code=response.status_code,
+            error_code=error_code,
+            category=category,
+            request_id=request_id,
+        )
 
     return response
 
@@ -87,7 +103,7 @@ def http_get(
     url: Optional[str] = None,
     params: Optional[Dict[str, Any]] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 600,
+    timeout: int = _HTTP_TIMEOUT,
 ) -> requests.Response:
     """
     Send HTTP GET request with required headers.
@@ -120,7 +136,7 @@ def http_post(
     json_data: Optional[Dict[str, Any]] = {},
     data: Optional[Any] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: Optional[int] = 600,
+    timeout: Optional[int] = _HTTP_TIMEOUT,
 ) -> requests.Response:
     """
     Send HTTP POST request with required headers.
@@ -157,7 +173,7 @@ def http_delete(
     url: Optional[str] = None,
     params: Optional[Dict[str, Any]] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 600,
+    timeout: int = _HTTP_TIMEOUT,
 ) -> requests.Response:
     """
     Send HTTP DELETE request with required headers.

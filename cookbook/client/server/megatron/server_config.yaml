@@ -18,10 +18,9 @@ telemetry:
 # Top-level placement makes the launcher propagate this to every Ray worker
 # via env vars, so the configured backend is used regardless of which
 # deployment initializes the ServerState actor first.
-#   mode: memory | file | redis
+#   mode: memory | redis
 #     memory: requires an initialized Ray runtime (the launcher handles this
 #             automatically; standalone scripts must call ray.init() first)
-#   file_path: required for `file` mode
 #   redis_url / key_prefix: required for `redis` mode
 persistence:
   mode: redis

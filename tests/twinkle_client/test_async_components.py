@@ -20,6 +20,11 @@ class _Response:
         return self._payload
 
 
+def _completed(result):
+    """Wrap a business result in a completed Task_Envelope (the new wire shape)."""
+    return {'request_id': 'req-test', 'status': 'completed', 'result': result}
+
+
 def test_model_forward_backward_sends_multiple_data_refs(monkeypatch) -> None:
     import twinkle_client.http as http_module
     from twinkle_client.model import multi_lora_transformers as module
@@ -30,7 +35,7 @@ def test_model_forward_backward_sends_multiple_data_refs(monkeypatch) -> None:
         calls.append((url, json_data))
         if url.endswith('/create'):
             return _Response({})
-        return _Response({'result': {'loss': 1.0}})
+        return _Response(_completed({'result': {'loss': 1.0}}))
 
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
     monkeypatch.setattr(module, 'http_post', post)
@@ -63,7 +68,7 @@ def test_model_inline_forward_methods_keep_the_original_endpoints(monkeypatch) -
 
     def post(*, url, json_data=None, **_kwargs):
         calls.append((url, json_data))
-        return _Response({} if url.endswith('/create') else {'result': {}})
+        return _Response({} if url.endswith('/create') else _completed({'result': {}}))
 
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
     monkeypatch.setattr(module, 'http_post', post)
@@ -92,7 +97,7 @@ def test_model_data_plane_forward_uses_a_separate_api(monkeypatch) -> None:
 
     def post(url, json_data=None, **_kwargs):
         calls.append((url, json_data))
-        return _Response({} if url.endswith('/create') else {'result': {'value': 1}})
+        return _Response({} if url.endswith('/create') else _completed({'result': {'value': 1}}))
 
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
     monkeypatch.setattr(module, 'http_post', post)
@@ -117,7 +122,7 @@ def test_model_data_plane_forward_only_can_append_selected_outputs(monkeypatch) 
 
     def post(*, url, json_data=None, **_kwargs):
         calls.append((url, json_data))
-        return _Response({} if url.endswith('/create') else {'result': updated_ref.model_dump()})
+        return _Response({} if url.endswith('/create') else _completed({'result': updated_ref.model_dump()}))
 
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
     monkeypatch.setattr(module, 'http_post', post)
@@ -153,7 +158,7 @@ def test_sampler_async_data_plane_path_returns_reference_without_materializing(m
         calls.append((url, json_data))
         if url.endswith('/create'):
             return _Response({})
-        return _Response(output_ref.model_dump())
+        return _Response(_completed(output_ref.model_dump()))
 
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
     monkeypatch.setattr(module, 'http_post', post)

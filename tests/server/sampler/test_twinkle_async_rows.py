@@ -74,9 +74,11 @@ class _SamplerManagement:
     async def _on_request_start(self, _request):
         return 'token'
 
-    async def schedule_task_and_wait(self, task, **kwargs):
-        self.scheduled.append(kwargs)
-        return await task()
+    async def submit_background_and_peek(self, coro_factory, *, model_id=None, task_type=None):
+        self.scheduled.append({'model_id': model_id, 'task_type': task_type})
+        result = await coro_factory()
+        from twinkle_client.types.lifecycle import TaskEnvelope
+        return TaskEnvelope(request_id='req-test', status='completed', result=result)
 
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):
         return fn(*args, **kwargs)
@@ -130,14 +132,15 @@ async def test_sample_to_data_plane_returns_ref_after_short_admission() -> None:
         sampling_params={'max_tokens': 4},
     )
 
-    ref = await route.endpoint(request, body, management)
+    env = await route.endpoint(request, body, management)
 
+    ref = types.DataRef(**env.result)
     assert ref.ref_id == 'rollout-ref'
+    # The whole admit -> generate -> store runs as one background future now
+    # (vLLM owns generation concurrency), so there is a single scheduled task.
     assert management.scheduled == [{
         'model_id': 'session-adapter',
-        'token': 'token',
-        'input_tokens': 1,
-        'task_type': 'sample_admission',
+        'task_type': 'sample_to_data_plane',
     }]
     assert management.put_rows == [{
         'train_input': {'input_ids': [1, 7], 'labels': [-100, 7]},
