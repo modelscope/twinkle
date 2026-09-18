@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle_client.types as types
-from twinkle_client.types import sampler as sampler_types
 from twinkle.data_format import SamplingParams
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
@@ -31,6 +30,7 @@ from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.json_utils import json_safe
+from twinkle_client.types import sampler as sampler_types
 
 logger = get_logger()
 
@@ -216,7 +216,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     """
 
     @app.post('/twinkle/create', response_model=sampler_types.SamplerCreateResponse)
-    async def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
+    async def create(
+        request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
         """Health check / session creation endpoint."""
         return sampler_types.SamplerCreateResponse()
 

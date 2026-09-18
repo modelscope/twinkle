@@ -68,7 +68,7 @@ class EndpointUnavailableError(TwinkleServerError):
     category = ErrorCategory.Server
 
 
-def resolve_backend(service: Any) -> Optional[str]:
+def resolve_backend(service: Any) -> str | None:
     """This deployment's declared backend, or ``None`` when it has no backend concept.
 
     Read from the deployment's own configuration (``ModelManagement.backend``), never
@@ -80,7 +80,7 @@ def resolve_backend(service: Any) -> Optional[str]:
     return backend if isinstance(backend, str) else None
 
 
-def assert_endpoint_available(service: Any, capability: Optional[str]) -> None:
+def assert_endpoint_available(service: Any, capability: str | None) -> None:
     """Raise 501 when this deployment's backend does not implement ``capability``."""
     if capability is None:
         return
@@ -113,7 +113,7 @@ def assert_backend_fields(service: Any, body: Any) -> None:
             error_code=422)
 
 
-def assert_request_supported(service: Any, body: Any, *, capability: Optional[str] = None) -> None:
+def assert_request_supported(service: Any, body: Any, *, capability: str | None = None) -> None:
     """The single preflight entry point, called from ``run_submit`` before the enqueue.
 
     Both checks read *declared* metadata, so neither can produce a false positive. A
