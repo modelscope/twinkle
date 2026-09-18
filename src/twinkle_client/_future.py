@@ -13,8 +13,8 @@ import time
 from typing import Any, Optional
 
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
-from twinkle_client.http import http_post
-from twinkle_client.http.context import get_base_url
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
 from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 
 logger = logging.getLogger('twinkle_client')
@@ -34,33 +34,33 @@ _NOT_FOUND_RETRY_MAX = 3
 _TRANSPORT_RETRY_MAX = 5
 
 
-def _retrieve_url() -> str:
-    return f'{get_base_url()}/twinkle/retrieve_future'
+def _retrieve_url(transport: ClientTransport) -> str:
+    return f'{transport.context.base_url}/twinkle/retrieve_future'
 
 
-def _cancel_url() -> str:
-    return f'{get_base_url()}/twinkle/cancel'
+def _cancel_url(transport: ClientTransport) -> str:
+    return f'{transport.context.base_url}/twinkle/cancel'
 
 
-def _best_effort_cancel(request_id: str) -> None:
+def _best_effort_cancel(request_id: str, transport: ClientTransport) -> None:
     """Ask the server to drop a task when the caller abandons the wait (e.g. Ctrl-C).
 
     Never raises: a failed cancel must not mask the original interrupt. The server
     only drops not-yet-started tasks, so a running task is unaffected.
     """
     try:
-        http_post(url=_cancel_url(), json_data={'request_id': request_id}, timeout=2)
+        transport.post(_cancel_url(transport), json_data={'request_id': request_id}, timeout=2)
     except BaseException as e:  # noqa: BLE001 - best effort; never mask the interrupt
         logger.debug('[future] best-effort cancel of %s failed: %s', request_id, e)
 
 
-def _post_retrieve(request_id: str) -> TaskEnvelope:
+def _post_retrieve(request_id: str, transport: ClientTransport) -> TaskEnvelope:
     """POST one retrieve and parse the reply into a TaskEnvelope.
 
     Raises ``requests.HTTPError`` (a :class:`TwinkleHTTPError` after the client
     error-parsing change lands) on a non-2xx response.
     """
-    response = http_post(url=_retrieve_url(), json_data={'request_id': request_id})
+    response = transport.post(_retrieve_url(transport), json_data={'request_id': request_id})
     return TaskEnvelope.model_validate(response.json())
 
 
@@ -110,7 +110,13 @@ def _unwrap(env: TaskEnvelope, model_cls) -> Any:
     return model_cls.model_validate(env.result) if model_cls is not None else env.result
 
 
-def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_TOTAL_TIMEOUT) -> Any:
+def resolve(
+    submit: TaskEnvelope,
+    *,
+    model_cls,
+    total_timeout: float = _DEFAULT_TOTAL_TIMEOUT,
+    transport: ClientTransport | None = None,
+) -> Any:
     """Block until ``submit``'s task reaches a terminal state, then return its result.
 
     A terminal submit envelope is unwrapped directly, issuing no Retrieve_Endpoint
@@ -124,6 +130,7 @@ def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_
     if submit.status in TERMINAL_STATUSES:
         return _unwrap(submit, model_cls)  # same call as the retrieve path
 
+    resolved_transport = capture_transport(transport)
     deadline = time.monotonic() + total_timeout
     transport_failures = not_found_count = 0
     try:
@@ -131,7 +138,7 @@ def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_
             if time.monotonic() >= deadline:
                 raise TaskWaitTimeoutError(request_id=submit.request_id, waited=total_timeout)
             try:
-                reply = _post_retrieve(submit.request_id)
+                reply = _post_retrieve(submit.request_id, resolved_transport)
                 transport_failures = not_found_count = 0
             except requests.HTTPError as e:
                 status = _status_of(e)
@@ -153,15 +160,14 @@ def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_
     except (KeyboardInterrupt, SystemExit):
         # Caller abandoned the wait: best-effort ask the server to drop the task if it
         # has not started, then re-raise so the interrupt is never swallowed.
-        _best_effort_cancel(submit.request_id)
+        _best_effort_cancel(submit.request_id, resolved_transport)
         raise
 
 
-def resolve_response(response, model_cls) -> Any:
-    """Resolve a Submit_Endpoint HTTP response through the Client_Future_Layer.
-
-    The one place the (already status-checked) reply's Task_Envelope is validated
-    and resolved, shared by every public client method so they keep synchronous
-    signatures without duplicating the parse+resolve step.
-    """
-    return resolve(TaskEnvelope.model_validate(response.json()), model_cls=model_cls)
+def resolve_response(response, model_cls, *, transport: ClientTransport | None = None) -> Any:
+    """Resolve a Submit_Endpoint response using the submitter's transport."""
+    return resolve(
+        TaskEnvelope.model_validate(response.json()),
+        model_cls=model_cls,
+        transport=transport,
+    )

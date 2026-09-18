@@ -17,6 +17,7 @@ import typing
 import twinkle
 from twinkle.server.utils.task_queue.types import QueueState
 from twinkle_client.types.errors import QueueStateLiteral
+from twinkle_client.types.server import GetServerCapabilitiesResponse
 
 _TWINKLE_SRC = pathlib.Path(twinkle.__file__).resolve().parent
 _LEGACY_PUBLIC_NAME_OVERLAP = frozenset({
@@ -45,6 +46,31 @@ def test_queue_state_literal_matches_server_enum():
     literal_values = set(typing.get_args(QueueStateLiteral))
     enum_values = {state.value for state in QueueState}
     assert literal_values == enum_values, (f'QueueStateLiteral {literal_values} != QueueState {enum_values}')
+
+
+def test_old_capabilities_response_gets_conservative_defaults():
+    response = GetServerCapabilitiesResponse.model_validate({'supported_models': []})
+    assert response.protocol_version == 1
+    assert response.features.task_envelope is True
+    assert response.features.cancel is False
+    assert response.features.batch_retrieve is False
+
+
+def test_capabilities_response_ignores_future_fields():
+    response = GetServerCapabilitiesResponse.model_validate({
+        'supported_models': [],
+        'future_top_level': True,
+        'features': {
+            'cancel': True,
+            'future_feature': True
+        },
+        'limits': {
+            'max_batch_size': 8,
+            'future_limit': 9
+        },
+    })
+    assert response.features.cancel is True
+    assert response.limits.max_batch_size == 8
 
 
 def _origin(module: str | None) -> str | None:

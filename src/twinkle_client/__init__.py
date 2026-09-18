@@ -65,7 +65,7 @@ def init_twinkle_client(
         An initialised :class:`~twinkle_client.manager.TwinkleClient` instance.
     """
     from .manager import TwinkleClient
-    return TwinkleClient(
+    return TwinkleClient.connect(
         base_url=base_url,
         api_key=api_key,
         session_heartbeat_interval=session_heartbeat_interval,
@@ -74,5 +74,6 @@ def init_twinkle_client(
 
 
 from .data_plane import DataPlaneClient  # noqa: E402  (late import: keeps optional data-plane dep off the hot path)
+from .http import ClientContext, ClientTransport  # noqa: E402
 
-__all__ = ['DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']
+__all__ = ['ClientContext', 'ClientTransport', 'DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']

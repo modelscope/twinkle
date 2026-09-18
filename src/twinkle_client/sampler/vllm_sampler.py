@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Union
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle_client._request_builder import build_request
 from twinkle_client.common.json_utils import json_safe
-from twinkle_client.http import http_post, http_post_model
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
 from twinkle_client.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle_client.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
                                           SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
@@ -35,38 +36,36 @@ class vLLMSampler:
     The server-side session (managed by TwinkleClient) keeps the sampler alive.
     """
 
-    def __init__(self, model_id: str, **kwargs):
-        """Create the sampler instance on server."""
-        from twinkle_client.http import get_base_url
-        self.server_url = get_base_url()
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        """Create the sampler instance on server with one captured transport."""
+        self._transport = capture_transport(transport)
         from twinkle_client.data_plane import DataPlaneClient
-        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None))
+        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None), transport=self._transport)
 
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
-        self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
-        response = http_post(url=f'{self.server_url}/create', json_data=kwargs)
-        response.raise_for_status()
+        self.server_url = f'{self._transport.context.base_url}/sampler/{model_id}/twinkle'
+        self._transport.post(f'{self.server_url}/create', json_data=kwargs)
 
-    @staticmethod
-    def _await_task(response, model_cls):
-        """Resolve a Submit_Endpoint response through the Client_Future_Layer.
-
-        Blocks until the task is terminal and returns the deserialized ``model_cls``
-        result (or ``None``), raising ``TaskFailedError`` on a failed terminal state.
-        Keeps every public method's synchronous signature unchanged.
-        """
+    def _await_task(self, response, model_cls):
+        """Resolve a Submit_Endpoint response through the Client_Future_Layer."""
         from twinkle_client._future import resolve_response
-        return resolve_response(response, model_cls)
+        return resolve_response(response, model_cls, transport=self._transport)
 
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> SamplerAddAdapterResponse:
         """Add a new adapter to the sampler."""
         if isinstance(config, PeftConfig):
             config = config.__dict__
         body = build_request(SamplerAddAdapterRequest, adapter_name=adapter_name, config=config, **kwargs)
-        response = http_post_model(f'{self.server_url}/add_adapter_to_sampler', body)
+        response = self._transport.post_model(f'{self.server_url}/add_adapter_to_sampler', body)
         self.adapter_name = adapter_name
         return SamplerAddAdapterResponse(**response.json())
 
@@ -90,7 +89,7 @@ class vLLMSampler:
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
-        response = http_post_model(
+        response = self._transport.post_model(
             f'{self.server_url}/sample',
             build_request(
                 SampleRequest,
@@ -134,7 +133,7 @@ class vLLMSampler:
             group_ids=group_ids,
             num_samples=num_samples,
             **source)
-        response = http_post_model(f'{self.server_url}/sample_to_data_plane', body)
+        response = self._transport.post_model(f'{self.server_url}/sample_to_data_plane', body)
         return self._await_task(response, DataRef)
 
     async def asample(
@@ -180,17 +179,17 @@ class vLLMSampler:
 
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""
-        http_post_model(f'{self.server_url}/unload_adapter_paths',
-                        build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
+        self._transport.post_model(f'{self.server_url}/unload_adapter_paths',
+                                   build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
         """Set the template for encoding trajectories."""
         body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
-        response = http_post_model(f'{self.server_url}/set_template', body)
+        response = self._transport.post_model(f'{self.server_url}/set_template', body)
         return SamplerSetTemplateResponse(**response.json())
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
         from twinkle_client.types.model import ApplyPatchRequest
         body = build_request(ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
-        http_post_model(f'{self.server_url}/apply_patch', body)
+        self._transport.post_model(f'{self.server_url}/apply_patch', body)

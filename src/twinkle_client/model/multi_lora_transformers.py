@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from twinkle_client._request_builder import build_request
-from twinkle_client.http import http_post, http_post_model
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
 from twinkle_client.types import model as model_types
 from twinkle_client.types.component import DataRef
 
@@ -35,24 +36,28 @@ class MultiLoraTransformersModel:
     signatures stay ``**kwargs`` and callers are unchanged.
     """
 
-    def __init__(self, model_id: str, **kwargs):
-        """Initialize model client."""
-        from twinkle_client.http import get_base_url
-        self.server_url = get_base_url()
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        """Initialize a model wrapper bound to one immutable request identity."""
+        self._transport = capture_transport(transport)
         kwargs.pop('data_plane_url', None)
 
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
-        self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
+        self.server_url = f'{self._transport.context.base_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         # Per-client monotonic sequence for idempotent dedup of stateful training ops:
         # the server dedups on (session_id, seq_id) so a retried grad/step call is
         # applied at most once. Reserved once per call and reused on retry.
         self._seq_counter = itertools.count(1)
         self._seq_lock = threading.Lock()
-        response = http_post(url=f'{self.server_url}/create', )
-        response.raise_for_status()
+        self._transport.post(f'{self.server_url}/create')
 
     # ------------------------------------------------------------------ #
     # Request plumbing
@@ -61,11 +66,10 @@ class MultiLoraTransformersModel:
     def _submit(self, endpoint: str, model_cls, response_cls, **values):
         """Build, send, and resolve one twinkle-native request."""
         body = build_request(model_cls, **values)
-        response = http_post_model(f'{self.server_url}/{endpoint}', body)
+        response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
         return self._await_task(response, response_cls)
 
-    @staticmethod
-    def _await_task(response, model_cls):
+    def _await_task(self, response, model_cls):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer.
 
         Blocks until the task is terminal and returns the deserialized ``model_cls``
@@ -73,7 +77,7 @@ class MultiLoraTransformersModel:
         Keeps every public method's synchronous signature unchanged.
         """
         from twinkle_client._future import resolve_response
-        return resolve_response(response, model_cls)
+        return resolve_response(response, model_cls, transport=self._transport)
 
     def _next_seq_id(self) -> int:
         """Reserve the next monotonic seq_id for a stateful op (dedup key with session)."""
@@ -122,7 +126,7 @@ class MultiLoraTransformersModel:
             model_types.ForwardRequest,
             model_types.ForwardResponse,
             inputs=inputs,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def forward_only(self, inputs: Any, **kwargs) -> model_types.ForwardResponse:
@@ -132,7 +136,7 @@ class MultiLoraTransformersModel:
             model_types.ForwardOnlyRequest,
             model_types.ForwardResponse,
             inputs=inputs,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def forward_backward(self, inputs: Any, **kwargs) -> model_types.ForwardBackwardResponse:
@@ -142,7 +146,7 @@ class MultiLoraTransformersModel:
             model_types.ForwardBackwardTaskRequest,
             model_types.ForwardBackwardResponse,
             inputs=inputs,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             seq_id=self._next_seq_id(),
             **kwargs)
 
@@ -152,7 +156,7 @@ class MultiLoraTransformersModel:
             'calculate_loss',
             model_types.AdapterRequest,
             model_types.CalculateLossResponse,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def get_train_configs(self, **kwargs) -> model_types.GetTrainConfigsResponse:
@@ -161,7 +165,7 @@ class MultiLoraTransformersModel:
             'get_train_configs',
             model_types.AdapterRequest,
             model_types.GetTrainConfigsResponse,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def backward(self, **kwargs) -> None:
@@ -170,7 +174,7 @@ class MultiLoraTransformersModel:
             'backward',
             model_types.AdapterRequest,
             None,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             seq_id=self._next_seq_id(),
             **kwargs)
 
@@ -192,7 +196,7 @@ class MultiLoraTransformersModel:
             model_types.DataPlaneForwardRequest,
             model_types.ForwardResponse,
             input_refs=_data_refs(inputs),
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             input_field=input_field,
             kwarg_fields=kwarg_fields or {},
             **kwargs)
@@ -213,7 +217,7 @@ class MultiLoraTransformersModel:
             model_types.DataPlaneForwardOnlyRequest,
             model_types.ForwardResponse,
             input_refs=_data_refs(inputs),
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             input_field=input_field,
             kwarg_fields=kwarg_fields or {},
             output_ref=output_ref.model_dump() if output_ref is not None else None,
@@ -237,7 +241,7 @@ class MultiLoraTransformersModel:
             model_types.DataPlaneForwardRequest,
             model_types.ForwardBackwardResponse,
             input_refs=_data_refs(inputs),
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             input_field=input_field,
             kwarg_fields=kwarg_fields or {},
             seq_id=self._next_seq_id(),
@@ -250,11 +254,21 @@ class MultiLoraTransformersModel:
     def step(self, **kwargs) -> None:
         """Execute optimizer step."""
         self._submit(
-            'step', model_types.StepRequest, None, adapter_name=self.adapter_name, seq_id=self._next_seq_id(), **kwargs)
+            'step',
+            model_types.StepRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            seq_id=self._next_seq_id(),
+            **kwargs)
 
     def zero_grad(self, **kwargs) -> None:
         """Zero out gradients."""
-        self._submit('zero_grad', model_types.AdapterRequest, None, adapter_name=self.adapter_name, **kwargs)
+        self._submit(
+            'zero_grad',
+            model_types.AdapterRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def lr_step(self, **kwargs) -> None:
         """Execute learning rate scheduler step."""
@@ -262,7 +276,7 @@ class MultiLoraTransformersModel:
             'lr_step',
             model_types.LrStepRequest,
             None,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             seq_id=self._next_seq_id(),
             **kwargs)
 
@@ -275,7 +289,7 @@ class MultiLoraTransformersModel:
             'clip_grad_norm',
             model_types.ClipGradNormRequest,
             model_types.ClipGradNormResponse,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             max_grad_norm=max_grad_norm,
             norm_type=norm_type,
             **kwargs)
@@ -286,7 +300,7 @@ class MultiLoraTransformersModel:
             'clip_grad_and_step',
             model_types.ClipGradAndStepRequest,
             None,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             max_grad_norm=max_grad_norm,
             norm_type=norm_type,
             seq_id=self._next_seq_id(),
@@ -299,7 +313,12 @@ class MultiLoraTransformersModel:
     def set_loss(self, loss_cls: str, **kwargs) -> None:
         """Set the loss function."""
         self._submit(
-            'set_loss', model_types.SetLossRequest, None, loss_cls=loss_cls, adapter_name=self.adapter_name, **kwargs)
+            'set_loss',
+            model_types.SetLossRequest,
+            None,
+            loss_cls=loss_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def set_optimizer(self, optimizer_cls: str, **kwargs) -> None:
         """Set the optimizer."""
@@ -308,7 +327,7 @@ class MultiLoraTransformersModel:
             model_types.SetOptimizerRequest,
             None,
             optimizer_cls=optimizer_cls,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs) -> None:
@@ -318,7 +337,7 @@ class MultiLoraTransformersModel:
             model_types.SetLrSchedulerRequest,
             None,
             scheduler_cls=scheduler_cls,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def set_template(self, template_cls: str, **kwargs) -> None:
@@ -334,7 +353,7 @@ class MultiLoraTransformersModel:
             model_types.SetTemplateRequest,
             None,
             template_cls=template_cls,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def set_processor(self, processor_cls: str, **kwargs) -> None:
@@ -344,7 +363,7 @@ class MultiLoraTransformersModel:
             model_types.SetProcessorRequest,
             None,
             processor_cls=processor_cls,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def add_metric(self, metric_cls: str, is_training: Optional[bool] = None, **kwargs) -> None:
@@ -355,7 +374,7 @@ class MultiLoraTransformersModel:
             None,
             metric_cls=metric_cls,
             is_training=is_training,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
@@ -365,7 +384,7 @@ class MultiLoraTransformersModel:
             model_types.ApplyPatchRequest,
             None,
             patch_cls=patch_cls,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def calculate_metric(self, is_training: bool = True, **kwargs) -> model_types.CalculateMetricResponse:
@@ -375,7 +394,7 @@ class MultiLoraTransformersModel:
             model_types.CalculateMetricRequest,
             model_types.CalculateMetricResponse,
             is_training=is_training,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     # ------------------------------------------------------------------ #
@@ -389,12 +408,18 @@ class MultiLoraTransformersModel:
             model_types.SaveRequest,
             model_types.SaveResponse,
             name=name,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
     def load(self, name: str, **kwargs) -> None:
         """Load model checkpoint."""
-        self._submit('load', model_types.LoadRequest, None, name=name, adapter_name=self.adapter_name, **kwargs)
+        self._submit(
+            'load',
+            model_types.LoadRequest,
+            None,
+            name=name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> Dict[str, Any]:
         """Resume weights (and optionally optimizer state) from a checkpoint."""
@@ -403,7 +428,7 @@ class MultiLoraTransformersModel:
             model_types.ResumeFromCheckpointRequest,
             model_types.TrainingProgressResponse,
             name=name,
-            adapter_name=self.adapter_name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             resume_only_model=resume_only_model,
             **kwargs)
         return progress.result

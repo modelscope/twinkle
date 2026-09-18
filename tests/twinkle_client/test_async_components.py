@@ -36,10 +36,10 @@ def _completed(result):
 
 
 def _recorder(calls, result_factory):
-    """A ``requests.post`` stand-in that records the URL and the decoded JSON body."""
+    """A Session.post stand-in that records the URL and decoded JSON body."""
 
-    def post(url, headers=None, data=None, timeout=None, **_kwargs):
-        body = json.loads(data) if data else {}
+    def post(url, headers=None, data=None, timeout=None, **kwargs):
+        body = json.loads(data) if data else kwargs.get('json') or {}
         calls.append((url, body))
         return _Response(result_factory(url))
 
@@ -47,12 +47,12 @@ def _recorder(calls, result_factory):
 
 
 def _patch_transport(monkeypatch, calls, result_factory):
-    import twinkle_client.http as http_module
-    import twinkle_client.http.client as http_client
-    monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
-    monkeypatch.setattr(http_client, 'get_base_url', lambda: 'http://server/api/v1')
-    monkeypatch.setattr(http_client, 'get_api_key', lambda: 'test-key')
-    monkeypatch.setattr(http_client.requests, 'post', _recorder(calls, result_factory))
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.http.context import set_default_transport
+
+    transport = ClientTransport(ClientContext(base_url='http://server', api_key='test-key'))
+    monkeypatch.setattr(transport._session, 'post', _recorder(calls, result_factory))
+    set_default_transport(transport)
 
 
 def test_model_forward_backward_sends_multiple_data_refs(monkeypatch) -> None:

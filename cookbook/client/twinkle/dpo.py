@@ -6,24 +6,18 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-import os
-from typing import Any, Dict, List
-
-dotenv.load_dotenv('.env')
 import numpy as np
+import os
 import torch
 from peft import LoraConfig
+from typing import Any, Dict, List
 
-from twinkle import get_logger
-from twinkle.dataset import Dataset, DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import get_logger, init_twinkle_client
 from twinkle.dataloader import DataLoader
-from twinkle_client.model import MultiLoraTransformersModel
-from twinkle.loss import DPOLoss
-from twinkle.metric import DPOMetric
+from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import EmojiDPOProcessor
-from twinkle.processor import InputProcessor
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 # Configuration (direct values, not from env)
@@ -68,11 +62,9 @@ def create_dpo_dataset():
     dataset = Dataset(DatasetMeta(dataset_id, data_slice=range(100)))
     dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=max_length)
     dataset.map(
-        EmojiDPOProcessor,
-        init_args={
+        EmojiDPOProcessor, init_args={
             'system': system_prompt,
-        }
-    )
+        })
     # DPO preprocessor returns {'positive': [...], 'negative': [...]}
     # batch_encode handles this format automatically
     dataset.encode()
@@ -121,7 +113,7 @@ def train():
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
-    model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+    model = client.model(f'ms://{base_model}')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(
@@ -162,7 +154,7 @@ def train():
     optim_step = 0
     max_steps = len(dataloader)
     logger.info(f'Starting LoRA DPO training: loss_type={loss_type}, beta={dpo_beta}, lr={learning_rate}')
-    logger.info(f'Using base model (disable_lora=True) as reference model')
+    logger.info('Using base model (disable_lora=True) as reference model')
 
     for batch in dataloader:
         # batch is List[Dict] with 'positive' and 'negative' keys

@@ -1,64 +1,86 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Immutable client identity and the compatibility default-transport registry."""
+from __future__ import annotations
+
 import os
+import threading
 import uuid
-from datetime import datetime
-from typing import Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .client import ClientTransport
 
 TWINKLE_SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://127.0.0.1:8000')
 TWINKLE_SERVER_TOKEN = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 
-# Global variables for configuration
-_base_url: Optional[str] = None
-_api_key: Optional[str] = None
-_session_id: Optional[str] = None
-_request_id: Optional[str] = None
+
+def _normalize_base_url(base_url: str) -> str:
+    base_url = base_url.rstrip('/')
+    return base_url if base_url.endswith('/api/v1') else f'{base_url}/api/v1'
 
 
-def set_base_url(url: str):
-    """Set the base URL for HTTP requests."""
-    global _base_url
-    _base_url = url.rstrip('/')
+@dataclass(frozen=True, slots=True)
+class ClientContext:
+    """A resolved request identity captured by one transport."""
+
+    base_url: str
+    api_key: str
+    session_id: str | None = None
+    routing_id: str = ''
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'base_url', _normalize_base_url(self.base_url))
+        if not self.routing_id:
+            object.__setattr__(self, 'routing_id', uuid.uuid4().hex)
 
 
-def get_base_url() -> str:
-    """Get the current base URL."""
-    base_url = _base_url or TWINKLE_SERVER_URL
-    if not base_url.endswith('/api/v1'):
-        base_url += '/api/v1'
-    return base_url
+_default_lock = threading.RLock()
+_default_transport: ClientTransport | None = None
 
 
-def set_api_key(api_key: str):
-    """Set the API key for HTTP requests."""
-    global _api_key
-    _api_key = api_key
+def _new_env_transport() -> ClientTransport:
+    from .client import ClientTransport
+    return ClientTransport(
+        ClientContext(
+            base_url=os.environ.get('TWINKLE_SERVER_URL', TWINKLE_SERVER_URL),
+            api_key=os.environ.get('TWINKLE_SERVER_TOKEN', TWINKLE_SERVER_TOKEN),
+        ))
 
 
+def capture_transport(explicit: ClientTransport | None = None) -> ClientTransport:
+    """Return an explicit transport or capture the current compatibility default."""
+    global _default_transport
+    if explicit is not None:
+        if explicit.closed:
+            raise RuntimeError('Cannot capture a closed ClientTransport')
+        return explicit
+    with _default_lock:
+        if _default_transport is None or _default_transport.closed:
+            _default_transport = _new_env_transport()
+        return _default_transport
+
+
+def set_default_transport(transport: ClientTransport) -> None:
+    if transport.closed:
+        raise RuntimeError('Cannot register a closed ClientTransport')
+    global _default_transport
+    with _default_lock:
+        _default_transport = transport
+
+
+def clear_default_transport(transport: ClientTransport) -> None:
+    global _default_transport
+    with _default_lock:
+        if _default_transport is transport:
+            _default_transport = None
+
+
+# Private compatibility seam for the deferred Tinker monkey patch. New Twinkle code
+# must use ClientTransport directly; these names are intentionally not re-exported.
 def get_api_key() -> str:
-    """Get the current API key."""
-    return _api_key or TWINKLE_SERVER_TOKEN
-
-
-def set_session_id(session_id: str):
-    """Set the session ID."""
-    global _session_id
-    _session_id = session_id
-
-
-def get_session_id() -> Optional[str]:
-    """Get the current session ID."""
-    return _session_id
-
-
-def set_request_id(request_id: str):
-    """Set the global request ID for HTTP requests (shared across all threads)."""
-    global _request_id
-    _request_id = request_id
+    return capture_transport().context.api_key
 
 
 def get_request_id() -> str:
-    """Get the global request ID or generate and cache a new one."""
-    global _request_id
-    if _request_id is not None:
-        return _request_id
-    _request_id = datetime.now().strftime('%Y%m%d_%H%M%S') + '-' + str(uuid.uuid4().hex)[0:8]
-    return _request_id
+    return capture_transport().context.routing_id

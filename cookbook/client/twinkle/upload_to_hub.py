@@ -17,14 +17,11 @@
 #   - A ModelScope API token with write access to the target repository
 
 import dotenv
-
-dotenv.load_dotenv('.env')
-
 import os
 
 from twinkle import get_logger, init_twinkle_client
-from twinkle_client.model import MultiLoraTransformersModel
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -45,10 +42,10 @@ hub_token = None  # Set to your ModelScope API token, or None to use server defa
 
 def upload():
     # Step 1: Initialize the Twinkle client
-    init_twinkle_client(base_url=base_url, api_key=api_key)
+    client = init_twinkle_client(base_url=base_url, api_key=api_key)
 
     # Step 2: Create the model client (no training state needed for upload)
-    model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+    model = client.model(f'ms://{base_model}')
 
     # Step 3: Upload checkpoint to ModelScope Hub.
     # The client polls for completion automatically; progress is printed to stdout.

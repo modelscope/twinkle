@@ -21,11 +21,10 @@
 # ``model.save(is_sampler=True)`` and point the sampler at the saved adapter; that
 # sync is intentionally omitted here to keep the rollout example focused.
 
-import os
-from typing import Any, Dict, List, Tuple
-
 import dotenv
+import os
 from peft import LoraConfig
+from typing import Any, Dict, List, Tuple
 
 from twinkle import get_logger, init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
@@ -33,9 +32,7 @@ from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.envs import EnvTool, OpenEnv
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.rollout import ClientMultiTurnRollout
-from twinkle_client.sampler import vLLMSampler
 
 dotenv.load_dotenv('.env')
 
@@ -45,7 +42,7 @@ logger = get_logger()
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
 ADAPTER_NAME = 'default'
-NUM_GENERATIONS = 2       # GRPO group size (rollout runs num_samples=1 per trajectory)
+NUM_GENERATIONS = 2  # GRPO group size (rollout runs num_samples=1 per trajectory)
 BATCH_SIZE = 2
 MAX_NEW_TOKENS = 512
 MAX_TURNS = 4
@@ -81,7 +78,8 @@ SYSTEM_PROMPT = """You are a skilled blackjack player. You will be told your cur
 
 Your goal is to win the game by getting as close to 21 as possible without going over.
 
-Use the `play` tool to choose either `hit` or `stand`. Reason briefly before each action. Once the environment reports that the game is over, give a short final answer without calling another tool."""
+Use the `play` tool to choose either `hit` or `stand`. Reason briefly before each action.
+Once the environment reports that the game is over, give a short final answer without calling another tool."""
 
 
 def blackjack_action_mapper(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -105,8 +103,7 @@ def create_env_tool(env: OpenEnv) -> EnvTool:
 
 
 def prepare_trajectories(
-    n_trajectories: int,
-) -> Tuple[List[Dict[str, Any]], List[ToolManager], List[List[EnvTool]], List[OpenEnv]]:
+    n_trajectories: int, ) -> Tuple[List[Dict[str, Any]], List[ToolManager], List[List[EnvTool]], List[OpenEnv]]:
     """Create and reset one independent OpenEnv instance per trajectory."""
     trajectories = []
     tool_managers = []
@@ -127,10 +124,17 @@ def prepare_trajectories(
             tool_manager = ToolManager(env_tools)
             trajectories.append({
                 'messages': [
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': initial_observation},
+                    {
+                        'role': 'system',
+                        'content': SYSTEM_PROMPT
+                    },
+                    {
+                        'role': 'user',
+                        'content': initial_observation
+                    },
                 ],
-                'tools': tool_manager.tool_infos(),
+                'tools':
+                tool_manager.tool_infos(),
             })
             tool_managers.append(tool_manager)
             env_tools_list.append(env_tools)
@@ -149,13 +153,13 @@ def extract_rewards(env_tools_list: List[List[EnvTool]]) -> List[float]:
 
 def train():
     # Step 1: connect to the running Twinkle server.
-    init_twinkle_client(
+    client = init_twinkle_client(
         base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
         api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
     )
 
     # Step 2: training model (GRPO), mirroring the ray-local example's config.
-    model = MultiLoraTransformersModel(model_id=MODEL_ID)
+    model = client.model(MODEL_ID)
     model.add_adapter_to_model(ADAPTER_NAME, LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_optimizer('Adam', lr=LEARNING_RATE)
@@ -163,7 +167,7 @@ def train():
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     # Step 3: client sampler (HTTP).
-    sampler = vLLMSampler(model_id=MODEL_ID)
+    sampler = client.sampler(MODEL_ID)
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     # Step 4: multi-turn rollout. Each call receives trajectory-bound ToolManagers

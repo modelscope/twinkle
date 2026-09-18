@@ -88,5 +88,6 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"twinkle_client" = ["py.typed"]
 "twinkle_client.skills.bundled" = ["*.md"]
 "twinkle.kernel.ops.dsv4_sas_li.aclnn" = ["*.h", "*.cpp", "**/*.cpp"]
