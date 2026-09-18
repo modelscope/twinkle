@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.server.lifecycle.submit import run_submit
+from twinkle_client.types.model import ForwardBackwardTaskRequest
 
 
 class _FakeState:
@@ -38,6 +39,9 @@ class _FakeManagement:
     def __init__(self, record_after_claim):
         self.state = _FakeState(record_after_claim)
         self._task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
+        # A real deployment declares its backend; preflight reads it from here.
+        self.backend = 'transformers'
+        self.data_world_size = 1
 
     async def _on_request_start(self, request):
         return 'token'
@@ -51,8 +55,13 @@ def _request():
     return SimpleNamespace(state=SimpleNamespace(session_id='sess-1', request_id='rq-1'))
 
 
-def _body():
-    return SimpleNamespace(adapter_name='ad', seq_id=7)
+def _body(adapter_name: str = 'ad', seq_id: int = 7) -> ForwardBackwardTaskRequest:
+    """A real request model, not a stand-in.
+
+    ``run_submit`` now reads field roles off the body to build the backend kwargs and to
+    run preflight, so a ``SimpleNamespace`` would exercise a shape production never sees.
+    """
+    return ForwardBackwardTaskRequest(inputs=[{'input_ids': [1, 2]}], adapter_name=adapter_name, seq_id=seq_id)
 
 
 async def _call(self, body, adapter_name, token):  # pragma: no cover - never invoked
@@ -93,7 +102,7 @@ async def test_dedup_key_is_scoped_per_adapter():
             await run_submit(
                 mgmt,
                 _request(),
-                SimpleNamespace(adapter_name=adapter, seq_id=1),
+                _body(adapter_name=adapter, seq_id=1),
                 task_type='forward_backward',
                 backend_call=_call)
 

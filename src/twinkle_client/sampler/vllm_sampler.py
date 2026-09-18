@@ -1,13 +1,17 @@
 import asyncio
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
-from twinkle_client.http import http_post
-from twinkle_client.types.sampler import (AddAdapterResponse, SampleResponseModel, SampleResponseModelList,
-                                          SetTemplateResponse)
+
 from peft import PeftConfig
-from twinkle.data_format import Trajectory, InputFeature, SamplingParams
+
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle_client._request_builder import build_request
 from twinkle_client.common.json_utils import json_safe
-from twinkle_client.types.component import DataRef
+from twinkle_client.http import http_post, http_post_model
+from twinkle_client.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
+from twinkle_client.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
+                                          SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
+                                          SamplerSetTemplateResponse)
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -61,17 +65,14 @@ class vLLMSampler:
         from twinkle_client._future import resolve_response
         return resolve_response(response, model_cls)
 
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> AddAdapterResponse:
+    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> SamplerAddAdapterResponse:
         """Add a new adapter to the sampler."""
         if isinstance(config, PeftConfig):
             config = config.__dict__
-        response = http_post(
-            url=f'{self.server_url}/add_adapter_to_sampler',
-            json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
-        )
-        response.raise_for_status()
+        body = build_request(SamplerAddAdapterRequest, adapter_name=adapter_name, config=config, **kwargs)
+        response = http_post_model(f'{self.server_url}/add_adapter_to_sampler', body)
         self.adapter_name = adapter_name
-        return AddAdapterResponse(**response.json())
+        return SamplerAddAdapterResponse(**response.json())
 
     def sample(
         self,
@@ -93,25 +94,27 @@ class vLLMSampler:
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
+        response = http_post_model(
+            f'{self.server_url}/sample',
+            build_request(
+                SampleRequest,
+                inputs=_json_safe(inputs),
+                sampling_params=self._sampling_params(sampling_params, num_samples),
+                adapter_name=adapter_name,
+                adapter_uri=adapter_uri))
+        return self._await_task(response, SampleResponseModelList).samples
+
+    @staticmethod
+    def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],
+                         num_samples: int) -> Dict[str, Any]:
+        """Normalise sampling parameters into the single dict the server builds from."""
         if isinstance(sampling_params, SamplingParams):
             sampling_params = asdict(sampling_params)
         else:
             sampling_params = dict(sampling_params or {})
         if num_samples != 1 and sampling_params.setdefault('num_samples', num_samples) != num_samples:
             raise ValueError('num_samples conflicts with sampling_params.num_samples')
-        json_data = {
-            'inputs': _json_safe(inputs),
-            'sampling_params': _json_safe(sampling_params),
-            'adapter_name': adapter_name,
-        }
-        if adapter_uri is not None:
-            json_data['adapter_uri'] = adapter_uri
-
-        response = http_post(
-            url=f'{self.server_url}/sample',
-            json_data=json_data
-        )
-        return self._await_task(response, SampleResponseModelList).samples
+        return _json_safe(sampling_params)
 
     def sample_to_data_plane(
         self,
@@ -125,20 +128,21 @@ class vLLMSampler:
         num_samples: int = 1,
     ) -> DataRef:
         """Generate complete prompt groups and keep their rows in the server DataPlane."""
-        body = {
-            'sampling_params': sampling_params,
-            'adapter_name': adapter_name,
-            'adapter_uri': adapter_uri,
-            'policy_version': policy_version,
-            'group_ids': group_ids,
-            'num_samples': num_samples,
-        }
-        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
-            inputs.model_dump() if isinstance(inputs, DataRef) else _json_safe(inputs))
-        response = http_post(
-            url=f'{self.server_url}/sample_to_data_plane',
-            json_data=json_safe(body),
-        )
+        source = ({
+            'input_ref': inputs.model_dump()
+        } if isinstance(inputs, DataRef) else {
+            'inputs': _json_safe(inputs)
+        })
+        body = build_request(
+            DataPlaneSampleRequest,
+            sampling_params=_json_safe(sampling_params) if sampling_params else None,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            policy_version=policy_version,
+            group_ids=group_ids,
+            num_samples=num_samples,
+            **source)
+        response = http_post_model(f'{self.server_url}/sample_to_data_plane', body)
         return self._await_task(response, DataRef)
 
     async def asample(
@@ -184,25 +188,19 @@ class vLLMSampler:
 
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""
-        response = http_post(
-            url=f'{self.server_url}/unload_adapter_paths',
-            json_data={'adapter_paths': adapter_paths},
-        )
-        response.raise_for_status()
+        http_post_model(
+            f'{self.server_url}/unload_adapter_paths',
+            build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
-    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
+    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
         """Set the template for encoding trajectories."""
-        response = http_post(
-            url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return SetTemplateResponse(**response.json())
+        body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
+        response = http_post_model(f'{self.server_url}/set_template', body)
+        return SamplerSetTemplateResponse(**response.json())
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
-        response = http_post(
-            url=f'{self.server_url}/apply_patch',
-            json_data={'patch_cls': patch_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        from twinkle_client.types.model import ApplyPatchRequest
+        body = build_request(
+            ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
+        http_post_model(f'{self.server_url}/apply_patch', body)

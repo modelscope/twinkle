@@ -28,6 +28,7 @@ from twinkle.server.lifecycle.submit import (backend_kwargs, input_metrics, reso
 from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_kwargs, resolve_data_plane_model_inputs,
                                         select_output_rows)
 from twinkle.server.utils.validation import get_session_id_from_request
+from twinkle.server.validation import BackendCapability
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -90,7 +91,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 **backend_kwargs(body))
             return {'result': ret}
 
-        return await run_submit(self, request, body, task_type='forward', backend_call=_call, metrics=_dp_metrics)
+        return await run_submit(
+            self,
+            request,
+            body,
+            task_type='forward',
+            backend_call=_call,
+            metrics=_dp_metrics,
+            capability=BackendCapability.Forward)
 
     @app.post('/twinkle/forward_only', response_model=types.TaskEnvelope)
     async def forward_only(
@@ -110,7 +118,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/forward_backward', response_model=types.TaskEnvelope)
     async def forward_backward(
-        request: Request, body: types.ForwardRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+        request: Request, body: types.ForwardBackwardTaskRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
 
@@ -147,7 +156,13 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 **backend_kwargs(body))
             return {'result': ret}
 
-        return await run_submit(self, request, body, task_type='calculate_loss', backend_call=_call)
+        return await run_submit(
+            self,
+            request,
+            body,
+            task_type='calculate_loss',
+            backend_call=_call,
+            capability=BackendCapability.CalculateLoss)
 
     @app.post('/twinkle/backward', response_model=types.TaskEnvelope)
     async def backward(request: Request, body: types.AdapterRequest,
@@ -157,7 +172,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             await self.call_backend(
                 self.model.backward, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type='backward', backend_call=_call)
+        return await run_submit(
+            self, request, body, task_type='backward', backend_call=_call, capability=BackendCapability.Backward)
 
     # ------------------------------------------------------------------ #
     # Data-plane forward family (DataRef inputs; response only enters the contract)
@@ -170,7 +186,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
-            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
             ret = await self.call_backend(
                 self.model.forward,
                 inputs=to_backend_inputs(raw_inputs),
@@ -179,7 +195,13 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             return {'result': ret}
 
         return await run_submit(
-            self, request, body, task_type='forward_from_data_plane', backend_call=_call, metrics=_data_plane_metrics)
+            self,
+            request,
+            body,
+            task_type='forward_from_data_plane',
+            backend_call=_call,
+            metrics=_data_plane_metrics,
+            capability=BackendCapability.Forward)
 
     @app.post('/twinkle/forward_only_from_data_plane', response_model=types.TaskEnvelope)
     async def forward_only_from_data_plane(
@@ -189,7 +211,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             inputs = to_backend_inputs(raw_inputs)
-            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
             ret = await self.call_backend(
                 self.model.forward_only,
                 inputs=inputs,
@@ -216,7 +238,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
-            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
             ret = await self.call_backend(
                 self.model.forward_backward,
                 inputs=to_backend_inputs(raw_inputs),
@@ -238,11 +260,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/clip_grad_norm', response_model=types.TaskEnvelope)
     async def clip_grad_norm(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+        request: Request, body: types.ClipGradNormRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.clip_grad_norm,
+                max_grad_norm=body.max_grad_norm,
+                norm_type=body.norm_type,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 **backend_kwargs(body))
             return {'result': str(ret)}
@@ -250,7 +275,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         return await run_submit(self, request, body, task_type='clip_grad_norm', backend_call=_call)
 
     @app.post('/twinkle/step', response_model=types.TaskEnvelope)
-    async def step(request: Request, body: types.AdapterRequest,
+    async def step(request: Request, body: types.StepRequest,
                    self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
@@ -272,7 +297,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         return await run_submit(self, request, body, task_type='zero_grad', backend_call=_call)
 
     @app.post('/twinkle/lr_step', response_model=types.TaskEnvelope)
-    async def lr_step(request: Request, body: types.AdapterRequest,
+    async def lr_step(request: Request, body: types.LrStepRequest,
                       self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
@@ -549,7 +574,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _task():
             from peft import LoraConfig
-            extra_kwargs = body.model_extra or {}
+            extra_kwargs = backend_kwargs(body)
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
             lora_config = None
             if isinstance(config, LoraConfig):

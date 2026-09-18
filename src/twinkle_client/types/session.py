@@ -1,24 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Pydantic models for twinkle session management endpoints."""
-from pydantic import BaseModel
 from typing import Any, Dict, Optional
 
+from .base import ResponseModel, StrictRequest
 
-class CreateSessionRequest(BaseModel):
+
+class CreateSessionRequest(StrictRequest):
     """Request body for POST /twinkle/create_session."""
     metadata: Optional[Dict[str, Any]] = None
 
 
-class CreateSessionResponse(BaseModel):
+class CreateSessionResponse(ResponseModel):
     """Response body for POST /twinkle/create_session."""
     session_id: str
 
 
-class SessionHeartbeatRequest(BaseModel):
+class SessionHeartbeatRequest(StrictRequest):
     """Request body for POST /twinkle/session_heartbeat."""
     session_id: str
 
 
-class SessionHeartbeatResponse(BaseModel):
+class SessionHeartbeatResponse(ResponseModel):
     """Response body for POST /twinkle/session_heartbeat."""
-    pass

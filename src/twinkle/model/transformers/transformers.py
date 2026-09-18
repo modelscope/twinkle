@@ -27,7 +27,7 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
@@ -395,7 +395,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     @staticmethod
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        return not is_encoded(inputs)
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:

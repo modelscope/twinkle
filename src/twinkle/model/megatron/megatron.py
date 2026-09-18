@@ -25,7 +25,7 @@ import twinkle.metric
 import twinkle.patch
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, torch_util
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
@@ -201,7 +201,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     @staticmethod
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        return not is_encoded(inputs)
 
     @staticmethod
     def _slice_value_for_microbatch(value, mb_start: int, mb_end: int, micro_batch_size: int):

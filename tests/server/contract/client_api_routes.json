@@ -393,7 +393,7 @@
     },
     "POST /twinkle/clip_grad_norm": {
       "body": [
-        "AdapterRequest"
+        "ClipGradNormRequest"
       ],
       "response": "TaskEnvelope",
       "statusCode": 200
@@ -414,7 +414,7 @@
     },
     "POST /twinkle/forward_backward": {
       "body": [
-        "ForwardRequest"
+        "ForwardBackwardTaskRequest"
       ],
       "response": "TaskEnvelope",
       "statusCode": 200
@@ -463,7 +463,7 @@
     },
     "POST /twinkle/lr_step": {
       "body": [
-        "AdapterRequest"
+        "LrStepRequest"
       ],
       "response": "TaskEnvelope",
       "statusCode": 200
@@ -526,7 +526,7 @@
     },
     "POST /twinkle/step": {
       "body": [
-        "AdapterRequest"
+        "StepRequest"
       ],
       "response": "TaskEnvelope",
       "statusCode": 200
@@ -572,9 +572,9 @@
     },
     "POST /twinkle/add_adapter_to_sampler": {
       "body": [
-        "AddAdapterRequest"
+        "SamplerAddAdapterRequest"
       ],
-      "response": "AddAdapterResponse",
+      "response": "SamplerAddAdapterResponse",
       "statusCode": 200
     },
     "POST /twinkle/apply_patch": {
@@ -586,7 +586,7 @@
     },
     "POST /twinkle/create": {
       "body": [],
-      "response": "CreateResponse",
+      "response": "SamplerCreateResponse",
       "statusCode": 200
     },
     "POST /twinkle/sample": {
@@ -612,9 +612,9 @@
     },
     "POST /twinkle/set_template": {
       "body": [
-        "SetTemplateRequest"
+        "SamplerSetTemplateRequest"
       ],
-      "response": "SetTemplateResponse",
+      "response": "SamplerSetTemplateResponse",
       "statusCode": 200
     },
     "POST /twinkle/unload_adapter_paths": {

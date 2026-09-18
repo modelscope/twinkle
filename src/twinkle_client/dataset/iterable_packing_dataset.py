@@ -1,77 +1,39 @@
-
+# Copyright (c) ModelScope Contributors. All rights reserved.
+from torch.utils.data import IterableDataset
 from typing import Type, Union
-from twinkle_client.http import http_post
-from twinkle.dataset import Dataset
+
 from twinkle.dataset import DatasetMeta
 from twinkle.template import Template
-from torch.utils.data import IterableDataset
+from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
+
 
 class IterablePackingDataset(IterableDataset):
     """Client wrapper for IterablePackingDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta = None, packing_interval: int = 128, packing_num_proc: int = 1, cyclic: bool = False, **kwargs):
-        from twinkle_client.http import get_base_url
+    def __init__(self,
+                 dataset_meta: DatasetMeta = None,
+                 packing_interval: int = 128,
+                 packing_num_proc: int = 1,
+                 cyclic: bool = False,
+                 **kwargs):
+        self.processor_id = create_remote_component(
+            'dataset',
+            'IterablePackingDataset',
+            dataset_meta=dataset_meta,
+            packing_interval=packing_interval,
+            packing_num_proc=packing_num_proc,
+            cyclic=cyclic,
+            **kwargs)
 
-        self.server_url = f'{get_base_url()}/processor/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data={
-                'processor_type': 'dataset',
-                'class_type': 'IterablePackingDataset',
-                **{'dataset_meta': dataset_meta, 'packing_interval': packing_interval, 'packing_num_proc': packing_num_proc, 'cyclic': cyclic}, **kwargs
-            }
-        )
-        response.raise_for_status()
-        self.processor_id = response.json()['processor_id']
-
-    
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'set_template',
-                **{'template_cls': template_cls},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return call_remote_component(self.processor_id, 'set_template', template_cls=template_cls, **kwargs)
 
     def pack_dataset(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'pack_dataset',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return call_remote_component(self.processor_id, 'pack_dataset')
 
     def __iter__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__iter__',
-                **{},
-            }
-        )
-        response.raise_for_status()
+        call_remote_component(self.processor_id, '__iter__')
         return self
-    
+
     def __next__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__next__',
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return call_remote_component(self.processor_id, '__next__')

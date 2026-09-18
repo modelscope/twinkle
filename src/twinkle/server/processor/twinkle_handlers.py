@@ -44,7 +44,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_type_name = body.processor_type
         class_type = body.class_type
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.init_kwargs)
 
         assert processor_type_name in _PROCESSOR_TYPES, f'Invalid processor type: {processor_type_name}'
         processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
@@ -98,7 +98,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_id = body.processor_id
         function_name = body.function
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.call_kwargs)
         processor_id = processor_id[4:]
         self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)

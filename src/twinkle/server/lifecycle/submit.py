@@ -12,65 +12,99 @@ from collections.abc import Callable, Coroutine
 from fastapi import Request
 from typing import Any
 
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import InputFeature, Trajectory, is_encoded
 from twinkle.server.utils.validation import get_session_id_from_request
+from twinkle.server.validation import assert_request_supported
+from twinkle_client.types.base import FieldRole, fields_with_role
+from twinkle_client.types.data import export_batch
 from twinkle_client.types.lifecycle import TaskEnvelope
 
 # --------------------------------------------------------------------------- #
-# Named seams. This spec implements the current semantics; the server-request-schema
-# spec later replaces these function bodies without touching the shell or the return
-# path, so the two specs edit disjoint regions.
+# Named seams shared by every queued twinkle-native handler.
 # --------------------------------------------------------------------------- #
 
 
 def to_backend_inputs(inputs: Any, *, single: bool = False) -> Any:
-    """Seam A: convert raw dict/list inputs to InputFeature / Trajectory objects.
+    """Seam A: export wire-validated ``inputs`` as the objects the backend consumes.
 
-    With ``single=False`` (default) a *batch* is returned: a list of parsed objects
-    for a list input, a one-element list for a single dict, and the value unchanged
-    otherwise. With ``single=True`` exactly one parsed object is returned (the
-    streaming path accepts only one input): a list must contain exactly one element
-    or a ``ValueError`` is raised, a dict is parsed to a single object, and anything
-    else is passed through. Element typing is unchanged: a dict with ``input_ids``
-    becomes an ``InputFeature``, otherwise a ``Trajectory``.
+    This is an *export*, not a validation step. The request model declares ``inputs``
+    as :data:`~twinkle_client.types.data.WireInputBatch`, so a malformed batch is
+    already rejected during FastAPI body parsing -- before a future record exists and
+    before anything reaches a GPU. Validating here instead would put the first check
+    inside the queued task, where a rejection has already cost an enqueue.
+
+    Entries arrive as wire models and are exported with ``exclude_none`` semantics, so
+    unset optional fields stay absent (Twinkle_Core branches on key presence) and
+    unknown keys the caller sent are preserved. ``InputFeature`` / ``Trajectory`` are
+    ``TypedDict``s, so constructing them is a plain dict build.
+
+    With ``single=True`` exactly one object is returned (the streaming path accepts
+    only one input) and a batch of any other size is a ``ValueError``. Plain dicts pass
+    through unchanged: the data-plane path resolves rows itself and never goes through
+    the wire schema.
     """
+    entries = export_batch(inputs) if isinstance(inputs, list) else inputs
     if single:
-        if isinstance(inputs, list):
-            if len(inputs) != 1:
+        if isinstance(entries, list):
+            if len(entries) != 1:
                 raise ValueError('Streaming only supports a single input')
-            inputs = inputs[0]
-        if isinstance(inputs, dict):
-            return InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
-        return inputs
-    if isinstance(inputs, list) and inputs:
-        first = inputs[0]
-        if isinstance(first, dict) and 'input_ids' in first:
-            return [InputFeature(**item) for item in inputs]
-        return [Trajectory(**item) for item in inputs]
-    if isinstance(inputs, dict):
-        if 'input_ids' in inputs:
-            return [InputFeature(**inputs)]
-        return [Trajectory(**inputs)]
-    return inputs
+            entries = entries[0]
+        if isinstance(entries, dict):
+            return _as_backend_entry(entries)
+        return entries
+    if isinstance(entries, list):
+        return [_as_backend_entry(entry) if isinstance(entry, dict) else entry for entry in entries]
+    if isinstance(entries, dict):
+        return [_as_backend_entry(entries)]
+    return entries
+
+
+def _as_backend_entry(entry: dict[str, Any]) -> Any:
+    """One exported entry as its ``TypedDict`` shape."""
+    return InputFeature(**entry) if is_encoded(entry) else Trajectory(**entry)
 
 
 def backend_kwargs(body: Any) -> dict[str, Any]:
-    """Seam B: the passthrough kwargs forwarded to the backend call."""
-    return body.model_extra or {}
+    """Seam B: the keyword arguments forwarded to the backend call.
+
+    Exactly two sources, both declared on the request model (see
+    :mod:`twinkle_client.types.base`):
+
+    1. fields whose role is ``BackendKwarg``, included iff their value is not ``None``;
+    2. the contents of every ``Passthrough`` field, flattened.
+
+    Control fields are never forwarded. That exclusion is the point of the field roles:
+    forwarding *all* declared non-``None`` fields would re-send ``inputs`` /
+    ``adapter_name`` / ``seq_id``, which the handlers already pass explicitly -- a
+    duplicate keyword argument at best, and a protocol field leaking into a backend
+    signature at worst.
+    """
+    model_cls = type(body)
+    kwargs: dict[str, Any] = {}
+    for name in fields_with_role(model_cls, FieldRole.BackendKwarg):
+        value = getattr(body, name, None)
+        if value is not None:
+            kwargs[name] = value
+    for name in fields_with_role(model_cls, FieldRole.Passthrough):
+        region = getattr(body, name, None) or {}
+        overlap = set(region) & set(kwargs)
+        if overlap:
+            raise ValueError(f'{name} collides with declared backend parameters: {", ".join(sorted(overlap))}')
+        kwargs.update(region)
+    return kwargs
 
 
 def input_metrics(self, body: Any, *, data_parallel: bool = False) -> dict[str, Any]:
     """Seam C: scheduling metrics (input_tokens, and batch_size/data_world_size).
 
-    Defensive shape (isinstance guards + .get defaults) because the body is not yet
-    strictly validated; a non-dict element must not raise here.
+    Reads validated wire models, so no isinstance guards: ``inputs`` is a list and
+    ``input_ids`` is either absent or a list of ints.
     """
     inputs = body.inputs
-    inputs_list = inputs if isinstance(inputs, list) else [inputs]
-    input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+    input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in inputs)
     metrics: dict[str, Any] = {'input_tokens': input_tokens}
     if data_parallel:
-        metrics['batch_size'] = len(inputs_list)
+        metrics['batch_size'] = len(inputs)
         metrics['data_world_size'] = self.data_world_size
     return metrics
 
@@ -92,13 +126,23 @@ async def run_submit(
     backend_call: Callable[..., Coroutine],
     metrics: Callable[[Any, Any], dict[str, Any]] | None = None,
     assert_resource: bool = True,
+    capability: str | None = None,
 ) -> TaskEnvelope:
     """The common Submit_Endpoint judgment sequence, called by every queued
     twinkle-native handler instead of being repeated in each.
 
-    Order is load-bearing: request start -> adapter resolution -> ``submit_and_peek``
-    (whose ``schedule_task`` runs preflight). Every admission check runs before any
-    state write, so a rejected request writes nothing.
+    Order is load-bearing: request start -> adapter resolution -> preflight ->
+    ``submit_and_peek`` (whose ``schedule_task`` runs its own resource preflight).
+    Every admission check runs before any state write, so a rejected request writes
+    nothing.
+
+    ``assert_request_supported`` is the one place the request is checked against *this
+    deployment*: a parameter that only exists on the other backend and an endpoint this
+    backend does not implement are decided here -- before the seq claim and before the
+    enqueue, so a rejected request runs on zero data-parallel ranks. Putting these checks
+    in the queued task instead would let an incompatible request cost a full GPU dispatch.
+    Passthrough keys are forwarded unjudged (no spelling check): see
+    :mod:`twinkle.server.validation.backend_compat`.
 
     A plain helper, not a signature-rewriting decorator: each handler keeps its natural
     FastAPI signature so the app stays shallow enough for Ray Serve to cloudpickle (a
@@ -117,9 +161,15 @@ async def run_submit(
     and returns the JSON-safe task result. ``metrics(self, body)`` supplies scheduling
     kwargs; omit it for control-plane ops. ``assert_resource`` guards on the adapter
     existing before the work runs; set it False for endpoints that create/drop it.
+    ``capability`` names the backend capability the endpoint needs, when the endpoint is
+    not implemented by every backend.
     """
     token = await self._on_request_start(request)
     adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
+
+    # ---- Preflight: decidable from the body plus this deployment's backend, so it
+    # runs before any state write and before the enqueue. ----
+    assert_request_supported(self, body, capability=capability)
 
     schedule_kwargs = metrics(self, body) if metrics is not None else {}
 

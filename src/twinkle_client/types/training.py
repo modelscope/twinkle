@@ -9,6 +9,8 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
+from .base import ResponseModel
+
 
 class Cursor(BaseModel):
     limit: int
@@ -49,12 +51,12 @@ class TrainingRun(BaseModel):
     user_metadata: Optional[Dict[str, Any]] = None
 
 
-class TrainingRunsResponse(BaseModel):
+class TrainingRunsResponse(ResponseModel):
     training_runs: List[TrainingRun]
     cursor: Cursor
 
 
-class CheckpointsListResponse(BaseModel):
+class CheckpointsListResponse(ResponseModel):
     checkpoints: List[Checkpoint]
     cursor: Optional[Cursor] = None
 
@@ -68,7 +70,7 @@ class ParsedCheckpointTwinklePath(BaseModel):
     checkpoint_id: str
 
 
-class WeightsInfoResponse(BaseModel):
+class WeightsInfoResponse(ResponseModel):
     """Twinkle weights info response."""
     training_run_id: str
     base_model: str

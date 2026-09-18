@@ -10,12 +10,27 @@ Two axes, kept deliberately distinct:
   :class:`TaskWaitTimeoutError`, :class:`TaskRecordLostError`) do NOT inherit
   ``requests.HTTPError``: a task that reaches a ``failed`` terminal state is
   delivered over HTTP 200, so it is not an HTTP-level error.
+- Request-construction failures (:class:`TwinkleClientValidationError`) happen before
+  any HTTP call is made.
 """
 from __future__ import annotations
 
 from typing import Any, Optional
 
 import requests
+
+
+class TwinkleClientValidationError(ValueError):
+    """A caller argument could not be placed in the request model, in-process.
+
+    Distinct from ``pydantic.ValidationError``, which reports a *field* that failed
+    validation. This one is raised **before** the model is constructed, when an
+    argument has no field to go into at all -- so it cannot be expressed as a field
+    error. Either way no HTTP request is sent.
+
+    A ``ValueError`` subclass so callers already catching ``ValueError`` around request
+    construction keep working.
+    """
 
 
 class TwinkleHTTPError(requests.HTTPError):

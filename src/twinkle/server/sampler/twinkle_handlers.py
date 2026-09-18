@@ -21,9 +21,10 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle_client.types as types
+from twinkle_client.types import sampler as sampler_types
 from twinkle.data_format import SamplingParams
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name, to_backend_inputs
+from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.weights import resolve_sampler_weights
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
@@ -214,10 +215,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    @app.post('/twinkle/create', response_model=types.CreateResponse)
-    async def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> types.CreateResponse:
+    @app.post('/twinkle/create', response_model=sampler_types.SamplerCreateResponse)
+    async def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
         """Health check / session creation endpoint."""
-        return types.CreateResponse()
+        return sampler_types.SamplerCreateResponse()
 
     @app.post('/twinkle/sample', response_model=types.TaskEnvelope)
     async def sample(request: Request, body: types.SampleRequest,
@@ -260,9 +261,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             )
             return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
 
-        # Calculate metrics for queue scheduling
-        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
-        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        # Calculate metrics for queue scheduling. The body is wire-validated, so the
+        # entries are models and ``input_ids`` is absent or a list of ints.
+        input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
         return await self.submit_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
@@ -340,24 +341,23 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             await self.call_backend(unload, resolved_paths)
         return {'status': 'ok'}
 
-    @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
+    @app.post('/twinkle/set_template', response_model=sampler_types.SamplerSetTemplateResponse)
     async def set_template(
             request: Request,
-            body: types.SetTemplateRequest,
+            body: sampler_types.SamplerSetTemplateRequest,
             self: SamplerManagement = Depends(self_fn),
-    ) -> types.SetTemplateResponse:
+    ) -> sampler_types.SamplerSetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
-        extra_kwargs = body.model_extra or {}
         with traced_operation('sampler.set_template'):
-            await self.call_backend(self.sampler.set_template, body.template_cls, **extra_kwargs)
-        return types.SetTemplateResponse()
+            await self.call_backend(self.sampler.set_template, body.template_cls, **backend_kwargs(body))
+        return sampler_types.SamplerSetTemplateResponse()
 
-    @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
+    @app.post('/twinkle/add_adapter_to_sampler', response_model=sampler_types.SamplerAddAdapterResponse)
     async def add_adapter_to_sampler(
             request: Request,
-            body: types.AddAdapterRequest,
+            body: sampler_types.SamplerAddAdapterRequest,
             self: SamplerManagement = Depends(self_fn),
-    ) -> types.AddAdapterResponse:
+    ) -> sampler_types.SamplerAddAdapterResponse:
         """Add a LoRA adapter to the sampler."""
         # Raised, not asserted: decidable from the request body alone, so it owes the caller
         # a real 400 rather than an AssertionError surfacing as a 500 -- and a bare assert
@@ -372,7 +372,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
             await self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config)
 
-        return types.AddAdapterResponse(adapter_name=full_adapter_name)
+        return sampler_types.SamplerAddAdapterResponse(adapter_name=full_adapter_name)
 
     @app.post('/twinkle/apply_patch')
     async def apply_patch(
@@ -381,10 +381,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             self: SamplerManagement = Depends(self_fn),
     ) -> None:
         from twinkle_client.common.serialize import deserialize_object
-        extra_kwargs = body.model_extra or {}
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
-            await self.call_backend(self.sampler.apply_patch, patch_cls, **extra_kwargs)
+            await self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body))
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(

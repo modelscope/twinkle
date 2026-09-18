@@ -39,6 +39,7 @@ from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.validation.errors import register_validation_error_handler
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
@@ -94,17 +95,20 @@ def build_deployment_app(
        shutdown → ``on_shutdown(get_servable())`` (best-effort) then
        ``flush_telemetry_safely()`` so buffered OTLP batches flush on graceful
        replica termination;
-    2. [if ``attach_cleanup_middleware``] the gateway-only lazy-cleanup
+    2. the ``TwinkleServerError`` and ``RequestValidationError`` handlers, so a
+       rejected request body carries the same ``ErrorPayload`` shape as any other
+       failure;
+    3. [if ``attach_cleanup_middleware``] the gateway-only lazy-cleanup
        middleware (registered first ⇒ innermost), since the Gateway has no
        per-handler hook;
-    3. ``catch_unhandled_exceptions`` middleware, inside auth/tracing/metrics
+    4. ``catch_unhandled_exceptions`` middleware, inside auth/tracing/metrics
        and outside cleanup/routes;
-    4. ``verify_token`` middleware;
-    5. ``create_tracing_middleware(component)``;
-    6. ``create_metrics_middleware(component)``;
-    7. [if ``attach_replica_id_header``] replica-id response header middleware
+    5. ``verify_token`` middleware;
+    6. ``create_tracing_middleware(component)``;
+    7. ``create_metrics_middleware(component)``;
+    8. [if ``attach_replica_id_header``] replica-id response header middleware
        (registered last ⇒ outermost);
-    8. ``register_routes(app, get_servable)``.
+    9. ``register_routes(app, get_servable)``.
 
     Args:
         component: ``'Gateway' | 'Model' | 'Sampler' | 'Processor'`` — used as
@@ -144,6 +148,10 @@ def build_deployment_app(
     app = FastAPI(lifespan=lifespan, **(fastapi_kwargs or {}))
 
     app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
+    # Request-body validation failures answer with the same ``ErrorPayload`` shape as
+    # every other error, registered here so all deployments behave identically rather
+    # than each app keeping (or forgetting) its own copy.
+    register_validation_error_handler(app)
 
     # Registration order matters: FastAPI runs middleware LIFO, so the LAST
     # registered wraps the outermost layer. Register cleanup (if any) first so

@@ -169,6 +169,25 @@ def http_post(
     return _handle_response(response)
 
 
+def http_post_model(
+    url: str,
+    body: Any,
+    additional_headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = _HTTP_TIMEOUT,
+) -> requests.Response:
+    """POST a request model as its own JSON serialization.
+
+    One pydantic-core pass produces the bytes, instead of ``model_dump`` followed by
+    ``_serialize_params``' Python-level walk and then ``json.dumps`` -- three traversals
+    of a body whose ``inputs`` can hold millions of elements. The model has already
+    validated everything, so nothing here needs to inspect the payload again.
+    """
+    from twinkle_client._request_builder import request_json
+    headers = _build_headers({'content-type': 'application/json', **(additional_headers or {})})
+    response = requests.post(url, headers=headers, data=request_json(body), timeout=timeout)
+    return _handle_response(response)
+
+
 def http_delete(
     url: Optional[str] = None,
     params: Optional[Dict[str, Any]] = {},
