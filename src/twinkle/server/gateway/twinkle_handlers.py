@@ -19,7 +19,7 @@ import twinkle_client.types as types
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager, validate_user_path
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
-from twinkle.server.utils.validation import get_token_from_request
+from twinkle.server.utils.auth import get_token_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.lifecycle import TERMINAL_STATUSES
 

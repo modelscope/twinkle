@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
+from twinkle.server.utils.auth import get_token_from_request
 from twinkle.server.utils.task_errors import error_payload_from_stored
-from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

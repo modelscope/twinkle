@@ -41,6 +41,7 @@ def _running():
 
 def test_terminal_submit_issues_no_retrieve(monkeypatch):
     """R8#1: a task terminal in the submit envelope makes zero retrieve calls."""
+
     def _boom(_request_id):
         raise AssertionError('retrieve must not be called for a terminal submit')
 
@@ -58,7 +59,7 @@ def test_terminal_submit_failure_raises_taskfailed_with_payload(monkeypatch):
     assert exc.value.category == 'server'
     assert exc.value.request_id == 'r'
     assert exc.value.error_code == 500
-    assert not isinstance(exc.value, requests.HTTPError)   # R3#10
+    assert not isinstance(exc.value, requests.HTTPError)  # R3#10
 
 
 def test_model_cls_none_returns_none_result(monkeypatch):
@@ -76,6 +77,7 @@ def test_non_terminal_submit_polls_until_terminal(monkeypatch):
 
 
 def test_404_is_bounded_then_raises_record_lost(monkeypatch):
+
     def _always_404(_request_id):
         e = requests.HTTPError('404')
         e.status_code = 404
@@ -87,7 +89,7 @@ def test_404_is_bounded_then_raises_record_lost(monkeypatch):
 
 
 def test_transport_5xx_is_bounded_then_reraises(monkeypatch):
-    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)   # no real backoff sleeps
+    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)  # no real backoff sleeps
 
     def _always_503(_request_id):
         e = requests.HTTPError('503')
@@ -100,6 +102,7 @@ def test_transport_5xx_is_bounded_then_reraises(monkeypatch):
 
 
 def test_non_retryable_4xx_reraises_immediately(monkeypatch):
+
     def _400(_request_id):
         e = requests.HTTPError('400')
         e.status_code = 400
@@ -124,12 +127,12 @@ def test_success_resets_both_retry_counters(monkeypatch):
     def _mixed(_request_id):
         seq.append(1)
         n = len(seq)
-        if n in (1, 2, 4, 5):          # 404s interleaved with a success at n==3
+        if n in (1, 2, 4, 5):  # 404s interleaved with a success at n==3
             e = requests.HTTPError('404')
             e.status_code = 404
             raise e
         if n == 3:
-            return _running()          # success resets not_found_count
+            return _running()  # success resets not_found_count
         return _completed({'done': True})
 
     monkeypatch.setattr(_future, '_post_retrieve', _mixed)

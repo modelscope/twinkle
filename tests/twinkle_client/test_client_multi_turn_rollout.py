@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import copy
 import json
+import pytest
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
-
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from typing import Any, Dict, List, Optional
 
 from twinkle.data_format.sampling import SamplingParams
 from twinkle_agentic.tools.base import Tool
@@ -114,8 +113,7 @@ class FakeTemplate:
 
     def encode(self, trajectory: Dict[str, Any], add_generation_prompt: bool = False) -> Dict[str, Any]:
         messages = trajectory.get('messages', [])
-        s = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+        s = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
         input_ids = self.tokenizer.encode(s, add_special_tokens=False)
         pif: Dict[str, Any] = dict(trajectory)  # preserve top-level fields (incl. _tid)
         pif['input_ids'] = input_ids
@@ -416,8 +414,7 @@ def test_logprobs_align_with_trainable_labels(scripts_spec, max_turns):
         logprobs = out.get('logprobs')
         if logprobs:
             trainable = _count_trainable(out.get('labels') or [])
-            assert len(logprobs) == trainable, (
-                f'logprobs({len(logprobs)}) != trainable labels({trainable})')
+            assert len(logprobs) == trainable, (f'logprobs({len(logprobs)}) != trainable labels({trainable})')
 
 
 # =============================================================================
@@ -450,8 +447,7 @@ def test_max_turns_one_forces_truncation(logprobs_flags):
     # Every trajectory emits a tool_call on its first (and only allowed) turn.
     scripts_spec = [{'num_tools': 3, 'terminal': 'stop', 'logprobs': lp} for lp in logprobs_flags]
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=1)
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=1)
 
     outs = rollout(copy.deepcopy(trajectories))
 
@@ -475,8 +471,7 @@ def test_length_stop_marks_truncated(logprobs_flags):
     # very first generation is the one that gets cut.
     scripts_spec = [{'num_tools': 0, 'terminal': 'length', 'logprobs': lp} for lp in logprobs_flags]
     trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=4)
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=4)
 
     outs = rollout(copy.deepcopy(trajectories))
 
@@ -546,11 +541,13 @@ class _NetworkFailingSampler:
 
 def test_missing_new_input_feature_raises_indexed_runtime_error():
     """new_input_feature=None -> RuntimeError naming batch AND trajectory index."""
-    trajectories, _script_sampler, template = _build_from_scripts(
-        [{'num_tools': 0, 'terminal': 'stop', 'logprobs': False}])
+    trajectories, _script_sampler, template = _build_from_scripts([{
+        'num_tools': 0,
+        'terminal': 'stop',
+        'logprobs': False
+    }])
     sampler = _NullFeatureSampler(template)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
 
     with pytest.raises(RuntimeError) as excinfo:
         rollout(copy.deepcopy(trajectories))
@@ -567,10 +564,8 @@ def test_tool_calls_without_tool_manager_raises_value_error():
     """tool_calls produced but tool_manager missing -> ValueError."""
     # One tool-call turn then a terminal turn; max_turns=2 so the tool-dispatch
     # site (not the max_turns truncation edge) is what fails.
-    trajectories, sampler, template = _build_from_scripts(
-        [{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=None, max_turns=2)
+    trajectories, sampler, template = _build_from_scripts([{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=None, max_turns=2)
 
     with pytest.raises(ValueError) as excinfo:
         rollout(copy.deepcopy(trajectories))
@@ -582,11 +577,9 @@ def test_tool_calls_without_tool_manager_raises_value_error():
 
 def test_tool_calls_without_tool_manager_via_per_call_kwarg_raises_value_error():
     """Passing tool_manager=None as a per-call kwarg also raises at dispatch."""
-    trajectories, sampler, template = _build_from_scripts(
-        [{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
+    trajectories, sampler, template = _build_from_scripts([{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
     # Constructed WITH a manager, but the per-call override nulls it out.
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=2)
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=2)
 
     with pytest.raises(ValueError):
         rollout(copy.deepcopy(trajectories), tool_manager=None)
@@ -594,12 +587,14 @@ def test_tool_calls_without_tool_manager_via_per_call_kwarg_raises_value_error()
 
 def test_sampler_network_error_propagates_unchanged():
     """vLLMSampler.sample() network error propagates unchanged (not swallowed/wrapped)."""
-    trajectories, _script_sampler, template = _build_from_scripts(
-        [{'num_tools': 0, 'terminal': 'stop', 'logprobs': False}])
+    trajectories, _script_sampler, template = _build_from_scripts([{
+        'num_tools': 0,
+        'terminal': 'stop',
+        'logprobs': False
+    }])
     sentinel = NetworkError('simulated connection reset by peer')
     sampler = _NetworkFailingSampler(template, sentinel)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
+    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
 
     with pytest.raises(NetworkError) as excinfo:
         rollout(copy.deepcopy(trajectories))

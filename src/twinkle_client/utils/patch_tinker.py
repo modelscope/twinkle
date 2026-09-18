@@ -12,8 +12,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
 
+from twinkle_client.http.context import get_api_key, get_request_id
 from twinkle_client.http.headers import build_routing_headers
-from twinkle_client.http.utils import get_api_key, get_request_id
 
 _patched = False
 _loss_fn_config_patched = False
@@ -57,8 +57,8 @@ def _patched_async_tinker_init(
     if api_key is None:
         api_key = os.environ.get('TWINKLE_SERVER_TOKEN')
     if api_key is None:
-        raise TinkerError('The api_key client option must be set either by passing api_key to the client or by '
-                          'setting the TWINKLE_SERVER_TOKEN environment variable')
+        raise TinkerError('The api_key client option must be set either by passing api_key to the client '
+                          'or by setting the TWINKLE_SERVER_TOKEN environment variable')
     # REMOVED: api_key 'tml-' prefix validation
     # Original code:
     # if not api_key.startswith("tml-"):

@@ -25,9 +25,9 @@ from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoi
 from twinkle.server.exceptions import RequestRejectedError, TrainModeMismatchError
 from twinkle.server.lifecycle.submit import (backend_kwargs, input_metrics, resolve_twinkle_adapter_name, run_submit,
                                              to_backend_inputs)
-from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_kwargs, resolve_data_plane_model_inputs,
-                                        select_output_rows)
-from twinkle.server.utils.validation import get_session_id_from_request
+from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
+                                                    resolve_data_plane_model_inputs, select_output_rows)
+from twinkle.server.utils.auth import get_session_id_from_request
 from twinkle.server.validation import BackendCapability
 from twinkle.utils.logger import get_logger
 

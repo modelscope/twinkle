@@ -2,8 +2,8 @@ import requests
 from typing import Any, Dict, Optional
 
 from twinkle_client.exceptions import TwinkleHTTPError
+from .context import get_api_key, get_base_url, get_request_id, get_session_id
 from .headers import build_routing_headers
-from .utils import get_api_key, get_base_url, get_request_id, get_session_id
 
 # Single shared HTTP timeout for every client request (was three separate 600s).
 # Must be <= 120 and strictly greater than the server Long_Poll_Window (default 30),

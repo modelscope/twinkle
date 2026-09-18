@@ -13,7 +13,7 @@ from fastapi import Request
 from typing import Any
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
-from twinkle.server.utils.validation import get_session_id_from_request
+from twinkle.server.utils.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
 from twinkle_client.types.base import FieldRole, fields_with_role
 from twinkle_client.types.data import export_batch

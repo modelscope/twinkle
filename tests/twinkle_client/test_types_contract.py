@@ -44,8 +44,7 @@ _LEGACY_PUBLIC_NAME_OVERLAP = frozenset({
 def test_queue_state_literal_matches_server_enum():
     literal_values = set(typing.get_args(QueueStateLiteral))
     enum_values = {state.value for state in QueueState}
-    assert literal_values == enum_values, (
-        f'QueueStateLiteral {literal_values} != QueueState {enum_values}')
+    assert literal_values == enum_values, (f'QueueStateLiteral {literal_values} != QueueState {enum_values}')
 
 
 def _origin(module: str | None) -> str | None:
@@ -83,13 +82,10 @@ def _binding_collisions(tree: ast.AST) -> set[str]:
 
 def test_public_name_overlap_does_not_grow():
     import tinker.types
+
     import twinkle_client.types
 
-    overlap = {
-        name
-        for name in set(dir(tinker.types)) & set(dir(twinkle_client.types))
-        if not name.startswith('_')
-    }
+    overlap = {name for name in set(dir(tinker.types)) & set(dir(twinkle_client.types)) if not name.startswith('_')}
     assert overlap == _LEGACY_PUBLIC_NAME_OVERLAP
 
 
@@ -100,6 +96,5 @@ def test_no_tinker_twinkle_same_name_binding():
         collisions = _binding_collisions(tree)
         if collisions:
             offenders[str(path.relative_to(_TWINKLE_SRC))] = collisions
-    assert not offenders, (
-        'tinker and twinkle_client types bound to the same local name (alias tinker '
-        f'to disambiguate): {offenders}')
+    assert not offenders, ('tinker and twinkle_client types bound to the same local name (alias tinker '
+                           f'to disambiguate): {offenders}')

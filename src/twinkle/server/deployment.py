@@ -38,7 +38,7 @@ from typing import Any
 from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.auth import verify_request_token
 from twinkle.server.validation.errors import register_validation_error_handler
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload

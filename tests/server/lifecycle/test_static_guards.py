@@ -13,9 +13,8 @@ the two sets are equal", which was written in a docstring while no such test exi
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC = _REPO_ROOT / 'src' / 'twinkle'
@@ -43,7 +42,7 @@ def test_deleted_symbol_has_zero_occurrences(symbol):
 
 def test_client_http_timeout_bounds():
     from twinkle.server.lifecycle.poll_config import long_poll_window
-    from twinkle_client.http.http_utils import _HTTP_TIMEOUT
+    from twinkle_client.http.client import _HTTP_TIMEOUT
 
     assert _HTTP_TIMEOUT <= 120
     assert _HTTP_TIMEOUT > long_poll_window()
@@ -68,7 +67,7 @@ def test_task_envelope_has_exactly_one_construction_site():
 
     offenders = [site for site in sites if 'server/lifecycle/envelope.py' not in site]
     assert offenders == [], ('TaskEnvelope must only be constructed in lifecycle/envelope.py '
-                            f'(via envelope_from_record); found: {offenders}')
+                             f'(via envelope_from_record); found: {offenders}')
     assert sites, 'expected to find the construction sites inside envelope.py'
 
 
@@ -86,12 +85,13 @@ def test_server_task_status_enum_matches_client_literal():
     from typing import get_args
 
     from twinkle.server.utils.task_queue.types import TaskStatus as ServerTaskStatus
-    from twinkle_client.types.lifecycle import TaskStatus as WireTaskStatus, TERMINAL_STATUSES
+    from twinkle_client.types.lifecycle import TERMINAL_STATUSES
+    from twinkle_client.types.lifecycle import TaskStatus as WireTaskStatus
 
     server_values = {member.value for member in ServerTaskStatus}
     wire_values = set(get_args(WireTaskStatus))
     assert server_values == wire_values, (f'task status sets drifted: server-only={server_values - wire_values}, '
-                                         f'wire-only={wire_values - server_values}')
+                                          f'wire-only={wire_values - server_values}')
     assert TERMINAL_STATUSES <= wire_values, 'TERMINAL_STATUSES must be a subset of the declared statuses'
 
 

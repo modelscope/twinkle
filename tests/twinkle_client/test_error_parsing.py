@@ -6,7 +6,7 @@ import pytest
 import requests
 
 from twinkle_client.exceptions import TwinkleHTTPError
-from twinkle_client.http.http_utils import _handle_response
+from twinkle_client.http.client import _handle_response
 
 
 class _Resp:
@@ -30,7 +30,7 @@ def test_structured_error_reads_top_level_fields():
     resp = _Resp(422, body={'error': 'bad input', 'category': 'user', 'error_code': 422, 'request_id': 'req-7'})
     with pytest.raises(TwinkleHTTPError) as exc:
         _handle_response(resp)
-    assert isinstance(exc.value, requests.HTTPError)   # R3#8: existing except clauses keep working
+    assert isinstance(exc.value, requests.HTTPError)  # R3#8: existing except clauses keep working
     assert exc.value.status_code == 422
     assert exc.value.error_code == 422
     assert exc.value.category == 'user'

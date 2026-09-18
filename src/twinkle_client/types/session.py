@@ -7,7 +7,7 @@ from .base import ResponseModel, StrictRequest
 
 class CreateSessionRequest(StrictRequest):
     """Request body for POST /twinkle/create_session."""
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: dict[str, Any] | None = None
 
 
 class CreateSessionResponse(ResponseModel):

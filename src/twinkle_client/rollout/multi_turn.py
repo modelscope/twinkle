@@ -28,6 +28,16 @@ from twinkle_agentic.utils.token_utils import extend_with_bridge
 from twinkle_client.sampler import vLLMSampler
 
 
+@dataclasses.dataclass
+class _RolloutState:
+    pifs: list[dict[str, Any]]
+    all_logprobs: list[list[Any]]
+    stop_reasons: list[str | None]
+    turns: list[int]
+    truncated: list[bool]
+    done: list[bool]
+
+
 class ClientMultiTurnRollout:
     """Agentic multi-turn rollout with tool use, driven over HTTP.
 
@@ -107,159 +117,147 @@ class ClientMultiTurnRollout:
         sampling_params = self._as_sampling_params_dict(kwargs.get('sampling_params', self.sampling_params))
         tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
 
-        # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
-        #    state for trajectory ``i``. ``vLLMSampler.sample`` is responsible for
-        #    JSON-serialising the feature (ndarray / tensor -> list) before the
-        #    HTTP POST, so no conversion is needed here.
-        pifs: List[Dict[str, Any]] = []
-        for traj in trajectories:
-            pif = self.template.encode(traj, add_generation_prompt=True)
-            pif.setdefault('messages', list(traj.get('messages', [])))
-            pifs.append(pif)
-
-        all_logprobs: List[List[Any]] = [[] for _ in range(n)]
-        stop_reasons: List[Optional[str]] = [None] * n
-        turns: List[int] = [0] * n
-        truncated: List[bool] = [False] * n
-        done: List[bool] = [False] * n
-
+        state = self._initialize_state(trajectories)
         for _ in range(self.max_turns):
-            active = [i for i in range(n) if not done[i]]
+            active = [index for index in range(n) if not state.done[index]]
             if not active:
                 break
 
-            # 2. One batched HTTP sample call for all currently-live
-            #    trajectories. No device_mesh / min_batch_size padding: an HTTP
-            #    client has no Ray DP ranks to align against.
-            #
-            #    Passthrough contract: ``vLLMSampler.sample()`` may raise
-            #    network / timeout / HTTP errors (e.g. requests exceptions). We
-            #    deliberately do NOT wrap this call in try/except -- such errors
-            #    propagate unchanged to the caller so ret/backoff policy stays an
-            #    upstream concern (retry/backoff) and failures are never
-            #    silently swallowed.
-            batch_pifs = [pifs[i] for i in active]
-            resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
+            # One batched HTTP call for all live trajectories. Network and timeout
+            # errors intentionally propagate unchanged so retry policy stays upstream.
+            responses = self.sampler.sample(
+                [state.pifs[index] for index in active],
+                sampling_params=sampling_params,
+            )
+            pending_bridges = self._process_responses(active, responses, state, tool_managers)
+            self._apply_bridges(state, pending_bridges)
 
-            pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
-            for local_idx, global_idx in enumerate(active):
-                turns[global_idx] += 1
-                seq = resps[local_idx].sequences[0]
+        self._validate_logprob_alignment(state.pifs, state.all_logprobs)
+        return self._build_outputs(
+            trajectories,
+            state.pifs,
+            state.all_logprobs,
+            state.turns,
+            state.stop_reasons,
+            state.truncated,
+        )
 
-                # ``new_input_feature`` is the running pif for the next round;
-                # the /twinkle/sample response contract guarantees it is set and
-                # carries ``input_ids``. A missing feature makes the next round
-                # impossible, so raise a batch/trajectory-indexed RuntimeError.
-                if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
-                    raise RuntimeError(f'Sampler returned a sequence without new_input_feature.input_ids at '
-                                       f'batch index {local_idx} (trajectory {global_idx}); '
-                                       f'cannot continue multi-turn.')
+    # ------------------------------------------------------------------ private
 
-                pifs[global_idx] = dict(seq.new_input_feature)
-                # Per-round logprobs/token alignment guard: each sampled token
-                # must carry exactly one logprob entry. Mirrors the core-lib
-                # ``len(seq.logprobs) != len(seq.tokens)`` semantic so client and
-                # Ray paths cannot drift on this invariant.
-                if seq.logprobs is not None:
-                    if len(seq.logprobs) != len(seq.tokens):
-                        raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match sampled '
-                                           f'token count ({len(seq.tokens)}) at turn {turns[global_idx]} '
-                                           f'(trajectory {global_idx})')
-                    all_logprobs[global_idx].extend(seq.logprobs)
-                stop_reasons[global_idx] = seq.stop_reason
+    def _initialize_state(self, trajectories: List[Trajectory]) -> _RolloutState:
+        pifs: list[dict[str, Any]] = []
+        for trajectory in trajectories:
+            pif = self.template.encode(trajectory, add_generation_prompt=True)
+            pif.setdefault('messages', list(trajectory.get('messages', [])))
+            pifs.append(pif)
+        size = len(trajectories)
+        return _RolloutState(
+            pifs=pifs,
+            all_logprobs=[[] for _ in range(size)],
+            stop_reasons=[None] * size,
+            turns=[0] * size,
+            truncated=[False] * size,
+            done=[False] * size,
+        )
 
-                # 3. Termination conditions.
-                # Cut off at ``max_tokens``: truncated, same as the max_turns and
-                # length-cap cases below, and same as ``MultiTurnRollout`` and
-                # ``ApiMultiTurnRollout``. Tool calls in the cut reply are still
-                # not dispatched.
-                if seq.stop_reason == 'length':
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                    continue
+    def _process_responses(self, active, responses, state: _RolloutState,
+                           tool_managers) -> list[tuple[int, list[dict]]]:
+        pending_bridges = []
+        for local_index, global_index in enumerate(active):
+            sequence = responses[local_index].sequences[0]
+            tool_messages = self._process_sequence(local_index, global_index, sequence, state,
+                                                   tool_managers[global_index])
+            if tool_messages is not None:
+                pending_bridges.append((global_index, tool_messages))
+        return pending_bridges
 
-                # 3a. Sequence-length cap.
-                if (self.max_trajectory_tokens is not None
-                        and len(pifs[global_idx].get('input_ids') or []) >= self.max_trajectory_tokens):
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                    continue
+    def _process_sequence(self, local_index, global_index, sequence, state: _RolloutState,
+                          tool_manager: ToolManager | None) -> list[dict] | None:
+        state.turns[global_index] += 1
+        if sequence.new_input_feature is None or 'input_ids' not in sequence.new_input_feature:
+            raise RuntimeError(f'Sampler returned a sequence without new_input_feature.input_ids at '
+                               f'batch index {local_index} (trajectory {global_index}); '
+                               f'cannot continue multi-turn.')
 
-                # 3b. Parse tool calls from the freshly sampled assistant turn.
-                _msgs = pifs[global_idx].get('messages') or []
-                _last_msg = _msgs[-1] if _msgs else None
-                tool_calls = (_last_msg.get('tool_calls') if isinstance(_last_msg, dict) else None)
-                if not tool_calls:
-                    tool_calls = self.template.parse_tool_call(seq.decoded or '')
-                if not tool_calls:
-                    done[global_idx] = True
-                    continue
+        state.pifs[global_index] = dict(sequence.new_input_feature)
+        if sequence.logprobs is not None:
+            if len(sequence.logprobs) != len(sequence.tokens):
+                raise RuntimeError(f'logprobs length ({len(sequence.logprobs)}) does not match sampled '
+                                   f'token count ({len(sequence.tokens)}) at turn {state.turns[global_index]} '
+                                   f'(trajectory {global_index})')
+            state.all_logprobs[global_index].extend(sequence.logprobs)
+        state.stop_reasons[global_index] = sequence.stop_reason
 
-                # 3c. Hit the turn cap while still wanting to call a tool: force
-                #     truncation. Also covers the ``max_turns == 1`` edge, where
-                #     the very first sampled turn trips this branch.
-                if turns[global_idx] >= self.max_turns:
-                    truncated[global_idx] = True
-                    stop_reasons[global_idx] = 'max_turns'
-                    done[global_idx] = True
-                    continue
+        if sequence.stop_reason == 'length' or self._at_token_limit(state.pifs[global_index]):
+            state.truncated[global_index] = True
+            state.done[global_index] = True
+            return None
 
-                # 4. Dispatch tools for this trajectory via its ToolManager.
-                tool_manager = tool_managers[global_idx]
-                if tool_manager is None:
-                    raise ValueError(f'trajectory {global_idx} produced tool_calls but no tool_manager '
-                                     f'was provided (at construction time or as a per-call kwarg).')
-                tool_messages = [{
-                    'role': 'tool',
-                    'content': tool_manager(tc),
-                } for tc in tool_calls]
-                pending_bridges.append((global_idx, tool_messages))
+        messages = state.pifs[global_index].get('messages') or []
+        last_message = messages[-1] if messages else None
+        tool_calls = last_message.get('tool_calls') if isinstance(last_message, dict) else None
+        tool_calls = tool_calls or self.template.parse_tool_call(sequence.decoded or '')
+        if not tool_calls:
+            state.done[global_index] = True
+            return None
+        if state.turns[global_index] >= self.max_turns:
+            state.truncated[global_index] = True
+            state.stop_reasons[global_index] = 'max_turns'
+            state.done[global_index] = True
+            return None
+        if tool_manager is None:
+            raise ValueError(f'trajectory {global_index} produced tool_calls but no tool_manager '
+                             f'was provided (at construction time or as a per-call kwarg).')
+        return [{'role': 'tool', 'content': tool_manager(tool_call)} for tool_call in tool_calls]
 
-            # Stitch bridge tokens (tool turns + next generation prompt) for
-            # every trajectory with outstanding tool turns. Reuses the shared
-            # pure function so client and core-lib paths cannot drift.
-            for global_idx, tool_messages in pending_bridges:
-                extended = extend_with_bridge(pifs[global_idx], tool_messages, self.template)
-                if extended is None:
-                    # Trajectory exceeded max_length (truncation strategy 'delete').
-                    truncated[global_idx] = True
-                    done[global_idx] = True
-                else:
-                    pifs[global_idx] = extended
+    def _at_token_limit(self, pif: dict[str, Any]) -> bool:
+        return self.max_trajectory_tokens is not None and len(pif.get('input_ids') or []) >= self.max_trajectory_tokens
 
-        # 4b. Final logprobs/labels alignment guard. For every trajectory that
-        #     collected logprobs, the total logprob count must equal the number
-        #     of trainable positions (labels != -100) in the final pif. This is
-        #     the same invariant grpo._pad_and_align_to_batch relies on; a
-        #     mismatch would silently corrupt GRPO old_logps alignment, so we
-        #     fail loudly with the specific numbers.
-        for i in range(n):
-            if not all_logprobs[i]:
+    def _apply_bridges(self, state: _RolloutState, pending_bridges: list[tuple[int, list[dict]]]) -> None:
+        for global_index, tool_messages in pending_bridges:
+            extended = extend_with_bridge(state.pifs[global_index], tool_messages, self.template)
+            if extended is None:
+                state.truncated[global_index] = True
+                state.done[global_index] = True
+            else:
+                state.pifs[global_index] = extended
+
+    @staticmethod
+    def _validate_logprob_alignment(pifs: List[Dict[str, Any]], all_logprobs: List[List[Any]]) -> None:
+        """Reject output that would corrupt downstream GRPO old-logprob alignment."""
+        for index, logprobs in enumerate(all_logprobs):
+            if not logprobs:
                 continue
-            labels_i = pifs[i].get('labels') or []
-            trainable_i = sum(1 for label in labels_i if label != -100)
-            if len(all_logprobs[i]) != trainable_i:
-                raise RuntimeError(f'logprobs/labels misaligned for trajectory {i}: '
-                                   f'{len(all_logprobs[i])} logprobs vs {trainable_i} '
+            labels = pifs[index].get('labels') or []
+            trainable = sum(1 for label in labels if label != -100)
+            if len(logprobs) != trainable:
+                raise RuntimeError(f'logprobs/labels misaligned for trajectory {index}: '
+                                   f'{len(logprobs)} logprobs vs {trainable} '
                                    f'trainable labels (labels != -100). This invariant is '
                                    f'required by grpo._pad_and_align_to_batch; a mismatch '
                                    f'would silently corrupt GRPO old_logps alignment.')
 
-        # 5. Merge pif fields into each trajectory dict at TOP LEVEL, preserving
-        #    input length and order.
-        outs: List[Trajectory] = []
-        for i, traj in enumerate(trajectories):
-            out = dict(traj)
-            out.update(pifs[i])
-            out['messages'] = list(pifs[i].get('messages') or out.get('messages', []))
-            out['logprobs'] = all_logprobs[i] if all_logprobs[i] else None
-            out['turns'] = turns[i]
-            out['stop_reason'] = stop_reasons[i]
-            out['truncated'] = truncated[i]
-            outs.append(out)
-        return outs
-
-    # ------------------------------------------------------------------ private
+    @staticmethod
+    def _build_outputs(
+        trajectories: List[Trajectory],
+        pifs: List[Dict[str, Any]],
+        all_logprobs: List[List[Any]],
+        turns: List[int],
+        stop_reasons: List[Optional[str]],
+        truncated: List[bool],
+    ) -> List[Trajectory]:
+        """Merge final per-trajectory state while preserving input order."""
+        outputs: List[Trajectory] = []
+        for index, trajectory in enumerate(trajectories):
+            output = dict(trajectory)
+            output.update(pifs[index])
+            output['messages'] = list(pifs[index].get('messages') or output.get('messages', []))
+            output['logprobs'] = all_logprobs[index] or None
+            output['turns'] = turns[index]
+            output['stop_reason'] = stop_reasons[index]
+            output['truncated'] = truncated[index]
+            outputs.append(output)
+        return outputs
 
     @staticmethod
     def _as_sampling_params_dict(sampling_params) -> Optional[Dict[str, Any]]:

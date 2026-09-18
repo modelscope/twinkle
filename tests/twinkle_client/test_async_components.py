@@ -47,20 +47,22 @@ def _recorder(calls, result_factory):
 
 
 def _patch_transport(monkeypatch, calls, result_factory):
-    import twinkle_client.http.http_utils as http_utils
     import twinkle_client.http as http_module
+    import twinkle_client.http.client as http_client
     monkeypatch.setattr(http_module, 'get_base_url', lambda: 'http://server/api/v1')
-    monkeypatch.setattr(http_utils, 'get_base_url', lambda: 'http://server/api/v1')
-    monkeypatch.setattr(http_utils, 'get_api_key', lambda: 'test-key')
-    monkeypatch.setattr(http_utils.requests, 'post', _recorder(calls, result_factory))
+    monkeypatch.setattr(http_client, 'get_base_url', lambda: 'http://server/api/v1')
+    monkeypatch.setattr(http_client, 'get_api_key', lambda: 'test-key')
+    monkeypatch.setattr(http_client.requests, 'post', _recorder(calls, result_factory))
 
 
 def test_model_forward_backward_sends_multiple_data_refs(monkeypatch) -> None:
     from twinkle_client.model import multi_lora_transformers as module
 
     calls: list = []
-    _patch_transport(monkeypatch, calls,
-                     lambda url: {} if url.endswith('/create') else _completed({'result': {'loss': 1.0}}))
+    _patch_transport(monkeypatch, calls, lambda url: {}
+                     if url.endswith('/create') else _completed({'result': {
+                         'loss': 1.0
+                     }}))
 
     model = module.MultiLoraTransformersModel('ms://base')
     model.adapter_name = 'adapter'
@@ -132,8 +134,10 @@ def test_model_data_plane_forward_uses_a_separate_api(monkeypatch) -> None:
     from twinkle_client.model import multi_lora_transformers as module
 
     calls: list = []
-    _patch_transport(monkeypatch, calls,
-                     lambda url: {} if url.endswith('/create') else _completed({'result': {'value': 1}}))
+    _patch_transport(monkeypatch, calls, lambda url: {}
+                     if url.endswith('/create') else _completed({'result': {
+                         'value': 1
+                     }}))
 
     model = module.MultiLoraTransformersModel('ms://base')
     model.adapter_name = 'adapter'
@@ -154,9 +158,8 @@ def test_model_data_plane_forward_only_can_append_selected_outputs(monkeypatch) 
     calls: list = []
     # The handler wraps its payload as ``{'result': ...}``, so the stub must too --
     # otherwise the test asserts against a reply shape the server never sends.
-    _patch_transport(monkeypatch, calls,
-                     lambda url: {} if url.endswith('/create') else _completed(
-                         {'result': updated_ref.model_dump()}))
+    _patch_transport(monkeypatch, calls, lambda url: {}
+                     if url.endswith('/create') else _completed({'result': updated_ref.model_dump()}))
 
     model = module.MultiLoraTransformersModel('ms://base')
     model.adapter_name = 'adapter'
@@ -184,13 +187,15 @@ def test_sampler_async_data_plane_path_returns_reference_without_materializing(m
         kind='rollout',
     )
     calls: list = []
-    _patch_transport(monkeypatch, calls,
-                     lambda url: {} if url.endswith('/create') else _completed(output_ref.model_dump()))
+    _patch_transport(monkeypatch, calls, lambda url: {}
+                     if url.endswith('/create') else _completed(output_ref.model_dump()))
 
     sampler = module.vLLMSampler('ms://base')
 
     result = asyncio.run(sampler.asample_to_data_plane(
-        [{'input_ids': [1]}],
+        [{
+            'input_ids': [1]
+        }],
         num_samples=4,
         group_ids=['group-1'],
     ))

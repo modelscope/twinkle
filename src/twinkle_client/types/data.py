@@ -56,19 +56,19 @@ from twinkle_client.types.base import DataModel
 
 _LEFT_TO_RIGHT = Field(union_mode='left_to_right')
 
-Ints1to2 = Annotated[Union[List[StrictInt], List[List[StrictInt]]], _LEFT_TO_RIGHT]
-Ints1to3 = Annotated[Union[List[StrictInt], List[List[StrictInt]], List[List[List[StrictInt]]]], _LEFT_TO_RIGHT]
-Ints3 = List[List[List[StrictInt]]]
+Ints1to2 = Annotated[Union[list[StrictInt], list[list[StrictInt]]], _LEFT_TO_RIGHT]
+Ints1to3 = Annotated[Union[list[StrictInt], list[list[StrictInt]], list[list[list[StrictInt]]]], _LEFT_TO_RIGHT]
+Ints3 = list[list[list[StrictInt]]]
 
 _Number = Union[StrictInt, float]
-Numbers1to2 = Annotated[Union[List[_Number], List[List[_Number]]], _LEFT_TO_RIGHT]
-Numbers1to4 = Annotated[Union[List[_Number], List[List[_Number]], List[List[List[_Number]]],
-                              List[List[List[List[_Number]]]]], _LEFT_TO_RIGHT]
+Numbers1to2 = Annotated[Union[list[_Number], list[list[_Number]]], _LEFT_TO_RIGHT]
+Numbers1to4 = Annotated[Union[list[_Number], list[list[_Number]], list[list[list[_Number]]],
+                              list[list[list[list[_Number]]]]], _LEFT_TO_RIGHT]
 
 # Media references travel as strings on the wire (local path, ``http(s)://`` URL, or
 # a ``data:`` base64 URI). ``PIL.Image`` / raw ``bytes`` / ``np.ndarray`` are valid in
 # the in-process training path but are not JSON, so they are not declared here.
-MediaList = List[str]
+MediaList = list[str]
 
 # The VLM tensor fields batched by concatenation rather than padding. Declared here
 # because this module must stay free of Twinkle_Core's heavyweight imports; a
@@ -155,7 +155,7 @@ class WireTrajectory(DataModel):
 # instead of being silently accepted and blowing up inside the backend. Order is
 # encoded-first, matching ``is_encoded``: a trajectory has neither encoded key, so it
 # cannot satisfy ``WireInputFeature``'s validator.
-WireInputs = Union[List[WireInputFeature], List[WireTrajectory]]
+WireInputs = Union[list[WireInputFeature], list[WireTrajectory]]
 
 
 def _as_batch(value: Any) -> Any:

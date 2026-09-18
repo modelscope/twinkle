@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 import twinkle_client.types as types
 from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
+from twinkle.server.utils.auth import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

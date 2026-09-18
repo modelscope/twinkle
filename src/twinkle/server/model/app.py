@@ -19,10 +19,10 @@ from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_d
 from twinkle.server.exceptions import FullModeBusyError
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.utils import wrap_builder_with_device_group_env
+from twinkle.server.utils.auth import get_token_from_request
 from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.session_resource import AdapterManagerMixin
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes

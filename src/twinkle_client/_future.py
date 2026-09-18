@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle_client.http import http_post
-from twinkle_client.http.utils import get_base_url
+from twinkle_client.http.context import get_base_url
 from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 
 logger = logging.getLogger('twinkle_client')

@@ -5,17 +5,26 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 import twinkle_client.types as types
+from twinkle.server.model.data_plane_inputs import model_result_rows
 from twinkle.server.model.twinkle_handlers import _register_twinkle_routes
-from twinkle.server.model.utils import model_result_rows
 
 
 def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
     assert model_result_rows(
-        {'logps': [[-1.0], [-2.0]], 'loss': 0.25},
+        {
+            'logps': [[-1.0], [-2.0]],
+            'loss': 0.25
+        },
         batch_size=2,
     ) == [
-        {'logps': [-1.0], 'loss': 0.25},
-        {'logps': [-2.0], 'loss': 0.25},
+        {
+            'logps': [-1.0],
+            'loss': 0.25
+        },
+        {
+            'logps': [-2.0],
+            'loss': 0.25
+        },
     ]
 
 
@@ -29,12 +38,16 @@ class _SchedulingManagement:
         self.data_plane = self
         self.rows = {
             'data-a': [{
-                'train_input': {'input_ids': [index]},
+                'train_input': {
+                    'input_ids': [index]
+                },
                 'sampled_logprobs': [-0.1],
                 'advantage': 1.0,
             } for index in range(4)],
             'data-b': [{
-                'train_input': {'input_ids': [index]},
+                'train_input': {
+                    'input_ids': [index]
+                },
                 'sampled_logprobs': [-0.2],
                 'advantage': -1.0,
             } for index in range(4, 8)],
@@ -75,9 +88,7 @@ async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -
     app = FastAPI()
     _register_twinkle_routes(app, lambda: management)
     route = next(
-        route for route in app.routes
-        if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane'
-    )
+        route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane')
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
     body = types.DataPlaneForwardRequest(
@@ -122,9 +133,7 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
     app = FastAPI()
     _register_twinkle_routes(app, lambda: management)
     route = next(
-        route for route in app.routes
-        if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane'
-    )
+        route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane')
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
     body = types.DataPlaneForwardRequest(
