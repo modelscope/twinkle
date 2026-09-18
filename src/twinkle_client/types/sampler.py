@@ -36,43 +36,40 @@ class SampleRequest(StrictRequest):
     """
 
     inputs: WireInputBatch = Field(..., description='Trajectory or InputFeature entries to sample from')
-    sampling_params: Optional[Dict[str, JsonValue]] = Field(
+    sampling_params: dict[str, JsonValue] | None = Field(
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
-    adapter_uri: Optional[str] = Field(
-        None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
+    adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
 
 
 class SampledSequenceModel(ResponseModel):
     """A single sampled sequence, mirroring twinkle.data_format.SampledSequence."""
     stop_reason: StopReason = Field(..., description="Stop reason: 'length' or 'stop'")
-    tokens: List[int] = Field(..., description='Token IDs of the sampled sequence')
-    logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = Field(None, description='Per-token log-probabilities')
-    decoded: Optional[str] = Field(None, description='Decoded text of the sampled sequence')
-    new_input_feature: Optional[Dict[str, Any]] = Field(
+    tokens: list[int] = Field(..., description='Token IDs of the sampled sequence')
+    logprobs: list[list[tuple[int, float]] | None] | None = Field(None, description='Per-token log-probabilities')
+    decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
+    new_input_feature: dict[str, Any] | None = Field(
         None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
 
 
 class SampleResponseModel(ResponseModel):
     """Mirroring twinkle.data_format.SampleResponse."""
-    sequences: List[SampledSequenceModel] = Field(
-        ..., description='List of sampled sequences')
-    prompt_token_ids: Optional[List[int]] = Field(
-        None, description='Token IDs of the prompt the sequences continue')
-    prompt_logprobs: Optional[List[Optional[float]]] = None
-    topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
+    sequences: list[SampledSequenceModel] = Field(..., description='List of sampled sequences')
+    prompt_token_ids: list[int] | None = Field(None, description='Token IDs of the prompt the sequences continue')
+    prompt_logprobs: list[float | None] | None = None
+    topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
 
 
 class SampleResponseModelList(ResponseModel):
     """Response body for the /sample endpoint"""
-    samples: List[SampleResponseModel] = Field(..., description='List of sample responses')
+    samples: list[SampleResponseModel] = Field(..., description='List of sample responses')
 
 
 class SamplerSetTemplateRequest(StrictRequest):
     """Request body for the sampler ``/set_template`` endpoint."""
     template_cls: str = Field(..., description="Template class name (e.g. 'Template')")
     adapter_name: str = Field('', description='Adapter name to associate the template with')
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SamplerSetTemplateResponse(ResponseModel):

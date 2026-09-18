@@ -23,7 +23,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         'function': {
             'name': 'list_training_runs',
             'description': 'List all active and historical training runs.',
-            'parameters': {'type': 'object', 'properties': {}, 'required': []},
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            },
         },
     },
     {
@@ -34,7 +38,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID.'
+                    },
                 },
                 'required': ['run_id'],
             },
@@ -43,13 +50,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         'type': 'function',
         'function': {
-            'name': 'start_server',
-            'description': (
-                'Start Ray cluster and Twinkle Server. MUST be called before start_training. '
-                'Idempotent: skips if server is already reachable. '
-                'Supports multi-model deployments: one training model + N sampler/teacher models. '
-                'Automatically generates server_config.yaml from parameters.'
-            ),
+            'name':
+            'start_server',
+            'description': ('Start Ray cluster and Twinkle Server. MUST be called before start_training. '
+                            'Idempotent: skips if server is already reachable. '
+                            'Supports multi-model deployments: one training model + N sampler/teacher models. '
+                            'Automatically generates server_config.yaml from parameters.'),
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -67,11 +73,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         'description': 'Training model backend. Default: transformers.',
                     },
                     'samplers': {
-                        'type': 'array',
-                        'description': (
-                            'List of sampler/teacher models for RL/OPD. Each entry deploys '
-                            'an inference service (vLLM or torch). Omit for simple SFT.'
-                        ),
+                        'type':
+                        'array',
+                        'description': ('List of sampler/teacher models for RL/OPD. Each entry deploys '
+                                        'an inference service (vLLM or torch). Omit for simple SFT.'),
                         'items': {
                             'type': 'object',
                             'properties': {
@@ -81,21 +86,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 },
                                 'gpus': {
                                     'type': 'integer',
-                                    'description': 'Total number of GPUs for this sampler. Default: 1. Must equal tp * dp.',
+                                    'description':
+                                    'Total number of GPUs for this sampler. Default: 1. Must equal tp * dp.',
                                 },
                                 'tp': {
-                                    'type': 'integer',
-                                    'description': (
-                                        'Tensor parallelism size (GPUs per vLLM worker process). '
-                                        'Use tp>1 for large models that do not fit on a single GPU. Default: 1.'
-                                    ),
+                                    'type':
+                                    'integer',
+                                    'description':
+                                    ('Tensor parallelism size (GPUs per vLLM worker process). '
+                                     'Use tp>1 for large models that do not fit on a single GPU. Default: 1.'),
                                 },
                                 'dp': {
-                                    'type': 'integer',
-                                    'description': (
-                                        'Data parallelism size (number of independent inference replicas). '
-                                        'If not specified, computed as gpus // tp. Default: 1.'
-                                    ),
+                                    'type':
+                                    'integer',
+                                    'description': ('Data parallelism size (number of independent inference replicas). '
+                                                    'If not specified, computed as gpus // tp. Default: 1.'),
                                 },
                                 'engine': {
                                     'type': 'string',
@@ -122,32 +127,43 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         'type': 'function',
         'function': {
-            'name': 'shutdown_server',
-            'description': (
-                'Shut down Twinkle Server and Ray cluster. WARNING: This releases all GPU resources '
-                'and DESTROYS model state held in server memory. Only call when training is truly '
-                'finished and you no longer need the server. Model weights/optimizer state in GPU '
-                'will be LOST unless a checkpoint was explicitly saved.'
-            ),
-            'parameters': {'type': 'object', 'properties': {}, 'required': []},
+            'name':
+            'shutdown_server',
+            'description': ('Shut down Twinkle Server and Ray cluster. WARNING: This releases all GPU resources '
+                            'and DESTROYS model state held in server memory. Only call when training is truly '
+                            'finished and you no longer need the server. Model weights/optimizer state in GPU '
+                            'will be LOST unless a checkpoint was explicitly saved.'),
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            },
         },
     },
     {
         'type': 'function',
         'function': {
-            'name': 'start_training',
-            'description': (
-                'Create a new training run: write the client script, launch it, and start monitoring. '
-                'REQUIRES: Twinkle Server must be running (call start_server first). '
-                'The client script connects to the server — server holds model state in GPU memory. '
-                'Kill client = pause (state preserved). Re-launch client = resume.'
-            ),
+            'name':
+            'start_training',
+            'description': ('Create a new training run: write the client script, launch it, and start monitoring. '
+                            'REQUIRES: Twinkle Server must be running (call start_server first). '
+                            'The client script connects to the server — server holds model state in GPU memory. '
+                            'Kill client = pause (state preserved). Re-launch client = resume.'),
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Unique run ID (e.g., "grpo-gsm8k").'},
-                    'script_content': {'type': 'string', 'description': 'Full Python source code of the training script.'},
-                    'model_id': {'type': 'string', 'description': 'Model identifier for metadata (e.g., "Qwen/Qwen3.5-4B").'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Unique run ID (e.g., "grpo-gsm8k").'
+                    },
+                    'script_content': {
+                        'type': 'string',
+                        'description': 'Full Python source code of the training script.'
+                    },
+                    'model_id': {
+                        'type': 'string',
+                        'description': 'Model identifier for metadata (e.g., "Qwen/Qwen3.5-4B").'
+                    },
                 },
                 'required': ['run_id', 'script_content'],
             },
@@ -161,7 +177,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID to monitor.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID to monitor.'
+                    },
                 },
                 'required': ['run_id'],
             },
@@ -171,11 +190,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         'type': 'function',
         'function': {
             'name': 'pause_training',
-            'description': 'Pause training by killing the client process (SIGKILL). Server retains all state — call resume_training to continue.',
+            'description': 'Pause training by killing the client process (SIGKILL). Server retains all state — call '
+            'resume_training to continue.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID to pause.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID to pause.'
+                    },
                 },
                 'required': ['run_id'],
             },
@@ -189,7 +212,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID to resume.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID to resume.'
+                    },
                 },
                 'required': ['run_id'],
             },
@@ -198,17 +224,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         'type': 'function',
         'function': {
-            'name': 'stop_training',
-            'description': (
-                'Gracefully stop the training client (SIGTERM). The script saves a checkpoint '
-                'before exiting. Server retains model/optimizer state in GPU memory — '
-                'use resume_training to continue. Similar to pause_training but with checkpoint save. '
-                'To fully release GPU resources, use shutdown_server.'
-            ),
+            'name':
+            'stop_training',
+            'description': ('Gracefully stop the training client (SIGTERM). The script saves a checkpoint '
+                            'before exiting. Server retains model/optimizer state in GPU memory — '
+                            'use resume_training to continue. Similar to pause_training but with checkpoint save. '
+                            'To fully release GPU resources, use shutdown_server.'),
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID to stop.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID to stop.'
+                    },
                 },
                 'required': ['run_id'],
             },
@@ -218,12 +246,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         'type': 'function',
         'function': {
             'name': 'update_script',
-            'description': 'Update the training script for a run. Archives the current train.py as train_v{N}.py and writes the new version. Use after diagnosing a script error, then call resume_training.',
+            'description': 'Update the training script for a run. Archives the current train.py as train_v{N}.py and '
+            'writes the new version. Use after diagnosing a script error, then call resume_training.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'run_id': {'type': 'string', 'description': 'Training run ID.'},
-                    'script_content': {'type': 'string', 'description': 'Full Python source code of the new training script.'},
+                    'run_id': {
+                        'type': 'string',
+                        'description': 'Training run ID.'
+                    },
+                    'script_content': {
+                        'type': 'string',
+                        'description': 'Full Python source code of the new training script.'
+                    },
                 },
                 'required': ['run_id', 'script_content'],
             },
@@ -233,13 +268,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         'type': 'function',
         'function': {
             'name': 'list_supported_models',
-            'description': 'Query the Twinkle server for its list of supported base models. Always call this before writing a training script to verify model availability.',
+            'description': 'Query the Twinkle server for its list of supported base models. Always call this before '
+            'writing a training script to verify model availability.',
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'base_url': {
-                        'type': 'string',
-                        'description': 'Server base URL. Default: http://localhost:8000. Cloud: http://www.modelscope.cn/twinkle',
+                        'type':
+                        'string',
+                        'description':
+                        'Server base URL. Default: http://localhost:8000. Cloud: http://www.modelscope.cn/twinkle',
                     },
                 },
                 'required': [],
@@ -254,8 +292,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'query': {'type': 'string', 'description': 'Search query for datasets.'},
-                    'limit': {'type': 'integer', 'description': 'Max results (default 5).'},
+                    'query': {
+                        'type': 'string',
+                        'description': 'Search query for datasets.'
+                    },
+                    'limit': {
+                        'type': 'integer',
+                        'description': 'Max results (default 5).'
+                    },
                 },
                 'required': ['query'],
             },
@@ -269,31 +313,38 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'query': {'type': 'string', 'description': 'Search query for models.'},
-                    'limit': {'type': 'integer', 'description': 'Max results (default 5).'},
+                    'query': {
+                        'type': 'string',
+                        'description': 'Search query for models.'
+                    },
+                    'limit': {
+                        'type': 'integer',
+                        'description': 'Max results (default 5).'
+                    },
                 },
                 'required': ['query'],
             },
         },
     },
-
     {
         'type': 'function',
         'function': {
-            'name': 'get_cluster_info',
-            'description': (
-                'Get cluster GPU resource info for planning training parallelism. '
-                'First attempts to query a running Ray cluster; if Ray is not available, '
-                'falls back to nvidia-smi for local GPU discovery. '
-                'The result indicates whether Ray is active — if not, the training script '
-                'should either start a local Ray cluster itself or the user should launch '
-                'Ray manually (see server mode run.sh).'
-            ),
-            'parameters': {'type': 'object', 'properties': {}, 'required': []},
+            'name':
+            'get_cluster_info',
+            'description': ('Get cluster GPU resource info for planning training parallelism. '
+                            'First attempts to query a running Ray cluster; if Ray is not available, '
+                            'falls back to nvidia-smi for local GPU discovery. '
+                            'The result indicates whether Ray is active — if not, the training script '
+                            'should either start a local Ray cluster itself or the user should launch '
+                            'Ray manually (see server mode run.sh).'),
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            },
         },
     },
 ]
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tool executor
@@ -325,11 +376,7 @@ class ToolExecutor:
 
     def _resolve_server_url(self) -> str:
         """Resolve server URL: instance state > env var > default."""
-        return (
-            self._server_url
-            or os.environ.get('TWINKLE_SERVER_URL')
-            or 'http://localhost:8000'
-        )
+        return (self._server_url or os.environ.get('TWINKLE_SERVER_URL') or 'http://localhost:8000')
 
     async def _tool_list_training_runs(self) -> list[dict]:
         return self.connection.list_training_runs()
@@ -345,12 +392,12 @@ class ToolExecutor:
         server_url = self._resolve_server_url()
         if not await self._check_server_health(server_url):
             return {
-                'status': 'error',
-                'run_id': run_id,
-                'error': (
-                    f'Twinkle Server is not reachable at {server_url}. '
-                    'Call start_server first to launch Ray cluster and Twinkle Server.'
-                ),
+                'status':
+                'error',
+                'run_id':
+                run_id,
+                'error': (f'Twinkle Server is not reachable at {server_url}. '
+                          'Call start_server first to launch Ray cluster and Twinkle Server.'),
             }
         result = self.connection.start_training(run_id, script_content, model_id)
         actual_run_id = result.get('run_id', run_id)
@@ -382,8 +429,8 @@ class ToolExecutor:
 
     async def _check_server_health(self, url: str) -> bool:
         """Check if Twinkle Server is reachable (non-blocking)."""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         def _probe():
             try:
@@ -433,8 +480,11 @@ class ToolExecutor:
 
             # Step 2: Generate server_config.yaml
             config_path = self._generate_server_config(
-                model_id=model_id, train_gpus=t_gpus,
-                port=port, backend=backend, samplers=sampler_list,
+                model_id=model_id,
+                train_gpus=t_gpus,
+                port=port,
+                backend=backend,
+                samplers=sampler_list,
             )
 
             # Step 3: Start Ray cluster (multi-node GPU partitioning)
@@ -449,9 +499,14 @@ class ToolExecutor:
 
             # Step 5: Wait for readiness (healthz + sampler engine)
             return self._wait_server_ready(
-                server_url=server_url, proc=proc, log_path=log_path,
-                sampler_list=sampler_list, model_id=model_id,
-                t_gpus=t_gpus, backend=backend, config_path=config_path,
+                server_url=server_url,
+                proc=proc,
+                log_path=log_path,
+                sampler_list=sampler_list,
+                model_id=model_id,
+                t_gpus=t_gpus,
+                backend=backend,
+                config_path=config_path,
             )
 
         result = await asyncio.get_event_loop().run_in_executor(None, _start)
@@ -468,7 +523,9 @@ class ToolExecutor:
         try:
             r = _sp.run(
                 ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if r.returncode == 0:
                 return len([ln for ln in r.stdout.strip().split('\n') if ln.strip()])
@@ -498,10 +555,8 @@ class ToolExecutor:
         needed = t_gpus + sampler_gpu_total
         if needed > total_hw_gpus:
             return {
-                'error': (
-                    f'Requested {needed} GPUs (train={t_gpus}, samplers={sampler_gpu_total}) '
-                    f'but only {total_hw_gpus} available.'
-                ),
+                'error': (f'Requested {needed} GPUs (train={t_gpus}, samplers={sampler_gpu_total}) '
+                          f'but only {total_hw_gpus} available.'),
             }
         return {'train_gpus': t_gpus, 'sampler_gpus': sampler_gpu_total}
 
@@ -529,8 +584,11 @@ class ToolExecutor:
         ray_base.mkdir(parents=True, exist_ok=True)
 
         def _ray_node(
-            devices: str, num_gpus: int, *,
-            head: bool = False, node_name: str = 'worker',
+            devices: str,
+            num_gpus: int,
+            *,
+            head: bool = False,
+            node_name: str = 'worker',
         ) -> str | None:
             env = os.environ.copy()
             env['CUDA_VISIBLE_DEVICES'] = devices
@@ -580,7 +638,9 @@ class ToolExecutor:
         cmd = ['python', '-m', 'twinkle.server', 'launch', '--config', config_path]
         try:
             proc = _sp.Popen(
-                cmd, stdout=log_file, stderr=_sp.STDOUT,
+                cmd,
+                stdout=log_file,
+                stderr=_sp.STDOUT,
                 start_new_session=True,
             )
         except OSError as e:
@@ -601,24 +661,20 @@ class ToolExecutor:
     ) -> dict:
         """Poll server until healthy (healthz + sampler engine ready)."""
         import time
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         timeout_s = 120 if sampler_list else 60
-        needed = t_gpus + sum(
-            s.get('gpus') or (s.get('tp', 1) * s.get('dp', 1)) for s in sampler_list
-        )
+        needed = t_gpus + sum(s.get('gpus') or (s.get('tp', 1) * s.get('dp', 1)) for s in sampler_list)
 
         for _ in range(timeout_s):
             time.sleep(1)
             if proc.poll() is not None:
                 # Server died — read log tail to diagnose
                 log_tail = ToolExecutor._read_log_tail(log_path, max_chars=2000)
-                error_msg = (
-                    f'Server exited immediately (code={proc.returncode}). '
-                    f'Model: {model_id}, GPUs: {t_gpus}, Samplers: {len(sampler_list)}.\n'
-                    f'--- server.log tail ---\n{log_tail}'
-                )
+                error_msg = (f'Server exited immediately (code={proc.returncode}). '
+                             f'Model: {model_id}, GPUs: {t_gpus}, Samplers: {len(sampler_list)}.\n'
+                             f'--- server.log tail ---\n{log_tail}')
                 return {
                     'status': 'error',
                     'error': error_msg,
@@ -635,31 +691,37 @@ class ToolExecutor:
                 return {
                     'status': 'started',
                     'warning': 'Server is up but sampler may still be loading.',
-                    'server_url': server_url, 'server_pid': proc.pid,
-                    'model_id': model_id, 'log_path': log_path,
+                    'server_url': server_url,
+                    'server_pid': proc.pid,
+                    'model_id': model_id,
+                    'log_path': log_path,
                 }
 
             return {
                 'status': 'started',
-                'server_url': server_url, 'server_pid': proc.pid,
-                'model_id': model_id, 'train_gpus': t_gpus,
+                'server_url': server_url,
+                'server_pid': proc.pid,
+                'model_id': model_id,
+                'train_gpus': t_gpus,
                 'backend': backend,
                 'samplers': [s.get('model_id') for s in sampler_list],
                 'total_gpus_used': needed,
-                'config_path': config_path, 'log_path': log_path,
+                'config_path': config_path,
+                'log_path': log_path,
             }
 
         return {
             'status': 'timeout',
             'error': 'Health check did not pass within timeout. Models may still be loading.',
-            'server_pid': proc.pid, 'log_path': log_path,
+            'server_pid': proc.pid,
+            'log_path': log_path,
         }
 
     @staticmethod
     def _read_log_tail(log_path: str, max_chars: int = 2000) -> str:
         """Read the tail of a log file for error diagnosis."""
         try:
-            with open(log_path, 'r', errors='replace') as f:
+            with open(log_path, errors='replace') as f:
                 content = f.read()
             if len(content) <= max_chars:
                 return content.strip()
@@ -671,8 +733,8 @@ class ToolExecutor:
     def _probe_sampler_ready(server_url: str, sampler_list: list[dict], fallback_model_id: str) -> bool:
         """Probe sampler route up to 90s to confirm vLLM engine is loaded."""
         import time
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         s_mid = sampler_list[0].get('model_id', fallback_model_id)
         probe_url = f'{server_url}/api/v1/sampler/{s_mid}/twinkle/create'
@@ -680,7 +742,9 @@ class ToolExecutor:
         for _ in range(90):
             try:
                 req = urllib.request.Request(
-                    probe_url, method='POST', data=b'{}',
+                    probe_url,
+                    method='POST',
+                    data=b'{}',
                     headers={'Content-Type': 'application/json'},
                 )
                 urllib.request.urlopen(req, timeout=5)
@@ -708,8 +772,8 @@ class ToolExecutor:
           - N sampler/teacher models (for RL/OPD)
           - 1 processor service
         """
-        from pathlib import Path
         import yaml
+        from pathlib import Path
 
         sampler_list = samplers or []
 
@@ -727,11 +791,16 @@ class ToolExecutor:
 
         # 1. API Gateway
         applications.append({
-            'name': 'server',
-            'route_prefix': '/api/v1',
-            'import_path': 'server',
+            'name':
+            'server',
+            'route_prefix':
+            '/api/v1',
+            'import_path':
+            'server',
             'args': {
-                'server_config': {'per_token_model_limit': 3},
+                'server_config': {
+                    'per_token_model_limit': 3
+                },
                 'supported_models': all_model_ids,
             },
             'deployments': [{
@@ -742,7 +811,9 @@ class ToolExecutor:
                     'max_replicas': 1,
                     'target_ongoing_requests': 128,
                 },
-                'ray_actor_options': {'num_cpus': 0.1},
+                'ray_actor_options': {
+                    'num_cpus': 0.1
+                },
             }],
         })
 
@@ -753,48 +824,55 @@ class ToolExecutor:
         gpu_apps: list[tuple[int, dict]] = []  # (gpu_count, app_config)
 
         # 2a. Training model worker (student)
-        gpu_apps.append((train_gpus, {
-            'name': f'models-{model_short}',
-            'route_prefix': f'/api/v1/model/{model_id}',
-            'import_path': 'model',
-            'args': {
-                'backend': backend,
-                'model_id': f'ms://{model_id}',
-                'max_length': 500000,  # total tokens per forward pass (must match max_input_tokens)
-                'nproc_per_node': train_gpus,
-                'device_group': {
-                    'name': 'model',
-                    'ranks': train_gpus,
-                    'device_type': 'cuda',
-                },
-                'device_mesh': {
-                    'device_type': 'cuda',
-                    'dp_size': train_gpus,
-                },
-                'queue_config': {
-                    'rps_limit': 100,
-                    'tps_limit': 100000,
-                    'max_input_tokens': 500000,
-                },
-                'adapter_config': {
-                    'adapter_timeout': 600,
-                },
-            },
-            'deployments': [{
-                'name': 'ModelManagement',
-                'autoscaling_config': {
-                    'min_replicas': 1,
-                    'max_replicas': 1,
-                    'target_ongoing_requests': 16,
-                },
-                'ray_actor_options': {
-                    'num_cpus': 0.1,
-                    'runtime_env': {
-                        'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'},
+        gpu_apps.append((
+            train_gpus,
+            {
+                'name':
+                f'models-{model_short}',
+                'route_prefix':
+                f'/api/v1/model/{model_id}',
+                'import_path':
+                'model',
+                'args': {
+                    'backend': backend,
+                    'model_id': f'ms://{model_id}',
+                    'max_length': 500000,  # total tokens per forward pass (must match max_input_tokens)
+                    'nproc_per_node': train_gpus,
+                    'device_group': {
+                        'name': 'model',
+                        'ranks': train_gpus,
+                        'device_type': 'cuda',
+                    },
+                    'device_mesh': {
+                        'device_type': 'cuda',
+                        'dp_size': train_gpus,
+                    },
+                    'queue_config': {
+                        'rps_limit': 100,
+                        'tps_limit': 100000,
+                        'max_input_tokens': 500000,
+                    },
+                    'adapter_config': {
+                        'adapter_timeout': 600,
                     },
                 },
-            }],
-        }))
+                'deployments': [{
+                    'name': 'ModelManagement',
+                    'autoscaling_config': {
+                        'min_replicas': 1,
+                        'max_replicas': 1,
+                        'target_ongoing_requests': 16,
+                    },
+                    'ray_actor_options': {
+                        'num_cpus': 0.1,
+                        'runtime_env': {
+                            'env_vars': {
+                                'TWINKLE_TRUST_REMOTE_CODE': '1'
+                            },
+                        },
+                    },
+                }],
+            }))
 
         # 2b. Sampler/teacher models
         sampler_name_count: dict[str, int] = {}
@@ -844,9 +922,12 @@ class ToolExecutor:
                 mesh_config['tp_size'] = s_tp
 
             sampler_app: dict = {
-                'name': s_name,
-                'route_prefix': f'/api/v1/sampler/{s_model_id}',
-                'import_path': 'sampler',
+                'name':
+                s_name,
+                'route_prefix':
+                f'/api/v1/sampler/{s_model_id}',
+                'import_path':
+                'sampler',
                 'args': {
                     'model_id': f'ms://{s_model_id}',
                     'nproc_per_node': s_total_gpus,
@@ -873,7 +954,9 @@ class ToolExecutor:
                     'ray_actor_options': {
                         'num_cpus': 0.1,
                         'runtime_env': {
-                            'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'},
+                            'env_vars': {
+                                'TWINKLE_TRUST_REMOTE_CODE': '1'
+                            },
                         },
                     },
                 }],
@@ -902,9 +985,12 @@ class ToolExecutor:
 
         # 4. Processor service
         applications.append({
-            'name': 'processor',
-            'route_prefix': '/api/v1/processor',
-            'import_path': 'processor',
+            'name':
+            'processor',
+            'route_prefix':
+            '/api/v1/processor',
+            'import_path':
+            'processor',
             'args': {
                 'ncpu_proc_per_node': 2,
                 'device_group': {
@@ -924,7 +1010,9 @@ class ToolExecutor:
                     'max_replicas': 1,
                     'target_ongoing_requests': 128,
                 },
-                'ray_actor_options': {'num_cpus': 0.1},
+                'ray_actor_options': {
+                    'num_cpus': 0.1
+                },
             }],
         })
 
@@ -990,8 +1078,8 @@ class ToolExecutor:
             # Use a lightweight HTTP GET instead of init_twinkle_client() which
             # creates a session + heartbeat thread that would leak since we never
             # call close().
-            import urllib.request
             import urllib.error
+            import urllib.request
 
             endpoint = f'{url}/api/v1/twinkle/get_server_capabilities'
             req = urllib.request.Request(endpoint, method='GET')
@@ -1045,10 +1133,7 @@ class ToolExecutor:
         api = HubApi()
         result = api.list_datasets('', search=query, page_size=limit)
         datasets = result.get('datasets', [])
-        return [
-            {'id': d.get('id', ''), 'name': d.get('display_name', d.get('id', ''))}
-            for d in datasets
-        ]
+        return [{'id': d.get('id', ''), 'name': d.get('display_name', d.get('id', ''))} for d in datasets]
 
     @staticmethod
     def _search_models_impl(query: str, limit: int) -> list[dict]:
@@ -1056,7 +1141,11 @@ class ToolExecutor:
         import requests
         resp = requests.put(
             'https://modelscope.cn/api/v1/models/',
-            json={'Name': query, 'PageSize': limit, 'PageNumber': 1},
+            json={
+                'Name': query,
+                'PageSize': limit,
+                'PageNumber': 1
+            },
             timeout=15,
         )
         resp.raise_for_status()
@@ -1064,13 +1153,10 @@ class ToolExecutor:
         if not data.get('Success'):
             raise RuntimeError(data.get('Message', 'Unknown error'))
         models = data.get('Data', {}).get('Models', [])
-        return [
-            {
-                'id': f"{m.get('Path', '')}/{m.get('Name', '')}",
-                'name': m.get('ChineseName') or m.get('Name', ''),
-            }
-            for m in models
-        ]
+        return [{
+            'id': f"{m.get('Path', '')}/{m.get('Name', '')}",
+            'name': m.get('ChineseName') or m.get('Name', ''),
+        } for m in models]
 
     # ── Cluster info ──
 
@@ -1087,11 +1173,9 @@ class ToolExecutor:
             # 2. Ray not available — fall back to nvidia-smi
             nvidia_info = self._try_nvidia_smi()
             nvidia_info['ray_active'] = False
-            nvidia_info['hint'] = (
-                'Ray cluster is not running. To use distributed training, '
-                'start Ray first: `ray start --head --num-gpus=N` or use '
-                'the server mode run.sh script.'
-            )
+            nvidia_info['hint'] = ('Ray cluster is not running. To use distributed training, '
+                                   'start Ray first: `ray start --head --num-gpus=N` or use '
+                                   'the server mode run.sh script.')
             return nvidia_info
 
         return await asyncio.get_event_loop().run_in_executor(None, _query)
@@ -1150,9 +1234,13 @@ class ToolExecutor:
 
         try:
             result = _sp.run(
-                ['nvidia-smi', '--query-gpu=index,name,memory.total,memory.free,utilization.gpu',
-                 '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=10,
+                [
+                    'nvidia-smi', '--query-gpu=index,name,memory.total,memory.free,utilization.gpu',
+                    '--format=csv,noheader,nounits'
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode != 0:
                 return {'error': f'nvidia-smi failed: {result.stderr.strip()}', 'gpu_total': 0}
@@ -1175,7 +1263,7 @@ class ToolExecutor:
                         # Skip lines with unparseable values (e.g. [N/A])
                         continue
 
-            gpu_types = sorted(set(g['name'] for g in gpus))
+            gpu_types = sorted({g['name'] for g in gpus})
             return {
                 'gpu_total': len(gpus),
                 'gpu_available': len([g for g in gpus if g['utilization_pct'] < 10]),

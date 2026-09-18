@@ -4,15 +4,17 @@ from __future__ import annotations
 import atexit
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+
 from twinkle import get_logger
-from twinkle_client.types.server import (CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse)
+from twinkle_client.types.server import CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse
 from twinkle_client.types.session import (CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest,
-                                           SessionHeartbeatResponse)
+                                          SessionHeartbeatResponse)
 from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
-                                            TrainingRunsResponse, WeightsInfoResponse)
+                                           TrainingRunsResponse, WeightsInfoResponse)
 from .http import get_api_key, get_base_url, http_delete, http_get, http_post, set_api_key, set_base_url, set_session_id
 
 logger = get_logger()
+
 
 class TwinkleClientError(Exception):
     """Base exception for TwinkleManager errors."""
@@ -44,11 +46,11 @@ class TwinkleClient:
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        route_prefix: Optional[str] = '/twinkle',
+        base_url: str | None = None,
+        api_key: str | None = None,
+        route_prefix: str | None = '/twinkle',
         session_heartbeat_interval: int = 10,
-        session_metadata: Optional[Dict[str, Any]] = None,
+        session_metadata: dict[str, Any] | None = None,
     ):
         # Resolve and store config, then propagate to context so all generated
         # client objects that call get_base_url() / get_api_key() get these values.
@@ -110,7 +112,7 @@ class TwinkleClient:
             raise TwinkleClientError(f'Request failed with status {response.status_code}: {detail}')
         return response.json()
 
-    def create_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
+    def create_session(self, metadata: dict[str, Any] | None = None) -> str:
         """
         Create a server-side session.
 
@@ -201,7 +203,7 @@ class TwinkleClient:
     # Training Runs
     # ------------------------------------------------------------------
 
-    def list_training_runs(self, limit: int = 20, offset: int = 0, all_users: bool = False) -> List[TrainingRun]:
+    def list_training_runs(self, limit: int = 20, offset: int = 0, all_users: bool = False) -> list[TrainingRun]:
         """
         List training runs.
 
@@ -218,7 +220,7 @@ class TwinkleClient:
         Raises:
             TwinkleClientError: If the request fails.
         """
-        params: Dict[str, Any] = {'limit': limit, 'offset': offset}
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
         if all_users:
             params['all_users'] = 'true'
 
@@ -232,7 +234,7 @@ class TwinkleClient:
         limit: int = 20,
         offset: int = 0,
         all_users: bool = False,
-    ) -> Tuple[List[TrainingRun], Cursor]:
+    ) -> tuple[list[TrainingRun], Cursor]:
         """
         List training runs with pagination info.
 
@@ -247,7 +249,7 @@ class TwinkleClient:
         Raises:
             TwinkleClientError: If the request fails.
         """
-        params: Dict[str, Any] = {'limit': limit, 'offset': offset}
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
         if all_users:
             params['all_users'] = 'true'
 
@@ -279,7 +281,7 @@ class TwinkleClient:
     # Checkpoints
     # ------------------------------------------------------------------
 
-    def list_checkpoints(self, run_id: str) -> List[Checkpoint]:
+    def list_checkpoints(self, run_id: str) -> list[Checkpoint]:
         """
         List checkpoints for a training run.
 
@@ -382,7 +384,7 @@ class TwinkleClient:
     # Convenience Methods
     # ------------------------------------------------------------------
 
-    def get_latest_checkpoint_path(self, run_id: str) -> Optional[str]:
+    def get_latest_checkpoint_path(self, run_id: str) -> str | None:
         """
         Get the filesystem path to the latest checkpoint for a training run.
 
@@ -403,7 +405,7 @@ class TwinkleClient:
         latest = checkpoints[-1]
         return self.get_checkpoint_path(run_id, latest.checkpoint_id).path
 
-    def find_training_run_by_model(self, base_model: str) -> List[TrainingRun]:
+    def find_training_run_by_model(self, base_model: str) -> list[TrainingRun]:
         """
         Find training runs for a specific base model.
 

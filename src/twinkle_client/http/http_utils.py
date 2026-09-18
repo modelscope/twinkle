@@ -83,10 +83,8 @@ def _handle_response(response: requests.Response) -> requests.Response:
             summary = body.get('error') or body.get('detail') or response.text
         else:
             category, error_code, request_id, summary = 'Unknown', None, None, response.text
-        http_error_msg = (
-            f'{response.status_code} Error for url: {response.url}\n'
-            f'Server detail:\n{summary}'
-        )
+        http_error_msg = (f'{response.status_code} Error for url: {response.url}\n'
+                          f'Server detail:\n{summary}')
         raise TwinkleHTTPError(
             http_error_msg,
             response=response,

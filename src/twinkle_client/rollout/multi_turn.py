@@ -104,10 +104,8 @@ class ClientMultiTurnRollout:
         if n == 0:
             return []
 
-        sampling_params = self._as_sampling_params_dict(
-            kwargs.get('sampling_params', self.sampling_params))
-        tool_managers = self._resolve_tool_managers(
-            kwargs.get('tool_manager', self.tool_manager), n)
+        sampling_params = self._as_sampling_params_dict(kwargs.get('sampling_params', self.sampling_params))
+        tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
 
         # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
         #    state for trajectory ``i``. ``vLLMSampler.sample`` is responsible for
@@ -153,10 +151,9 @@ class ClientMultiTurnRollout:
                 # carries ``input_ids``. A missing feature makes the next round
                 # impossible, so raise a batch/trajectory-indexed RuntimeError.
                 if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
-                    raise RuntimeError(
-                        f'Sampler returned a sequence without new_input_feature.input_ids at '
-                        f'batch index {local_idx} (trajectory {global_idx}); '
-                        f'cannot continue multi-turn.')
+                    raise RuntimeError(f'Sampler returned a sequence without new_input_feature.input_ids at '
+                                       f'batch index {local_idx} (trajectory {global_idx}); '
+                                       f'cannot continue multi-turn.')
 
                 pifs[global_idx] = dict(seq.new_input_feature)
                 # Per-round logprobs/token alignment guard: each sampled token
@@ -165,10 +162,9 @@ class ClientMultiTurnRollout:
                 # Ray paths cannot drift on this invariant.
                 if seq.logprobs is not None:
                     if len(seq.logprobs) != len(seq.tokens):
-                        raise RuntimeError(
-                            f'logprobs length ({len(seq.logprobs)}) does not match sampled '
-                            f'token count ({len(seq.tokens)}) at turn {turns[global_idx]} '
-                            f'(trajectory {global_idx})')
+                        raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match sampled '
+                                           f'token count ({len(seq.tokens)}) at turn {turns[global_idx]} '
+                                           f'(trajectory {global_idx})')
                     all_logprobs[global_idx].extend(seq.logprobs)
                 stop_reasons[global_idx] = seq.stop_reason
 
@@ -183,8 +179,8 @@ class ClientMultiTurnRollout:
                     continue
 
                 # 3a. Sequence-length cap.
-                if (self.max_trajectory_tokens is not None and len(
-                        pifs[global_idx].get('input_ids') or []) >= self.max_trajectory_tokens):
+                if (self.max_trajectory_tokens is not None
+                        and len(pifs[global_idx].get('input_ids') or []) >= self.max_trajectory_tokens):
                     truncated[global_idx] = True
                     done[global_idx] = True
                     continue
@@ -211,9 +207,8 @@ class ClientMultiTurnRollout:
                 # 4. Dispatch tools for this trajectory via its ToolManager.
                 tool_manager = tool_managers[global_idx]
                 if tool_manager is None:
-                    raise ValueError(
-                        f'trajectory {global_idx} produced tool_calls but no tool_manager '
-                        f'was provided (at construction time or as a per-call kwarg).')
+                    raise ValueError(f'trajectory {global_idx} produced tool_calls but no tool_manager '
+                                     f'was provided (at construction time or as a per-call kwarg).')
                 tool_messages = [{
                     'role': 'tool',
                     'content': tool_manager(tc),

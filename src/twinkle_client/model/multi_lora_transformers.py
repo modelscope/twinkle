@@ -51,9 +51,7 @@ class MultiLoraTransformersModel:
         # applied at most once. Reserved once per call and reused on retry.
         self._seq_counter = itertools.count(1)
         self._seq_lock = threading.Lock()
-        response = http_post(
-            url=f'{self.server_url}/create',
-        )
+        response = http_post(url=f'{self.server_url}/create', )
         response.raise_for_status()
 
     # ------------------------------------------------------------------ #
@@ -252,12 +250,7 @@ class MultiLoraTransformersModel:
     def step(self, **kwargs) -> None:
         """Execute optimizer step."""
         self._submit(
-            'step',
-            model_types.StepRequest,
-            None,
-            adapter_name=self.adapter_name,
-            seq_id=self._next_seq_id(),
-            **kwargs)
+            'step', model_types.StepRequest, None, adapter_name=self.adapter_name, seq_id=self._next_seq_id(), **kwargs)
 
     def zero_grad(self, **kwargs) -> None:
         """Zero out gradients."""

@@ -6,7 +6,7 @@ from twinkle.data_format import InputFeature
 from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
 
 
-class InputProcessor(object):
+class InputProcessor:
     """Client wrapper for InputProcessor that calls server HTTP endpoints."""
 
     def __init__(self,

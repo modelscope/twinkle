@@ -42,8 +42,8 @@ from collections.abc import Mapping
 from pydantic import BeforeValidator, Field, StrictInt, model_validator
 from typing import Annotated, Any, List, Literal, Optional, Union
 
-from twinkle_client.types.base import DataModel
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS
+from twinkle_client.types.base import DataModel
 
 # --------------------------------------------------------------------------- #
 # Leaf types. Shallowest-first, and ``StrictInt`` wherever the values come from a
@@ -89,43 +89,43 @@ VLM_TENSOR_FIELDS: frozenset[str] = frozenset({
 class WireMessage(DataModel):
     """One conversation turn, as sent over HTTP."""
 
-    role: Optional[Literal['system', 'user', 'assistant', 'tool']] = None
-    type: Optional[str] = None
-    content: Optional[Union[str, List[dict[str, Any]]]] = None
-    tool_calls: Optional[List[dict[str, Any]]] = None
-    tool_call_id: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    images: Optional[MediaList] = None
-    videos: Optional[MediaList] = None
-    audios: Optional[MediaList] = None
+    role: Literal['system', 'user', 'assistant', 'tool'] | None = None
+    type: str | None = None
+    content: str | list[dict[str, Any]] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    reasoning_content: str | None = None
+    images: MediaList | None = None
+    videos: MediaList | None = None
+    audios: MediaList | None = None
 
 
 class WireInputFeature(DataModel):
     """An already-encoded entry: token ids (or embeddings) plus aligned tensors."""
 
-    input_ids: Optional[Ints1to2] = None
-    input_embedding: Optional[Numbers1to2] = None
-    attention_mask: Optional[Ints1to2] = None
-    labels: Optional[Ints1to2] = None
-    completion_mask: Optional[Ints1to2] = None
+    input_ids: Ints1to2 | None = None
+    input_embedding: Numbers1to2 | None = None
+    attention_mask: Ints1to2 | None = None
+    labels: Ints1to2 | None = None
+    completion_mask: Ints1to2 | None = None
     # 1-D standard encoding, 2-D Qwen-VL mrope ``[3, T]``, 3-D megatron ``[3, 1, N]``.
-    position_ids: Optional[Ints1to3] = None
+    position_ids: Ints1to3 | None = None
     # Exactly ``[seq_len, num_layers, topk]``.
-    routed_experts: Optional[Ints3] = None
-    length: Optional[StrictInt] = None
+    routed_experts: Ints3 | None = None
+    length: StrictInt | None = None
 
     # VLM tensors: float values are normal here, so no strict-int leaves.
-    pixel_values: Optional[Numbers1to4] = None
-    image_grid_thw: Optional[Numbers1to4] = None
-    pixel_values_videos: Optional[Numbers1to4] = None
-    video_grid_thw: Optional[Numbers1to4] = None
-    input_features: Optional[Numbers1to4] = None
-    input_features_mask: Optional[Numbers1to4] = None
-    feature_attention_mask: Optional[Numbers1to4] = None
-    grid_thws: Optional[Numbers1to4] = None
+    pixel_values: Numbers1to4 | None = None
+    image_grid_thw: Numbers1to4 | None = None
+    pixel_values_videos: Numbers1to4 | None = None
+    video_grid_thw: Numbers1to4 | None = None
+    input_features: Numbers1to4 | None = None
+    input_features_mask: Numbers1to4 | None = None
+    feature_attention_mask: Numbers1to4 | None = None
+    grid_thws: Numbers1to4 | None = None
 
     @model_validator(mode='after')
-    def require_encoded_key(self) -> 'WireInputFeature':
+    def require_encoded_key(self) -> WireInputFeature:
         """At least one of the encoded-input keys must be present.
 
         Declared as a model validator rather than by making ``input_ids`` required:
@@ -140,14 +140,14 @@ class WireInputFeature(DataModel):
 class WireTrajectory(DataModel):
     """A not-yet-encoded entry: messages the server template will encode."""
 
-    messages: List[WireMessage]
-    images: Optional[MediaList] = None
-    videos: Optional[MediaList] = None
-    audios: Optional[MediaList] = None
-    tools: Optional[List[dict[str, Any]]] = None
+    messages: list[WireMessage]
+    images: MediaList | None = None
+    videos: MediaList | None = None
+    audios: MediaList | None = None
+    tools: list[dict[str, Any]] | None = None
     # ``List[Tuple[str, str]]`` on the wire: the PyArrow-stable encoding of the
     # user-data pairs attached by ``twinkle.data_format.attach_user_data``.
-    user_data: Optional[List[tuple[str, str]]] = None
+    user_data: list[tuple[str, str]] | None = None
 
 
 # A batch is homogeneous: every entry is encoded, or none is. Expressed as a union of
@@ -199,7 +199,7 @@ def declared_wire_keys() -> frozenset[str]:
     return frozenset(WireInputFeature.model_fields) | frozenset(WireTrajectory.model_fields)
 
 
-def export(entry: Union[WireInputFeature, WireTrajectory]) -> dict[str, Any]:
+def export(entry: WireInputFeature | WireTrajectory) -> dict[str, Any]:
     """Render a validated entry as the plain dict the backend consumes.
 
     ``exclude_none=True`` is required, not cosmetic: Twinkle_Core branches on key
@@ -211,6 +211,6 @@ def export(entry: Union[WireInputFeature, WireTrajectory]) -> dict[str, Any]:
     return entry.model_dump(exclude_none=True)
 
 
-def export_batch(entries: List[Any]) -> List[dict[str, Any]]:
+def export_batch(entries: list[Any]) -> list[dict[str, Any]]:
     """Export a validated batch, leaving already-plain entries untouched."""
     return [export(entry) if isinstance(entry, DataModel) else entry for entry in entries]

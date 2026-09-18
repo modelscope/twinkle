@@ -1,8 +1,7 @@
 import asyncio
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Union
-
 from peft import PeftConfig
+from typing import Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle_client._request_builder import build_request
@@ -48,10 +47,7 @@ class vLLMSampler:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data=kwargs
-        )
+        response = http_post(url=f'{self.server_url}/create', json_data=kwargs)
         response.raise_for_status()
 
     @staticmethod
@@ -128,11 +124,7 @@ class vLLMSampler:
         num_samples: int = 1,
     ) -> DataRef:
         """Generate complete prompt groups and keep their rows in the server DataPlane."""
-        source = ({
-            'input_ref': inputs.model_dump()
-        } if isinstance(inputs, DataRef) else {
-            'inputs': _json_safe(inputs)
-        })
+        source = ({'input_ref': inputs.model_dump()} if isinstance(inputs, DataRef) else {'inputs': _json_safe(inputs)})
         body = build_request(
             DataPlaneSampleRequest,
             sampling_params=_json_safe(sampling_params) if sampling_params else None,
@@ -188,9 +180,8 @@ class vLLMSampler:
 
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""
-        http_post_model(
-            f'{self.server_url}/unload_adapter_paths',
-            build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
+        http_post_model(f'{self.server_url}/unload_adapter_paths',
+                        build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
         """Set the template for encoding trajectories."""
@@ -201,6 +192,5 @@ class vLLMSampler:
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
         from twinkle_client.types.model import ApplyPatchRequest
-        body = build_request(
-            ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
+        body = build_request(ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
         http_post_model(f'{self.server_url}/apply_patch', body)

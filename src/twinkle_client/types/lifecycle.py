@@ -77,7 +77,7 @@ class TaskEnvelope(ResponseModel):
 
     request_id: str
     status: TaskStatus
-    result: Optional[Any] = None            # set iff status == 'completed'
-    error: Optional[ErrorPayload] = None    # set iff status == 'failed'
-    queue_state: Optional[QueueStateLiteral] = None
-    queue_state_reason: Optional[str] = None
+    result: Any | None = None  # set iff status == 'completed'
+    error: ErrorPayload | None = None  # set iff status == 'failed'
+    queue_state: QueueStateLiteral | None = None
+    queue_state_reason: str | None = None

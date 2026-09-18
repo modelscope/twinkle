@@ -7,7 +7,7 @@ from twinkle.template import Template
 from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
 
 
-class Dataset(object):
+class Dataset:
     """Client wrapper for Dataset that calls server HTTP endpoints."""
 
     def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):

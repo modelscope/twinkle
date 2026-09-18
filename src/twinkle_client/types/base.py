@@ -158,7 +158,7 @@ def read_field_role(field_info: FieldInfo) -> FieldRole:
     return FieldRole(value) if value is not None else FieldRole.Control
 
 
-def read_backend_only(field_info: FieldInfo) -> Optional[tuple[str, ...]]:
+def read_backend_only(field_info: FieldInfo) -> tuple[str, ...] | None:
     """Return the backend tuple a field was restricted to, or ``None`` if unrestricted."""
     value = _read_extra(field_info, BACKEND_ONLY_KEY)
     return tuple(value) if value else None

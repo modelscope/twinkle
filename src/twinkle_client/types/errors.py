@@ -51,8 +51,8 @@ class ErrorPayload(ResponseModel):
     category: ErrorCategory
     error_code: int = Field(ge=400, le=599)
     request_id: str
-    traceback: Optional[str] = Field(default=None, max_length=65536)
-    details: Optional[list[dict[str, Any]]] = None
+    traceback: str | None = Field(default=None, max_length=65536)
+    details: list[dict[str, Any]] | None = None
 
     @field_validator('category', mode='before')
     @classmethod
@@ -62,7 +62,7 @@ class ErrorPayload(ResponseModel):
         return value
 
     @model_validator(mode='after')
-    def traceback_is_server_only(self) -> 'ErrorPayload':
+    def traceback_is_server_only(self) -> ErrorPayload:
         if self.traceback is not None and self.category is not ErrorCategory.Server:
             raise ValueError('traceback is only valid for server errors')
         return self

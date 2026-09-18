@@ -42,8 +42,9 @@ def to_wire_value(value: Any) -> Any:
     """
     if hasattr(value, 'processor_id'):
         return value.processor_id
-    from twinkle.dataset import DatasetMeta
     from peft import LoraConfig
+
+    from twinkle.dataset import DatasetMeta
     if isinstance(value, (DatasetMeta, LoraConfig)):
         from twinkle_client.common.serialize import serialize_object
         return serialize_object(value)

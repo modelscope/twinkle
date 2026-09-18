@@ -27,7 +27,7 @@ from .base import ResponseModel, StrictRequest, passthrough
 class ProcessorCreateRequest(StrictRequest):
     processor_type: str
     class_type: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ProcessorHeartbeatRequest(StrictRequest):
@@ -37,7 +37,7 @@ class ProcessorHeartbeatRequest(StrictRequest):
 class ProcessorCallRequest(StrictRequest):
     processor_id: str
     function: str
-    call_kwargs: Dict[str, JsonValue] = passthrough()
+    call_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ProcessorCreateResponse(ResponseModel):

@@ -6,7 +6,7 @@ from twinkle.processor import InputProcessor
 from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
 
 
-class DataLoader(object):
+class DataLoader:
     """Client wrapper for DataLoader that calls server HTTP endpoints."""
 
     def __init__(self, dataset: Union[Dataset, Callable], **kwargs):

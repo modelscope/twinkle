@@ -95,7 +95,7 @@ class TrainingMonitor:
         self,
         connection: LocalConnection,
         on_message: Callable[[str], None],
-        llm_client: 'AsyncOpenAI',
+        llm_client: AsyncOpenAI,
         llm_model: str = 'qwen3.5',
         poll_interval: float = 30.0,
     ):
@@ -305,8 +305,14 @@ class TrainingMonitor:
             response = await self._client.chat.completions.create(
                 model=self.llm_model,
                 messages=[
-                    {'role': 'system', 'content': MONITOR_SYSTEM_PROMPT + extra},
-                    {'role': 'user', 'content': user_content},
+                    {
+                        'role': 'system',
+                        'content': MONITOR_SYSTEM_PROMPT + extra
+                    },
+                    {
+                        'role': 'user',
+                        'content': user_content
+                    },
                 ],
                 temperature=0.3,
                 max_tokens=4096,
@@ -340,10 +346,8 @@ class TrainingMonitor:
         """Apply auto-fix: update script + resume training."""
         attempts = self._fix_attempts.get(run_id, 0)
         if attempts >= _MAX_FIX_ATTEMPTS:
-            self.on_message(
-                f'[Monitor] 已达最大自动修复次数 ({_MAX_FIX_ATTEMPTS})，不再尝试。'
-                '请手动检查或输入指令。'
-            )
+            self.on_message(f'[Monitor] 已达最大自动修复次数 ({_MAX_FIX_ATTEMPTS})，不再尝试。'
+                            '请手动检查或输入指令。')
             return
 
         self.on_message(f'[Monitor] 检测到问题，正在自动修复 (第{attempts + 1}次)...\n诊断: {diagnosis}')
@@ -390,7 +394,7 @@ class TrainingMonitor:
         else:
             # Fallback: text before the python block
             before = response[:response.find('```python')]
-            lines = [l.strip() for l in before.splitlines() if l.strip() and not l.startswith('```')]
+            lines = [line.strip() for line in before.splitlines() if line.strip() and not line.startswith('```')]
             diagnosis = lines[-1] if lines else 'Auto-fix applied'
 
         return diagnosis, fixed_script

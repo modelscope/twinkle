@@ -10,7 +10,6 @@ from twinkle_client.common.json_utils import json_safe
 from twinkle_client.http import get_base_url, http_post
 from twinkle_client.types.component import DataRef, DataRowsResponse
 
-
 _T = TypeVar('_T')
 
 
@@ -33,7 +32,11 @@ class DataPlaneClient:
     ) -> DataRef:
         response = http_post(
             f'{self.server_url}/twinkle/put',
-            json_data={'rows': json_safe(rows), 'kind': kind, 'tags': json_safe(tags)},
+            json_data={
+                'rows': json_safe(rows),
+                'kind': kind,
+                'tags': json_safe(tags)
+            },
         )
         response.raise_for_status()
         return DataRef(**response.json())
@@ -53,7 +56,10 @@ class DataPlaneClient:
     def get(self, ref: DataRef, *, fields: list[str] | None = None) -> list[dict[str, Any]]:
         response = http_post(
             f'{self.server_url}/twinkle/get',
-            json_data={'ref': ref.model_dump(), 'fields': fields},
+            json_data={
+                'ref': ref.model_dump(),
+                'fields': fields
+            },
         )
         response.raise_for_status()
         return DataRowsResponse(**response.json()).rows
@@ -66,7 +72,11 @@ class DataPlaneClient:
     ) -> DataRowsResponse:
         response = http_post(
             f'{self.server_url}/twinkle/get',
-            json_data={'ref': ref.model_dump(), 'fields': fields, 'include_tags': True},
+            json_data={
+                'ref': ref.model_dump(),
+                'fields': fields,
+                'include_tags': True
+            },
         )
         response.raise_for_status()
         return DataRowsResponse(**response.json())

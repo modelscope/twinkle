@@ -15,9 +15,8 @@ Two axes, kept deliberately distinct:
 """
 from __future__ import annotations
 
-from typing import Any, Optional
-
 import requests
+from typing import Any, Optional
 
 
 class TwinkleClientValidationError(ValueError):
@@ -44,10 +43,10 @@ class TwinkleHTTPError(requests.HTTPError):
     def __init__(
         self,
         *args: Any,
-        status_code: Optional[int] = None,
-        error_code: Optional[int] = None,
+        status_code: int | None = None,
+        error_code: int | None = None,
         category: str = 'Unknown',
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -72,8 +71,8 @@ class TaskFailedError(Exception):
         *,
         category: str,
         request_id: str,
-        error_code: Optional[int] = None,
-        details: Optional[list[dict[str, Any]]] = None,
+        error_code: int | None = None,
+        details: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(error)
         self.error = error
@@ -96,7 +95,7 @@ class TaskCancelledError(Exception):
         error: str,
         *,
         request_id: str,
-        error_code: Optional[int] = None,
+        error_code: int | None = None,
     ) -> None:
         super().__init__(error)
         self.error = error

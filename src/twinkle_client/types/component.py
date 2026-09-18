@@ -28,19 +28,19 @@ class DataRef(BaseModel):
 class DataPutRequest(StrictRequest):
     rows: list[dict[str, Any]]
     kind: str = 'data'
-    tags: Optional[list[dict[str, Any]]] = None
+    tags: list[dict[str, Any]] | None = None
 
 
 class DataGetRequest(StrictRequest):
     ref: DataRef
-    fields: Optional[list[str]] = None
+    fields: list[str] | None = None
     include_tags: bool = False
 
 
 class DataAppendRequest(StrictRequest):
     ref: DataRef
     rows: list[dict[str, Any]]
-    tags: Optional[list[dict[str, Any]]] = None
+    tags: list[dict[str, Any]] | None = None
 
 
 class DataReleaseRequest(StrictRequest):
@@ -58,17 +58,17 @@ class DataPlaneSampleRequest(StrictRequest):
     Exactly one input source: inline entries (wire-validated) or a ``DataRef``.
     """
 
-    inputs: Optional[WireInputBatch] = None
-    input_ref: Optional[DataRef] = None
-    sampling_params: Optional[dict[str, JsonValue]] = None
+    inputs: WireInputBatch | None = None
+    input_ref: DataRef | None = None
+    sampling_params: dict[str, JsonValue] | None = None
     adapter_name: str = ''
-    adapter_uri: Optional[str] = None
-    policy_version: Optional[int] = None
-    group_ids: Optional[list[str]] = None
+    adapter_uri: str | None = None
+    policy_version: int | None = None
+    group_ids: list[str] | None = None
     num_samples: int = Field(default=1, ge=1)
 
     @model_validator(mode='after')
-    def validate_input(self) -> 'DataPlaneSampleRequest':
+    def validate_input(self) -> DataPlaneSampleRequest:
         if (self.inputs is None) == (self.input_ref is None):
             raise ValueError('exactly one of inputs and input_ref must be provided')
         if self.group_ids is not None and self.inputs is not None:

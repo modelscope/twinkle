@@ -8,15 +8,14 @@ never imported by Twinkle_Server.
 from __future__ import annotations
 
 import logging
+import requests
 import time
 from typing import Any, Optional
-
-import requests
 
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle_client.http import http_post
 from twinkle_client.http.utils import get_base_url
-from twinkle_client.types.lifecycle import TaskEnvelope, TERMINAL_STATUSES
+from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 
 logger = logging.getLogger('twinkle_client')
 
@@ -65,7 +64,7 @@ def _post_retrieve(request_id: str) -> TaskEnvelope:
     return TaskEnvelope.model_validate(response.json())
 
 
-def _status_of(error: requests.HTTPError) -> Optional[int]:
+def _status_of(error: requests.HTTPError) -> int | None:
     status = getattr(error, 'status_code', None)
     if status is None and getattr(error, 'response', None) is not None:
         status = error.response.status_code
@@ -123,7 +122,7 @@ def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_
     long-poll. Only transport retries back off.
     """
     if submit.status in TERMINAL_STATUSES:
-        return _unwrap(submit, model_cls)          # same call as the retrieve path
+        return _unwrap(submit, model_cls)  # same call as the retrieve path
 
     deadline = time.monotonic() + total_timeout
     transport_failures = not_found_count = 0
@@ -146,10 +145,10 @@ def resolve(submit: TaskEnvelope, *, model_cls, total_timeout: float = _DEFAULT_
                 transport_failures += 1
                 if transport_failures > _TRANSPORT_RETRY_MAX:
                     raise
-                time.sleep(min(2 ** transport_failures, 30))
+                time.sleep(min(2**transport_failures, 30))
                 continue
             if reply.status in TERMINAL_STATUSES:
-                return _unwrap(reply, model_cls)       # same call as the submit path
+                return _unwrap(reply, model_cls)  # same call as the submit path
             _log_queue_state(reply)
     except (KeyboardInterrupt, SystemExit):
         # Caller abandoned the wait: best-effort ask the server to drop the task if it

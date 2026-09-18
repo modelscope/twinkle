@@ -30,8 +30,7 @@ def processor_base_url() -> str:
 
 def create_remote_component(processor_type: str, class_type: str, **init_kwargs: Any) -> str:
     """Create a server-side component and return its ``pid:``-prefixed id."""
-    body = build_request(
-        ProcessorCreateRequest, processor_type=processor_type, class_type=class_type, **init_kwargs)
+    body = build_request(ProcessorCreateRequest, processor_type=processor_type, class_type=class_type, **init_kwargs)
     response = http_post_model(f'{processor_base_url()}/create', body)
     return ProcessorCreateResponse(**response.json()).processor_id
 

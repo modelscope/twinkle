@@ -47,14 +47,14 @@ class AdapterRequest(StrictRequest):
     """
 
     adapter_name: str
-    seq_id: Optional[int] = None
-    gradient_accumulation_steps: Optional[int] = backend_kwarg(default=None, ge=1)
+    seq_id: int | None = None
+    gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
 
 
 class StepRequest(AdapterRequest):
     """Body of ``POST /twinkle/step``."""
 
-    optim_params: Optional[Dict[str, JsonValue]] = backend_kwarg(default=None)
+    optim_params: dict[str, JsonValue] | None = backend_kwarg(default=None)
 
 
 class LrStepRequest(AdapterRequest):
@@ -62,7 +62,7 @@ class LrStepRequest(AdapterRequest):
 
     # ``OptimizerParamScheduler.step(increment=...)``; the transformers scheduler has
     # no equivalent knob.
-    increment: Optional[int] = backend_only('megatron', default=None, ge=0)
+    increment: int | None = backend_only('megatron', default=None, ge=0)
 
 
 class ClipGradNormRequest(AdapterRequest):
@@ -80,7 +80,7 @@ class ClipGradNormRequest(AdapterRequest):
 class ClipGradAndStepRequest(ClipGradNormRequest):
     """Body of ``POST /twinkle/clip_grad_and_step``."""
 
-    optim_params: Optional[Dict[str, JsonValue]] = backend_kwarg(default=None)
+    optim_params: dict[str, JsonValue] | None = backend_kwarg(default=None)
 
 
 class CalculateMetricRequest(StrictRequest):
@@ -109,26 +109,26 @@ class _InlineForwardBase(StrictRequest):
     """Fields common to the three inline forward endpoints."""
 
     inputs: WireInputBatch
-    task: Optional[str] = backend_kwarg(default=None)
-    temperature: Optional[float] = backend_kwarg(default=None, gt=0)
-    return_logits: Optional[bool] = backend_kwarg(default=None)
-    micro_batch_size: Optional[int] = backend_kwarg(default=None, ge=1)
-    gradient_accumulation_steps: Optional[int] = backend_kwarg(default=None, ge=1)
+    task: str | None = backend_kwarg(default=None)
+    temperature: float | None = backend_kwarg(default=None, gt=0)
+    return_logits: bool | None = backend_kwarg(default=None)
+    micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
+    gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
     # Read only by the transformers backend.
-    sampling_masks: Optional[JsonValue] = backend_only('transformers', default=None)
-    router_replay_action: Optional[str] = backend_only('transformers', default=None)
+    sampling_masks: JsonValue | None = backend_only('transformers', default=None)
+    router_replay_action: str | None = backend_only('transformers', default=None)
     # Loss inputs (``advantages`` / ``old_logps`` / ``ref_outputs`` / ...). Their key
     # set is decided by the configured Loss, so they get a declared dict rather than
     # top-level fields; the flattening in ``backend_kwargs`` keeps the backend call
     # shape identical to before.
-    loss_kwargs: Dict[str, JsonValue] = passthrough()
+    loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ForwardRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward``: keeps the graph, mutates no gradients."""
 
     adapter_name: str
-    disable_lora: Optional[bool] = backend_kwarg(default=None)
+    disable_lora: bool | None = backend_kwarg(default=None)
 
 
 class ForwardOnlyRequest(_InlineForwardBase):
@@ -139,17 +139,17 @@ class ForwardOnlyRequest(_InlineForwardBase):
     about.
     """
 
-    adapter_name: Optional[str] = None
-    disable_lora: Optional[bool] = backend_kwarg(default=None)
+    adapter_name: str | None = None
+    disable_lora: bool | None = backend_kwarg(default=None)
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward_backward``: accumulates gradients."""
 
     adapter_name: str
-    seq_id: Optional[int] = None
-    sync_gradients: Optional[bool] = backend_kwarg(default=None)
-    loss_scale: Optional[float] = backend_kwarg(default=None)
+    seq_id: int | None = None
+    sync_gradients: bool | None = backend_kwarg(default=None)
+    loss_scale: float | None = backend_kwarg(default=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -164,30 +164,30 @@ class ForwardBackwardTaskRequest(_InlineForwardBase):
 class DataPlaneForwardRequest(StrictRequest):
     """Body of the ``*_from_data_plane`` forward endpoints."""
 
-    input_refs: List[DataRef] = Field(min_length=1)
-    input_field: Optional[str] = None
+    input_refs: list[DataRef] = Field(min_length=1)
+    input_field: str | None = None
     # Values are *field paths*, not parameter values, so this is not a passthrough
     # region: nothing in it is forwarded verbatim.
-    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
+    kwarg_fields: dict[str, str] = Field(default_factory=dict)
     adapter_name: str
-    seq_id: Optional[int] = None
-    task: Optional[str] = backend_kwarg(default=None)
-    temperature: Optional[float] = backend_kwarg(default=None, gt=0)
-    return_logits: Optional[bool] = backend_kwarg(default=None)
-    disable_lora: Optional[bool] = backend_kwarg(default=None)
-    micro_batch_size: Optional[int] = backend_kwarg(default=None, ge=1)
-    gradient_accumulation_steps: Optional[int] = backend_kwarg(default=None, ge=1)
-    loss_kwargs: Dict[str, JsonValue] = passthrough()
+    seq_id: int | None = None
+    task: str | None = backend_kwarg(default=None)
+    temperature: float | None = backend_kwarg(default=None, gt=0)
+    return_logits: bool | None = backend_kwarg(default=None)
+    disable_lora: bool | None = backend_kwarg(default=None)
+    micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
+    gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
+    loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
     """Body of ``POST /twinkle/forward_only_from_data_plane``."""
 
-    output_ref: Optional[DataRef] = None
-    output_fields: Dict[str, str] = Field(default_factory=dict)
+    output_ref: DataRef | None = None
+    output_fields: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode='after')
-    def validate_output(self) -> 'DataPlaneForwardOnlyRequest':
+    def validate_output(self) -> DataPlaneForwardOnlyRequest:
         if (self.output_ref is None) != (len(self.output_fields) == 0):
             raise ValueError('output_ref and output_fields must be configured together')
         return self
@@ -209,19 +209,19 @@ class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
 class SetLossRequest(StrictRequest):
     loss_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetOptimizerRequest(StrictRequest):
     optimizer_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetLrSchedulerRequest(StrictRequest):
     scheduler_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetTemplateRequest(StrictRequest):
@@ -235,26 +235,26 @@ class SetTemplateRequest(StrictRequest):
 
     template_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetProcessorRequest(StrictRequest):
     processor_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class AddMetricRequest(StrictRequest):
     metric_cls: str
     adapter_name: str
-    is_training: Optional[bool] = None
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    is_training: bool | None = None
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ApplyPatchRequest(StrictRequest):
     patch_cls: str
     adapter_name: str
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 # --------------------------------------------------------------------------- #
@@ -264,20 +264,20 @@ class ApplyPatchRequest(StrictRequest):
 
 class SaveRequest(StrictRequest):
     adapter_name: str
-    name: Optional[str] = None
+    name: str | None = None
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
-    consumed_train_samples: Optional[int] = backend_kwarg(default=None, ge=0)
-    merge_lora: Optional[bool] = backend_only('megatron', default=None)
+    consumed_train_samples: int | None = backend_kwarg(default=None, ge=0)
+    merge_lora: bool | None = backend_only('megatron', default=None)
 
 
 class LoadRequest(StrictRequest):
     adapter_name: str
     name: str
     load_optimizer: bool = False
-    no_load_optim: Optional[bool] = backend_only('megatron', default=None)
-    no_load_rng: Optional[bool] = backend_only('megatron', default=None)
-    strict: Optional[bool] = backend_only('transformers', default=None)
+    no_load_optim: bool | None = backend_only('megatron', default=None)
+    no_load_rng: bool | None = backend_only('megatron', default=None)
+    strict: bool | None = backend_only('transformers', default=None)
 
 
 class ResumeFromCheckpointRequest(StrictRequest):
@@ -292,10 +292,10 @@ class AddAdapterRequest(StrictRequest):
     adapter_name: str
     # ``config`` is None for full-parameter training (no LoRA adapter) and a
     # serialized LoraConfig string for LoRA training.
-    config: Optional[str] = None
-    save_dir: Optional[str] = None
-    gradient_accumulation_steps: Optional[int] = backend_kwarg(default=None, ge=1)
-    init_kwargs: Dict[str, JsonValue] = passthrough()
+    config: str | None = None
+    save_dir: str | None = None
+    gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class UploadToHubRequest(StrictRequest):
@@ -305,9 +305,9 @@ class UploadToHubRequest(StrictRequest):
     the client waits through the future layer, so the flag could only ever be ignored.
     """
 
-    checkpoint_dir: Union[str, Dict[str, Any]]
+    checkpoint_dir: str | dict[str, Any]
     hub_model_id: str
-    hub_token: Optional[str] = None
+    hub_token: str | None = None
 
     @field_validator('checkpoint_dir', mode='before')
     @classmethod
@@ -369,18 +369,18 @@ class GetTrainConfigsResponse(ResponseModel):
 
 class CalculateMetricResponse(ResponseModel):
     """Response for /calculate_metric endpoint (returns Dict)."""
-    result: Dict[str, Any]
+    result: dict[str, Any]
 
 
 class SaveResponse(ResponseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
     twinkle_path: str
-    checkpoint_dir: Optional[str] = None
+    checkpoint_dir: str | None = None
 
 
 class TrainingProgressResponse(ResponseModel):
     """Response for /resume_from_checkpoint endpoint."""
-    result: Dict[str, Any]
+    result: dict[str, Any]
 
 
 # --- Void responses (return None → OkResponse) ---
