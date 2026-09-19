@@ -36,7 +36,7 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
 
     Lifecycle is handled by ProcessorManagerMixin:
     - Processors are registered with a session ID on creation.
-    - A background thread expires processors whose session has timed out.
+    - A background task expires processors whose session has timed out.
     - Per-user processor limit is enforced at registration.
     - Sticky session routing ensures session requests hit the same replica.
     """
@@ -82,8 +82,8 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
         self._ensure_countdown_started()
         await self._ensure_state_cleanup_started()
 
-    def _on_processor_expired(self, processor_id: str) -> None:
-        """Called by the countdown thread when a processor's session expires."""
+    async def _on_processor_expired(self, processor_id: str) -> None:
+        """Called by the countdown loop when a processor's session expires."""
         self.resource_dict.pop(processor_id, None)
         self.unregister_resource(processor_id)
 

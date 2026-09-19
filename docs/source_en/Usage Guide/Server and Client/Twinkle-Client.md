@@ -38,7 +38,7 @@ latest_path = client.get_latest_checkpoint_path(run_id='xxx')
 
 ## Migrating from Local Code to Remote
 
-Migration is very simple, just replace the import path from `twinkle` to `twinkle_client`:
+Keep the data-processing and training-loop code, then create the remote model through `client.model(...)` after initializing the remote client:
 
 ```python
 # Local training code (original)
@@ -50,10 +50,13 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader        # or: from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # or: from twinkle_client.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client import init_twinkle_client
+
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+model = client.model(f'ms://{base_model}')
 ```
 
-Training loops, data processing, and other logic do not need any modifications.
+Training loops and data processing do not need any modifications. Prefer `client.model(...)` over constructing `MultiLoraTransformersModel(...)` directly so the model wrapper explicitly reuses the current client's transport, session, and authentication context.
 
 ## Complete Training Example (Transformers Backend)
 
@@ -69,7 +72,6 @@ from twinkle_client import init_twinkle_client
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
@@ -118,8 +120,8 @@ dataset.encode(batched=True)
 # Create DataLoader
 dataloader = DataLoader(dataset=dataset, batch_size=4)
 
-# Step 4: Configure model
-model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+# Step 4: Create the remote model bound to the current client
+model = client.model(f'ms://{base_model}')
 
 # Configure LoRA: apply low-rank adapters to all linear layers
 lora_config = LoraConfig(target_modules='all-linear')
@@ -171,12 +173,14 @@ for epoch in range(3):
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: Upload to ModelScope Hub (optional)
+# The server always uploads in the background; this call waits through the future layer
+# until upload completion or failure. Do not pass async_upload or poll_interval: they
+# remain only for old-call compatibility, are deprecated, and have no effect.
 # YOUR_USER_NAME = "your_username"
 # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
 # model.upload_to_hub(
 #     checkpoint_dir=twinkle_path,
 #     hub_model_id=hub_model_id,
-#     async_upload=False
 # )
 ```
 
@@ -223,17 +227,16 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.rollout import ClientMultiTurnRollout
 from twinkle_client.sampler import vLLMSampler
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 2   # GRPO group size (rollout samples num_samples=1 per trajectory)
 
-init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
 
-# Training model (GRPO)
-model = MultiLoraTransformersModel(model_id=MODEL_ID)
+# Training model (GRPO): bind the current transport, session, and authentication context
+model = client.model(MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
 model.set_loss('GRPOLoss', epsilon=0.2)
 model.set_optimizer('Adam', lr=1e-5)

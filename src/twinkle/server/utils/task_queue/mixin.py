@@ -297,7 +297,7 @@ class TaskQueueMixin:
         self._compute_worker.ensure_queue_registered(queue_key)
         await self._compute_worker.ensure_started()
 
-        q = self._compute_worker.task_queues[queue_key]
+        q = self._compute_worker.get_queue(queue_key)
         await q.put(
             QueuedTask(
                 request_id=request_id,
@@ -321,7 +321,7 @@ class TaskQueueMixin:
         self._compute_worker.new_task_event.set()
 
         if self._task_metrics:
-            total_depth = sum(q.qsize() for q in self._compute_worker.task_queues.values())
+            total_depth = self._compute_worker.total_queued()
             self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
 
         return {'request_id': request_id, 'model_id': model_id}
@@ -508,36 +508,6 @@ class TaskQueueMixin:
             asyncio.create_task(self._fail_queue_tasks_async(queue_key, reason))
 
         self._event_loop.call_soon_threadsafe(_schedule)
-
-    def get_queue_stats(self) -> dict[str, Any]:
-        """Return current compute queue statistics.
-
-        Not exposed over HTTP yet: no endpoint reads these three ``*_stats``
-        helpers. Kept as the intended data source for a future observability
-        endpoint; if that endpoint never lands, delete them instead of leaving
-        them as dead reflection.
-        """
-        return {
-            'queue_size':
-            sum(q.qsize() for q in self._compute_worker.task_queues.values()),
-            'queue_count':
-            len(self._compute_worker.task_queues),
-            'worker_running': (self._compute_worker._worker_task is not None
-                               and not self._compute_worker._worker_task.done()),
-            'rate_limit_config': {
-                'rps_limit': self._task_queue_config.rps_limit,
-                'tps_limit': self._task_queue_config.tps_limit,
-                'enabled': self._task_queue_config.enabled,
-            },
-        }
-
-    def get_rate_limit_stats(self, token: str) -> dict[str, Any]:
-        """Return rate-limiting stats for a user token. Not exposed over HTTP yet (see get_queue_stats)."""
-        return self._rate_limiter.get_stats(token)
-
-    def get_rate_limiter_memory_stats(self) -> dict[str, Any]:
-        """Return memory usage statistics from the rate limiter. Not exposed over HTTP yet (see get_queue_stats)."""
-        return self._rate_limiter.get_memory_stats()
 
     async def shutdown_task_queue(self) -> None:
         """Gracefully shut down the compute queue and release resources."""

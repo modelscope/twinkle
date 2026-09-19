@@ -191,7 +191,6 @@ def train():
     # model.upload_to_hub(
     #     checkpoint_dir=twinkle_path,
     #     hub_model_id=hub_model_id,
-    #     async_upload=False
     # )
     # logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 

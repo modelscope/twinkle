@@ -9,12 +9,11 @@ deliberately slow plain callable -- no GPU, Megatron, or Ray involved.
 from __future__ import annotations
 
 import asyncio
+import httpx
+import pytest
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-
-import httpx
-import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -28,8 +27,7 @@ class _Harness(TaskQueueMixin):
     """Minimal holder exposing the real call_backend with a chosen gate setting."""
 
     def __init__(self, gate_enabled: bool, *, max_workers: int | None = None) -> None:
-        self._backend_executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix='twinkle-backend')
+        self._backend_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='twinkle-backend')
         self._backend_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='twinkle-backend-probe')
         self._backend_admission = asyncio.Lock() if gate_enabled else None
         self._backend_poisoned = asyncio.Event()
@@ -175,7 +173,7 @@ async def test_probe_times_out_while_same_serial_actor_is_busy():
             return JSONResponse(status_code=503, content={'healthy': False})
 
     try:
-        slow = asyncio.create_task(h.call_backend(lambda: ray.get(actor.slow.remote(), timeout=2)))
+        slow = asyncio.create_task(h.call_backend(lambda: ray.get(actor.slow.remote(), timeout=10)))
         await asyncio.sleep(0.1)
         start = time.monotonic()
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:

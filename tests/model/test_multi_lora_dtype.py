@@ -17,6 +17,6 @@ def test_multi_lora_dtype_matches_bf16_base_before_fsdp_wrap():
 
     assert {param.dtype for name, param in model.named_parameters() if 'lora_' in name} == {torch.float32}
 
-    TransformersModel._ensure_lora_dtype(None, model)
+    TransformersModel._ensure_lora_dtype(model)
 
     assert {param.dtype for name, param in model.named_parameters() if 'lora_' in name} == {torch.bfloat16}

@@ -151,6 +151,19 @@ class MultiLora:
     def patch_target_parameters(self, module, target_parameters):
         self.target_parameter_manager.patch(module, target_parameters)
 
+    @staticmethod
+    def _autocast_adapter_dtype(peft_model, adapter_name: str) -> None:
+        """Apply PEFT's own adapter dtype autocast to one preallocated slot.
+
+        ``PeftModel.__init__`` runs ``_cast_adapter_dtype`` (fp16/bf16 -> fp32) for the
+        slot created at construction time, but ``PeftModel.add_adapter`` does not. Calling
+        it explicitly keeps every preallocated slot on the same dtype PEFT would produce,
+        instead of forcing fp32 ourselves. It is a no-op for an fp32 base.
+        """
+        base = getattr(peft_model, 'base_model', None)
+        if base is not None and hasattr(base, '_cast_adapter_dtype'):
+            base._cast_adapter_dtype(adapter_name=adapter_name, autocast_adapter_dtype=True)
+
     @contextmanager
     def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
         self.activate_adapter(tenant_adapter_name)
@@ -512,6 +525,7 @@ class MultiLora:
             def _patch_peft(_module):
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     _peft_model: PeftModel = get_peft_model(
                         _module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
@@ -528,6 +542,7 @@ class MultiLora:
                 _config = deepcopy(config)
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     # TODO first wrap needs parse target_modules, need to fix later
                     if _config.target_modules:

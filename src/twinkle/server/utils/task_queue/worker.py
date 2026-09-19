@@ -102,6 +102,19 @@ class ComputeWorker:
         if queue_key not in self.queue_order:
             self.queue_order.append(queue_key)
 
+    def get_queue(self, queue_key: str) -> asyncio.Queue:
+        """Return the registered queue for ``queue_key``.
+
+        Callers must have registered it first via :meth:`ensure_queue_registered`.
+        Exposed so producers (the mixin) enqueue through a method instead of
+        indexing the worker's internal ``task_queues`` container directly.
+        """
+        return self.task_queues[queue_key]
+
+    def total_queued(self) -> int:
+        """Total number of pending tasks across all per-key queues."""
+        return sum(q.qsize() for q in self.task_queues.values())
+
     # ------------------------------------------------------------------
     # Metrics helpers
     # ------------------------------------------------------------------

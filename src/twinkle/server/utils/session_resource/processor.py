@@ -85,11 +85,13 @@ class ProcessorManagerMixin(SessionResourceMixin):
 
         ``_on_processor_expired`` is the supported extension point: the
         processor-domain name is kept deliberately so subclass authors override a
-        method named for processors rather than the generic base-class hook.
+        method named for processors rather than the generic base-class hook. It is
+        ``async`` to match the sibling ``AdapterManagerMixin._on_adapter_expired``
+        contract, so both resource kinds expose the same extension-point shape.
         """
-        self._on_processor_expired(resource_id)
+        await self._on_processor_expired(resource_id)
 
-    def _on_processor_expired(self, processor_id: str) -> None:
+    async def _on_processor_expired(self, processor_id: str) -> None:
         """Hook called when a processor's session expires.
 
         Must be overridden by inheriting classes.

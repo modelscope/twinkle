@@ -1480,7 +1480,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
-    def _ensure_lora_dtype(self, model):
+    @staticmethod
+    def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
         is_npu_device = Platform.device_prefix() == 'npu'

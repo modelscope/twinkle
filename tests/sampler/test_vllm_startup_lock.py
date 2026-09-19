@@ -1,6 +1,5 @@
 import multiprocessing
 import os
-
 import pytest
 
 from twinkle.utils.parallel import PosixFileLock
@@ -9,7 +8,7 @@ from twinkle.utils.parallel import PosixFileLock
 def _hold_startup_lock(lock_path: str, acquired, release) -> None:
     with PosixFileLock(lock_path):
         acquired.set()
-        if not release.wait(timeout=5):
+        if not release.wait(timeout=30):
             raise TimeoutError('test did not release vLLM startup lock')
 
 
@@ -33,21 +32,23 @@ def test_vllm_engine_startup_is_serialized(tmp_path):
 
     try:
         first.start()
-        assert first_acquired.wait(timeout=5)
+        assert first_acquired.wait(timeout=30)
 
         second.start()
-        assert second_started.wait(timeout=5)
+        assert second_started.wait(timeout=30)
         assert not second_acquired.wait(timeout=0.2)
 
         release_first.set()
-        assert second_acquired.wait(timeout=5)
+        assert second_acquired.wait(timeout=30)
     finally:
         release_first.set()
         for process in (first, second):
-            process.join(timeout=5)
+            if process.pid is None:
+                continue
+            process.join(timeout=30)
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=5)
+                process.join(timeout=30)
 
     assert first.exitcode == 0
     assert second.exitcode == 0

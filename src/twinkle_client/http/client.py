@@ -5,7 +5,6 @@ from __future__ import annotations
 import requests
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
-from pydantic import BaseModel
 from typing import Any
 
 from twinkle_client.exceptions import TwinkleClientValidationError, TwinkleHTTPError
@@ -23,19 +22,18 @@ def _serialize_value(value: Any) -> Any:
         return value
     if isinstance(value, bytes | bytearray | memoryview):
         raise TwinkleClientValidationError('Binary values are not supported by the JSON transport')
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode='json')
-    if is_dataclass(value) and not isinstance(value, type):
-        return _serialize_value(asdict(value))
     if isinstance(value, Mapping):
         return {str(key): _serialize_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_serialize_value(item) for item in value]
-    processor_id = getattr(value, 'processor_id', None)
-    if isinstance(processor_id, str):
-        return processor_id
-    raise TwinkleClientValidationError(
-        f'Unsupported wire value {type(value).__name__}; use a Pydantic model, dataclass, or JSON value')
+    if is_dataclass(value) and not isinstance(value, type):
+        return _serialize_value(asdict(value))
+    # Single source of truth for leaf/domain objects (pydantic models, remote
+    # component handles, DatasetMeta / LoraConfig, numpy / torch): reuse the
+    # request builder's converter so a value serializes identically whether it
+    # goes out via ``post(json_data=...)`` or via ``post_model(body=...)``.
+    from twinkle_client._request_builder import to_wire_value
+    return to_wire_value(value)
 
 
 def _handle_response(response: requests.Response) -> requests.Response:

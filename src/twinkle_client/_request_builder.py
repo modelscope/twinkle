@@ -40,8 +40,13 @@ def to_wire_value(value: Any) -> Any:
     Anything else is passed through for the model to validate, so an unsupported type
     is reported by pydantic with its field path instead of by a generic error here.
     """
-    if hasattr(value, 'processor_id'):
-        return value.processor_id
+    # A remote-component handle (InputProcessor / dataset / dataloader wrapper)
+    # is sent as its server-side id. Guarded on ``str`` so an unrelated object
+    # that merely happens to expose a ``processor_id`` attribute is not silently
+    # coerced to something that is not an id.
+    component_id = getattr(value, 'processor_id', None)
+    if isinstance(component_id, str):
+        return component_id
     from peft import LoraConfig
 
     from twinkle.dataset import DatasetMeta

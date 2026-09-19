@@ -57,14 +57,33 @@ class MultiLoraTransformersModel:
         # applied at most once. Reserved once per call and reused on retry.
         self._seq_counter = itertools.count(1)
         self._seq_lock = threading.Lock()
-        self._transport.post(f'{self.server_url}/create')
+        # The server-side component is created lazily on first use rather than in
+        # __init__, so constructing the wrapper performs no network I/O.
+        self._created = False
+        self._create_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Request plumbing
     # ------------------------------------------------------------------ #
 
+    def _ensure_created(self) -> None:
+        """Create the server-side model component once, on first use.
+
+        Deferred out of ``__init__`` so construction has no side effect: a failed
+        ``create`` surfaces from the first operation instead of leaving a
+        half-initialised object published. Idempotent and thread-safe.
+        """
+        if self._created:
+            return
+        with self._create_lock:
+            if self._created:
+                return
+            self._transport.post(f'{self.server_url}/create')
+            self._created = True
+
     def _submit(self, endpoint: str, model_cls, response_cls, **values):
         """Build, send, and resolve one twinkle-native request."""
+        self._ensure_created()
         body = build_request(model_cls, **values)
         response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
         return self._await_task(response, response_cls)

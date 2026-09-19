@@ -1,14 +1,14 @@
 import copy
-import sys
-import types
-
 import pytest
+import sys
 import torch
+import types
 from peft import LoraConfig, get_peft_model
 from peft.utils import set_peft_model_state_dict
 from torch import nn
 
 print(f"sys.path: {sys.path}")
+
 
 class FakePackedExperts(nn.Module):
 
@@ -95,11 +95,13 @@ def test_peft_target_parameter_key_shapes_for_3d_experts():
     state = peft_model.state_dict()
     lora_shapes = {key: tuple(state[key].shape) for key in state if "lora_" in key}
 
+    # PEFT 0.18.1 follows Linear's (out_features, in_features) convention for
+    # target parameters: A projects input->rank and B projects rank->output.
     assert lora_shapes == {
-        "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 12),
-        "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (4, 4),
-        "base_model.model.mlp.experts.lora_A.default.weight": (4, 4),
-        "base_model.model.mlp.experts.lora_B.default.weight": (6, 4),
+        "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 4),
+        "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (12, 4),
+        "base_model.model.mlp.experts.lora_A.default.weight": (4, 6),
+        "base_model.model.mlp.experts.lora_B.default.weight": (4, 4),
     }
 
 
@@ -122,10 +124,7 @@ def test_target_parameter_multi_lora_updates_only_active_adapter():
     manager.acquire("adapter_a", "lora_0", _make_target_cfg(r=2))
     manager.acquire("adapter_b", "lora_1", _make_target_cfg(r=2))
 
-    params_before = {
-        name: param.detach().clone()
-        for name, param in manager.named_slot_parameters("adapter_b")
-    }
+    params_before = {name: param.detach().clone() for name, param in manager.named_slot_parameters("adapter_b")}
 
     opt = torch.optim.SGD(manager.parameters_for_tenant("adapter_a"), lr=0.1)
     with manager.adapter("adapter_a"):
@@ -153,8 +152,7 @@ def test_multilora_releases_target_parameter_slot_to_initial_weights():
 
     initial_a = {
         name: param.detach().clone()
-        for name, param in multi_lora.target_parameter_manager.named_slot_parameters("adapter_a")
-        if ".lora_A." in name
+        for name, param in multi_lora.target_parameter_manager.named_slot_parameters("adapter_a") if ".lora_A." in name
     }
 
     with torch.no_grad():
@@ -170,7 +168,8 @@ def test_multilora_releases_target_parameter_slot_to_initial_weights():
             else:
                 assert torch.count_nonzero(param.detach()) == 0
 
-# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support 
+
+# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support
 # installing multiple LoRA slots on target parameters.
 # def test_target_parameter_state_dict_loads_with_peft():
 #     from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
@@ -296,11 +295,3 @@ def test_multilora_transformers_installs_target_parameters_once():
         pass
     else:
         raise AssertionError("different target_parameters should be rejected")
-
-# Run in the local environment.
-if __name__ == "__main__":
-    assert test_peft_target_parameter_key_shapes_for_3d_experts() == True
-    assert test_target_parameter_multi_lora_updates_only_active_adapter() == True
-    assert test_multilora_releases_target_parameter_slot_to_initial_weights() == True
-    assert test_multilora_state_dict_round_trips_target_parameters() == True
-    assert test_multilora_transformers_installs_target_parameters_once() == True
