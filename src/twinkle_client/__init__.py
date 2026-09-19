@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-from typing import Optional, TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .manager import TwinkleClient
@@ -35,11 +36,11 @@ def init_tinker_client(**kwargs) -> None:
 
 
 def init_twinkle_client(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
     session_heartbeat_interval: int = 10,
     **kwargs,
-) -> 'TwinkleClient':
+) -> TwinkleClient:
     """
     Initialize a Twinkle client.
 
@@ -64,7 +65,7 @@ def init_twinkle_client(
         An initialised :class:`~twinkle_client.manager.TwinkleClient` instance.
     """
     from .manager import TwinkleClient
-    return TwinkleClient(
+    return TwinkleClient.connect(
         base_url=base_url,
         api_key=api_key,
         session_heartbeat_interval=session_heartbeat_interval,
@@ -72,6 +73,7 @@ def init_twinkle_client(
     )
 
 
-from .data_plane import DataPlaneClient
+from .data_plane import DataPlaneClient  # noqa: E402  (late import: keeps optional data-plane dep off the hot path)
+from .http import ClientContext, ClientTransport  # noqa: E402
 
-__all__ = ['DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']
+__all__ = ['ClientContext', 'ClientTransport', 'DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']

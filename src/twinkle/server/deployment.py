@@ -35,16 +35,37 @@ from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
+from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.auth import verify_request_token
+from twinkle.server.validation.errors import register_validation_error_handler
 from twinkle.utils.logger import get_logger
+from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
 logger = get_logger()
 
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
 OnShutdown = Callable[[Any], Awaitable[None]]
+
+
+async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError) -> JSONResponse:
+    """Map a TwinkleServerError to a structured response, fields at the top level.
+
+    Status code is the exception's ``error_code``; the body is an ``ErrorPayload``
+    (``error`` / ``category`` / ``error_code`` / ``request_id``) placed at the top
+    level rather than nested under ``detail``. A Decision_Boundary-left rejection
+    (``category=user``) carries no traceback.
+    """
+    request_id = getattr(request.state, 'request_id', None) or ''
+    payload = ErrorPayload(
+        error=(str(exc) or exc.__class__.__name__),
+        category=exc.category,
+        error_code=exc.error_code,
+        request_id=request_id,
+    )
+    return JSONResponse(status_code=exc.error_code, content=payload.model_dump(mode='json', exclude_none=True))
 
 
 def get_servable() -> Any:
@@ -74,17 +95,20 @@ def build_deployment_app(
        shutdown → ``on_shutdown(get_servable())`` (best-effort) then
        ``flush_telemetry_safely()`` so buffered OTLP batches flush on graceful
        replica termination;
-    2. [if ``attach_cleanup_middleware``] the gateway-only lazy-cleanup
+    2. the ``TwinkleServerError`` and ``RequestValidationError`` handlers, so a
+       rejected request body carries the same ``ErrorPayload`` shape as any other
+       failure;
+    3. [if ``attach_cleanup_middleware``] the gateway-only lazy-cleanup
        middleware (registered first ⇒ innermost), since the Gateway has no
        per-handler hook;
-    3. ``catch_unhandled_exceptions`` middleware, inside auth/tracing/metrics
+    4. ``catch_unhandled_exceptions`` middleware, inside auth/tracing/metrics
        and outside cleanup/routes;
-    4. ``verify_token`` middleware;
-    5. ``create_tracing_middleware(component)``;
-    6. ``create_metrics_middleware(component)``;
-    7. [if ``attach_replica_id_header``] replica-id response header middleware
+    5. ``verify_token`` middleware;
+    6. ``create_tracing_middleware(component)``;
+    7. ``create_metrics_middleware(component)``;
+    8. [if ``attach_replica_id_header``] replica-id response header middleware
        (registered last ⇒ outermost);
-    8. ``register_routes(app, get_servable)``.
+    9. ``register_routes(app, get_servable)``.
 
     Args:
         component: ``'Gateway' | 'Model' | 'Sampler' | 'Processor'`` — used as
@@ -123,6 +147,12 @@ def build_deployment_app(
 
     app = FastAPI(lifespan=lifespan, **(fastapi_kwargs or {}))
 
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
+    # Request-body validation failures answer with the same ``ErrorPayload`` shape as
+    # every other error, registered here so all deployments behave identically rather
+    # than each app keeping (or forgetting) its own copy.
+    register_validation_error_handler(app)
+
     # Registration order matters: FastAPI runs middleware LIFO, so the LAST
     # registered wraps the outermost layer. Register cleanup (if any) first so
     # it stays innermost, then the exception boundary, auth, tracing, metrics,
@@ -142,10 +172,21 @@ def build_deployment_app(
     async def catch_unhandled_exceptions(request: Request, call_next):
         try:
             return await call_next(request)
-        except Exception:
-            error = traceback.format_exc()
-            logger.error(error)
-            return JSONResponse(status_code=500, content={'detail': error})
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error(tb)
+            # Unify the last-resort 500 with the rest of the wire: an
+            # ``ErrorPayload`` body (Server category keeps the traceback) instead
+            # of the legacy ``{'detail': <traceback>}`` shape.
+            request_id = getattr(request.state, 'request_id', None) or ''
+            payload = ErrorPayload(
+                error=(str(exc) or exc.__class__.__name__),
+                category=ErrorCategory.Server,
+                error_code=500,
+                request_id=request_id,
+                traceback=tb,
+            )
+            return JSONResponse(status_code=500, content=payload.model_dump(mode='json', exclude_none=True))
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):

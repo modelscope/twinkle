@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Any
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat()
+    # UTC-aware so _parse_timestamp (which reads timestamps back as UTC) agrees with
+    # it and with time.time(); a naive local string would be misread as UTC and skew
+    # every expiry comparison by the host's UTC offset.
+    return datetime.now(timezone.utc).isoformat()
 
 
 class SessionRecord(BaseModel):
@@ -53,5 +56,8 @@ class FutureRecord(BaseModel):
     result: Any = None
     queue_state: str | None = None
     queue_state_reason: str | None = None
+    # Replica ownership and deadline are fixed when the record is created.
+    replica_id: str | None = None
+    absolute_deadline: float | None = None
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)

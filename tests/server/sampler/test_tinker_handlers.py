@@ -20,6 +20,7 @@ class _DummySampler:
 
     def __init__(self):
         self.adapter_paths = []
+        self.sampling_params = []
 
     def set_template(self, *args, **kwargs):
         return None
@@ -29,6 +30,7 @@ class _DummySampler:
 
     def sample(self, inputs, sampling_params=None, adapter_name='', *, adapter_path=None, **kwargs):
         self.adapter_paths.append(adapter_path)
+        self.sampling_params.append(sampling_params)
         return [
             SampleResponse(
                 sequences=[SampledSequence(
@@ -52,6 +54,9 @@ class _DummyManagement:
     async def schedule_task(self, task, **kwargs):
         return await task()
 
+    async def call_backend(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
 
 @pytest.mark.asyncio
 async def test_tinker_asample_allows_base_model_session_without_model_path():
@@ -71,4 +76,6 @@ async def test_tinker_asample_allows_base_model_session_without_model_path():
     response = await route.endpoint(request, body, management)
 
     assert isinstance(response, types.SampleResponse)
+    assert response.sequences[0].tokens == [1, 2]
     assert management.sampler.adapter_paths == [None]
+    assert management.sampler.sampling_params[0].logprobs == 1

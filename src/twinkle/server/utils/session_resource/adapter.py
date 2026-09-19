@@ -11,8 +11,6 @@ to handle expired adapters without using callbacks or polling.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from twinkle.utils.logger import get_logger
 from .base import SessionResourceMixin
 
@@ -29,9 +27,9 @@ class AdapterManagerMixin(SessionResourceMixin):
     1. Call _init_adapter_manager() in __init__
     2. Override _on_adapter_expired() to customize expiration handling
 
-    Attributes:
-        _adapter_timeout: Session inactivity timeout in seconds used to determine if a session is alive.
-        _adapter_max_lifetime: Maximum lifetime in seconds for any adapter, regardless of session liveness.
+    The inactivity timeout / max lifetime are stored on the base mixin as
+    ``_resource_timeout`` / ``_resource_max_lifetime`` (set via
+    ``_init_adapter_manager``).
     """
 
     # Set resource type for logging
@@ -57,23 +55,13 @@ class AdapterManagerMixin(SessionResourceMixin):
             resource_max_lifetime=adapter_max_lifetime,
         )
 
-    @property
-    def _adapter_timeout(self) -> float:
-        """Adapter timeout for backward compatibility."""
-        return self._resource_timeout
-
-    @property
-    def _adapter_max_lifetime(self) -> float | None:
-        """Adapter max lifetime for backward compatibility."""
-        return self._resource_max_lifetime
-
-    @property
-    def _adapter_records(self) -> dict[str, dict[str, Any]]:
-        """Adapter records for backward compatibility."""
-        return self._resource_records
-
     async def _on_resource_expired(self, resource_id: str) -> None:
-        """Internal hook called by base class. Delegates to _on_adapter_expired."""
+        """Base-class expiry hook; forwards to the domain hook ``_on_adapter_expired``.
+
+        ``_on_adapter_expired`` is the supported extension point: the adapter-domain
+        name is kept deliberately so subclass authors override a method named for
+        adapters rather than the generic base-class resource hook.
+        """
         await self._on_adapter_expired(resource_id)
 
     async def _on_adapter_expired(self, adapter_name: str) -> None:
@@ -103,7 +91,3 @@ class AdapterManagerMixin(SessionResourceMixin):
             The adapter name to use
         """
         return adapter_name
-
-    def stop_adapter_countdown(self) -> None:
-        """Stop the background countdown task."""
-        self.stop_resource_countdown()

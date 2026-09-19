@@ -1,76 +1,94 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Pydantic request/response models for twinkle sampler endpoints.
+"""Request / response models for the twinkle-native sampler endpoints.
 
-These models are used by both the server-side handler and the twinkle client.
+Shared by the server handler and the twinkle client. Field roles follow
+:mod:`twinkle_client.types.base`; the sampler handlers pass everything they need
+explicitly, so these requests carry control fields and -- for the template setter --
+one passthrough region, and no free-floating backend kwargs.
+
+Class names carry a ``Sampler`` prefix wherever ``model.py`` already owns the bare
+name (``AddAdapterRequest``, ``SetTemplateRequest``, ``CreateResponse`` and their
+responses). The two modules describe *different* endpoints with different field sets;
+a shared bare name is distinguished only by an import alias and, when a handler does
+``import twinkle_client.types as types``, silently resolves to whichever module the
+package ``__init__`` re-exported first -- which is how the sampler endpoints once
+bound ``model.py``'s schema. Prefixing at the definition site removes the ambiguity,
+matching :mod:`twinkle_client.types.processor`.
 """
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from pydantic import Field, JsonValue
 from typing import Any, Dict, List, Literal, Optional, Tuple
+
+from .base import ResponseModel, StrictRequest, passthrough
+from .data import WireInputBatch
 
 StopReason = Literal['length', 'stop', 'abort', 'error']
 
 
-class SampleRequest(BaseModel):
-    """Request body for the /sample endpoint."""
-    inputs: Any = Field(..., description='List of Trajectory or InputFeature dicts')
-    sampling_params: Optional[Dict[str, Any]] = Field(
+class SampleRequest(StrictRequest):
+    """Request body for the ``/sample`` and ``/sample_stream`` endpoints.
+
+    ``num_samples`` is not a top-level field: it is a sampling parameter and
+    ``SamplingParams.from_dict(sampling_params)`` is the one place sampling
+    parameters are built. A second, top-level spelling would be a second source of
+    truth for the same value.
+    """
+
+    inputs: WireInputBatch = Field(..., description='Trajectory or InputFeature entries to sample from')
+    sampling_params: dict[str, JsonValue] | None = Field(
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
-    adapter_uri: Optional[str] = Field(
-        None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
+    adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
 
 
-class SampledSequenceModel(BaseModel):
+class SampledSequenceModel(ResponseModel):
     """A single sampled sequence, mirroring twinkle.data_format.SampledSequence."""
     stop_reason: StopReason = Field(..., description="Stop reason: 'length' or 'stop'")
-    tokens: List[int] = Field(..., description='Token IDs of the sampled sequence')
-    logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = Field(None, description='Per-token log-probabilities')
-    decoded: Optional[str] = Field(None, description='Decoded text of the sampled sequence')
-    new_input_feature: Optional[Dict[str, Any]] = Field(
+    tokens: list[int] = Field(..., description='Token IDs of the sampled sequence')
+    logprobs: list[list[tuple[int, float]] | None] | None = Field(None, description='Per-token log-probabilities')
+    decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
+    new_input_feature: dict[str, Any] | None = Field(
         None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
 
 
-class SampleResponseModel(BaseModel):
+class SampleResponseModel(ResponseModel):
     """Mirroring twinkle.data_format.SampleResponse."""
-    sequences: List[SampledSequenceModel] = Field(
-        ..., description='List of sampled sequences')
-    prompt_token_ids: Optional[List[int]] = Field(
-        None, description='Token IDs of the prompt the sequences continue')
-    prompt_logprobs: Optional[List[Optional[float]]] = None
-    topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
+    sequences: list[SampledSequenceModel] = Field(..., description='List of sampled sequences')
+    prompt_token_ids: list[int] | None = Field(None, description='Token IDs of the prompt the sequences continue')
+    prompt_logprobs: list[float | None] | None = None
+    topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
 
 
-class SampleResponseModelList(BaseModel):
+class SampleResponseModelList(ResponseModel):
     """Response body for the /sample endpoint"""
-    samples: List[SampleResponseModel] = Field(..., description='List of sample responses')
+    samples: list[SampleResponseModel] = Field(..., description='List of sample responses')
 
 
-class SetTemplateRequest(BaseModel):
-    """Request body for the /set_template endpoint."""
+class SamplerSetTemplateRequest(StrictRequest):
+    """Request body for the sampler ``/set_template`` endpoint."""
     template_cls: str = Field(..., description="Template class name (e.g. 'Template')")
     adapter_name: str = Field('', description='Adapter name to associate the template with')
-
-    class Config:
-        extra = 'allow'
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class SetTemplateResponse(BaseModel):
-    """Response body for the /set_template endpoint."""
+class SamplerSetTemplateResponse(ResponseModel):
+    """Response body for the sampler /set_template endpoint."""
     status: str = 'ok'
 
 
-class AddAdapterRequest(BaseModel):
-    """Request body for the /add_adapter_to_sampler endpoint."""
+class SamplerAddAdapterRequest(StrictRequest):
+    """Request body for the ``/add_adapter_to_sampler`` endpoint."""
     adapter_name: str = Field(..., description='Name of the adapter to add')
     config: Any = Field(..., description='LoRA configuration dict')
 
 
-class AddAdapterResponse(BaseModel):
+class SamplerAddAdapterResponse(ResponseModel):
     """Response body for the /add_adapter_to_sampler endpoint."""
     status: str = 'ok'
     adapter_name: str
 
 
-class CreateResponse(BaseModel):
-    """Response body for the /create endpoint."""
+class SamplerCreateResponse(ResponseModel):
+    """Response body for the sampler /create endpoint."""
     status: str = 'ok'

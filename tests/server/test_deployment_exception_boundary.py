@@ -34,8 +34,14 @@ def test_deployment_app_catches_unhandled_route_exception_and_keeps_serving(monk
     response = client.get('/boom', headers={'x-request-id': 'boundary-test'})
     assert response.status_code == 500
     assert response.headers['X-Twinkle-Replica-Id'] == 'replica-test'
-    assert 'Traceback' in response.json()['detail']
-    assert 'RuntimeError: boom with replica header' in response.json()['detail']
+    # Unhandled exceptions now return the unified ErrorPayload (Server category
+    # keeps the traceback) instead of the legacy {'detail': <traceback>} shape.
+    body = response.json()
+    assert body['category'] == 'server'
+    assert body['error_code'] == 500
+    assert body['error'] == 'boom with replica header'
+    assert 'Traceback' in body['traceback']
+    assert 'RuntimeError: boom with replica header' in body['traceback']
 
     response = client.get('/healthz')
     assert response.status_code == 200

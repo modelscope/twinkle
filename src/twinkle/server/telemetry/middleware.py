@@ -24,7 +24,7 @@ from collections.abc import Callable
 from pydantic import BaseModel, ConfigDict
 from typing import Any
 
-from twinkle.server.telemetry import MetricsRegistry
+from twinkle.server.telemetry.metrics import MetricsRegistry
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

@@ -11,6 +11,7 @@ actor in front.
 from __future__ import annotations
 
 import functools
+import time
 
 from .backend.base import StateBackend
 from .base import BaseManager
@@ -100,6 +101,28 @@ class ModelManager(BaseManager[ModelRecord]):
         for model_id in loaded:
             await self.remove(model_id)
         await self._replicas.unregister(replica_id)
+
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        """Refresh a replica's liveness timestamp."""
+        await self._replicas.touch_last_seen(replica_id)
+
+    async def get_alive_replica_ids(self, liveness_threshold: float) -> set[str]:
+        """Return replicas considered alive.
+
+        A replica is alive when it has a ``last_seen`` within ``liveness_threshold``,
+        OR when it has a ``max_loras`` entry but no ``last_seen`` yet (registered
+        before this spec / before its first request -- treated as alive so an
+        upgrade does not orphan in-flight tasks).
+        """
+        registered = await self._replicas.get_all()
+        last_seen = await self._replicas.get_all_last_seen()
+        now = time.time()
+        alive: set[str] = set()
+        for rid in set(registered) | set(last_seen):
+            ls = last_seen.get(rid)
+            if (ls is None and rid in registered) or (ls is not None and (now - ls) <= liveness_threshold):
+                alive.add(rid)
+        return alive
 
     async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
         """Return the subset of ``candidate_ids`` that still have capacity.

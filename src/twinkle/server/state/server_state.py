@@ -280,6 +280,35 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
+    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int) -> str | None:
+        """Idempotency claim for a client seq_id.
+
+        Atomically records ``dedup_key -> request_id`` if unseen and returns ``None``
+        (caller proceeds to enqueue). If the key already exists, returns the prior
+        ``request_id`` so the caller can return that task's envelope instead of
+        enqueuing a duplicate. ``ttl`` bounds the dedup window.
+        """
+        if await self._backend.set_nx(dedup_key, request_id, ttl=ttl):
+            return None
+        return await self._backend.get(dedup_key)
+
+    async def release_seq(self, dedup_key: str) -> None:
+        """Drop a seq dedup claim (used when the claimed request never enqueued, e.g.
+        preflight rejected it) so a retry can be admitted rather than see a phantom."""
+        await self._backend.delete(dedup_key)
+
+    async def cancel_future(self, request_id: str) -> dict[str, Any]:
+        """Best-effort cancel: drop the task iff it has not started running.
+
+        Returns ``{'cancelled': bool, 'state': str}`` where ``state`` is the task's
+        status after the attempt (``cancelled`` if just dropped or already cancelled,
+        ``running``/``completed``/``failed`` if too late, ``not_found`` if unknown).
+        """
+        status = await self._future_mgr.cancel_if_pending(request_id)
+        if status is None:
+            return {'cancelled': False, 'state': 'not_found'}
+        return {'cancelled': status == 'cancelled', 'state': status}
+
     async def store_future_status(
         self,
         request_id: str,
@@ -289,6 +318,8 @@ class ServerState:
         result: Any = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
+        replica_id: str | None = None,
+        absolute_deadline: float | None = None,
     ) -> None:
         """Store task status with optional result.
 
@@ -298,13 +329,12 @@ class ServerState:
         - RUNNING: Task currently executing
         - COMPLETED: Task completed successfully (result required)
         - FAILED: Task failed with error (result contains error payload)
-        - RATE_LIMITED: Task rejected due to rate limiting (reason required)
 
         Args:
             request_id: Unique identifier for the request.
-            status: Task status string (pending/queued/running/completed/failed/rate_limited).
+            status: Task status string (pending/queued/running/completed/failed).
             model_id: Optional associated model_id.
-            reason: Optional reason string (used for rate_limited status).
+            reason: Optional reason string.
             result: Optional result data (used for completed/failed status).
             queue_state: Optional queue state for tinker client (active/paused_rate_limit/paused_capacity).
             queue_state_reason: Optional reason for the queue state.
@@ -317,6 +347,8 @@ class ServerState:
             result=result,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
+            replica_id=replica_id,
+            absolute_deadline=absolute_deadline,
         )
 
     # ----- Configuration Management -----
@@ -370,7 +402,9 @@ class ServerState:
         models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
         samplings_removed = await self._sampling_mgr.cleanup_expired(
             cutoff_time, expired_session_ids=expired_session_ids)
-        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time)
+
+        alive_replica_ids = await self._model_mgr.get_alive_replica_ids(self.expiration_timeout)
+        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time, alive_replica_ids=alive_replica_ids)
 
         return {
             'sessions': sessions_removed,
@@ -378,6 +412,10 @@ class ServerState:
             'sampling_sessions': samplings_removed,
             'futures': futures_removed,
         }
+
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        """Refresh a replica's liveness timestamp in the shared registry."""
+        await self._model_mgr.touch_replica_last_seen(replica_id)
 
     async def _cleanup_loop(self) -> None:
         """Background task that periodically cleans up expired resources.
@@ -579,14 +617,21 @@ class ServerState:
 
 _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 
+# ServerState policy defaults. Used when neither an explicit argument nor a
+# launcher-propagated env var (``ServerStateArgs.from_env``) supplies a value.
+_DEFAULT_EXPIRATION_TIMEOUT = 86400.0  # 24 hours in seconds
+_DEFAULT_CLEANUP_INTERVAL = 3600.0  # 1 hour in seconds
+_DEFAULT_PER_TOKEN_MODEL_LIMIT = 30
+_DEFAULT_METRICS_UPDATE_INTERVAL = 15.0
+
 
 def get_server_state(actor_name: str = 'twinkle_server_state',
                      backend: StateBackend | None = None,
                      persistence_config: PersistenceConfig | None = None,
-                     expiration_timeout: float = 86400.0,
-                     cleanup_interval: float = 3600.0,
-                     per_token_model_limit: int = 30,
-                     metrics_update_interval: float = 15.0) -> ServerState:
+                     expiration_timeout: float | None = None,
+                     cleanup_interval: float | None = None,
+                     per_token_model_limit: int | None = None,
+                     metrics_update_interval: float | None = None) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
     Within one process the same ``actor_name`` returns the same cached instance
@@ -617,6 +662,28 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     if cached is not None:
         return cached
 
+    # Resolve the ServerState policy: an explicit argument wins, else the
+    # launcher-propagated env (so a non-gateway worker honours the operator's
+    # YAML instead of the hardcoded default), else the module default.
+    from twinkle.server.config.application_spec import ServerStateArgs
+    env_policy = ServerStateArgs.from_env()
+
+    def _resolve(explicit, env_value, default):
+        if explicit is not None:
+            return explicit
+        if env_value is not None:
+            return env_value
+        return default
+
+    expiration_timeout = _resolve(expiration_timeout, getattr(env_policy, 'expiration_timeout', None),
+                                  _DEFAULT_EXPIRATION_TIMEOUT)
+    cleanup_interval = _resolve(cleanup_interval, getattr(env_policy, 'cleanup_interval', None),
+                                _DEFAULT_CLEANUP_INTERVAL)
+    per_token_model_limit = _resolve(per_token_model_limit, getattr(env_policy, 'per_token_model_limit', None),
+                                     _DEFAULT_PER_TOKEN_MODEL_LIMIT)
+    metrics_update_interval = _resolve(metrics_update_interval, getattr(env_policy, 'metrics_update_interval', None),
+                                       _DEFAULT_METRICS_UPDATE_INTERVAL)
+
     state = ServerState(
         backend=backend,
         persistence_config=persistence_config,
@@ -626,6 +693,10 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
         metrics_update_interval=metrics_update_interval,
     )
     _PROCESS_STATE_CACHE[actor_name] = state
+    logger.info(
+        'ServerState policy in effect: per_token_model_limit=%s expiration_timeout=%s '
+        'cleanup_interval=%s metrics_update_interval=%s (resolution: explicit>env>default)', per_token_model_limit,
+        expiration_timeout, cleanup_interval, metrics_update_interval)
     # Cleanup task is started by the deployment's FastAPI ``lifespan`` hook
     # via ``await state.start_cleanup_task()`` — that's the single async
     # entry point each worker has, so we don't need any sync-context

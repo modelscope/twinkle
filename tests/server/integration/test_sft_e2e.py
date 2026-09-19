@@ -5,6 +5,12 @@ Tests SFT training across all 4 combinations:
   - Twinkle client x (transformers | megatron)
   - Tinker client x (transformers | megatron)
 
+Each test also verifies save-LoRA + resume-training succeeds: after the training
+loop it saves a checkpoint (Twinkle ``model.save``; Tinker ``save_state``), resumes
+(Twinkle ``resume_from_checkpoint``; Tinker
+``create_training_client_from_state_with_optimizer``), and runs a few more steps
+that must complete without timeout.
+
 Backend selection via env var TWINKLE_TEST_BACKEND (default: transformers).
 
 ## How to run
@@ -45,6 +51,7 @@ from tests.server.integration.e2e_helpers import (
     create_tinker_training_client,
     create_twinkle_sft_model,
     get_backend,
+    init_tinker_client_session,
     init_twinkle_client_session,
     log,
     wait_for_server,
@@ -52,6 +59,7 @@ from tests.server.integration.e2e_helpers import (
 
 # ── Configuration ──
 SFT_TRAIN_STEPS = 20  # 20 steps ensures enough training for both backends
+SFT_RESUME_STEPS = 3  # post-resume steps that must run without timeout
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -107,7 +115,32 @@ def test_sft_twinkle():
     # Assertions — both backends should report real loss via calculate_metric
     assert len(losses) >= 4, f'Expected at least 4 logged losses, got {len(losses)}'
     assert_loss_decreases(losses, 'sft_twinkle')
-    log(f'test_sft_twinkle PASSED (backend={backend})')
+
+    # ── Save LoRA + resume training (must succeed) ──
+    save_resp = model.save(
+        name='sft-twinkle-resume',
+        save_optimizer=True,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    )
+    ckpt = save_resp.twinkle_path
+    assert ckpt, 'save() did not return a twinkle_path'
+    log(f'saved LoRA checkpoint: {ckpt}')
+
+    progress = model.resume_from_checkpoint(ckpt)
+    log(f'resumed from checkpoint: {progress}')
+
+    resume_loader = DataLoader(dataset=create_sft_dataset(), batch_size=4)
+    resumed = 0
+    for step, batch in enumerate(resume_loader):
+        if step >= SFT_RESUME_STEPS:
+            break
+        t0 = time.time()
+        model.forward_backward(inputs=batch)
+        model.clip_grad_and_step()
+        assert_no_timeout(time.time() - t0, f'sft_twinkle resume step {step}')
+        resumed += 1
+    assert resumed == SFT_RESUME_STEPS, f'expected {SFT_RESUME_STEPS} post-resume steps, ran {resumed}'
+    log(f'test_sft_twinkle PASSED (backend={backend}) [+save LoRA +resume]')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -171,7 +204,31 @@ def test_sft_tinker():
     # Assertions
     assert len(losses) >= 4, f'Expected at least 4 logged losses, got {len(losses)}'
     assert_loss_decreases(losses, 'sft_tinker')
-    log(f'test_sft_tinker PASSED (backend={backend})')
+
+    # ── Save state + resume training (must succeed) ──
+    save_result = training_client.save_state('sft-tinker-resume').result()
+    state_path = save_result.path
+    assert state_path, 'save_state() did not return a path'
+    log(f'saved tinker state: {state_path}')
+
+    # Resume restores both weights and optimizer state into a fresh client.
+    service_client = init_tinker_client_session()
+    resumed_client = service_client.create_training_client_from_state_with_optimizer(path=state_path)
+    log('resumed tinker training client from saved state')
+
+    resume_loader = DataLoader(dataset=create_sft_dataset(), batch_size=4)
+    resumed = 0
+    for step, batch in enumerate(resume_loader):
+        if step >= SFT_RESUME_STEPS:
+            break
+        input_datums = [input_feature_to_datum(input_feature) for input_feature in batch]
+        t0 = time.time()
+        resumed_client.forward_backward(input_datums, 'cross_entropy').result()
+        resumed_client.optim_step(types.AdamParams(learning_rate=1e-4)).result()
+        assert_no_timeout(time.time() - t0, f'sft_tinker resume step {step}')
+        resumed += 1
+    assert resumed == SFT_RESUME_STEPS, f'expected {SFT_RESUME_STEPS} post-resume steps, ran {resumed}'
+    log(f'test_sft_tinker PASSED (backend={backend}) [+save state +resume]')
 
 
 # ── Direct execution ──

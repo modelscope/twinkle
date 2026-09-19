@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 import twinkle_client.types as types
 from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
+from twinkle.server.utils.auth import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -45,7 +44,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_type_name = body.processor_type
         class_type = body.class_type
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.init_kwargs)
 
         assert processor_type_name in _PROCESSOR_TYPES, f'Invalid processor type: {processor_type_name}'
         processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
@@ -61,6 +60,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         _kwargs.pop('remote_group', None)
         _kwargs.pop('device_mesh', None)
 
+        from twinkle_client.common.serialize import deserialize_object
         resolved_kwargs = {}
         for key, value in _kwargs.items():
             if isinstance(value, str) and value.startswith('pid:'):
@@ -98,7 +98,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_id = body.processor_id
         function_name = body.function
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.call_kwargs)
         processor_id = processor_id[4:]
         self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)
@@ -107,6 +107,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         assert function is not None, f'`{function_name}` not found in {processor.__class__}'
         assert hasattr(function, '_execute'), f'Cannot call inner method of {processor.__class__}'
 
+        from twinkle_client.common.serialize import deserialize_object
         resolved_kwargs = {}
         for key, value in _kwargs.items():
             if isinstance(value, str) and value.startswith('pid:'):

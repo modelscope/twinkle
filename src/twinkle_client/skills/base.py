@@ -14,9 +14,10 @@ To create a new provider, subclass SkillProvider and implement:
 from __future__ import annotations
 
 import dataclasses
-from twinkle.utils.logger import get_logger
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 

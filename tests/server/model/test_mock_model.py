@@ -47,7 +47,6 @@ _REQUIRED_METHODS = (
     'save',
     'load',
     'resume_from_checkpoint',
-    'get_state_dict',
     'get_train_configs',
     'add_adapter',
     'add_adapter_to_model',

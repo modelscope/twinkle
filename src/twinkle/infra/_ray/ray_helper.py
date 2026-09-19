@@ -137,10 +137,17 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
-        """Execute method and return results."""
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], timeout=None):
+        """Execute method and return results.
+
+        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
+        the **total** wall-clock time to collect the whole list -- different from
+        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
+        The two paths are each bounded on their own; the total-time semantics here
+        are strictly tighter.
+        """
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args), timeout=timeout)
 
     @staticmethod
     def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):

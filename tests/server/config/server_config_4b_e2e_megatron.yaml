@@ -36,6 +36,7 @@ applications:
       backend: megatron
       model_id: "ms://Qwen/Qwen3.5-4B"
       max_length: 10240
+      max_loras: 10
       nproc_per_node: 4
       device_group:
         name: model

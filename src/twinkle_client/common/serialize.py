@@ -8,12 +8,7 @@ from typing import Any, Mapping
 
 from twinkle.dataset import DatasetMeta
 
-supported_types = {
-    DatasetMeta,
-    LoraConfig,
-}
-
-primitive_types = (str, Number, bool, bytes, type(None))
+primitive_types = (str, Number, bool, type(None))
 container_types = (Mapping, list, tuple, set, frozenset)
 basic_types = (*primitive_types, *container_types)
 _DATASET_META_FIELDS = {field.name for field in fields(DatasetMeta)}
@@ -45,7 +40,9 @@ def _deserialize_data_slice(data_slice):
     raise ValueError(f'Unsupported data_slice type: {slice_type}')
 
 
-def serialize_object(obj) -> str:
+def serialize_object(obj) -> Any:
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        raise TypeError(f'Unsupported binary object: {type(obj).__name__}')
     if isinstance(obj, DatasetMeta):
         data = {name: getattr(obj, name) for name in _DATASET_META_FIELDS}
         data['data_slice'] = _serialize_data_slice(data.get('data_slice'))

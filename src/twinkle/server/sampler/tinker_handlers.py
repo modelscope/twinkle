@@ -18,10 +18,28 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.sampler.weights import resolve_sampler_weights
 from twinkle.server.utils import get_template_for_model
+from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _sampled_sequence(*, stop_reason, tokens, logprobs):
+    return types.SampledSequence(
+        stop_reason=stop_reason,
+        tokens=tokens,
+        logprobs=logprobs,
+    )
+
+
+def _sample_response(*, sequences, prompt_logprobs, topk_prompt_logprobs):
+    return types.SampleResponse(
+        sequences=sequences,
+        prompt_logprobs=prompt_logprobs,
+        topk_prompt_logprobs=topk_prompt_logprobs,
+    )
 
 
 def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -52,9 +70,12 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Set template for sampler based on model type
                 template = get_template_for_model(self.model_id)
-                self.sampler.set_template(template, model_id=self.model_id)
-                # Reset prefix cache for new weights
-                self.sampler.reset_prefix_cache()
+                await self.call_backend(self.sampler.set_template, template, model_id=self.model_id)
+                # Reset prefix cache unconditionally on every tinker request (by
+                # design): the tinker dialect does not signal whether weights
+                # changed, so it always invalidates. This differs from the twinkle
+                # endpoints, which reset only when an adapter_uri is supplied.
+                await self.call_backend(self.sampler.reset_prefix_cache)
 
                 # Get model_path from body or sampling session
                 model_path = body.model_path
@@ -71,10 +92,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Base-model sampling is valid when no model_path was provided.
                 if adapter_uri and not os.path.exists(adapter_uri):
-                    return types.RequestFailedResponse(
-                        error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
 
                 # Convert tinker SamplingParams to twinkle SamplingParams if needed
                 sampling_params = None
@@ -85,20 +103,19 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         top_p=body.sampling_params.top_p,
                         top_k=body.sampling_params.top_k,
                         stop=body.sampling_params.stop,
+                        # tinker 0.16.1 has no SamplingParams.logprobs field, but its
+                        # SampledSequence contract and GRPO training require one
+                        # chosen-token logprob per generated token.
+                        logprobs=1,
                     )
 
-                # A resolved checkpoint is either a LoRA adapter dir (has
-                # adapter_config.json) or a full-parameter HF checkpoint. Full
-                # checkpoints are loaded into the sampler base model instead of
-                # being passed as a LoRA adapter.
-                lora_path = None
-                if adapter_uri:
-                    if os.path.exists(os.path.join(adapter_uri, 'adapter_config.json')):
-                        lora_path = adapter_uri
-                    else:
-                        self.sampler.load_full_weights_from_path(adapter_uri)
+                # LoRA adapter dir vs full-parameter checkpoint (shared helper);
+                # a full checkpoint is loaded into the base model and yields no
+                # LoRA path.
+                lora_path = await resolve_sampler_weights(self, adapter_uri)
 
-                responses = self.sampler.sample(
+                responses = await self.call_backend(
+                    self.sampler.sample,
                     inputs=[prompt_inputs] * body.num_samples,
                     sampling_params=sampling_params,
                     adapter_path=lora_path,
@@ -116,25 +133,26 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                                 flattened = [float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list]
                             except (IndexError, TypeError):
                                 flattened = []
-                            if flattened and len(flattened) == len(seq.logprobs):
+                            if len(flattened) == len(seq.tokens):
                                 logprobs = flattened
+                            else:
+                                raise RuntimeError(
+                                    f'Sampler returned {len(flattened)} logprobs for {len(seq.tokens)} generated '
+                                    'tokens; refusing to return a misaligned Tinker SampledSequence.')
                         tinker_sequences.append(
-                            types.SampledSequence(
+                            _sampled_sequence(
                                 stop_reason=seq.stop_reason,
                                 tokens=list(seq.tokens),
                                 logprobs=logprobs,
                             ))
-                return types.SampleResponse(
+                return _sample_response(
                     sequences=tinker_sequences,
                     prompt_logprobs=responses[0].prompt_logprobs,
                     topk_prompt_logprobs=responses[0].topk_prompt_logprobs,
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         input_tokens = len(body.prompt.to_ints())
         return await self.schedule_task(

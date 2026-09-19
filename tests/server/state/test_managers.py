@@ -173,6 +173,12 @@ class TestModelManager:
         assert info['free_loras'] == 5
 
     @pytest.mark.asyncio
+    async def test_liveness_only_replica_is_alive(self, manager):
+        await manager.touch_replica_last_seen('sampler-replica')
+        alive = await manager.get_alive_replica_ids(liveness_threshold=60)
+        assert 'sampler-replica' in alive
+
+    @pytest.mark.asyncio
     async def test_capacity_info_after_add(self, manager):
         await manager.register_replica('r1', max_loras=3)
         record = ModelRecord(token='tok1', replica_id='r1')

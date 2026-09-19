@@ -183,10 +183,10 @@ telemetry:
   otlp_endpoint: http://localhost:4317
 
 # Persistence: storage backend for ServerState (sessions, models, futures, etc.)
-#   mode: memory | file | redis
+#   mode: memory | redis
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
+  mode: redis
+  redis_url: redis://localhost:6379/0
 
 # Application list: Each entry defines a service component deployed on the Server
 applications:
@@ -350,7 +350,7 @@ The difference from the Megatron backend is only in the `backend` parameter of t
 | `proxy_location` | HTTP proxy location (`EveryNode` or `HeadOnly`) |
 | `http_options` | HTTP listener config (`host`, `port`) |
 | `telemetry` | Observability config (`enabled`, `otlp_endpoint`) |
-| `persistence` | State persistence config (`mode`, `file_path`, `redis_url`) |
+| `persistence` | State persistence config (`mode`, `redis_url`) |
 | `applications` | Application component list |
 
 > The config file uses strict validation (`extra='forbid'`). Any misspelled field name will be rejected before startup. Use `twinkle-server check-config -c xxx.yaml` to detect errors early.
@@ -418,8 +418,7 @@ Storage backend for ServerState (sessions, models, futures, etc.).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | str | `memory` | `memory` / `file` / `redis` |
-| `file_path` | str | — | Required for `file` mode, JSON file path |
+| `mode` | str | `memory` | `memory` / `redis` |
 | `redis_url` | str | — | Required for `redis` mode, e.g. `redis://localhost:6379` |
 | `key_prefix` | str | `""` | Optional global key prefix |
 
@@ -450,3 +449,33 @@ twinkle-server check-config -c server_config.yaml
 | `use_megatron: false` | `backend: transformers` |
 
 Additionally, this refactor introduces two new top-level fields — `telemetry` and `persistence` — which did not exist before. Add them as needed.
+
+## Execution time bounds
+
+Every backend call has a finite time bound. `T` is the effective task execution
+timeout: it equals `execution_timeout`, or `3600s` when that setting is `0`.
+`asyncio.wait_for` uses `T`. The Ray wait uses `R`, which is a method's explicit
+constant timeout when present and otherwise `T`. The default `T` is `1800s`.
+
+Two distinct bounds follow, and they must not be collapsed into one number:
+
+| Bound | Expression | Meaning |
+|-------|------------|---------|
+| Record-terminal bound | `queue_timeout + T` | After this, a task's future record is guaranteed to be in a terminal state (`completed`/`failed`). Use it for alerting thresholds and client polling total-timeout. |
+| Resource-release bound | `Collect_Width × R` from execution start, or `queue_timeout + Collect_Width × R` from submission | After this, the executor thread and the in-flight model-actor call for that task are guaranteed to have finished. Use it for capacity planning. |
+
+`Collect_Width = len(self._actors) = world_size = tp × pp × dp` — the number of
+futures each `remote_function` collection waits on per call. Evidence:
+`LazyCollect._get_result` iterates `self._futures`, which come from
+`_get_workers(self._actors, execute)` (`infra/__init__.py`), covering every actor —
+not just the data-parallel width. On a `tp=8` deployment the execution-start
+resource-release bound is therefore `8 × R`, not `R`.
+
+After the task record becomes terminal, the per-replica Admission_Gate can remain
+closed for at most `max(0, Collect_Width × R − T)`: the record is already terminal,
+but a leaked executor thread may still hold the gate until its `ray.get` returns or
+raises. During that window newly arriving tasks fail fast with a `server`/503 error.
+
+Each persisted future stores its immutable `absolute_deadline` when it is created.
+Cleanup therefore reaches the same decision regardless of which deployment process
+holds the cleanup lease.

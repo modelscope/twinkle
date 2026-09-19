@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from numbers import Number
-from typing import Any
-
 from pydantic import BaseModel
-
+from typing import Any
 
 _PRIMITIVE_TYPES = (str, Number, bool, bytes, type(None))
 

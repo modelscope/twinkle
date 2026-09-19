@@ -12,12 +12,13 @@ Public exports (backward-compatible with the former task_queue.py module):
 from .config import TaskQueueConfig
 from .mixin import TaskQueueMixin
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import QueuedTask, QueueState, TaskStatus, UserTaskError
 from .worker import ComputeWorker
 
 __all__ = [
     'TaskStatus',
     'QueueState',
+    'UserTaskError',
     'QueuedTask',
     'TaskQueueConfig',
     'TaskQueueMixin',

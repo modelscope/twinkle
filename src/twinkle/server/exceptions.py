@@ -1,16 +1,46 @@
-"""Twinkle Server unified exception hierarchy."""
+"""Twinkle Server unified exception hierarchy.
+
+Every exception carries an ``error_code`` (an HTTP-status-shaped int in 400-599) and
+a ``category`` (:class:`ErrorCategory`). A single ``TwinkleServerError`` exception
+handler (see the gateway/model/sampler apps) reads these two attributes to build a
+structured response whose fields sit at the top level of the body -- not nested
+under ``detail``.
+"""
 
 from __future__ import annotations
 
+from twinkle_client.types.errors import ErrorCategory
+
 
 class TwinkleServerError(Exception):
-    """Base class for all Twinkle Server exceptions."""
-    pass
+    """Base class for all Twinkle Server exceptions.
+
+    ``error_code`` / ``category`` are class-level defaults a subclass overrides; an
+    instance may also override them via keyword to avoid a subclass per status code.
+    """
+
+    error_code: int = 500
+    category: ErrorCategory = ErrorCategory.Server
+
+    def __init__(
+        self,
+        message: str = '',
+        *,
+        error_code: int | None = None,
+        category: ErrorCategory | None = None,
+    ) -> None:
+        super().__init__(message)
+        if error_code is not None:
+            self.error_code = error_code
+        if category is not None:
+            self.category = category
 
 
 class StateBackendError(TwinkleServerError):
     """State backend operation failed (connection lost, timeout, data serialization error, etc.)."""
-    pass
+
+    error_code = 500
+    category = ErrorCategory.Server
 
 
 class ConfigError(TwinkleServerError):
@@ -21,6 +51,9 @@ class ConfigError(TwinkleServerError):
     detail for the operator to find and fix the offending YAML entry without
     re-running the server.
     """
+
+    error_code = 500
+    category = ErrorCategory.Server
 
     def __init__(
         self,
@@ -45,20 +78,84 @@ class ConfigParseError(TwinkleServerError):
     value violates a field/cross-field rule) and from ``FileNotFoundError``
     (which signals that the source could not be read at all).
     """
-    pass
+
+    error_code = 500
+    category = ErrorCategory.Server
 
 
 class ResourceExhaustedError(TwinkleServerError):
     """Resource exhausted — queue full, insufficient memory, connection pool exhausted, etc."""
-    pass
+
+    error_code = 503
+    category = ErrorCategory.Server
 
 
-class FullModeBusyError(TwinkleServerError):
+class RequestRejectedError(TwinkleServerError):
+    """Decision_Boundary-left failure: rejectable from the request body, deployment
+    config, and loaded schema alone, so it is returned with a real HTTP status code
+    and writes NO future record.
+
+    Named ``RequestRejectedError`` rather than ``RequestValidationError`` to avoid a
+    collision with ``fastapi.exceptions.RequestValidationError``. The default is a
+    400/User rejection; the subclasses below pin the specific status codes from the
+    Decision_Boundary placement table.
+    """
+
+    error_code = 400
+    category = ErrorCategory.User
+
+
+class TrainModeMismatchError(RequestRejectedError):
+    """The request's train mode does not match the deployment's (LoRA vs full)."""
+
+    error_code = 400
+    category = ErrorCategory.User
+
+
+class InputTokensExceededError(RequestRejectedError):
+    """The request's input token count exceeds ``max_input_tokens``."""
+
+    error_code = 422
+    category = ErrorCategory.User
+
+
+class BatchSizeError(RequestRejectedError):
+    """Batch size is incompatible with the data world size (too small / not a multiple)."""
+
+    error_code = 422
+    category = ErrorCategory.User
+
+
+class RateLimitExceededError(RequestRejectedError):
+    """The request or token rate exceeds the configured limit."""
+
+    error_code = 429
+    category = ErrorCategory.User
+
+
+class ResourceNotFoundError(RequestRejectedError):
+    """A well-formed request names a resource (adapter / session) that is absent.
+
+    Distinct from a malformed request (400): the request itself is valid but the
+    referenced resource does not exist or is expiring, so it is a 404 on the
+    Decision_Boundary left. Raised (never ``assert``-ed) so the check survives
+    ``python -O`` and is classified as user-facing rather than a 500.
+    """
+
+    error_code = 404
+    category = ErrorCategory.User
+
+
+class FullModeBusyError(RequestRejectedError):
     """A full-parameter (exclusive) model deployment already has a holder.
 
     Full-parameter training rewrites the shared base-model weights, so a single
-    deployment can only host one training task at a time.
+    deployment can only host one training task at a time. It is a request rejection
+    (a second tenant is turned away), hence a 409 on the Decision_Boundary left.
     """
+
+    error_code = 409
+    category = ErrorCategory.User
 
     def __init__(self, current_holder: str) -> None:
         self.current_holder = current_holder

@@ -6,22 +6,18 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-import os
-from twinkle.data_format import Trajectory, Message
-from twinkle.preprocessor import Preprocessor
-
-dotenv.load_dotenv('.env')
 import numpy as np
+import os
 import torch
 from peft import LoraConfig
 
-from twinkle import get_logger
-from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import get_logger, init_twinkle_client
+from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import LazyDataset
-from twinkle_client.model import MultiLoraTransformersModel
+from twinkle.dataset import DatasetMeta, LazyDataset
+from twinkle.preprocessor import Preprocessor
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
@@ -58,12 +54,10 @@ class LatexOCRProcessor(Preprocessor):
         return rows
 
     def preprocess(self, row) -> Trajectory:
-        return Trajectory(
-            messages=[
-                Message(role='user', content='<image>Using LaTeX to perform OCR on the image.', images=[row['image']]),
-                Message(role='assistant', content=row['text']),
-            ]
-        )
+        return Trajectory(messages=[
+            Message(role='user', content='<image>Using LaTeX to perform OCR on the image.', images=[row['image']]),
+            Message(role='assistant', content=row['text']),
+        ])
 
 
 def train():
@@ -87,7 +81,7 @@ def train():
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
-    model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+    model = client.model(f'ms://{base_model}')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(target_modules='all-linear')
@@ -160,7 +154,6 @@ def train():
     # model.upload_to_hub(
     #     checkpoint_dir=twinkle_path,
     #     hub_model_id=hub_model_id,
-    #     async_upload=False
     # )
     # logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 

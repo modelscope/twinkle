@@ -1,8 +1,8 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import FastAPI
 from starlette.requests import Request
 from tinker import types
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from twinkle.server.model.tinker_handlers import _register_tinker_routes
 
@@ -73,8 +73,10 @@ class _SaveWeightsDummyManagement:
         pass
 
     async def schedule_task(self, task, **kwargs):
-        # Actually execute the task to test response logic
         return await task()
+
+    async def call_backend(self, fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
 
 
 @pytest.mark.asyncio

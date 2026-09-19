@@ -13,7 +13,6 @@ Both handle tinker (Datum-based I/O) via /tinker/* endpoints and twinkle-native
 (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
 from tinker import types
-from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
@@ -23,7 +22,6 @@ from twinkle.model.transformers import TransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
-from twinkle.utils.nccl_safe import nccl_safe
 
 
 class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
@@ -48,7 +46,6 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    @nccl_safe(tinker=True)
     def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name)
@@ -107,14 +104,13 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    @nccl_safe
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         self._normalize_ref_outputs(kwargs)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

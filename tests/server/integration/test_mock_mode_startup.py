@@ -254,8 +254,6 @@ def _exercise_twinkle_clients(base: str) -> None:
     assert isinstance(metric.result, dict)
     cfgs = model.get_train_configs()
     assert isinstance(cfgs.result, str)
-    state = model.get_state_dict()
-    assert isinstance(state.result, dict)
 
     save_resp = model.save(name='step-1')
     assert save_resp.twinkle_path and save_resp.twinkle_path.startswith('twinkle://')

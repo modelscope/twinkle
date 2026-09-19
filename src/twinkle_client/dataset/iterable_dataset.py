@@ -1,88 +1,41 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+from torch.utils.data import IterableDataset as TorchIterableDataset
 
-from twinkle_client.http import http_post
-from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta
-from torch.utils.data import IterableDataset
+from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
 
-class IterableDataset(IterableDataset):
+
+class IterableDataset(TorchIterableDataset):
     """Client wrapper for IterableDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
-        from twinkle_client.http import get_base_url
+    def __init__(
+        self,
+        dataset_meta: DatasetMeta = None,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        self._transport = capture_transport(transport)
+        self.processor_id = create_remote_component(
+            'dataset', 'IterableDataset', dataset_meta=dataset_meta, transport=self._transport, **kwargs)
 
-        self.server_url = f'{get_base_url()}/processor/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data={
-                'processor_type': 'dataset',
-                'class_type': 'IterableDataset',
-                **{'dataset_meta': dataset_meta}, **kwargs
-            }
-        )
-        response.raise_for_status()
-        self.processor_id = response.json()['processor_id']
+    def _call(self, function: str, *args, **kwargs):
+        return call_remote_component(self.processor_id, function, *args, transport=self._transport, **kwargs)
 
-    
     def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'add_dataset',
-                **{'dataset_meta': dataset_meta},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('add_dataset', dataset_meta=dataset_meta, **kwargs)
 
     def __len__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__len__',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__len__')
 
     def __getitem__(self, idx):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__getitem__',
-                **{'idx': idx},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__getitem__', idx=idx)
 
     def __iter__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__iter__',
-                **{},
-            }
-        )
-        response.raise_for_status()
+        self._call('__iter__')
         return self
-    
+
     def __next__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__next__',
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__next__')

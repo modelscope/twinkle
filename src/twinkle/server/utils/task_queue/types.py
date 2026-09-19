@@ -9,11 +9,9 @@ Provides:
 """
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
 
 
 class TaskStatus(Enum):
@@ -23,7 +21,21 @@ class TaskStatus(Enum):
     RUNNING = 'running'  # Task currently executing
     COMPLETED = 'completed'  # Task completed successfully
     FAILED = 'failed'  # Task failed with error
-    RATE_LIMITED = 'rate_limited'  # Task rejected due to rate limiting
+    CANCELLED = 'cancelled'  # Task cancelled by the client before it started running
+
+
+class UserTaskError(ValueError):
+    """A queued operation rejected because of caller input or usage."""
+
+
+class BackendBusyError(RuntimeError):
+    """Raised when the per-replica Admission_Gate is held by a leaked backend call.
+
+    A new backend call arriving while the gate is closed (its holder is a call that
+    already exceeded ``asyncio.wait_for`` but whose executor thread has not yet
+    returned) fails fast with this error instead of queueing behind it. The worker
+    maps it to ``ErrorPayload(category='server', error_code=503)``.
+    """
 
 
 class QueueState(Enum):
@@ -49,9 +61,3 @@ class QueuedTask:
     task_type: str | None
     created_at: float
     first_rate_limited_at: float | None = None
-    # ``schedule_task_and_wait`` is an in-process request/response path.  Its
-    # potentially large result is delivered through this Future instead of
-    # being persisted in ServerState merely for the same process to read it
-    # back.  Polling-style ``schedule_task`` leaves this as ``None``.
-    completion: asyncio.Future[Any] | None = None
-    persist_status: bool = True

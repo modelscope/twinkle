@@ -25,10 +25,6 @@ from twinkle.server.launcher import ServerLauncher
 _PERSISTENCE_VARIANTS = st.one_of(
     st.fixed_dictionaries({'mode': st.just('memory')}),
     st.fixed_dictionaries({
-        'mode': st.just('file'),
-        'file_path': st.just('/tmp/state.json')
-    }),
-    st.fixed_dictionaries({
         'mode': st.just('redis'),
         'redis_url': st.just('redis://localhost:6379/0')
     }),
@@ -84,13 +80,6 @@ def test_redis_mode_missing_url() -> None:
         ServerConfig.model_validate({'persistence': {'mode': 'redis'}})
     msg = str(exc.value)
     assert 'persistence.redis_url' in msg or 'redis_url' in msg
-
-
-def test_file_mode_missing_path() -> None:
-    with pytest.raises(ValidationError) as exc:
-        ServerConfig.model_validate({'persistence': {'mode': 'file'}})
-    msg = str(exc.value)
-    assert 'persistence.file_path' in msg or 'file_path' in msg
 
 
 @settings(max_examples=100)
@@ -257,8 +246,34 @@ def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
         ApplicationSpec.model_validate({
             'name': 'data-plane',
             'import_path': 'data_plane',
-            'args': {'unknown': True},
+            'args': {
+                'unknown': True
+            },
         })
+
+
+def test_processor_queue_config_is_rejected() -> None:
+    # A processor deployment has no task queue; queue_config was silently ignored
+    # before and now fails validation (F013 / P009) naming the offending field.
+    ApplicationSpec.model_validate({
+        'name': 'processor',
+        'import_path': 'processor',
+        'args': {
+            'ncpu_proc_per_node': 1
+        },
+    })
+    with pytest.raises(ValidationError) as exc:
+        ApplicationSpec.model_validate({
+            'name': 'processor',
+            'import_path': 'processor',
+            'args': {
+                'ncpu_proc_per_node': 1,
+                'queue_config': {
+                    'rps_limit': 4
+                }
+            },
+        })
+    assert 'queue_config' in str(exc.value)
 
 
 def test_cookbook_examples_load() -> None:

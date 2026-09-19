@@ -1,63 +1,37 @@
-
-from twinkle_client.http import http_post
-from twinkle.dataset import Dataset
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from twinkle.dataset import DatasetMeta
+from twinkle_client.common.component_rpc import create_remote_component
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
 from .base import Dataset
+
 
 class PackingDataset(Dataset):
     """Client wrapper for PackingDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta = None, packing_num_proc: int = 1, **kwargs):
-        from twinkle_client.http import get_base_url
-
-        self.server_url = f'{get_base_url()}/processor/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data={
-                'processor_type': 'dataset',
-                'class_type': 'PackingDataset',
-                **{'dataset_meta': dataset_meta, 'packing_num_proc': packing_num_proc}, **kwargs
-            }
+    def __init__(
+        self,
+        dataset_meta: DatasetMeta = None,
+        packing_num_proc: int = 1,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        self._transport = capture_transport(transport)
+        self.processor_id = create_remote_component(
+            'dataset',
+            'PackingDataset',
+            dataset_meta=dataset_meta,
+            packing_num_proc=packing_num_proc,
+            transport=self._transport,
+            **kwargs,
         )
-        response.raise_for_status()
-        self.processor_id = response.json()['processor_id']
 
-    
     def pack_dataset(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'pack_dataset',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('pack_dataset')
 
     def __getitem__(self, index):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__getitem__',
-                **{'index': index},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__getitem__', index=index)
 
     def __len__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__len__',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__len__')

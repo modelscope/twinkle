@@ -25,9 +25,9 @@ class ProcessorManagerMixin(SessionResourceMixin):
     1. Call _init_processor_manager() in __init__
     2. Override _on_processor_expired() to handle cleanup
 
-    Attributes:
-        _processor_timeout: Session inactivity timeout in seconds.
-        _per_token_processor_limit: Maximum active processors per user token.
+    The inactivity timeout is stored on the base mixin as ``_resource_timeout``
+    (set via ``_init_processor_manager``); ``_per_token_processor_limit`` caps the
+    active processors per user token.
     """
 
     # Set resource type for logging
@@ -51,16 +51,6 @@ class ProcessorManagerMixin(SessionResourceMixin):
             resource_max_lifetime=None,  # No max lifetime for processors
         )
         self._per_token_processor_limit = per_token_processor_limit
-
-    @property
-    def _processor_timeout(self) -> float:
-        """Processor timeout for backward compatibility."""
-        return self._resource_timeout
-
-    @property
-    def _processor_records(self) -> dict[str, dict[str, Any]]:
-        """Processor records for backward compatibility."""
-        return self._resource_records
 
     def _validate_registration(self, resource_id: str, token: str, session_id: str) -> None:
         """Validate before registering a processor. Checks per-token limit.
@@ -91,10 +81,17 @@ class ProcessorManagerMixin(SessionResourceMixin):
         }
 
     async def _on_resource_expired(self, resource_id: str) -> None:
-        """Internal hook called by base class. Delegates to _on_processor_expired."""
-        self._on_processor_expired(resource_id)
+        """Base-class expiry hook; forwards to the domain hook ``_on_processor_expired``.
 
-    def _on_processor_expired(self, processor_id: str) -> None:
+        ``_on_processor_expired`` is the supported extension point: the
+        processor-domain name is kept deliberately so subclass authors override a
+        method named for processors rather than the generic base-class hook. It is
+        ``async`` to match the sibling ``AdapterManagerMixin._on_adapter_expired``
+        contract, so both resource kinds expose the same extension-point shape.
+        """
+        await self._on_processor_expired(resource_id)
+
+    async def _on_processor_expired(self, processor_id: str) -> None:
         """Hook called when a processor's session expires.
 
         Must be overridden by inheriting classes.
@@ -103,7 +100,3 @@ class ProcessorManagerMixin(SessionResourceMixin):
             NotImplementedError: If not overridden.
         """
         raise NotImplementedError(f'_on_processor_expired must be implemented by {self.__class__.__name__}')
-
-    def stop_processor_countdown(self) -> None:
-        """Stop the background countdown task."""
-        self.stop_resource_countdown()

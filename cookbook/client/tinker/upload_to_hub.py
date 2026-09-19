@@ -6,9 +6,11 @@
 #
 # How it works:
 #   1. The server submits the upload as a background task and returns a
-#      request_id immediately, so the HTTP call never times out.
-#   2. The client polls /upload_status/{request_id} every few seconds and
-#      blocks until the upload completes or raises on failure.
+#      Task_Envelope with a request_id immediately, so the HTTP call never times out.
+#   2. The client's future layer long-polls /twinkle/retrieve_future and blocks
+#      until the upload reaches a terminal state, raising on failure.
+#      (`upload_to_hub` keeps its `poll_interval` / `async_upload` arguments for
+#      signature compatibility; both are deprecated and have no effect.)
 #
 # Prerequisites:
 #   - Server must be running (see server.py / server_config.yaml)

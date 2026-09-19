@@ -21,10 +21,6 @@ TELEMETRY_ENV_KEYS: tuple[str, ...] = (
     'TWINKLE_MODEL_ID_ALIASES',
 )
 
-# NCCL-safe env var keys: controls fault tolerance behavior in distributed
-# training (safe_loss / @nccl_safe). Must reach model worker actors.
-NCCL_SAFE_ENV_KEYS: tuple[str, ...] = ('TWINKLE_FAIL_FAST', )
-
 
 def build_telemetry_env_vars() -> dict[str, str]:
     """Collect telemetry env vars from ``os.environ`` for worker propagation."""
@@ -37,9 +33,15 @@ def build_persistence_env_vars() -> dict[str, str]:
     return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
 
 
-def build_nccl_safe_env_vars() -> dict[str, str]:
-    """Collect NCCL-safe env vars from ``os.environ`` for worker propagation."""
-    return {k: os.environ[k] for k in NCCL_SAFE_ENV_KEYS if k in os.environ}
+def build_server_state_env_vars() -> dict[str, str]:
+    """Collect ServerState-policy env vars from ``os.environ`` for worker propagation.
+
+    Read inside each worker by ``ServerStateArgs.from_env()`` (via
+    ``get_server_state``) so the configured quota / expiry / metrics interval is
+    applied everywhere, not only in the gateway that first built the state.
+    """
+    from twinkle.server.config.application_spec import SERVER_STATE_ENV_KEYS
+    return {k: os.environ[k] for k in SERVER_STATE_ENV_KEYS if k in os.environ}
 
 
 def build_propagated_env_vars() -> dict[str, str]:
@@ -47,5 +49,5 @@ def build_propagated_env_vars() -> dict[str, str]:
     merged: dict[str, str] = {}
     merged.update(build_telemetry_env_vars())
     merged.update(build_persistence_env_vars())
-    merged.update(build_nccl_safe_env_vars())
+    merged.update(build_server_state_env_vars())
     return merged

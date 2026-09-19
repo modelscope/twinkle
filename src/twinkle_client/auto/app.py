@@ -43,7 +43,7 @@ class TwinkleAuto:
 
     def __init__(
         self,
-        run_id: Optional[str] = None,
+        run_id: str | None = None,
         llm_base_url: str = 'http://localhost:11434/v1',
         llm_model: str = 'qwen3.5',
         llm_api_key: str = 'not-needed',
@@ -64,11 +64,11 @@ class TwinkleAuto:
             pass
 
     async def _main(self) -> None:
+        from openai import AsyncOpenAI
+
         from twinkle_client.auto.agent.core import AgentLoop
         from twinkle_client.auto.agent.monitor import TrainingMonitor
         from twinkle_client.auto.connection import LocalConnection
-
-        from openai import AsyncOpenAI
 
         # Connection
         self._connection = LocalConnection()
@@ -125,9 +125,7 @@ class TwinkleAuto:
         loop = asyncio.get_event_loop()
         while True:
             try:
-                user_input = await loop.run_in_executor(
-                    None, lambda: input(f'{_GREEN}You:{_RESET} ')
-                )
+                user_input = await loop.run_in_executor(None, lambda: input(f'{_GREEN}You:{_RESET} '))
             except (KeyboardInterrupt, EOFError):
                 break
 

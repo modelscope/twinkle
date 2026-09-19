@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from twinkle.utils.logger import get_logger
 from typing import Any, Callable
 
+from twinkle.utils.logger import get_logger
 from twinkle_client.auto.agent.prompts import SYSTEM_PROMPT
 from twinkle_client.auto.agent.tools import TOOL_SCHEMAS, ToolExecutor
 from twinkle_client.auto.connection import LocalConnection
@@ -28,7 +28,7 @@ class AgentLoop:
     def __init__(
         self,
         connection: LocalConnection,
-        llm_client: 'AsyncOpenAI',
+        llm_client: AsyncOpenAI,
         llm_model: str,
         skills_prompt: str = '',
     ):
@@ -41,7 +41,10 @@ class AgentLoop:
         if skills_prompt:
             full_prompt = f'{SYSTEM_PROMPT}\n\n{skills_prompt}'
         self.history: list[dict[str, Any]] = [
-            {'role': 'system', 'content': full_prompt},
+            {
+                'role': 'system',
+                'content': full_prompt
+            },
         ]
 
     async def send(
@@ -94,7 +97,8 @@ class AgentLoop:
                 except json.JSONDecodeError as e:
                     logger.error(f'Tool {func_name}: invalid JSON args: {e}\n  raw={raw_args[:500]}')
                     args = {}
-                logger.info(f'Executing tool: {func_name}({", ".join(f"{k}={v!r}" for k, v in list(args.items())[:5])})')
+                logger.info(
+                    f'Executing tool: {func_name}({", ".join(f"{k}={v!r}" for k, v in list(args.items())[:5])})')
                 result = await self._tool_executor.execute(func_name, args)
                 logger.debug(f'Tool {func_name} result ({len(result)} chars): {result[:300]}')
                 self.history.append({
@@ -156,7 +160,10 @@ class AgentLoop:
                         tool_calls_map[idx] = {
                             'id': '',
                             'type': 'function',
-                            'function': {'name': '', 'arguments': ''},
+                            'function': {
+                                'name': '',
+                                'arguments': ''
+                            },
                         }
                     tc = tool_calls_map[idx]
                     if tc_delta.id:
