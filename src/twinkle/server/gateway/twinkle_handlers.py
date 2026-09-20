@@ -7,7 +7,7 @@ All endpoints are prefixed /twinkle/* and registered via _register_twinkle_route
 from __future__ import annotations
 
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 import twinkle_client.types as types
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager, validate_user_path
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.utils.auth import get_token_from_request
@@ -115,7 +116,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
     ) -> types.SessionHeartbeatResponse:
         alive = await touch_session(self.state, body.session_id)
         if not alive:
-            raise HTTPException(status_code=404, detail='Unknown session')
+            raise ResourceNotFoundError('Unknown session')
         return types.SessionHeartbeatResponse()
 
     @app.post('/twinkle/retrieve_future', response_model=types.TaskEnvelope)
@@ -141,7 +142,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         request_id = body.request_id
         outcome = await poll_future(self.state, request_id)
         if outcome.record is None:
-            raise HTTPException(status_code=404, detail=f'request_id {request_id} not found or expired')
+            raise ResourceNotFoundError(f'request_id {request_id} not found or expired')
         return envelope_from_record(request_id, outcome.record)
 
     @app.post('/twinkle/cancel', response_model=types.CancelResponse)
@@ -169,7 +170,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         token = get_token_from_request(request)
         run = get_training_run_use_case(token, 'twinkle', run_id, check_permission=True)
         if not run:
-            raise HTTPException(status_code=404, detail=f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
         return run
 
     @app.get('/twinkle/training_runs/{run_id}/checkpoints', response_model=types.CheckpointsListResponse)
@@ -177,7 +178,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         token = get_token_from_request(request)
         response = list_checkpoints(token, 'twinkle', run_id)
         if response is None:
-            raise HTTPException(status_code=404, detail=f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
         return response
 
     @app.delete(
@@ -188,11 +189,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         token = get_token_from_request(request)
 
         if not validate_user_path(token, checkpoint_id):
-            raise HTTPException(status_code=400, detail='Invalid checkpoint path: path traversal not allowed')
+            raise RequestRejectedError('Invalid checkpoint path: path traversal not allowed')
 
         success = delete_checkpoint(token, 'twinkle', run_id, checkpoint_id)
         if not success:
-            raise HTTPException(status_code=404, detail=f'Checkpoint {checkpoint_id} not found or access denied')
+            raise ResourceNotFoundError(f'Checkpoint {checkpoint_id} not found or access denied')
 
         return types.DeleteCheckpointResponse(success=True, message=f'Checkpoint {checkpoint_id} deleted successfully')
 
@@ -201,7 +202,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         token = get_token_from_request(request)
         response = get_weights_info(token, 'twinkle', body.twinkle_path)
         if response is None:
-            raise HTTPException(status_code=404, detail=f'Weights at {body.twinkle_path} not found or access denied')
+            raise ResourceNotFoundError(f'Weights at {body.twinkle_path} not found or access denied')
         return response
 
     @app.get('/twinkle/checkpoint_path/{run_id}/{checkpoint_id:path}', response_model=types.CheckpointPathResponse)
@@ -209,18 +210,18 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
         token = get_token_from_request(request)
 
         if not validate_user_path(token, checkpoint_id):
-            raise HTTPException(status_code=400, detail='Invalid checkpoint path: path traversal not allowed')
+            raise RequestRejectedError('Invalid checkpoint path: path traversal not allowed')
 
         training_run_manager = create_training_run_manager(token, client_type='twinkle')
         checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
 
         run = training_run_manager.get(run_id)
         if not run:
-            raise HTTPException(status_code=404, detail=f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
 
         checkpoint = checkpoint_manager.get(run_id, checkpoint_id)
         if not checkpoint:
-            raise HTTPException(status_code=404, detail=f'Checkpoint {checkpoint_id} not found')
+            raise ResourceNotFoundError(f'Checkpoint {checkpoint_id} not found')
 
         ckpt_dir = checkpoint_manager.get_ckpt_dir(run_id, checkpoint_id)
         return types.CheckpointPathResponse(path=str(ckpt_dir), twinkle_path=checkpoint.twinkle_path)

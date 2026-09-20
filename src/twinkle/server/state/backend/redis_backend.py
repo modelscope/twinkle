@@ -157,6 +157,6 @@ class RedisBackend(StateBackend):
     async def health_check(self) -> bool:
         """Check if Redis is healthy and available."""
         try:
-            return await self._client.ping()
+            return bool(await self._client.ping())
         except Exception:
             return False

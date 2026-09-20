@@ -12,9 +12,9 @@ from __future__ import annotations
 import pytest
 from types import SimpleNamespace
 
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, run_submit
-from twinkle.server.validation import BackendCapability, EndpointUnavailableError, assert_request_supported
+from twinkle.server.validation import BackendCapability, assert_request_supported
 from twinkle.server.validation.backend_compat import resolve_backend
 from twinkle_client.types import model as model_types
 

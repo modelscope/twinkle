@@ -44,12 +44,6 @@ def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
     return VLLMSamplerTQ(**kw, context_manager=None)
 
 
-def _make_torch_sampler(kw: dict[str, Any]) -> Any:
-    from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
-
-    return TorchSampler(**kw)
-
-
 # Single validate-then-dispatch selector for the sampler backend.
 SAMPLER_SELECTOR = BackendSelector(
     'sampler_type',
@@ -57,7 +51,6 @@ SAMPLER_SELECTOR = BackendSelector(
         'mock': _make_mock_sampler,
         'vllm': _make_vllm_sampler,
         'vllm_async': _make_vllm_async_sampler,
-        'torch': _make_torch_sampler,
     },
 )
 
@@ -76,7 +69,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     """Unified sampler management service.
 
     Manages:
-    - vLLM or Torch sampler initialization and lifecycle
+    - mock or vLLM sampler initialization and lifecycle
     - Tinker inference requests (/tinker/asample) with rate limiting via TaskQueueMixin
     - Twinkle inference requests (/twinkle/*) calling sampler directly
     - Template configuration for trajectory encoding
@@ -182,7 +175,7 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``torch``.
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async``.
             Validated up front; bad values raise :class:`ConfigError` before
             any side effect.
         engine_args: Additional engine arguments for the sampler

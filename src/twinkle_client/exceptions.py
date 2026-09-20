@@ -18,6 +18,8 @@ from __future__ import annotations
 import requests
 from typing import Any, Optional
 
+from twinkle_client.types.errors import ErrorCategory
+
 
 class TwinkleClientValidationError(ValueError):
     """A caller argument could not be placed in the request model, in-process.
@@ -37,7 +39,8 @@ class TwinkleHTTPError(requests.HTTPError):
 
     Inherits ``requests.HTTPError`` so callers already catching that keep working.
     ``status_code`` is the HTTP status; ``error_code`` / ``category`` come from the
-    server's structured error body when present (else ``None`` / ``'Unknown'``).
+    server's structured error body when present. ``category`` always uses the
+    lowercase :class:`ErrorCategory` wire value.
     """
 
     def __init__(
@@ -45,8 +48,10 @@ class TwinkleHTTPError(requests.HTTPError):
         *args: Any,
         status_code: int | None = None,
         error_code: int | None = None,
-        category: str = 'Unknown',
+        category: str = ErrorCategory.Unknown.value,
         request_id: str | None = None,
+        details: list[dict[str, Any]] | None = None,
+        traceback: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -54,6 +59,8 @@ class TwinkleHTTPError(requests.HTTPError):
         self.error_code = error_code
         self.category = category
         self.request_id = request_id
+        self.details = details
+        self.traceback = traceback
 
 
 class TaskFailedError(Exception):

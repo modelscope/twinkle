@@ -44,8 +44,15 @@ def test_try_again_shape_for_non_terminal(monkeypatch):
 
 
 def test_error_category_shape_for_failed():
-    resp = _client({'status': 'failed', 'result': {'error': 'boom', 'category': 'server'}}).post(
-        '/retrieve_future', json={'request_id': 'r'})
+    record = {
+        'status': 'failed',
+        'failure': {
+            'reason_code': 'internal_error',
+            'message': 'boom',
+            'attribution': 'server',
+        },
+    }
+    resp = _client(record).post('/retrieve_future', json={'request_id': 'r'})
     assert resp.status_code == 200
     body = resp.json()
     assert body['error'] == 'boom'

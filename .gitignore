@@ -166,3 +166,6 @@ tests/server/config/_generated_e2e.yaml
 # Regenerate via `python -m tests.server.contract.update_baseline`; do not commit it.
 # NOTE: client_api_routes.json is the compact, COMMITTED guard -- do not ignore that one.
 tests/server/contract/client_api_baseline.json
+
+# Redis dump file produced by a local redis-server (test infra), never source.
+*.rdb

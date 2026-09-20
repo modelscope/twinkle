@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING, Any
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
+from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.middleware import get_task_metrics
-from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 from .config import TaskQueueConfig
@@ -475,17 +475,17 @@ class TaskQueueMixin:
                 )
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
             except Exception as exc:
-                error_payload = task_error_payload(
-                    f'{type(exc).__name__}: {exc}',
-                    request_id=request_id,
-                    error_code=500,
-                    traceback_text=traceback.format_exc(),
+                failure = FutureFailureRecord(
+                    reason_code='internal_error',
+                    message=f'{type(exc).__name__}: {exc}'[:1024],
+                    attribution='server',
+                    diagnostic=traceback.format_exc(),
                 )
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,
                     model_id,
-                    result=error_payload,
+                    failure=failure,
                     queue_state=QueueState.ACTIVE.value,
                 )
                 logger.error(f'[TaskQueue] Background task {request_id} FAILED, type={task_type or "unknown"}:\n'

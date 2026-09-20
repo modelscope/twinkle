@@ -10,8 +10,48 @@ from __future__ import annotations
 
 from typing import Any
 
-from twinkle.server.utils.task_errors import error_payload_from_stored
+from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.utils.task_errors import trim_traceback
+from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 from twinkle_client.types.lifecycle import TaskEnvelope
+
+# Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
+_FAILURE_WIRE: dict[str, tuple[int, ErrorCategory]] = {
+    'invalid_request': (400, ErrorCategory.User),
+    'request_rejected': (400, ErrorCategory.User),
+    'resource_not_found': (404, ErrorCategory.User),
+    'full_mode_busy': (409, ErrorCategory.User),
+    'input_tokens_exceeded': (422, ErrorCategory.User),
+    'batch_size_invalid': (422, ErrorCategory.User),
+    'rate_limit_exceeded': (429, ErrorCategory.User),
+    'resource_quota_exceeded': (429, ErrorCategory.User),
+    'cancelled': (499, ErrorCategory.User),
+    'endpoint_unavailable': (501, ErrorCategory.Server),
+    'state_contention': (503, ErrorCategory.Server),
+    'backend_gate_unavailable': (503, ErrorCategory.Server),
+    'orphaned_replica': (503, ErrorCategory.Server),
+    'execution_timeout': (504, ErrorCategory.Server),
+    'deadline_exceeded': (500, ErrorCategory.Server),
+    'internal_error': (500, ErrorCategory.Server),
+}
+
+
+def error_payload_from_failure(stored: Any, *, request_id: str) -> ErrorPayload:
+    """Map one protocol-independent failure record to Twinkle's wire model."""
+    failure = FutureFailureRecord.model_validate(stored)
+    error_code, category = _FAILURE_WIRE.get(
+        failure.reason_code,
+        (500, ErrorCategory.Server),
+    )
+    diagnostic = failure.diagnostic if category is ErrorCategory.Server else None
+    return ErrorPayload(
+        error=failure.message[:1024],
+        category=category,
+        error_code=error_code,
+        request_id=request_id,
+        traceback=trim_traceback(diagnostic) if diagnostic else None,
+        details=failure.details,
+    )
 
 
 def envelope_from_record(
@@ -22,17 +62,10 @@ def envelope_from_record(
 ) -> TaskEnvelope:
     """Map a stored ``FutureRecord`` dict to the wire ``TaskEnvelope``.
 
-    Two behaviours are load-bearing:
-
-    - The stored ``FutureRecord`` keeps a failure payload in its ``result`` field
-      (changing that would break state backward-compatibility). The wire split of
-      ``result`` / ``error`` is done here, which is why there must be exactly one
-      mapping point.
-    - A failure payload is reconstructed through Part 1's
-      ``error_payload_from_stored`` rather than a strict ``ErrorPayload.model_validate``.
-      Pre-spec records carry only ``{error, category}``; strict validation would
-      make retrieve return 500 for a record that should be a 200 + payload during
-      any rolling upgrade.
+    Failed and cancelled records carry a protocol-independent ``failure`` field.
+    This is the only place that maps those domain reasons to Twinkle's
+    ``ErrorPayload`` status/category vocabulary. Legacy failures embedded in
+    ``result`` are intentionally unsupported because that format was never merged.
 
     ``completed`` with ``result is None`` is a valid success (``step`` /
     ``zero_grad`` / ``lr_step`` all return ``None``); it is NOT treated as a
@@ -53,7 +86,7 @@ def envelope_from_record(
         return TaskEnvelope(
             request_id=request_id,
             status=status,
-            error=error_payload_from_stored(record.get('result'), request_id=request_id),
+            error=error_payload_from_failure(record.get('failure'), request_id=request_id),
             **common,
         )
     return TaskEnvelope(

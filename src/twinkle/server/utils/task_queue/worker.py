@@ -14,10 +14,14 @@ import traceback
 from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
-from twinkle.server.exceptions import TwinkleServerError
+from twinkle.server.exceptions import (BatchSizeError, EndpointUnavailableError, FullModeBusyError,
+                                       InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
+                                       ResourceNotFoundError, ResourceQuotaExceededError, StateBackendError,
+                                       TrainModeMismatchError, TwinkleServerError)
+from twinkle.server.state.backend.base import ConcurrencyError
+from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.errors import ErrorCategory
 from .config import TaskQueueConfig
@@ -28,6 +32,28 @@ if TYPE_CHECKING:
     from twinkle.server.telemetry.middleware import TaskMetrics
 
 logger = get_logger()
+
+
+def _reason_code_for_server_error(exc: TwinkleServerError) -> str:
+    """Map typed execution failures to protocol-independent reason codes."""
+    mappings: tuple[tuple[type[TwinkleServerError], str], ...] = (
+        (TrainModeMismatchError, 'invalid_request'),
+        (ResourceNotFoundError, 'resource_not_found'),
+        (FullModeBusyError, 'full_mode_busy'),
+        (InputTokensExceededError, 'input_tokens_exceeded'),
+        (BatchSizeError, 'batch_size_invalid'),
+        (RateLimitExceededError, 'rate_limit_exceeded'),
+        (ResourceQuotaExceededError, 'resource_quota_exceeded'),
+        (EndpointUnavailableError, 'endpoint_unavailable'),
+        (ConcurrencyError, 'state_contention'),
+        (StateBackendError, 'backend_gate_unavailable'),
+        (RequestRejectedError, 'request_rejected'),
+    )
+    for error_type, reason_code in mappings:
+        if isinstance(exc, error_type):
+            return reason_code
+    return 'internal_error'
+
 
 # Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server.
 try:
@@ -157,27 +183,22 @@ class ComputeWorker:
         queue_state: str,
         queue_state_reason: str | None = None,
         *,
-        error_code: int = 500,
-        category: ErrorCategory = ErrorCategory.Server,
+        reason_code: str = 'internal_error',
+        attribution: str = 'server',
         traceback_text: str | None = None,
     ) -> None:
-        """Store FAILED status with a standardised ``ErrorPayload``.
-
-        The future record is the single delivery channel: a failed task is written
-        unconditionally so both the Inline_Fast_Path peek and the Retrieve_Endpoint
-        observe the same terminal record.
-        """
+        """Store FAILED status with protocol-independent failure details."""
+        failure = FutureFailureRecord(
+            reason_code=reason_code,
+            message=(error.splitlines() or [''])[0][:1024],
+            attribution='user' if attribution == 'user' else 'server',
+            diagnostic=traceback_text,
+        )
         await self._state.store_future_status(
             task.request_id,
             TaskStatus.FAILED.value,
             task.model_id,
-            result=task_error_payload(
-                error,
-                request_id=task.request_id,
-                error_code=error_code,
-                category=category,
-                traceback_text=traceback_text,
-            ),
+            failure=failure,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
         )
@@ -279,7 +300,8 @@ class ComputeWorker:
             logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
                          f'type={task_type}, queue_key={queue_key}')
             # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server.
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=504)
+            await self._store_task_failed(
+                task, error, QueueState.ACTIVE.value, reason_code='execution_timeout')
             # Probe actor liveness after a timeout so an operator learns the replica's
             # state without waiting for a second request to also time out.
             if self._on_backend_timeout is not None:
@@ -294,8 +316,8 @@ class ComputeWorker:
                 task,
                 f'{type(exc).__name__}: {exc}',
                 QueueState.UNKNOWN.value,
-                error_code=400,
-                category=ErrorCategory.User,
+                reason_code='request_rejected',
+                attribution='user',
             )
         except BackendBusyError as exc:
             task_status = 'failed'
@@ -304,7 +326,8 @@ class ComputeWorker:
             logger.error(f'[ComputeWorker] Task {task.request_id} REFUSED (admission gate held) after '
                          f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
             # Gate held by a leaked timed-out call -> 503/Server.
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value, error_code=503)
+            await self._store_task_failed(
+                task, error, QueueState.ACTIVE.value, reason_code='backend_gate_unavailable')
         except TwinkleServerError as exc:
             # A typed server error carries its own status + category (e.g.
             # ResourceNotFoundError = 404/User from a deferred
@@ -321,8 +344,8 @@ class ComputeWorker:
                 task,
                 f'{type(exc).__name__}: {exc}',
                 QueueState.ACTIVE.value,
-                error_code=exc.error_code,
-                category=exc.category,
+                reason_code=_reason_code_for_server_error(exc),
+                attribution=exc.category.value,
                 traceback_text=traceback.format_exc() if is_server else None,
             )
         except Exception as exc:
@@ -334,7 +357,12 @@ class ComputeWorker:
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
             await self._store_task_failed(
-                task, error, QueueState.ACTIVE.value, error_code=500, traceback_text=traceback.format_exc())
+                task,
+                error,
+                QueueState.ACTIVE.value,
+                reason_code='internal_error',
+                traceback_text=traceback.format_exc(),
+            )
         finally:
             q.task_done()
             self._record_execution_time(task_type, exec_time)

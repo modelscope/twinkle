@@ -9,19 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
 
-from twinkle.server.exceptions import ResourceNotFoundError
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
 
-class SessionResourceMixin:
+class SessionResourceMixin(ABC):
     """Base mixin for managing session-bound resources with automatic expiration.
 
     This mixin tracks resources and automatically expires them when their
@@ -63,37 +63,47 @@ class SessionResourceMixin:
         self._resource_max_lifetime = resource_max_lifetime
 
         # Resource lifecycle tracking
-        # Dict mapping resource_id ->
-        # {'token': str, 'session_id': str, 'created_at': float, 'state': dict, 'expiring': bool}
+        # Dict mapping resource_id -> lifecycle metadata, including the last time
+        # the shared state backend confirmed that the owning session was alive.
         self._resource_records: dict[str, dict[str, Any]] = {}
 
         # Countdown task
         self._resource_countdown_running = False
         self._countdown_task: asyncio.Task | None = None
 
-    async def _is_session_alive(self, session_id: str) -> bool:
-        """Check if a session is still alive via state proxy.
+    async def _is_session_alive(self, session_id: str, resource_id: str, record: dict[str, Any]) -> bool:
+        """Check session liveness with a bounded fail-open window.
 
-        Args:
-            session_id: Session ID to check
-
-        Returns:
-            True if session is alive, False if expired or not found
+        ``record`` is the caller-held lifecycle dict (the same object stored in
+        ``_resource_records``), passed in so a concurrent ``unregister_resource``
+        cannot turn a by-key lookup here into a ``KeyError`` mid-sweep.
         """
         if not session_id:
-            return True  # No session association means always alive
+            raise RuntimeError(f'registered {self._resource_type} {resource_id} has no session_id')
 
         try:
             last_heartbeat = await self.state.get_session_last_heartbeat(session_id)
-        except Exception as e:
-            logger.warning(f'[{self._resource_type}Manager] Failed to check session liveness: {e}')
-            return True  # Assume alive on error
+        except Exception as exc:
+            elapsed = time.time() - record['last_liveness_confirmed_at']
+            logger.warning(
+                '[%sManager] Session liveness probe failed for %s; bounded fail-open '
+                'elapsed=%.3fs timeout=%.3fs error=%r',
+                self._resource_type,
+                resource_id,
+                elapsed,
+                self._resource_timeout,
+                exc,
+            )
+            return elapsed < self._resource_timeout
 
         if last_heartbeat is None:
-            return False  # Session doesn't exist
+            return False
 
-        # Check if session has timed out
-        return (time.time() - last_heartbeat) < self._resource_timeout
+        now = time.time()
+        alive = (now - last_heartbeat) < self._resource_timeout
+        if alive:
+            record['last_liveness_confirmed_at'] = now
+        return alive
 
     def _validate_registration(self, resource_id: str, token: str, session_id: str) -> None:
         """Validate before registering a resource. Override for custom validation.
@@ -104,11 +114,11 @@ class SessionResourceMixin:
             session_id: Session ID
 
         Raises:
-            ValueError: If validation fails
-            RuntimeError: If resource limit is reached
+            RequestRejectedError: If the required session ID is absent.
         """
         if not session_id:
-            raise ValueError(f'session_id must be provided when registering {self._resource_type} {resource_id}')
+            raise RequestRejectedError(
+                f'session_id must be provided when registering {self._resource_type} {resource_id}')
 
     def _create_resource_record(self, token: str, session_id: str) -> dict[str, Any]:
         """Create a new resource record. Override to add custom fields.
@@ -120,12 +130,14 @@ class SessionResourceMixin:
         Returns:
             Resource record dict
         """
+        now = time.time()
         return {
             'token': token,
             'session_id': session_id,
-            'created_at': time.time(),
+            'created_at': now,
             'state': {},
             'expiring': False,
+            'last_liveness_confirmed_at': now,
         }
 
     def register_resource(self, resource_id: str, token: str, session_id: str) -> None:
@@ -137,8 +149,7 @@ class SessionResourceMixin:
             session_id: Session ID to associate with this resource.
 
         Raises:
-            ValueError: If session_id is None or empty.
-            RuntimeError: If custom validation fails (e.g., limit reached).
+            RequestRejectedError: If session_id is None or empty.
         """
         self._validate_registration(resource_id, token, session_id)
 
@@ -239,6 +250,14 @@ class SessionResourceMixin:
         if not (resource_id and info is not None and not info.get('expiring')):
             raise ResourceNotFoundError(f'{self._resource_type} {resource_id} not found')
 
+    async def _on_resource_liveness_confirmed(self, resource_id: str) -> bool:
+        """Refresh any resource-specific lease after a successful session probe.
+
+        Returns ``False`` when a resource-specific lease has already been lost and
+        the local resource must be expired to avoid running outside its quota.
+        """
+        return True
+
     @abstractmethod
     async def _on_resource_expired(self, resource_id: str) -> None:
         """Hook method called when a resource expires.
@@ -287,12 +306,9 @@ class SessionResourceMixin:
                         expired_resources.append((resource_id, token, session_id))
                         continue
 
-                    try:
-                        session_alive = await self._is_session_alive(session_id)
-                    except Exception as e:
-                        logger.warning(f'[{self._resource_type}Manager] Failed to check session liveness '
-                                       f'for {resource_id}: {type(e).__name__}: {e}')
-                        continue
+                    session_alive = await self._is_session_alive(session_id, resource_id, info)
+                    if session_alive:
+                        session_alive = await self._on_resource_liveness_confirmed(resource_id)
                     session_expired = not session_alive
                     logger.debug(f'[{self._resource_type}Manager] {self._resource_type} {resource_id} session check '
                                  f'(session_id={session_id}, session_alive={not session_expired})')

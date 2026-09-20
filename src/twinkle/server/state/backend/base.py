@@ -4,16 +4,29 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
+from twinkle.server.exceptions import StateBackendError
+from twinkle_client.types.errors import ErrorCategory
 
-class ConcurrencyError(RuntimeError):
-    """Raised by ``StateBackend.update_atomic`` when contention exhausts retries."""
+
+class ConcurrencyError(StateBackendError):
+    """Atomic state update failed after exhausting the backend retry budget."""
+
+    error_code = 503
+    category = ErrorCategory.Server
 
 
 class StateBackend(ABC):
-    """Unified interface for state storage backends.
+    """Unified interface for the Ray-actor and Redis state backends.
 
-    All state management operations go through this interface, supporting
-    multiple backend implementations (memory, file, Redis).
+    ``close()`` releases only this process's backend handle; shared state must
+    survive. ``key_prefix`` has intentionally different physical meanings:
+    Redis prepends it to stored keys while Ray uses it only to namespace the
+    detached actor. Logical keys returned by ``keys()`` omit the Redis prefix,
+    so physical keyspaces cannot be copied directly between modes.
+
+    Only ``*`` wildcard matching is portable. Ray's ``fnmatch`` additionally
+    accepts ``?`` and character classes, while Redis uses its native glob.
+    ``health_check()`` always returns a strict bool and absorbs transport errors.
     """
 
     @abstractmethod
@@ -72,7 +85,7 @@ class StateBackend(ABC):
         - The read/transform/write triple is atomic against concurrent callers
           on the same backend; Redis-backed implementations use WATCH+MULTI+EXEC
           and may raise :class:`ConcurrencyError` after exhausting internal
-          retries (default 3).
+          retries (currently 16).
 
         ``transform`` must be picklable when running against a Ray-backed
         backend — pass module-level functions wrapped with ``functools.partial``,
@@ -90,7 +103,7 @@ class StateBackend(ABC):
 
     @abstractmethod
     async def close(self) -> None:
-        """Close backend connection / release resources."""
+        """Release this process's handle without changing shared state."""
         ...
 
     @abstractmethod

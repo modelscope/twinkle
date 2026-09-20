@@ -5,11 +5,10 @@ import functools
 import time
 from typing import Any
 
-from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .base import BaseManager
-from .models import FutureRecord, _now_iso
+from .models import FutureFailureRecord, FutureRecord, _now_iso
 
 logger = get_logger()
 
@@ -26,6 +25,7 @@ def _future_record_transform(
     model_id: str | None,
     reason: str | None,
     result: Any,
+    failure: dict[str, Any] | None,
     queue_state: str | None,
     queue_state_reason: str | None,
     replica_id: str | None,
@@ -55,6 +55,7 @@ def _future_record_transform(
             model_id=model_id,
             reason=reason,
             result=result,
+            failure=failure,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
             replica_id=replica_id,
@@ -71,7 +72,14 @@ def _future_record_transform(
     # replica_id is set at creation and is deliberately NOT overwritten here.
     if reason is not None:
         updated['reason'] = reason
-    if result is not None:
+    if new_status in _TERMINAL_STATUSES:
+        if new_status in ('failed', 'cancelled'):
+            updated['result'] = None
+            updated['failure'] = failure
+        else:
+            updated['failure'] = None
+            updated['result'] = result
+    elif result is not None:
         updated['result'] = result
     if queue_state is not None:
         updated['queue_state'] = queue_state
@@ -83,7 +91,7 @@ def _future_record_transform(
 _CANCELLABLE_STATUSES = frozenset({'pending', 'queued'})
 
 
-def _cancel_if_not_started_transform(existing: dict | None, *, payload: dict, now: str) -> dict | None:
+def _cancel_if_not_started_transform(existing: dict | None, *, failure: dict, now: str) -> dict | None:
     """Atomic transform: cancel iff the task has not started (pending/queued).
 
     Returns ``None`` (no change) for running/terminal/missing records so a task
@@ -94,7 +102,8 @@ def _cancel_if_not_started_transform(existing: dict | None, *, payload: dict, no
         return None
     updated = dict(existing)
     updated['status'] = 'cancelled'
-    updated['result'] = payload
+    updated['result'] = None
+    updated['failure'] = failure
     updated['updated_at'] = now
     return updated
 
@@ -114,6 +123,7 @@ class FutureManager(BaseManager[FutureRecord]):
         model_id: str | None,
         reason: str | None = None,
         result: Any = None,
+        failure: FutureFailureRecord | None = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
@@ -128,8 +138,16 @@ class FutureManager(BaseManager[FutureRecord]):
         If the result object has a ``model_dump`` method (i.e. it is a Pydantic
         model) it is serialized to a plain dict before storage.
         """
+        is_failure = status in ('failed', 'cancelled')
+        if is_failure and failure is None:
+            raise ValueError(f'{status} future requires a FutureFailureRecord')
+        if is_failure and result is not None:
+            raise ValueError(f'{status} future cannot carry result')
+        if not is_failure and failure is not None:
+            raise ValueError(f'{status} future cannot carry failure')
         if result is not None and hasattr(result, 'model_dump'):
             result = result.model_dump()
+        failure_data = failure.model_dump() if failure is not None else None
 
         now = _now_iso()
         await self._backend.update_atomic(
@@ -141,6 +159,7 @@ class FutureManager(BaseManager[FutureRecord]):
                 model_id=model_id,
                 reason=reason,
                 result=result,
+                failure=failure_data,
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
                 replica_id=replica_id,
@@ -152,15 +171,19 @@ class FutureManager(BaseManager[FutureRecord]):
     async def cancel_if_pending(self, request_id: str) -> str | None:
         """Cancel a task iff it has not started; return the resulting status.
 
-        Writes a terminal ``cancelled`` record (carrying a user ErrorPayload) only
-        when the current status is pending/queued -- a running task is left alone.
+        Writes a terminal ``cancelled`` record with a domain failure only when
+        the current status is pending/queued -- a running task is left alone.
         Returns the record's status after the attempt, or ``None`` if there is no
         record for ``request_id``.
         """
-        payload = {'error': 'Task cancelled by client', 'category': 'user', 'error_code': 499}
+        failure = FutureFailureRecord(
+            reason_code='cancelled',
+            message='Task cancelled by client',
+            attribution='user',
+        )
         result = await self._backend.update_atomic(
             self._make_key(request_id),
-            functools.partial(_cancel_if_not_started_transform, payload=payload, now=_now_iso()),
+            functools.partial(_cancel_if_not_started_transform, failure=failure.model_dump(), now=_now_iso()),
         )
         return result.get('status') if result else None
 
@@ -211,10 +234,10 @@ class FutureManager(BaseManager[FutureRecord]):
                     request_id,
                     'failed',
                     record.model_id,
-                    result=task_error_payload(
-                        'The replica that owned this task is no longer available.',
-                        request_id=request_id,
-                        error_code=503,
+                    failure=FutureFailureRecord(
+                        reason_code='orphaned_replica',
+                        message='The replica that owned this task is no longer available.',
+                        attribution='server',
                     ),
                     replica_id=replica_id,
                 )
@@ -227,10 +250,10 @@ class FutureManager(BaseManager[FutureRecord]):
                     request_id,
                     'failed',
                     record.model_id,
-                    result=task_error_payload(
-                        'Task exceeded the absolute survival bound without reaching a terminal state.',
-                        request_id=request_id,
-                        error_code=500,
+                    failure=FutureFailureRecord(
+                        reason_code='deadline_exceeded',
+                        message='Task exceeded the absolute survival bound without reaching a terminal state.',
+                        attribution='server',
                     ),
                     replica_id=replica_id,
                 )

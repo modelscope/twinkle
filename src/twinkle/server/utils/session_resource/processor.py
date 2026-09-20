@@ -7,8 +7,7 @@ Sessions are tracked via session ID; processors expire when their session expire
 """
 from __future__ import annotations
 
-import time
-from typing import Any
+from abc import abstractmethod
 
 from twinkle.utils.logger import get_logger
 from .base import SessionResourceMixin
@@ -51,34 +50,30 @@ class ProcessorManagerMixin(SessionResourceMixin):
             resource_max_lifetime=None,  # No max lifetime for processors
         )
         self._per_token_processor_limit = per_token_processor_limit
+        # The countdown runs every 10 seconds. A 30-second lease tolerates two
+        # missed renewals while still bounding stale reservations after a crash.
+        self._processor_quota_lease_seconds = 30.0
 
-    def _validate_registration(self, resource_id: str, token: str, session_id: str) -> None:
-        """Validate before registering a processor. Checks per-token limit.
-
-        Args:
-            resource_id: Processor identifier
-            token: User token
-            session_id: Session ID
-
-        Raises:
-            ValueError: If session_id is empty.
-            RuntimeError: If per-token limit is reached.
-        """
-        super()._validate_registration(resource_id, token, session_id)
-
-        current_count = sum(1 for info in self._resource_records.values() if info.get('token') == token)
-        if current_count >= self._per_token_processor_limit:
-            raise RuntimeError(f'Per-user processor limit ({self._per_token_processor_limit}) reached '
-                               f'for token {token[:8]}...')
-
-    def _create_resource_record(self, token: str, session_id: str) -> dict[str, Any]:
-        """Create a new processor record without state field."""
-        return {
-            'token': token,
-            'session_id': session_id,
-            'created_at': time.time(),
-            'expiring': False,
-        }
+    async def _on_resource_liveness_confirmed(self, resource_id: str) -> bool:
+        """Renew this processor's shared quota lease after a healthy probe."""
+        info = self._resource_records.get(resource_id)
+        if info is None:
+            return False
+        try:
+            renewed = await self.state.renew_processor_quota(
+                info['token'],
+                resource_id,
+                lease_seconds=self._processor_quota_lease_seconds,
+            )
+        except Exception as exc:
+            # Keep the local processor during a transient backend outage. Once the
+            # backend recovers, a lost/expired reservation returns False and the
+            # countdown loop removes the unaccounted local resource.
+            logger.warning('[ProcessorManager] Failed to renew quota lease for %s: %r', resource_id, exc)
+            return True
+        if not renewed:
+            logger.warning('[ProcessorManager] Quota lease for %s was lost; expiring local processor', resource_id)
+        return renewed
 
     async def _on_resource_expired(self, resource_id: str) -> None:
         """Base-class expiry hook; forwards to the domain hook ``_on_processor_expired``.
@@ -91,12 +86,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
         """
         await self._on_processor_expired(resource_id)
 
+    @abstractmethod
     async def _on_processor_expired(self, processor_id: str) -> None:
-        """Hook called when a processor's session expires.
-
-        Must be overridden by inheriting classes.
-
-        Raises:
-            NotImplementedError: If not overridden.
-        """
-        raise NotImplementedError(f'_on_processor_expired must be implemented by {self.__class__.__name__}')
+        """Hook called when a processor's session expires."""
+        ...

@@ -11,6 +11,8 @@ import time
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from twinkle.server.deployment import twinkle_server_error_handler
+from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.gateway.twinkle_handlers import _register_twinkle_routes
 
 
@@ -32,6 +34,7 @@ class _Gateway:
 
 def _client(record) -> TestClient:
     app = FastAPI()
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
     _register_twinkle_routes(app, lambda: _Gateway(record))
     return TestClient(app)
 
@@ -47,9 +50,15 @@ def test_completed_with_null_result_returns_200_and_null(monkeypatch):
     assert body['error'] is None
 
 
-def test_legacy_two_field_failure_returns_200_and_valid_envelope():
-    """Property 5 / R8#5: a {error, category} record is 200 with a legal envelope."""
-    client = _client({'status': 'failed', 'result': {'error': 'boom', 'category': 'server'}})
+def test_domain_failure_returns_200_and_valid_envelope():
+    client = _client({
+        'status': 'failed',
+        'failure': {
+            'reason_code': 'internal_error',
+            'message': 'boom',
+            'attribution': 'server',
+        },
+    })
     resp = client.post('/twinkle/retrieve_future', json={'request_id': 'req-2'})
     assert resp.status_code == 200
     body = resp.json()
@@ -69,7 +78,9 @@ def test_always_missing_record_404s_only_after_the_full_window(monkeypatch):
     resp = client.post('/twinkle/retrieve_future', json={'request_id': 'ghost'})
     waited = time.monotonic() - start
     assert resp.status_code == 404
-    assert 'ghost' in resp.json()['detail']
+    assert 'ghost' in resp.json()['error']
+    assert resp.json()['category'] == 'user'
+    assert resp.json()['error_code'] == 404
     # It must fold the missing record into the wait loop, not short-circuit.
     assert waited >= 0.3
 

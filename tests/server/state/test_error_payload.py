@@ -1,27 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tests for ErrorPayload construction, backfill, and tinker-SDK wire compat.
-
-Spec: T2.4 / R9#7 / R8#5.
-"""
+"""Tests for direct/streaming ErrorPayload construction and Tinker parsing."""
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.utils.task_errors import error_payload_from_stored, task_error_payload
+from twinkle.server.utils.task_errors import task_error_payload
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
-
-
-def test_two_field_legacy_backfills_error_code_and_request_id():
-    """A pre-spec {error, category} payload backfills to 500 + passed request_id."""
-    stored = {'error': 'boom', 'category': 'Server'}
-
-    payload = error_payload_from_stored(stored, request_id='req_42')
-
-    assert isinstance(payload, ErrorPayload)
-    assert payload.error_code == 500
-    assert payload.request_id == 'req_42'
-    assert payload.error == 'boom'
 
 
 def test_overlong_traceback_is_trimmed_tail_kept_with_marker():
@@ -72,12 +57,6 @@ def test_tinker_sdk_parses_six_field_like_two_field():
     assert parsed_six.category == parsed_two.category
 
 
-def test_legacy_title_case_category_is_normalized():
-    payload = error_payload_from_stored({'error': 'boom', 'category': 'Server'}, request_id='req_10')
-    assert payload.category is ErrorCategory.Server
-    assert payload.category.value == 'server'
-
-
 @pytest.mark.parametrize('category', [ErrorCategory.User, ErrorCategory.Unknown])
 def test_non_server_traceback_is_rejected(category):
     with pytest.raises(ValidationError):
@@ -88,10 +67,3 @@ def test_non_server_traceback_is_rejected(category):
             request_id='req_11',
             traceback='server stack',
         )
-
-
-def test_legacy_unknown_traceback_is_removed():
-    payload = error_payload_from_stored(
-        {'error': 'legacy', 'category': 'Unknown', 'traceback': 'old stack'}, request_id='req_12')
-    assert payload.category is ErrorCategory.Unknown
-    assert payload.traceback is None

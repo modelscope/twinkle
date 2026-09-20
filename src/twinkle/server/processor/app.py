@@ -83,9 +83,16 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
         await self._ensure_state_cleanup_started()
 
     async def _on_processor_expired(self, processor_id: str) -> None:
-        """Called by the countdown loop when a processor's session expires."""
+        """Remove the local processor and release its shared quota lease."""
+        info = self.get_resource_info(processor_id)
         self.resource_dict.pop(processor_id, None)
         self.unregister_resource(processor_id)
+        if info is not None:
+            await self.state.release_processor_quota(
+                info['token'],
+                processor_id,
+                lease_seconds=self._processor_quota_lease_seconds,
+            )
 
 
 def build_processor_app(ncpu_proc_per_node: int,

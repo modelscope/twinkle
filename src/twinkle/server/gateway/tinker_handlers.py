@@ -17,8 +17,9 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.utils.auth import get_token_from_request
-from twinkle.server.utils.task_errors import error_payload_from_stored
+from twinkle.server.utils.task_errors import trim_traceback
 from twinkle.utils.logger import get_logger
 from .services import create_session as create_session_use_case
 from .services import delete_checkpoint
@@ -26,6 +27,43 @@ from .services import get_training_run as get_training_run_use_case
 from .services import get_weights_info, list_checkpoints, list_training_runs, poll_future, touch_session
 
 logger = get_logger()
+
+# Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
+_TINKER_FAILURE_WIRE: dict[str, tuple[int, str]] = {
+    'invalid_request': (400, 'user'),
+    'request_rejected': (400, 'user'),
+    'resource_not_found': (404, 'user'),
+    'full_mode_busy': (409, 'user'),
+    'input_tokens_exceeded': (422, 'user'),
+    'batch_size_invalid': (422, 'user'),
+    'rate_limit_exceeded': (429, 'user'),
+    'resource_quota_exceeded': (429, 'user'),
+    'cancelled': (499, 'user'),
+    'endpoint_unavailable': (501, 'server'),
+    'state_contention': (503, 'server'),
+    'backend_gate_unavailable': (503, 'server'),
+    'orphaned_replica': (503, 'server'),
+    'execution_timeout': (504, 'server'),
+    'deadline_exceeded': (500, 'server'),
+    'internal_error': (500, 'server'),
+}
+
+
+def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any]:
+    """Map domain failure state to the existing Tinker-compatible error body."""
+    failure = FutureFailureRecord.model_validate(stored)
+    error_code, category = _TINKER_FAILURE_WIRE.get(failure.reason_code, (500, 'server'))
+    payload: dict[str, Any] = {
+        'error': failure.message[:1024],
+        'category': category,
+        'error_code': error_code,
+        'request_id': request_id,
+    }
+    if failure.details is not None:
+        payload['details'] = failure.details
+    if failure.diagnostic and category == 'server':
+        payload['traceback'] = trim_traceback(failure.diagnostic)
+    return payload
 
 
 def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -97,8 +135,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
         status = record.get('status')
         if status == 'failed':
-            payload = error_payload_from_stored(record.get('result'), request_id=request_id)
-            return payload.model_dump(mode='json', exclude_none=True)
+            return _tinker_error_from_failure(record.get('failure'), request_id=request_id)
 
         result = record.get('result')
         if result is None:

@@ -90,6 +90,13 @@ class ResourceExhaustedError(TwinkleServerError):
     category = ErrorCategory.Server
 
 
+class EndpointUnavailableError(TwinkleServerError):
+    """The endpoint is not implemented by this deployment's backend."""
+
+    error_code = 501
+    category = ErrorCategory.Server
+
+
 class RequestRejectedError(TwinkleServerError):
     """Decision_Boundary-left failure: rejectable from the request body, deployment
     config, and loaded schema alone, so it is returned with a real HTTP status code
@@ -128,6 +135,13 @@ class BatchSizeError(RequestRejectedError):
 
 class RateLimitExceededError(RequestRejectedError):
     """The request or token rate exceeds the configured limit."""
+
+    error_code = 429
+    category = ErrorCategory.User
+
+
+class ResourceQuotaExceededError(RequestRejectedError):
+    """The caller exhausted a configured per-token resource quota."""
 
     error_code = 429
     category = ErrorCategory.User

@@ -28,9 +28,8 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Optional
 
-from twinkle.server.exceptions import RequestRejectedError, TwinkleServerError
+from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle_client.types.base import FieldRole, fields_with_role, read_backend_only
-from twinkle_client.types.errors import ErrorCategory
 
 
 class BackendCapability(StrEnum):
@@ -54,18 +53,6 @@ _UNSUPPORTED: dict[str, frozenset[str]] = {
 }
 
 _ALTERNATIVES = 'use `forward_backward` (training) or `forward_only` (inference) instead'
-
-
-class EndpointUnavailableError(TwinkleServerError):
-    """The endpoint is not implemented by this deployment's backend.
-
-    501, not 4xx: the request is well-formed and the caller is not at fault -- this
-    deployment simply cannot serve it. ``Server`` category, and no traceback, because
-    the answer is a deployment fact rather than a crash.
-    """
-
-    error_code = 501
-    category = ErrorCategory.Server
 
 
 def resolve_backend(service: Any) -> str | None:

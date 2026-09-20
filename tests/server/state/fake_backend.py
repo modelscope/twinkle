@@ -72,5 +72,11 @@ class FakeBackend(StateBackend):
         await self.set(key, updated, ttl)
         return updated
 
-    async def close(self) -> None:
+    async def flush_all(self) -> None:
         self._store.clear()
+
+    async def close(self) -> None:
+        pass
+
+    async def health_check(self) -> bool:
+        return True

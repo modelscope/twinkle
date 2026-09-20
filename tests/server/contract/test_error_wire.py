@@ -12,11 +12,10 @@ class _State:
     async def get_future(self, request_id: str):
         return {
             'status': 'failed',
-            'result': {
-                'error': 'backend timed out',
-                'category': 'server',
-                'error_code': 504,
-                'request_id': request_id,
+            'failure': {
+                'reason_code': 'execution_timeout',
+                'message': 'backend timed out',
+                'attribution': 'server',
             },
         }
 

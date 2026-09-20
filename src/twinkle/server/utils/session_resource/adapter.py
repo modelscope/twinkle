@@ -11,6 +11,8 @@ to handle expired adapters without using callbacks or polling.
 """
 from __future__ import annotations
 
+from abc import abstractmethod
+
 from twinkle.utils.logger import get_logger
 from .base import SessionResourceMixin
 
@@ -64,19 +66,10 @@ class AdapterManagerMixin(SessionResourceMixin):
         """
         await self._on_adapter_expired(resource_id)
 
+    @abstractmethod
     async def _on_adapter_expired(self, adapter_name: str) -> None:
-        """Hook method called when an adapter expires.
-
-        This method must be overridden by inheriting classes to handle
-        adapter expiration logic. The base implementation raises NotImplementedError.
-
-        Args:
-            adapter_name: Name of the expired adapter.
-
-        Raises:
-            NotImplementedError: If not overridden by inheriting class.
-        """
-        raise NotImplementedError(f'_on_adapter_expired must be implemented by {self.__class__.__name__}')
+        """Hook method called when an adapter expires."""
+        ...
 
     @staticmethod
     def get_adapter_name(adapter_name: str) -> str:

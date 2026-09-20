@@ -49,7 +49,7 @@ def _reset_canonical_state_actor():
     """Clear the canonical state actor's store before each test function.
 
     Hypothesis property tests reuse the function scope across examples and
-    so should call ``backend.close()`` themselves to reset between examples.
+    so should call the actor's explicit ``flush_all()`` test hook themselves.
     """
     import ray
 
@@ -62,7 +62,7 @@ def _reset_canonical_state_actor():
         actor = None
     if actor is not None:
         try:
-            ray.get(actor.close.remote())
+            ray.get(actor.flush_all.remote())
         except Exception:
             pass
     yield

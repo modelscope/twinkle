@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import re
 import time
 import uuid
@@ -10,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
+from twinkle.server.exceptions import ResourceQuotaExceededError
 from twinkle.server.telemetry import MetricsRegistry
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
@@ -20,7 +22,7 @@ from .backend.factory import create_backend
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
 from .model_manager import ModelManager
-from .models import ModelRecord, SamplingSessionRecord, SessionRecord
+from .models import FutureFailureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
 from .sampling_manager import SamplingSessionManager
 from .session_manager import SessionManager
 
@@ -38,6 +40,68 @@ logger = get_logger()
 LEADER_KEY = 'cleanup_leader'  # actual backend key: '<key_prefix>cleanup_leader'
 LEASE_TTL = 30  # seconds — leader loses the lease after this without a renew
 LEASE_RENEW = 10  # seconds — must be < LEASE_TTL/2 so two missed renews still beat the TTL
+_PROCESSOR_QUOTA_PREFIX = 'processor_quota::'
+
+
+def _clean_processor_reservations(existing: Any, *, now: float) -> dict[str, dict[str, Any]]:
+    """Return only well-formed processor reservations whose leases are active."""
+    if not isinstance(existing, dict):
+        return {}
+    active: dict[str, dict[str, Any]] = {}
+    for processor_id, reservation in existing.items():
+        if not isinstance(processor_id, str) or not isinstance(reservation, dict):
+            continue
+        expires_at = reservation.get('lease_expires_at')
+        if isinstance(expires_at, (int, float)) and float(expires_at) > now:
+            active[processor_id] = dict(reservation)
+    return active
+
+
+def _reserve_processor_transform(
+    existing: Any,
+    *,
+    processor_id: str,
+    session_id: str,
+    now: float,
+    lease_seconds: float,
+    limit: int,
+) -> dict[str, dict[str, Any]]:
+    reservations = _clean_processor_reservations(existing, now=now)
+    if processor_id in reservations or len(reservations) < limit:
+        reservations[processor_id] = {
+            'session_id': session_id,
+            'lease_expires_at': now + lease_seconds,
+        }
+    return reservations
+
+
+def _renew_processor_transform(
+    existing: Any,
+    *,
+    processor_id: str,
+    now: float,
+    lease_seconds: float,
+) -> dict[str, dict[str, Any]]:
+    reservations = _clean_processor_reservations(existing, now=now)
+    reservation = reservations.get(processor_id)
+    if reservation is not None:
+        reservation['lease_expires_at'] = now + lease_seconds
+    return reservations
+
+
+def _release_processor_transform(
+    existing: Any,
+    *,
+    processor_id: str,
+    now: float,
+) -> dict[str, dict[str, Any]]:
+    reservations = _clean_processor_reservations(existing, now=now)
+    reservations.pop(processor_id, None)
+    return reservations
+
+
+def _sweep_processor_transform(existing: Any, *, now: float) -> dict[str, dict[str, Any]]:
+    return _clean_processor_reservations(existing, now=now)
 
 
 def _renew_if_owner(current: str | None, *, owner: str) -> str | None:
@@ -237,6 +301,85 @@ class ServerState:
         """
         return await self._model_mgr.get_available_replica_ids(candidate_ids)
 
+    # ----- Processor Quota Management -----
+
+    @staticmethod
+    def _processor_quota_key(token: str) -> str:
+        return f'{_PROCESSOR_QUOTA_PREFIX}{token}'
+
+    @staticmethod
+    def _processor_quota_ttl(lease_seconds: float) -> int:
+        # The key-level TTL is only stale-key hygiene. Individual entries carry
+        # their own deadlines and are cleaned atomically on every operation.
+        return max(1, math.ceil(lease_seconds * 2))
+
+    async def reserve_processor_quota(
+        self,
+        token: str,
+        processor_id: str,
+        session_id: str,
+        *,
+        limit: int,
+        lease_seconds: float,
+    ) -> None:
+        """Atomically reserve one cluster-wide processor slot for ``token``."""
+        now = time.time()
+        reservations = await self._backend.update_atomic(
+            self._processor_quota_key(token),
+            functools.partial(
+                _reserve_processor_transform,
+                processor_id=processor_id,
+                session_id=session_id,
+                now=now,
+                lease_seconds=lease_seconds,
+                limit=limit,
+            ),
+            ttl=self._processor_quota_ttl(lease_seconds),
+        )
+        if not isinstance(reservations, dict) or processor_id not in reservations:
+            raise ResourceQuotaExceededError(
+                f'Per-user processor quota ({limit}) reached for token {token[:8]}...')
+
+    async def renew_processor_quota(
+        self,
+        token: str,
+        processor_id: str,
+        *,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew an existing reservation; never recreate an expired lease."""
+        now = time.time()
+        reservations = await self._backend.update_atomic(
+            self._processor_quota_key(token),
+            functools.partial(
+                _renew_processor_transform,
+                processor_id=processor_id,
+                now=now,
+                lease_seconds=lease_seconds,
+            ),
+            ttl=self._processor_quota_ttl(lease_seconds),
+        )
+        return isinstance(reservations, dict) and processor_id in reservations
+
+    async def release_processor_quota(self, token: str, processor_id: str, *, lease_seconds: float = 30.0) -> None:
+        """Idempotently release a processor reservation."""
+        await self._backend.update_atomic(
+            self._processor_quota_key(token),
+            functools.partial(_release_processor_transform, processor_id=processor_id, now=time.time()),
+            ttl=self._processor_quota_ttl(lease_seconds),
+        )
+
+    async def sweep_processor_quotas(self, *, lease_seconds: float = 30.0) -> None:
+        """Remove expired leases from every persisted processor quota map."""
+        now = time.time()
+        keys = await self._backend.keys(f'{_PROCESSOR_QUOTA_PREFIX}*')
+        for key in keys:
+            await self._backend.update_atomic(
+                key,
+                functools.partial(_sweep_processor_transform, now=now),
+                ttl=self._processor_quota_ttl(lease_seconds),
+            )
+
     # ----- Sampling Session Management -----
 
     async def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
@@ -316,26 +459,28 @@ class ServerState:
         model_id: str | None,
         reason: str | None = None,
         result: Any = None,
+        failure: FutureFailureRecord | None = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
     ) -> None:
-        """Store task status with optional result.
+        """Store task status with either a success result or domain failure.
 
         Supports the full task lifecycle:
         - PENDING: Task created, waiting to be processed
         - QUEUED: Task in queue waiting for execution
         - RUNNING: Task currently executing
         - COMPLETED: Task completed successfully (result required)
-        - FAILED: Task failed with error (result contains error payload)
+        - FAILED: Task failed (failure contains protocol-independent details)
 
         Args:
             request_id: Unique identifier for the request.
             status: Task status string (pending/queued/running/completed/failed).
             model_id: Optional associated model_id.
             reason: Optional reason string.
-            result: Optional result data (used for completed/failed status).
+            result: Optional success result data.
+            failure: Optional protocol-independent failure record.
             queue_state: Optional queue state for tinker client (active/paused_rate_limit/paused_capacity).
             queue_state_reason: Optional reason for the queue state.
         """
@@ -345,6 +490,7 @@ class ServerState:
             model_id=model_id,
             reason=reason,
             result=result,
+            failure=failure,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
             replica_id=replica_id,
@@ -405,6 +551,7 @@ class ServerState:
 
         alive_replica_ids = await self._model_mgr.get_alive_replica_ids(self.expiration_timeout)
         futures_removed = await self._future_mgr.cleanup_expired(cutoff_time, alive_replica_ids=alive_replica_ids)
+        await self.sweep_processor_quotas()
 
         return {
             'sessions': sessions_removed,

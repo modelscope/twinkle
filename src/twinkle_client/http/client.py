@@ -8,6 +8,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from twinkle_client.exceptions import TwinkleClientValidationError, TwinkleHTTPError
+from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 from .context import ClientContext, capture_transport
 from .headers import build_routing_headers
 
@@ -51,13 +52,29 @@ def _handle_response(response: requests.Response) -> requests.Response:
         body = response.json()
     except Exception:
         body = None
+    payload: ErrorPayload | None = None
     if isinstance(body, dict):
-        category = body.get('category', 'Unknown')
-        error_code = body.get('error_code')
-        request_id = body.get('request_id')
-        summary = body.get('error') or body.get('detail') or response.text
+        try:
+            payload = ErrorPayload.model_validate(body)
+        except Exception:
+            payload = None
+
+    if payload is not None:
+        summary = payload.error or response.text
+        category = payload.category.value
+        error_code = payload.error_code
+        request_id = payload.request_id
+        details = payload.details
+        traceback_text = payload.traceback
+    elif isinstance(body, dict):
+        summary = body.get('detail') or response.text
+        category = ErrorCategory.Unknown.value
+        error_code = request_id = details = traceback_text = None
     else:
-        category, error_code, request_id, summary = 'Unknown', None, None, response.text
+        summary = response.text
+        category = ErrorCategory.Unknown.value
+        error_code = request_id = details = traceback_text = None
+
     message = f'{response.status_code} Error for url: {response.url}\nServer detail:\n{summary}'
     raise TwinkleHTTPError(
         message,
@@ -66,6 +83,8 @@ def _handle_response(response: requests.Response) -> requests.Response:
         error_code=error_code,
         category=category,
         request_id=request_id,
+        details=details,
+        traceback=traceback_text,
     )
 
 

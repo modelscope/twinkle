@@ -19,6 +19,7 @@ class _DummyState:
         self._latest[request_id] = {
             'status': status,
             'result': kwargs.get('result'),
+            'failure': (kwargs['failure'].model_dump() if kwargs.get('failure') is not None else None),
             'queue_state': kwargs.get('queue_state'),
             'queue_state_reason': kwargs.get('queue_state_reason'),
         }
@@ -203,14 +204,15 @@ async def test_user_task_error_is_stored_as_user_failure():
     finally:
         await queue._compute_worker.stop()
 
-    assert failed[-1]['result']['category'] == 'user'
-    assert 'traceback' not in failed[-1]['result']
+    failure = failed[-1]['failure']
+    assert failure.reason_code == 'request_rejected'
+    assert failure.attribution == 'user'
+    assert failure.diagnostic is None
 
 
 @pytest.mark.asyncio
-async def test_typed_server_error_keeps_its_status_and_category():
-    """A TwinkleServerError (e.g. ResourceNotFoundError) must keep its own 404/user
-    classification instead of collapsing to a generic 500/server."""
+async def test_typed_server_error_keeps_its_domain_reason_and_attribution():
+    """A typed user failure must retain its domain meaning in persisted state."""
     from twinkle.server.exceptions import ResourceNotFoundError
 
     queue = _DummyQueue()
@@ -229,10 +231,10 @@ async def test_typed_server_error_keeps_its_status_and_category():
     finally:
         await queue._compute_worker.stop()
 
-    assert failed[-1]['result']['error_code'] == 404
-    assert failed[-1]['result']['category'] == 'user'
-    # A user rejection carries no traceback.
-    assert 'traceback' not in failed[-1]['result']
+    failure = failed[-1]['failure']
+    assert failure.reason_code == 'resource_not_found'
+    assert failure.attribution == 'user'
+    assert failure.diagnostic is None
 
 
 @pytest.mark.asyncio

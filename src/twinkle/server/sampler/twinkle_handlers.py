@@ -11,7 +11,7 @@ import json
 import traceback
 import uuid
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING
 
@@ -22,7 +22,7 @@ import numpy as np
 
 import twinkle_client.types as types
 from twinkle.data_format import SamplingParams
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.weights import resolve_sampler_weights
 from twinkle.server.telemetry.correlation import MODEL_ID
@@ -277,9 +277,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         whose result is the stored group's DataRef."""
         token = await self._on_request_start(request)
         if not self.data_plane.enabled:
-            raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
+            raise EndpointUnavailableError('sample_to_data_plane requires data_plane_url')
         if not callable(getattr(self.sampler, 'submit_generation', None)):
-            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async')
+            raise EndpointUnavailableError('sampler_type must be vllm_async')
 
         adapter_path = None
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
@@ -419,7 +419,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         try:
             inputs_parsed = to_backend_inputs(body.inputs, single=True)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise RequestRejectedError(str(e))
 
         params = None
         if body.sampling_params:

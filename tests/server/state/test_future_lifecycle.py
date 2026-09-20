@@ -17,6 +17,7 @@ import pytest
 
 from twinkle.server.state.backend.base import StateBackend
 from twinkle.server.state.future_manager import FutureManager
+from twinkle.server.state.models import FutureFailureRecord
 
 
 class _FakeBackend(StateBackend):
@@ -74,7 +75,7 @@ class _FakeBackend(StateBackend):
         return updated
 
     async def close(self) -> None:
-        self._store.clear()
+        pass
 
     async def health_check(self) -> bool:
         return True
@@ -86,10 +87,15 @@ def manager():
 
 
 async def _store(manager, request_id, status, *, replica_id=None, absolute_deadline=None):
+    failure = None
+    if status in ('failed', 'cancelled'):
+        failure = FutureFailureRecord(
+            reason_code='internal_error', message='boom', attribution='server')
     await manager.store_status(
         request_id,
         status,
         model_id='m1',
+        failure=failure,
         replica_id=replica_id,
         absolute_deadline=absolute_deadline,
     )
@@ -112,7 +118,9 @@ async def test_non_terminal_orphan_is_failed_not_deleted(manager):
     rec = await manager.get('r2')
     assert rec is not None  # NOT deleted (Property 6)
     assert rec.status == 'failed'
-    assert rec.result['category'] == 'server'
+    assert rec.result is None
+    assert rec.failure.reason_code == 'orphaned_replica'
+    assert rec.failure.attribution == 'server'
 
 
 @pytest.mark.asyncio
@@ -121,15 +129,17 @@ async def test_non_terminal_past_absolute_deadline_is_failed(manager):
     await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     rec = await manager.get('r3')
     assert rec is not None and rec.status == 'failed'
+    assert rec.failure.reason_code == 'deadline_exceeded'
 
 
 @pytest.mark.asyncio
-async def test_legacy_record_without_deadline_uses_expiration_timeout(manager):
-    await _store(manager, 'legacy', 'running', replica_id=None)
+async def test_record_without_deadline_uses_expiration_timeout(manager):
+    await _store(manager, 'without-deadline', 'running', replica_id=None)
     with mock.patch('twinkle.server.state.future_manager.time.time', return_value=time.time() + 301):
         await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids=set())
-    rec = await manager.get('legacy')
+    rec = await manager.get('without-deadline')
     assert rec is not None and rec.status == 'failed'
+    assert rec.failure.reason_code == 'deadline_exceeded'
 
 
 @pytest.mark.asyncio
@@ -206,11 +216,14 @@ async def test_claim_seq_dedups_then_release_readmits():
 async def test_cancel_drops_pending_but_never_running():
     from twinkle.server.state.server_state import ServerState
     state = ServerState(backend=_FakeBackend())
-    # pending -> cancel drops it to the terminal 'cancelled' state with a user payload.
+    # pending -> cancel drops it to a terminal domain failure.
     await state.store_future_status('rp', 'pending', 'm1')
     assert await state.cancel_future('rp') == {'cancelled': True, 'state': 'cancelled'}
     rec = await state.get_future('rp')
-    assert rec['status'] == 'cancelled' and rec['result']['error_code'] == 499
+    assert rec['status'] == 'cancelled'
+    assert rec['result'] is None
+    assert rec['failure']['reason_code'] == 'cancelled'
+    assert rec['failure']['attribution'] == 'user'
     # running -> cancel is a no-op; in-flight work is never interrupted.
     await state.store_future_status('rr', 'running', 'm1')
     assert await state.cancel_future('rr') == {'cancelled': False, 'state': 'running'}
@@ -220,8 +233,14 @@ async def test_cancel_drops_pending_but_never_running():
 
 def test_cancelled_record_maps_to_error_envelope():
     from twinkle.server.lifecycle.envelope import envelope_from_record
-    rec = {'status': 'cancelled',
-           'result': {'error': 'Task cancelled by client', 'category': 'user', 'error_code': 499}}
+    rec = {
+        'status': 'cancelled',
+        'failure': {
+            'reason_code': 'cancelled',
+            'message': 'Task cancelled by client',
+            'attribution': 'user',
+        },
+    }
     env = envelope_from_record('rc', rec)
     assert env.status == 'cancelled'
     assert env.error is not None and env.error.error_code == 499

@@ -85,7 +85,7 @@ class SamplerArgs(_ArgsBase):
     nproc_per_node: int = 1
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
-    sampler_type: Literal['mock', 'vllm', 'vllm_async', 'torch']
+    sampler_type: Literal['mock', 'vllm', 'vllm_async']
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
