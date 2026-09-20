@@ -104,6 +104,19 @@ Resampling must use the same rollout policy snapshot as the initial candidates.
 The controller only plans work; the caller remains responsible for policy
 version and staleness checks.
 
+For a complete GSM8K rollout, admission, bounded-resampling, GRPO advantage,
+and optimizer-step loop, run the end-to-end
+[`cookbook/rl/grpo/group_admission.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/group_admission.py)
+example. It follows the official `short_math_grpo.py` setup and keeps one
+rollout policy snapshot across initial and replacement groups:
+
+```bash
+sh cookbook/rl/grpo/group_admission.sh --max-steps 2
+```
+
+Exact-dead and near-tie outcomes are stochastic in a real rollout; their
+deterministic branch coverage remains in `tests/advantage/test_group_admission.py`.
+
 Use `group_admission_metrics(decisions)` to report effective-group rate, the
 orthogonal reward/near-duplicate rejection counts, and the mutually exclusive
 `exact_dead`, `near_tie`, and `redundant` counts. Derive ratios at the caller

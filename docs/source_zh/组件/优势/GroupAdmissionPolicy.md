@@ -91,6 +91,19 @@ sample_more_complete_groups(plan.extra_groups)
 补采必须使用与首批候选相同的 rollout policy 快照。控制器只负责规划补采量，
 调用方仍需检查 policy version 和 staleness。
 
+从 GSM8K rollout、整组准入、有界补采、GRPO advantage 到优化器更新的
+端到端流程，可参考
+[`cookbook/rl/grpo/group_admission.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/group_admission.py)
+。该示例基于官方 `short_math_grpo.py` 配置，首轮与补采组共用同一个
+rollout policy 快照：
+
+```bash
+sh cookbook/rl/grpo/group_admission.sh --max-steps 2
+```
+
+真实 rollout 中 exact-dead 和 near-tie 的出现具有随机性；相关分支的确定性
+覆盖仍由 `tests/advantage/test_group_admission.py` 保证。
+
 可以使用 `group_admission_metrics(decisions)` 记录有效组率、reward/近重复条件的独立
 拒绝数量，以及互斥的 `exact_dead`、`near_tie`、`redundant` 数量。比例由调用方
 基于原始计数计算，以便分布式合并时使用统一分母。
