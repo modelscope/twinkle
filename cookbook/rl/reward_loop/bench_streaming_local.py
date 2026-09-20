@@ -21,7 +21,11 @@ Outputs (JSONL timeline + CSV per-step summary) go to ``BENCH_OUT_DIR``.
 Environment knobs: TWINKLE_MODEL_ID / TWINKLE_DATASET_ID / TWINKLE_MODEL_GPUS /
 TWINKLE_SAMPLER_GPUS / TWINKLE_LEARNING_RATE / TWINKLE_ADAPTER_NAME /
 TWINKLE_REWARD_NUM_WORKERS / TWINKLE_REWARD_DELAY_MS / BENCH_RUNS (all|smoke) /
-BENCH_OUT_DIR.
+BENCH_OUT_DIR. RM mode adds BENCH_RM (0|1), BENCH_RM_BATCH / BENCH_RM_GEN /
+BENCH_RM_STEPS (matrix size, default 2 / 2 / 3), BENCH_RM_MAX_TOKENS (sampling),
+TWINKLE_REWARD_JUDGE_MAX_TOKENS (verdict length), BENCH_SUBMIT_GRANULARITY
+(whole|mini|per-item) and BENCH_MICRO_BATCH / BENCH_MICRO_BATCH_TIMEOUT_MS
+(worker-side micro batching, 0 = off).
 """
 from __future__ import annotations
 
@@ -103,6 +107,10 @@ BENCH_PATH_B_STREAM = os.environ.get('BENCH_PATH_B_STREAM', 'engine')
 # RM 模式：奖励提交粒度（whole=整批 / mini=每 K 条一批 / per-item=逐条）。
 BENCH_SUBMIT_GRANULARITY = os.environ.get('BENCH_SUBMIT_GRANULARITY', 'per-item')
 MINI_SUBMIT_SIZE = int(os.environ.get('BENCH_MINI_BATCH_SIZE', '2'))
+# RM 模式：奖励节点的微批（worker 内把多次逐条提交合并成更大的 judge 请求）。
+# 0 = 关闭（默认，行为与不设该变量一致）；timeout 是攒不满一批时的兜底等待毫秒数。
+BENCH_MICRO_BATCH = int(os.environ.get('BENCH_MICRO_BATCH', '0'))
+BENCH_MICRO_BATCH_TIMEOUT_MS = float(os.environ.get('BENCH_MICRO_BATCH_TIMEOUT_MS', '0'))
 
 BASE_STEPS = 6
 SWEEP_STEPS = 4
@@ -112,11 +120,24 @@ MAX_TOTAL_PER_STEP = 4 * 8  # batch=4, gen=8
 REWARD_BACKLOG = MAX_TOTAL_PER_STEP + 2
 
 
+def _select_runs(runs: List[Dict[str, Any]], spec: str) -> List[Dict[str, Any]]:
+    """``BENCH_RUNS`` subset selection, shared by both matrices."""
+    names = [r['name'] for r in runs]
+    selected = [name.strip() for name in spec.split(',') if name.strip()]
+    unknown = [name for name in selected if name not in names]
+    if unknown or not selected:
+        raise ValueError(
+            f"BENCH_RUNS must be 'all', 'smoke', or a comma-separated subset of "
+            f"{names}; got {spec!r}")
+    return [r for r in runs if r['name'] in selected]
+
+
 def build_runs() -> List[Dict[str, Any]]:
     """Run matrix: one base config plus single-variable sweep points.
 
     ``BENCH_RUNS`` accepts 'all', 'smoke', or a comma-separated run-name list
-    (e.g. 'base,gen8,d1000') for targeted reruns.
+    (e.g. 'base,gen8,d1000', or in RM mode 'rm-b-whole,rm-b-per') for targeted
+    reruns.
     """
     runs = [
         dict(name='base', batch=4, gen=4, max_tokens=1024, delay_ms=0, steps=BASE_STEPS),
@@ -128,26 +149,24 @@ def build_runs() -> List[Dict[str, Any]]:
         dict(name='d1000', batch=4, gen=4, max_tokens=1024, delay_ms=1000, steps=SWEEP_STEPS),
     ]
     if BENCH_RM:
-        # RM 场景专用矩阵：路径 × 提交粒度（小规模，每步 4 条序列）。
-        base = dict(batch=2, gen=2, max_tokens=BENCH_RM_MAX_TOKENS, delay_ms=0, steps=3)
-        return [
+        # RM 场景专用矩阵：路径 × 提交粒度（默认每步 4 条序列；BENCH_RM_BATCH /
+        # BENCH_RM_GEN / BENCH_RM_STEPS 可放大规模做排队压测）。
+        base = dict(batch=RM_BATCH, gen=RM_GEN, max_tokens=BENCH_RM_MAX_TOKENS,
+                    delay_ms=0, steps=RM_STEPS)
+        rm_runs = [
             dict(name='rm-whole', path='A', granularity='whole', **base),
             dict(name='rm-b-whole', path='B', granularity='whole', **base),
             dict(name='rm-b-mini', path='B', granularity='mini', **base),
             dict(name='rm-b-per', path='B', granularity='per-item', **base),
         ]
+        if BENCH_RUNS in ('all', 'smoke'):
+            return rm_runs
+        return _select_runs(rm_runs, BENCH_RUNS)
     if BENCH_RUNS == 'smoke':
         return [dict(name='smoke', batch=1, gen=2, max_tokens=64, delay_ms=0, steps=1)]
     if BENCH_RUNS == 'all':
         return runs
-    names = [r['name'] for r in runs]
-    selected = [name.strip() for name in BENCH_RUNS.split(',') if name.strip()]
-    unknown = [name for name in selected if name not in names]
-    if unknown or not selected:
-        raise ValueError(
-            f"BENCH_RUNS must be 'all', 'smoke', or a comma-separated subset of "
-            f"{names}; got {BENCH_RUNS!r}")
-    return [r for r in runs if r['name'] in selected]
+    return _select_runs(runs, BENCH_RUNS)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +347,11 @@ def gsm8k_score(data_source: str, solution_str: str, ground_truth: str, extra_in
 # 单条延迟升至秒级；RM 采样 max_tokens 由 BENCH_RM_MAX_TOKENS 控制。
 _JUDGE_MAX_TOKENS = int(os.environ.get('TWINKLE_REWARD_JUDGE_MAX_TOKENS', '8'))
 BENCH_RM_MAX_TOKENS = int(os.environ.get('BENCH_RM_MAX_TOKENS', '512'))
+# RM 矩阵规模：默认每步 batch2 × gen2 = 4 条。要压出"奖励排队溢出"就调大 gen
+# （如 batch4 × gen8 = 32 条，仍在 REWARD_BACKLOG=34 内）。
+RM_BATCH = int(os.environ.get('BENCH_RM_BATCH', '2'))
+RM_GEN = int(os.environ.get('BENCH_RM_GEN', '2'))
+RM_STEPS = int(os.environ.get('BENCH_RM_STEPS', '3'))
 _JUDGE_SYSTEM = ('You are a strict math answer verifier. Reason briefly about '
                  'whether the model answer matches the ground truth, then end '
                  'your response with exactly one word on the last line: Correct '
@@ -377,21 +401,37 @@ class BatchJudgeRewardManager(RewardManagerBase):
 
     Items in a chunk are packed into one ``judge_sampler.sample(prompts)``
     call so the judge's vLLM batches them (real RM batching), then each
-    verdict is parsed per item. Chunk size = reward submission granularity
-    (whole / mini / per-item), so the granularity experiment controls exactly
-    how many trajectories the judge sees per engine call.
+    verdict is parsed per item. Overriding ``call_score_batch`` (rather than
+    ``run_batch``) is what lets ``BENCH_MICRO_BATCH`` decide the chunk size:
+    the worker's micro batcher feeds it whatever it accumulated, independent
+    of how many items the caller submitted at a time.
     """
 
     def __init__(self, compute_score=None, judge_sampler=None, **kwargs):
         super().__init__(compute_score=compute_score, **kwargs)
         self.judge_sampler = judge_sampler
 
-    async def run_batch(self, items):
+    async def call_score_batch(self, items):
         if not items:
             return []
         prompts = [judge_prompt_for(item) for item in items]
+        # Timeline: reward events are per item (all items of a chunk share the
+        # same start/end), plus one judge_chunk / judge_call pair carrying the
+        # chunk size and the engine call duration. analyze_bench_timeline.py
+        # uses these to compare RM queueing and batching on the same footing as
+        # the function-reward runs.
+        chunk_head = items[0].item_id
+        for item in items:
+            TIMELINE.record('__run__', '__path__', 'reward_start', item_id=item.item_id)
+        TIMELINE.record('__run__', '__path__', 'judge_chunk', item_id=chunk_head,
+                        value=float(len(items)))
+        t_judge = time.perf_counter()
         responses = await asyncio.to_thread(
             self.judge_sampler.sample, prompts, _JUDGE_PARAMS, '')
+        TIMELINE.record('__run__', '__path__', 'judge_call', item_id=chunk_head,
+                        value=time.perf_counter() - t_judge)
+        for item in items:
+            TIMELINE.record('__run__', '__path__', 'reward_end', item_id=item.item_id)
         results = []
         for item, response in zip(items, responses):
             text = response.sequences[0].decoded or ''
@@ -822,9 +862,36 @@ def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _log_bench_config(runs: List[Dict[str, Any]]) -> None:
+    """Print every knob that affects the results, so each run is self-describing."""
+    logger.info(
+        '[bench] model=%s | dataset=%s | template=%s | reward_template=%s | '
+        'adapter=%s | lr=%g | gpus(model/sampler/reward)=%d/%d/%d | num_gpus=%d',
+        MODEL_ID, DATASET_ID, TEMPLATE_CLS, REWARD_TEMPLATE_CLS, ADAPTER_NAME,
+        LEARNING_RATE, MODEL_GPUS, SAMPLER_GPUS, REWARD_GPUS if BENCH_RM else 0, NUM_GPUS)
+    logger.info(
+        '[bench] reward: workers=%d | delay_ms=%g | path_b_stream=%s | '
+        'mini_submit_size=%d | micro_batch=%d (timeout_ms=%g) | backlog=%d | '
+        'on_backlog_full=block | on_error=raise | granularity_env=%s '
+        '(declared but unused: granularity is fixed per run)',
+        REWARD_NUM_WORKERS, REWARD_DELAY_MS, BENCH_PATH_B_STREAM, MINI_SUBMIT_SIZE,
+        BENCH_MICRO_BATCH, BENCH_MICRO_BATCH_TIMEOUT_MS, REWARD_BACKLOG,
+        BENCH_SUBMIT_GRANULARITY)
+    logger.info('[bench] out_dir=%s | runs_spec=%s | selected=%s',
+                BENCH_OUT_DIR, BENCH_RUNS, ', '.join(run['name'] for run in runs))
+    for run in runs:
+        logger.info(
+            '[bench] run %s: path=%s batch=%d gen=%d max_tokens=%d delay_ms=%d '
+            'steps=%d granularity=%s',
+            run['name'], run.get('path', 'A+B'), run['batch'], run['gen'],
+            run['max_tokens'], run['delay_ms'], run['steps'],
+            run.get('granularity', '-'))
+
+
 def main() -> None:
     runs = build_runs()
     os.makedirs(BENCH_OUT_DIR, exist_ok=True)
+    _log_bench_config(runs)
 
     _sampler_start = MODEL_GPUS
     _reward_start = MODEL_GPUS + SAMPLER_GPUS
@@ -897,6 +964,8 @@ def main() -> None:
                 'compute_score': gsm8k_score,
                 'manager_name': 'batch_judge',
                 'reward_kwargs': {'judge_sampler': judge_sampler},
+                'micro_batch_size': BENCH_MICRO_BATCH,
+                'micro_batch_timeout_ms': BENCH_MICRO_BATCH_TIMEOUT_MS,
             },
         )
     else:
@@ -913,10 +982,16 @@ def main() -> None:
     logger.info(get_device_placement())
     if BENCH_RM:
         logger.info(f'[bench] ** RM MODE ENABLED ** judge={REWARD_MODEL_ID} '
-                    f'reward_gpus={REWARD_GPUS} granularity-matrix='
-                    f'{BENCH_SUBMIT_GRANULARITY}')
+                    f'reward_gpus={REWARD_GPUS} reward_workers={REWARD_NUM_WORKERS} '
+                    f'judge_max_tokens={_JUDGE_MAX_TOKENS} '
+                    f'sampling_max_tokens={BENCH_RM_MAX_TOKENS} '
+                    f'rm_matrix={RM_BATCH}x{RM_GEN}x{RM_STEPS} '
+                    f'micro_batch={BENCH_MICRO_BATCH}'
+                    f'({BENCH_MICRO_BATCH_TIMEOUT_MS:.0f}ms) '
+                    f'granularity-matrix={BENCH_SUBMIT_GRANULARITY}')
     else:
-        logger.info(f'[bench] RM mode disabled (add BENCH_RM=1 for reward-model runs)')
+        logger.info(f'[bench] RM mode disabled (add BENCH_RM=1 for reward-model runs); '
+                    f'reward_workers={REWARD_NUM_WORKERS}')
     logger.info(f'[bench] outputs -> {BENCH_OUT_DIR}')
     summary_rows: List[Dict[str, Any]] = []
     try:

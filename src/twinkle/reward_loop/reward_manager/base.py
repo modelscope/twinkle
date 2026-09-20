@@ -62,7 +62,16 @@ class RewardManagerBase(ABC):
         async with self._semaphore:
             return await run()
 
-    async def run_batch(self, items):
+    async def call_score_batch(self, items):
+        """Score a chunk in one manager-level operation.
+
+        The default keeps per-item semantics (``run_single`` per item, gathered),
+        which is all any existing manager needs: the per-item semaphore and the
+        per-item rate limiter stay in effect. A manager whose backend charges per
+        request rather than per item (a generation-based judge, a batched remote
+        RM) overrides this to send the whole chunk as one call — and then owns its
+        own concurrency, since ``max_concurrent`` wraps ``run_single`` only.
+        """
         tasks = [asyncio.create_task(self.run_single(item)) for item in items]
         if not tasks:
             return []
@@ -74,3 +83,6 @@ class RewardManagerBase(ABC):
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    async def run_batch(self, items):
+        return await self.call_score_batch(items)

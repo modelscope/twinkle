@@ -20,5 +20,7 @@ class RewardLoopArgs:
     max_tpm: Optional[int] = None
     max_concurrent: int = 1
     timeout: float = 300.0
+    micro_batch_size: int = 0
+    micro_batch_timeout_ms: float = 0.0
     reward_worker_executors: Optional[int] = None
     reward_kwargs: dict = field(default_factory=dict)

@@ -1,4 +1,5 @@
 from .data import RewardItem, RewardResult, assemble_scores, reorder_by_id, split_items
+from .batching import MicroBatcher
 from .config import RewardLoopArgs
 from .metrics import RewardLoopMetrics
 from .pipeline import AsyncRewardPipeline, BatchHandle
@@ -8,4 +9,4 @@ from .reward_manager import (RewardLoopManager, RewardManagerBase, get_reward_ma
 
 __all__ = ["RewardItem", "RewardResult", "split_items", "reorder_by_id", "assemble_scores", "RewardLoopArgs",
            "RewardLoopMetrics", "AsyncRewardPipeline", "BatchHandle", "RewardLoopWorker", "RewardLoopManager",
-           "RewardManagerBase", "register", "get_reward_manager_cls", "registered_managers"]
+           "RewardManagerBase", "register", "get_reward_manager_cls", "registered_managers", "MicroBatcher"]

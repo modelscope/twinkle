@@ -35,13 +35,30 @@ class AsyncRewardPipeline:
             raise ValueError("at least one worker is required")
         self.pending: List[BatchHandle] = []
         self.metrics = RewardLoopMetrics()
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_workers))
+        # One pool thread per in-flight call, so the width must cover the widest
+        # worker: a worker that merges items itself (micro batching) only fills a
+        # chunk if that many calls are in flight at once, and per-item submits are
+        # one call each.
+        inflight = max([getattr(worker, "max_inflight_calls", 1) for worker in self.workers] + [1])
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_workers, inflight))
         self._lock = threading.RLock()
 
     @classmethod
     def from_args(cls, args, **kwargs):
+        """Build a pipeline from ``RewardLoopArgs`` (or any mapping).
+
+        Pipeline-level fields go to the constructor, everything else becomes
+        worker kwargs. Without this split, ``mode`` / ``backlog`` /
+        ``on_backlog_full`` / ``on_error`` were handed to the worker, whose
+        ``**kwargs`` swallowed them silently.
+        """
         worker_kwargs = vars(args).copy() if hasattr(args, "__dataclass_fields__") else dict(args)
-        return cls(num_workers=worker_kwargs.pop("num_workers", 1), worker_kwargs=worker_kwargs, **kwargs)
+        options = {"num_workers": worker_kwargs.pop("num_workers", 1)}
+        for name in ("mode", "backlog", "on_backlog_full", "on_error"):
+            if name in worker_kwargs:
+                options[name] = worker_kwargs.pop(name)
+        options.update(kwargs)
+        return cls(worker_kwargs=worker_kwargs, **options)
 
     @staticmethod
     def _drain_future(future):
