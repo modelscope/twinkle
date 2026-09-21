@@ -1,9 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """``import_path`` → deployment-builder resolution.
 
-Extracted from the former single-file ``launcher.py`` (TIER 3 same-named-package
-decomposition). No logic change.
-
 The operator-facing YAML ``import_path`` literals (``"server"``, ``"model"``,
 ``"sampler"``, ``"processor"``, ``"data_plane"``) resolve to internal builder
 functions. The function selected by the ``"server"`` literal was renamed

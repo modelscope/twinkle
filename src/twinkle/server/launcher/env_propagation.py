@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Collection of telemetry / persistence env vars for propagation to Ray workers.
 
-Extracted from the former single-file ``launcher.py`` (TIER 3 same-named-package
-decomposition). No logic change. These vars are read inside each Ray Serve
-worker process — telemetry by ``ensure_telemetry_initialized()`` and persistence
+These variables are read inside each Ray Serve worker process — telemetry by
+``ensure_telemetry_initialized()`` and persistence
 by ``PersistenceConfig.from_env()`` — so the chosen backend / telemetry config
 is independent of deployment startup order.
 """

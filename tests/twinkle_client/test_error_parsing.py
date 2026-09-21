@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Client error-response parsing ( / Requirement 3 #7-#11)."""
+"""Client error-response parsing tests."""
 from __future__ import annotations
 
 import pytest

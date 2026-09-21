@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Checkpoint subsystem (TIER 2 consolidation).
+"""Checkpoint subsystem.
 
 Top-level package consolidating the checkpoint base classes (split from the
 former 1017-line ``utils/checkpoint_base.py``, now deleted) with the concrete

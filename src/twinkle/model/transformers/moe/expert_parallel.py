@@ -234,7 +234,7 @@ def patch_forward(
         else:
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
-        # R2 / R3 routing replay: pass block-level replay state
+        # Pass block-level routing replay state.
         from .router_replay import get_replay_state
         replay_state = get_replay_state(block_name)
 

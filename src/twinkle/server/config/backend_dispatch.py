@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Generic validate-then-dispatch helper for backend selectors (TIER 1, R12).
+"""Generic validate-then-dispatch helper for backend selectors.
 
 The Model backend selector (``mock | transformers | megatron``) and the Sampler
 type selector (``mock | vllm | torch``) share one validate-then-dispatch shape.

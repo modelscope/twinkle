@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Client_Future_Layer unit tests ( / Requirement 4).
+"""Client future-layer unit tests.
 
 ``resolve`` is exercised against fabricated envelopes and a monkeypatched
 ``_post_retrieve``; no server or network is involved.
