@@ -38,7 +38,7 @@ def _counter_delta_transform(existing: object, *, delta: int) -> int:
     return new if new > 0 else 0
 
 
-async def _remove_with_record(manager: 'ModelManager', model_id: str, record: ModelRecord) -> bool:
+async def _remove_with_record(manager: ModelManager, model_id: str, record: ModelRecord) -> bool:
     """Remove a known record without exposing it in the public method signature."""
     removed = await BaseManager.remove(manager, model_id)
     if not removed:
