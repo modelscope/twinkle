@@ -13,17 +13,15 @@ Both handle tinker (Datum-based I/O) via /tinker/* endpoints and twinkle-native
 (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
 from tinker import types
-from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.model.transformers import TransformersModel
-from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
-from twinkle.utils.nccl_safe import nccl_safe
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 
 
 class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
@@ -48,7 +46,6 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    @nccl_safe(tinker=True)
     def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name)
@@ -83,18 +80,18 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return clean_metrics(metric)
 
     @remote_function()
-    def tinker_load(self, checkpoint_dir: str, **kwargs):
-        """Load checkpoint with token-based isolation support."""
-        token = kwargs.pop('token', None)
-        if not token:
-            raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.checkpoint import create_checkpoint_manager
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-        resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
-        if resolved.is_twinkle_path:
-            return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
-        else:
-            return super().load(name=resolved.checkpoint_name, **kwargs)
+    def tinker_load(self, *, checkpoint_name: str, output_dir: str | None = None, **kwargs):
+        """Load a checkpoint from an already-resolved location.
+
+        Path resolution (token isolation, twinkle-vs-external path shapes) belongs to the
+        handler layer: it is a server storage policy, and this class runs inside a Ray
+        actor as a compute backend. Keeping it here meant a checkpoint-layout change had
+        to touch GPU-side code -- the hardest layer to test -- and the resolution block
+        was duplicated verbatim in the megatron backend.
+        """
+        if output_dir is not None:
+            return super().load(name=checkpoint_name, output_dir=output_dir, **kwargs)
+        return super().load(name=checkpoint_name, **kwargs)
 
     # ------------------------------------------------------------------
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
@@ -107,14 +104,13 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    @nccl_safe
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         self._normalize_ref_outputs(kwargs)
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

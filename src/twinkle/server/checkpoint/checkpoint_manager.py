@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Abstract base checkpoint manager.
-
-Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
 
@@ -16,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from twinkle import get_logger
 from twinkle.hub import HubOperation
-from twinkle_client.types import ResolvedLoadPath
+from twinkle.protocol.types import ResolvedLoadPath
 from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
@@ -29,7 +27,6 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
     Subclasses must implement:
     - path_prefix property
-    - path_field_name property
     - _create_checkpoint method
     - _parse_checkpoint method
     - _create_checkpoints_response method
@@ -52,12 +49,6 @@ class BaseCheckpointManager(BaseFileManager, ABC):
     @abstractmethod
     def path_prefix(self) -> str:
         """Return the path prefix (e.g., 'twinkle://')."""
-        pass
-
-    @property
-    @abstractmethod
-    def path_field_name(self) -> str:
-        """Return the field name for the path (e.g., 'twinkle_path' or 'tinker_path')."""
         pass
 
     @abstractmethod

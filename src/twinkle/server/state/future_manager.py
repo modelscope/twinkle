@@ -2,27 +2,34 @@
 from __future__ import annotations
 
 import functools
-from datetime import datetime
+import time
 from typing import Any
 
+from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .base import BaseManager
-from .models import FutureRecord
+from .models import FutureFailureRecord, FutureRecord, _now_iso
+
+logger = get_logger()
 
 # Status sets used by the do-not-regress guard inside the atomic transform.
-_TERMINAL_STATUSES = frozenset({'completed', 'failed'})
+_TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
 _NON_TERMINAL_STATUSES = frozenset({'pending', 'queued', 'running'})
 
 
 def _future_record_transform(
     existing: dict | None,
     *,
+    request_id: str,
     new_status: str,
     model_id: str | None,
     reason: str | None,
     result: Any,
+    failure: dict[str, Any] | None,
     queue_state: str | None,
     queue_state_reason: str | None,
+    replica_id: str | None,
+    absolute_deadline: float | None,
     now: str,
 ) -> dict | None:
     """Atomic transform body for :meth:`FutureManager.store_status`.
@@ -30,12 +37,16 @@ def _future_record_transform(
     Module-level so it remains picklable when forwarded across the Ray actor
     boundary (closures and lambdas cannot be).
 
-    Drops the write entirely (returns ``None``) when ``new_status`` would
-    regress a terminal status — the StateBackend.update_atomic contract treats
-    a ``None`` return as "keep the current value", which is what stops stale
-    retries from clobbering a freshly committed terminal state.
+    A record already in a terminal state is never overwritten (returns ``None``,
+    which ``update_atomic`` treats as "keep current value"). A write of a
+    *different* terminal state is logged; a write of the *same* terminal state is
+    dropped silently (State_Backend idempotent retries produce these and they
+    indicate no defect).
     """
-    if (existing is not None and existing.get('status') in _TERMINAL_STATUSES and new_status in _NON_TERMINAL_STATUSES):
+    existing_status = existing.get('status') if existing is not None else None
+    if existing_status in _TERMINAL_STATUSES:
+        if new_status != existing_status:
+            logger.warning('future %s already terminal as %r; refusing %r', request_id, existing_status, new_status)
         return None
 
     if existing is None:
@@ -44,8 +55,11 @@ def _future_record_transform(
             model_id=model_id,
             reason=reason,
             result=result,
+            failure=failure,
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
+            replica_id=replica_id,
+            absolute_deadline=absolute_deadline,
             created_at=now,
             updated_at=now,
         )
@@ -55,9 +69,17 @@ def _future_record_transform(
     updated['status'] = new_status
     updated['model_id'] = model_id
     updated['updated_at'] = now
+    # replica_id is set at creation and is deliberately NOT overwritten here.
     if reason is not None:
         updated['reason'] = reason
-    if result is not None:
+    if new_status in _TERMINAL_STATUSES:
+        if new_status in ('failed', 'cancelled'):
+            updated['result'] = None
+            updated['failure'] = failure
+        else:
+            updated['failure'] = None
+            updated['result'] = result
+    elif result is not None:
         updated['result'] = result
     if queue_state is not None:
         updated['queue_state'] = queue_state
@@ -66,11 +88,28 @@ def _future_record_transform(
     return updated
 
 
-class FutureManager(BaseManager[FutureRecord]):
-    """Manages async task futures / request statuses.
+_CANCELLABLE_STATUSES = frozenset({'pending', 'queued'})
 
-    Expiry is based on `updated_at` (falls back to `created_at`).
+
+def _cancel_if_not_started_transform(existing: dict | None, *, failure: dict, now: str) -> dict | None:
+    """Atomic transform: cancel iff the task has not started (pending/queued).
+
+    Returns ``None`` (no change) for running/terminal/missing records so a task
+    already executing is never interrupted -- cancel is best-effort on the queue.
     """
+    status = existing.get('status') if existing is not None else None
+    if status not in _CANCELLABLE_STATUSES:
+        return None
+    updated = dict(existing)
+    updated['status'] = 'cancelled'
+    updated['result'] = None
+    updated['failure'] = failure
+    updated['updated_at'] = now
+    return updated
+
+
+class FutureManager(BaseManager[FutureRecord]):
+    """Manage future state, terminal retention, and immutable task deadlines."""
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
         super().__init__(backend, 'future::', FutureRecord, expiration_timeout)
@@ -84,8 +123,11 @@ class FutureManager(BaseManager[FutureRecord]):
         model_id: str | None,
         reason: str | None = None,
         result: Any = None,
+        failure: FutureFailureRecord | None = None,
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
+        replica_id: str | None = None,
+        absolute_deadline: float | None = None,
     ) -> None:
         """Create or update a future record with the latest status.
 
@@ -96,42 +138,125 @@ class FutureManager(BaseManager[FutureRecord]):
         If the result object has a ``model_dump`` method (i.e. it is a Pydantic
         model) it is serialized to a plain dict before storage.
         """
+        is_failure = status in ('failed', 'cancelled')
+        if is_failure and failure is None:
+            raise ValueError(f'{status} future requires a FutureFailureRecord')
+        if is_failure and result is not None:
+            raise ValueError(f'{status} future cannot carry result')
+        if not is_failure and failure is not None:
+            raise ValueError(f'{status} future cannot carry failure')
         if result is not None and hasattr(result, 'model_dump'):
             result = result.model_dump()
+        failure_data = failure.model_dump() if failure is not None else None
 
-        now = datetime.now().isoformat()
+        now = _now_iso()
         await self._backend.update_atomic(
             self._make_key(request_id),
             functools.partial(
                 _future_record_transform,
+                request_id=request_id,
                 new_status=status,
                 model_id=model_id,
                 reason=reason,
                 result=result,
+                failure=failure_data,
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
+                replica_id=replica_id,
+                absolute_deadline=absolute_deadline,
                 now=now,
             ),
         )
 
+    async def cancel_if_pending(self, request_id: str) -> str | None:
+        """Cancel a task iff it has not started; return the resulting status.
+
+        Writes a terminal ``cancelled`` record with a domain failure only when
+        the current status is pending/queued -- a running task is left alone.
+        Returns the record's status after the attempt, or ``None`` if there is no
+        record for ``request_id``.
+        """
+        failure = FutureFailureRecord(
+            reason_code='cancelled',
+            message='Task cancelled by client',
+            attribution='user',
+        )
+        result = await self._backend.update_atomic(
+            self._make_key(request_id),
+            functools.partial(_cancel_if_not_started_transform, failure=failure.model_dump(), now=_now_iso()),
+        )
+        return result.get('status') if result else None
+
     # ----- Cleanup -----
 
-    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
-        """Remove futures whose last update is older than cutoff_time.
+    async def cleanup_expired(
+        self,
+        cutoff_time: float,
+        *,
+        alive_replica_ids: set[str] | None = None,
+    ) -> int:
+        """Expire future records without ever deleting a non-terminal one.
+
+        Processing matrix:
+
+        | status       | replica alive | past deadline | action            |
+        |--------------|---------------|---------------|-------------------|
+        | Terminal     | —             | ts < cutoff       | delete            |
+        | non-Terminal | yes           | no                | keep (untouched)  |
+        | non-Terminal | yes           | yes               | write ``failed``  |
+        | non-Terminal | no            | —                 | write ``failed``  |
 
         Args:
-            cutoff_time: Unix timestamp threshold.
+            cutoff_time: Unix timestamp; terminal records older than it are deleted.
+            alive_replica_ids: replicas currently considered alive. ``None`` disables
+                the orphan check (every non-terminal record is treated as owned).
 
         Returns:
-            Number of futures removed.
+            Number of terminal records removed (records written ``failed`` are not
+            counted here; they are removed on a later pass once terminal).
         """
         all_records = await self.get_all()
-        expired_ids = []
+        now = time.time()
+        expired_ids: list[str] = []
         for request_id, record in all_records.items():
-            timestamp_str = record.updated_at or record.created_at
-            timestamp = self._parse_timestamp(timestamp_str)
-            if timestamp < cutoff_time:
-                expired_ids.append(request_id)
+            if record.status in _TERMINAL_STATUSES:
+                timestamp = self._parse_timestamp(record.updated_at or record.created_at)
+                if timestamp < cutoff_time:
+                    expired_ids.append(request_id)
+                continue
+
+            # Non-terminal records are never deleted -- only ever written ``failed``.
+            # replica_id None (pre-upgrade) => ownership unknown => treated as alive.
+            replica_id = record.replica_id
+            replica_alive = (replica_id is None or alive_replica_ids is None or replica_id in alive_replica_ids)
+            if not replica_alive:
+                await self.store_status(
+                    request_id,
+                    'failed',
+                    record.model_id,
+                    failure=FutureFailureRecord(
+                        reason_code='orphaned_replica',
+                        message='The replica that owned this task is no longer available.',
+                        attribution='server',
+                    ),
+                    replica_id=replica_id,
+                )
+                continue
+            deadline = record.absolute_deadline
+            if deadline is None:
+                deadline = self._parse_timestamp(record.created_at) + self.expiration_timeout
+            if now > deadline:
+                await self.store_status(
+                    request_id,
+                    'failed',
+                    record.model_id,
+                    failure=FutureFailureRecord(
+                        reason_code='deadline_exceeded',
+                        message='Task exceeded the absolute survival bound without reaching a terminal state.',
+                        attribution='server',
+                    ),
+                    replica_id=replica_id,
+                )
 
         for request_id in expired_ids:
             await self.remove(request_id)

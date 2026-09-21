@@ -20,30 +20,24 @@
 # Requires both model and sampler services to be configured.
 
 import dotenv
-
-dotenv.load_dotenv('.env')
-
 import gc
 import os
 import re
-from peft import LoraConfig
-from typing import List, Tuple, Dict, Any
-
 import swanlab
+from peft import LoraConfig
+from typing import Any, Dict, List, Tuple
 
 from twinkle import get_logger
+from twinkle import init_twinkle_client
+from twinkle.advantage import GRPOAdvantage
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.metric import CompletionRewardMetric
+from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
-from twinkle.advantage import GRPOAdvantage
-from twinkle.dataset import DatasetMeta
-from twinkle.metric import CompletionRewardMetric
-from twinkle import init_twinkle_client
-from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset
-from twinkle.preprocessor.llm import GSM8KProcessor
-from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client.sampler import vLLMSampler
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 
@@ -64,10 +58,7 @@ class GSM8KBrevityReward(Reward):
                     completion = msg.get('content', '')
                     break
 
-            has_answer = bool(
-                re.search(r'\\boxed\{[^}]+\}', completion)
-                or re.search(r'####\s*[\-\d,\.]+', completion)
-            )
+            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
 
             if not has_answer:
                 rewards.append(0.0)
@@ -78,6 +69,7 @@ class GSM8KBrevityReward(Reward):
                 else:
                     rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
         return rewards
+
 
 # ========== Configuration ==========
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
@@ -96,20 +88,20 @@ USE_SWANLAB = False
 SWANLAB_PROJECT = 'twinkle-grpo'
 SWANLAB_EXPERIMENT_NAME = 'short-math-grpo'
 
-
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
 
+
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
+    dataset = Dataset(
+        DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
 
-def compute_rewards(
-    trajectories: List[Dict[str, Any]],
-) -> Tuple[List[float], List[float], List[float]]:
+
+def compute_rewards(trajectories: List[Dict[str, Any]], ) -> Tuple[List[float], List[float], List[float]]:
     accuracy_reward_fn = GSM8KAccuracyReward()
     brevity_reward_fn = GSM8KBrevityReward()
 
@@ -151,7 +143,7 @@ def train():
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
 
     # Step 3: Configure the training model
-    model = MultiLoraTransformersModel(model_id=MODEL_ID)
+    model = client.model(MODEL_ID)
 
     lora_config = LoraConfig(
         target_modules='all-linear',
@@ -182,7 +174,7 @@ def train():
     model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
-    sampler = vLLMSampler(model_id=MODEL_ID)
+    sampler = client.sampler(MODEL_ID)
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function
@@ -241,9 +233,7 @@ def train():
 
         # ========== 3. Compute rewards ==========
 
-        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(
-            all_input_data
-        )
+        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(all_input_data)
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
@@ -252,7 +242,6 @@ def train():
                 'accuracy': accuracy_rewards,
             },
         )
-
 
         # ========== 4. Compute advantages ==========
         advantages = advantage_fn(

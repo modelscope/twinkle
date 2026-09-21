@@ -1,31 +1,33 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Tinker-compatible model handler mixin.
+"""Tinker-compatible routes for the Model deployment.
 
-All endpoints are prefixed /tinker/... and use schedule_task() returning UntypedAPIFuture.
-self_fn is injected via FastAPI Depends to obtain the ModelManagement instance at request time.
+Registered by ``_register_model_tinker_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. All endpoints are prefixed
+/tinker/... and use schedule_task() returning UntypedAPIFuture. ``self_fn`` is injected
+via FastAPI Depends to obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
 
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
-from peft import LoraConfig
 from tinker import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import ModelManagement
 
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
 
-def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
+def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
     """Register all /tinker/* routes on the given FastAPI app.
 
     self_fn is a zero-argument callable that returns the current ModelManagement
@@ -45,17 +47,11 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             try:
                 # Validate lora_config against the deployment's train_mode up front.
                 if self.is_full_mode and body.lora_config:
-                    return types.RequestFailedResponse(
-                        error='This deployment runs in full-parameter (exclusive) mode; do not pass '
-                        'lora_config. Use create_full_training_client (or omit lora_config).',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError('This deployment runs in full-parameter (exclusive) mode; do not pass '
+                                        'lora_config. Use create_full_training_client (or omit lora_config).')
                 if (not self.is_full_mode) and (not body.lora_config):
-                    return types.RequestFailedResponse(
-                        error='This deployment runs in LoRA mode; lora_config is required. '
-                        'Use create_lora_training_client.',
-                        category=types.RequestErrorCategory.User,
-                    )
+                    raise UserTaskError('This deployment runs in LoRA mode; lora_config is required. '
+                                        'Use create_lora_training_client.')
                 # Exclusive full-parameter training: reject early (before touching
                 # state) if another tenant already holds the deployment.
                 if self.is_full_mode:
@@ -69,34 +65,33 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 template = get_template_for_model(self.base_model)
                 if self.is_full_mode:
                     self.register_resource(adapter_name, token, session_id=body.session_id)
-                    self.model.set_template(template, adapter_name=model_adapter, model_id=self.base_model)
-                    self.model.set_processor('InputProcessor', adapter_name=model_adapter)
-                    self.model.set_optimizer('Adam', adapter_name=model_adapter)
+                    await self.call_backend(
+                        self.model.set_template, template, adapter_name=model_adapter, model_id=self.base_model)
+                    await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=model_adapter)
+                    await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=model_adapter)
                     self.set_resource_state(adapter_name, 'grad_ready', False)
                 else:
-                    # TODO: Make LoraConfig more flexible
+                    from peft import LoraConfig
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
                     self.register_resource(adapter_name, token, session_id=body.session_id)
-                    self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
-                    self.model.set_template(template, adapter_name=adapter_name, model_id=self.base_model)
-                    self.model.set_processor('InputProcessor', adapter_name=adapter_name)
-                    self.model.set_optimizer('Adam', adapter_name=adapter_name)
+                    await self.call_backend(
+                        self.model.add_adapter_to_model, adapter_name=adapter_name, config_or_dir=lora_cfg)
+                    await self.call_backend(
+                        self.model.set_template, template, adapter_name=adapter_name, model_id=self.base_model)
+                    await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=adapter_name)
+                    await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=adapter_name)
                     self.set_resource_state(adapter_name, 'grad_ready', False)
                 training_run_manager = create_training_run_manager(token, client_type='tinker')
                 training_run_manager.save(_model_id, body)
                 return types.CreateModelResponse(model_id=_model_id)
             except FullModeBusyError as e:
-                # Nothing was registered yet (check runs before register_model).
-                return types.RequestFailedResponse(error=str(e), category=types.RequestErrorCategory.User)
+                raise UserTaskError(str(e)) from e
             except Exception:
                 if _model_id:
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
                     await self._cleanup_adapter(adapter_name)
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_create_adapter, token=token, task_type='create_model')
 
@@ -147,8 +142,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 model_adapter = self.resolve_model_adapter_name(adapter_name)
                 datum_list = body.forward_input.data
                 loss_fn_config = body.forward_input.loss_fn_config or {}
-                output, loss = self.model.tinker_forward_only(
-                    inputs=datum_list, adapter_name=model_adapter, **loss_fn_config)
+                output, loss = await self.call_backend(
+                    self.model.tinker_forward_only, inputs=datum_list, adapter_name=model_adapter, **loss_fn_config)
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type='CrossEntropyLossReturn',
                     loss_fn_outputs=output,
@@ -156,10 +151,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         datum_list = body.forward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
@@ -190,8 +182,12 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 datum_list = body.forward_backward_input.data
                 loss_fn = body.forward_backward_input.loss_fn
                 loss_fn_config = body.forward_backward_input.loss_fn_config or {}
-                output, loss = self.model.tinker_forward_backward(
-                    inputs=datum_list, adapter_name=model_adapter, loss_fn=loss_fn, **loss_fn_config)
+                output, loss = await self.call_backend(
+                    self.model.tinker_forward_backward,
+                    inputs=datum_list,
+                    adapter_name=model_adapter,
+                    loss_fn=loss_fn,
+                    **loss_fn_config)
                 output_type = ('ImportanceSamplingLossReturn'
                                if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn')
                 self.set_resource_state(adapter_name, 'grad_ready', True)
@@ -202,10 +198,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 )
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         datum_list = body.forward_backward_input.data
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
@@ -238,16 +231,15 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if not self.get_resource_state(adapter_name, 'grad_ready', False):
                     raise RuntimeError(f'No accumulated gradients for adapter={adapter_name}; '
                                        'call forward_backward before optim_step')
-                self.model.tinker_step(adam_params=body.adam_params, adapter_name=model_adapter)
+                await self.call_backend(
+                    self.model.tinker_step, adam_params=body.adam_params, adapter_name=model_adapter)
                 self.set_resource_state(adapter_name, 'grad_ready', False)
-                metrics = self.model.tinker_calculate_metric(is_training=True, adapter_name=model_adapter)
+                metrics = await self.call_backend(
+                    self.model.tinker_calculate_metric, is_training=True, adapter_name=model_adapter)
                 return types.OptimStepResponse(metrics=metrics)
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_optim, model_id=body.model_id, token=token, task_type='optim_step')
 
@@ -267,16 +259,17 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
                 checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
                 save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=False)
-                self.model.save(
-                    name=checkpoint_name, output_dir=save_dir, adapter_name=model_adapter, save_optimizer=True)
+                await self.call_backend(
+                    self.model.save,
+                    name=checkpoint_name,
+                    output_dir=save_dir,
+                    adapter_name=model_adapter,
+                    save_optimizer=True)
                 tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=False)
                 return types.SaveWeightsResponse(path=tinker_path, type='save_weights')
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_save, model_id=body.model_id, token=token, task_type='save_weights')
 
@@ -298,7 +291,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 # Must save the checkpoint in the twinkle format before calling model.save()
                 tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=True)
                 logger.info(f'Saving weights to {save_dir}')
-                self.model.save(
+                await self.call_backend(
+                    self.model.save,
                     name='latest',
                     output_dir=save_dir,
                     adapter_name=self.resolve_model_adapter_name(adapter_name),
@@ -320,10 +314,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                         path=tinker_path, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(
             _do_save_for_sampler, model_id=body.model_id, token=token, task_type='save_weights_for_sampler')
@@ -341,18 +332,21 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 assert self.model is not None, 'Model not loaded, please load model first'
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_resource_exists(adapter_name)
-                self.model.tinker_load(
-                    checkpoint_dir=body.path,
+                # Path resolution (token isolation, twinkle-vs-external path shapes) is a
+                # server storage policy and belongs in the handler, not in the GPU-side
+                # backend actor. The backend receives an already-resolved location.
+                checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
+                resolved = checkpoint_manager.resolve_load_path(body.path)
+                await self.call_backend(
+                    self.model.tinker_load,
+                    checkpoint_name=resolved.checkpoint_name,
+                    output_dir=resolved.checkpoint_dir if resolved.is_twinkle_path else None,
                     load_optimizer=body.optimizer,
-                    adapter_name=self.resolve_model_adapter_name(adapter_name),
-                    token=token)
+                    adapter_name=self.resolve_model_adapter_name(adapter_name))
                 self.set_resource_state(adapter_name, 'grad_ready', False)
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')
             except Exception:
                 logger.error(traceback.format_exc())
-                return types.RequestFailedResponse(
-                    error=traceback.format_exc(),
-                    category=types.RequestErrorCategory.Server,
-                )
+                raise
 
         return await self.schedule_task(_do_load, model_id=body.model_id, token=token, task_type='load_weights')

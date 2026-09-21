@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
 
 from twinkle.server.exceptions import ConfigParseError
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
 from .telemetry import TelemetryConfig
@@ -71,8 +71,6 @@ class ServerConfig(BaseModel):
     def _validate_cross_field(self) -> ServerConfig:
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
-        if self.persistence.mode == 'file' and not self.persistence.file_path:
-            raise ValueError("persistence.file_path is required when persistence.mode == 'file'", )
         return self
 
     # ---- round-trip / serialization -------------------------------------- #

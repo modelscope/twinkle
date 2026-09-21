@@ -35,12 +35,11 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from twinkle_client.model import MultiLoraTransformersModel
     from twinkle.dataloader import DataLoader
-
+    from twinkle_client.model import MultiLoraTransformersModel
 
 DEFAULT_BASE_DIR = Path.home() / '.cache' / 'twinkle'
 
@@ -68,9 +67,7 @@ class TrainingRuntime:
         if run_id is None:
             run_id = os.environ.get('TWINKLE_RUN_ID', '')
             if not run_id:
-                raise ValueError(
-                    'run_id must be provided or TWINKLE_RUN_ID env var must be set'
-                )
+                raise ValueError('run_id must be provided or TWINKLE_RUN_ID env var must be set')
         self.run_id = run_id
         self.run_dir = self.base_dir / run_id
 
@@ -247,8 +244,8 @@ class TrainingRuntime:
 
     def register_graceful_shutdown(
         self,
-        model: 'MultiLoraTransformersModel',
-        dataloader: 'DataLoader | None' = None,
+        model: MultiLoraTransformersModel,
+        dataloader: DataLoader | None = None,
         checkpoint_name: str = 'interrupted',
     ) -> None:
         """Register SIGTERM handler for graceful shutdown with checkpoint.
@@ -270,6 +267,7 @@ class TrainingRuntime:
             rt.register_graceful_shutdown(model, dataloader)
             # ... training loop ...
         """
+
         def _shutdown_handler(signum, frame):
             self.log('SIGTERM received, saving checkpoint before exit...')
             try:

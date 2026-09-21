@@ -211,7 +211,7 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
 
 
 def _exercise_twinkle_clients(base: str) -> None:
-    from twinkle_client import init_twinkle_client
+    from twinkle import init_twinkle_client
     from twinkle_client.model import MultiLoraTransformersModel
     from twinkle_client.sampler import vLLMSampler
 
@@ -254,8 +254,6 @@ def _exercise_twinkle_clients(base: str) -> None:
     assert isinstance(metric.result, dict)
     cfgs = model.get_train_configs()
     assert isinstance(cfgs.result, str)
-    state = model.get_state_dict()
-    assert isinstance(state.result, dict)
 
     save_resp = model.save(name='step-1')
     assert save_resp.twinkle_path and save_resp.twinkle_path.startswith('twinkle://')
@@ -310,7 +308,7 @@ def _exercise_tinker_client(base: str) -> None:
     import os
     from tinker import ServiceClient, types
 
-    from twinkle_client import init_tinker_client
+    from twinkle import init_tinker_client
 
     # patch_tinker injects Twinkle's auth + Ray Serve multiplex headers and
     # lifts tinker's ``tml-`` api-key prefix check so EMPTY_TOKEN passes.

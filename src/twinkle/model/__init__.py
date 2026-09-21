@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING
 
-from twinkle.utils.import_utils import _LazyModule
+from twinkle._lazy_module import _LazyModule
 
 if TYPE_CHECKING:
     from .base import TwinkleModel

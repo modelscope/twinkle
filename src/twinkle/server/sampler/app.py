@@ -7,18 +7,19 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
-import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
 
 from twinkle import DeviceGroup
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
-from twinkle.server.utils.backend_dispatch import BackendSelector
-from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
@@ -45,12 +46,6 @@ def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
     return VLLMSamplerTQ(**kw, context_manager=None)
 
 
-def _make_torch_sampler(kw: dict[str, Any]) -> Any:
-    from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
-
-    return TorchSampler(**kw)
-
-
 # Single validate-then-dispatch selector for the sampler backend.
 SAMPLER_SELECTOR = BackendSelector(
     'sampler_type',
@@ -58,7 +53,6 @@ SAMPLER_SELECTOR = BackendSelector(
         'mock': _make_mock_sampler,
         'vllm': _make_vllm_sampler,
         'vllm_async': _make_vllm_async_sampler,
-        'torch': _make_torch_sampler,
     },
 )
 
@@ -77,7 +71,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     """Unified sampler management service.
 
     Manages:
-    - vLLM or Torch sampler initialization and lifecycle
+    - mock or vLLM sampler initialization and lifecycle
     - Tinker inference requests (/tinker/asample) with rate limiting via TaskQueueMixin
     - Twinkle inference requests (/twinkle/*) calling sampler directly
     - Template configuration for trajectory encoding
@@ -103,12 +97,12 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.sampler_type = sampler_type
         self.model_id = model_id
         replica_context = serve.get_replica_context()
-        replica_id = replica_context.replica_id.unique_id
+        self.replica_id = replica_context.replica_id.unique_id
 
         sampler_kwargs: dict[str, Any] = {
             'model_id': model_id,
             'remote_group': self.device_group.name,
-            'instance_id': replica_id,
+            'instance_id': self.replica_id,
         }
         if sampler_type != 'mock':
             sampler_kwargs.update(
@@ -127,14 +121,25 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
 
-        # Initialize task queue mixin
-        self._init_task_queue(queue_config, deployment_name='Sampler')
+        actors = getattr(self.sampler, '_actors', None)
+        self._init_task_queue(
+            queue_config,
+            deployment_name='Sampler',
+            collect_width=len(actors) if actors else 1,
+        )
+        self.sampler._ray_get_timeout = self.task_queue_config.effective_execution_timeout
 
     async def shutdown(self) -> None:
-        cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
-        if callable(cancel_all):
-            await asyncio.to_thread(cancel_all)
-        await self.data_plane.close()
+        try:
+            cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+            if callable(cancel_all):
+                await self.call_backend(cancel_all)
+        finally:
+            try:
+                await self.state.unregister_replica(self.replica_id)
+            finally:
+                await self.shutdown_task_queue()
+                await self.data_plane.close()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -146,9 +151,9 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
-        token = get_token_from_request(request)
-        return token
+        return get_token_from_request(request)
 
 
 def build_sampler_app(model_id: str,
@@ -172,7 +177,7 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``torch``.
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async``.
             Validated up front; bad values raise :class:`ConfigError` before
             any side effect.
         engine_args: Additional engine arguments for the sampler

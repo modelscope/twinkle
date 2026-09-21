@@ -39,7 +39,7 @@ _MATH_LATEX_RE = re.compile(
     r'\\times|\\div|\\pm|\\leq|\\geq|\\neq|\\approx|\\equiv|'
     r'\\infty|\\pi|\\alpha|\\beta|\\gamma|\\theta|\\lambda|\\mu|\\sigma|\\prod|\\to|\\rightarrow|'
     r'\\\[.+?\\\]|'
-    # R1-distill writes math in plain Unicode without $...$; catch operators, Greek, sub/super digits, fractions.
+    # Also match plain-Unicode operators, Greek letters, super/subscripts, and fractions.
     r'[×÷±°∑∏∫√∂∇∞∈∋⊂⊃⊆⊇≤≥≠≈≡≅∝⇒⇔]|'
     r'[α-ωΔΘΛΞΠΣΦΨΩ]|'
     r'[⁰¹²³⁴-⁹₀-₉]|'
@@ -355,8 +355,8 @@ class IntentClassifier(Preprocessor):
     Pure-heuristic, no LLM. Each intent is a pluggable :class:`IntentDetector`;
     pass ``detectors=[...]`` to extend or override.
 
-    R3: this is an *annotator* — by default it never drops rows
-    (``drop_no_key_rounds=False``); rows with no detected key round are simply
+    This is an *annotator*: by default it never drops rows
+    (``drop_no_key_rounds=False``), and rows with no detected key round are simply
     tagged ``INTENT_OTHER``. Set ``drop_no_key_rounds=True`` to also filter.
 
     Annotates per row::
@@ -366,7 +366,7 @@ class IntentClassifier(Preprocessor):
                              ('intents', dict[str, str])] # per-round intent
     """
 
-    # R4: default to the detectors with a live downstream consumer. The heavier
+    # Default to detectors with a live downstream consumer. The heavier
     # heuristics (ComplexLogic / Reasoning / UserDissatisfaction) are kept as
     # importable classes but dropped from the default set — their outputs had no
     # active consumer. Pass ``detectors=[...]`` to re-enable them.

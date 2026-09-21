@@ -6,7 +6,7 @@
 # Follow the same LazyModule approach as `twinkle.model`: only import when those symbols are actually accessed.
 from typing import TYPE_CHECKING
 
-from twinkle.utils.import_utils import _LazyModule
+from twinkle._lazy_module import _LazyModule
 
 if TYPE_CHECKING:
     from .megatron import MegatronModel, MegatronStrategy

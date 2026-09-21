@@ -9,6 +9,8 @@ Properties covered:
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 import yaml
 from hypothesis import given, settings
@@ -19,15 +21,12 @@ from pydantic import ValidationError
 from twinkle.server.config import ApplicationSpec, ServerConfig
 from twinkle.server.exceptions import ConfigParseError
 from twinkle.server.launcher import ServerLauncher
+from twinkle.server.sampler.app import SAMPLER_SELECTOR, build_sampler_app
 
 # ---------- minimal valid config strategy ---------------------------------- #
 
 _PERSISTENCE_VARIANTS = st.one_of(
     st.fixed_dictionaries({'mode': st.just('memory')}),
-    st.fixed_dictionaries({
-        'mode': st.just('file'),
-        'file_path': st.just('/tmp/state.json')
-    }),
     st.fixed_dictionaries({
         'mode': st.just('redis'),
         'redis_url': st.just('redis://localhost:6379/0')
@@ -86,13 +85,6 @@ def test_redis_mode_missing_url() -> None:
     assert 'persistence.redis_url' in msg or 'redis_url' in msg
 
 
-def test_file_mode_missing_path() -> None:
-    with pytest.raises(ValidationError) as exc:
-        ServerConfig.model_validate({'persistence': {'mode': 'file'}})
-    msg = str(exc.value)
-    assert 'persistence.file_path' in msg or 'file_path' in msg
-
-
 @settings(max_examples=100)
 @given(bad_backend=st.text(min_size=1, max_size=8).filter(lambda s: s not in ('mock', 'transformers', 'megatron')))
 def test_bad_backend_names_field(bad_backend: str) -> None:
@@ -124,6 +116,26 @@ def test_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> N
         ServerConfig.model_validate({'task_queue': {'max_input_tokens': bad_max_input_tokens}})
     errors = exc.value.errors()
     assert any('max_input_tokens' in err['loc'] for err in errors)
+
+
+def test_torch_sampler_is_rejected_during_config_validation() -> None:
+    with pytest.raises(ValidationError):
+        ApplicationSpec.model_validate({
+            'name': 'sampler',
+            'import_path': 'sampler',
+            'args': {
+                'model_id': 'm',
+                'device_group': {},
+                'device_mesh': {},
+                'sampler_type': 'torch',
+            },
+        })
+
+
+def test_sampler_docstring_values_match_selector() -> None:
+    doc = build_sampler_app.__doc__ or ''
+    line = next(line for line in doc.splitlines() if 'sampler_type:' in line)
+    assert set(re.findall(r'``(\w+)``', line)) == set(SAMPLER_SELECTOR.builders)
 
 
 # ---------- round-trip fidelity ----------------------------------------- #
@@ -257,8 +269,34 @@ def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
         ApplicationSpec.model_validate({
             'name': 'data-plane',
             'import_path': 'data_plane',
-            'args': {'unknown': True},
+            'args': {
+                'unknown': True
+            },
         })
+
+
+def test_processor_queue_config_is_rejected() -> None:
+    # A processor deployment has no task queue; queue_config was silently ignored
+    # before and now fails validation (F013 / P009) naming the offending field.
+    ApplicationSpec.model_validate({
+        'name': 'processor',
+        'import_path': 'processor',
+        'args': {
+            'ncpu_proc_per_node': 1
+        },
+    })
+    with pytest.raises(ValidationError) as exc:
+        ApplicationSpec.model_validate({
+            'name': 'processor',
+            'import_path': 'processor',
+            'args': {
+                'ncpu_proc_per_node': 1,
+                'queue_config': {
+                    'rps_limit': 4
+                }
+            },
+        })
+    assert 'queue_config' in str(exc.value)
 
 
 def test_cookbook_examples_load() -> None:

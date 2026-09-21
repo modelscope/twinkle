@@ -14,7 +14,7 @@ import pytest
 
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.server_state import LEADER_KEY, LEASE_RENEW
+from twinkle.server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW
 from twinkle.server.telemetry import MetricsRegistry
 
 

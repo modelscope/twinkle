@@ -24,18 +24,15 @@
 # megatron mrope model gets valid positions (transformers derives them internally).
 
 import dotenv
-
-dotenv.load_dotenv('.env')
-
 import os
+from peft import LoraConfig
 from typing import Any, Dict, List
 
-from peft import LoraConfig
-
-from twinkle import get_logger, init_twinkle_client
+from twinkle import get_logger
+from twinkle import init_twinkle_client
 from twinkle.template import Qwen3_5Template
-from twinkle_client.model import MultiLoraTransformersModel
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 # ========== Configuration ==========
@@ -84,13 +81,13 @@ def build_minibatch(tokenizer) -> List[Dict[str, Any]]:
 
 def train():
     # Step 1: connect to the running Twinkle server.
-    init_twinkle_client(
+    client = init_twinkle_client(
         base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
         api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
     )
 
     # Step 2: build the client model with a fresh LoRA adapter.
-    model = MultiLoraTransformersModel(model_id=MODEL_ID)
+    model = client.model(MODEL_ID)
     model.add_adapter_to_model(ADAPTER_NAME, LoraConfig(target_modules='all-linear'))
     model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 

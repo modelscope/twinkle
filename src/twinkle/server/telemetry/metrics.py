@@ -1,6 +1,24 @@
-"""Twinkle Server metrics registry — low-invasiveness facade over OpenTelemetry metrics."""
+"""Twinkle Server metrics registry — low-invasiveness facade over OpenTelemetry metrics.
+
+Besides the :class:`MetricsRegistry` that declares the raw OTEL instruments, this module
+holds the legacy-API adapter classes (``_Counter`` / ``_Histogram`` / ``_Gauge``), the
+structured containers (:class:`TaskMetrics` / ``_RequestMetrics``) and ``get_task_metrics``.
+Keeping the metric types and the registry in one file (with the HTTP middleware factory in
+``http_middleware.py``) avoids a ``metrics <-> adapters`` import cycle.
+
+Per-deployment adapters are cached on the *registry instance*
+(``_task_metrics`` / ``_request_metrics``), not at module level. That is load-bearing: the
+adapters hold bound instrument objects, and ``reset()`` swaps the singleton precisely in
+order to rebind them to a real MeterProvider (``worker_init.ensure_telemetry_initialized``
+does ``init_telemetry()`` -> ``reset()``). A module-level cache survived that swap, so
+anything that called ``get_task_metrics`` before ``init_telemetry`` cached NoOp instruments
+for the life of the process.
+"""
 
 from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict
+from typing import Any
 
 from .provider import get_meter
 
@@ -15,6 +33,91 @@ _RESOURCE_GAUGES: tuple[tuple[str, str, str], ...] = (
     ('active_sampling_sessions', 'twinkle.sampling_sessions.active', 'Number of active sampling sessions'),
     ('active_futures', 'twinkle.futures.active', 'Number of pending futures/tasks'),
 )
+
+# ---------------------------------------------------------------------------
+# Adapter classes – wrap OTEL instruments to expose the legacy Ray-style API
+# (``.inc(tags=...)`` / ``.set(value, tags=...)`` / ``.observe(value, tags=...)``)
+# while delegating all measurements to OpenTelemetry.
+# ---------------------------------------------------------------------------
+
+
+class _Counter:
+    """Adapter mapping ``.inc(value, tags=...)`` to ``otel_counter.add()``."""
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+
+    def inc(self, value: float = 1.0, tags: dict[str, str] | None = None) -> None:
+        self._instrument.add(value, attributes=tags or {})
+
+
+class _Histogram:
+    """Adapter mapping ``.observe(value, tags=...)`` to ``otel_histogram.record()``."""
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+
+    def observe(self, value: float, tags: dict[str, str] | None = None) -> None:
+        self._instrument.record(value, attributes=tags or {})
+
+
+class _Gauge:
+    """Adapter mapping ``.set(value, tags=...)`` onto an OTEL UpDownCounter.
+
+    OpenTelemetry up/down counters take *deltas*, not absolute values, so we
+    track the last reported value per attribute combination and emit the
+    incremental change. State is held per adapter instance (= per deployment),
+    keyed by the frozen attribute tuple.
+    """
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+        self._last: dict[tuple, float] = {}
+
+    def set(self, value: float, tags: dict[str, str] | None = None) -> None:
+        attrs = tags or {}
+        key = tuple(sorted(attrs.items()))
+        last = self._last.get(key, 0.0)
+        delta = value - last
+        if delta != 0:
+            self._instrument.add(delta, attributes=attrs)
+        self._last[key] = value
+
+
+# ---------------------------------------------------------------------------
+# Pydantic containers for structured metric access
+# ---------------------------------------------------------------------------
+
+
+class TaskMetrics(BaseModel):
+    """Task queue metrics container.
+
+    Attributes:
+        queue_depth: Current number of queued tasks (gauge).
+        tasks_total: Total task completions (counter).
+        execution_seconds: Pure task execution time in seconds (histogram).
+        queue_wait_seconds: Time from enqueue to execution start (histogram).
+        rate_limit_rejections: Total rate-limit rejections (counter).
+        rate_limiter_active_tokens: Tokens tracked by rate limiter (gauge).
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    queue_depth: _Gauge
+    tasks_total: _Counter
+    execution_seconds: _Histogram
+    queue_wait_seconds: _Histogram
+    rate_limit_rejections: _Counter
+    rate_limiter_active_tokens: _Gauge
+
+
+class _RequestMetrics(BaseModel):
+    """HTTP request metrics container (internal)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    requests_total: _Counter
+    request_duration_seconds: _Histogram
 
 
 class MetricsRegistry:
@@ -85,6 +188,11 @@ class MetricsRegistry:
                 description=description,
             )
 
+        # Per-deployment adapter caches held on the instance so ``reset()`` (which
+        # swaps this singleton to rebind instruments) invalidates them.
+        self._task_metrics: dict[str, TaskMetrics] = {}
+        self._request_metrics: dict[str, _RequestMetrics] = {}
+
     def _make_gauge_callback(self, name: str):
         """Build the sync OTEL callback that reads ``_resource_cache[name]``."""
 
@@ -92,6 +200,32 @@ class MetricsRegistry:
             return [Observation(self._resource_cache.get(name, 0))]
 
         return _callback
+
+    # ----- Per-deployment adapter accessors -----
+
+    def task_metrics(self, deployment: str) -> TaskMetrics:
+        """Return (or build) the per-deployment task-queue metric adapters."""
+        cached = self._task_metrics.get(deployment)
+        if cached is None:
+            cached = self._task_metrics[deployment] = TaskMetrics(
+                queue_depth=_Gauge(self.queue_depth),
+                tasks_total=_Counter(self.tasks_total),
+                execution_seconds=_Histogram(self.task_execution_seconds),
+                queue_wait_seconds=_Histogram(self.task_wait_seconds),
+                rate_limit_rejections=_Counter(self.rate_limit_rejections),
+                rate_limiter_active_tokens=_Gauge(self.rate_limiter_active_tokens),
+            )
+        return cached
+
+    def request_metrics(self, deployment: str) -> _RequestMetrics:
+        """Return (or build) the per-deployment HTTP request metric adapters."""
+        cached = self._request_metrics.get(deployment)
+        if cached is None:
+            cached = self._request_metrics[deployment] = _RequestMetrics(
+                requests_total=_Counter(self.requests_total),
+                request_duration_seconds=_Histogram(self.request_duration_seconds),
+            )
+        return cached
 
     # ----- Push API for the cleanup leader -----
 
@@ -120,3 +254,17 @@ class MetricsRegistry:
     def reset(cls) -> None:
         """Reset singleton (for testing or telemetry re-initialization)."""
         cls._instance = None
+
+
+def get_task_metrics(deployment: str) -> TaskMetrics:
+    """Return the per-deployment task-queue metric adapters.
+
+    Signature unchanged (``_init_task_queue`` needs no edit); the adapters are now
+    cached on the ``MetricsRegistry`` instance so ``reset()`` invalidates them.
+    """
+    return MetricsRegistry.get().task_metrics(deployment)
+
+
+def get_request_metrics(deployment: str) -> _RequestMetrics:
+    """Return the per-deployment HTTP request metric adapters."""
+    return MetricsRegistry.get().request_metrics(deployment)
