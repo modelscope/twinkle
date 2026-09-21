@@ -6,10 +6,10 @@ import asyncio
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from twinkle_client.common.json_utils import json_safe
+from twinkle.protocol.json_utils import json_safe
+from twinkle.protocol.types.component import DataRef, DataRowsResponse
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
-from twinkle_client.types.component import DataRef, DataRowsResponse
 
 _T = TypeVar('_T')
 
@@ -23,7 +23,7 @@ class DataPlaneClient:
 
     def __init__(self, server_url: str | None = None, *, transport: ClientTransport | None = None):
         self._transport = capture_transport(transport)
-        self.server_url = (server_url or f'{self._transport.context.base_url}/data-plane').rstrip('/')
+        self.server_url = (server_url or self._transport.url('data-plane')).rstrip('/')
 
     def put(
         self,

@@ -21,38 +21,42 @@ wrong callable -- a silently wrong result rather than an error.
 """
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from pydantic import BaseModel
 from typing import Any, Mapping
 
-from twinkle_client.common.json_utils import json_safe
+from twinkle.protocol.json_utils import json_safe
+from twinkle.protocol.types.base import FieldRole, fields_with_role
 from twinkle_client.exceptions import TwinkleClientValidationError
-from twinkle_client.types.base import FieldRole, fields_with_role
 
 
 def to_wire_value(value: Any) -> Any:
-    """Convert one caller-supplied argument to a JSON-native value.
+    """Recursively convert a caller value to its JSON wire representation.
 
-    Handles the three object kinds the client has always accepted in a request body:
-    a server-side component handle (sent as its id), a ``DatasetMeta`` / ``LoraConfig``
-    (sent as the canonical serialized form the server decodes), and numpy / torch
-    values (sent as nested lists).
-
-    Anything else is passed through for the model to validate, so an unsupported type
-    is reported by pydantic with its field path instead of by a generic error here.
+    ``ClientTransport.post`` and schema-driven request construction both use this
+    function. ``post_model`` remains a separate Pydantic JSON entry point and
+    deliberately excludes unset optionals.
     """
-    # A remote-component handle (InputProcessor / dataset / dataloader wrapper)
-    # is sent as its server-side id. Guarded on ``str`` so an unrelated object
-    # that merely happens to expose a ``processor_id`` attribute is not silently
-    # coerced to something that is not an id.
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TwinkleClientValidationError('Binary values are not supported by the JSON transport')
     component_id = getattr(value, 'processor_id', None)
     if isinstance(component_id, str):
         return component_id
+    if isinstance(value, Mapping):
+        return {str(key): to_wire_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [to_wire_value(item) for item in value]
+
     from peft import LoraConfig
 
     from twinkle.dataset import DatasetMeta
     if isinstance(value, (DatasetMeta, LoraConfig)):
-        from twinkle_client.common.serialize import serialize_object
+        from twinkle.protocol.serialize import serialize_object
         return serialize_object(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return to_wire_value(asdict(value))
     if isinstance(value, BaseModel):
         return value.model_dump(mode='json')
     return json_safe(value)

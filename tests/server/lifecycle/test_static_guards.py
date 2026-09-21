@@ -74,7 +74,7 @@ def test_task_envelope_has_exactly_one_construction_site():
 def test_server_task_status_enum_matches_client_literal():
     """The two independent declarations of the task status set must not drift.
 
-    ``twinkle_client.types.lifecycle.TaskStatus`` (a Literal on the wire model) and the
+    ``twinkle.protocol.types.lifecycle.TaskStatus`` (a Literal on the wire model) and the
     server's ``TaskStatus`` enum are declared separately. ``envelope_from_record`` copies
     ``record['status']`` straight into ``TaskEnvelope.status``, so a value the server can
     write but the Literal does not list would fail pydantic validation *while serialising
@@ -85,8 +85,8 @@ def test_server_task_status_enum_matches_client_literal():
     from typing import get_args
 
     from twinkle.server.task_queue.types import TaskStatus as ServerTaskStatus
-    from twinkle_client.types.lifecycle import TERMINAL_STATUSES
-    from twinkle_client.types.lifecycle import TaskStatus as WireTaskStatus
+    from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES
+    from twinkle.protocol.types.lifecycle import TaskStatus as WireTaskStatus
 
     server_values = {member.value for member in ServerTaskStatus}
     wire_values = set(get_args(WireTaskStatus))
@@ -98,7 +98,7 @@ def test_server_task_status_enum_matches_client_literal():
 def test_client_future_layer_is_not_imported_by_the_server():
     """``_future.py`` carries an underscore because the dependency runs one way only.
 
-    The server reverse-imports ``twinkle_client.types`` (the shared wire contract), but the
+    The server reverse-imports ``twinkle.protocol.types`` (the shared wire contract), but the
     client's polling layer is private to the client. An import in the other direction would
     make the server depend on client retry policy, which its own long-poll already owns.
     Another claim that lived only in a docstring.

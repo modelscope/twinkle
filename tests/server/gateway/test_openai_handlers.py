@@ -20,7 +20,7 @@ from twinkle.server.gateway.openai_bridge import translate_response
 @pytest.fixture
 def mock_gateway():
     """Build a minimal FastAPI app with OpenAI routes and a mock GatewayServer."""
-    import twinkle_client.types as types
+    import twinkle.protocol.types as types
     from twinkle.server.gateway.openai_handlers import _register_openai_routes
 
     mock_state = AsyncMock()

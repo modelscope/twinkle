@@ -6,7 +6,7 @@ Tinker Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker
 
 ```python
 # 在导入 ServiceClient 之前，先初始化 Tinker 客户端
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 
 init_tinker_client()
 
@@ -41,7 +41,7 @@ import os
 import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
@@ -132,7 +132,7 @@ for i, seq in enumerate(result.sequences):
 ```python
 import os
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 

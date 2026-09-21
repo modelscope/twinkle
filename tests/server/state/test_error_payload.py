@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from twinkle.server.task_errors import task_error_payload
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 
 
 def test_overlong_traceback_is_trimmed_tail_kept_with_marker():

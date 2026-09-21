@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .app import GatewayServer
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager, validate_user_path
 from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record

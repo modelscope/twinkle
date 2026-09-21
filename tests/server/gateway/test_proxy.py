@@ -14,7 +14,7 @@ from starlette.requests import Request
 from unittest.mock import AsyncMock
 
 from twinkle.server.gateway.proxy import ServiceProxy
-from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
+from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
 
 
 def _make_request(headers: list[tuple[bytes, bytes]] | None = None) -> Request:

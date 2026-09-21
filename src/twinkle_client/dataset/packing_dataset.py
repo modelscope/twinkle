@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from twinkle.dataset import DatasetMeta
-from twinkle_client.common.component_rpc import create_remote_component
 from twinkle_client.http import ClientTransport
-from twinkle_client.http.context import capture_transport
 from .base import Dataset
 
 
@@ -17,13 +15,12 @@ class PackingDataset(Dataset):
         transport: ClientTransport | None = None,
         **kwargs,
     ):
-        self._transport = capture_transport(transport)
-        self.processor_id = create_remote_component(
+        self._bind_remote(
             'dataset',
             'PackingDataset',
             dataset_meta=dataset_meta,
             packing_num_proc=packing_num_proc,
-            transport=self._transport,
+            transport=transport,
             **kwargs,
         )
 

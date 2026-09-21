@@ -71,8 +71,6 @@ class ServerConfig(BaseModel):
     def _validate_cross_field(self) -> ServerConfig:
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
-        if self.persistence.mode == 'file' and not self.persistence.file_path:
-            raise ValueError("persistence.file_path is required when persistence.mode == 'file'", )
         return self
 
     # ---- round-trip / serialization -------------------------------------- #

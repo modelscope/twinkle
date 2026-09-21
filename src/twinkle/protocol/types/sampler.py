@@ -2,7 +2,7 @@
 """Request / response models for the twinkle-native sampler endpoints.
 
 Shared by the server handler and the twinkle client. Field roles follow
-:mod:`twinkle_client.types.base`; the sampler handlers pass everything they need
+:mod:`twinkle.protocol.types.base`; the sampler handlers pass everything they need
 explicitly, so these requests carry control fields and -- for the template setter --
 one passthrough region, and no free-floating backend kwargs.
 
@@ -10,10 +10,10 @@ Class names carry a ``Sampler`` prefix wherever ``model.py`` already owns the ba
 name (``AddAdapterRequest``, ``SetTemplateRequest``, ``CreateResponse`` and their
 responses). The two modules describe *different* endpoints with different field sets;
 a shared bare name is distinguished only by an import alias and, when a handler does
-``import twinkle_client.types as types``, silently resolves to whichever module the
+``import twinkle.protocol.types as types``, silently resolves to whichever module the
 package ``__init__`` re-exported first -- which is how the sampler endpoints once
 bound ``model.py``'s schema. Prefixing at the definition site removes the ambiguity,
-matching :mod:`twinkle_client.types.processor`.
+matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 

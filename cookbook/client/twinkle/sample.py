@@ -13,7 +13,8 @@ import dotenv
 import os
 from transformers import AutoTokenizer
 
-from twinkle import get_logger, init_twinkle_client
+from twinkle import get_logger
+from twinkle_client import init_twinkle_client
 
 dotenv.load_dotenv('.env')
 logger = get_logger()

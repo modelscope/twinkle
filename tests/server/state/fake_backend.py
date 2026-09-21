@@ -41,6 +41,9 @@ class FakeBackend(StateBackend):
             return None
         return self._store[key][0]
 
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        return [await self.get(key) for key in keys]
+
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
 

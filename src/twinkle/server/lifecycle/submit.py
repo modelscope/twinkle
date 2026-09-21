@@ -13,11 +13,11 @@ from fastapi import Request
 from typing import TYPE_CHECKING, Any
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
+from twinkle.protocol.types.base import FieldRole, fields_with_role
+from twinkle.protocol.types.data import export_batch
+from twinkle.protocol.types.lifecycle import TaskEnvelope
 from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
-from twinkle_client.types.base import FieldRole, fields_with_role
-from twinkle_client.types.data import export_batch
-from twinkle_client.types.lifecycle import TaskEnvelope
 
 if TYPE_CHECKING:
     from twinkle.server.lifecycle.protocols import DataParallelDeployment, QueuedDeployment
@@ -31,7 +31,7 @@ def to_backend_inputs(inputs: Any, *, single: bool = False) -> Any:
     """Seam A: export wire-validated ``inputs`` as the objects the backend consumes.
 
     This is an *export*, not a validation step. The request model declares ``inputs``
-    as :data:`~twinkle_client.types.data.WireInputBatch`, so a malformed batch is
+    as :data:`~twinkle.protocol.types.data.WireInputBatch`, so a malformed batch is
     already rejected during FastAPI body parsing -- before a future record exists and
     before anything reaches a GPU. Validating here instead would put the first check
     inside the queued task, where a rejection has already cost an enqueue.
@@ -71,7 +71,7 @@ def backend_kwargs(body: Any) -> dict[str, Any]:
     """Seam B: the keyword arguments forwarded to the backend call.
 
     Exactly two sources, both declared on the request model (see
-    :mod:`twinkle_client.types.base`):
+    :mod:`twinkle.protocol.types.base`):
 
     1. fields whose role is ``BackendKwarg``, included iff their value is not ``None``;
     2. the contents of every ``Passthrough`` field, flattened.

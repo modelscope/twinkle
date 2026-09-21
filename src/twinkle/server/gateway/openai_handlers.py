@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 
 if TYPE_CHECKING:
     from .app import GatewayServer

@@ -41,7 +41,8 @@ pytestmark = pytest.mark.skipif(
     reason='Set TWINKLE_TEST_GPU_E2E=1 to run real GPU E2E tests (requires running server)',
 )
 
-from twinkle import get_logger, init_tinker_client  # noqa: E402
+from twinkle import get_logger  # noqa: E402
+from twinkle_client import init_tinker_client  # noqa: E402
 from twinkle.dataloader import DataLoader  # noqa: E402
 from twinkle.dataset import Dataset, DatasetMeta  # noqa: E402
 from twinkle.preprocessor import SelfCognitionProcessor  # noqa: E402

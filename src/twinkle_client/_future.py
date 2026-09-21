@@ -12,10 +12,10 @@ import requests
 import time
 from typing import Any, Optional
 
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
-from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 
 logger = logging.getLogger('twinkle_client')
 
@@ -35,11 +35,11 @@ _TRANSPORT_RETRY_MAX = 5
 
 
 def _retrieve_url(transport: ClientTransport) -> str:
-    return f'{transport.context.base_url}/twinkle/retrieve_future'
+    return transport.url('twinkle/retrieve_future')
 
 
 def _cancel_url(transport: ClientTransport) -> str:
-    return f'{transport.context.base_url}/twinkle/cancel'
+    return transport.url('twinkle/cancel')
 
 
 def _best_effort_cancel(request_id: str, transport: ClientTransport) -> None:
@@ -140,6 +140,12 @@ def resolve(
             try:
                 reply = _post_retrieve(submit.request_id, resolved_transport)
                 transport_failures = not_found_count = 0
+            except (requests.ConnectionError, requests.Timeout):
+                transport_failures += 1
+                if transport_failures > _TRANSPORT_RETRY_MAX:
+                    raise
+                time.sleep(min(2**transport_failures, 30))
+                continue
             except requests.HTTPError as e:
                 status = _status_of(e)
                 if status == 404:

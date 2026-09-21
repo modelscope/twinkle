@@ -2,13 +2,16 @@
 from torch.utils.data import IterableDataset as TorchIterableDataset
 
 from twinkle.dataset import DatasetMeta
-from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
+from twinkle_client.common.remote_component import RemoteComponent
 from twinkle_client.http import ClientTransport
-from twinkle_client.http.context import capture_transport
 
 
-class IterableDataset(TorchIterableDataset):
-    """Client wrapper for IterableDataset that calls server HTTP endpoints."""
+class IterableDataset(TorchIterableDataset, RemoteComponent):
+    """Remote iterable backed by one server-side cursor.
+
+    Iteration is stateful and does not support concurrent or repeated iteration
+    over the same wrapper instance.
+    """
 
     def __init__(
         self,
@@ -17,21 +20,10 @@ class IterableDataset(TorchIterableDataset):
         transport: ClientTransport | None = None,
         **kwargs,
     ):
-        self._transport = capture_transport(transport)
-        self.processor_id = create_remote_component(
-            'dataset', 'IterableDataset', dataset_meta=dataset_meta, transport=self._transport, **kwargs)
-
-    def _call(self, function: str, *args, **kwargs):
-        return call_remote_component(self.processor_id, function, *args, transport=self._transport, **kwargs)
+        self._bind_remote('dataset', 'IterableDataset', dataset_meta=dataset_meta, transport=transport, **kwargs)
 
     def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
         return self._call('add_dataset', dataset_meta=dataset_meta, **kwargs)
-
-    def __len__(self):
-        return self._call('__len__')
-
-    def __getitem__(self, idx):
-        return self._call('__getitem__', idx=idx)
 
     def __iter__(self):
         self._call('__iter__')

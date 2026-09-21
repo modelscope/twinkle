@@ -2,7 +2,6 @@
 from .backend import create_backend
 from .base import BaseManager
 from .cleanup_coordinator import ResourceCleanupCoordinator
-from .config_manager import ConfigManager
 from .count_publisher import ResourceCountPublisher
 from .future_manager import FutureManager
 from .model_manager import ModelManager
@@ -25,7 +24,6 @@ __all__ = [
     'ModelManager',
     'SamplingSessionManager',
     'FutureManager',
-    'ConfigManager',
     # Server state
     'ServerState',
     'ReplicaRegistry',

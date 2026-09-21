@@ -4,8 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
+from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import StateBackendError
-from twinkle_client.types.errors import ErrorCategory
 
 
 class ConcurrencyError(StateBackendError):
@@ -93,13 +93,10 @@ class StateBackend(ABC):
         """
         ...
 
+    @abstractmethod
     async def mget(self, keys: list[str]) -> list[Any | None]:
-        """Batch-read multiple keys. Returns values in the same order as *keys*.
-
-        Default implementation falls back to serial ``get()`` calls.
-        Backends should override for efficiency (e.g. Redis MGET).
-        """
-        return [await self.get(key) for key in keys]
+        """Batch-read multiple keys, preserving input order."""
+        ...
 
     @abstractmethod
     async def close(self) -> None:

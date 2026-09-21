@@ -1,8 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import logging
+import pytest
+
 from twinkle_client.http import ClientContext, ClientTransport
-from twinkle_client.http.context import set_default_transport
+from twinkle_client.http.context import capture_transport, clear_default_transport, set_default_transport
 from twinkle_client.manager import TwinkleClient
 
 
@@ -108,6 +111,56 @@ def test_http_public_api_has_no_legacy_context_getters_or_setters():
     } & set(http.__all__))
 
 
+def test_default_transport_fallback_logs_info_once(monkeypatch, caplog):
+    import twinkle_client.http.context as context
+
+    monkeypatch.setattr(context, '_default_transport', None)
+    with caplog.at_level(logging.INFO, logger='twinkle_client'):
+        transport = capture_transport()
+        assert capture_transport() is transport
+    records = [record for record in caplog.records if 'No explicit Twinkle client configured' in record.message]
+    assert len(records) == 1
+    assert transport.context.base_url in records[0].message
+    transport.close()
+    clear_default_transport(transport)
+
+
+def test_publish_blocks_rebind_and_replacement_does_not_close_old(caplog):
+    first = _transport('first')
+    first.bind_context(ClientContext(base_url='http://bound', api_key='key'))
+    set_default_transport(first)
+
+    with pytest.raises(RuntimeError, match='published'):
+        first.bind_context(ClientContext(base_url='http://too-late', api_key='key'))
+
+    second = _transport('second')
+    with caplog.at_level(logging.WARNING, logger='twinkle_client'):
+        set_default_transport(second)
+    assert any('Replacing default Twinkle transport' in record.message for record in caplog.records)
+    assert not first.closed
+    clear_default_transport(second)
+    first.close()
+    second.close()
+
+
+def test_transport_adapter_configuration_and_post_retry_boundary():
+    transport = ClientTransport(ClientContext(base_url='http://pool', api_key='key'))
+    adapter = transport._session.get_adapter('http://')
+    assert adapter._pool_maxsize == 32
+    assert adapter._pool_block is True
+    assert adapter.max_retries.allowed_methods == frozenset({'GET', 'DELETE'})
+    assert 'POST' not in adapter.max_retries.allowed_methods
+    transport.close()
+
+
+def test_client_closes_distinct_heartbeat_transport():
+    main = _transport('main')
+    heartbeat = _transport('heartbeat')
+    client = TwinkleClient(transport=main, heartbeat_transport=heartbeat)
+    client.close()
+    assert main.closed and heartbeat.closed
+
+
 class _CapabilitiesResponse(_Response):
 
     def json(self):
@@ -130,7 +183,7 @@ def _capability_client(name: str) -> TwinkleClient:
 
 
 def test_capability_cache_is_per_transport_and_not_process_global():
-    from twinkle_client.types.server import GetServerCapabilitiesResponse
+    from twinkle.protocol.types.server import GetServerCapabilitiesResponse
 
     client_a = _capability_client('alpha')
     client_b = _capability_client('beta')

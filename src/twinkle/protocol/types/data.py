@@ -14,7 +14,7 @@ Two asymmetries are deliberate:
   reads is declared with a strict type (``StrictInt`` leaves reject ``true`` and
   ``1.0``), while unknown JSON-native keys are kept and re-exported: a user's
   preprocessor may leave extra columns on an entry and dropping them would lose
-  data the caller sent. See :class:`~twinkle_client.types.base.DataModel`.
+  data the caller sent. See :class:`~twinkle.protocol.types.base.DataModel`.
 - **Shallowest-first unions.** Nesting depth encodes tensor rank here, so a rank
   range needs a union. Declaring the deepest branch first is a large, silent
   pessimisation: given a 2-D input the 3-D branch does not fail at element 0, it
@@ -43,7 +43,7 @@ from pydantic import BeforeValidator, Field, StrictInt, model_validator
 from typing import Annotated, Any, List, Literal, Optional, Union
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS
-from twinkle_client.types.base import DataModel
+from twinkle.protocol.types.base import DataModel
 
 # --------------------------------------------------------------------------- #
 # Leaf types. Shallowest-first, and ``StrictInt`` wherever the values come from a

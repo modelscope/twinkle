@@ -13,7 +13,7 @@ from typing import Union, get_args, get_origin
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS, is_encoded
 from twinkle.processor.base import InputProcessor
-from twinkle_client.types import data as wire
+from twinkle.protocol.types import data as wire
 
 _INPUTS = TypeAdapter(wire.WireInputBatch)
 

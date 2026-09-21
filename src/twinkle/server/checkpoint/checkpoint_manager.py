@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from twinkle import get_logger
 from twinkle.hub import HubOperation
-from twinkle_client.types import ResolvedLoadPath
+from twinkle.protocol.types import ResolvedLoadPath
 from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 

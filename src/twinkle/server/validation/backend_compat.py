@@ -28,9 +28,9 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Optional
 
+from twinkle.protocol.types.base import FieldRole, fields_with_role, read_backend_only
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.base import FieldRole, fields_with_role, read_backend_only
 
 
 class BackendCapability(StrEnum):

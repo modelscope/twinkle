@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .app import ModelManagement
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
+from twinkle.protocol.serialize import deserialize_object
 from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
                                        validate_user_path)
 from twinkle.server.exceptions import RequestRejectedError, TrainModeMismatchError
@@ -409,7 +410,6 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                          self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
-            from twinkle_client.common.serialize import deserialize_object
             metric_cls = deserialize_object(body.metric_cls)
             await self.call_backend(
                 self.model.add_metric,
@@ -426,7 +426,6 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
-            from twinkle_client.common.serialize import deserialize_object
             patch_cls = deserialize_object(body.patch_cls)
             await self.call_backend(
                 self.model.apply_patch,
@@ -560,7 +559,6 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         except ValueError as exc:
             raise RequestRejectedError(str(exc)) from exc
 
-        from twinkle_client.common.serialize import deserialize_object
         config = deserialize_object(body.config)
 
         # ---- Decision_Boundary left: validate against the deployment's train_mode ----

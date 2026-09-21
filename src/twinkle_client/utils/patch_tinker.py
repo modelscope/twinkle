@@ -12,8 +12,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
 
+from twinkle.protocol.headers import build_routing_headers
 from twinkle_client.http.context import get_api_key, get_request_id
-from twinkle_client.http.headers import build_routing_headers
 
 _patched = False
 _loss_fn_config_patched = False

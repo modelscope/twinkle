@@ -36,12 +36,12 @@ from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.middleware.auth import verify_request_token
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
 logger = get_logger()
 

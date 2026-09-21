@@ -16,7 +16,7 @@ from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedE
 from twinkle.server.lifecycle.submit import backend_kwargs, run_submit
 from twinkle.server.validation import BackendCapability, assert_request_supported
 from twinkle.server.validation.backend_compat import resolve_backend
-from twinkle_client.types import model as model_types
+from twinkle.protocol.types import model as model_types
 
 
 class _Deployment:
@@ -147,7 +147,7 @@ def test_an_unset_backend_only_parameter_is_not_rejected():
 
 
 def test_every_restricted_field_is_optional_with_a_none_default():
-    from twinkle_client.types.base import FieldRole, fields_with_role, read_backend_only
+    from twinkle.protocol.types.base import FieldRole, fields_with_role, read_backend_only
     offenders = []
     for model_cls in vars(model_types).values():
         if not isinstance(model_cls, type) or not hasattr(model_cls, 'model_fields'):

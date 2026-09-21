@@ -23,7 +23,8 @@ from typing import Any, Dict, List
 import swanlab
 
 from tinker import types
-from twinkle import init_tinker_client, get_logger
+from twinkle import get_logger
+from twinkle_client import init_tinker_client
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import EmojiDPOProcessor

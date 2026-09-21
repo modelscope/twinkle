@@ -4,12 +4,11 @@ from typing import Any, Callable, Dict, Optional, Type, Union
 from twinkle.dataset import DatasetMeta
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
-from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
+from twinkle_client.common.remote_component import RemoteComponent
 from twinkle_client.http import ClientTransport
-from twinkle_client.http.context import capture_transport
 
 
-class Dataset:
+class Dataset(RemoteComponent):
     """Client wrapper for Dataset that calls server HTTP endpoints."""
 
     def __init__(
@@ -19,12 +18,7 @@ class Dataset:
         transport: ClientTransport | None = None,
         **kwargs,
     ):
-        self._transport = capture_transport(transport)
-        self.processor_id = create_remote_component(
-            'dataset', 'Dataset', dataset_meta=dataset_meta, transport=self._transport, **kwargs)
-
-    def _call(self, function: str, *args, **kwargs):
-        return call_remote_component(self.processor_id, function, *args, transport=self._transport, **kwargs)
+        self._bind_remote('dataset', 'Dataset', dataset_meta=dataset_meta, transport=transport, **kwargs)
 
     def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
         return self._call('set_template', template_func=template_func, **kwargs)

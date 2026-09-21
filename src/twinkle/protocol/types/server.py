@@ -46,10 +46,6 @@ class DeleteCheckpointResponse(ResponseModel):
     message: str
 
 
-class ErrorResponse(ResponseModel):
-    detail: str
-
-
 class WeightsInfoRequest(StrictRequest):
     twinkle_path: str
 

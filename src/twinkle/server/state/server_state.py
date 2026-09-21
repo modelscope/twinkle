@@ -18,7 +18,6 @@ from twinkle.utils.logger import get_logger
 from .backend import StateBackend
 from .backend.factory import create_backend
 from .cleanup_coordinator import ResourceCleanupCoordinator
-from .config_manager import ConfigManager
 from .count_publisher import ResourceCountPublisher
 from .future_manager import FutureManager
 from .model_manager import ModelManager
@@ -95,13 +94,12 @@ def _sweep_processor_transform(existing: Any, *, now: float) -> dict[str, dict[s
 class ServerState:
     """Unified server state management class.
 
-    Composes five resource managers:
+    Composes four resource managers:
 
     - :class:`SessionManager` — client sessions
     - :class:`ModelManager` — registered models
     - :class:`SamplingSessionManager` — sampling sessions
     - :class:`FutureManager` — async task futures
-    - :class:`ConfigManager` — key-value configuration
 
     Each Ray Serve worker owns one process-local instance, bound directly to a
     shared :class:`StateBackend`.
@@ -133,7 +131,6 @@ class ServerState:
         self._model_mgr = ModelManager(self._backend, expiration_timeout, per_token_model_limit)
         self._sampling_mgr = SamplingSessionManager(self._backend, expiration_timeout)
         self._future_mgr = FutureManager(self._backend, expiration_timeout)
-        self._config_mgr = ConfigManager(self._backend)
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
@@ -505,32 +502,6 @@ class ServerState:
             replica_id=replica_id,
             absolute_deadline=absolute_deadline,
         )
-
-    # ----- Configuration Management -----
-
-    async def add_config(self, key: str, value: Any) -> None:
-        """Add or overwrite a configuration value."""
-        await self._config_mgr.add(key, value)
-
-    async def add_or_get_config(self, key: str, value: Any) -> Any:
-        """Add a config value if absent; otherwise return the existing value."""
-        return await self._config_mgr.add_or_get(key, value)
-
-    async def get_config(self, key: str) -> Any | None:
-        """Return the configuration value for key, or None."""
-        return await self._config_mgr.get(key)
-
-    async def pop_config(self, key: str) -> Any | None:
-        """Remove and return the configuration value for key, or None."""
-        return await self._config_mgr.pop(key)
-
-    async def clear_config(self) -> None:
-        """Remove all configuration entries."""
-        await self._config_mgr.clear()
-
-    async def count_config(self) -> int:
-        """Return the number of stored configuration entries."""
-        return await self._config_mgr.count()
 
     # ----- Resource Cleanup -----
 

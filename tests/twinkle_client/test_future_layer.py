@@ -11,8 +11,8 @@ import requests
 
 from twinkle_client import _future
 from twinkle_client.exceptions import TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
-from twinkle_client.types.errors import ErrorPayload
-from twinkle_client.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.errors import ErrorPayload
+from twinkle.protocol.types.lifecycle import TaskEnvelope
 
 
 class _Model:
@@ -99,6 +99,36 @@ def test_transport_5xx_is_bounded_then_reraises(monkeypatch):
     monkeypatch.setattr(_future, '_post_retrieve', _always_503)
     with pytest.raises(requests.HTTPError):
         _future.resolve(_running(), model_cls=_Model)
+
+
+def test_connection_error_is_retried_then_succeeds(monkeypatch):
+    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)
+    replies = [requests.ConnectionError('reset'), _completed({'ok': True})]
+
+    def _next(_request_id, _transport):
+        value = replies.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(_future, '_post_retrieve', _next)
+    out = _future.resolve(_running(), model_cls=_Model)
+    assert out.result == {'ok': True}
+
+
+def test_connection_error_is_bounded_then_reraised(monkeypatch):
+    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)
+    calls = 0
+
+    def _always_fails(_request_id, _transport):
+        nonlocal calls
+        calls += 1
+        raise requests.ConnectionError('reset')
+
+    monkeypatch.setattr(_future, '_post_retrieve', _always_fails)
+    with pytest.raises(requests.ConnectionError, match='reset'):
+        _future.resolve(_running(), model_cls=_Model)
+    assert calls == _future._TRANSPORT_RETRY_MAX + 1
 
 
 def test_non_retryable_4xx_reraises_immediately(monkeypatch):

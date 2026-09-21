@@ -9,7 +9,7 @@ under ``detail``.
 
 from __future__ import annotations
 
-from twinkle_client.types.errors import ErrorCategory
+from twinkle.protocol.types.errors import ErrorCategory
 
 
 class TwinkleServerError(Exception):

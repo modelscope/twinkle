@@ -6,7 +6,7 @@ import pytest
 import threading
 
 from twinkle_client.data_plane import DataPlaneClient
-from twinkle_client.types import DataRef, DataRowsResponse
+from twinkle.protocol.types import DataRef, DataRowsResponse
 
 
 def test_async_convenience_methods_delegate_to_sync_operations(monkeypatch) -> None:

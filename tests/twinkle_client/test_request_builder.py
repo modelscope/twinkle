@@ -12,10 +12,10 @@ from pydantic import JsonValue, ValidationError
 from typing import Dict
 
 from twinkle_client._request_builder import build_request, request_json, to_wire_value
-from twinkle_client.common.serialize import serialize_object
+from twinkle.protocol.serialize import serialize_object
 from twinkle_client.exceptions import TwinkleClientValidationError
-from twinkle_client.types import model as model_types
-from twinkle_client.types.base import StrictRequest, passthrough
+from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types.base import StrictRequest, passthrough
 
 
 @pytest.fixture(autouse=True)

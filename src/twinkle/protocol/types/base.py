@@ -2,7 +2,7 @@
 """Shared pydantic base classes, field roles, and the naming rulings for the wire contract.
 
 This module is a public contract carrier imported across packages (Twinkle_Server
-reverse-imports ``twinkle_client.types``); it therefore intentionally carries **no**
+reverse-imports ``twinkle.protocol.types``); it therefore intentionally carries **no**
 underscore prefix.
 
 Naming rulings (authoritative for all three split specs; kept in code, not only in

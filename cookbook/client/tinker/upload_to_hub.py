@@ -22,7 +22,8 @@ dotenv.load_dotenv('.env')
 
 import os
 
-from twinkle import get_logger, init_twinkle_client
+from twinkle import get_logger
+from twinkle_client import init_twinkle_client
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()

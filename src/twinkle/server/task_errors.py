@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 
 _ERROR_MAX = 1024
 _TRACEBACK_MAX = 65536

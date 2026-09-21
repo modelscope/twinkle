@@ -14,7 +14,7 @@ keys are forwarded unchecked. Claiming otherwise would need a second resolution 
 that guesses.
 
 Class names are prefixed with ``Processor`` to avoid collisions when importing from
-``twinkle_client.types`` alongside ``model.py``.
+``twinkle.protocol.types`` alongside ``model.py``.
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from twinkle_client.types import DataRef
+from twinkle.protocol.types import DataRef
 
 
 class _Response:

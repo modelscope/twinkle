@@ -1,17 +1,36 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""Tagged serialization for non-JSON domain objects used by the wire contract.
+
+Heavy domain types are resolved lazily so importing :mod:`twinkle.protocol` does
+not load PEFT or the dataset implementation.
+"""
 import json
 from dataclasses import fields
+from functools import lru_cache
 from numbers import Number
-from peft import LoraConfig
 from pydantic import BaseModel
 from typing import Any, Mapping
-
-from twinkle.dataset import DatasetMeta
 
 primitive_types = (str, Number, bool, type(None))
 container_types = (Mapping, list, tuple, set, frozenset)
 basic_types = (*primitive_types, *container_types)
-_DATASET_META_FIELDS = {field.name for field in fields(DatasetMeta)}
+
+
+@lru_cache(maxsize=1)
+def _dataset_meta_cls():
+    from twinkle.dataset import DatasetMeta
+    return DatasetMeta
+
+
+@lru_cache(maxsize=1)
+def _dataset_meta_fields() -> frozenset[str]:
+    return frozenset(field.name for field in fields(_dataset_meta_cls()))
+
+
+@lru_cache(maxsize=1)
+def _lora_config_cls():
+    from peft import LoraConfig
+    return LoraConfig
 
 
 def _serialize_data_slice(data_slice):
@@ -43,12 +62,12 @@ def _deserialize_data_slice(data_slice):
 def serialize_object(obj) -> Any:
     if isinstance(obj, (bytes, bytearray, memoryview)):
         raise TypeError(f'Unsupported binary object: {type(obj).__name__}')
-    if isinstance(obj, DatasetMeta):
-        data = {name: getattr(obj, name) for name in _DATASET_META_FIELDS}
+    if isinstance(obj, _dataset_meta_cls()):
+        data = {name: getattr(obj, name) for name in _dataset_meta_fields()}
         data['data_slice'] = _serialize_data_slice(data.get('data_slice'))
         data['_TWINKLE_TYPE_'] = 'DatasetMeta'
         return json.dumps(data, ensure_ascii=False)
-    elif isinstance(obj, LoraConfig):
+    elif isinstance(obj, _lora_config_cls()):
         filtered_dict = {}
         for _subkey, _subvalue in obj.__dict__.items():
             if isinstance(_subvalue, basic_types) and not _subkey.startswith('_'):
@@ -79,11 +98,12 @@ def deserialize_object(data: str) -> Any:
     if '_TWINKLE_TYPE_' in data:
         _type = data.pop('_TWINKLE_TYPE_')
         if _type == 'DatasetMeta':
-            data = {key: value for key, value in data.items() if key in _DATASET_META_FIELDS}
+            fields_set = _dataset_meta_fields()
+            data = {key: value for key, value in data.items() if key in fields_set}
             data['data_slice'] = _deserialize_data_slice(data.get('data_slice'))
-            return DatasetMeta(**data)
+            return _dataset_meta_cls()(**data)
         elif _type == 'LoraConfig':
-            return LoraConfig(**data)
+            return _lora_config_cls()(**data)
         else:
             raise ValueError(f'Unsupported type: {_type}')
     else:

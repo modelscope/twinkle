@@ -16,8 +16,9 @@ import typing
 
 import twinkle
 from twinkle.server.task_queue.types import QueueState
-from twinkle_client.types.errors import QueueStateLiteral
-from twinkle_client.types.server import GetServerCapabilitiesResponse
+from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types.errors import QueueStateLiteral
+from twinkle.protocol.types.server import GetServerCapabilitiesResponse
 
 _TWINKLE_SRC = pathlib.Path(twinkle.__file__).resolve().parent
 _LEGACY_PUBLIC_NAME_OVERLAP = frozenset({
@@ -73,6 +74,31 @@ def test_capabilities_response_ignores_future_fields():
     assert response.limits.max_batch_size == 8
 
 
+def test_data_plane_forward_only_has_no_seq_id() -> None:
+    fields = model_types.DataPlaneForwardOnlyRequest.model_fields
+    assert 'seq_id' not in fields
+    assert 'seq_id' in model_types.DataPlaneForwardRequest.model_fields
+
+
+def test_void_response_names_are_canonical_ok_response_aliases() -> None:
+    for name in (
+        'BackwardResponse',
+        'StepResponse',
+        'ZeroGradResponse',
+        'LrStepResponse',
+        'SetLossResponse',
+        'SetOptimizerResponse',
+        'SetLrSchedulerResponse',
+        'LoadResponse',
+        'SetTemplateResponse',
+        'SetProcessorResponse',
+        'ClipGradAndStepResponse',
+        'ApplyPatchResponse',
+        'AddMetricResponse',
+    ):
+        assert getattr(model_types, name) is model_types.OkResponse
+
+
 def _origin(module: str | None) -> str | None:
     """Classify an import's source module as 'tinker', 'twinkle_client', or None."""
     if not module:
@@ -109,9 +135,9 @@ def _binding_collisions(tree: ast.AST) -> set[str]:
 def test_public_name_overlap_does_not_grow():
     import tinker.types
 
-    import twinkle_client.types
+    import twinkle.protocol.types
 
-    overlap = {name for name in set(dir(tinker.types)) & set(dir(twinkle_client.types)) if not name.startswith('_')}
+    overlap = {name for name in set(dir(tinker.types)) & set(dir(twinkle.protocol.types)) if not name.startswith('_')}
     assert overlap == _LEGACY_PUBLIC_NAME_OVERLAP
 
 

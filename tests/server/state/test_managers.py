@@ -204,9 +204,10 @@ class TestModelManager:
         avail = await manager.get_available_replica_ids(['r1', 'r2'])
         assert avail == ['r1', 'r2']
 
-        # Per-token count enforces the limit using the persisted records.
-        count = await manager._count_models_for_token('tok1')
-        assert count == 2
+        # The public add path enforces the per-token quota from persisted counts.
+        await manager.add('m3', ModelRecord(token='tok1'))
+        with pytest.raises(ResourceQuotaExceededError, match='Model quota exceeded'):
+            await manager.add('m4', ModelRecord(token='tok1'))
 
     @pytest.mark.asyncio
     async def test_cascade_cleanup_by_session(self, manager):

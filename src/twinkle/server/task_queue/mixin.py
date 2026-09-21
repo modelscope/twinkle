@@ -14,13 +14,13 @@ import uuid
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
 from .backend_gate import BackendGate
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
@@ -54,6 +54,7 @@ class TaskQueueMixin:
     """
 
     state: ServerState
+    replica_id: str
 
     def _init_task_queue(
         self,
@@ -108,6 +109,7 @@ class TaskQueueMixin:
             token_cleanup_interval=self._task_queue_config.token_cleanup_interval,
             active_tokens_gauge=self._task_metrics.rate_limiter_active_tokens if self._task_metrics else None,
             deployment_name=deployment_name,
+            replica_id=self.replica_id,
         )
         self._rate_limiter.start_cleanup_task()
 

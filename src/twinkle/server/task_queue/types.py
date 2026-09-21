@@ -60,4 +60,3 @@ class QueuedTask:
     input_tokens: int
     task_type: str | None
     created_at: float
-    first_rate_limited_at: float | None = None

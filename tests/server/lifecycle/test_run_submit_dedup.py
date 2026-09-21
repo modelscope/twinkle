@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.server.lifecycle.submit import run_submit
-from twinkle_client.types.model import ForwardBackwardTaskRequest
+from twinkle.protocol.types.model import ForwardBackwardTaskRequest
 
 
 class _FakeState:

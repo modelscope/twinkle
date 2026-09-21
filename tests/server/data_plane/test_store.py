@@ -103,7 +103,7 @@ async def test_data_ref_round_trip_append_release_and_ref_isolation(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_append_rejects_row_count_mismatch() -> None:
-    from twinkle_client.types import DataRef
+    from twinkle.protocol.types import DataRef
 
     store = TQDataRefStore.__new__(TQDataRefStore)
     ref = DataRef(ref_id='r', size=2, fields=['x'])
@@ -112,7 +112,7 @@ async def test_append_rejects_row_count_mismatch() -> None:
 
 
 def test_partition_is_stable_and_scoped_by_data_ref() -> None:
-    from twinkle_client.types import DataRef
+    from twinkle.protocol.types import DataRef
 
     first = DataRef(ref_id='a', size=1, fields=['x'])
     same = DataRef(ref_id='a', size=99, fields=['other'])

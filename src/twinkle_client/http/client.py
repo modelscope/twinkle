@@ -1,40 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Instance-owned HTTP transport and legacy module-level compatibility facade."""
+"""Instance-owned HTTP transport."""
 from __future__ import annotations
 
 import requests
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from requests.adapters import HTTPAdapter
 from typing import Any
+from urllib3.util.retry import Retry
 
+from twinkle.protocol.headers import build_routing_headers
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
+from twinkle_client._request_builder import to_wire_value
 from twinkle_client.exceptions import TwinkleClientValidationError, TwinkleHTTPError
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 from .context import ClientContext, capture_transport
-from .headers import build_routing_headers
 
 # Must be greater than the server long-poll window and below common gateway idle limits.
 _HTTP_TIMEOUT = 90
-_UNSET = object()
-_JSON_PRIMITIVES = (str, int, float, bool, type(None))
-
-
-def _serialize_value(value: Any) -> Any:
-    if isinstance(value, _JSON_PRIMITIVES):
-        return value
-    if isinstance(value, bytes | bytearray | memoryview):
-        raise TwinkleClientValidationError('Binary values are not supported by the JSON transport')
-    if isinstance(value, Mapping):
-        return {str(key): _serialize_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_serialize_value(item) for item in value]
-    if is_dataclass(value) and not isinstance(value, type):
-        return _serialize_value(asdict(value))
-    # Single source of truth for leaf/domain objects (pydantic models, remote
-    # component handles, DatasetMeta / LoraConfig, numpy / torch): reuse the
-    # request builder's converter so a value serializes identically whether it
-    # goes out via ``post(json_data=...)`` or via ``post_model(body=...)``.
-    from twinkle_client._request_builder import to_wire_value
-    return to_wire_value(value)
+DEFAULT_TIMEOUT = object()
 
 
 def _handle_response(response: requests.Response) -> requests.Response:
@@ -89,7 +71,18 @@ def _handle_response(response: requests.Response) -> requests.Response:
 
 
 class ClientTransport:
-    """The sole request-time owner of URL, identity, headers, and HTTP resources."""
+    """The sole request-time owner of URL, identity, headers, and HTTP resources.
+
+    ``post`` recursively converts arbitrary JSON-like values through
+    :func:`to_wire_value`; ``post_model`` serializes a validated Pydantic model
+    directly and excludes ``None`` fields. The two entry points intentionally
+    remain distinct.
+
+    The adapter retries only idempotent GET/DELETE requests. POST is never
+    transparently replayed because control-plane calls such as ``create_session``
+    do not carry a deduplication key; read-only future retrieval handles retries
+    explicitly in the future layer.
+    """
 
     def __init__(
         self,
@@ -97,11 +90,35 @@ class ClientTransport:
         *,
         session: requests.Session | None = None,
         timeout: float = _HTTP_TIMEOUT,
+        pool_maxsize: int = 32,
     ) -> None:
+        if pool_maxsize < 2:
+            raise ValueError('pool_maxsize must be at least 2')
         self._context = context
         self._session = session or requests.Session()
+        if session is None:
+            retry = Retry(
+                total=3,
+                connect=3,
+                read=0,
+                status=3,
+                backoff_factor=0.25,
+                status_forcelist=(408, 429, 500, 502, 503, 504),
+                allowed_methods=frozenset({'GET', 'DELETE'}),
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(
+                max_retries=retry,
+                pool_connections=pool_maxsize,
+                pool_maxsize=pool_maxsize,
+                pool_block=True,
+            )
+            self._session.mount('http://', adapter)
+            self._session.mount('https://', adapter)
         self._timeout = timeout
         self._closed = False
+        self._published = False
         self._capabilities: object | None = None
 
     @property
@@ -115,7 +132,12 @@ class ClientTransport:
     def bind_context(self, context: ClientContext) -> None:
         """Replace provisional identity before the transport is published to wrappers."""
         self._ensure_open()
+        if self._published:
+            raise RuntimeError('Cannot rebind a published ClientTransport')
         self._context = context
+
+    def _mark_published(self) -> None:
+        self._published = True
 
     @property
     def cached_capabilities(self) -> object | None:
@@ -141,58 +163,52 @@ class ClientTransport:
         return headers
 
     def _request_timeout(self, timeout: object) -> float | None:
-        return self._timeout if timeout is _UNSET else timeout  # type: ignore[return-value]
+        return self._timeout if timeout is DEFAULT_TIMEOUT else timeout  # type: ignore[return-value]
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError('ClientTransport is closed')
 
-    def get(
-        self,
-        path_or_url: str = '',
-        *,
-        params: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float | None | object = _UNSET,
-    ) -> requests.Response:
+    def get(self,
+            path_or_url: str = '',
+            *,
+            params: Mapping[str, Any] | None = None,
+            headers: Mapping[str, str] | None = None,
+            timeout: float | None | object = DEFAULT_TIMEOUT) -> requests.Response:
         self._ensure_open()
         response = self._session.get(
             self.url(path_or_url),
             headers=self._headers(headers),
-            params=_serialize_value(params or {}),
+            params=to_wire_value(params or {}),
             timeout=self._request_timeout(timeout),
         )
         return _handle_response(response)
 
-    def post(
-        self,
-        path_or_url: str = '',
-        *,
-        json_data: Mapping[str, Any] | None = None,
-        data: Any = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float | None | object = _UNSET,
-    ) -> requests.Response:
+    def post(self,
+             path_or_url: str = '',
+             *,
+             json_data: Mapping[str, Any] | None = None,
+             data: Any = None,
+             headers: Mapping[str, str] | None = None,
+             timeout: float | None | object = DEFAULT_TIMEOUT) -> requests.Response:
         self._ensure_open()
         if isinstance(data, (bytes, bytearray, memoryview)):
             raise TwinkleClientValidationError('Binary request bodies are not supported by this transport')
         response = self._session.post(
             self.url(path_or_url),
             headers=self._headers(headers),
-            json=_serialize_value(json_data or {}),
+            json=to_wire_value(json_data or {}),
             data=data,
             timeout=self._request_timeout(timeout),
         )
         return _handle_response(response)
 
-    def post_model(
-        self,
-        path_or_url: str,
-        body: Any,
-        *,
-        headers: Mapping[str, str] | None = None,
-        timeout: float | None | object = _UNSET,
-    ) -> requests.Response:
+    def post_model(self,
+                   path_or_url: str,
+                   body: Any,
+                   *,
+                   headers: Mapping[str, str] | None = None,
+                   timeout: float | None | object = DEFAULT_TIMEOUT) -> requests.Response:
         from twinkle_client._request_builder import request_json
         self._ensure_open()
         request_headers = {'content-type': 'application/json', **dict(headers or {})}
@@ -204,19 +220,17 @@ class ClientTransport:
         )
         return _handle_response(response)
 
-    def delete(
-        self,
-        path_or_url: str = '',
-        *,
-        params: Mapping[str, Any] | None = None,
-        headers: Mapping[str, str] | None = None,
-        timeout: float | None | object = _UNSET,
-    ) -> requests.Response:
+    def delete(self,
+               path_or_url: str = '',
+               *,
+               params: Mapping[str, Any] | None = None,
+               headers: Mapping[str, str] | None = None,
+               timeout: float | None | object = DEFAULT_TIMEOUT) -> requests.Response:
         self._ensure_open()
         response = self._session.delete(
             self.url(path_or_url),
             headers=self._headers(headers),
-            params=_serialize_value(params or {}),
+            params=to_wire_value(params or {}),
             timeout=self._request_timeout(timeout),
         )
         return _handle_response(response)
@@ -226,51 +240,3 @@ class ClientTransport:
             return
         self._closed = True
         self._session.close()
-
-
-# Compatibility facade. Core wrappers always pass their captured transport explicitly;
-# only legacy external callers may omit it and resolve the current default here.
-def http_get(
-    url: str | None = None,
-    params: Mapping[str, Any] | None = None,
-    additional_headers: Mapping[str, str] | None = None,
-    timeout: float | None = _HTTP_TIMEOUT,
-    *,
-    transport: ClientTransport | None = None,
-) -> requests.Response:
-    return capture_transport(transport).get(url or '', params=params, headers=additional_headers, timeout=timeout)
-
-
-def http_post(
-    url: str | None = None,
-    json_data: Mapping[str, Any] | None = None,
-    data: Any = None,
-    additional_headers: Mapping[str, str] | None = None,
-    timeout: float | None = _HTTP_TIMEOUT,
-    *,
-    transport: ClientTransport | None = None,
-) -> requests.Response:
-    return capture_transport(transport).post(
-        url or '', json_data=json_data, data=data, headers=additional_headers, timeout=timeout)
-
-
-def http_post_model(
-    url: str,
-    body: Any,
-    additional_headers: Mapping[str, str] | None = None,
-    timeout: float | None = _HTTP_TIMEOUT,
-    *,
-    transport: ClientTransport | None = None,
-) -> requests.Response:
-    return capture_transport(transport).post_model(url, body, headers=additional_headers, timeout=timeout)
-
-
-def http_delete(
-    url: str | None = None,
-    params: Mapping[str, Any] | None = None,
-    additional_headers: Mapping[str, str] | None = None,
-    timeout: float | None = _HTTP_TIMEOUT,
-    *,
-    transport: ClientTransport | None = None,
-) -> requests.Response:
-    return capture_transport(transport).delete(url or '', params=params, headers=additional_headers, timeout=timeout)

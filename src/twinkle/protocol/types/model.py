@@ -3,7 +3,7 @@
 
 One declaration per endpoint, shared by Twinkle_Client and the server handler, so
 there is a single answer to "what may this endpoint receive". Every field carries a
-role (see :mod:`twinkle_client.types.base`):
+role (see :mod:`twinkle.protocol.types.base`):
 
 - plain fields are **control** fields: the handler consumes them or passes them as a
   named argument, and they are never re-forwarded through ``**backend_kwargs``;
@@ -180,9 +180,25 @@ class DataPlaneForwardRequest(StrictRequest):
     loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
-    """Body of ``POST /twinkle/forward_only_from_data_plane``."""
+class DataPlaneForwardOnlyRequest(StrictRequest):
+    """Body of ``POST /twinkle/forward_only_from_data_plane``.
 
+    This endpoint is read-only, so it deliberately has no ``seq_id`` idempotency
+    key. Its fields are declared directly rather than inherited from the
+    gradient-mutating data-plane request.
+    """
+
+    input_refs: list[DataRef] = Field(min_length=1)
+    input_field: str | None = None
+    kwarg_fields: dict[str, str] = Field(default_factory=dict)
+    adapter_name: str
+    task: str | None = backend_kwarg(default=None)
+    temperature: float | None = backend_kwarg(default=None, gt=0)
+    return_logits: bool | None = backend_kwarg(default=None)
+    disable_lora: bool | None = backend_kwarg(default=None)
+    micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
+    gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
+    loss_kwargs: dict[str, JsonValue] = passthrough()
     output_ref: DataRef | None = None
     output_fields: dict[str, str] = Field(default_factory=dict)
 
@@ -335,7 +351,7 @@ class OkResponse(ResponseModel):
 
 
 class ModelResult(ResponseModel):
-    """Generic single-value result wrapper returned by result-bearing endpoints."""
+    """Generic result wrapper; ``ModelResult`` is the retained historical public name."""
     result: Any
 
 
@@ -385,58 +401,19 @@ class TrainingProgressResponse(ResponseModel):
 
 # --- Void responses (return None → OkResponse) ---
 
-
-class BackwardResponse(OkResponse):
-    """Response for /backward endpoint."""
-
-
-class StepResponse(OkResponse):
-    """Response for /step (optimizer step) endpoint."""
-
-
-class ZeroGradResponse(OkResponse):
-    """Response for /zero_grad endpoint."""
-
-
-class LrStepResponse(OkResponse):
-    """Response for /lr_step endpoint."""
-
-
-class SetLossResponse(OkResponse):
-    """Response for /set_loss endpoint."""
-
-
-class SetOptimizerResponse(OkResponse):
-    """Response for /set_optimizer endpoint."""
-
-
-class SetLrSchedulerResponse(OkResponse):
-    """Response for /set_lr_scheduler endpoint."""
-
-
-class LoadResponse(OkResponse):
-    """Response for /load endpoint."""
-
-
-class SetTemplateResponse(OkResponse):
-    """Response for /set_template endpoint."""
-
-
-class SetProcessorResponse(OkResponse):
-    """Response for /set_processor endpoint."""
-
-
-class ClipGradAndStepResponse(OkResponse):
-    """Response for /clip_grad_and_step endpoint."""
-
-
-class ApplyPatchResponse(OkResponse):
-    """Response for /apply_patch endpoint."""
-
-
-class AddMetricResponse(OkResponse):
-    """Response for /add_metric endpoint."""
-
+BackwardResponse = OkResponse
+StepResponse = OkResponse
+ZeroGradResponse = OkResponse
+LrStepResponse = OkResponse
+SetLossResponse = OkResponse
+SetOptimizerResponse = OkResponse
+SetLrSchedulerResponse = OkResponse
+LoadResponse = OkResponse
+SetTemplateResponse = OkResponse
+SetProcessorResponse = OkResponse
+ClipGradAndStepResponse = OkResponse
+ApplyPatchResponse = OkResponse
+AddMetricResponse = OkResponse
 
 # --- Other responses ---
 

@@ -232,12 +232,6 @@ class ModelManager(BaseManager[ModelRecord]):
 
     # ----- Backend-derived helpers --------------------------------------- #
 
-    async def _count_models_for_token(self, token: str | None) -> int:
-        if not token:
-            return 0
-        all_records = await self.get_all()
-        return sum(1 for r in all_records.values() if r.token == token)
-
     async def _models_for_replica(self, replica_id: str) -> list[str]:
         all_records = await self.get_all()
         return [mid for mid, r in all_records.items() if r.replica_id == replica_id]

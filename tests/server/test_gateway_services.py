@@ -37,7 +37,7 @@ def test_gateway_services_do_not_import_protocol_models():
     path = Path(services.__file__)
     tree = ast.parse(path.read_text(), filename=str(path))
     imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
-    assert not any(module == 'tinker.types' or module.startswith('twinkle_client.types') for module in imports)
+    assert not any(module == 'tinker.types' or module.startswith('twinkle.protocol.types') for module in imports)
 
 
 class _FakeGateway:

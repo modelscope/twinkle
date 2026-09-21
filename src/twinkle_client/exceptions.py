@@ -18,7 +18,7 @@ from __future__ import annotations
 import requests
 from typing import Any, Optional
 
-from twinkle_client.types.errors import ErrorCategory
+from twinkle.protocol.types.errors import ErrorCategory
 
 
 class TwinkleClientValidationError(ValueError):

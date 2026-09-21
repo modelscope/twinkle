@@ -17,7 +17,7 @@ from twinkle.server.task_queue.config import TaskQueueConfig        # noqa: E402
 from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 from twinkle_client import _future                                        # noqa: E402
 from twinkle_client.exceptions import TaskFailedError                     # noqa: E402
-from twinkle_client.types.lifecycle import TaskEnvelope                   # noqa: E402
+from twinkle.protocol.types.lifecycle import TaskEnvelope                   # noqa: E402
 
 
 class _Harness(TaskQueueMixin):

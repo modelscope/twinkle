@@ -25,8 +25,7 @@ from .sampler import (SampledSequenceModel, SamplerAddAdapterRequest, SamplerAdd
                       SampleRequest, SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
                       SamplerSetTemplateResponse)
 from .server import (CapacityInfoResponse, CheckpointPathResponse, ClientFeatures, DeleteCheckpointResponse,
-                     ErrorResponse, GetServerCapabilitiesResponse, HealthResponse, ProtocolLimits, SupportedModel,
-                     WeightsInfoRequest)
+                     GetServerCapabilitiesResponse, HealthResponse, ProtocolLimits, SupportedModel, WeightsInfoRequest)
 from .session import CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest, SessionHeartbeatResponse
 from .training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor, LoraConfig,
                        ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse, WeightsInfoResponse)
@@ -136,7 +135,6 @@ __all__ = [
     'CheckpointPathResponse',
     'ClientFeatures',
     'DeleteCheckpointResponse',
-    'ErrorResponse',
     'GetServerCapabilitiesResponse',
     'HealthResponse',
     'ProtocolLimits',

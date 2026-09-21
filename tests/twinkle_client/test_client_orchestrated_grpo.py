@@ -5,7 +5,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from twinkle_client.types import DataRef
+from twinkle.protocol.types import DataRef
 
 MODULE_PATH = (Path(__file__).parents[2] / 'cookbook' / 'client' / 'async_rl' / 'client_orchestrated_grpo.py')
 

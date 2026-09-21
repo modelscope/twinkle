@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.server.sampler.twinkle_handlers import (
     _register_twinkle_sampler_routes,
@@ -77,7 +77,7 @@ class _SamplerManagement:
     async def submit_background_and_peek(self, coro_factory, *, model_id=None, task_type=None):
         self.scheduled.append({'model_id': model_id, 'task_type': task_type})
         result = await coro_factory()
-        from twinkle_client.types.lifecycle import TaskEnvelope
+        from twinkle.protocol.types.lifecycle import TaskEnvelope
         return TaskEnvelope(request_id='req-test', status='completed', result=result)
 
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):

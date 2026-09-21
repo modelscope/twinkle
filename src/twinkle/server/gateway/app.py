@@ -11,7 +11,7 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 from typing import Any
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger

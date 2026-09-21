@@ -21,8 +21,8 @@ class TaskQueueConfig(BaseModel):
     """Configuration for task queue and rate limiting.
 
     Attributes:
-        rps_limit: Maximum requests per second per user token. ``0`` disables.
-        tps_limit: Maximum input tokens per second per user token. ``0`` disables.
+        rps_limit: Maximum requests per second per user token, per replica. ``0`` disables.
+        tps_limit: Maximum input tokens per second per user token, per replica. ``0`` disables.
         window_seconds: Sliding window for rate-limit calculations. Must be > 0.
         queue_timeout: Maximum time a task can wait in queue (seconds).
         execution_timeout: Maximum time a task can execute (seconds). ``0`` means "no

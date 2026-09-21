@@ -2,6 +2,7 @@
 """Immutable client identity and the compatibility default-transport registry."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import uuid
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
 
 TWINKLE_SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://127.0.0.1:8000')
 TWINKLE_SERVER_TOKEN = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
+
+logger = logging.getLogger('twinkle_client')
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -54,10 +57,13 @@ def capture_transport(explicit: ClientTransport | None = None) -> ClientTranspor
     if explicit is not None:
         if explicit.closed:
             raise RuntimeError('Cannot capture a closed ClientTransport')
+        explicit._mark_published()
         return explicit
     with _default_lock:
         if _default_transport is None or _default_transport.closed:
             _default_transport = _new_env_transport()
+            logger.info('No explicit Twinkle client configured; using %s', _default_transport.context.base_url)
+        _default_transport._mark_published()
         return _default_transport
 
 
@@ -66,6 +72,13 @@ def set_default_transport(transport: ClientTransport) -> None:
         raise RuntimeError('Cannot register a closed ClientTransport')
     global _default_transport
     with _default_lock:
+        if _default_transport is not None and _default_transport is not transport and not _default_transport.closed:
+            logger.warning(
+                'Replacing default Twinkle transport %s with %s; existing wrappers retain the old transport',
+                _default_transport.context.base_url,
+                transport.context.base_url,
+            )
+        transport._mark_published()
         _default_transport = transport
 
 

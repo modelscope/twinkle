@@ -2,7 +2,7 @@
 """The request-lifecycle wire model: one envelope for submit and retrieve.
 
 This module is a public-contract carrier imported across packages (Twinkle_Server
-reverse-imports ``twinkle_client.types``); per the naming rulings in ``base.py`` it
+reverse-imports ``twinkle.protocol.types``); per the naming rulings in ``base.py`` it
 therefore intentionally carries **no** underscore prefix.
 """
 from __future__ import annotations

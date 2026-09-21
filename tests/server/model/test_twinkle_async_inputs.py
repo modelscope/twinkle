@@ -4,7 +4,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.server.model.data_plane_inputs import model_result_rows
 from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
 
@@ -75,7 +75,7 @@ class _SchedulingManagement:
     async def submit_and_peek(self, coro_factory, *, model_id=None, token=None, task_type=None, **schedule_kwargs):
         self.scheduled.append(schedule_kwargs)
         result = await coro_factory()
-        from twinkle_client.types.lifecycle import TaskEnvelope
+        from twinkle.protocol.types.lifecycle import TaskEnvelope
         return TaskEnvelope(request_id='req-test', status='completed', result=result)
 
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):

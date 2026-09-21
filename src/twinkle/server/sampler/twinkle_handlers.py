@@ -22,8 +22,11 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.data_format import SamplingParams
+from twinkle.protocol.json_utils import json_safe
+from twinkle.protocol.serialize import deserialize_object
+from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.weights import resolve_sampler_weights
@@ -31,8 +34,6 @@ from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.json_utils import json_safe
-from twinkle_client.types import sampler as sampler_types
 
 logger = get_logger()
 
@@ -377,7 +378,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             body: types.ApplyPatchRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> None:
-        from twinkle_client.common.serialize import deserialize_object
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
             await self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body))

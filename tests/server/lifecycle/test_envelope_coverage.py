@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi.routing import APIRoute
 
 from tests.server.contract.client_api_harness import build_model_app, build_sampler_app
-from twinkle_client.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.lifecycle import TaskEnvelope
 
 # The single exemption declaration, keyed BY APP. A flat path set would be wrong:
 # ``/twinkle/set_template`` and ``/twinkle/apply_patch`` exist on both apps, but only the

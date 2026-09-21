@@ -7,7 +7,7 @@ They reuse the char-level Fake Tokenizer / Template infrastructure style from
 ``tests/twinkle_agentic/test_multi_turn_rollout.py`` but adapt the fake sampler
 to the ``twinkle_client`` HTTP contract: ``FakeClientSampler.sample()`` mirrors
 ``vLLMSampler.sample()`` and returns ``List[SampleResponseModel]`` (pydantic,
-from ``twinkle_client.types.sampler``) whose ``sequences[0]`` carries a populated
+from ``twinkle.protocol.types.sampler``) whose ``sequences[0]`` carries a populated
 ``new_input_feature`` so the multi-turn loop can proceed round after round.
 
 Properties covered:
@@ -32,7 +32,7 @@ from twinkle.data_format.sampling import SamplingParams
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
 from twinkle_client.rollout.multi_turn import ClientMultiTurnRollout
-from twinkle_client.types.sampler import SampledSequenceModel, SampleResponseModel
+from twinkle.protocol.types.sampler import SampledSequenceModel, SampleResponseModel
 
 
 # =============================================================================

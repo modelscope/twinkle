@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .data_plane import DataPlaneClient
+    from .http import ClientContext, ClientTransport
     from .manager import TwinkleClient
 
 
@@ -73,7 +75,17 @@ def init_twinkle_client(
     )
 
 
-from .data_plane import DataPlaneClient  # noqa: E402  (late import: keeps optional data-plane dep off the hot path)
-from .http import ClientContext, ClientTransport  # noqa: E402
+def __getattr__(name: str) -> Any:
+    if name == 'DataPlaneClient':
+        from .data_plane import DataPlaneClient
+        value = DataPlaneClient
+    elif name in {'ClientContext', 'ClientTransport'}:
+        from .http import ClientContext, ClientTransport
+        value = {'ClientContext': ClientContext, 'ClientTransport': ClientTransport}[name]
+    else:
+        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    globals()[name] = value
+    return value
+
 
 __all__ = ['ClientContext', 'ClientTransport', 'DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']

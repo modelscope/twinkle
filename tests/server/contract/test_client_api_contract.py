@@ -62,8 +62,8 @@ def test_schedule_task_and_wait_removed():
 
 def test_new_client_types_importable():
     # The only permitted client-side additions.
-    import twinkle_client.types.base as base
-    import twinkle_client.types.errors as errors
+    import twinkle.protocol.types.base as base
+    import twinkle.protocol.types.errors as errors
 
     for symbol in ('StrictRequest', 'ResponseModel', 'DataModel', 'backend_only'):
         assert hasattr(base, symbol)

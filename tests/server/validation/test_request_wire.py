@@ -16,8 +16,8 @@ from pydantic import ValidationError
 from fastapi.exceptions import RequestValidationError
 
 from twinkle.server.deployment import validation_error_handler
-from twinkle_client.types import model as model_types
-from twinkle_client.types.base import StrictRequest
+from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types.base import StrictRequest
 
 
 @pytest.fixture(scope='module')
@@ -191,7 +191,7 @@ def test_every_twinkle_route_body_is_strict():
 # Regression: the sampler routes must bind the sampler-domain models, not model.py's
 #
 # ``sampler.py`` and ``model.py`` once both declared bare ``AddAdapterRequest`` /
-# ``SetTemplateRequest``. Because the handler does ``import twinkle_client.types as
+# ``SetTemplateRequest``. Because the handler does ``import twinkle.protocol.types as
 # types`` and the package ``__init__`` re-exported ``model.py`` first,
 # ``types.AddAdapterRequest`` resolved to *model.py*'s model -- whose ``config`` is a
 # ``str``, so it rejected the dict a real ``add_adapter_to_sampler`` call sends. The
@@ -211,7 +211,7 @@ def _body_model(app, path: str):
 
 def test_sampler_routes_bind_sampler_domain_models():
     from tests.server.contract.client_api_harness import build_sampler_app
-    from twinkle_client.types import sampler as sampler_types
+    from twinkle.protocol.types import sampler as sampler_types
 
     app = build_sampler_app()
     assert _body_model(app, '/twinkle/add_adapter_to_sampler') is sampler_types.SamplerAddAdapterRequest
@@ -220,8 +220,8 @@ def test_sampler_routes_bind_sampler_domain_models():
 
 def test_sampler_add_adapter_accepts_a_dict_config_where_model_rejects_it():
     """The exact divergence the collision hid: the client sends ``config`` as a dict."""
-    from twinkle_client.types import model as model_types
-    from twinkle_client.types import sampler as sampler_types
+    from twinkle.protocol.types import model as model_types
+    from twinkle.protocol.types import sampler as sampler_types
 
     # The sampler contract (``config: Any``) accepts the LoRA config dict the client sends.
     ok = sampler_types.SamplerAddAdapterRequest(adapter_name='a', config={'r': 8})

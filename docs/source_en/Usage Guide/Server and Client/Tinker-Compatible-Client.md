@@ -6,7 +6,7 @@ The Tinker Client is suitable for scenarios with existing Tinker training code. 
 
 ```python
 # Initialize Tinker client before importing ServiceClient
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 
 init_tinker_client()
 
@@ -41,7 +41,7 @@ import os
 import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
@@ -132,7 +132,7 @@ You can also load saved checkpoints for inference:
 ```python
 import os
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 

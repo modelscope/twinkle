@@ -82,7 +82,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
             request: Request,
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
-        # Convert twinkle_client.types.SupportedModel to tinker.types.SupportedModel
+        # Convert twinkle.protocol.types.SupportedModel to tinker.types.SupportedModel
         tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
         return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 

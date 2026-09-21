@@ -7,10 +7,10 @@ from pathlib import Path
 
 _ROOT = Path(__file__).parents[3] / 'src'
 _ALLOWED_SERVER_IMPORTS = (
-    'twinkle_client.types',
-    'twinkle_client.http.headers',
-    'twinkle_client.common.json_utils',
-    'twinkle_client.common.serialize',
+    'twinkle.protocol.types',
+    'twinkle.protocol.headers',
+    'twinkle.protocol.json_utils',
+    'twinkle.protocol.serialize',
 )
 
 

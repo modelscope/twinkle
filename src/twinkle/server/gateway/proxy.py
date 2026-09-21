@@ -13,10 +13,10 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 from typing import Any
 
+from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
-from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 from . import routes
 
 logger = get_logger()

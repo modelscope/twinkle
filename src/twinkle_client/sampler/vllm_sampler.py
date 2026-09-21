@@ -4,14 +4,14 @@ from peft import PeftConfig
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.protocol.json_utils import json_safe
+from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
+from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
+                                            SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
+                                            SamplerSetTemplateResponse)
 from twinkle_client._request_builder import build_request
-from twinkle_client.common.json_utils import json_safe
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
-from twinkle_client.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
-from twinkle_client.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
-                                          SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
-                                          SamplerSetTemplateResponse)
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -190,6 +190,6 @@ class vLLMSampler:
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
-        from twinkle_client.types.model import ApplyPatchRequest
+        from twinkle.protocol.types.model import ApplyPatchRequest
         body = build_request(ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
         self._transport.post_model(f'{self.server_url}/apply_patch', body)

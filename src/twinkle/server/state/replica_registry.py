@@ -48,16 +48,6 @@ class ReplicaRegistry:
         """Refresh the replica's liveness timestamp (separate key from max_loras)."""
         await self._backend.set(_last_seen_key(replica_id), time.time())
 
-    async def get_last_seen(self, replica_id: str) -> float | None:
-        """Return the replica's last-seen unix time, or ``None`` if never refreshed."""
-        value = await self._backend.get(_last_seen_key(replica_id))
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
     async def get_all_last_seen(self) -> dict[str, float]:
         """Return every replica's last-seen timestamp."""
         keys = await self._backend.keys(f'{REPLICA_PREFIX}*{_LAST_SEEN_SUFFIX}')
@@ -72,16 +62,6 @@ class ReplicaRegistry:
             except (TypeError, ValueError):
                 continue
         return out
-
-    async def get_max_loras(self, replica_id: str) -> int | None:
-        """Return the declared capacity, or ``None`` if the replica is unknown."""
-        value = await self._backend.get(_make_key(replica_id))
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
 
     async def get_all(self) -> dict[str, int]:
         """Return every registered replica's declared capacity."""

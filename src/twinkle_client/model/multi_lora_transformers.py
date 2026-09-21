@@ -4,11 +4,11 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types.component import DataRef
 from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
-from twinkle_client.types import model as model_types
-from twinkle_client.types.component import DataRef
 
 logger = logging.getLogger('twinkle_client')
 

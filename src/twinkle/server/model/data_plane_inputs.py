@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from twinkle_client.common.json_utils import json_safe
+from twinkle.protocol.json_utils import json_safe
 
 
 def model_result_rows(result: Any, batch_size: int) -> list[dict[str, Any]]:

@@ -205,16 +205,6 @@ class SessionResourceMixin(ABC):
         state = info.get('state') or {}
         return state.get(key, default)
 
-    def pop_resource_state(self, resource_id: str, key: str, default: Any = None) -> Any:
-        """Pop a per-resource state value."""
-        info = self._resource_records.get(resource_id)
-        if info is None:
-            return default
-        state = info.get('state')
-        if not isinstance(state, dict):
-            return default
-        return state.pop(key, default)
-
     def clear_resource_state(self, resource_id: str) -> None:
         """Clear all per-resource state values."""
         info = self._resource_records.get(resource_id)
@@ -349,10 +339,6 @@ class SessionResourceMixin(ABC):
             self._resource_countdown_running = True
             self._countdown_task = asyncio.create_task(self._resource_countdown_loop())
             logger.debug(f'[{self._resource_type}Manager] Countdown task started')
-
-    async def _async_ensure_countdown_started(self) -> None:
-        """Async version for convenience."""
-        self._ensure_countdown_started()
 
     def stop_resource_countdown(self) -> None:
         """Stop the background countdown task."""

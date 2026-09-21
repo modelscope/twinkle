@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
+from twinkle.protocol.types.lifecycle import TaskEnvelope
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_errors import trim_traceback
-from twinkle_client.types.errors import ErrorCategory, ErrorPayload
-from twinkle_client.types.lifecycle import TaskEnvelope
 
 # Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
 _FAILURE_WIRE: dict[str, tuple[int, ErrorCategory]] = {

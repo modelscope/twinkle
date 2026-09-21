@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
 
 from twinkle.utils.logger import get_logger
 
@@ -43,12 +42,15 @@ class RateLimiter:
         token_cleanup_interval: float = 60.0,
         active_tokens_gauge=None,
         deployment_name: str = '',
+        replica_id: str = '',
     ):
         """Initialize the rate limiter.
 
         Args:
-            rps_limit: Maximum requests per second per user token.
-            tps_limit: Maximum input tokens per second per user token.
+            rps_limit: Maximum requests per second per user token, per replica.
+                ``0`` disables the RPS limit.
+            tps_limit: Maximum input tokens per second per user token, per replica.
+                ``0`` disables the TPS limit.
             window_seconds: Time window for rate limiting (default 1.0s).
             token_cleanup_multiplier: Multiplier for token cleanup threshold.
                 Tokens inactive for window_seconds * token_cleanup_multiplier
@@ -58,6 +60,7 @@ class RateLimiter:
             active_tokens_gauge: Optional gauge adapter (see twinkle.server.telemetry.metrics)
                 for tracking the active token count.
             deployment_name: Deployment name for metrics labels.
+            replica_id: Replica identifier for metrics labels.
         """
         self.rps_limit = rps_limit
         self.tps_limit = tps_limit
@@ -79,7 +82,11 @@ class RateLimiter:
 
         # Metrics gauge for active token count
         self._active_tokens_gauge = active_tokens_gauge
-        self._deployment_name = deployment_name
+        self._metric_tags = {}
+        if deployment_name:
+            self._metric_tags['deployment'] = deployment_name
+        if replica_id:
+            self._metric_tags['replica'] = replica_id
 
     def _cleanup_old_requests(self, token: str, current_time: float) -> None:
         """Remove requests outside the sliding window."""
@@ -120,8 +127,7 @@ class RateLimiter:
                                      f'Active tokens remaining: {len(self._token_requests)}')
 
                     if self._active_tokens_gauge is not None:
-                        tags = {'deployment': self._deployment_name} if self._deployment_name else {}
-                        self._active_tokens_gauge.set(len(self._token_requests), tags=tags)
+                        self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
 
             except asyncio.CancelledError:
                 logger.debug('[RateLimiter] Cleanup task cancelled')
@@ -165,45 +171,13 @@ class RateLimiter:
             request_count = len(requests)
             token_count = sum(count for _, count in requests)
 
-            if request_count >= self.rps_limit:
+            if self.rps_limit > 0 and request_count >= self.rps_limit:
                 return False, f'RPS limit exceeded: {request_count}/{self.rps_limit} requests/s'
 
-            if token_count + input_tokens > self.tps_limit:
+            if self.tps_limit > 0 and token_count + input_tokens > self.tps_limit:
                 return False, f'TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s'
 
             self._token_requests[token].append((current_time, input_tokens))
             if self._active_tokens_gauge is not None:
-                tags = {'deployment': self._deployment_name} if self._deployment_name else {}
-                self._active_tokens_gauge.set(len(self._token_requests), tags=tags)
+                self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
             return True, None
-
-    def get_stats(self, token: str) -> dict[str, Any]:
-        """Get current rate limiting stats for a token."""
-        current_time = time.time()
-        self._cleanup_old_requests(token, current_time)
-
-        if token in self._token_requests:
-            self._last_activity[token] = current_time
-
-        requests = self._token_requests.get(token, [])
-        request_count = len(requests)
-        token_count = sum(count for _, count in requests)
-
-        return {
-            'current_rps': request_count,
-            'current_tps': token_count,
-            'rps_limit': self.rps_limit,
-            'tps_limit': self.tps_limit,
-            'rps_available': self.rps_limit - request_count,
-            'tps_available': self.tps_limit - token_count,
-        }
-
-    def get_memory_stats(self) -> dict[str, Any]:
-        """Get memory usage statistics for monitoring."""
-        return {
-            'active_tokens': len(self._token_requests),
-            'tracked_tokens': len(self._last_activity),
-            'cleanup_threshold_seconds': self.window_seconds * self.token_cleanup_multiplier,
-            'cleanup_interval_seconds': self.token_cleanup_interval,
-            'cleanup_task_running': self._cleanup_started and self._cleanup_task and not self._cleanup_task.done(),
-        }
