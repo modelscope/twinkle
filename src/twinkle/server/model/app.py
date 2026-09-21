@@ -14,24 +14,23 @@ from ray.serve.config import RequestRouterConfig
 from typing import Any
 
 from twinkle import DeviceGroup
-from twinkle.server.common.router import StickyLoraRequestRouter
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.model.routing import StickyLoraRequestRouter
+from twinkle.server.runtime import init_twinkle_runtime
+from twinkle.server.session_resource import AdapterManagerMixin
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
-from twinkle.server.utils.auth import get_token_from_request
-from twinkle.server.utils.backend_dispatch import BackendSelector
-from twinkle.server.utils.session_resource import AdapterManagerMixin
-from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.utils.logger import get_logger
-from .tinker_handlers import _register_tinker_routes
-from .twinkle_handlers import _register_twinkle_routes
+from .tinker_handlers import _register_model_tinker_routes
+from .twinkle_handlers import _register_model_twinkle_routes
 
 logger = get_logger()
 
-# ``FullModeBusyError`` lives in ``twinkle.server.exceptions``; re-exported here
-# for backwards compatibility with callers importing it from this module.
-__all__ = ['FullModeBusyError', 'ModelManagement', 'build_model_app']
+__all__ = ['ModelManagement', 'build_model_app']
 
 # Ctor kwargs consumed by the MultiLora wrappers' signatures but unknown to the
 # plain (full-parameter) model classes, where **kwargs flows into HF
@@ -133,7 +132,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
         self._model_unhealthy = False
-        self._health_probe_task = None
+        self._health_probe_task: asyncio.Task | None = None
 
         actors = getattr(self.model, '_actors', None)
         self._init_task_queue(
@@ -143,7 +142,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             on_backend_timeout=self._probe_after_timeout,
             collect_width=len(actors) if actors else 1,
         )
-        self.model._ray_get_timeout = self._task_queue_config.effective_execution_timeout
+        self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
         self._init_adapter_manager(**(adapter_config or {}))
         await self._register_replica_on_startup()
         # Note: countdown task is started lazily in _ensure_sticky()
@@ -310,8 +309,8 @@ def build_model_app(model_id: str,
     # teardown via ``on_shutdown`` and its sticky-LoRA router via
     # ``request_router_config``.
     def register_routes(app: FastAPI, get_self: Any) -> None:
-        _register_tinker_routes(app, get_self)
-        _register_twinkle_routes(app, get_self)
+        _register_model_tinker_routes(app, get_self)
+        _register_model_twinkle_routes(app, get_self)
 
     async def _on_shutdown(servable: Any) -> None:
         await servable.shutdown()

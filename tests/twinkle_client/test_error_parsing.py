@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Client error-response parsing (T3.4 / Requirement 3 #7-#11)."""
+"""Client error-response parsing ( / Requirement 3 #7-#11)."""
 from __future__ import annotations
 
 import pytest
@@ -26,11 +26,11 @@ class _Resp:
 
 
 def test_structured_error_reads_top_level_fields():
-    """R3#7/#8: top-level category/error_code/request_id are preferred."""
+    """Top-level category/error_code/request_id are preferred."""
     resp = _Resp(422, body={'error': 'bad input', 'category': 'user', 'error_code': 422, 'request_id': 'req-7'})
     with pytest.raises(TwinkleHTTPError) as exc:
         _handle_response(resp)
-    assert isinstance(exc.value, requests.HTTPError)  # R3#8: existing except clauses keep working
+    assert isinstance(exc.value, requests.HTTPError) # existing except clauses keep working
     assert exc.value.status_code == 422
     assert exc.value.error_code == 422
     assert exc.value.category == 'user'
@@ -96,7 +96,7 @@ def test_server_traceback_is_preserved():
 
 
 def test_410_raises_stop_iteration_not_http_error():
-    """R3#9: 410 keeps raising StopIteration, not an HTTP error."""
+    """410 keeps raising StopIteration, not an HTTP error."""
     resp = _Resp(410, body={'detail': 'exhausted'})
     with pytest.raises(StopIteration):
         _handle_response(resp)

@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Tinker-compatible model handler mixin.
+"""Tinker-compatible routes for the Model deployment.
 
-All endpoints are prefixed /tinker/... and use schedule_task() returning UntypedAPIFuture.
-self_fn is injected via FastAPI Depends to obtain the ModelManagement instance at request time.
+Registered by ``_register_model_tinker_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. All endpoints are prefixed
+/tinker/... and use schedule_task() returning UntypedAPIFuture. ``self_fn`` is injected
+via FastAPI Depends to obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
 
@@ -18,14 +20,14 @@ if TYPE_CHECKING:
 
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.utils import get_template_for_model
-from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
 
-def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
+def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
     """Register all /tinker/* routes on the given FastAPI app.
 
     self_fn is a zero-argument callable that returns the current ModelManagement
@@ -330,12 +332,17 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 assert self.model is not None, 'Model not loaded, please load model first'
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_resource_exists(adapter_name)
+                # Path resolution (token isolation, twinkle-vs-external path shapes) is a
+                # server storage policy and belongs in the handler, not in the GPU-side
+                # backend actor. The backend receives an already-resolved location.
+                checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
+                resolved = checkpoint_manager.resolve_load_path(body.path)
                 await self.call_backend(
                     self.model.tinker_load,
-                    checkpoint_dir=body.path,
+                    checkpoint_name=resolved.checkpoint_name,
+                    output_dir=resolved.checkpoint_dir if resolved.is_twinkle_path else None,
                     load_optimizer=body.optimizer,
-                    adapter_name=self.resolve_model_adapter_name(adapter_name),
-                    token=token)
+                    adapter_name=self.resolve_model_adapter_name(adapter_name))
                 self.set_resource_state(adapter_name, 'grad_ready', False)
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')
             except Exception:

@@ -1,10 +1,10 @@
 import asyncio
 import pytest
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin
-from twinkle.server.utils.task_queue.types import UserTaskError
-from twinkle.server.utils.task_queue.worker import ComputeWorker
+from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle.server.task_queue.types import UserTaskError
+from twinkle.server.task_queue.worker import ComputeWorker
 
 
 class _DummyState:
@@ -70,7 +70,7 @@ async def test_preflight_rejects_batch_without_per_dp_multiple():
             batch_size_multiple=2,
         )
 
-    # Property 3: a rejection writes no future record.
+    # A rejection writes no future record.
     assert queue.state.records == []
 
 
@@ -180,7 +180,7 @@ async def test_submit_and_peek_failure_returns_failed_envelope_and_persists():
     finally:
         await queue._compute_worker.stop()
 
-    # Property 0: the failure payload rides the envelope's `error` field.
+    # The failure payload rides the envelope's `error` field.
     assert env.status == 'failed'
     assert env.error is not None and 'model failed' in env.error.error
     assert any(args[1] == 'failed' for args, _ in queue.state.records)

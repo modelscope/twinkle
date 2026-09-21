@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Client_Future_Layer unit tests (T2.2 / Requirement 4).
+"""Client_Future_Layer unit tests ( / Requirement 4).
 
 ``resolve`` is exercised against fabricated envelopes and a monkeypatched
 ``_post_retrieve``; no server or network is involved.
@@ -40,7 +40,7 @@ def _running():
 
 
 def test_terminal_submit_issues_no_retrieve(monkeypatch):
-    """R8#1: a task terminal in the submit envelope makes zero retrieve calls."""
+    """A task terminal in the submit envelope makes zero retrieve calls."""
 
     def _boom(_request_id, _transport):
         raise AssertionError('retrieve must not be called for a terminal submit')
@@ -51,7 +51,7 @@ def test_terminal_submit_issues_no_retrieve(monkeypatch):
 
 
 def test_terminal_submit_failure_raises_taskfailed_with_payload(monkeypatch):
-    """Property 0: a failure in the submit envelope raises TaskFailedError, payload intact."""
+    """A failure in the submit envelope raises TaskFailedError, payload intact."""
     monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: pytest.fail('no retrieve'))
     with pytest.raises(TaskFailedError) as exc:
         _future.resolve(_failed(), model_cls=_Model)
@@ -59,11 +59,11 @@ def test_terminal_submit_failure_raises_taskfailed_with_payload(monkeypatch):
     assert exc.value.category == 'server'
     assert exc.value.request_id == 'r'
     assert exc.value.error_code == 500
-    assert not isinstance(exc.value, requests.HTTPError)  # R3#10
+    assert not isinstance(exc.value, requests.HTTPError)
 
 
 def test_model_cls_none_returns_none_result(monkeypatch):
-    """R4#9: a method that returned None before still returns None (not swallowed)."""
+    """A method that returned None before still returns None (not swallowed)."""
     monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: pytest.fail('no retrieve'))
     assert _future.resolve(_completed(None), model_cls=None) is None
 
@@ -121,7 +121,7 @@ def test_total_timeout_raises_wait_timeout(monkeypatch):
 
 
 def test_success_resets_both_retry_counters(monkeypatch):
-    """R4#8: a successful reply zeroes both counters, so intermittent 404s never sum up."""
+    """A successful reply zeroes both counters, so intermittent 404s never sum up."""
     seq = []
 
     def _mixed(_request_id, _transport):

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for the single FutureRecord -> TaskEnvelope mapping point (T1.2)."""
+"""Unit tests for the single FutureRecord -> TaskEnvelope mapping point."""
 from __future__ import annotations
 
 import pytest
@@ -21,7 +21,7 @@ def test_wire_maps_cover_exactly_the_canonical_reason_codes():
 
 
 def test_completed_with_none_result_is_a_success_not_a_failure():
-    """R1#4 / Property 4: `completed` + `result is None` is a valid success."""
+    """`completed` + `result is None` is a valid success."""
     env = envelope_from_record('req-1', {'status': 'completed', 'result': None})
     assert env.status == 'completed'
     assert env.result is None

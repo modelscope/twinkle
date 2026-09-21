@@ -2,7 +2,7 @@
 """
 Twinkle-native gateway handlers.
 
-All endpoints are prefixed /twinkle/* and registered via _register_twinkle_routes(app, self_fn).
+All endpoints are prefixed /twinkle/* and registered via _register_gateway_twinkle_routes(app, self_fn).
 """
 from __future__ import annotations
 
@@ -18,17 +18,16 @@ from twinkle.server.checkpoint import create_checkpoint_manager, create_training
 from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
-from twinkle.server.utils.auth import get_token_from_request
+from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.utils.logger import get_logger
-from .services import create_session as create_session_use_case
-from .services import delete_checkpoint
-from .services import get_training_run as get_training_run_use_case
-from .services import get_weights_info, list_checkpoints, list_training_runs, poll_future, touch_session
+from .use_cases import delete_checkpoint
+from .use_cases import get_training_run as get_training_run_use_case
+from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
 logger = get_logger()
 
 
-def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
+def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register all /twinkle/* routes on the given FastAPI app."""
 
     @app.get('/twinkle/capacity_info', response_model=types.CapacityInfoResponse)
@@ -105,7 +104,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
             body: types.CreateSessionRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
-        session_id = await create_session_use_case(self.state, body.model_dump())
+        session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post('/twinkle/session_heartbeat', response_model=types.SessionHeartbeatResponse)
@@ -114,7 +113,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
             body: types.SessionHeartbeatRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.SessionHeartbeatResponse:
-        alive = await touch_session(self.state, body.session_id)
+        alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise ResourceNotFoundError('Unknown session')
         return types.SessionHeartbeatResponse()

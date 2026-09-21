@@ -69,7 +69,7 @@ class _SamplerManagement:
         self.enabled = True
         self.scheduled = []
         self.put_rows = None
-        self._task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
+        self.task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
 
     async def _on_request_start(self, _request):
         return 'token'

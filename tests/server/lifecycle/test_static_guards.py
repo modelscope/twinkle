@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Static / structural guards for the lifecycle refactor.
 
-- Property 1 (R8#7): the deleted symbols occur zero times under ``src/twinkle/**``.
-- Property 0: ``TaskEnvelope`` has exactly one construction site.
-- D5 client-side invariant (R1#12): the client HTTP timeout is <= 120 and strictly
+- the deleted symbols occur zero times under ``src/twinkle/**``.
+- ``TaskEnvelope`` has exactly one construction site.
+- The client-side invariant: the client HTTP timeout is <= 120 and strictly
   greater than the server Long_Poll_Window.
 - The task status set has two independent declarations that must not drift.
 
@@ -20,7 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC = _REPO_ROOT / 'src' / 'twinkle'
 
 # Symbols the refactor removed. A wildcard search (not a per-file list) must find
-# each of them zero times across the whole server tree (R8#7, Property 1).
+# each of them zero times across the whole server tree.
 _FORBIDDEN_SYMBOLS = (
     'schedule_task_and_wait',
     'run_task',
@@ -49,7 +49,7 @@ def test_client_http_timeout_bounds():
 
 
 def test_task_envelope_has_exactly_one_construction_site():
-    """Property 0's structural precondition: one mapping point, mechanically enforced.
+    """'s structural precondition: one mapping point, mechanically enforced.
 
     ``envelope_from_record`` is the only place a FutureRecord becomes a TaskEnvelope, so
     ``failed`` always lands in ``error`` and never in ``result`` regardless of which
@@ -84,7 +84,7 @@ def test_server_task_status_enum_matches_client_literal():
     """
     from typing import get_args
 
-    from twinkle.server.utils.task_queue.types import TaskStatus as ServerTaskStatus
+    from twinkle.server.task_queue.types import TaskStatus as ServerTaskStatus
     from twinkle_client.types.lifecycle import TERMINAL_STATUSES
     from twinkle_client.types.lifecycle import TaskStatus as WireTaskStatus
 

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Post-timeout liveness probe and health status bit (T4.2 / R3#2-3).
+"""Post-timeout liveness probe and health status bit.
 
 Binds the real ``ModelManagement`` health methods onto a minimal harness with a
 toggleable mock ``ping`` and a direct ``call_backend``. No GPU/Ray/full server.
@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI
 
 from twinkle.server.model.app import ModelManagement
-from twinkle.server.model.twinkle_handlers import _register_twinkle_routes
+from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
 
 
 class _MockModel:
@@ -67,7 +67,7 @@ async def test_health_route_returns_503_when_probe_fails():
     model.alive = False
     harness = _HealthHarness(model)
     app = FastAPI()
-    _register_twinkle_routes(app, lambda: harness)
+    _register_model_twinkle_routes(app, lambda: harness)
     route = next(route for route in app.routes if getattr(route, 'path', None) == '/healthz')
 
     response = await route.endpoint(object(), harness)

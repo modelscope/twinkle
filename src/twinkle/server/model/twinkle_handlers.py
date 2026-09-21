@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Twinkle-native model handler mixin.
+"""Twinkle-native routes for the Model deployment.
 
-All queued endpoints are prefixed /twinkle/... and return a Task_Envelope via the
-shared ``run_submit`` judgment sequence: the handler submits work and returns
-immediately, and the client's Client_Future_Layer resolves the envelope to a
-terminal state. self_fn is injected via FastAPI Depends to obtain the
-ModelManagement instance at request time.
+Registered by ``_register_model_twinkle_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. All queued endpoints are prefixed
+/twinkle/... and return a Task_Envelope via the shared ``run_submit`` judgment sequence:
+the handler submits work and returns immediately, and the client's Client_Future_Layer
+resolves the envelope to a terminal state. ``self_fn`` is injected via FastAPI Depends to
+obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
 
@@ -25,9 +26,9 @@ from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoi
 from twinkle.server.exceptions import RequestRejectedError, TrainModeMismatchError
 from twinkle.server.lifecycle.submit import (backend_kwargs, input_metrics, resolve_twinkle_adapter_name, run_submit,
                                              to_backend_inputs)
+from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
                                                     resolve_data_plane_model_inputs, select_output_rows)
-from twinkle.server.utils.auth import get_session_id_from_request
 from twinkle.server.validation import BackendCapability
 from twinkle.utils.logger import get_logger
 
@@ -50,7 +51,7 @@ def _data_plane_metrics(self, body):
     return {'input_tokens': input_tokens, 'batch_size': batch_size, 'data_world_size': self.data_world_size}
 
 
-def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
+def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
     """Register all /twinkle/* routes on the given FastAPI app.
 
     self_fn is a zero-argument callable that returns the current ModelManagement

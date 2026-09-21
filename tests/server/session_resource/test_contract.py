@@ -7,9 +7,9 @@ from unittest import mock
 import pytest
 
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.utils.session_resource.adapter import AdapterManagerMixin
-from twinkle.server.utils.session_resource.base import SessionResourceMixin
-from twinkle.server.utils.session_resource.processor import ProcessorManagerMixin
+from twinkle.server.session_resource.adapter import AdapterManagerMixin
+from twinkle.server.session_resource.base import SessionResourceMixin
+from twinkle.server.session_resource.processor import ProcessorManagerMixin
 
 
 class _State:
@@ -63,25 +63,25 @@ def test_registration_requires_session_id() -> None:
 async def test_liveness_failure_has_hard_upper_bound_and_recovery_refreshes() -> None:
     state = _State([RuntimeError('down'), 109.0, RuntimeError('down'), RuntimeError('down')])
     manager = _ResourceManager(state, timeout=10.0)
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=100.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=100.0):
         manager.register_resource('r1', 'token', 'session')
     record = manager.get_resource_info('r1')
 
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=105.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=105.0):
         assert await manager._is_session_alive('session', 'r1', record) is True
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=110.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=110.0):
         assert await manager._is_session_alive('session', 'r1', record) is True
     assert manager.get_resource_info('r1')['last_liveness_confirmed_at'] == 110.0
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=115.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=115.0):
         assert await manager._is_session_alive('session', 'r1', record) is True
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=120.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=120.0):
         assert await manager._is_session_alive('session', 'r1', record) is False
 
 
 @pytest.mark.asyncio
 async def test_countdown_restart_preserves_confirmation_time() -> None:
     manager = _ResourceManager(_State([100.0]))
-    with mock.patch('twinkle.server.utils.session_resource.base.time.time', return_value=100.0):
+    with mock.patch('twinkle.server.session_resource.base.time.time', return_value=100.0):
         manager.register_resource('r1', 'token', 'session')
     confirmed_at = manager.get_resource_info('r1')['last_liveness_confirmed_at']
 

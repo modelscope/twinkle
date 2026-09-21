@@ -13,7 +13,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
 
 # ---------- defaults snapshot used by the default-value test -------------- #
 

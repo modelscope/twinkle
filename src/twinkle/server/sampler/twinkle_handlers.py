@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Twinkle-native sampler handler mixin.
+"""Twinkle-native routes for the Sampler deployment.
 
-Provides /twinkle/* sampler endpoints.
+Registered by ``_register_twinkle_sampler_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. Provides /twinkle/* sampler
+endpoints.
 """
 from __future__ import annotations
 
@@ -25,9 +27,9 @@ from twinkle.data_format import SamplingParams
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.json_utils import json_safe
 from twinkle_client.types import sampler as sampler_types
@@ -51,11 +53,6 @@ def _serialize_input_feature(feature: dict) -> dict:
                 pass
             result[k] = v
     return result
-
-
-def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Per-session adapter name; delegates to the shared lifecycle resolver."""
-    return resolve_twinkle_adapter_name(request, adapter_name)
 
 
 def _build_rollout_rows_and_tags(
@@ -234,7 +231,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # Resolve adapter
             adapter_path = None
             adapter_name = body.adapter_name or ''
-            full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
+            full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
                 from twinkle.server.checkpoint import create_checkpoint_manager
@@ -282,7 +279,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             raise EndpointUnavailableError('sampler_type must be vllm_async')
 
         adapter_path = None
-        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
+        full_adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name) or ''
         if body.adapter_uri:
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
@@ -308,8 +305,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-            responses = await _await_generation(self, submission_id,
-                                                self._task_queue_config.effective_execution_timeout)
+            responses = await _await_generation(self, submission_id, self.task_queue_config.effective_execution_timeout)
             rows, tags = _build_rollout_rows_and_tags(
                 _to_sample_response_models(responses),
                 group_ids=body.group_ids,
@@ -365,7 +361,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         # would vanish under `python -O`, letting an empty adapter_name reach the backend.
         if not body.adapter_name:
             raise RequestRejectedError('`adapter_name` is required and must be non-empty.')
-        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
+        full_adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
 
         from peft import LoraConfig
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
@@ -404,7 +400,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         adapter_path = None
         adapter_name = body.adapter_name or ''
-        full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
+        full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
         if body.adapter_uri:
             from twinkle.server.checkpoint import create_checkpoint_manager
@@ -453,7 +449,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 q,
                 STREAM_SENTINEL,
                 request_id,
-                self._task_queue_config.effective_execution_timeout,
+                self.task_queue_config.effective_execution_timeout,
             ),
             media_type='application/x-ndjson',
         )

@@ -38,7 +38,7 @@ class _FakeState:
 class _FakeManagement:
     def __init__(self, record_after_claim):
         self.state = _FakeState(record_after_claim)
-        self._task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
+        self.task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
         # A real deployment declares its backend; preflight reads it from here.
         self.backend = 'transformers'
         self.data_world_size = 1

@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-import asyncio
 import functools
 import math
 import re
@@ -12,14 +11,15 @@ from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceQuotaExceededError
-from twinkle.server.telemetry import MetricsRegistry
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
 from .backend.factory import create_backend
+from .cleanup_coordinator import ResourceCleanupCoordinator
 from .config_manager import ConfigManager
+from .count_publisher import ResourceCountPublisher
 from .future_manager import FutureManager
 from .model_manager import ModelManager
 from .models import FutureFailureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
@@ -28,18 +28,6 @@ from .session_manager import SessionManager
 
 logger = get_logger()
 
-# ---------- Cleanup-leader election ------------------------------------------
-#
-# Every Ray Serve worker creates its own ``ServerState``; without coordination
-# each one would run the periodic cleanup and metrics-publish loop, so a
-# single Twinkle deployment would multiply the work and inflate every gauge
-# by the worker count. We elect one leader per backend by racing for a TTL-
-# scoped key inside the shared StateBackend: the winner runs cleanup +
-# publishes metrics, the others stay quiet.
-
-LEADER_KEY = 'cleanup_leader'  # actual backend key: '<key_prefix>cleanup_leader'
-LEASE_TTL = 30  # seconds — leader loses the lease after this without a renew
-LEASE_RENEW = 10  # seconds — must be < LEASE_TTL/2 so two missed renews still beat the TTL
 _PROCESSOR_QUOTA_PREFIX = 'processor_quota::'
 
 
@@ -104,13 +92,6 @@ def _sweep_processor_transform(existing: Any, *, now: float) -> dict[str, dict[s
     return _clean_processor_reservations(existing, now=now)
 
 
-def _renew_if_owner(current: str | None, *, owner: str) -> str | None:
-    """``update_atomic`` transform: only re-write the lease if it is still mine."""
-    if current == owner:
-        return owner
-    return None
-
-
 class ServerState:
     """Unified server state management class.
 
@@ -123,9 +104,17 @@ class ServerState:
     - :class:`ConfigManager` — key-value configuration
 
     Each Ray Serve worker owns one process-local instance, bound directly to a
-    shared :class:`StateBackend`. The cleanup loop is started from the
-    deployment's FastAPI ``lifespan`` startup hook and only runs in the worker
-    that wins the cleanup-leader lease — see :meth:`_leader_loop`.
+    shared :class:`StateBackend`.
+
+    Cleanup start-up: NOT from FastAPI lifespan startup. Ray Serve binds
+    ``servable_object`` *after* lifespan startup, so ``start_cleanup_task()`` is
+    lazy-started on the first request by
+    ``deployment.LazyCleanupMixin._ensure_state_cleanup_started`` (the reason is
+    spelled out in ``build_deployment_app``'s lifespan comment). Cleanup
+    orchestration and cleanup-leader election live in
+    :class:`ResourceCleanupCoordinator`; resource-count publishing lives in
+    :class:`ResourceCountPublisher`. ``start_cleanup_task`` is idempotent, which is
+    what makes per-request invocation safe.
     """
 
     def __init__(
@@ -148,20 +137,41 @@ class ServerState:
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
-        self._cleanup_task: asyncio.Task | None = None
-        self._cleanup_running = False
 
-        # Leader election + metrics-publish loop state. ``metrics_update_interval``
-        # is a typed parameter (a misspelled key now fails loudly rather than
-        # being silently ignored); it controls how often the leader pushes counts
-        # into the MetricsRegistry cache.
-        self._leader_id = uuid.uuid4().hex
-        self._is_leader = False
-        self._leader_task: asyncio.Task | None = None
-        self._leader_running = False
-        self._metrics_publish_task: asyncio.Task | None = None
-        self._metrics_publish_running = False
-        self._metrics_update_interval: float = float(metrics_update_interval)
+        # Cleanup orchestration, leader election and resource-count publishing are
+        # delegated. ``metrics_update_interval`` controls how often the leader pushes
+        # counts into the MetricsRegistry cache. ``on_become_leader`` /
+        # ``on_lose_leader`` wire leader identity to the publisher's lifecycle so only
+        # the leader publishes, while keeping the coordinator itself free
+        # of any telemetry dependency.
+        _managers = {
+            'sessions': self._session_mgr,
+            'models': self._model_mgr,
+            'sampling_sessions': self._sampling_mgr,
+            'futures': self._future_mgr,
+        }
+        self._count_publisher = ResourceCountPublisher(
+            [
+                ('active_sessions', self._session_mgr),
+                ('active_models', self._model_mgr),
+                ('active_sampling_sessions', self._sampling_mgr),
+                ('active_futures', self._future_mgr),
+            ],
+            interval=float(metrics_update_interval),
+        )
+        self._cleanup = ResourceCleanupCoordinator(
+            self._backend,
+            _managers,
+            cleanup_interval=cleanup_interval,
+            expiration_timeout=expiration_timeout,
+            sweep_processor_quotas=self.sweep_processor_quotas,
+            on_become_leader=self._count_publisher.start,
+            on_lose_leader=self._on_lose_leader,
+        )
+
+    async def _on_lose_leader(self) -> None:
+        await self._count_publisher.stop()
+        self._count_publisher.clear()
 
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
@@ -337,8 +347,7 @@ class ServerState:
             ttl=self._processor_quota_ttl(lease_seconds),
         )
         if not isinstance(reservations, dict) or processor_id not in reservations:
-            raise ResourceQuotaExceededError(
-                f'Per-user processor quota ({limit}) reached for token {token[:8]}...')
+            raise ResourceQuotaExceededError(f'Per-user processor quota ({limit}) reached for token {token[:8]}...')
 
     async def renew_processor_quota(
         self,
@@ -528,227 +537,46 @@ class ServerState:
     async def cleanup_expired_resources(self) -> dict[str, int]:
         """Clean up expired sessions, models, sampling_sessions, and futures.
 
-        Sessions expire based on last_heartbeat (or created_at).  Models and
-        sampling sessions are also cascade-expired when their owning session
-        expires.  Futures expire based on updated_at (or created_at).
-
-        Returns:
-            Dict with counts of cleaned up resources by type.
+        Delegates to :class:`ResourceCleanupCoordinator`.
         """
-        current_time = time.time()
-        cutoff_time = current_time - self.expiration_timeout
-
-        # Determine expired sessions and remove them in a SINGLE pass, then
-        # cascade the SAME set to dependent resources. Using one authoritative
-        # set (rather than a separate expiry scan followed by a second scan in
-        # cleanup) closes the TOCTOU window where a session touched mid-cleanup
-        # could survive removal while its children were cascade-deleted.
-        expired_session_ids, sessions_removed = await self._session_mgr.collect_and_remove_expired(cutoff_time)
-
-        models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
-        samplings_removed = await self._sampling_mgr.cleanup_expired(
-            cutoff_time, expired_session_ids=expired_session_ids)
-
-        alive_replica_ids = await self._model_mgr.get_alive_replica_ids(self.expiration_timeout)
-        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time, alive_replica_ids=alive_replica_ids)
-        await self.sweep_processor_quotas()
-
-        return {
-            'sessions': sessions_removed,
-            'models': models_removed,
-            'sampling_sessions': samplings_removed,
-            'futures': futures_removed,
-        }
+        return await self._cleanup.cleanup_expired_resources()
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:
         """Refresh a replica's liveness timestamp in the shared registry."""
         await self._model_mgr.touch_replica_last_seen(replica_id)
 
-    async def _cleanup_loop(self) -> None:
-        """Background task that periodically cleans up expired resources.
+    # ----- Cleanup + leader election (delegated to ResourceCleanupCoordinator) -----
 
-        Gated by leader election — non-leader workers skip the actual cleanup
-        so the same backend isn't swept 4× by 4 deployment workers.
-        """
-        while self._cleanup_running:
-            try:
-                await asyncio.sleep(self.cleanup_interval)
-                if not self._is_leader:
-                    continue
-                stats = await self.cleanup_expired_resources()
-                if any(stats.values()):
-                    logger.debug(f'[ServerState Cleanup] Removed expired resources: {stats}')
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f'[ServerState Cleanup] Error during cleanup: {e}')
-                continue
+    @property
+    def _is_leader(self) -> bool:
+        return self._cleanup._is_leader
 
-    # ----- Leader election + metrics publish -----
-
-    async def _leader_loop(self) -> None:
-        """Acquire and renew the cleanup-leader lease every LEASE_RENEW seconds."""
-        await self._try_acquire_or_renew()  # Race for leadership at startup
-        while self._leader_running:
-            try:
-                await asyncio.sleep(LEASE_RENEW)
-                await self._try_acquire_or_renew()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f'[ServerState Leader] renew error: {e}')
-                continue
+    @property
+    def _leader_id(self) -> str:
+        return self._cleanup._leader_id
 
     async def _try_acquire_or_renew(self) -> None:
-        was_leader = self._is_leader
-        try:
-            if self._is_leader:
-                val = await self._backend.update_atomic(
-                    LEADER_KEY,
-                    functools.partial(_renew_if_owner, owner=self._leader_id),
-                    ttl=LEASE_TTL,
-                )
-                self._is_leader = (val == self._leader_id)
-            else:
-                self._is_leader = await self._backend.set_nx(LEADER_KEY, self._leader_id, ttl=LEASE_TTL)
-        except Exception as e:
-            logger.warning(f'[ServerState Leader] backend error during election: {e}')
-            self._is_leader = False
-            if was_leader:
-                # Our renewal failed but our lease value may still be sitting in
-                # the backend, so a plain ``set_nx`` would keep returning False
-                # for up to LEASE_TTL and leadership would stall unclaimed.
-                # Best-effort delete ONLY when we were the leader (never steal a
-                # lease another replica legitimately holds), swallowing errors so
-                # a delete failure cannot escape the election loop. The next tick
-                # can then re-acquire immediately.
-                try:
-                    await self._backend.delete(LEADER_KEY)
-                except Exception:
-                    pass
-
-        if self._is_leader and not was_leader:
-            await self._on_become_leader()
-        elif not self._is_leader and was_leader:
-            await self._on_lose_leader()
-
-    async def _on_become_leader(self) -> None:
-        logger.info(f'[ServerState] became cleanup leader (id={self._leader_id[:8]})')
-        # Start pushing resource counts so the four ObservableGauges in the
-        # MetricsRegistry have a single source of truth across deployments.
-        if self._metrics_publish_task is None or self._metrics_publish_task.done():
-            self._metrics_publish_running = True
-            self._metrics_publish_task = asyncio.create_task(self._metrics_publish_loop())
-
-    async def _on_lose_leader(self) -> None:
-        logger.warning(f'[ServerState] lost cleanup leadership (id={self._leader_id[:8]})')
-        self._metrics_publish_running = False
-        if self._metrics_publish_task is not None:
-            self._metrics_publish_task.cancel()
-            try:
-                await self._metrics_publish_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._metrics_publish_task = None
-        # Clear this worker's resource-gauge cache after cancelling the publish
-        # task. Across replicas the old leader's MetricsRegistry cache lives in
-        # a different process, and after handover its publish loop is cancelled
-        # and never overwrites the cache again — so without this zeroing the
-        # stale worker would keep emitting its last counts forever. The new
-        # leader publishes the authoritative counts from its own process.
-        MetricsRegistry.get().clear_resource_counts()
-
-    async def _metrics_publish_loop(self) -> None:
-        """Push resource counts into the MetricsRegistry cache every N seconds.
-
-        Only runs while this ``ServerState`` holds the cleanup-leader lease.
-        The ObservableGauges registered by :class:`MetricsRegistry` read the
-        cache at OTEL export time and report whatever was pushed last.
-        """
-        registry = MetricsRegistry.get()
-        sources = (
-            ('active_sessions', self._session_mgr),
-            ('active_models', self._model_mgr),
-            ('active_sampling_sessions', self._sampling_mgr),
-            ('active_futures', self._future_mgr),
-        )
-        while self._metrics_publish_running:
-            try:
-                await asyncio.sleep(self._metrics_update_interval)
-                if not self._is_leader:
-                    continue
-                for name, mgr in sources:
-                    registry.set_resource_count(name, await mgr.count())
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.debug(f'[ServerState] Error publishing metrics: {e}')
-                continue
+        await self._cleanup._try_acquire_or_renew()
 
     async def start_cleanup_task(self) -> bool:
         """Start the background cleanup + leader-election tasks.
 
-        Returns:
-            True if tasks were started, False if already running.
+        Returns True if tasks were started, False if already running. The
+        idempotency guard lives inside the coordinator's ``start`` so a
+        per-request lazy invocation cannot double-start.
         """
-        if self._cleanup_running:
-            return False
-        # Rebuild in-memory indexes from backend data
-        await self._rebuild_indexes()
-        self._cleanup_running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._leader_running = True
-        self._leader_task = asyncio.create_task(self._leader_loop())
-        return True
-
-    async def _rebuild_indexes(self) -> None:
-        """Rebuild in-memory indexes from backend data after startup."""
-        # Rebuild model indexes
-        await self._model_mgr.rebuild_indexes()
+        return await self._cleanup.start()
 
     async def stop_cleanup_task(self) -> bool:
         """Stop the background cleanup + leader-election tasks.
 
-        Returns:
-            True if tasks were stopped, False if not running.
+        Returns True if tasks were stopped, False if not running.
         """
-        if not self._cleanup_running:
-            return False
-        self._cleanup_running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            self._cleanup_task = None
-        self._leader_running = False
-        if self._leader_task:
-            self._leader_task.cancel()
-            self._leader_task = None
-        if self._is_leader:
-            # Release callback registration; the lease itself expires on its own
-            # TTL — update_atomic can't express "atomic delete", so we accept a
-            # short outage where the gauge reads 0 between leaders.
-            await self._on_lose_leader()
-            self._is_leader = False
-        return True
+        return await self._cleanup.stop()
 
     async def get_cleanup_stats(self) -> dict[str, Any]:
-        """Get current cleanup configuration and resource counts.
-
-        Returns:
-            Dict with cleanup configuration and task status.
-        """
-        return {
-            'expiration_timeout': self.expiration_timeout,
-            'cleanup_interval': self.cleanup_interval,
-            'cleanup_running': self._cleanup_running,
-            'is_leader': self._is_leader,
-            'leader_id': self._leader_id,
-            'resource_counts': {
-                'sessions': await self._session_mgr.count(),
-                'models': await self._model_mgr.count(),
-                'sampling_sessions': await self._sampling_mgr.count(),
-                'futures': await self._future_mgr.count(),
-            },
-        }
+        """Get current cleanup configuration and resource counts."""
+        return await self._cleanup.get_cleanup_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -758,9 +586,9 @@ class ServerState:
 # Each Ray Serve worker binds one ``ServerState`` instance to the shared
 # ``StateBackend`` for the lifetime of the process — the cleanup loop and
 # leader-election loop are started exactly once per worker (see
-# ``start_cleanup_task``). Callers use ``actor_name`` as the cache key purely
-# for per-process deduplication; cross-worker coordination happens inside the
-# shared backend, not in this dict.
+# ``start_cleanup_task``). Callers use ``cache_key`` purely for per-process
+# deduplication; cross-worker coordination happens inside the shared backend,
+# not in this dict.
 
 _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 
@@ -772,7 +600,7 @@ _DEFAULT_PER_TOKEN_MODEL_LIMIT = 30
 _DEFAULT_METRICS_UPDATE_INTERVAL = 15.0
 
 
-def get_server_state(actor_name: str = 'twinkle_server_state',
+def get_server_state(cache_key: str = 'twinkle_server_state',
                      backend: StateBackend | None = None,
                      persistence_config: PersistenceConfig | None = None,
                      expiration_timeout: float | None = None,
@@ -781,14 +609,15 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
                      metrics_update_interval: float | None = None) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
-    Within one process the same ``actor_name`` returns the same cached instance
+    Within one process the same ``cache_key`` returns the same cached instance
     so repeated callers share one ``ServerState`` and the cleanup loop is
     started exactly once. Cross-worker consistency comes from the shared
     :class:`StateBackend` rather than from any singleton in this process.
 
     Args:
-        actor_name: Cache key for the per-process ``ServerState`` instance.
-            The legacy parameter name is kept for call-site compatibility.
+        cache_key: Cache key for the per-process ``ServerState`` instance.
+            (Formerly ``actor_name``; the parameter never carried actor
+            semantics.)
         backend: Optional :class:`StateBackend` to inject. When ``None`` a
             backend is built from ``persistence_config`` (or env vars) via
             :func:`create_backend`.
@@ -805,7 +634,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     if backend is None and persistence_config is None:
         persistence_config = PersistenceConfig.from_env()
 
-    cached = _PROCESS_STATE_CACHE.get(actor_name)
+    cached = _PROCESS_STATE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -839,7 +668,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
         per_token_model_limit=per_token_model_limit,
         metrics_update_interval=metrics_update_interval,
     )
-    _PROCESS_STATE_CACHE[actor_name] = state
+    _PROCESS_STATE_CACHE[cache_key] = state
     logger.info(
         'ServerState policy in effect: per_token_model_limit=%s expiration_timeout=%s '
         'cleanup_interval=%s metrics_update_interval=%s (resolution: explicit>env>default)', per_token_model_limit,

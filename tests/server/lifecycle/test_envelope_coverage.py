@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Task_Envelope coverage check (T5.4 / R5#7, R5#2/#3).
+"""Task_Envelope coverage check.
 
 Walks the model and sampler route tables and asserts that every twinkle-native
 POST route that enters the Task_Queue declares ``response_model = TaskEnvelope``.
@@ -13,7 +13,7 @@ from fastapi.routing import APIRoute
 from tests.server.contract.client_api_harness import build_model_app, build_sampler_app
 from twinkle_client.types.lifecycle import TaskEnvelope
 
-# The single exemption declaration (R5#7), keyed BY APP. A flat path set would be wrong:
+# The single exemption declaration, keyed BY APP. A flat path set would be wrong:
 # ``/twinkle/set_template`` and ``/twinkle/apply_patch`` exist on both apps, but only the
 # sampler's bypass the queue -- the model's are queued and must return a Task_Envelope.
 # Sharing one set silently exempted the model's two and left a hole in this guard.
@@ -29,7 +29,7 @@ _EXEMPT_BY_APP = {
         '/twinkle/add_adapter_to_sampler',
         '/twinkle/apply_patch',
         '/twinkle/unload_adapter_paths',
-        # the one streaming exception (R5#2)
+        # the one streaming exception
         '/twinkle/sample_stream',
     },
 }

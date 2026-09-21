@@ -33,9 +33,8 @@ TIMEOUT = EXECUTION_TIMEOUT + 15
 ADAPTER_NAME = 'loud-failure-test'
 # The `global_rank=` attribution is added by `nccl_safe_megatron`, which decorates
 # only the Megatron backend; the transformers backend's forward_backward carries no
-# such annotation (its former silent-degradation decorator was removed by R6#3). Gate the
-# rank-attribution assertion on the backend so this file is safe to run under the
-# integration-e2e SKILL's TWINKLE_TEST_BACKEND=transformers path.
+# such annotation. Gate the rank-attribution assertion on the backend so this file is
+# safe to run under the integration-e2e SKILL's TWINKLE_TEST_BACKEND=transformers path.
 BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'megatron')
 
 
@@ -83,7 +82,7 @@ def test_failure_is_terminal_then_valid_request_succeeds():
 
     Replaces the former assertion "failure degraded to zero loss and training
     continued". If the recovery request does not reach a terminal success, that is
-    recorded as evidence that R3#2-3 actor recovery and R2#3-4 admission gate are
+    recorded as evidence that actor recovery and admission gate are
     necessary, not optional.
     """
     model = _init_client()

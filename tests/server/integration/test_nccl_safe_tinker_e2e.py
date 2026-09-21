@@ -32,9 +32,9 @@ SERVER_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
 EXECUTION_TIMEOUT = float(os.environ.get('TWINKLE_TEST_EXECUTION_TIMEOUT', '30'))
 TIMEOUT = EXECUTION_TIMEOUT + 15
 # The `global_rank=` attribution is added by `nccl_safe_megatron`, which decorates
-# only the Megatron backend; the transformers backend carries no such annotation
-# (its former silent-degradation decorator was removed by R6#3). Gate the rank-attribution assertion
-# on the backend so this file is safe under TWINKLE_TEST_BACKEND=transformers.
+# only the Megatron backend; the transformers backend carries no such annotation.
+# Gate the rank-attribution assertion on the backend so this file is safe under
+# TWINKLE_TEST_BACKEND=transformers.
 BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'megatron')
 
 
@@ -90,7 +90,7 @@ def test_failure_is_terminal_then_valid_request_succeeds():
 
     Replaces the former assertion "failure degraded to zero loss and training
     continued". If the recovery request does not reach a terminal success, that is
-    recorded as evidence that R3#2-3 actor recovery and R2#3-4 admission gate are
+    recorded as evidence that actor recovery and admission gate are
     necessary, not optional.
     """
     from tinker import types
@@ -106,7 +106,7 @@ def test_failure_is_terminal_then_valid_request_succeeds():
     assert time.time() - start < TIMEOUT, 'malformed request must fail fast, not hang (NCCL)'
 
     # Megatron must recover successfully. Tinker's Transformers path executes
-    # forward/loss/backward separately; after a mid-iteration failure, R6#14 only
+    # forward/loss/backward separately; after a mid-iteration failure, the test only
     # guarantees that the next request reaches a terminal state.
     _assert_recovery_terminal(tc)
 
@@ -123,7 +123,7 @@ def test_partial_rank_failure_is_terminal_then_recovers():
         tc.forward_backward(batch, 'importance_sampling').result(timeout=TIMEOUT)
     assert caught.value.category is types.RequestErrorCategory.Server
     # Megatron attributes the failure to a global rank via nccl_safe_megatron; the
-    # transformers backend has no such annotation (R6#3 removed its old decorator).
+    # transformers backend has no such annotation ( removed its old decorator).
     if BACKEND == 'megatron':
         assert 'global_rank=' in str(caught.value)
     assert time.time() - start < TIMEOUT

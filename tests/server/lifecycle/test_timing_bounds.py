@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Timing guards for the lifecycle constants.
 
-- Property 2 (R1#6): a single Submit_Endpoint's server-side duration is bounded by the
+- a single Submit_Endpoint's server-side duration is bounded by the
   Inline_Fast_Path window + 1s and is INDEPENDENT of how long the task itself runs. This
   is the spec's core benefit claim and was previously the only property with no automated
   guard.
-- R2#4 / R2#6 / D4: the retrieve poll interval is a single shared declaration, is strictly
+- The retrieve poll interval is a single shared declaration, is strictly
   inside the Long_Poll_Window, and is deliberately FIXED (see the measurement recorded in
   ``poll_config`` and in the test below).
 """
@@ -21,8 +21,8 @@ ray = pytest.importorskip('ray')
 
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval  # noqa: E402
 from twinkle.server.state import ServerState                              # noqa: E402
-from twinkle.server.utils.task_queue.config import TaskQueueConfig        # noqa: E402
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin          # noqa: E402
+from twinkle.server.task_queue.config import TaskQueueConfig        # noqa: E402
+from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 
 _WINDOW = 0.05
 
@@ -37,7 +37,7 @@ class _Harness(TaskQueueMixin):
 
 @pytest.mark.asyncio
 async def test_submit_duration_is_bounded_and_task_duration_independent():
-    """Property 2: submit returns on the window, not on task completion."""
+    """Submit returns on the window, not on task completion."""
     h = _Harness()
 
     async def fast():
@@ -58,7 +58,7 @@ async def test_submit_duration_is_bounded_and_task_duration_independent():
         env = await h.submit_and_peek(lambda: slow(), task_type='forward_backward')
         elapsed = time.monotonic() - started
 
-        # Bounded by the window + 1s even though the task needs 5s (R1#6).
+        # Bounded by the window + 1s even though the task needs 5s.
         assert elapsed < _WINDOW + 1.0, f'submit took {elapsed:.3f}s, expected < {_WINDOW + 1.0}s'
         # 5s task cannot have finished, so the envelope must be non-terminal.
         assert env.status not in ('completed', 'failed', 'cancelled'), env.status
@@ -75,7 +75,7 @@ def test_poll_interval_satisfies_the_constant_chain():
 
 
 def test_both_retrieve_endpoints_share_one_interval_declaration():
-    """R2#6: one declaration point, and no endpoint reading os.environ on its own.
+    """One declaration point, and no endpoint reading os.environ on its own.
 
     Also pins the measured decision: a FIXED interval, not exponential backoff. The
     backoff variant was implemented, measured on real PPU hardware, and reverted --
@@ -99,7 +99,7 @@ def test_both_retrieve_endpoints_share_one_interval_declaration():
 
 
 def test_gateway_guard_warns_once_per_value_not_once_per_request(monkeypatch):
-    """D5 guard must be audible but not spam.
+    """The poll-window guard must be audible but not spam.
 
     ``long_poll_window()`` runs on the hot path of both retrieve endpoints, not only at
     startup, so an unguarded warning would repeat on every retrieve request (~2/s during

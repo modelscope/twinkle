@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from twinkle.server.state.models import FutureFailureRecord
-from twinkle.server.utils.task_errors import trim_traceback
+from twinkle.server.task_errors import trim_traceback
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 from twinkle_client.types.lifecycle import TaskEnvelope
 

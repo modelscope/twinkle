@@ -1,5 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Protocol-neutral gateway use cases shared by Tinker and Twinkle adapters."""
+"""Gateway use cases that do real assembly or control flow.
+
+What is *not* here is the point: ``create_session`` / ``touch_session`` were one-line
+forwards to ``state``, so "is it in this file?" told a reader nothing. Now the file holds
+only the long-poll loop and the five checkpoint use cases, which wire up
+``create_*_manager(token, client_type)`` -- i.e. things a handler cannot express in one
+line. The four handlers that call ``self.state`` directly (``get_capacity_info``,
+``cancel_future``, ``get_cleanup_stats``, ``get_model_metadata``) deliberately stay
+direct: wrapping them for symmetry would add forwarding, not structure.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,14 +25,6 @@ _TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
 class FuturePollResult:
     record: dict[str, Any] | None
     timed_out: bool
-
-
-async def create_session(state: Any, metadata: dict[str, Any]) -> str:
-    return await state.create_session(metadata)
-
-
-async def touch_session(state: Any, session_id: str) -> bool:
-    return await state.touch_session(session_id)
 
 
 async def poll_future(state: Any, request_id: str) -> FuturePollResult:

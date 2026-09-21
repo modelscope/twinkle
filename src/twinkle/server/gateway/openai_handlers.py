@@ -24,6 +24,7 @@ import httpx
 
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
+from . import routes
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
 
 logger = get_logger()
@@ -87,7 +88,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             # Non-streaming: proxy to /twinkle/sample, translate response
             response = await self.proxy.proxy_request(
                 request,
-                endpoint='twinkle/sample',
+                endpoint=routes.TWINKLE_SAMPLE,
                 base_model=base_model,
                 service_type='sampler',
                 body_override=body_bytes,
@@ -121,7 +122,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 try:
                     async for line in self.proxy.proxy_request_stream(
                             request,
-                            endpoint='twinkle/sample_stream',
+                            endpoint=routes.TWINKLE_SAMPLE_STREAM,
                             base_model=base_model,
                             service_type='sampler',
                             body_override=body_bytes,
@@ -195,12 +196,12 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
         pass
 
     # Check if it's directly a supported base model
-    if model in gateway._supported_model_names:
+    if model in gateway.supported_model_names:
         return model
 
     # Fallback: if there's exactly one supported model, use it
-    if len(gateway._supported_model_names) == 1:
-        return next(iter(gateway._supported_model_names))
+    if len(gateway.supported_model_names) == 1:
+        return next(iter(gateway.supported_model_names))
 
     return None
 
@@ -211,10 +212,6 @@ def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
     return build_routing_headers(sticky_key, auth)
 
 
-# Per-process cache; each Ray Serve worker holds its own instance.
-_template_initialized: set[str] = set()
-
-
 async def _ensure_template(
     gateway: GatewayServer,
     base_model: str,
@@ -223,10 +220,10 @@ async def _ensure_template(
 ) -> None:
     """Ensure the sampler has a chat template set for encoding Trajectory inputs.
 
-    Called once per base_model (cached in-process). On failure, logs a warning
-    but doesn't block — the sampler will return its own error if needed.
+    Called once per base_model (cached on the ``GatewayServer`` instance). On failure,
+    logs a warning but doesn't block -- the sampler will return its own error if needed.
     """
-    if base_model in _template_initialized:
+    if base_model in gateway._template_initialized:
         return
 
     template_cls = get_template_for_model(base_model)
@@ -239,14 +236,14 @@ async def _ensure_template(
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint='twinkle/set_template',
+            endpoint=routes.TWINKLE_SET_TEMPLATE,
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,
             extra_headers=sticky_headers,
         )
         if resp.status_code == 200:
-            _template_initialized.add(base_model)
+            gateway._template_initialized.add(base_model)
         else:
             logger.warning('set_template failed: %s', resp.body.decode()[:200])
     except Exception as e:

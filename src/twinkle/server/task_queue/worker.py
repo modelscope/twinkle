@@ -29,7 +29,7 @@ from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTas
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
-    from twinkle.server.telemetry.middleware import TaskMetrics
+    from twinkle.server.telemetry.metrics import TaskMetrics
 
 logger = get_logger()
 
@@ -141,6 +141,16 @@ class ComputeWorker:
         """Total number of pending tasks across all per-key queues."""
         return sum(q.qsize() for q in self.task_queues.values())
 
+    def notify_new_task(self) -> None:
+        """Wake the worker loop and refresh the queue-depth gauge.
+
+        Producers (the mixin) call this instead of reaching into the worker's
+        ``new_task_event`` directly; it is also the single write point of the
+        queue-depth gauge, so the gauge has one writer rather than two.
+        """
+        self.new_task_event.set()
+        self._record_queue_depth()
+
     # ------------------------------------------------------------------
     # Metrics helpers
     # ------------------------------------------------------------------
@@ -163,6 +173,12 @@ class ComputeWorker:
                     'task_type': task_type,
                 })
 
+    def _record_queue_depth(self) -> None:
+        """Single writer of the queue-depth gauge."""
+        if self._task_metrics:
+            total_depth = sum(qq.qsize() for qq in self.task_queues.values())
+            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+
     def _record_queue_metrics(self, task_type: str, queue_wait: float) -> None:
         """Observe queue wait time and update current queue depth if metrics are enabled."""
         if self._task_metrics:
@@ -171,8 +187,7 @@ class ComputeWorker:
                     'deployment': self._deployment_name,
                     'task_type': task_type,
                 })
-            total_depth = sum(qq.qsize() for qq in self.task_queues.values())
-            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+        self._record_queue_depth()
 
     # ------------------------------------------------------------------
 
@@ -300,8 +315,7 @@ class ComputeWorker:
             logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
                          f'type={task_type}, queue_key={queue_key}')
             # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server.
-            await self._store_task_failed(
-                task, error, QueueState.ACTIVE.value, reason_code='execution_timeout')
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, reason_code='execution_timeout')
             # Probe actor liveness after a timeout so an operator learns the replica's
             # state without waiting for a second request to also time out.
             if self._on_backend_timeout is not None:
@@ -326,8 +340,7 @@ class ComputeWorker:
             logger.error(f'[ComputeWorker] Task {task.request_id} REFUSED (admission gate held) after '
                          f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
             # Gate held by a leaked timed-out call -> 503/Server.
-            await self._store_task_failed(
-                task, error, QueueState.ACTIVE.value, reason_code='backend_gate_unavailable')
+            await self._store_task_failed(task, error, QueueState.ACTIVE.value, reason_code='backend_gate_unavailable')
         except TwinkleServerError as exc:
             # A typed server error carries its own status + category (e.g.
             # ResourceNotFoundError = 404/User from a deferred

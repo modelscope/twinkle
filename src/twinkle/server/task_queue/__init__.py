@@ -2,7 +2,7 @@
 """
 Task Queue package.
 
-Public exports (backward-compatible with the former task_queue.py module):
+Public exports:
 - TaskStatus      - task lifecycle enum
 - QueueState      - queue state enum for tinker client compatibility
 - TaskQueueConfig - queue and rate-limit configuration dataclass

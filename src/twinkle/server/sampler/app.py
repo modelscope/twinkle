@@ -12,12 +12,14 @@ from ray import serve
 from typing import Any
 
 from twinkle import DeviceGroup
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
-from twinkle.server.utils.auth import get_token_from_request
-from twinkle.server.utils.backend_dispatch import BackendSelector
-from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.utils.logger import get_logger
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
@@ -125,7 +127,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             deployment_name='Sampler',
             collect_width=len(actors) if actors else 1,
         )
-        self.sampler._ray_get_timeout = self._task_queue_config.effective_execution_timeout
+        self.sampler._ray_get_timeout = self.task_queue_config.effective_execution_timeout
 
     async def shutdown(self) -> None:
         try:

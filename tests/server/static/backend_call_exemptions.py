@@ -4,7 +4,7 @@
 This file is the SINGLE source of allowed Blocking_Backend_Call bypasses. It is
 consumed by this spec's check (``test_no_direct_backend_call.py``) and is intended
 to be consumed unchanged by the ``server-request-lifecycle`` spec's equivalent
-check -- there must be exactly one physical copy, not one per spec (R2#8).
+check -- there must be exactly one physical copy, not one per spec.
 
 Each entry is ``(module_relpath, function_name)`` where ``module_relpath`` is
 relative to ``src/twinkle/server`` and ``function_name`` is the innermost enclosing
@@ -13,8 +13,8 @@ function of the exempted call.
 The allowed exemptions are:
 
 - the ray ``Queue.get`` inside ``sample_stream``'s ``_stream_queue``: it bridges the
-  sampler actor's process boundary and is bounded by the dedicated double-timeout of
-  R4#10-11 (T5.5), not by ``call_backend``;
+  sampler actor's process boundary and is bounded by a dedicated double-timeout,
+  not by ``call_backend``;
 - the ``<actor>.sample_stream_to_queue.remote(...)`` call inside ``sample_stream``
   itself: streaming generation must keep producing while the HTTP response streams,
   so it cannot use ``call_backend`` as-is and carries its own double timeout. This is

@@ -1,7 +1,7 @@
 import torch
 from tinker import types
 
-from twinkle.server.common.datum import extract_rl_features_for_loss
+from twinkle.server.model.tinker_datum import extract_rl_features_for_loss
 from twinkle.server.model.backends.common import TwinkleCompatModelBase
 
 

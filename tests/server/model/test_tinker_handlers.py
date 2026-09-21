@@ -4,7 +4,7 @@ from starlette.requests import Request
 from tinker import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from twinkle.server.model.tinker_handlers import _register_tinker_routes
+from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
 
 
 class _DummyManagement:
@@ -29,7 +29,7 @@ def _datum():
 async def test_tinker_dpo_forward_backward_requires_per_dp_pairs():
     management = _DummyManagement()
     app = FastAPI()
-    _register_tinker_routes(app, lambda: management)
+    _register_model_tinker_routes(app, lambda: management)
 
     body = types.ForwardBackwardRequest(
         model_id='model1',
@@ -91,7 +91,7 @@ async def test_save_weights_for_sampler_path_mode_returns_path(mock_create_ckpt_
 
     management = _SaveWeightsDummyManagement()
     app = FastAPI()
-    _register_tinker_routes(app, lambda: management)
+    _register_model_tinker_routes(app, lambda: management)
 
     body = types.SaveWeightsForSamplerRequest(
         model_id='model1',
@@ -119,7 +119,7 @@ async def test_save_weights_for_sampler_session_mode_returns_none_path(mock_crea
 
     management = _SaveWeightsDummyManagement()
     app = FastAPI()
-    _register_tinker_routes(app, lambda: management)
+    _register_model_tinker_routes(app, lambda: management)
 
     body = types.SaveWeightsForSamplerRequest(
         model_id='model1',

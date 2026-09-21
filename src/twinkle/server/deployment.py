@@ -31,15 +31,15 @@ import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
 from twinkle.server.exceptions import TwinkleServerError
-from twinkle.server.telemetry.middleware import create_metrics_middleware
+from twinkle.server.middleware.auth import verify_request_token
+from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.auth import verify_request_token
-from twinkle.server.validation.errors import register_validation_error_handler
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
@@ -66,6 +66,68 @@ async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError
         request_id=request_id,
     )
     return JSONResponse(status_code=exc.error_code, content=payload.model_dump(mode='json', exclude_none=True))
+
+
+# A body can produce hundreds of errors (one per element of a mis-typed tensor), and a
+# response listing all of them helps nobody while costing bandwidth on every retry.
+_MAX_VALIDATION_DETAILS = 20
+
+
+def _validation_detail(error: dict[str, Any]) -> dict[str, Any]:
+    """One pydantic error as a JSON-safe detail entry."""
+    location = [str(part) for part in error.get('loc', ())]
+    return {
+        'field': location[-1] if location else '',
+        'path': '.'.join(location),
+        'type': error.get('type', ''),
+        'message': error.get('msg', ''),
+    }
+
+
+def _validation_summary(errors: list[dict[str, Any]]) -> str:
+    fields = []
+    for error in errors:
+        path = '.'.join(str(part) for part in error.get('loc', ()))
+        if path and path not in fields:
+            fields.append(path)
+    shown = ', '.join(fields[:_MAX_VALIDATION_DETAILS]) or 'request body'
+    suffix = '' if len(fields) <= _MAX_VALIDATION_DETAILS else f' (+{len(fields) - _MAX_VALIDATION_DETAILS} more)'
+    return f'Request body validation failed for: {shown}{suffix}'
+
+
+def _validation_mentions_unknown_field(errors: list[dict[str, Any]]) -> bool:
+    return any(error.get('type') == 'extra_forbidden' for error in errors)
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Map a body validation failure to a 422 carrying an ``ErrorPayload``.
+
+    Lives next to ``twinkle_server_error_handler`` because both are the same concern --
+    the wire shape of a failure -- and both are registered by ``build_deployment_app``
+    for all four deployments. It used to sit in ``validation/``, whose ``__init__``
+    docstring admitted the fit was awkward ("another half of the story").
+
+    FastAPI's default handler answers with ``{"detail": [...]}``, a second error shape
+    on the wire; this makes the Model, Sampler and Processor deployments answer
+    identically to every other twinkle failure. The per-field ``details`` name the
+    offending field, its path, and why it was rejected; there is no traceback because a
+    rejected body is the caller's problem, not a crash.
+    """
+    errors = list(exc.errors())
+    message = _validation_summary(errors)
+    if _validation_mentions_unknown_field(errors):
+        # An unknown top-level field is what an older client looks like against a newer
+        # server, so say so instead of leaving the caller to infer it from a field list.
+        message += ('. Unknown fields are rejected; if this worked before, upgrade '
+                    'twinkle-kit on the client to match the server version.')
+    payload = ErrorPayload(
+        error=message[:1024],
+        category=ErrorCategory.User,
+        error_code=422,
+        request_id=getattr(request.state, 'request_id', None) or '',
+        details=[_validation_detail(error) for error in errors[:_MAX_VALIDATION_DETAILS]],
+    )
+    return JSONResponse(status_code=422, content=payload.model_dump(mode='json', exclude_none=True))
 
 
 def get_servable() -> Any:
@@ -151,7 +213,7 @@ def build_deployment_app(
     # Request-body validation failures answer with the same ``ErrorPayload`` shape as
     # every other error, registered here so all deployments behave identically rather
     # than each app keeping (or forgetting) its own copy.
-    register_validation_error_handler(app)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     # Registration order matters: FastAPI runs middleware LIFO, so the LAST
     # registered wraps the outermost layer. Register cleanup (if any) first so
@@ -240,31 +302,6 @@ def bind_deployment(
     return deployment_cls.options(**deploy_options).bind(*bind_args, **(bind_kwargs or {}))
 
 
-def init_twinkle_runtime(
-    is_mock: bool,
-    nproc_per_node: int,
-    device_group: Any,
-    device_mesh_dict: dict[str, Any],
-) -> Any | None:
-    """Initialize the Twinkle distributed runtime and build a DeviceMesh.
-
-    Shared by ModelManagement and SamplerManagement ``__init__``.
-    Returns ``None`` for mock backends (CPU-only, no device mesh).
-    """
-    import twinkle
-    from twinkle import DeviceMesh
-
-    if is_mock:
-        twinkle.initialize(
-            mode='ray', nproc_per_node=nproc_per_node, ncpu_proc_per_node=1, groups=[device_group], lazy_collect=False)
-        return None
-
-    twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[device_group], lazy_collect=False)
-    if 'mesh_dim_names' in device_mesh_dict:
-        return DeviceMesh(**device_mesh_dict)
-    return DeviceMesh.from_sizes(**device_mesh_dict)
-
-
 class LazyCleanupMixin:
     """Single source of the lazy first-request ServerState cleanup-start behavior.
 
@@ -272,13 +309,22 @@ class LazyCleanupMixin:
     ``_ensure_state_cleanup_started`` methods collapse into one. The method name
     is preserved so existing call sites (``_on_request_start``,
     ``_ensure_sticky``, the Gateway cleanup middleware) are unchanged.
+
+    ``_state_cleanup_started`` is declared here with a class-level default so the four
+    deployment classes need no ``__init__`` change and the ``getattr`` fallback can go:
+    only ``GatewayServer`` used to initialise it explicitly, and Model/Sampler/Processor
+    relied on ``getattr``'s default. The first write of ``True`` shadows the
+    class attribute on the instance -- expected, since the class attribute is only a
+    default.
     """
 
+    _state_cleanup_started: bool = False
+
     async def _ensure_state_cleanup_started(self) -> None:
-        if getattr(self, '_state_cleanup_started', False):
+        if self._state_cleanup_started:
             return
         try:
-            # Idempotent via ServerState's own ``_cleanup_running`` guard.
+            # Idempotent via the ResourceCleanupCoordinator's own start guard.
             await self.state.start_cleanup_task()
         except Exception as e:
             logger.warning(f'Failed to start ServerState cleanup task: {e}')

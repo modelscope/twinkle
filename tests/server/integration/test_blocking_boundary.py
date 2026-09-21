@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Blocking_Call_Boundary integration tests (T3.8 / R9#2 / Property 3-4).
+"""Blocking_Call_Boundary integration tests.
 
 These exercise the real ``TaskQueueMixin.call_backend`` through a minimal harness
 that sets only the two attributes it uses (a dedicated executor and the optional
@@ -19,27 +19,34 @@ from fastapi.responses import JSONResponse
 
 ray = pytest.importorskip('ray')
 
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin  # noqa: E402
-from twinkle.server.utils.task_queue.types import BackendBusyError  # noqa: E402
+from twinkle.server.task_queue.backend_gate import BackendGate  # noqa: E402
+from twinkle.server.task_queue.mixin import TaskQueueMixin  # noqa: E402
+from twinkle.server.task_queue.types import BackendBusyError  # noqa: E402
 
 
 class _Harness(TaskQueueMixin):
     """Minimal holder exposing the real call_backend with a chosen gate setting."""
 
     def __init__(self, gate_enabled: bool, *, max_workers: int | None = None) -> None:
-        self._backend_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='twinkle-backend')
-        self._backend_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='twinkle-backend-probe')
-        self._backend_admission = asyncio.Lock() if gate_enabled else None
-        self._backend_poisoned = asyncio.Event()
+        # ``call_backend`` delegates to the extracted ``BackendGate``; build one and
+        # alias its internals so the assertions below still read the same names.
+        self._backend_gate = BackendGate(enable_admission_gate=gate_enabled)
+        if max_workers is not None:
+            self._backend_gate._executor.shutdown(wait=False)
+            self._backend_gate._executor = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix='twinkle-backend')
+        self._backend_executor = self._backend_gate._executor
+        self._backend_probe_executor = self._backend_gate._probe_executor
+        self._backend_admission = self._backend_gate._admission
+        self._backend_poisoned = self._backend_gate._poisoned
 
     def close(self) -> None:
-        self._backend_executor.shutdown(wait=False, cancel_futures=True)
-        self._backend_probe_executor.shutdown(wait=False, cancel_futures=True)
+        self._backend_gate.shutdown()
 
 
 @pytest.mark.asyncio
 async def test_healthz_style_probe_responsive_during_slow_backend():
-    """Property 3: while a slow backend call is in flight, an admit=False probe
+    """While a slow backend call is in flight, an admit=False probe
     (as /healthz uses) returns well within 5 seconds."""
     h = _Harness(gate_enabled=True)
     try:
@@ -116,7 +123,7 @@ async def test_cancelled_queued_backend_call_releases_gate():
 
 @pytest.mark.asyncio
 async def test_gate_held_by_leaked_call_fast_fails_next_task():
-    """Property 4 / R2#4: a call that outlives its wait_for keeps the gate; the next
+    """A call that outlives its wait_for keeps the gate; the next
     admitting call fails fast with BackendBusyError instead of entering the backend."""
     h = _Harness(gate_enabled=True)
     entered = {'count': 0}
@@ -190,7 +197,7 @@ async def test_probe_times_out_while_same_serial_actor_is_busy():
 
 @pytest.mark.asyncio
 async def test_sampler_without_gate_runs_two_calls_concurrently():
-    """R9#2 case 3 / opt-in: with the gate disabled (SamplerManagement), two backend
+    """Case 3 / opt-in: with the gate disabled (SamplerManagement), two backend
     calls are in flight at once rather than serialized."""
     h = _Harness(gate_enabled=False)
     try:

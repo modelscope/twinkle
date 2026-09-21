@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Decision_Boundary tests: preflight rejects with real status codes and zero writes.
 
-Covers Property 3 / R8#3 (a rejected request writes no future record) and the
-TwinkleServerError handler wire shape (R3#5/#6). No Ray or GPU is involved: the
+Covers the case where a rejected request writes no future record, plus the
+TwinkleServerError handler wire shape. No Ray or GPU is involved: the
 task queue is driven with a spy state that counts ``store_future_status`` calls.
 """
 from __future__ import annotations
@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import (BatchSizeError, InputTokensExceededError, RateLimitExceededError,
                                        RequestRejectedError, TwinkleServerError)
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin
+from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.mixin import TaskQueueMixin
 
 
 class _SpyState:
@@ -45,7 +45,7 @@ async def _noop():
 
 @pytest.mark.asyncio
 async def test_input_tokens_rejection_is_422_and_zero_writes():
-    """Property 3 / R8#3: an over-limit request raises 422 and writes no record."""
+    """An over-limit request raises 422 and writes no record."""
     h = _Harness(enabled=True, max_input_tokens=10)
     try:
         with pytest.raises(InputTokensExceededError) as exc:
@@ -88,7 +88,7 @@ async def test_rate_limit_rejection_is_429_and_zero_writes():
 
 @pytest.mark.asyncio
 async def test_disabled_queue_skips_preflight():
-    """The 'no token or queue disabled' short circuit is preserved (R3#3)."""
+    """The 'no token or queue disabled' short circuit is preserved."""
     h = _Harness(enabled=False, max_input_tokens=10)
     try:
         ref = await h.schedule_task(lambda: _noop(), model_id='m', token='tok', input_tokens=999, task_type='forward')
@@ -98,7 +98,7 @@ async def test_disabled_queue_skips_preflight():
 
 
 def test_error_handler_puts_fields_at_top_level():
-    """R3#5/#6: the handler returns error_code as the status and fields at top level."""
+    """The handler returns error_code as the status and fields at top level."""
     app = FastAPI()
     app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
 

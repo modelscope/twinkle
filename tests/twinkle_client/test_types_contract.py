@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Contract-base consistency and naming-disambiguation tests.
 
-- T6.2 / R7#9: ``QueueStateLiteral`` value set equals the server ``QueueState`` enum.
-- T6.3 / R7#7: naming disambiguation guard.
+- ``QueueStateLiteral`` value set equals the server ``QueueState`` enum.
+- naming disambiguation guard.
 
 The two SDKs already share public names. The contract freezes that legacy set and
 rejects new collisions while requiring explicit aliases when both SDKs are imported
@@ -15,7 +15,7 @@ import pathlib
 import typing
 
 import twinkle
-from twinkle.server.utils.task_queue.types import QueueState
+from twinkle.server.task_queue.types import QueueState
 from twinkle_client.types.errors import QueueStateLiteral
 from twinkle_client.types.server import GetServerCapabilitiesResponse
 

@@ -138,4 +138,4 @@ def get_runtime_env_for_patches() -> dict:
     Returns:
         dict: Ray runtime_env configuration
     """
-    return {'worker_process_setup_hook': ('twinkle.server.utils.ray_serve_patch._apply_patch_in_worker_process')}
+    return {'worker_process_setup_hook': ('twinkle.patch.ray_serve._apply_patch_in_worker_process')}

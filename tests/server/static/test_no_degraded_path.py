@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Static check: no silent-degradation symbols remain (T7.8 / R6#6 / R9#4 / Property 9).
+"""Static check: no silent-degradation symbols remain.
 
 One wildcard search covering eight symbols; each must occur zero times in its scope.
 The symbols are matched as identifiers (word boundaries) so that ``nccl_safe_megatron``

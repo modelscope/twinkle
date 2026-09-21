@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Tinker-compatible sampler handler mixin.
+"""Tinker-compatible routes for the Sampler deployment.
 
-Provides POST /tinker/asample using schedule_task() returning UntypedAPIFuture.
+Registered by ``_register_tinker_sampler_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. Provides POST /tinker/asample using
+schedule_task() returning UntypedAPIFuture.
 """
 from __future__ import annotations
 
@@ -19,8 +21,8 @@ if TYPE_CHECKING:
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.utils import get_template_for_model
-from twinkle.server.utils.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

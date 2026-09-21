@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for the Sync_Dispatch_Path time bound (spec T1.6 / R9#1).
+"""Unit tests for the Sync_Dispatch_Path time bound.
 
 These exercise only ``twinkle.infra`` against a plain sleeping Ray actor. They
 depend on neither GPU, Megatron, nor any ``src/twinkle/server/**`` component.
@@ -54,7 +54,7 @@ def _make_driver():
 
 
 def test_execute_all_sync_times_out(_ray_and_ray_mode):
-    """R9#1: execute_all_sync(timeout=) raises when the remote does not return in time."""
+    """``execute_all_sync(timeout=)`` raises when the remote does not return in time."""
     actor = _Sleeper.remote()
     workers_and_args = [(actor, [3.0], {})]
     with pytest.raises(ray.exceptions.GetTimeoutError):
@@ -125,7 +125,7 @@ def test_continuous_work_timeout_zero_is_not_treated_as_falsy():
 
 
 def test_decorator_timeout_zero_is_not_treated_as_falsy():
-    """timeout=0 means 'time out immediately', not 'fall back to unbounded'."""
+    """Timeout=0 means 'time out immediately', not 'fall back to unbounded'."""
 
     def slow(self, seconds):
         return seconds

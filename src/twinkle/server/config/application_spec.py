@@ -15,7 +15,7 @@ import os
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any
 # Ray worker (model / sampler / processor), not just the gateway, applies the

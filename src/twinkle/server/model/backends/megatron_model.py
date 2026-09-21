@@ -16,9 +16,9 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model.megatron import MegatronModel, MultiLoraMegatronModel
-from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.utils.nccl_safe import nccl_safe_megatron
 
 
@@ -102,18 +102,16 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         return clean_metrics(metric)
 
     @remote_function(dispatch='all', sync=True, timeout=3600)
-    def tinker_load(self, checkpoint_dir: str, **kwargs):
-        """Load checkpoint with token-based isolation support."""
-        token = kwargs.pop('token', None)
-        if not token:
-            raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.checkpoint import create_checkpoint_manager
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-        resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
-        if resolved.is_twinkle_path:
-            return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
-        else:
-            return super().load(name=resolved.checkpoint_name, **kwargs)
+    def tinker_load(self, *, checkpoint_name: str, output_dir: str | None = None, **kwargs):
+        """Load a checkpoint from an already-resolved location.
+
+        Path resolution (token isolation, twinkle-vs-external path shapes) belongs to the
+        handler layer: it is a server storage policy, and this class runs inside a Ray
+        actor as a compute backend.
+        """
+        if output_dir is not None:
+            return super().load(name=checkpoint_name, output_dir=output_dir, **kwargs)
+        return super().load(name=checkpoint_name, **kwargs)
 
     # ------------------------------------------------------------------
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)

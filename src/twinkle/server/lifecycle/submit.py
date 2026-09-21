@@ -2,7 +2,7 @@
 """Submit_Endpoint shell and the named seams every queued handler shares.
 
 The Inline_Fast_Path wait itself (``submit_and_peek``) lives on
-:class:`~twinkle.server.utils.task_queue.mixin.TaskQueueMixin`, since it operates on
+:class:`~twinkle.server.task_queue.mixin.TaskQueueMixin`, since it operates on
 queue state; this module owns the request-shaped pieces around it.
 """
 from __future__ import annotations
@@ -10,14 +10,17 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Coroutine
 from fastapi import Request
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
-from twinkle.server.utils.auth import get_session_id_from_request
+from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
 from twinkle_client.types.base import FieldRole, fields_with_role
 from twinkle_client.types.data import export_batch
 from twinkle_client.types.lifecycle import TaskEnvelope
+
+if TYPE_CHECKING:
+    from twinkle.server.lifecycle.protocols import DataParallelDeployment, QueuedDeployment
 
 # --------------------------------------------------------------------------- #
 # Named seams shared by every queued twinkle-native handler.
@@ -94,7 +97,7 @@ def backend_kwargs(body: Any) -> dict[str, Any]:
     return kwargs
 
 
-def input_metrics(self, body: Any, *, data_parallel: bool = False) -> dict[str, Any]:
+def input_metrics(self: 'DataParallelDeployment', body: Any, *, data_parallel: bool = False) -> dict[str, Any]:
     """Seam C: scheduling metrics (input_tokens, and batch_size/data_world_size).
 
     Reads validated wire models, so no isinstance guards: ``inputs`` is a list and
@@ -118,7 +121,7 @@ def resolve_twinkle_adapter_name(request: Request, adapter_name: str | None) -> 
 
 
 async def run_submit(
-    self,
+    self: 'QueuedDeployment',
     request: Request,
     body: Any,
     *,
@@ -195,7 +198,7 @@ async def run_submit(
     if seq_id is not None:
         session_id = get_session_id_from_request(request) or request.state.request_id
         dedup_key = f'seq::{session_id}::{adapter_name or "-"}::{seq_id}'
-        ttl = int(self._task_queue_config.effective_execution_timeout) + 60
+        ttl = int(self.task_queue_config.effective_execution_timeout) + 60
         prior_request_id = await self.state.claim_seq(dedup_key, request_id, ttl)
         if prior_request_id is not None:
             return await self._peek_terminal(prior_request_id, fallback_status='pending')

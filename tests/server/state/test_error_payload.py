@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.utils.task_errors import task_error_payload
+from twinkle.server.task_errors import task_error_payload
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
 
 
@@ -39,7 +39,7 @@ def test_error_category_matches_tinker_wire_values():
 
 
 def test_tinker_sdk_parses_six_field_like_two_field():
-    """R8#5: tinker's RequestFailedResponse ignores extra fields, so a six-field
+    """Tinker's RequestFailedResponse ignores extra fields, so a six-field
     payload parses equal to a two-field one on the declared fields.
 
     tinker's RequestErrorCategory values are lowercase ('server'), so the payloads

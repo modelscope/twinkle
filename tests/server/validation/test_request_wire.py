@@ -13,7 +13,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from twinkle.server.validation.errors import register_validation_error_handler
+from fastapi.exceptions import RequestValidationError
+
+from twinkle.server.deployment import validation_error_handler
 from twinkle_client.types import model as model_types
 from twinkle_client.types.base import StrictRequest
 
@@ -27,7 +29,7 @@ def client() -> TestClient:
     check did not happen.
     """
     app = FastAPI()
-    register_validation_error_handler(app)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     @app.post('/forward')
     async def forward(body: model_types.ForwardRequest):

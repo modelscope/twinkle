@@ -29,6 +29,7 @@ from enum import StrEnum
 from typing import Any, Optional
 
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
+from twinkle.utils.logger import get_logger
 from twinkle_client.types.base import FieldRole, fields_with_role, read_backend_only
 
 
@@ -64,6 +65,14 @@ def resolve_backend(service: Any) -> str | None:
     sampler deployment has no ``backend`` at all.
     """
     backend = getattr(service, 'backend', None)
+    if backend is None:
+        # Not an error: Sampler deployments have no ``backend`` attribute at all. But a
+        # silent ``None`` meant the whole backend-compat preflight vanished with no
+        # trace, so the skip is now observable. ``debug`` not ``warning``:
+        # for Sampler the skip is normal and happens every request.
+        get_logger().debug('backend-compat preflight skipped: %s exposes no ``backend`` attribute',
+                           type(service).__name__)
+        return None
     return backend if isinstance(backend, str) else None
 
 

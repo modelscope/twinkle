@@ -5,7 +5,7 @@ import ast
 import asyncio
 from pathlib import Path
 
-from twinkle.server.gateway import services
+from twinkle.server.gateway import use_cases as services
 
 
 class _State:
@@ -59,8 +59,8 @@ def _parity_client(monkeypatch, canonical_record):
     app = FastAPI()
     monkeypatch.setattr(tinker_handlers, 'poll_future', _fixed_poll)
     monkeypatch.setattr(twinkle_handlers, 'poll_future', _fixed_poll)
-    tinker_handlers._register_tinker_routes(app, lambda: _FakeGateway())
-    twinkle_handlers._register_twinkle_routes(app, lambda: _FakeGateway())
+    tinker_handlers._register_gateway_tinker_routes(app, lambda: _FakeGateway())
+    twinkle_handlers._register_gateway_twinkle_routes(app, lambda: _FakeGateway())
     return TestClient(app)
 
 

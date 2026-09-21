@@ -2,7 +2,7 @@
 """
 Tinker-compatible gateway handlers.
 
-All endpoints are prefixed /* and registered via _register_tinker_routes(app, self_fn).
+All endpoints are prefixed /* and registered via _register_gateway_tinker_routes(app, self_fn).
 self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at request time.
 """
 from __future__ import annotations
@@ -17,14 +17,13 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.server.state.models import FutureFailureRecord
-from twinkle.server.utils.auth import get_token_from_request
-from twinkle.server.utils.task_errors import trim_traceback
+from twinkle.server.task_errors import trim_traceback
 from twinkle.utils.logger import get_logger
-from .services import create_session as create_session_use_case
-from .services import delete_checkpoint
-from .services import get_training_run as get_training_run_use_case
-from .services import get_weights_info, list_checkpoints, list_training_runs, poll_future, touch_session
+from .use_cases import delete_checkpoint
+from .use_cases import get_training_run as get_training_run_use_case
+from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
 logger = get_logger()
 
@@ -66,7 +65,7 @@ def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any
     return payload
 
 
-def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
+def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register all /* Tinker routes on the given FastAPI app.
 
     self_fn is a zero-argument callable that returns the current GatewayServer
@@ -97,14 +96,14 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             body: types.CreateSessionRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
-        session_id = await create_session_use_case(self.state, body.model_dump())
+        session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post('/session_heartbeat')
     async def session_heartbeat(
         request: Request, body: types.SessionHeartbeatRequest, self: GatewayServer = Depends(self_fn)
     ) -> types.SessionHeartbeatResponse:  # noqa: E125
-        alive = await touch_session(self.state, body.session_id)
+        alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise HTTPException(status_code=404, detail='Unknown session')
         return types.SessionHeartbeatResponse()

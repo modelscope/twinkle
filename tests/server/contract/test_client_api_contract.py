@@ -54,8 +54,8 @@ def test_full_surface_extraction_is_self_consistent():
 
 def test_schedule_task_and_wait_removed():
     # server-request-lifecycle (Part 2) deletes the in-process blocking wait: the
-    # future record is now the single delivery channel (Property 1).
-    from twinkle.server.utils.task_queue.mixin import TaskQueueMixin
+    # future record is now the single delivery channel.
+    from twinkle.server.task_queue.mixin import TaskQueueMixin
     assert not hasattr(TaskQueueMixin, 'schedule_task_and_wait')
     assert hasattr(TaskQueueMixin, 'submit_and_peek')
 

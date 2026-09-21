@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""End-to-end proof of the Inline_Fast_Path + Client_Future_Layer seam (T2.3).
+"""End-to-end proof of the Inline_Fast_Path + Client_Future_Layer seam.
 
 A minimal harness drives the *real* ``submit_and_peek`` against a real compute
 worker and a real (memory) ServerState -- no HTTP, no GPU. The resulting envelope
 is round-tripped through model_dump/model_validate (simulating the wire) and fed to
-the real client ``resolve``, so this covers the exact submit -> client path that
-Property 0 protects.
+the real client ``resolve``, so this covers the exact submit -> client path.
 """
 from __future__ import annotations
 
@@ -14,8 +13,8 @@ import pytest
 ray = pytest.importorskip('ray')
 
 from twinkle.server.state import ServerState                              # noqa: E402
-from twinkle.server.utils.task_queue.config import TaskQueueConfig        # noqa: E402
-from twinkle.server.utils.task_queue.mixin import TaskQueueMixin          # noqa: E402
+from twinkle.server.task_queue.config import TaskQueueConfig        # noqa: E402
+from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 from twinkle_client import _future                                        # noqa: E402
 from twinkle_client.exceptions import TaskFailedError                     # noqa: E402
 from twinkle_client.types.lifecycle import TaskEnvelope                   # noqa: E402
@@ -39,7 +38,7 @@ def _across_the_wire(env: TaskEnvelope) -> TaskEnvelope:
 
 @pytest.mark.asyncio
 async def test_window_completed_task_is_single_round_trip(monkeypatch):
-    """R8#1: a task terminal within the window makes the client issue zero retrieves."""
+    """A task terminal within the window makes the client issue zero retrieves."""
     h = _Harness()
 
     async def _ok():
@@ -59,7 +58,7 @@ async def test_window_completed_task_is_single_round_trip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_window_failed_task_surfaces_payload_as_taskfailed(monkeypatch):
-    """R8#2 / Property 0: a failure inside the window reaches the client via the submit
+    """A failure inside the window reaches the client via the submit
     response and is raised as TaskFailedError with its payload intact."""
     h = _Harness()
 

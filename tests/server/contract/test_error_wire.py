@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from tinker.types import RequestFailedResponse
 
-from twinkle.server.gateway.tinker_handlers import _register_tinker_routes
+from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_routes
 
 
 class _State:
@@ -26,7 +26,7 @@ class _Gateway:
 
 def test_retrieve_future_returns_parseable_error_payload():
     app = FastAPI()
-    _register_tinker_routes(app, lambda: _Gateway())
+    _register_gateway_tinker_routes(app, lambda: _Gateway())
 
     response = TestClient(app).post('/retrieve_future', json={'request_id': 'req-1'})
 

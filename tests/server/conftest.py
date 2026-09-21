@@ -13,7 +13,7 @@ of the actor wrapper. To keep tests independent we clear that actor's store
 before each test function. Tests that pin a non-default ``key_prefix`` get
 their own actor; this fixture intentionally leaves those alone.
 
-Evidence boundary (spec T8.4 / R9#10): every mock-model backend method accepts
+Evidence boundary: every mock-model backend method accepts
 ``**kwargs`` without argument validation, and the mock enters no real collective.
 A mock-backed test therefore proves neither request/argument validation nor NCCL
 behavior (asymmetric failure, collective mis-pairing, ReduceScatter, etc.). It may

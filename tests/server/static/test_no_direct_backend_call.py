@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Static check: no direct Blocking_Backend_Call in ``src/twinkle/server/**``.
 
-Spec: T3.7 / R2#7 / R2#8 / Property 2.
-
 Asserts that backend methods are invoked only through ``call_backend``. The check
 covers direct calls, aliases created with ``getattr``, and methods passed to generic
 thread executors. The scan range is the server directory rather than a file list.

@@ -18,9 +18,9 @@ from typing import Any
 
 from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
+from twinkle.patch.ray_serve import apply_ray_serve_patches, get_runtime_env_for_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
-from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 from .builder_registry import get_builders, resolve_builder
 from .env_propagation import build_propagated_env_vars
 

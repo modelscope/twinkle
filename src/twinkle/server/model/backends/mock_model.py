@@ -140,7 +140,7 @@ class TwinkleCompatMockModel:
         return {'loss': 0.5, 'grad_norm': 0.1}
 
     @remote_function()
-    def tinker_load(self, checkpoint_dir: str, **kwargs: Any) -> None:
+    def tinker_load(self, *, checkpoint_name: str, output_dir: str | None = None, **kwargs: Any) -> None:
         return None
 
     # ----- Configuration setters ----------------------------------------- #

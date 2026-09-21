@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
 
 from twinkle.server.exceptions import ConfigParseError
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
 from .telemetry import TelemetryConfig

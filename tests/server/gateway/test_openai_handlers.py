@@ -17,14 +17,6 @@ from twinkle.server.gateway.openai_bridge import translate_response
 # ---------- Fixtures ------------------------------------------------------- #
 
 
-@pytest.fixture(autouse=True)
-def _reset_template_cache():
-    from twinkle.server.gateway.openai_handlers import _template_initialized
-    _template_initialized.clear()
-    yield
-    _template_initialized.clear()
-
-
 @pytest.fixture
 def mock_gateway():
     """Build a minimal FastAPI app with OpenAI routes and a mock GatewayServer."""
@@ -42,7 +34,10 @@ def mock_gateway():
     mock_self.state = mock_state
     mock_self.proxy = mock_proxy
     mock_self.supported_models = [types.SupportedModel(model_name='Qwen/Qwen3.5-4B')]
-    mock_self._supported_model_names = frozenset(['Qwen/Qwen3.5-4B'])
+    mock_self.supported_model_names = frozenset(['Qwen/Qwen3.5-4B'])
+    # Per-instance template cache; a fresh mock per test isolates it, so the
+    # former module-global clear fixture is no longer needed.
+    mock_self._template_initialized = set()
 
     app = FastAPI()
     _register_openai_routes(app, lambda: mock_self)
@@ -125,7 +120,7 @@ class TestChatCompletions:
     def test_model_not_found_returns_404(self, mock_gateway):
         mock_self, app = mock_gateway
         mock_self.supported_models = []  # No supported models
-        mock_self._supported_model_names = frozenset()
+        mock_self.supported_model_names = frozenset()
 
         client = TestClient(app)
         resp = client.post(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from twinkle.tq_utils import rows_to_tq_fields
+from twinkle.data_format import rows_to_tq_fields
 from twinkle_client.common.json_utils import json_safe
 from twinkle_client.types.component import DataRef
 

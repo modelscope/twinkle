@@ -1,9 +1,44 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Small TransferQueue packing helpers shared by both async-RL modes."""
+"""TransferQueue field packing and the field-name schema both async-RL modes share.
+
+Lives in ``data_format/`` because "rows/columns -> TensorDict" is a data-format
+conversion, alongside ``input_feature`` / ``trajectory`` / ``encoding`` / ``message`` /
+``output`` / ``sampling``. It used to sit at the package root as ``twinkle/tq_utils.py``
+-- the only domain module there, unreachable via ``twinkle.<attr>``, under an unexplained
+abbreviation and a ``_utils`` suffix that undersold what it does (it validates field
+consistency and raises).
+
+The field lists moved here from ``twinkle_agentic/async_rl/tq_utils.py``: the schema and
+the packing logic belong in one file, and that shim existed only to re-export this
+module. This deliberately means ``twinkle`` holds the RL training field names
+(``logprobs`` / ``rewards`` / ``advantages`` / ``returns``) while ``twinkle_agentic``
+only consumes them.
+
+``torch`` / ``tensordict`` stay inside the functions: ``tensordict`` arrives with
+``TransferQueue``, which is only in the ``async-rl`` extra, so this module must import
+cleanly without it. Do NOT hoist them.
+"""
 from __future__ import annotations
 
 from numbers import Number
 from typing import Any
+
+TRANSFORMERS_INPUT_FIELDS = (
+    'input_ids',
+    'labels',
+    'attention_mask',
+    'position_ids',
+    'cu_seqlens',
+    'completion_mask',
+    'pixel_values',
+    'image_grid_thw',
+    'video_pixel_values',
+    'video_grid_thw',
+    'input_features',
+    'feature_attention_mask',
+)
+REQUIRED_MODEL_INPUT_FIELDS = ('input_ids', 'labels', 'attention_mask', 'position_ids')
+ROLLOUT_TRAIN_FIELDS = (*TRANSFORMERS_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns')
 
 
 def rows_to_tq_fields(rows: list[dict[str, Any]]):

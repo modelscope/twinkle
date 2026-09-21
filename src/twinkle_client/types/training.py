@@ -3,7 +3,7 @@
 Shared Pydantic models for twinkle training runs and checkpoints.
 
 These types are used both by twinkle_client (as request/response shapes)
-and by twinkle.server.common.io_utils (as persistence models).
+and by twinkle.server.checkpoint.twinkle (as persistence / response models).
 """
 from datetime import datetime
 from pydantic import BaseModel

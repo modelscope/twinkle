@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Wire tests for the twinkle Retrieve_Endpoint (T1.4, Property 4/5, R8#4/#5).
+"""Wire tests for the twinkle Retrieve_Endpoint.
 
 These use a fake state and FastAPI's TestClient; no Ray runtime is needed, so they
 live outside the state-actor fixtures.
@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import TwinkleServerError
-from twinkle.server.gateway.twinkle_handlers import _register_twinkle_routes
+from twinkle.server.gateway.twinkle_handlers import _register_gateway_twinkle_routes
 
 
 class _State:
@@ -35,12 +35,12 @@ class _Gateway:
 def _client(record) -> TestClient:
     app = FastAPI()
     app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
-    _register_twinkle_routes(app, lambda: _Gateway(record))
+    _register_gateway_twinkle_routes(app, lambda: _Gateway(record))
     return TestClient(app)
 
 
 def test_completed_with_null_result_returns_200_and_null(monkeypatch):
-    """Property 4 / R8#4: completed + result=None is 200 with result null, not 500."""
+    """Completed + result=None is 200 with result null, not 500."""
     client = _client({'status': 'completed', 'result': None})
     resp = client.post('/twinkle/retrieve_future', json={'request_id': 'req-1'})
     assert resp.status_code == 200
@@ -71,7 +71,7 @@ def test_domain_failure_returns_200_and_valid_envelope():
 
 
 def test_always_missing_record_404s_only_after_the_full_window(monkeypatch):
-    """R2#5: a request_id that never appears returns 404, and only after waiting a window."""
+    """A request_id that never appears returns 404, and only after waiting a window."""
     monkeypatch.setenv('TWINKLE_LONG_POLL_TIMEOUT', '0.3')
     client = _client(None)
     start = time.monotonic()

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tinker /retrieve_future wire regression (T6.3 / Property 6 / R8#8).
+"""Tinker /retrieve_future wire regression.
 
 The tinker endpoint's response shape and status-code semantics must be unchanged by
 this spec, across all three shapes: ``try_again`` / ``{error, category}`` / bare
@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from twinkle.server.gateway.tinker_handlers import _register_tinker_routes
+from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_routes
 
 
 class _State:
@@ -30,7 +30,7 @@ class _Gateway:
 
 def _client(record):
     app = FastAPI()
-    _register_tinker_routes(app, lambda: _Gateway(record))
+    _register_gateway_tinker_routes(app, lambda: _Gateway(record))
     return TestClient(app)
 
 

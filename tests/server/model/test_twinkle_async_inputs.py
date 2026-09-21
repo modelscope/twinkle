@@ -6,7 +6,7 @@ from starlette.requests import Request
 
 import twinkle_client.types as types
 from twinkle.server.model.data_plane_inputs import model_result_rows
-from twinkle.server.model.twinkle_handlers import _register_twinkle_routes
+from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
 
 
 def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
@@ -86,7 +86,7 @@ class _SchedulingManagement:
 async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -> None:
     management = _SchedulingManagement()
     app = FastAPI()
-    _register_twinkle_routes(app, lambda: management)
+    _register_model_twinkle_routes(app, lambda: management)
     route = next(
         route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane')
     request = Request({'type': 'http', 'headers': []})
@@ -131,7 +131,7 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
         },
     ]
     app = FastAPI()
-    _register_twinkle_routes(app, lambda: management)
+    _register_model_twinkle_routes(app, lambda: management)
     route = next(
         route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane')
     request = Request({'type': 'http', 'headers': []})

@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """State-hygiene tests for FutureManager cleanup and the do-not-regress guard.
 
-Spec: T5.6 / R9#5 / R9#6 / Property 6 / Property 7. Both shipped backends need
-infrastructure (``memory`` starts a detached Ray actor, ``redis`` needs a server),
+Both shipped backends need infrastructure (``memory`` starts a detached Ray actor,
+``redis`` needs a server),
 so these pure ``FutureManager`` semantics run against the dict-backed fake below.
 """
 from __future__ import annotations
@@ -116,7 +116,7 @@ async def test_non_terminal_orphan_is_failed_not_deleted(manager):
     await _store(manager, 'r2', 'running', replica_id='dead-replica')
     await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids={'replica-A'})
     rec = await manager.get('r2')
-    assert rec is not None  # NOT deleted (Property 6)
+    assert rec is not None # NOT deleted
     assert rec.status == 'failed'
     assert rec.result is None
     assert rec.failure.reason_code == 'orphaned_replica'

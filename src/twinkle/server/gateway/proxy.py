@@ -17,6 +17,7 @@ from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
 from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
 from twinkle_client.types.errors import ErrorCategory, ErrorPayload
+from . import routes
 
 logger = get_logger()
 
@@ -58,7 +59,6 @@ class ServiceProxy:
         Returns:
             Complete target URL for the internal service
         """
-        prefix = self.route_prefix.rstrip('/') if self.route_prefix else ''
         host = self.http_options.get('host', 'localhost')
         port = self.http_options.get('port', 8000)
 
@@ -66,7 +66,7 @@ class ServiceProxy:
             host = 'localhost'
 
         base_url = f'http://{host}:{port}'
-        return f'{base_url}{prefix}/{service_type}/{base_model}/{endpoint}'
+        return f'{base_url}{routes.target_url(self.route_prefix, service_type, base_model, endpoint)}'
 
     def _prepare_headers(self, request_headers) -> dict[str, str]:
         """Prepare headers for proxying by removing problematic headers."""
@@ -217,7 +217,7 @@ class ServiceProxy:
             endpoint: The tinker endpoint name (e.g., 'create_model', 'forward')
             base_model: The base model name for routing
         """
-        return await self.proxy_request(request, f'tinker/{endpoint}', base_model, 'model')
+        return await self.proxy_request(request, routes.tinker_endpoint(endpoint), base_model, 'model')
 
     async def proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
         """Proxy request to sampler's tinker endpoint (/tinker/<endpoint>).
@@ -227,4 +227,4 @@ class ServiceProxy:
             endpoint: The tinker endpoint name (e.g., 'asample')
             base_model: The base model name for routing
         """
-        return await self.proxy_request(request, f'tinker/{endpoint}', base_model, 'sampler')
+        return await self.proxy_request(request, routes.tinker_endpoint(endpoint), base_model, 'sampler')

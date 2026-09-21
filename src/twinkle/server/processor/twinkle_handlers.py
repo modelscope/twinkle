@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Processor management handler mixin.
+"""Processor management routes for the Processor deployment.
 
-All endpoints are prefixed /twinkle/... and handle processor lifecycle
-(create, call). self_fn is injected via FastAPI Depends to obtain the
-ProcessorManagement instance at request time.
+Registered by ``_register_processor_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. All endpoints are prefixed
+/twinkle/... and handle processor lifecycle (create, call). ``self_fn`` is injected via
+FastAPI Depends to obtain the ProcessorManagement instance at request time.
 """
 from __future__ import annotations
 
@@ -19,9 +20,9 @@ if TYPE_CHECKING:
     from .app import ProcessorManagement
 
 import twinkle_client.types as types
+from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.auth import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -92,7 +93,8 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
             # Span the primary processor.create op with token + session correlation.
             with traced_operation(
-                    f'processor.create.{processor_type_name}.{class_type}', attrs={
+                    f'processor.create.{processor_type_name}.{class_type}',
+                    attrs={
                         TOKEN_ID: token,
                         SESSION_ID: session_id,
                     }):
@@ -108,8 +110,8 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
                     lease_seconds=self._processor_quota_lease_seconds,
                 )
             except Exception as release_error:
-                logger.warning('Failed to release processor quota after create failure for %s: %r',
-                               processor_id, release_error)
+                logger.warning('Failed to release processor quota after create failure for %s: %r', processor_id,
+                               release_error)
             raise
         return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
 

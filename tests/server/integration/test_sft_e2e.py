@@ -156,7 +156,7 @@ def test_sft_tinker():
     """
     from tinker import types
     from twinkle.dataloader import DataLoader
-    from twinkle.server.common import input_feature_to_datum
+    from twinkle.server.model.tinker_datum import input_feature_to_datum
 
     backend = get_backend()
     log(f'=== test_sft_tinker [backend={backend}] ===')
