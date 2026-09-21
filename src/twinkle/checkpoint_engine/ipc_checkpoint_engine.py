@@ -31,7 +31,8 @@ import torch
 import zmq
 from typing import Any, AsyncGenerator, Generator
 
-from twinkle import get_logger
+from twinkle import Platform, get_logger
+from twinkle.utils.framework import Torch
 from .base import CheckpointEngine
 
 logger = get_logger()
@@ -49,7 +50,7 @@ _ALIGNMENT = 16
 
 
 class IPCCheckpointEngine(CheckpointEngine):
-    """Hand weights to a sampler on the same GPU by mapping memory instead of copying it."""
+    """Hand weights to a sampler on the same device by mapping memory instead of copying it."""
 
     def __init__(self, bucket_size: int = 512 << 20, **kwargs) -> None:
         # Smaller default than the NCCL engine's 3 GB: a bigger bucket buys nothing when the transfer
@@ -65,21 +66,22 @@ class IPCCheckpointEngine(CheckpointEngine):
         self.socket = None
         self._context = None
         self._handle = None
+        self._shm = None
         # Receiver side: the mapping of the sender's buffer, kept across buckets. Re-mapping per
         # bucket is what makes device memory appear to grow during a sync.
         self._mapped: torch.Tensor | None = None
+        self._mapped_shms = []
         self._mapped_signature = None
 
     # ── rendezvous ───────────────────────────────────────────────────────
 
     @staticmethod
     def endpoint() -> str:
-        """The socket both peers derive independently from the GPU they share.
+        """The socket both peers derive independently from the device they share.
 
-        The device's UUID rather than its index: under Ray each role sees its own GPU as index 0, so
-        indices collide across ranks while UUIDs do not.
+        The platform helper obtains the physical device UUID for the current local device.
         """
-        uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+        uuid = str(Platform.get_vllm_device_uuid(Torch.get_current_device()))
         return f'ipc:///tmp/twinkle-colocate-{uuid}.sock'
 
     def prepare(self) -> dict[str, Any]:
@@ -165,9 +167,17 @@ class IPCCheckpointEngine(CheckpointEngine):
             path = self.endpoint().removeprefix('ipc://')
             if os.path.exists(path):
                 os.unlink(path)
+        if self._shm is not None:
+            self.send_buf = None
+            self._shm.close()
+            self._shm.unlink()
+            self._shm = None
         self.send_buf = None
         self._handle = None
         self._mapped = None
+        for shm in self._mapped_shms:
+            shm.close()
+        self._mapped_shms.clear()
         self._mapped_signature = None
         self.rank = None
 
@@ -178,9 +188,29 @@ class IPCCheckpointEngine(CheckpointEngine):
         if self.send_buf is not None and self.send_buf.numel() >= min_size:
             return
         size = max(self.bucket_size, min_size)
-        self.send_buf = torch.empty(size, dtype=torch.uint8, device=torch.cuda.current_device())
+        platform = Platform.get_platform()
+        if platform.device_prefix() == 'npu' and not platform.is_ipc_supported():
+            from multiprocessing import shared_memory
+
+            if self._shm is not None:
+                self.send_buf = None
+                self._shm.close()
+                self._shm.unlink()
+                self._shm = None
+            self._shm = shared_memory.SharedMemory(create=True, size=size)
+            self.send_buf = torch.frombuffer(self._shm.buf, dtype=torch.uint8, count=size)
+            self._handle = {'name': self._shm.name, 'size': size}
+            return
+
+        self.send_buf = torch.empty(
+            size,
+            dtype=torch.uint8,
+            device=f'{platform.device_prefix()}:{Torch.get_current_device()}',
+        )
         # One handle per buffer, reused for every bucket: the buffer is refilled, not reallocated, so
         # the mapping stays valid and the receiver can keep it.
+        if platform.device_prefix() == 'npu':
+            import torch_npu  # noqa: F401
         from torch.multiprocessing.reductions import reduce_tensor
         self._handle = reduce_tensor(self.send_buf)
 
@@ -223,7 +253,7 @@ class IPCCheckpointEngine(CheckpointEngine):
     def _flush(self, bucket_meta: list[dict], is_last: bool) -> None:
         """Publish the filled part of the buffer and wait until the receiver is done with it."""
         # The copies above are non_blocking; without this the receiver could map bytes not yet written.
-        torch.cuda.synchronize()
+        Torch.synchronize()
         self.socket.send(pickle.dumps({'handle': self._handle, 'bucket_meta': bucket_meta, 'is_last': is_last}))
         # The receiver copies out of this buffer, so it must say so before we overwrite it.
         self.socket.recv()
@@ -245,7 +275,7 @@ class IPCCheckpointEngine(CheckpointEngine):
                 yield meta['name'], buffer[start:start + nbytes].view(meta['dtype']).view(meta['shape'])
             # Consumers copy with non_blocking=True, so the acknowledgement has to wait for the copies
             # and not merely for the loop above.
-            torch.cuda.synchronize()
+            Torch.synchronize()
             self.socket.send(b'ack')
             if message['is_last']:
                 break
@@ -259,13 +289,25 @@ class IPCCheckpointEngine(CheckpointEngine):
         signature = self._handle_signature(handle)
         if self._mapped is not None and signature == self._mapped_signature:
             return self._mapped
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+        if isinstance(handle, dict):
+            from multiprocessing import shared_memory
+
+            mapped_shm = shared_memory.SharedMemory(name=handle['name'])
+            self._mapped_shms.append(mapped_shm)
+            self._mapped = torch.frombuffer(
+                mapped_shm.buf,
+                dtype=torch.uint8,
+                count=handle['size'],
+            )
+            self._mapped_signature = signature
+            return self._mapped
+
         func, args = handle
         args = list(args)
-        # Both peers see the shared GPU as their own device 0, but be explicit rather than trust the
-        # index the sender happened to record.
-        args[6] = torch.cuda.current_device()
-        self._mapped = func(*args) if callable(func) else rebuild_cuda_tensor(*args)
+        if Platform.device_prefix() == 'npu':
+            import torch_npu  # noqa: F401
+        args[6] = Torch.get_current_device()
+        self._mapped = func(*args)
         self._mapped_signature = signature
         return self._mapped
 
@@ -276,6 +318,8 @@ class IPCCheckpointEngine(CheckpointEngine):
         Locally implemented rather than shared with the sampler's worker extension, which has the same
         helper: the sampler imports this package, so importing it back would be circular.
         """
+        if isinstance(handle, dict):
+            return tuple(handle.items())
         _, args = handle
         return tuple((type(v).__name__, bytes(v) if isinstance(v, (bytes, bytearray)) else v) for v in args
                      if isinstance(v, (bytes, bytearray, int, float, bool, str)) or v is None)

@@ -51,7 +51,7 @@ class VLLMEngine(BaseSamplerEngine):
     This engine uses vLLM v1's AsyncLLM and supports:
     - Tinker-compatible sample() API with logprobs
     - Multi-tenant LoRA adapters for client-server mode
-    - Weight synchronization via load_weights (colocated) or CUDA IPC
+    - Weight synchronization via load_weights (colocated) or device IPC
     - Sleep/wake_up for GPU memory management in colocated training
 
     Deployment scenarios:
@@ -109,10 +109,10 @@ class VLLMEngine(BaseSamplerEngine):
         # ``list_loras()`` per request.
         self._synced_lora_request: Optional[Any] = None
 
-        # Long-lived CUDA IPC bucket reused across all update_weights()
+        # Long-lived device IPC bucket reused across all update_weights()
         # calls. Allocating a new IPC buffer (and hence a new IPC handle)
-        # per sync forces every worker to create a new CUDA IPC mapping via
-        # ``rebuild_cuda_tensor`` because PyTorch's ``shared_cache`` cannot
+        # per sync forces every worker to create a new device IPC mapping via
+        # the reducer callable because PyTorch's ``shared_cache`` cannot
         # hit on unseen storage handles. The driver reclaims those mappings
         # lazily, which is the root cause of the slow GPU memory drift we
         # observed under frequent LoRA syncs. By pinning a single buffer
@@ -578,14 +578,14 @@ class VLLMEngine(BaseSamplerEngine):
         bucket_size_mb: int = 2048,
         **kwargs,
     ) -> None:
-        """Update model weights via ZMQ + CUDA IPC to worker extension.
+        """Update model weights via ZMQ + device IPC to worker extension.
 
         Accepts **either** a ``dict[str, Tensor]`` (legacy) **or** an async
         generator / sync generator of ``(name, tensor)`` pairs (streaming).
 
         The streaming path avoids accumulating a full model copy on GPU:
         tensors are consumed one-by-one from the generator, copied into a
-        GPU IPC bucket, and flushed to the vLLM worker subprocess when the
+        device IPC bucket, and flushed to the vLLM worker subprocess when the
         bucket is full.
 
         Args:
@@ -621,15 +621,19 @@ class VLLMEngine(BaseSamplerEngine):
 
             weight_aiter = _sync_iter()
 
-        # Peek first tensor to detect device (GPU → IPC, CPU → SHM).
+        # Peek first tensor to detect device (supported accelerator → IPC, CPU → SHM).
         try:
             first_name, first_tensor = await weight_aiter.__anext__()
         except StopAsyncIteration:
             logger.warning('update_weights called with empty weights')
             return
 
-        use_gpu_ipc = first_tensor.is_cuda
-        use_shm = not use_gpu_ipc
+        use_device_ipc = first_tensor.is_cuda
+        if first_tensor.device.type == 'npu':
+            from twinkle.utils.platforms import NPU
+
+            use_device_ipc = NPU.is_ipc_supported()
+        use_shm = not use_device_ipc
 
         # Use a per-sync unique IPC endpoint to avoid cross-actor collisions
         # when multiple sampler actors share the same device UUID.
@@ -650,13 +654,16 @@ class VLLMEngine(BaseSamplerEngine):
         buffer = None
         shm = None
 
-        if use_gpu_ipc:
+        if use_device_ipc:
+            if first_tensor.device.type == 'npu':
+                # torch_npu registers the NPU reducer used by reduce_tensor.
+                import torch_npu  # noqa: F401
             from torch.multiprocessing.reductions import reduce_tensor
 
             # Reuse a long-lived IPC bucket whenever the requested size
             # fits. The handle is produced once and shipped to every
             # subsequent sync so each worker's ``shared_cache`` stays warm
-            # and no new CUDA IPC mapping is created per sync.
+            # and no new device IPC mapping is created per sync.
             need_realloc = (
                 self._ipc_buffer is None or self._ipc_buffer_size < bucket_size
                 or self._ipc_buffer.device != first_tensor.device)
@@ -714,7 +721,7 @@ class VLLMEngine(BaseSamplerEngine):
                 ))
 
             # Send IPC/SHM handle, wait for worker ready (non-blocking)
-            handle_payload = ipc_handle if use_gpu_ipc else {'name': shm_name, 'size': bucket_size}
+            handle_payload = ipc_handle if use_device_ipc else {'name': shm_name, 'size': bucket_size}
             await loop.run_in_executor(None, _zmq_send_recv, handle_payload, 'handle handshake')
 
             # Stream weights into buckets and send to worker
@@ -821,7 +828,7 @@ class VLLMEngine(BaseSamplerEngine):
         elapsed = time.time() - start_time
         mode = 'LoRA' if base_sync_done and peft_config else 'base'
         logger.info(f'Updated {n_weights} {mode} weights via '
-                    f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
+                    f"{'IPC' if use_device_ipc else 'SHM'} in {elapsed:.2f}s")
 
     async def shutdown(self) -> None:
         """Shutdown the vLLM engine and release all resources.
