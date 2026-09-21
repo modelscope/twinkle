@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
+import dataclasses
 import os
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol
+
+import json
 
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampleResponse, SamplingParams
@@ -12,6 +14,28 @@ from twinkle.template.base import Template
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import Rollout
 from .bridge import _to_plain, extend_with_bridge
+
+
+class TurnController(Protocol):
+    """Boundary contract for framework-specific multi-turn scheduling.
+
+    Twinkle owns batching, token budgets, termination and response aggregation. A controller only translates
+    between a framework's mutable request state and Twinkle sampler inputs/turn updates.
+    """
+
+    def create_state(self, trajectory: Trajectory) -> Any: ...
+
+    def sampler_input(self, state: Any) -> Any: ...
+
+    def start(self, states: List[Any]) -> None: ...
+
+    def on_turn(self, states: List[Any], sequences: List[Any], current_turn: int,
+                forced_stops: List[bool]) -> List[Dict[str, Any]]: ...
+
+    def finalize(self, state: Any, response_token_ids: List[List[int]],
+                 response_loss_mask: List[List[int]]) -> Dict[str, Any]: ...
+
+    def close(self, states: List[Any]) -> None: ...
 
 
 @remote_class()
@@ -57,17 +81,19 @@ class MultiTurnRollout(Rollout):
         template: Template,
         tool_manager: Optional[ToolManager] = None,
         sampling_params: Optional[SamplingParams] = None,
-        max_turns: int = 6,
+        max_turns: Optional[int] = 6,
         max_trajectory_tokens: Optional[int] = None,
         trace_dir: Optional[str] = None,
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        turn_controller: Optional[TurnController] = None,
+        completion_length_limit_scope: str = 'per_round',
     ):
         super().__init__()
         if template is None:
             raise ValueError('MultiTurnRollout requires a local Template instance')
-        if max_turns < 1:
-            raise ValueError(f'max_turns must be >= 1, got {max_turns}')
+        if max_turns is not None and max_turns < 1:
+            raise ValueError(f'max_turns must be >= 1 or None, got {max_turns}')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
                              f'{max_trajectory_tokens}')
@@ -80,15 +106,22 @@ class MultiTurnRollout(Rollout):
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
+        self.turn_controller = turn_controller
+        if completion_length_limit_scope not in ('total', 'per_round'):
+            raise ValueError("completion_length_limit_scope must be 'total' or 'per_round'.")
+        self.completion_length_limit_scope = completion_length_limit_scope
         if self.trace_dir:
             os.makedirs(self.trace_dir, exist_ok=True)
 
         if self.sampling_params.num_samples != 1:
             raise ValueError(f'MultiTurnRollout currently supports num_samples=1 only, '
                              f'got {self.sampling_params.num_samples}')
-        assert self.template.truncation_strategy != 'split', (
-            "MultiTurnRollout does not support truncation_strategy='split'; "
-            'use left/right/delete/raise on the template.')
+        if self.turn_controller is None and self.max_turns is None:
+            raise ValueError('max_turns cannot be None for tool-managed multi-turn rollout.')
+        if self.turn_controller is None:
+            assert self.template.truncation_strategy != 'split', (
+                "MultiTurnRollout does not support truncation_strategy='split'; "
+                'use left/right/delete/raise on the template.')
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
@@ -101,6 +134,8 @@ class MultiTurnRollout(Rollout):
             return []
 
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
+        if self.turn_controller is not None:
+            return self._run_controlled(trajectories, sampling_params)
         tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
 
         # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
@@ -233,6 +268,163 @@ class MultiTurnRollout(Rollout):
         if self.trace_dir:
             self._write_rollout_traces(outs, global_step=kwargs.get('global_step'))
         return outs
+
+    @staticmethod
+    def _controlled_params(sampling_params, max_tokens: Optional[int]) -> SamplingParams:
+        """Clone sampling parameters for one controller-driven batch."""
+        if isinstance(sampling_params, dict):
+            values = dict(sampling_params)
+            values.update(max_tokens=max_tokens, num_samples=1)
+            return SamplingParams.from_dict(values)
+        return dataclasses.replace(sampling_params, max_tokens=max_tokens, num_samples=1)
+
+    def _sample_controlled(self, states: List[Any], active: List[int], sampling_params) -> Dict[int, Any]:
+        """Sample every live controller state, batching equal remaining token budgets."""
+        base_limit = (sampling_params.get('max_tokens')
+                      if isinstance(sampling_params, dict) else sampling_params.max_tokens)
+        grouped: Dict[Optional[int], List[int]] = {}
+        for index in active:
+            max_tokens = base_limit
+            if self.completion_length_limit_scope == 'total' and base_limit is not None:
+                max_tokens = max(0, int(base_limit) - states[index]['generated_tokens'])
+            if max_tokens == 0:
+                raise RuntimeError('multi-turn trajectory remained active after exhausting its total token budget.')
+            grouped.setdefault(max_tokens, []).append(index)
+
+        sampled: Dict[int, Any] = {}
+        for max_tokens, indices in grouped.items():
+            params = self._controlled_params(sampling_params, max_tokens)
+            inputs = [self.turn_controller.sampler_input(states[index]['value']) for index in indices]
+            responses = self.sampler.sample(inputs, sampling_params=params)
+            if len(responses) != len(indices):
+                raise RuntimeError(f'multi-turn sampler returned {len(responses)} responses for '
+                                   f'{len(indices)} inputs.')
+            for index, response in zip(indices, responses, strict=True):
+                if len(response.sequences) != 1:
+                    raise RuntimeError('multi-turn sampling requires exactly one sequence per active trajectory.')
+                sampled[index] = response.sequences[0]
+        return sampled
+
+    @staticmethod
+    def _record_controlled_turn(state: Dict[str, Any], update: Dict[str, Any]) -> None:
+        token_ids = list(update['response_token_ids'])
+        loss_mask = list(update.get('response_loss_mask', [1] * len(token_ids)))
+        logprobs = list(update.get('rollout_logprobs') or [])
+        if len(token_ids) != len(loss_mask):
+            raise RuntimeError(f'multi-turn response has {len(token_ids)} token IDs but '
+                               f'{len(loss_mask)} loss masks.')
+        trainable = sum(int(bool(value)) for value in loss_mask)
+        if len(logprobs) != trainable:
+            raise RuntimeError(f'multi-turn rollout logprobs misaligned: {len(logprobs)} logprobs for '
+                               f'{trainable} trainable tokens.')
+        if update.get('continuation') and state['response_token_ids']:
+            state['response_token_ids'][-1].extend(token_ids)
+            state['response_loss_mask'][-1].extend(loss_mask)
+            state['rollout_logprobs'][-1].extend(logprobs)
+        else:
+            state['response_token_ids'].append(token_ids)
+            state['response_loss_mask'].append(loss_mask)
+            state['rollout_logprobs'].append(logprobs)
+
+    def _controlled_stops(self, states: List[Dict[str, Any]], active: List[int], sampled: Dict[int, Any],
+                          current_turn: int, sampling_params) -> List[bool]:
+        base_limit = (sampling_params.get('max_tokens')
+                      if isinstance(sampling_params, dict) else sampling_params.max_tokens)
+        stops = []
+        for index in active:
+            sequence = sampled[index]
+            states[index]['generated_tokens'] += len(sequence.tokens or [])
+            total_stop = (self.completion_length_limit_scope == 'total' and base_limit is not None
+                          and states[index]['generated_tokens'] >= int(base_limit))
+            turn_stop = self.max_turns is not None and current_turn >= self.max_turns
+            states[index]['truncated'] |= sequence.stop_reason == 'length' or total_stop or turn_stop
+            stops.append(total_stop or turn_stop)
+        return stops
+
+    def _finalize_controlled(self, trajectories: List[Trajectory], states: List[Dict[str, Any]]) -> List[Trajectory]:
+        outs: List[Trajectory] = []
+        for trajectory, state in zip(trajectories, states, strict=True):
+            finalized = self.turn_controller.finalize(
+                state['value'], state['response_token_ids'], state['response_loss_mask'])
+            encoded = finalized.get('encoded')
+            labels = encoded.get('labels') if isinstance(encoded, dict) else None
+            flat_logprobs = [value for turn in state['rollout_logprobs'] for value in turn]
+            if labels is not None and len(flat_logprobs) != sum(int(label) != -100 for label in labels):
+                raise RuntimeError(f'multi-turn training feature has '
+                                   f'{sum(int(label) != -100 for label in labels)} trainable labels but '
+                                   f'{len(flat_logprobs)} rollout logprobs.')
+            out = dict(trajectory)
+            out.update(finalized)
+            out.update({
+                'response_token_ids': state['response_token_ids'],
+                'response_loss_mask': state['response_loss_mask'],
+                'rollout_logprobs': state['rollout_logprobs'],
+                'logprobs': flat_logprobs,
+                'rollout_infos': state['rollout_infos'],
+                'turns': state['turns'],
+                'stop_reason': state['stop_reason'],
+                'truncated': state['truncated'],
+            })
+            outs.append(out)
+        return outs
+
+    def _run_controlled(self, trajectories: List[Trajectory], sampling_params) -> List[Trajectory]:
+        """Run the shared batched state machine with a framework-owned turn controller.
+
+        The controller translates framework-specific scheduler requests at the boundary; Twinkle owns
+        batching, token budgets, per-turn alignment and output aggregation.
+        """
+        states = [{
+            'value': self.turn_controller.create_state(trajectory),
+            'response_token_ids': [],
+            'response_loss_mask': [],
+            'rollout_logprobs': [],
+            'rollout_infos': {},
+            'generated_tokens': 0,
+            'turns': 0,
+            'stop_reason': None,
+            'truncated': False,
+        } for trajectory in trajectories]
+        active = list(range(len(states)))
+        current_turn = 1
+        try:
+            self.turn_controller.start([state['value'] for state in states])
+            while active:
+                sampled = self._sample_controlled(states, active, sampling_params)
+                forced_stops = self._controlled_stops(states, active, sampled, current_turn, sampling_params)
+                updates = self.turn_controller.on_turn(
+                    [states[index]['value'] for index in active],
+                    [sampled[index] for index in active],
+                    current_turn,
+                    forced_stops,
+                )
+                if len(updates) != len(active):
+                    raise RuntimeError(f'multi-turn controller returned {len(updates)} updates for '
+                                       f'{len(active)} active trajectories.')
+                next_active = []
+                for index, sequence, forced_stop, update in zip(
+                        active, (sampled[i] for i in active), forced_stops, updates, strict=True):
+                    self._record_controlled_turn(states[index], update)
+                    states[index]['rollout_infos'].update(update.get('rollout_infos') or {})
+                    states[index]['turns'] = current_turn
+                    states[index]['stop_reason'] = update.get('stop_reason', sequence.stop_reason)
+                    states[index]['truncated'] |= bool(update.get('truncated'))
+                    done = forced_stop or bool(update.get('done'))
+                    if not done:
+                        if not sequence.tokens and self.max_turns is None:
+                            raise RuntimeError('multi-turn controller kept an empty generation active without '
+                                               'max_turns; the trajectory cannot make progress.')
+                        next_active.append(index)
+                    else:
+                        states[index]['rollout_infos']['num_turns'] = current_turn
+                active = next_active
+                current_turn += 1
+            outs = self._finalize_controlled(trajectories, states)
+            if self.trace_dir:
+                self._write_rollout_traces(outs)
+            return outs
+        finally:
+            self.turn_controller.close([state['value'] for state in states])
 
     # ------------------------------------------------------------------ private
 
