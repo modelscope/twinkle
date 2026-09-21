@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Regenerate the client-API contract snapshots.
+"""Manual contract-maintenance helper; it is not a pytest test or CI entry point.
+
+Regenerate the client-API contract snapshots.
 
 Run with::
 

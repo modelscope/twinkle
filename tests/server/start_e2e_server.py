@@ -1,4 +1,6 @@
-"""One-click: restart Ray cluster + launch Twinkle server + wait until ready.
+"""Manual PPU E2E helper; it is not a pytest test or CI entry point.
+
+One-click: restart Ray cluster + launch Twinkle server + wait until ready.
 
 Usage:
     python start_e2e_server.py                         # default config (transformers LoRA)

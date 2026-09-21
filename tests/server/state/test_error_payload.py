@@ -23,6 +23,18 @@ def test_overlong_traceback_is_trimmed_tail_kept_with_marker():
     assert tb.endswith('line\n')  # tail preserved
 
 
+def test_task_error_payload_shapes_and_sanitizes_errors():
+    payload = task_error_payload(
+        'RuntimeError: boom\n  File "/server/path.py", line 1', request_id='req_1', error_code=500)
+
+    assert payload == {
+        'error': 'RuntimeError: boom',
+        'category': ErrorCategory.Server.value,
+        'error_code': 500,
+        'request_id': 'req_1',
+    }
+
+
 def test_user_category_carries_no_traceback():
     payload = task_error_payload(
         'invalid field', request_id='req_2', error_code=422,
