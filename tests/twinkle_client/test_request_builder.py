@@ -128,6 +128,11 @@ def test_a_missing_required_field_fails_in_process():
         build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}])
 
 
+def test_forward_only_requires_an_adapter_context():
+    with pytest.raises(ValidationError):
+        build_request(model_types.ForwardOnlyRequest, inputs=[{'input_ids': [1]}])
+
+
 # --------------------------------------------------------------------------- #
 # Serialization
 # --------------------------------------------------------------------------- #

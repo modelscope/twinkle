@@ -19,12 +19,15 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from twinkle.utils.logger import get_logger
 from twinkle_client.auto.connection import LocalConnection
 
 logger = get_logger()
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 
 # Maximum auto-fix attempts per run (prevent infinite retry loops)
 _MAX_FIX_ATTEMPTS = 3

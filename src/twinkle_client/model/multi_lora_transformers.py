@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import itertools
 import logging
 import threading
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from peft import LoraConfig
 
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types.component import DataRef
@@ -107,13 +113,22 @@ class MultiLoraTransformersModel:
     # Adapter lifecycle
     # ------------------------------------------------------------------ #
 
-    def add_adapter_to_model(self, adapter_name: str, config: Optional[Dict[str, Any]] = None, **kwargs) -> None:
+    def add_adapter_to_model(
+        self,
+        adapter_name: str,
+        config: LoraConfig | Mapping[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
         """Add a new adapter to the model.
 
         Pass a peft ``LoraConfig`` (or its dict form) for LoRA training against a
         LoRA-mode deployment. Pass ``config=None`` for full-parameter training
         against a ``train_mode: full`` deployment.
         """
+        if isinstance(config, Mapping):
+            from peft import LoraConfig
+
+            config = LoraConfig(**config)
         save_dir = kwargs.pop('save_dir', None)
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()
@@ -385,7 +400,7 @@ class MultiLoraTransformersModel:
             adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
-    def add_metric(self, metric_cls: str, is_training: Optional[bool] = None, **kwargs) -> None:
+    def add_metric(self, metric_cls: str, is_training: bool | None = None, **kwargs) -> None:
         """Add a metric to the model."""
         self._submit(
             'add_metric',
@@ -440,7 +455,7 @@ class MultiLoraTransformersModel:
             adapter_name=kwargs.pop('adapter_name', self.adapter_name),
             **kwargs)
 
-    def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> Dict[str, Any]:
+    def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> dict[str, Any]:
         """Resume weights (and optionally optimizer state) from a checkpoint."""
         progress = self._submit(
             'resume_from_checkpoint',
@@ -456,7 +471,7 @@ class MultiLoraTransformersModel:
         self,
         checkpoint_dir: str,
         hub_model_id: str,
-        hub_token: Optional[str] = None,
+        hub_token: str | None = None,
         async_upload: bool = True,
         poll_interval: float = 5.0,
     ) -> None:

@@ -12,10 +12,9 @@ import sys
 
 import pytest
 
-tensordict = pytest.importorskip('tensordict')
-
 
 def test_rows_to_tq_fields_empty_rows():
+    pytest.importorskip('tensordict')
     from twinkle.data_format import rows_to_tq_fields
 
     packed = rows_to_tq_fields([])
@@ -24,6 +23,7 @@ def test_rows_to_tq_fields_empty_rows():
 
 def test_rows_to_tq_fields_rejects_inconsistent_fields():
     """Rows with differing key sets must raise, not silently pack a ragged TensorDict."""
+    pytest.importorskip('tensordict')
     from twinkle.data_format import rows_to_tq_fields
 
     with pytest.raises(ValueError):
@@ -32,6 +32,7 @@ def test_rows_to_tq_fields_rejects_inconsistent_fields():
 
 def test_columns_to_tq_fields_mixes_numeric_and_non_numeric():
     """Numeric columns go through ``torch.tensor``; the rest through ``NonTensorStack``."""
+    pytest.importorskip('tensordict')
     import torch
 
     from twinkle.data_format import columns_to_tq_fields

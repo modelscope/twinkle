@@ -110,6 +110,24 @@ def test_model_inline_forward_methods_keep_the_original_endpoints(monkeypatch) -
     assert calls[-1][1]['micro_batch_size'] == 1
 
 
+def test_model_add_adapter_serializes_dict_lora_config(monkeypatch) -> None:
+    """Dict input remains compatible with the strict serialized LoRA wire field."""
+    from twinkle_client.model import multi_lora_transformers as module
+
+    calls: list = []
+    _patch_transport(monkeypatch, calls,
+                     lambda url: {} if url.endswith('/create') else _completed({'status': 'ok'}))
+
+    model = module.MultiLoraTransformersModel('ms://base')
+    model.add_adapter_to_model('adapter', {'r': 4, 'target_modules': 'all-linear'})
+
+    url, body = calls[-1]
+    assert url.endswith('/model/base/twinkle/add_adapter_to_model')
+    assert isinstance(body['config'], str)
+    assert 'LoraConfig' in body['config']
+    assert model.adapter_name == 'adapter'
+
+
 def test_undeclared_forward_arguments_are_routed_to_loss_kwargs(monkeypatch) -> None:
     """A loss input is not a declared field, so it travels in the passthrough region.
 

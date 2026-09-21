@@ -134,12 +134,12 @@ class ForwardRequest(_InlineForwardBase):
 class ForwardOnlyRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward_only``: no graph, no gradients.
 
-    ``adapter_name`` is optional here -- a reference forward may run against the base
-    weights -- and there is no ``seq_id`` because nothing is mutated to be idempotent
-    about.
+    An existing ``adapter_name`` supplies the template and adapter context, even when
+    ``disable_lora`` requests base-weight inference. There is no ``seq_id`` because
+    nothing is mutated to be idempotent about.
     """
 
-    adapter_name: str | None = None
+    adapter_name: str
     disable_lora: bool | None = backend_kwarg(default=None)
 
 
