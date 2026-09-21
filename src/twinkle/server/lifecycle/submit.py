@@ -97,7 +97,7 @@ def backend_kwargs(body: Any) -> dict[str, Any]:
     return kwargs
 
 
-def input_metrics(self: 'DataParallelDeployment', body: Any, *, data_parallel: bool = False) -> dict[str, Any]:
+def input_metrics(self: DataParallelDeployment, body: Any, *, data_parallel: bool = False) -> dict[str, Any]:
     """Seam C: scheduling metrics (input_tokens, and batch_size/data_world_size).
 
     Reads validated wire models, so no isinstance guards: ``inputs`` is a list and
@@ -121,7 +121,7 @@ def resolve_twinkle_adapter_name(request: Request, adapter_name: str | None) -> 
 
 
 async def run_submit(
-    self: 'QueuedDeployment',
+    self: QueuedDeployment,
     request: Request,
     body: Any,
     *,
