@@ -131,7 +131,7 @@ def create_grpo_dataset(data_slice=range(50)):
 
 def init_twinkle_client_session():
     """Initialize the Twinkle client session."""
-    from twinkle_client import init_twinkle_client
+    from twinkle import init_twinkle_client
     return init_twinkle_client(base_url=BASE_URL, api_key=API_KEY)
 
 
@@ -205,7 +205,7 @@ def create_twinkle_sampler():
 
 def init_tinker_client_session():
     """Initialize the Tinker client session and return ServiceClient."""
-    from twinkle_client import init_tinker_client
+    from twinkle import init_tinker_client
     init_tinker_client()
     from tinker import ServiceClient
     return ServiceClient(base_url=BASE_URL, api_key=API_KEY)

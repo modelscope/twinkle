@@ -13,7 +13,7 @@ from peft import LoraConfig
 from typing import Any, Dict, List
 
 from twinkle import get_logger
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import EmojiDPOProcessor

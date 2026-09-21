@@ -24,7 +24,7 @@ def init_tinker_client(**kwargs) -> None:
 
     Example::
 
-        >>> from twinkle_client import init_tinker_client
+        >>> from twinkle import init_tinker_client
         >>> init_tinker_client()
         >>> from tinker import ServiceClient
         >>> client = ServiceClient(base_url='http://localhost:8000', api_key='your_token')

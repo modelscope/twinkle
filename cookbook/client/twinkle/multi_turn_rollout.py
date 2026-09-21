@@ -27,7 +27,7 @@ from peft import LoraConfig
 from typing import Any, Dict, List, Tuple
 
 from twinkle import get_logger
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template

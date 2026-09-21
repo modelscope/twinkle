@@ -36,9 +36,10 @@ from fastapi.responses import JSONResponse
 from ray import serve
 from typing import Any
 
-from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
+from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.middleware.auth import verify_request_token
+from twinkle.server.task_errors import build_error_payload
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
@@ -59,8 +60,8 @@ async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError
     (``category=user``) carries no traceback.
     """
     request_id = getattr(request.state, 'request_id', None) or ''
-    payload = ErrorPayload(
-        error=(str(exc) or exc.__class__.__name__),
+    payload = build_error_payload(
+        str(exc) or exc.__class__.__name__,
         category=exc.category,
         error_code=exc.error_code,
         request_id=request_id,
@@ -120,8 +121,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         # server, so say so instead of leaving the caller to infer it from a field list.
         message += ('. Unknown fields are rejected; if this worked before, upgrade '
                     'twinkle-kit on the client to match the server version.')
-    payload = ErrorPayload(
-        error=message[:1024],
+    payload = build_error_payload(
+        message,
         category=ErrorCategory.User,
         error_code=422,
         request_id=getattr(request.state, 'request_id', None) or '',
@@ -241,12 +242,12 @@ def build_deployment_app(
             # ``ErrorPayload`` body (Server category keeps the traceback) instead
             # of the legacy ``{'detail': <traceback>}`` shape.
             request_id = getattr(request.state, 'request_id', None) or ''
-            payload = ErrorPayload(
-                error=(str(exc) or exc.__class__.__name__),
+            payload = build_error_payload(
+                str(exc) or exc.__class__.__name__,
                 category=ErrorCategory.Server,
                 error_code=500,
                 request_id=request_id,
-                traceback=tb,
+                traceback_text=tb,
             )
             return JSONResponse(status_code=500, content=payload.model_dump(mode='json', exclude_none=True))
 

@@ -368,7 +368,7 @@ from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
@@ -454,11 +454,11 @@ import os
 from tinker import types
 from tqdm import tqdm
 
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.common import input_feature_to_datum
+from twinkle.server.model.tinker_datum import input_feature_to_datum
 
 # Initialize Tinker client (must be called before importing ServiceClient)
 init_tinker_client()

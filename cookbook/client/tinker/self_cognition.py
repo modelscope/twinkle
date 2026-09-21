@@ -10,13 +10,13 @@ import os
 import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.common import input_feature_to_datum
+from twinkle.server.model.tinker_datum import input_feature_to_datum
 
 # Initialize the Tinker client before importing ServiceClient
 init_tinker_client()

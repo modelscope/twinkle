@@ -13,7 +13,7 @@ dotenv.load_dotenv('.env')
 import os
 
 # Step 2: Initialize Tinker client before importing ServiceClient
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 init_tinker_client()
 

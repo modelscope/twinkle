@@ -5,7 +5,7 @@ Twinkle Client 是原生客户端，设计理念是：**将 `from twinkle import
 ## 初始化
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # 初始化客户端，连接到 Twinkle Server
 client = init_twinkle_client(
@@ -50,7 +50,7 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader        # 或 from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # 或 from twinkle_client.dataset import Dataset
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 client = init_twinkle_client(base_url=base_url, api_key=api_key)
 model = client.model(f'ms://{base_model}')
@@ -67,7 +67,7 @@ dotenv.load_dotenv('.env')
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader
@@ -221,7 +221,7 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 ```python
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template

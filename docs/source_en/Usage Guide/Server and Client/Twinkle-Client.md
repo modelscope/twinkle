@@ -5,7 +5,7 @@ Twinkle Client is the native client, designed with the philosophy: **Change `fro
 ## Initialization
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # Initialize client, connect to Twinkle Server
 client = init_twinkle_client(
@@ -50,7 +50,7 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader        # or: from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # or: from twinkle_client.dataset import Dataset
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 client = init_twinkle_client(base_url=base_url, api_key=api_key)
 model = client.model(f'ms://{base_model}')
@@ -67,7 +67,7 @@ dotenv.load_dotenv('.env')
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader
@@ -222,7 +222,7 @@ The examples above are all single-turn training. If you want to do **multi-turn 
 
 ```python
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template

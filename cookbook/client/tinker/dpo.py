@@ -24,11 +24,11 @@ import swanlab
 
 from tinker import types
 from twinkle import get_logger
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import EmojiDPOProcessor
-from twinkle.server.common import input_feature_to_datum
+from twinkle.server.model.tinker_datum import input_feature_to_datum
 
 logger = get_logger()
 

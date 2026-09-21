@@ -113,3 +113,20 @@ def test_error_handler_puts_fields_at_top_level():
     assert body['error'] == 'nope'
     assert body['category'] == 'user'
     assert body['error_code'] == 409
+
+
+def test_error_handler_bounds_overlong_domain_error():
+    app = FastAPI()
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
+
+    @app.get('/boom')
+    async def boom(request: Request):
+        raise RequestRejectedError(f'bad request {"X" * 2048}\ninternal detail', error_code=409)
+
+    response = TestClient(app, raise_server_exceptions=False).get('/boom')
+    assert response.status_code == 409
+    body = response.json()
+    assert len(body['error']) == 1024
+    assert '\n' not in body['error']
+    assert body['category'] == 'user'
+    assert 'traceback' not in body

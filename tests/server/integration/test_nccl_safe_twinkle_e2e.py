@@ -40,7 +40,7 @@ BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'megatron')
 
 def _init_client():
     from peft import LoraConfig
-    from twinkle_client import init_twinkle_client
+    from twinkle import init_twinkle_client
     from twinkle_client.model import MultiLoraTransformersModel
 
     init_twinkle_client(base_url=SERVER_URL, api_key='EMPTY_TOKEN')

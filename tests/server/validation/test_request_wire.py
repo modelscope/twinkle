@@ -82,6 +82,18 @@ def test_the_error_names_the_client_version_mismatch(client):
     assert 'upgrade' in response.json()['error'].lower()
 
 
+def test_overlong_validation_summary_is_bounded_without_losing_details(client):
+    field = 'unknown_' + ('X' * 2048)
+    response = _post(client, '/forward', _valid_forward(**{field: 1}))
+
+    assert response.status_code == 422
+    body = response.json()
+    assert len(body['error']) == 1024
+    assert body['category'] == 'user'
+    assert body['details'][0]['field'] == field
+    assert 'traceback' not in body
+
+
 def test_the_error_body_is_an_error_payload_not_fastapi_detail(client):
     """One error shape on the wire, or a client has to learn two."""
     body = _post(client, '/forward', _valid_forward(unknown=1)).json()

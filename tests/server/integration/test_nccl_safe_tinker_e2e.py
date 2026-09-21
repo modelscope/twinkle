@@ -41,7 +41,7 @@ BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'megatron')
 def _init_client():
     os.environ['TINKER_BASE_URL'] = SERVER_URL
     os.environ['TWINKLE_SERVER_TOKEN'] = 'EMPTY_TOKEN'
-    from twinkle_client import init_tinker_client
+    from twinkle import init_tinker_client
     init_tinker_client()
     from tinker import ServiceClient
     return ServiceClient().create_lora_training_client(base_model=BASE_MODEL, rank=16)

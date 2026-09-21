@@ -17,7 +17,7 @@ dotenv.load_dotenv('.env')
 # =============================================================================
 # Step 1: Initialize Tinker client (MUST be done before importing ServiceClient)
 # =============================================================================
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 init_tinker_client()
 
@@ -30,7 +30,7 @@ from twinkle.data_format import Trajectory, Message
 from twinkle.preprocessor import Preprocessor
 from twinkle.dataset import DatasetMeta, LazyDataset
 from twinkle.dataloader import DataLoader
-from twinkle.server.common import input_feature_to_datum  # Key: converts InputFeature -> Datum
+from twinkle.server.model.tinker_datum import input_feature_to_datum  # Key: converts InputFeature -> Datum
 from twinkle import get_logger
 
 logger = get_logger()

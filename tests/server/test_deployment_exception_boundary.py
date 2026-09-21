@@ -46,3 +46,33 @@ def test_deployment_app_catches_unhandled_route_exception_and_keeps_serving(monk
     response = client.get('/healthz')
     assert response.status_code == 200
     assert response.json() == {'ok': True, 'health_calls': 1}
+
+
+def test_deployment_app_bounds_overlong_unhandled_error(monkeypatch):
+
+    class _ReplicaId:
+        unique_id = 'replica-test'
+
+    class _Context:
+        replica_id = _ReplicaId()
+
+    from twinkle.server import deployment
+
+    monkeypatch.setattr(deployment.serve, 'get_replica_context', lambda: _Context())
+
+    def register_routes(app: FastAPI, _get_self):
+
+        @app.get('/boom')
+        async def boom():
+            raise RuntimeError(f'first line {"X" * 2048}\nsecond line')
+
+    client = TestClient(build_deployment_app('Test', register_routes))
+    response = client.get('/boom', headers={'x-request-id': 'long-error'})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert len(body['error']) == 1024
+    assert '\n' not in body['error']
+    assert len(body['traceback']) <= 65536
+    assert body['traceback'].endswith('second line\n')
+    assert body['request_id'] == 'long-error'

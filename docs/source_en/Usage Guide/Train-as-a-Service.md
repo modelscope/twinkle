@@ -24,11 +24,11 @@ Sample code:
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.common import input_feature_to_datum
+from twinkle.server.model.tinker_datum import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3.8-27B'
 base_url='https://www.modelscope.cn/twinkle'
@@ -72,7 +72,7 @@ from tinker import types
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 # Step 1: Initialize Tinker client
 init_tinker_client()

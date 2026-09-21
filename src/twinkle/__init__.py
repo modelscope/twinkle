@@ -5,7 +5,7 @@ from ._lazy_module import _LazyModule  # noqa
 
 
 def init_tinker_client(**kwargs) -> None:
-    """Compatibility entry point; prefer ``twinkle_client.init_tinker_client``."""
+    """Initialize the Tinker-compatible client without eager client imports."""
     from twinkle_client import init_tinker_client as _init_tinker_client
     return _init_tinker_client(**kwargs)
 
@@ -16,7 +16,7 @@ def init_twinkle_client(
     session_heartbeat_interval: int = 10,
     **kwargs,
 ) -> Any:
-    """Compatibility entry point; prefer ``twinkle_client.init_twinkle_client``."""
+    """Initialize the Twinkle client without eager client imports."""
     from twinkle_client import init_twinkle_client as _init_twinkle_client
     return _init_twinkle_client(
         base_url=base_url,

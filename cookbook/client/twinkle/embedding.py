@@ -29,7 +29,7 @@ from peft import LoraConfig
 from typing import Any, Dict, List
 
 from twinkle import get_logger
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.template import Qwen3_5Template
 
 dotenv.load_dotenv('.env')

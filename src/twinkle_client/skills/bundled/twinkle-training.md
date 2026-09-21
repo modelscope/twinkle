@@ -76,7 +76,7 @@ Large models: 2× TP for 32B, 4× TP for 72B
 ### 1. Initialization
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # Server Mode (primary — self-hosted)
 client = init_twinkle_client(base_url='http://localhost:8000', api_key='EMPTY_API_KEY')
@@ -484,7 +484,7 @@ InputFeature(
 ```python
 import os
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import SelfCognitionProcessor
@@ -559,7 +559,7 @@ rt.finish(status='completed')
 import gc
 from typing import List, Dict, Any
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import GSM8KProcessor
@@ -671,7 +671,7 @@ import numpy as np
 import torch
 from typing import Any, Dict, List
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import EmojiDPOProcessor
@@ -753,7 +753,7 @@ rt.finish(status='completed')
 import numpy as np
 import torch
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.dataset import LazyDataset, DatasetMeta
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import Preprocessor
@@ -828,7 +828,7 @@ rt.finish(status='completed')
 ### Example 5: Sampling / Inference Only
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle_client.sampler import vLLMSampler
 
 # 1. Init
@@ -919,7 +919,7 @@ The TUI agent's `start_server` tool handles this automatically — generates con
 
 For GRPO with Tinker API:
 ```python
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 init_tinker_client()
 from tinker import ServiceClient, types
 

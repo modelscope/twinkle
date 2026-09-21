@@ -12,7 +12,7 @@ import torch
 from peft import LoraConfig
 
 from twinkle import get_logger
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import DatasetMeta, LazyDataset

@@ -15,7 +15,8 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
-from twinkle_client import DataPlaneClient, init_twinkle_client
+from twinkle import init_twinkle_client
+from twinkle_client import DataPlaneClient
 from twinkle_client.async_rl import Worker, WorkerPipeline
 from twinkle.protocol.json_utils import json_safe
 from twinkle_client.model import MultiLoraTransformersModel

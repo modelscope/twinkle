@@ -211,7 +211,7 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
 
 
 def _exercise_twinkle_clients(base: str) -> None:
-    from twinkle_client import init_twinkle_client
+    from twinkle import init_twinkle_client
     from twinkle_client.model import MultiLoraTransformersModel
     from twinkle_client.sampler import vLLMSampler
 
@@ -308,7 +308,7 @@ def _exercise_tinker_client(base: str) -> None:
     import os
     from tinker import ServiceClient, types
 
-    from twinkle_client import init_tinker_client
+    from twinkle import init_tinker_client
 
     # patch_tinker injects Twinkle's auth + Ray Serve multiplex headers and
     # lifts tinker's ``tml-`` api-key prefix check so EMPTY_TOKEN passes.

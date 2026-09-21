@@ -19,6 +19,31 @@ def trim_traceback(text: str) -> str:
     return _TRUNCATION_MARKER + text[-keep:]
 
 
+def build_error_payload(
+    error: str,
+    *,
+    request_id: str,
+    error_code: int = 500,
+    category: ErrorCategory | str = ErrorCategory.Server,
+    traceback_text: str | None = None,
+    details: list[dict[str, Any]] | None = None,
+) -> ErrorPayload:
+    """Build a validated error payload with bounded diagnostic text."""
+    if isinstance(category, str):
+        category = ErrorCategory(category.lower())
+    tb = trim_traceback(traceback_text) if category is ErrorCategory.Server and traceback_text else None
+    lines = str(error).splitlines()
+    summary = (lines[0] if lines else '')[:_ERROR_MAX]
+    return ErrorPayload(
+        error=summary,
+        category=category,
+        error_code=error_code,
+        request_id=request_id,
+        traceback=tb,
+        details=details,
+    )
+
+
 def task_error_payload(
     error: str,
     *,
@@ -29,17 +54,12 @@ def task_error_payload(
     details: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-safe wire payload for direct or streaming responses."""
-    if isinstance(category, str):
-        category = ErrorCategory(category.lower())
-    tb = trim_traceback(traceback_text) if category is ErrorCategory.Server and traceback_text else None
-    lines = str(error).splitlines()
-    summary = (lines[0] if lines else '')[:_ERROR_MAX]
-    payload = ErrorPayload(
-        error=summary,
-        category=category,
-        error_code=error_code,
+    payload = build_error_payload(
+        error,
         request_id=request_id,
-        traceback=tb,
+        error_code=error_code,
+        category=category,
+        traceback_text=traceback_text,
         details=details,
     )
     return payload.model_dump(mode='json', exclude_none=True)

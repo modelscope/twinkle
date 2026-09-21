@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.task_errors import task_error_payload
+from twinkle.server.task_errors import build_error_payload, task_error_payload
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 
 
@@ -33,6 +33,35 @@ def test_task_error_payload_shapes_and_sanitizes_errors():
         'error_code': 500,
         'request_id': 'req_1',
     }
+
+
+def test_build_error_payload_bounds_text_and_preserves_metadata():
+    details = [{'field': 'adapter_name'}]
+    payload = build_error_payload(
+        f'bad input {"X" * 2048}\nignored second line',
+        request_id='req_build',
+        error_code=422,
+        category='user',
+        traceback_text='server stack',
+        details=details,
+    )
+
+    assert isinstance(payload, ErrorPayload)
+    assert len(payload.error) == 1024
+    assert '\n' not in payload.error
+    assert payload.category is ErrorCategory.User
+    assert payload.error_code == 422
+    assert payload.request_id == 'req_build'
+    assert payload.traceback is None
+    assert payload.details == details
+    assert task_error_payload(
+        f'bad input {"X" * 2048}\nignored second line',
+        request_id='req_build',
+        error_code=422,
+        category='user',
+        traceback_text='server stack',
+        details=details,
+    ) == payload.model_dump(mode='json', exclude_none=True)
 
 
 def test_user_category_carries_no_traceback():
