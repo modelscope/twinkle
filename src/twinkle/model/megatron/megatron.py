@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import numpy as np
@@ -30,7 +31,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
-from twinkle.model.base import TwinkleModel
+from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
@@ -131,7 +132,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.model_id = model_id
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self._model_path = HubOperation.download_model(model_id)
+        self._model_path = HubOperation.download_model(model_id, revision=kwargs.pop('revision', None))
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.pop('use_distributed_optimizer', True)
@@ -1020,7 +1021,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         config_overrides = kwargs.pop('config_overrides', None)
 
         opt_config = OptimizerConfig(
-            optimizer='adam',
+            optimizer=kwargs.pop('optimizer', 'adam'),
             lr=lr,
             min_lr=kwargs.pop('min_lr', 0.0),
             weight_decay=kwargs.pop('weight_decay', 0.01),
@@ -1131,9 +1132,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 the full merged model instead of PEFT adapter format. The merge
                 is reversed after saving so training can continue.
             **kwargs: Additional arguments forwarded to the underlying save
-                methods (e.g. ``adapter_name``).
+                methods (e.g. ``adapter_name``, ``safe_serialization``, and ``max_shard_size``).
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        safe_serialization = kwargs.pop('safe_serialization', True)
+        max_shard_size = kwargs.pop('max_shard_size', '5GB')
+        save_total_limit = kwargs.pop('save_total_limit', None)
+        if not safe_serialization:
+            raise NotImplementedError('Megatron HF-format checkpoints require safe_serialization=True.')
         optimizer_config = self.optimizer_group[adapter_name]
         if optimizer_config.cur_step % interval != 0:
             return
@@ -1148,11 +1154,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if merge_lora and is_lora:
             self._merge_lora_adapters(optimizer_config.adapter_name)
-            self._save_hf_format(checkpoint_dir, _default_adapter_name)
+            self._save_hf_format(checkpoint_dir, _default_adapter_name, max_shard_size=max_shard_size)
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
             self._unmerge_lora_adapters()
         else:
-            self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+            self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name, max_shard_size=max_shard_size)
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Optionally save mcore optimizer state (for training resumption).
@@ -1174,7 +1180,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 with open(state_path, 'w') as f:
                     json.dump(trainer_state, f, indent=2)
 
-        # Final synchronization to ensure all ranks complete save.
+        # Copy the run metadata and rotate only after every checkpoint component has completed. Rank 0
+        # removes old directories; the final barrier keeps workers from continuing while rotation is in flight.
+        copy_checkpoint_args(output_dir, checkpoint_dir)
+        rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         if dist.is_initialized():
             dist.barrier()
 
@@ -1227,13 +1236,19 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     @remote_function(dispatch='all')
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+
+        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
+        if resume_only_model:
+            return {
+                'cur_step': 0,
+                'consumed_train_samples': 0,
+                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            }
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
-
-        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
-
         return {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
@@ -1331,7 +1346,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # DTensors, plain DDP does not), and that decision was made at wrap time.
         sharded_sd_metadata = self.strategy.get_sharded_sd_metadata()
 
-        rng_state = self._get_rng_state()
+        no_save_rng = kwargs.pop('no_save_rng', False)
+        rng_state = None if no_save_rng else self._get_rng_state()
         model = self.model
 
         state_dict = self._generate_state_dict(
@@ -1396,6 +1412,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         no_load_optim = kwargs.pop('no_load_optim', False)
         no_load_rng = kwargs.pop('no_load_rng', False)
+        data_parallel_random_init = kwargs.pop('data_parallel_random_init', False)
 
         optimizer_config = self.optimizer_group.get(adapter_name or self._get_default_group(), )
 
@@ -1464,7 +1481,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if not no_load_rng and 'rng_state' in state_dict:
             rng = state_dict['rng_state']
-            rng = rng[0]
+            if isinstance(rng, (list, tuple)):
+                rng_index = mpu.get_data_parallel_rank() if data_parallel_random_init else 0
+                if rng_index >= len(rng):
+                    raise ValueError(
+                        f'Checkpoint contains {len(rng)} RNG states, but data-parallel rank {rng_index} was requested.')
+                rng = rng[rng_index]
             random.setstate(rng['random_rng_state'])
             np.random.set_state(rng['np_rng_state'])
             torch.set_rng_state(rng['torch_rng_state'])
@@ -1550,7 +1572,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 hf_config.quantization_config = None
         return hf_config
 
-    def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter=None):
+    def _save_hf_format(self,
+                        output_dir: str,
+                        adapter_name: str,
+                        lora_converter=None,
+                        max_shard_size: str = '5GB'):
         """Save in HuggingFace format using bridge adapter.
 
         For distributed training:
@@ -1574,8 +1600,23 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Get the model (unwrap if DDP wrapped)
         model = self.strategy.unwrap_model(self.model)
-        self.strategy.bridge.save_weights(
-            model, output_dir, peft_format=is_peft_format, adapter_name=adapter_name, converter=lora_converter)
+        save_weights = self.strategy.bridge.save_weights
+        save_kwargs = {
+            'peft_format': is_peft_format,
+            'adapter_name': adapter_name,
+            'converter': lora_converter,
+            'max_shard_size': max_shard_size,
+        }
+        # Newer mcore-bridge releases can preserve source-checkpoint tensors for modules that
+        # Megatron does not materialize. Enable it when the active bridge exposes the capability;
+        # adapter checkpoints intentionally contain deltas only, so the bridge ignores it there.
+        try:
+            supports_missing_weights = 'save_missing_weights' in inspect.signature(save_weights).parameters
+        except (TypeError, ValueError):
+            supports_missing_weights = False
+        if supports_missing_weights:
+            save_kwargs['save_missing_weights'] = True
+        save_weights(model, output_dir, **save_kwargs)
 
         # Save config on global rank 0 only (avoid concurrent writers).
         if is_global_zero:

@@ -375,19 +375,24 @@ class MultiLoraMegatronModel(MegatronModel):
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
+        optimizer_config = self.optimizer_group.get(adapter_name)
+
+        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
+        if resume_only_model:
+            return {
+                'cur_step': 0,
+                'consumed_train_samples': 0,
+                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            }
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         if not os.path.isfile(trainer_state_path):
             raise FileNotFoundError(f'trainer_state.json not found in {checkpoint_dir}. '
                                     f'Ensure the checkpoint was saved with save_optimizer=True.')
-
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 
-        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
-
-        optimizer_config = self.optimizer_group.get(adapter_name)
-        if not resume_only_model and optimizer_config is not None:
+        if optimizer_config is not None:
             optimizer_config.cur_step = trainer_state['cur_step']
             optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
 

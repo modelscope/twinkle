@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import re
+import shutil
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union
 
@@ -16,6 +18,36 @@ if TYPE_CHECKING:
     import torch
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
+
+
+def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
+    """Copy the run-level CLI metadata into a completed checkpoint on the master rank."""
+    if not Platform.is_master():
+        return
+    source = os.path.join(output_dir, 'args.json')
+    target = os.path.join(checkpoint_dir, 'args.json')
+    if os.path.isfile(source) and os.path.realpath(source) != os.path.realpath(target):
+        shutil.copy2(source, target)
+
+
+def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_limit: Optional[int]) -> None:
+    """Retain the newest completed checkpoint directories, always protecting the current save."""
+    if save_total_limit is None:
+        return
+    if save_total_limit < 1:
+        raise ValueError('save_total_limit must be >= 1.')
+    if not Platform.is_master() or not os.path.isdir(output_dir):
+        return
+    current = os.path.realpath(current_checkpoint_dir)
+    checkpoints = []
+    for entry in os.scandir(output_dir):
+        if not entry.is_dir(follow_symlinks=False) or re.fullmatch(r'checkpoint-(?:\d+|final)', entry.name) is None:
+            continue
+        path = os.path.realpath(entry.path)
+        checkpoints.append((path == current, entry.stat(follow_symlinks=False).st_mtime_ns, entry.name, path))
+    checkpoints.sort()
+    for _, _, _, checkpoint_path in checkpoints[:-save_total_limit]:
+        shutil.rmtree(checkpoint_path)
 
 
 class TwinkleModel(ABC):

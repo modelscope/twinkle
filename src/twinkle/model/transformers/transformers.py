@@ -33,7 +33,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import TwinkleModel
+from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
@@ -249,7 +249,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._decide_strategy(strategy, deepspeed_config=deepspeed_config)
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
-            model_id = HubOperation.download_model(model_id)
+            model_id = HubOperation.download_model(model_id, revision=kwargs.get('revision'))
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         if config is not None:
@@ -1119,8 +1119,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 save_optimizer: Whether to save optimizer state.
+                safe_serialization: Save weights with safetensors instead of torch serialization.
+                max_shard_size: Maximum size of each full-model weight shard.
+                save_total_limit: Maximum number of completed checkpoint directories to retain.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        safe_serialization = kwargs.pop('safe_serialization', True)
+        max_shard_size = kwargs.pop('max_shard_size', '5GB')
+        save_total_limit = kwargs.pop('save_total_limit', None)
         optimizer_config = self.optimizer_group[adapter_name]
         if name is None:
             name = f'checkpoint-step-{optimizer_config.cur_step}'
@@ -1130,7 +1136,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
-        save_kwargs = {}
+        save_kwargs = {
+            'safe_serialization': safe_serialization,
+            'max_shard_size': max_shard_size,
+        }
         if adapter_name == _default_adapter_name:
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
@@ -1138,10 +1147,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
 
         if isinstance(model, PeftModel):
+            if max_shard_size != '5GB':
+                raise NotImplementedError(
+                    'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
+                    'full-model checkpoint.')
             if Platform.is_master():
                 model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
                 contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
-                save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                if safe_serialization:
+                    save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                else:
+                    torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
         else:
             model.save_pretrained(
                 checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
@@ -1155,6 +1171,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 consumed_train_samples=kwargs.get('consumed_train_samples', 0),
             )
 
+        copy_checkpoint_args(output_dir, checkpoint_dir)
+        rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         return checkpoint_dir
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
@@ -1364,12 +1382,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if has_adapter:
             self.load(checkpoint_dir, adapter_name=adapter_name)
 
-        if not resume_only_model:
-            trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
-        else:
-            with open(os.path.join(checkpoint_dir, 'trainer_state.json')) as f:
-                trainer_state = json.load(f)
+        if resume_only_model:
+            optimizer_config = self.optimizer_group[adapter_name]
+            return {
+                'cur_step': 0,
+                'consumed_train_samples': 0,
+                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            }
 
+        trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
         return {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
