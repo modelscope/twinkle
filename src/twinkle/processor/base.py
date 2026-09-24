@@ -458,13 +458,19 @@ class InputProcessor:
             _inp['max_length_k'] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
+    @staticmethod
+    def _backend_builds_causal_mask(attention_mask_type: Optional[str]) -> bool:
+        """True when the accelerator synthesises its own causal mask.
+
+        MindSpeed rebuilds a compressed causal mask for FlashAttention, so
+        handing it the generic dense ``[B, 1, S, S]`` mask is both redundant and
+        expensive at long sequence lengths.
+        """
+        return attention_mask_type == 'causal' and Platform.device_prefix() == 'npu'
+
     def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        """On NPU, drop the generic 4D dense mask so MindSpeed can build
-        its own compressed causal mask for FlashAttention."""
-        if Platform.device_prefix() != 'npu':
-            return inputs
-        attention_mask_type = kwargs.get('attention_mask_type')
-        if attention_mask_type != 'causal':
+        """Drop a generic dense mask when the accelerator builds its causal mask."""
+        if not self._backend_builds_causal_mask(kwargs.get('attention_mask_type')):
             return inputs
         for _inp in inputs:
             attention_mask = _inp.get('attention_mask')
@@ -730,7 +736,10 @@ class InputProcessor:
                         continue
                 feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
-    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+    def _collate_macro_batch(self,
+                             inputs: List[InputFeature],
+                             *,
+                             omit_megatron_attention_mask: bool = False) -> InputFeature:
         # Work on local copies so squeezing doesn't mutate the caller's original samples.
         squeezed = []
         for _input in inputs:
@@ -782,7 +791,7 @@ class InputProcessor:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
                 if self.framework == 'megatron' and key == 'attention_mask':
-                    result[key] = self._create_4d_attention_mask(values)
+                    result[key] = (None if omit_megatron_attention_mask else self._create_4d_attention_mask(values))
                 elif key == 'position_ids' and is_mm_position_ids(values[0]):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                     num_axes = values[0].shape[0]
@@ -822,9 +831,11 @@ class InputProcessor:
                    **kwargs) -> List[InputFeature]:
         if len(inputs) == 1 and self.framework != 'megatron':
             return inputs
+        omit_megatron_attention_mask = (
+            self.framework == 'megatron' and self._backend_builds_causal_mask(kwargs.get('attention_mask_type')))
         if micro_batch_size is None:
             # normal collate
-            outputs = self._collate_macro_batch(inputs)
+            outputs = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             for key in outputs:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
@@ -835,7 +846,8 @@ class InputProcessor:
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
-                _output = self._collate_macro_batch(inputs[i:i + micro_batch_size])
+                _output = self._collate_macro_batch(
+                    inputs[i:i + micro_batch_size], omit_megatron_attention_mask=omit_megatron_attention_mask)
                 for key in _output:
                     if key in self.VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
@@ -843,14 +855,16 @@ class InputProcessor:
             return outputs
         else:
             # each macro batch shares the same length
-            res = self._collate_macro_batch(inputs)
+            res = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             keys = list(res.keys())
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 end = i + micro_batch_size
                 output = {}
                 for key in keys:
-                    if key == 'position_ids' and res[key].dim() > 2:
+                    if res[key] is None:
+                        output[key] = None
+                    elif key == 'position_ids' and res[key].dim() > 2:
                         output[key] = res[key][:, i:end, :]
                     elif key in self.VLM_CONCAT_FIELDS:
                         output[key] = torch.cat(res[key][i:end], dim=0)
