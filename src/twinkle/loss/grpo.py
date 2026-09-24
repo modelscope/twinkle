@@ -384,6 +384,16 @@ class PPOLoss(GRPOLoss):
                              f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
         self.loss_agg_mode = loss_agg_mode
 
+    def micro_batch_scale(self, inputs, indices):
+        if self.loss_agg_mode != 'token-mean':
+            return super().micro_batch_scale(inputs, indices)
+        import torch
+        token_counts = [
+            self._resolve_loss_mask(model_input, torch.atleast_2d(torch.as_tensor(model_input['labels']))).sum().item()
+            for model_input in inputs
+        ]
+        return sum(token_counts[index] for index in indices) / max(sum(token_counts), 1)
+
     def _aggregate_loss(
         self,
         per_token_loss: 'torch.Tensor',
