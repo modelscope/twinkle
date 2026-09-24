@@ -35,6 +35,22 @@ class DataAppendRequest(BaseModel):
     tags: list[dict[str, Any]] | None = None
 
 
+class DataCreateRequest(BaseModel):
+    """Pre-allocate a DataRef whose row keys are filled incrementally later."""
+
+    size: int
+    kind: str = 'data'
+
+
+class DataPutRowsRequest(BaseModel):
+    """Overwrite specific row keys of an existing ref in place."""
+
+    ref: DataRef
+    rows: list[dict[str, Any]]
+    indices: list[int]
+    tags: list[dict[str, Any]] | None = None
+
+
 class DataReleaseRequest(BaseModel):
     ref: DataRef
 
