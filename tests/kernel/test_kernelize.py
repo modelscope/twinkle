@@ -57,21 +57,28 @@ def test_kernelize_rejects_unknown_key_type():
 def test_kernelize_no_mapping_applies_default_config(monkeypatch, caplog):
     """kernelize(model) with no mapping applies DEFAULT_KERNEL_CONFIG.
 
-    On a CPU platform with no liger_kernel installed, every default entry is
-    unavailable or its family is missing -> model unchanged, and (default
-    config path) no WARNING-level noise.
+    With every backend unavailable, the model stays unchanged and the default
+    config path emits no WARNING-level noise. Backend resolution is mocked so
+    the test is deterministic even when optional kernels are installed.
     """
     import logging
 
-    from twinkle.utils.device_mesh import Platform
+    from twinkle.kernel import core
 
-    monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda platform=None: 'cpu'))
+    resolved = []
+
+    def unavailable(op, backends, **kwargs):
+        resolved.append((op, backends, kwargs))
+        return None, None
+
+    monkeypatch.setattr(core, 'resolve_impl', unavailable)
 
     parent = nn.Sequential(_SrcLayer())
     with caplog.at_level(logging.WARNING):
         out = kernelize(parent)
     assert out is parent
     assert type(parent[0]) is _SrcLayer
+    assert resolved
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
