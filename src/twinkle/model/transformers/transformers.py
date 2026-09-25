@@ -34,6 +34,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
@@ -41,12 +42,49 @@ from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, create_galore_pa
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
+from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
+                           replayed_selective_log_softmax, selective_log_softmax, torch_util)
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
+
+CHECKPOINT_ADAPTER_NAME = 'default'
+
+
+def _get_vocab_size(config: PretrainedConfig) -> int:
+    """Resolve the LM vocabulary size without running a sharded model forward."""
+    vocab_size = getattr(config, 'vocab_size', None)
+    if vocab_size is None:
+        text_config = getattr(config, 'text_config', None)
+        vocab_size = getattr(text_config, 'vocab_size', None)
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError('sampling replay requires a positive vocab_size in the model config')
+    return vocab_size
+
+
+def _prepare_sampling_replay(
+    labels: torch.Tensor,
+    sampling_masks,
+    temperature: float,
+    vocab_size: int,
+    allow_packed_masks: bool,
+):
+    """Build the labels and metadata shared by training and evaluation replay."""
+    if labels is None:
+        raise ValueError('labels are required when sampling replay is enabled')
+    loss_mask = (labels != -100).bool()
+    masked_labels = labels.masked_fill(~loss_mask, 0)
+    metadata = prepare_replayed_selective_log_softmax(
+        labels=labels,
+        loss_mask=loss_mask,
+        sampling_masks=sampling_masks,
+        temperature=temperature,
+        vocab_size=vocab_size,
+        allow_packed_masks=allow_packed_masks,
+    )
+    return loss_mask, masked_labels, metadata
 
 
 def _resolve_task_context(model, task, template=None):
@@ -192,6 +230,45 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
 
 
+def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+    """Read a full HuggingFace checkpoint directory into a CPU state dict.
+
+    Supports both single-file and sharded ``safetensors`` layouts, falling back
+    to ``pytorch_model.bin`` variants. Returns tensors on CPU.
+    """
+    import json
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    st_index = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+    st_single = os.path.join(checkpoint_dir, 'model.safetensors')
+    bin_index = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+    bin_single = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+    if os.path.exists(st_index) or os.path.exists(st_single):
+        from safetensors.torch import load_file
+        if os.path.exists(st_index):
+            with open(st_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(load_file(os.path.join(checkpoint_dir, shard), device='cpu'))
+        else:
+            state_dict.update(load_file(st_single, device='cpu'))
+    elif os.path.exists(bin_index) or os.path.exists(bin_single):
+        if os.path.exists(bin_index):
+            with open(bin_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(
+                    torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
+        else:
+            state_dict.update(torch.load(bin_single, map_location='cpu', weights_only=True))
+    else:
+        raise FileNotFoundError(f'No safetensors/bin weights found in {checkpoint_dir}')
+    return state_dict
+
+
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
@@ -235,6 +312,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             model_loader: Optional[Any] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
+        # equivalent): sporadic `mha_graph.execute` RuntimeError on Blackwell + CUDA 13
+        # (ablate12 E7 crashed at update 21 mid-forward). Env-gated to keep default behavior.
+        if os.environ.get('TWINKLE_DISABLE_CUDNN_SDP', '0') == '1':
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         # The Default tokenizer will be used to save with a model if no template was set.
@@ -288,6 +370,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **load_kwargs)
+        # ``from_pretrained``/``from_config`` may deepcopy the supplied config before
+        # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
+        # config reference aligned with the config that the model actually uses.
+        self.hf_config = self.model.config
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -525,6 +611,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -545,6 +632,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+        if enable_sampling_replay:
+            if sampling_masks is None:
+                raise ValueError('sampling_masks are required when sampling replay is enabled')
+            cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+            if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                raise ValueError('sampling replay does not support sequence or context parallelism')
+        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -556,6 +651,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
+        # Not a model argument; the loss reads it back off `inputs` further down.
+        completion_mask = inputs.pop('completion_mask', None)
+        replay_metadata = replay_loss_mask = replay_masked_labels = None
+        if enable_sampling_replay:
+            replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
+                labels=labels,
+                sampling_masks=sampling_masks,
+                temperature=temperature,
+                vocab_size=_get_vocab_size(self.hf_config),
+                allow_packed_masks=(processor.padding_free
+                                    or processor._is_packed_position_ids(inputs.get('position_ids'))),
+            )
         optimizer_config.accumulate_metrics(True)
 
         # Routing replay: respects router_replay_action regardless of caller
@@ -578,18 +685,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs['loss_scale'] = loss_scale
         if channel is not None:
             inputs['channel'] = channel
+        if completion_mask is not None:
+            inputs['completion_mask'] = completion_mask
         if task != 'embedding' and labels is not None and loss_require_logps:
-            loss_mask = (labels != -100).bool()
-            masked_labels = labels.clone()
-            masked_labels[~loss_mask] = 0
+            loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
+            masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
             logits = outputs['logits']
-            logits.div_(temperature)
-            if loss_require_entropy:
+            if enable_sampling_replay:
+                outputs['logps'] = replayed_selective_log_softmax(
+                    logits=logits,
+                    labels=masked_labels,
+                    loss_mask=loss_mask,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    metadata=replay_metadata,
+                )
+            elif loss_require_entropy:
+                logits.div_(temperature)
                 outputs['logps'], outputs['entropies'] = selective_log_softmax(
                     logits, masked_labels, return_entropy=True)
             else:
+                logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
+        if loss_require_values:
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -621,6 +742,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -643,6 +765,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_require_logits = getattr(loss_instance, 'require_logits', False)
             loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+            if enable_sampling_replay:
+                if sampling_masks is None:
+                    raise ValueError('sampling_masks are required when sampling replay is enabled')
+                cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+                if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                    raise ValueError('sampling replay does not support sequence or context parallelism')
+            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -653,6 +783,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
+            # Not a model argument; the loss reads it back off `inputs` further down.
+            completion_mask = inputs.pop('completion_mask', None)
+            replay_metadata = replay_loss_mask = replay_masked_labels = None
+            if enable_sampling_replay:
+                packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
+                replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
+                    labels=labels,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    vocab_size=_get_vocab_size(self.hf_config),
+                    allow_packed_masks=processor.padding_free or packed_position_ids,
+                )
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
@@ -678,18 +820,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs['loss_scale'] = loss_scale
             if channel is not None:
                 inputs['channel'] = channel
+            if completion_mask is not None:
+                inputs['completion_mask'] = completion_mask
             if task != 'embedding' and labels is not None and loss_require_logps:
-                loss_mask = (labels != -100).bool()
-                masked_labels = labels.clone()
-                masked_labels[~loss_mask] = 0
+                loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
+                masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
                 logits = outputs['logits']
-                logits.div_(temperature)
-                if loss_require_entropy:
+                if enable_sampling_replay:
+                    outputs['logps'] = replayed_selective_log_softmax(
+                        logits=logits,
+                        labels=masked_labels,
+                        loss_mask=loss_mask,
+                        sampling_masks=sampling_masks,
+                        temperature=temperature,
+                        metadata=replay_metadata,
+                    )
+                elif loss_require_entropy:
+                    logits.div_(temperature)
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
                         logits, masked_labels, return_entropy=True)
                 else:
+                    logits.div_(temperature)
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
+            if loss_require_values:
+                values = outputs['logits']
+                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
@@ -777,8 +933,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
-        optimizer_config.cur_step += 1
-        should_sync = optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+        increment_step = kwargs.pop('_increment_step', True)
+        if increment_step:
+            optimizer_config.cur_step += 1
+        sync_gradients = kwargs.pop('sync_gradients', None)
+        should_sync = (
+            optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+            if sync_gradients is None else bool(sync_gradients))
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
@@ -802,6 +963,117 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optimizer_config.train_status.loss_value = None
 
+    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        processor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
+        optimizer_config._ensure_dp_group()
+        dp_group = optimizer_config._dp_group
+        min_micro_batches = 1
+        while True:
+            try:
+                plan = plan_micro_batches(
+                    inputs,
+                    config,
+                    padding_free=processor.padding_free,
+                    min_micro_batches=min_micro_batches,
+                )
+                planning_error = None
+            except Exception as exc:
+                if dp_group is None:
+                    raise
+                plan = None
+                planning_error = f'{type(exc).__name__}: {exc}'
+
+            if dp_group is None:
+                return plan
+
+            local_state = {
+                'micro_batch_count': len(plan) if plan is not None else None,
+                'input_count': len(inputs),
+                'error': planning_error,
+            }
+            states = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(states, local_state, group=dp_group)
+            errors = [
+                f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
+            ]
+            if errors:
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
+
+            counts = [state['micro_batch_count'] for state in states]
+            if all(count == len(plan) for count in counts):
+                return plan
+            min_micro_batches = max(counts)
+            if any(min_micro_batches > state['input_count'] for state in states):
+                raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
+                                 'make the input batch divisible by the model data-parallel size')
+
+    def _forward_backward_micro_batch(
+        self,
+        *,
+        inputs,
+        optimizer_config,
+        loss_scale,
+        sync_gradients,
+        increment_step,
+        **kwargs,
+    ):
+        outputs = self.forward(
+            inputs=inputs,
+            router_replay_manual_cleanup=True,
+            **kwargs,
+        )
+        previous_normalizer = optimizer_config.train_status.num_tokens
+        loss = self.calculate_loss(**kwargs)
+        normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
+        optimizer_config.train_status.loss_value = (optimizer_config.train_status.loss_value * loss_scale)
+        optimizer_config.train_status.num_tokens = (previous_normalizer + normalizer_delta * loss_scale)
+        outputs['loss'] = loss * loss_scale
+        self.backward(
+            sync_gradients=sync_gradients,
+            _increment_step=increment_step,
+            **kwargs,
+        )
+        return outputs
+
+    def _forward_backward_micro_batches(
+        self,
+        *,
+        inputs,
+        config,
+        sync_gradients,
+        loss_scale,
+        **kwargs,
+    ):
+        adapter_name = kwargs.get('adapter_name')
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        optimizer_config = self.optimizer_group[adapter_name]
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)
+
+        local_batch_size = len(inputs)
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        outputs = {}
+        loss_instance = optimizer_config.loss_instance
+        for micro_batch_index, indices in enumerate(plan):
+            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_loss_scale = loss_scale * loss_instance.micro_batch_scale(inputs, indices)
+            is_last_micro_batch = micro_batch_index == len(plan) - 1
+            outputs = self._forward_backward_micro_batch(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                loss_scale=micro_loss_scale,
+                sync_gradients=sync_gradients if is_last_micro_batch else False,
+                increment_step=is_last_micro_batch,
+                **micro_kwargs,
+            )
+        return outputs
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
@@ -812,10 +1084,26 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 gradient_accumulation_steps: Number of gradient accumulation steps.
+                micro_batch_size: Maximum samples processed per rank in one forward/backward.
+                dynamic_batching: Pack sequences by token cost instead of fixed sample slices.
+                max_tokens_per_micro_batch: Per-rank token limit used by dynamic batching.
+                packing_algorithm: Dynamic packing algorithm.
+                sync_gradients: Override gradient synchronization on the final micro-batch.
+                loss_scale: Weight applied to this input batch's loss.
                 Any parameters needed for the specific loss type.
         Returns:
             The output of the model forward.
         """
+        micro_batch_config = MicroBatchConfig.from_kwargs(kwargs)
+        if micro_batch_config is not None:
+            return self._forward_backward_micro_batches(
+                inputs=inputs,
+                config=micro_batch_config,
+                sync_gradients=kwargs.pop('sync_gradients', None),
+                loss_scale=float(kwargs.pop('loss_scale', 1.0)),
+                **kwargs,
+            )
+
         outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss
@@ -950,7 +1238,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optim_params = kwargs.pop('optim_params', {})
         if optim_params:
-            assert isinstance(optimizer, (AdamW, Adam))
+            # After _lazy_wrap_model the optimizer may be wrapped (e.g.
+            # accelerate's AcceleratedOptimizer); check the inner instance.
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            assert isinstance(inner_optimizer, (AdamW, Adam)), \
+                f'optim_params is only supported for Adam/AdamW, got {type(inner_optimizer).__name__}'
             for group in optimizer.param_groups:
                 group['lr'] = optim_params['lr']
                 if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
@@ -1040,6 +1332,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metric copies the dp group at construction, and OptimizerGroup builds metrics before
+        # dist init -- so rebuild here (first path that runs post-init on every backend) to get
+        # dp-wide token-weighted logging. Logging only; gradients are unaffected.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         galore_config = kwargs.pop('galore_config', None)
         muon_config = kwargs.pop('muon_config', None)
@@ -1074,7 +1370,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         is_default = adapter_name == _default_adapter_name
         # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
         # parameters to be missed by the optimizer.
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}')
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -1180,11 +1476,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Avoid collecting the full base model for large FSDP/EP jobs.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
+        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
         processed_state_dict = {}
         for key, value in adapter_state.items():
-            normalized = key.replace(adapter_suffix, '.')
+            if modules_to_save_infix in key:
+                normalized = key.replace(modules_to_save_infix, '.')
+            else:
+                normalized = key.replace(adapter_suffix, '.')
             processed_state_dict[normalized] = value
         return processed_state_dict
+
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """Map runtime optimizer parameter names to checkpoint names."""
+        return {}
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1194,7 +1498,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if optimizer is not None:
             optimizer_path = os.path.join(output_dir, 'optimizer.pt')
-            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
+            name_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            self.strategy.save_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=name_mapping,
+            )
         if Platform.is_master():
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
@@ -1266,10 +1576,30 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
             self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
-            raise NotImplementedError
+            # Full-parameter model: load a plain HF checkpoint in-place.
+            state_dict = _read_hf_state_dict(checkpoint_dir)
+            self.strategy.load_full_state_dict(self.model, state_dict)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+
+    @remote_function()
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from ``self.model_id``.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        if not self.model_id:
+            logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
+            return
+        state_dict = _read_hf_state_dict(self.model_id)
+        self.strategy.load_full_state_dict(self.model, state_dict)
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        for param in self.model.parameters():
+            param.grad = None
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1289,7 +1619,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
-            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
+            optimizer = optimizer_config.optimizer
+            save_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            load_mapping = {logical_name: physical_name for physical_name, logical_name in save_mapping.items()}
+            self.strategy.load_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=load_mapping,
+            )
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
@@ -1653,10 +1991,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
-            else:
-                if 'conv1d.weight' in name:
-                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
-                        name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
+            return name
+
+        def _add_base_layer_suffix(name):
+            # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
+            # only their ``.base_layer.*`` param, even when PEFT does not target
+            # them on the training side (e.g. linear-attn ``conv1d`` /
+            # ``in_proj_qkvz``).  Rename to match whenever the sampler exposes
+            # the ``.base_layer.`` variant.
+            base_layer_name = None
+            if name.endswith('.weight'):
+                base_layer_name = f'{name[:-7]}.base_layer.weight'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            elif name.endswith('.bias'):
+                base_layer_name = f'{name[:-5]}.base_layer.bias'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            if 'experts' in name and base_layer_name is not None:
+                return base_layer_name
             return name
 
         def _print_weight_example(names):
@@ -1701,11 +2054,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     _print_weight_example(names)
 
         else:
-            # First full base-model sync.  Whether to keep ``.base_layer.``
-            # depends on whether the sampler uses ``enable_lora``:
-            #   merge_and_sync=True  → enable_lora=False → strip .base_layer
-            #   merge_and_sync=False → enable_lora=True  → keep .base_layer
-            keep_base_layer = not merge_and_sync
+            # First full base-model sync.  When the sampler runs with
+            # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
+            # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
+            # (detected via ``model_keys``); otherwise send canonical names.
+            add_base_layer = not merge_and_sync
             state_dict = model.state_dict()
 
             def weight_generator():
@@ -1714,7 +2067,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    name = _normalize(name, keep_base_layer=keep_base_layer)
+                    name = _normalize(name, keep_base_layer=False)
+                    if add_base_layer:
+                        name = _add_base_layer_suffix(name)
                     names.append(name)
                     yield name, tensor
                 _print_weight_example(names)

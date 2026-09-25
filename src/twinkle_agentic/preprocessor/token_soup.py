@@ -5,7 +5,7 @@ import unicodedata
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import msg_content_text
+from twinkle_agentic.utils.message_utils import msg_content_text
 
 # ── Pre-compiled patterns ─────────────────────────────────────────────────────
 

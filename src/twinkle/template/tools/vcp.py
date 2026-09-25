@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .base import ToolCallParser
 
@@ -39,7 +39,15 @@ class VCPParser(ToolCallParser):
         return _VCP_OPEN in (text or '')
 
     def parse(self, text: str) -> List[Dict[str, Any]]:
+        return self._scan(text)[0]
+
+    def parse_errors(self, text: str) -> List[str]:
+        return self._scan(text)[1]
+
+    def _scan(self, text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Calls and failures from one pass, so the two cannot disagree."""
         calls: List[Dict[str, Any]] = []
+        errors: List[str] = []
         for block in _VCP_BLOCK_RE.findall(text or ''):
             args: Dict[str, Any] = {}
             name = ''
@@ -51,6 +59,8 @@ class VCPParser(ToolCallParser):
                 else:
                     args[k] = v
             if not name:
+                errors.append('the block has no "tool_name:" line, '
+                              'so there is no tool to call')
                 continue
             calls.append({
                 'type': 'function',
@@ -59,7 +69,7 @@ class VCPParser(ToolCallParser):
                     'arguments': args,
                 },
             })
-        return calls
+        return calls, errors
 
     def clean(self, text: str) -> str:
         return _VCP_BLOCK_RE.sub('', text or '').rstrip()

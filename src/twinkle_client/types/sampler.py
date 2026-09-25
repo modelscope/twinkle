@@ -34,6 +34,8 @@ class SampleResponseModel(BaseModel):
     """Mirroring twinkle.data_format.SampleResponse."""
     sequences: List[SampledSequenceModel] = Field(
         ..., description='List of sampled sequences')
+    prompt_token_ids: Optional[List[int]] = Field(
+        None, description='Token IDs of the prompt the sequences continue')
     prompt_logprobs: Optional[List[Optional[float]]] = None
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
 

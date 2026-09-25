@@ -110,7 +110,18 @@ class ClineParser(ToolCallParser):
         return False
 
     def parse(self, text: str) -> list[dict[str, Any]]:
+        return self._scan(text)[0]
+
+    def parse_errors(self, text: str) -> list[str]:
+        return self._scan(text)[1]
+
+    def _scan(self, text: str) -> tuple[list[dict[str, Any]], list[str]]:
+        """Calls and failures from one pass, so the two cannot disagree.
+
+        A tag on the deny list is not a failure: those are skipped on purpose.
+        """
         calls: list[dict[str, Any]] = []
+        errors: list[str] = []
         for m in _BLOCK_RE.finditer(text or ''):
             tool = m.group('tool')
             if tool in _DENY:
@@ -119,6 +130,8 @@ class ClineParser(ToolCallParser):
             for pm in _PARAM_RE.finditer(m.group('body')):
                 args[pm.group('key')] = pm.group('val').strip()
             if not args:
+                errors.append(f'<{tool}> holds no <parameter>...</parameter> pair, '
+                              f'so the call has no arguments')
                 continue
             calls.append({
                 'type': 'function',
@@ -127,7 +140,7 @@ class ClineParser(ToolCallParser):
                     'arguments': args
                 },
             })
-        return calls
+        return calls, errors
 
     def clean(self, text: str) -> str:
         if not text:

@@ -9,9 +9,11 @@ Provides:
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class TaskStatus(Enum):
@@ -47,3 +49,9 @@ class QueuedTask:
     task_type: str | None
     created_at: float
     first_rate_limited_at: float | None = None
+    # ``schedule_task_and_wait`` is an in-process request/response path.  Its
+    # potentially large result is delivered through this Future instead of
+    # being persisted in ServerState merely for the same process to read it
+    # back.  Polling-style ``schedule_task`` leaves this as ``None``.
+    completion: asyncio.Future[Any] | None = None
+    persist_status: bool = True

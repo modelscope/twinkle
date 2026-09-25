@@ -87,10 +87,21 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         stop=body.sampling_params.stop,
                     )
 
+                # A resolved checkpoint is either a LoRA adapter dir (has
+                # adapter_config.json) or a full-parameter HF checkpoint. Full
+                # checkpoints are loaded into the sampler base model instead of
+                # being passed as a LoRA adapter.
+                lora_path = None
+                if adapter_uri:
+                    if os.path.exists(os.path.join(adapter_uri, 'adapter_config.json')):
+                        lora_path = adapter_uri
+                    else:
+                        self.sampler.load_full_weights_from_path(adapter_uri)
+
                 responses = self.sampler.sample(
                     inputs=[prompt_inputs] * body.num_samples,
                     sampling_params=sampling_params,
-                    adapter_path=adapter_uri,
+                    adapter_path=lora_path,
                 )
 
                 tinker_sequences = []

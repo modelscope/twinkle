@@ -193,6 +193,11 @@ class TwinkleCompatMockModel:
         return None
 
     @remote_function()
+    def reload_initial_weights(self, *args: Any, **kwargs: Any) -> None:
+        """No-op reload for the mock full-parameter path."""
+        return None
+
+    @remote_function()
     def resume_from_checkpoint(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return {'status': 'ok', 'progress': {}}
 

@@ -88,9 +88,14 @@ class VLLMLoraWeights(Patch):
                 # loading weights, throwing an exception if validation fails.
                 peft_helper.validate_legal(self.lora_config)
                 # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
-                # to ensure correct loading of lora weights.
+                # to ensure correct loading of lora weights. Drop the QKV/MLP fusion
+                # substr maps so constituent names (e.g. `q_proj`) survive for the
+                # LoRA manager to pack, while keeping genuine renames/prefixes.
+                # (align with vllm.lora.worker_manager.WorkerLoRAManager._load_adapter)
                 model = self._adapter_manager.model
                 hf_to_vllm_mapper = getattr(model, 'hf_to_vllm_mapper', None)
+                if hf_to_vllm_mapper is not None and hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
+                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
 
                 lora_request_kwargs = {
                     'peft_helper': peft_helper,
@@ -130,6 +135,29 @@ class VLLMLoraWeights(Patch):
                                      f'lora_extra_vocab_size {self.lora_config.lora_extra_vocab_size}.')
             return lora
 
+        # Cache the cache-wrapped template tokenizer (keyed by id) so we wrap once, not per request.
+        _wrapped_tok_cache: Dict[int, object] = {}
+
+        def _ensure_max_token_id(tokenizer):
+            """
+            vllm's Processor._validate_model_input reads ``tokenizer.max_token_id``, an attribute
+            that only exists on vllm's ``CachedTokenizer`` wrapper. The sampler template tokenizer is
+            a RAW HF tokenizer (never passed through vllm's ``get_cached_tokenizer``), so validation
+            raises ``AttributeError: ... has no attribute max_token_id``. Wrap it once to add the attr.
+            """
+            if tokenizer is None or hasattr(tokenizer, 'max_token_id'):
+                return tokenizer
+            key = id(tokenizer)
+            wrapped = _wrapped_tok_cache.get(key)
+            if wrapped is None:
+                try:
+                    from vllm.transformers_utils.tokenizer import get_cached_tokenizer
+                    wrapped = get_cached_tokenizer(tokenizer)
+                except Exception:
+                    wrapped = tokenizer
+                _wrapped_tok_cache[key] = wrapped
+            return wrapped
+
         def patched_get_lora_tokenizer(self: TokenizerGroup, lora_request: LoRARequest):
             # since we pass dummy path, skip get tokenizer from path
             # Use lazy tokenizer access
@@ -137,7 +165,7 @@ class VLLMLoraWeights(Patch):
             if tokenizer is None:
                 # Fallback to the original method if tokenizer not available
                 return self._old_get_lora_tokenizer(lora_request)
-            return tokenizer
+            return _ensure_max_token_id(tokenizer)
 
         if not hasattr(LRUCacheWorkerLoRAManager, '_old_load_adapter'):
             _old_load_adapter = LRUCacheWorkerLoRAManager._load_adapter

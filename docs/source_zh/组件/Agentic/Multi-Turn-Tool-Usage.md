@@ -19,8 +19,9 @@ Agentic rollout 管线由四个核心组件组成：
 from twinkle_agentic.protocol.openai import OpenAI
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle.data_format.sampling import SamplingParams
+from twinkle.template import Template
 
 # 1. 定义工具
 class WeatherTool(Tool):
@@ -47,16 +48,17 @@ class WeatherTool(Tool):
 # 2. 设置 ToolManager
 manager = ToolManager([WeatherTool()])
 
-# 3. 创建 API 客户端
-api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1')
+# 3. 创建 API 客户端，以及用于编码 API 回复的本地 template
+api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1', concurrency=8)
+template = Template(model_id='Qwen/Qwen3.5-32B')
 
 # 4. 创建 rollout
-rollout = APIMultiTurnRollout(
+rollout = MultiTurnRollout(
     api=api,
+    template=template,
     tool_manager=manager,
     sampling_params=SamplingParams(temperature=0.7, max_tokens=2048),
     max_turns=6,
-    concurrency=8,
 )
 
 # 5. 准备轨迹
@@ -138,7 +140,7 @@ env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 
 # 照常在 rollout 中使用 manager
-rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
+rollout = MultiTurnRollout(api=api, template=template, tool_manager=manager, max_turns=10)
 ```
 
 ## 使用 OpenEnv 环境
@@ -193,11 +195,12 @@ results = rollout(trajectories, tool_manager=managers)
 
 ## 跟踪调试
 
-两种 rollout 实现都支持跟踪文件输出用于调试：
+统一的 rollout 支持跟踪文件输出用于调试：
 
 ```python
-rollout = APIMultiTurnRollout(
+rollout = MultiTurnRollout(
     api=api,
+    template=template,
     tool_manager=manager,
     trace_dir='traces/',
     trace_callback=lambda t: t['turns'] > 1,    # 仅存储多轮对话

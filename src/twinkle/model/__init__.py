@@ -6,12 +6,18 @@ from twinkle.utils.import_utils import _LazyModule
 if TYPE_CHECKING:
     from .base import TwinkleModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
-    from .transformers import MultiLoraTransformersModel, TransformersModel
+    from .micro_batch import MicroBatchConfig
+    from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
+                               TransformersValueModel)
 
 else:
     _import_structure = {
         'base': ['TwinkleModel'],
-        'transformers': ['TransformersModel', 'MultiLoraTransformersModel'],
+        'micro_batch': ['MicroBatchConfig'],
+        'transformers': [
+            'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',
+            'TransformersValueModel'
+        ],
         'megatron': ['MegatronModel', 'MultiLoraMegatronModel'],
     }
 

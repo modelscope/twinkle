@@ -149,3 +149,34 @@ def test_extract_rl_features_keeps_grpo_logps_and_advantages_ragged():
 
     assert result['old_logps'] == [[1.0, 2.0, 3.0], [4.0, 5.0]]
     assert result['advantages'] == [[0.5, 0.5, 0.5], [-0.5, -0.5]]
+
+
+def test_normalize_ref_outputs_flattens_and_pads_serialized_logps():
+    kwargs = {
+        'ref_outputs': {
+            'logps': [
+                [[1.0, 2.0, 3.0], [4.0, 5.0]],
+                [[6.0, 7.0]],
+            ]
+        }
+    }
+
+    TwinkleCompatModelBase._normalize_ref_outputs(kwargs)
+
+    torch.testing.assert_close(
+        kwargs['ref_outputs']['logps'],
+        torch.tensor([
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 0.0],
+            [6.0, 7.0, 0.0],
+        ]),
+    )
+
+
+def test_normalize_ref_outputs_keeps_tensor_unchanged():
+    logps = torch.tensor([[1.0, 2.0]])
+    kwargs = {'ref_outputs': {'logps': logps}}
+
+    TwinkleCompatModelBase._normalize_ref_outputs(kwargs)
+
+    assert kwargs['ref_outputs']['logps'] is logps

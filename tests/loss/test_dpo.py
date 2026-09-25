@@ -42,6 +42,15 @@ class TestDPOLoss:
         assert isinstance(result, dict) and 'loss' in result
         assert result['loss'].dim() == 0
 
+    def test_json_ref_outputs_match_tensor_ref_outputs(self):
+        loss_fn = DPOLoss(beta=0.1, loss_type='sigmoid')
+        inputs, outputs, ref_logps = _make_preference_batch()
+
+        tensor_result = loss_fn(inputs, outputs, ref_outputs={'logps': ref_logps})
+        json_result = loss_fn(inputs, outputs, ref_outputs={'logps': ref_logps.tolist()})
+
+        torch.testing.assert_close(json_result['loss'], tensor_result['loss'])
+
     def test_dpo_hinge(self):
         loss_fn = DPOLoss(beta=0.1, loss_type='hinge')
         inputs, outputs, ref_logps = _make_preference_batch()

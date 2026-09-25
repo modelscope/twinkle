@@ -465,9 +465,9 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-# Base model
-base_model = 'Qwen/Qwen3.5-4B'
-base_url = 'http://www.modelscope.cn/twinkle'
+# Base model (currently deployed in the ModelScope official environment)
+base_model = 'Qwen/Qwen3.8-27B'
+base_url = 'https://www.modelscope.cn/twinkle'
 
 
 def train():
@@ -530,7 +530,7 @@ Alongside the open-source release of Twinkle, ModelScope provides a hosted model
 
 ```python
 base_url = 'https://www.modelscope.cn/twinkle'
-base_model = 'Qwen/Qwen3.5-4B'  # Model currently deployed in the official environment
+base_model = 'Qwen/Qwen3.8-27B'  # Model currently deployed in the official environment
 ```
 
 ---

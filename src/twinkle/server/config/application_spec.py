@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Per-deployment ``ApplicationSpec`` and typed argument schemas.
 
-Each deployment kind (``server | model | sampler | processor``) carries its
+Each deployment kind (``server | model | sampler | processor | data_plane``) carries its
 own ``args`` block with strict field validation. ``ApplicationSpec`` holds
 the routing metadata plus the deployment kind and validates ``args`` against
 the matching ``*Args`` schema in a model validator.
@@ -11,7 +11,8 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import math
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Any, Literal
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
@@ -41,6 +42,21 @@ class HttpOptions(BaseModel):
 # ---------- per-deployment args schemas ------------------------------------ #
 
 
+class SpectralHybridArgs(_ArgsBase):
+    """Strict server-owned Spectral Hybrid allocation and optimizer defaults."""
+
+    allocation_path: str = Field(min_length=1)
+    default_lr_lora: float = Field(default=2.5e-5, gt=0)
+    default_lr_fft: float = Field(default=1.0e-6, gt=0)
+
+    @field_validator('default_lr_lora', 'default_lr_fft')
+    @classmethod
+    def _finite_learning_rate(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError('learning rate must be finite')
+        return value
+
+
 class ModelArgs(_ArgsBase):
     """Args for the ``model`` deployment.
 
@@ -54,10 +70,27 @@ class ModelArgs(_ArgsBase):
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
+    train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
+    strategy: Literal['accelerate', 'native_fsdp'] | None = None
     adapter_config: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_loras: int = 5
+    max_r: int = Field(default=32, gt=0)
     max_length: int | None = None
+    target_modules: str | list[str] = 'all-linear'
+    hybrid: SpectralHybridArgs | None = None
+    data_plane_url: str | None = None
+
+    @model_validator(mode='after')
+    def _validate_spectral_backend(self):
+        if self.strategy is not None and self.backend != 'transformers':
+            raise ValueError('strategy is only supported by the transformers backend')
+        if self.hybrid is not None:
+            if self.backend != 'transformers':
+                raise ValueError('hybrid is only supported by the transformers backend')
+            if self.train_mode == 'full':
+                raise ValueError('hybrid is not supported with train_mode="full"')
+        return self
 
 
 class SamplerArgs(_ArgsBase):
@@ -70,9 +103,10 @@ class SamplerArgs(_ArgsBase):
     nproc_per_node: int = 1
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
-    sampler_type: Literal['mock', 'vllm', 'torch']
+    sampler_type: Literal['mock', 'vllm', 'vllm_async', 'torch']
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    data_plane_url: str | None = None
 
 
 class ServerStateArgs(_ArgsBase):
@@ -111,11 +145,18 @@ class ProcessorArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
+class DataPlaneArgs(_ArgsBase):
+    """Args for the TransferQueue-backed client data plane."""
+
+    config: dict[str, Any] | None = None
+
+
 _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
     'server': ServerArgs,
     'model': ModelArgs,
     'sampler': SamplerArgs,
     'processor': ProcessorArgs,
+    'data_plane': DataPlaneArgs,
 }
 
 # ---------- ApplicationSpec ------------------------------------------------ #
@@ -137,12 +178,12 @@ class ApplicationSpec(BaseModel):
 
     name: str
     route_prefix: str = '/'
-    import_path: Literal['server', 'model', 'sampler', 'processor']
+    import_path: Literal['server', 'model', 'sampler', 'processor', 'data_plane']
     # ``args`` is always populated by the ``mode='before'`` validator below
     # (which validates the raw block against the schema selected by
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
     deployments: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode='before')
@@ -169,3 +210,23 @@ class ApplicationSpec(BaseModel):
         # ``schema.model_validate`` rejects a non-dict itself with a clean
         # error, so no separate non-dict guard is needed here.
         return {**data, 'args': schema.model_validate(raw_args)}
+
+    @model_validator(mode='after')
+    def _validate_full_mode_single_replica(self) -> ApplicationSpec:
+        """``train_mode: full`` requires exactly one replica.
+
+        The exclusive-tenant lock lives in per-replica memory
+        (``ModelManagement._resource_records``), so more than one replica would
+        silently allow one full-parameter tenant per replica, each rewriting
+        its own copy of the base weights. Reject that at config-load time.
+        """
+        if not (isinstance(self.args, ModelArgs) and self.args.train_mode == 'full'):
+            return self
+        for dep in self.deployments:
+            num_replicas = dep.get('num_replicas')
+            max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
+            if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
+                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
+                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
+                                 'max_replicas to 1.')
+        return self

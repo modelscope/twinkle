@@ -125,6 +125,16 @@ class ComputeWorker:
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _complete_result(task: QueuedTask, result: Any) -> None:
+        if task.completion is not None and not task.completion.done():
+            task.completion.set_result(result)
+
+    @staticmethod
+    def _complete_error(task: QueuedTask, error: str) -> None:
+        if task.completion is not None and not task.completion.done():
+            task.completion.set_exception(RuntimeError(error))
+
     async def _store_task_failed(
         self,
         task: QueuedTask,
@@ -133,14 +143,16 @@ class ComputeWorker:
         queue_state_reason: str | None = None,
     ) -> None:
         """Store FAILED status with a standardised error payload."""
-        await self._state.store_future_status(
-            task.request_id,
-            TaskStatus.FAILED.value,
-            task.model_id,
-            result=task_error_payload(error),
-            queue_state=queue_state,
-            queue_state_reason=queue_state_reason,
-        )
+        if task.persist_status:
+            await self._state.store_future_status(
+                task.request_id,
+                TaskStatus.FAILED.value,
+                task.model_id,
+                result=task_error_payload(error),
+                queue_state=queue_state,
+                queue_state_reason=queue_state_reason,
+            )
+        self._complete_error(task, error)
 
     async def fail_queue_tasks(self, queue_key: str, reason: str) -> None:
         """Drain a queue and mark all pending tasks as FAILED."""
@@ -191,8 +203,13 @@ class ComputeWorker:
         Handles execution timeout, general exceptions, and always calls
         q.task_done() in the finally block.
         """
-        await self._state.store_future_status(
-            task.request_id, TaskStatus.RUNNING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
+        if task.persist_status:
+            await self._state.store_future_status(
+                task.request_id,
+                TaskStatus.RUNNING.value,
+                task.model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
 
         task_type = task.task_type or 'unknown'
         exec_start = time.monotonic()
@@ -221,12 +238,15 @@ class ComputeWorker:
                         result = await coro
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.COMPLETED.value,
-                task.model_id,
-                result=result,
-                queue_state=QueueState.ACTIVE.value)
+            if task.persist_status:
+                await self._state.store_future_status(
+                    task.request_id,
+                    TaskStatus.COMPLETED.value,
+                    task.model_id,
+                    result=result,
+                    queue_state=QueueState.ACTIVE.value,
+                )
+            self._complete_result(task, result)
         except asyncio.TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start

@@ -78,6 +78,8 @@ class SafeLossWrapper(Loss):
         self.require_logps = getattr(loss_instance, 'require_logps', True)
         self.require_entropy = getattr(loss_instance, 'require_entropy', False)
         self.require_logits = getattr(loss_instance, 'require_logits', False)
+        self.enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+        self.require_values = getattr(loss_instance, 'require_values', False)
         self.reduction = getattr(loss_instance, 'reduction', 'mean')
         self._nccl_safe_wrapped = True
 
@@ -93,6 +95,10 @@ class SafeLossWrapper(Loss):
                            type(e).__name__, e, traceback.format_exc())
             return _zero_loss(outputs)
 
+    def micro_batch_scale(self, inputs, indices):
+        """Preserve the wrapped loss's micro-batch reduction semantics."""
+        return self._loss_instance.micro_batch_scale(inputs, indices)
+
 
 def _zero_loss(outputs) -> 'LossOutput':
     """Create a graph-connected zero loss for FSDP compatibility.
@@ -102,7 +108,7 @@ def _zero_loss(outputs) -> 'LossOutput':
     """
     import torch
     if isinstance(outputs, dict):
-        for key in ('logps', 'logits', 'loss'):
+        for key in ('logps', 'values', 'logits', 'loss'):
             t = outputs.get(key)
             if t is not None and isinstance(t, torch.Tensor) and t.requires_grad:
                 return LossOutput(loss=(t.flatten()[:1] * 0).sum(), num_tokens=0)
@@ -232,7 +238,7 @@ def _force_zero_backward(model, og, adapter_name, kwargs):
     # Find a graph-connected tensor for zero loss
     zero_loss = None
     if outputs is not None and isinstance(outputs, dict):
-        for key in ('logps', 'logits', 'loss'):
+        for key in ('logps', 'values', 'logits', 'loss'):
             t = outputs.get(key)
             if t is not None and isinstance(t, torch.Tensor) and t.requires_grad:
                 zero_loss = (t.flatten()[:1] * 0).sum()

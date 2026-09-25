@@ -106,5 +106,5 @@ The same examples work with the ModelScope managed service by changing only the 
 ```bash
 export TWINKLE_SERVER_URL=https://www.modelscope.cn/twinkle
 export TWINKLE_SERVER_TOKEN="$MODELSCOPE_TOKEN"
-export TWINKLE_MODEL_ID=Qwen/Qwen3.6-27B
+export TWINKLE_MODEL_ID=Qwen/Qwen3.8-27B
 ```

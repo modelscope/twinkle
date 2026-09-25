@@ -4,8 +4,10 @@ Pydantic request/response models for twinkle model management endpoints.
 
 These models are used by both the server-side handler and the twinkle client.
 """
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, Dict, List, Optional, Union
+
+from .component import DataRef
 
 
 class CreateRequest(BaseModel):
@@ -28,6 +30,27 @@ class ForwardOnlyRequest(BaseModel):
 
     class Config:
         extra = 'allow'
+
+
+class DataPlaneForwardRequest(BaseModel):
+    input_refs: List[DataRef] = Field(min_length=1)
+    input_field: str | None = None
+    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
+    adapter_name: str
+
+    class Config:
+        extra = 'allow'
+
+
+class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
+    output_ref: DataRef | None = None
+    output_fields: Dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def validate_output(self) -> 'DataPlaneForwardOnlyRequest':
+        if (self.output_ref is None) != (len(self.output_fields) == 0):
+            raise ValueError('output_ref and output_fields must be configured together')
+        return self
 
 
 class AdapterRequest(BaseModel):
@@ -109,7 +132,9 @@ class ResumeFromCheckpointRequest(BaseModel):
 
 class AddAdapterRequest(BaseModel):
     adapter_name: str
-    config: str
+    # ``config`` is None for full-parameter training (no LoRA adapter) and a
+    # serialized LoraConfig string for LoRA training.
+    config: Optional[str] = None
     save_dir: Optional[str] = None
 
     class Config:

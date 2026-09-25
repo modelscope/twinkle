@@ -19,8 +19,9 @@ The simplest way to run a multi-turn tool-use rollout using an OpenAI-compatible
 from twinkle_agentic.protocol.openai import OpenAI
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
+from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle.data_format.sampling import SamplingParams
+from twinkle.template import Template
 
 # 1. Define tools
 class WeatherTool(Tool):
@@ -47,16 +48,17 @@ class WeatherTool(Tool):
 # 2. Set up ToolManager
 manager = ToolManager([WeatherTool()])
 
-# 3. Create API client
-api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1')
+# 3. Create API client and the local template used to encode its replies
+api = OpenAI(model='qwen3.5-32b', base_url='http://localhost:8000/v1', concurrency=8)
+template = Template(model_id='Qwen/Qwen3.5-32B')
 
 # 4. Create rollout
-rollout = APIMultiTurnRollout(
+rollout = MultiTurnRollout(
     api=api,
+    template=template,
     tool_manager=manager,
     sampling_params=SamplingParams(temperature=0.7, max_tokens=2048),
     max_turns=6,
-    concurrency=8,
 )
 
 # 5. Prepare trajectories
@@ -138,7 +140,7 @@ env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 
 # Use manager in rollout as usual
-rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
+rollout = MultiTurnRollout(api=api, template=template, tool_manager=manager, max_turns=10)
 ```
 
 ## Using OpenEnv Environments
@@ -193,11 +195,12 @@ results = rollout(trajectories, tool_manager=managers)
 
 ## Trace Debugging
 
-Both rollout implementations support trace dumps for debugging:
+The unified rollout supports trace dumps for debugging:
 
 ```python
-rollout = APIMultiTurnRollout(
+rollout = MultiTurnRollout(
     api=api,
+    template=template,
     tool_manager=manager,
     trace_dir='traces/',
     trace_callback=lambda t: t['turns'] > 1,    # Only store multi-turn

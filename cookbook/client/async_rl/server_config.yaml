@@ -1,0 +1,160 @@
+# Twinkle Server Configuration - local Qwen3.5-4B for client-orchestrated async RL
+
+# Set the absolute Hugging Face-compatible model directory before loading this file:
+#   export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+#   export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B  # in every client process
+#
+# The public HTTP model name remains Qwen/Qwen3.5-4B. Both the training Model
+# and the vLLM Sampler load the same local directory, so neither component
+# downloads the base model independently.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+telemetry:
+  enabled: false
+  otlp_endpoint: http://localhost:4317
+
+persistence:
+  mode: file
+  file_path: /tmp/twinkle_state.json
+
+applications:
+
+  # Gateway and Future query endpoint.
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 3
+      supported_models:
+        - Qwen/Qwen3.5-4B
+    deployments:
+      - name: TinkerCompatServer
+        max_ongoing_requests: 50
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"
+
+  # TransferQueue-backed DataRef service.
+  - name: data-plane
+    route_prefix: /api/v1/data-plane
+    import_path: data_plane
+    args:
+      config:
+        backend:
+          SimpleStorage:
+            num_data_storage_units: 2
+    deployments:
+      - name: DataPlaneManagement
+        num_replicas: 1
+        ray_actor_options:
+          num_cpus: 1
+
+  # One GPU hosts the training base model and multiple LoRA adapters.
+  - name: models-Qwen3.5-4B
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+    import_path: model
+    args:
+      backend: transformers
+      model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
+      max_loras: 8
+      max_length: 10240
+      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
+      nproc_per_node: 1
+      device_group:
+        name: model
+        ranks: 1
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+      adapter_config:
+        adapter_timeout: 30
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
+
+  # A second GPU hosts vLLM and loads the same local base model.
+  - name: sampler-Qwen3.5-4B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+    import_path: sampler
+    args:
+      model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
+      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
+      nproc_per_node: 1
+      sampler_type: vllm_async
+      engine_args:
+        max_model_len: 4096
+        gpu_memory_utilization: 0.5
+        enable_lora: true
+        max_loras: 8
+        logprobs_mode: processed_logprobs
+      device_group:
+        name: sampler
+        ranks: 1
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "0"
+
+  - name: processor
+    route_prefix: /api/v1/processor
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 2
+      device_group:
+        name: model
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 2
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "0"

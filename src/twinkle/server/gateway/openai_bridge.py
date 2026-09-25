@@ -5,6 +5,14 @@ OpenAI-compatible translation bridge.
 Pure functions that translate between OpenAI API shapes and Twinkle's
 internal SampleRequest/SampleResponseModelList types. No FastAPI or
 server dependency — fully unit-testable in isolation.
+
+The response is OpenAI's shape and nothing else. Training on what an endpoint
+served needs the token ids the sampler emitted, not the text re-tokenized -- but
+that is not this gateway's job: a rollout that trains on an agent's own requests
+serves them itself (``twinkle_agentic.rollout.PolicyEndpoint``), in the trainer's
+process, and reports each round through a callback. An extra field here would be a
+second, weaker way to do the same thing, over a hop that has already lost the
+sampler's own objects.
 """
 from __future__ import annotations
 
@@ -85,23 +93,28 @@ def translate_response(
     samples = sampler_response.get('samples', [])
     choices = []
     total_tokens = 0
+    prompt_tokens = 0
 
     for sample in samples:
         sequences = sample.get('sequences', [])
+        prompt_token_ids = sample.get('prompt_token_ids')
+        # Counted once per sample, not once per sequence: n>1 shares one prompt.
+        prompt_tokens += len(prompt_token_ids or [])
         for seq in sequences:
             decoded = seq.get('decoded') or ''
             finish_reason = _map_stop_reason(seq.get('stop_reason'))
             tokens = seq.get('tokens', [])
             total_tokens += len(tokens)
 
-            choices.append({
+            choice: dict[str, Any] = {
                 'index': len(choices),
                 'message': {
                     'role': 'assistant',
                     'content': decoded,
                 },
                 'finish_reason': finish_reason,
-            })
+            }
+            choices.append(choice)
 
     return {
         'id': request_id,
@@ -110,9 +123,9 @@ def translate_response(
         'model': model,
         'choices': choices,
         'usage': {
-            'prompt_tokens': 0,
+            'prompt_tokens': prompt_tokens,
             'completion_tokens': total_tokens,
-            'total_tokens': total_tokens,
+            'total_tokens': prompt_tokens + total_tokens,
         },
     }
 

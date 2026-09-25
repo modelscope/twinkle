@@ -1,0 +1,136 @@
+runtime:
+  run_id: async_multi_lora_grpo
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
+  mode: ray
+  model_gpus: 2
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 4
+  seed: 1
+  max_staleness: 1
+  max_steps: null
+  allow_partial_rollout: false
+  rollout_max_retries: 2
+  rollout_retry_delay_s: 0.5
+  keep_adapter_versions: 2
+  output_dir: output/async_multi_lora_grpo
+
+metrics:
+  enabled: true
+  drain_interval_s: 1.0
+  queue_capacity: 10000
+  close_timeout_s: 10
+  jsonl:
+    enabled: true
+    path: outputs/async_rl/metrics.jsonl
+    summary_path: outputs/async_rl/summary.json
+    batch_size: 64
+    flush_interval_s: 2.0
+  swanlab:
+    enabled: false
+    mode: local
+    project: twinkle-rl
+    name: ${runtime.run_id}
+    log_dir: outputs/swanlab
+
+template:
+  cls: Qwen3_5Template
+  enable_thinking: false
+
+model:
+  strategy: native_fsdp
+  fsdp_config:
+    reshard_after_forward: true
+  sequence_parallel_size: 1
+  padding_free: false
+  max_length: 8192
+
+sampler:
+  max_model_len: 8192
+  gpu_memory_utilization: 0.8
+  max_num_seqs: 64
+  max_num_batched_tokens: 8192
+  enforce_eager: false
+
+rollout_output:
+  enabled: true
+  output_dir: ${runtime.output_dir}/rollouts
+  include_token_ids: false
+
+tq:
+  polling_mode: true
+  storage_units: 2
+
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  train: {policy: sticky, max_consecutive_units: null}
+
+lora:
+  target_modules: all-linear
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  learning_rate: 5.0e-5
+  lr_scheduler:
+    cls: CosineAnnealingLR
+    # 128 prompts / 16 prompts per partition * 16 groups per partition.
+    T_max: 128
+    eta_min: 0.0
+
+loss:
+  cls: GRPOLoss
+  epsilon: 0.2
+
+lora_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_async
+    adapter_name: tenant_a_gsm8k_lora
+    reward:
+      class_path: twinkle.reward.GSM8KAccuracyBrevityReward
+    dataset:
+      dataset_id: ${oc.env:TENANT_A_DATASET_ID}
+      subset_name: main
+      split: train
+      data_num: 128
+      max_length: 8192
+      processor: GSM8KProcessor
+      system_prompt: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 2048
+      temperature: 1.0
+      top_p: 0.95
+    train:
+      mini_batch_size: 4
+      micro_batch_size: 1
+      dynamic_batching: false
+
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_async
+    adapter_name: tenant_b_gsm8k_lora
+    reward:
+      class_path: twinkle.reward.GSM8KAccuracyReward
+    dataset:
+      dataset_id: ${oc.env:TENANT_B_DATASET_ID}
+      subset_name: main
+      split: train
+      data_num: 128
+      max_length: 8192
+      processor: GSM8KProcessor
+      system_prompt: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 2048
+      temperature: 1.0
+      top_p: 0.95
+    train:
+      mini_batch_size: 4
+      micro_batch_size: 1
+      dynamic_batching: false

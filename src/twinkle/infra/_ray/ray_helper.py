@@ -17,6 +17,31 @@ class RayHelper:
     _remote_components: Dict[str, Any] = {}
 
     @staticmethod
+    def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
+        """Return custom accelerator resources needed for local Ray startup.
+
+        Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
+        NPUs, need to be registered as Ray custom resources so that placement
+        groups can request them.
+        """
+        device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
+
+        # ResourceManager supports one accelerator type per run.  Only NPU
+        # currently needs an explicit Ray custom-resource registration.
+        if device_types != {'NPU'}:
+            return {}
+
+        try:
+            import torch
+
+            npu = getattr(torch, 'npu', None)
+            npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
+        except (ImportError, AttributeError, RuntimeError):
+            return {}
+
+        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+
+    @staticmethod
     def init_registry():
         if RayHelper._registry is not None:
             return
@@ -71,7 +96,8 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init(ignore_reinit_error=True)
+            resources = RayHelper._get_ray_custom_resources(device_groups)
+            ray.init(ignore_reinit_error=True, resources=resources or None)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -242,6 +268,7 @@ class RayHelper:
                        instance_id,
                        seed=42,
                        full_determinism=False,
+                       max_concurrency: Optional[int] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -314,6 +341,11 @@ class RayHelper:
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
                 env_vars.update(ResourceManager.noset_env())
 
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
@@ -325,11 +357,24 @@ class RayHelper:
                     'num_cpus': 0.01,
                 }
 
-                if device_type == 'GPU':
-                    worker_options['num_gpus'] = 0.01
-                else:
-                    # Use custom resource key for non-GPU accelerators (e.g., NPU).
+                # The placement group already reserves a GPU worker's full
+                # allocation and ``CUDA_VISIBLE_DEVICES`` above pins that actor
+                # to the ranks selected by DeviceGroup.  Do not additionally
+                # request a fractional Ray GPU resource for CUDA workers.
+                #
+                # With a fractional request, Ray translates the placement-group
+                # GPU id through the already narrowed visible-device list.  For
+                # the second GPU that becomes index 1 into ``['1']``, killing
+                # the worker in ``set_visible_accelerator_ids`` before its
+                # constructor runs.  The CPU claim and placement-group strategy
+                # are sufficient to place the actor in the GPU-owning bundle.
+                if device_type != 'GPU':
+                    # Use a custom resource key for non-GPU accelerators
+                    # (for example, NPU).
                     worker_options['resources'] = {device_type: 0.01}
+
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)
@@ -354,6 +399,11 @@ class RayHelper:
                     'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
                     **_visible_device_env
                 })
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
@@ -364,6 +414,9 @@ class RayHelper:
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
+
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)

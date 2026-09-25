@@ -569,6 +569,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             labels = batch.pop('labels', None)
             loss_scale = batch.pop('loss_scale', None)
             channel = batch.pop('channel', None)
+            # Not a model argument; restored below so the loss can read it.
+            completion_mask = batch.pop('completion_mask', None)
             # MTP joint training. ``labels`` is deliberately withheld from the model so the main loss
             # stays external (twinkle derives log-probs from logits), but the MTP heads still need
             # next-token targets -- so they get them on a separate keyword. Passed only into the model
@@ -589,6 +591,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 batch['loss_scale'] = loss_scale
             if channel is not None:
                 batch['channel'] = channel
+            if completion_mask is not None:
+                batch['completion_mask'] = completion_mask
             logps = None
             unpacked_logits = None
             entropies = None
@@ -659,6 +663,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     if batch.get('loss_scale') is not None:
                         batch['loss_scale'] = processor.postprocess_tensor_cp(
                             batch['loss_scale'], cu_seqlens=cu_seqlens_q)
+                    if completion_mask is not None:
+                        # Same index space as labels, so it needs the same CP reassembly.
+                        batch['completion_mask'] = processor.postprocess_tensor_cp(
+                            completion_mask, cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
@@ -878,8 +886,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # For DDP-wrapped models, ALWAYS zero the gradient buffer
         # This is essential because Megatron's forward_backward_func uses
         # the buffer's state to track gradient accumulation
-        if self._is_model_ddp_wrapped() and hasattr(self.model, 'zero_grad_buffer'):
-            self.model.zero_grad_buffer()
+        # (self.model is a list of chunks; zero_grad_buffer lives on each chunk)
+        if self._is_model_ddp_wrapped():
+            for model_chunk in self.model:
+                if hasattr(model_chunk, 'zero_grad_buffer'):
+                    model_chunk.zero_grad_buffer()
 
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
@@ -1230,6 +1241,32 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 peft_format=(adapter_name != _default_adapter_name),
             )
 
+        if dist.is_initialized():
+            dist.barrier()
+
+    @remote_function(dispatch='all')
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from the original model path.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        bridge = self.strategy.bridge
+        bridge.load_weights(
+            self.strategy.unwrap_model(self.model),
+            self._model_path,
+            peft_format=False,
+        )
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        if self._is_model_ddp_wrapped():
+            for model_chunk in self.model:
+                if hasattr(model_chunk, 'zero_grad_buffer'):
+                    model_chunk.zero_grad_buffer()
+        for _model in self.strategy.unwrap_model(self.model):
+            for param in _model.parameters():
+                param.grad = None
         if dist.is_initialized():
             dist.barrier()
 
@@ -1621,7 +1658,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Save config on global rank 0 only (avoid concurrent writers).
         if is_global_zero:
             self._export_hf_config().save_pretrained(output_dir)
-            if isinstance(model[0], PeftModel):
+            # Only write an adapter_config when actually saving a PEFT adapter.
+            # merge_lora saves the merged full weights with adapter_name='' while the
+            # model is still PeftModel-wrapped; indexing peft_config[''] there raises KeyError.
+            if is_peft_format and isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
                 target_modules = config.target_modules
                 config.target_modules = 'all-linear'
@@ -1905,7 +1945,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 return base_layer_name
             return name
 
-        is_peft_format = (adapter_name != _default_adapter_name)
         if base_sync_done and adapter_name:
             # The first base model synchronization finished, and is lora training
             if merge_and_sync:
@@ -1956,7 +1995,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 _print_weight_example(names)
 
             def weight_generator():
-                if is_peft_format and (not merge_and_sync):
+                # Add the ``.base_layer.`` suffix whenever the sampler runs with
+                # ``enable_lora`` (``merge_and_sync=False``).  ``_add_base_layer_suffix``
+                # self-guards via ``model_keys``, so it only renames params vLLM
+                # actually exposes as ``*WithLoRA`` and is a no-op for full-param.
+                if not merge_and_sync:
                     yield from _raw_weights(True)
                 else:
                     yield from _raw_weights(False)

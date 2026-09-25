@@ -2,5 +2,6 @@
 from .input_feature import InputFeature
 from .message import Message, Tool, ToolCall
 from .output import LossOutput, ModelOutput
-from .sampling import PoolingParams, PoolingResponse, SampledSequence, SampleResponse, SamplingParams, pooling_to_list
-from .trajectory import Trajectory, pack_value, user_data_get
+from .sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleResponse, SamplingMask, SamplingParams,
+                       pooling_to_list)
+from .trajectory import Trajectory, attach_user_data, pack_user_data, pack_value, user_data_get

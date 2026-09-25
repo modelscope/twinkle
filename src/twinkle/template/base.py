@@ -23,6 +23,18 @@ ImageInput = Union[str, 'Image.Image', 'torch.Tensor']
 VideoInput = Union[str, List['Image.Image'], 'torch.Tensor']
 AudioInput = Union[str, np.ndarray, 'torch.Tensor']
 
+# Fields that are one entry per token and must be sliced with ``input_ids``.
+# ``mm_token_type_ids`` is excluded: it may carry a leading batch dim and is
+# sliced on its last axis instead.
+_SEQUENCE_ALIGNED_FIELDS = ('labels', 'completion_mask')
+
+# What an appended turn is to a trainer: the policy's own completion (scored, and
+# a log-prob exists for each of its tokens), someone else's completion offered
+# for imitation (scored, no log-prob -- usable by SFT but not by RL), or history
+# that no loss may touch. There is deliberately no fourth role: a log-prob is
+# only ever needed for a token that is also scored.
+_APPEND_ROLES = ('completion', 'demonstration', 'context')
+
 
 @remote_class()
 class Template:
@@ -86,6 +98,27 @@ class Template:
         """Strip tool-call markup using the same parser that ``parse_tool_call`` would pick."""
         parser = ToolCallRegistry.detect_first(decoded or '')
         return parser.clean(decoded) if parser else (decoded or '').rstrip()
+
+    def tool_call_errors(self, decoded: str) -> List[str]:
+        """Why ``parse_tool_call`` returned fewer calls than the text asked for.
+
+        Same parser choice as ``parse_tool_call``, so the two describe one pass
+        over the reply. Empty when the reply carries no tool-call markup at all --
+        a reply that simply answered is not a failure.
+        """
+        parser = ToolCallRegistry.detect_first(decoded or '')
+        return parser.parse_errors(decoded) if parser else []
+
+    @property
+    def tool_call_stop(self) -> Optional[str]:
+        """The string a caller stops generation at to hold a reply to one tool call.
+
+        Cannot be answered by ``detect``, which needs the reply that does not
+        exist yet, so each template names its own format. None means the format
+        has no closing marker -- ReAct and a bare call list end where the reply
+        does -- and a caller then lets the reply run to its end.
+        """
+        return None
 
     @property
     def tokenizer(self):
@@ -187,19 +220,48 @@ class Template:
             current = next_batch
         return current
 
-    def concat_input_feature(self, prompt_input_feature: InputFeature, new_tokens: List[int]) -> InputFeature:
+    def concat_input_feature(self,
+                             prompt_input_feature: InputFeature,
+                             new_tokens: List[int],
+                             *,
+                             appended_as: Literal['completion', 'demonstration', 'context'] = 'completion',
+                             tool_calls: Optional[List[Dict[str, Any]]] = None) -> InputFeature:
+        """Append one generated turn to an already-encoded prefix.
+
+        Args:
+            appended_as: what the turn is to a trainer, which decides ``labels``
+                and ``completion_mask`` together:
+
+                * ``'completion'`` -- the sampled policy's own output. Scored, and
+                  a log-prob exists for every token.
+                * ``'demonstration'`` -- written by someone else (a stronger model,
+                  a human) and offered for imitation. Scored, but carries no
+                  log-prob, so RL losses skip it while SFT trains on it.
+                * ``'context'`` -- history that later turns must see and no loss
+                  may touch.
+            tool_calls: calls to attach to the appended message, for generators that
+                return them as structured fields (any OpenAI-compatible API does)
+                rather than as markup inside the text, which is all
+                ``parse_tool_call`` can read.
+        """
         import copy
         import torch
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
+        if appended_as not in _APPEND_ROLES:
+            raise ValueError(f'appended_as must be one of {_APPEND_ROLES}, got {appended_as!r}')
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
         labels = list(result.get('labels', []))
         input_ids = list(prompt_ids) + new_tokens
         labels = labels[-1:] + labels[:-1]  # roll to input order
-        labels = labels + new_tokens
+        completion_mask = self._prefix_completion_mask(result, labels)
+        scored = appended_as != 'context'
+        labels = labels + (new_tokens if scored else [-100] * len(new_tokens))
+        completion_mask = completion_mask + [int(appended_as == 'completion')] * len(new_tokens)
         # We don't need to roll back, self._invoke_post_pipeline will do this.
         result['input_ids'] = input_ids
         result['labels'] = labels
+        result['completion_mask'] = completion_mask
         if 'mm_token_type_ids' in result:
             mm_token_type_ids = result['mm_token_type_ids']
             if not isinstance(mm_token_type_ids, torch.Tensor):
@@ -217,14 +279,40 @@ class Template:
         messages: List[Message] = result.get('messages')
         if messages is not None:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            parsed = self.parse_tool_call(response_text) or []
-            content_text = (self.clean_tool_call(response_text) if parsed else response_text)
+            if tool_calls is None:
+                parsed = self.parse_tool_call(response_text) or []
+                content_text = (self.clean_tool_call(response_text) if parsed else response_text)
+            else:
+                # Structured calls arrived beside the text, so the text carries no
+                # markup to strip.
+                parsed = list(tool_calls)
+                content_text = response_text
             asst_msg = Message(role='assistant', content=content_text)
             if parsed:
                 asst_msg['tool_calls'] = parsed
             messages.append(asst_msg)
             result['messages'] = messages
         return result
+
+    @staticmethod
+    def _prefix_completion_mask(feature: InputFeature, labels: List[int]) -> List[int]:
+        """The prefix's ``completion_mask``, in input order, materialised if absent.
+
+        A feature encoded before this field existed records no provenance, and for
+        those the trainable positions *were* exactly the policy's own -- deriving the
+        mask from ``labels`` therefore leaves old and new trajectories equivalent.
+        """
+        mask = feature.get('completion_mask')
+        if mask is None:
+            mask = [0 if label == -100 else 1 for label in labels]
+        else:
+            mask = list(mask)
+            mask = mask[-1:] + mask[:-1]  # roll to input order, exactly as labels
+        expected = len(feature['input_ids'])
+        if len(mask) != expected:
+            raise ValueError(f'prefix completion_mask has {len(mask)} entries for {expected} '
+                             f'input_ids; appending would misalign every position after it.')
+        return mask
 
     def _add_default_system(self, trajectory: Trajectory) -> List[Trajectory]:
         if self.use_chat_template and self.default_system:
@@ -264,27 +352,25 @@ class Template:
         return [trajectory]
 
     def _truncate_feature(self, feature: InputFeature, strategy: str) -> InputFeature:
-        """Truncate input_ids and labels in a single InputFeature."""
+        """Truncate the sequence-aligned fields of a single InputFeature."""
         length = len(feature['input_ids'])
         if length <= self.max_length:
             return feature
         if strategy == 'raise':
             raise ValueError(f'Input length {length} exceeds max_length {self.max_length}')
-        result = dict(feature)
         if strategy == 'left':
-            result['input_ids'] = result['input_ids'][-self.max_length:]
-            if 'labels' in result:
-                result['labels'] = result['labels'][-self.max_length:]
-            if 'mm_token_type_ids' in result:
-                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., -self.max_length:]
+            keep = slice(-self.max_length, None)
         elif strategy == 'right':
-            result['input_ids'] = result['input_ids'][:self.max_length]
-            if 'labels' in result:
-                result['labels'] = result['labels'][:self.max_length]
-            if 'mm_token_type_ids' in result:
-                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., :self.max_length]
+            keep = slice(None, self.max_length)
         else:
             raise ValueError(f'Unsupported truncation_strategy={strategy!r}.')
+        result = dict(feature)
+        result['input_ids'] = result['input_ids'][keep]
+        for key in _SEQUENCE_ALIGNED_FIELDS:
+            if key in result:
+                result[key] = result[key][keep]
+        if 'mm_token_type_ids' in result:
+            result['mm_token_type_ids'] = result['mm_token_type_ids'][..., keep]
         return InputFeature(**result)
 
     def set_mm_position_ids(self, input_feature: InputFeature):
@@ -311,8 +397,9 @@ class Template:
                 end = min(start + self.max_length, len(input_feature['input_ids']))
                 feat = dict(input_feature)
                 feat['input_ids'] = feat['input_ids'][start:end]
-                if 'labels' in feat:
-                    feat['labels'] = feat['labels'][start:end]
+                for key in _SEQUENCE_ALIGNED_FIELDS:
+                    if key in feat:
+                        feat[key] = feat[key][start:end]
                 if 'mm_token_type_ids' in feat:
                     feat['mm_token_type_ids'] = feat['mm_token_type_ids'][..., start:end]
                 results.append(InputFeature(**feat))
@@ -340,6 +427,10 @@ class Template:
         if 'input_ids' not in input_feature:
             return [input_feature]
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
+        if 'completion_mask' in input_feature:
+            # The mask answers "is there a log-prob for this position's target", so it
+            # lives on the labels' index space and has to follow the same roll.
+            input_feature['completion_mask'] = np.roll(input_feature['completion_mask'], -1, axis=-1)
         return [input_feature]
 
     def _process_mm_messages(self, messages: List, images: List, videos: List, audios: List) -> List:
@@ -514,6 +605,34 @@ class Template:
                     message['content'] = c[0]['text'] if c else ''
         return [trajectory]
 
+    @staticmethod
+    def decode_tool_calls(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Return ``message`` with ``tool_calls`` in the shape a chat template renders.
+
+        OpenAI-shaped calls carry ``function.arguments`` as a JSON string, and an
+        Arrow round-trip can turn the whole list into one; templates index them as
+        objects. Arguments that will not parse become ``{}`` rather than reaching
+        Jinja as a string it would render verbatim. The message is returned
+        untouched when it carries no calls.
+        """
+        tool_calls = message.get('tool_calls')
+        if isinstance(tool_calls, str):
+            tool_calls = json.loads(tool_calls) if tool_calls else []
+        elif not tool_calls:
+            return message
+        decoded = []
+        for tool_call in tool_calls:
+            fn = tool_call['function']
+            args = fn['arguments']
+            if isinstance(args, dict):
+                value = args
+            elif isinstance(args, str):
+                value = json.loads(args) if args.strip() else {}
+            else:
+                value = {}
+            decoded.append({**tool_call, 'function': {**fn, 'arguments': value}})
+        return {**message, 'tool_calls': decoded}
+
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory['messages']]
         # Arrow serialization may pad content blocks with null keys (e.g. 'image': None
@@ -526,25 +645,7 @@ class Template:
                 k: v
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
-        for msg in messages:
-            tcs = msg.get('tool_calls')
-            if isinstance(tcs, str):
-                tcs = json.loads(tcs) if tcs else []
-                msg['tool_calls'] = tcs
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                fn = tc['function']
-                args = fn['arguments']
-                if isinstance(args, dict):
-                    decoded = args
-                elif isinstance(args, str):
-                    decoded = json.loads(args) if args.strip() else {}
-                else:
-                    decoded = {}
-                new_tcs.append({**tc, 'function': {**fn, 'arguments': decoded}})
-            msg['tool_calls'] = new_tcs
+        messages = [self.decode_tool_calls(msg) for msg in messages]
         # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
         # :mod:`twinkle.data_format.message`); pass them through verbatim.
         tools = list(trajectory.get('tools') or [])
@@ -682,7 +783,10 @@ class Template:
         assert self.truncation_strategy != 'split', (
             'encode() does not support truncation_strategy=="split" because it may produce multiple outputs. '
             'Use batch_encode() instead.')
-        return self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)[0]
+        encoded = self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)
+        if encoded:
+            return encoded[0]
+        return None
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):

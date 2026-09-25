@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
+MODULES_TO_SAVE_SEGMENT = '.modules_to_save.'
 PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
@@ -120,6 +121,11 @@ class NativeFSDPStrategy:
         if self.device_mesh is None:
             return model, optimizer
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
+        if fsdp_mesh is None:
+            # FSDP has nothing to shard with a single rank, but callers still
+            # expect the native strategy to place the model on the worker's
+            # local device before CUDA inputs reach it.
+            model = model.to(torch.device(Platform.get_local_device()))
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
@@ -250,11 +256,15 @@ class NativeFSDPStrategy:
     def needs_wrapped_optimizer_state(self) -> bool:
         return self.device_mesh is not None
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
+
+        from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             if Platform.is_master():
-                torch.save(optimizer.state_dict(), output_path)
+                optim_state = optimizer.state_dict()
+                remap_optimizer_state_names(optim_state, param_name_mapping or {})
+                torch.save(optim_state, output_path)
             return
 
         from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -265,12 +275,17 @@ class NativeFSDPStrategy:
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
         if Platform.is_master():
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
+
+        from .optimizer_state import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
-            optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+            optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            optimizer.load_state_dict(optim_state)
             return
 
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
@@ -278,6 +293,7 @@ class NativeFSDPStrategy:
         optim_state = {}
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
         set_optimizer_state_dict(
             model,
             optimizer,
@@ -349,8 +365,26 @@ class NativeFSDPStrategy:
 
         return state_dict
 
+    def load_full_state_dict(self, model, state_dict) -> None:
+        """Load a full (non-sharded) state dict into the (possibly sharded) model.
+
+        Used by full-parameter training to (re)load base weights. Uses
+        ``set_model_state_dict`` when the model is distributed (FSDP2), else a
+        plain in-place ``load_state_dict``.
+        """
+        if self.device_mesh is not None:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            set_model_state_dict(
+                model,
+                state_dict,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+            return
+        unwrapped = self.unwrap_model(model)
+        unwrapped.load_state_dict(state_dict, strict=False)
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
-        """Collect only LoRA adapter parameters, with EP-aware all-gather."""
+        """Collect LoRA parameters and fully trained PEFT modules, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)
         state_dict = {}
 
@@ -365,7 +399,7 @@ class NativeFSDPStrategy:
         adapter_suffix = f'.{adapter_name}.'
 
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not _is_saveable_adapter_key(name) or adapter_suffix not in name:
                 continue
 
             local_full = torch_util.to_local_tensor(param)
@@ -698,6 +732,10 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
 
 def _is_lora_state_key(name: str) -> bool:
     return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
+
+
+def _is_saveable_adapter_key(name: str) -> bool:
+    return _is_lora_state_key(name) or MODULES_TO_SAVE_SEGMENT in name
 
 
 def _strip_peft_base_prefix(name: str) -> str:

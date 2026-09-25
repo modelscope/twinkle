@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
-from twinkle.utils.transformers_utils import get_llm_model
+from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
 from twinkle.patch.transformers_qwen3_vl_deepstack import Qwen3VLDeepstackSPPatch
 from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch, _iter_qwen35_gated_delta_net_classes
@@ -753,7 +753,7 @@ class SequenceParallel:
             # FlashAttention2 expects a 2D padding mask (or None). Converting it to a 4D causal mask here breaks
             # the later per-rank sequence split and changes the attention contract relative to the baseline path.
             if (cache_position is None and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
-                    and self.attn_implementation != 'flash_attention_2'):
+                    and not is_flash_attention_implementation(self.attn_implementation)):
                 attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype),
                                                        local_cache_position, None, None)
         if extra_split_values is not None:
@@ -816,15 +816,15 @@ class SequenceParallel:
         """Prepare inputs
 
         1. set extra_kwargs['position_ids']
-        2. split labels
+        2. split labels, and completion_mask when present
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         padding_free = bool(inputs.pop('padding_free', False))
-        if padding_free and self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+        if padding_free and not is_flash_attention_implementation(self.attn_implementation):
             raise RuntimeError('Transformers SequenceParallel does not support padding_free/packed inputs with '
                                f'attn_implementation={self.attn_implementation!r}. '
-                               'Use flash_attention_2 or flash_attention_3, or disable padding_free/packing. '
+                               'Use a FlashAttention backend, or disable padding_free/packing. '
                                'SDPA/eager attention cannot safely preserve packed sequence boundaries in this path.')
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
@@ -834,7 +834,11 @@ class SequenceParallel:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
             labels = inputs.get('labels')
-            _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
+            # completion_mask sits on the labels' index space, so it is padded and
+            # split identically -- unlike loss_scale, which is rolled beforehand.
+            completion_mask = inputs.get('completion_mask')
+            extra_split_values = None if completion_mask is None else [(completion_mask, 0, -1)]
+            _, _, labels, _, _, _, extra_values = self.pad_and_split_inputs(
                 None,
                 None,
                 labels,
@@ -842,8 +846,11 @@ class SequenceParallel:
                 None,
                 None,
                 real_position_ids=real_position_ids,
+                extra_split_values=extra_split_values,
             )
             inputs['labels'] = labels
+            if extra_values:
+                inputs['completion_mask'] = extra_values[0]
         return inputs
 
 
@@ -957,6 +964,19 @@ class SequenceParallelStrategy:
             return torch.cat(pieces, dim=1).contiguous() if pieces else tensor[:, :0].contiguous()
         return tensor[:, :real_position_ids.shape[-1]].contiguous()
 
+    def _gather_completion_mask(self, inputs: Dict[str, Any], real_position_ids) -> None:
+        """Gather ``completion_mask`` in place, mirroring the labels gather.
+
+        Deliberately not routed through :class:`GatherLoss`: the mask carries no
+        gradient, and reusing that autograd Function would attach a second backward
+        path to whichever tensor were passed alongside it, double-scaling its grad.
+        """
+        mask = inputs.get('completion_mask')
+        if mask is None or not torch.is_tensor(mask) or mask.dim() < 2:
+            return
+        gathered = sequence_parallel.gather(mask, dim=1, position_ids=real_position_ids)
+        inputs['completion_mask'] = self._trim_gathered_sequence_padding(gathered, real_position_ids)
+
     def gather_loss_tensors(
         self,
         inputs: Dict[str, Any],
@@ -988,6 +1008,7 @@ class SequenceParallelStrategy:
             gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
             outputs['logits'] = gathered_hidden
             inputs['labels'] = gathered_labels
+            self._gather_completion_mask(inputs, real_position_ids)
             return inputs, outputs
         if labels is None or logps is None:
             return inputs, outputs
@@ -1002,6 +1023,7 @@ class SequenceParallelStrategy:
         gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
+        self._gather_completion_mask(inputs, real_position_ids)
         entropies = outputs.get('entropies')
         if entropies is not None and torch.is_tensor(entropies) and entropies.dim() >= 2:
             gathered_entropies, _ = GatherLoss.apply(entropies, labels, 1, real_position_ids)
@@ -1018,10 +1040,16 @@ class SequenceParallelStrategy:
     def needs_wrapped_optimizer_state(self) -> bool:
         return False
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         from twinkle.utils.platforms import Platform
+        from ..optimizer_state import remap_optimizer_state_names
         if Platform.is_master():
-            torch.save(optimizer.state_dict(), output_path)
+            optim_state = optimizer.state_dict()
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
-        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
+        from ..optimizer_state import remap_optimizer_state_names
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        optimizer.load_state_dict(optim_state)

@@ -154,8 +154,11 @@ class TestCheckWindow:
         text = 'a' * 700 + " I can't help you complete that task."
         assert _is_refusal(text, check_window=1000) is True
 
-    def test_zero_window_finds_nothing(self):
-        assert _is_refusal("I can't help you complete tasks.", check_window=0) is False
+    def test_zero_window_scans_whole_text(self):
+        # check_window <= 0 disables truncation, so even a refusal past the
+        # default 600-char window is found.
+        text = 'a' * 700 + " I can't help you complete that task."
+        assert _is_refusal(text, check_window=0) is True
 
 
 # ── RefuseFilter pipeline ───────────────────────────────────────────────────
@@ -193,29 +196,34 @@ class TestRefuseFilterPipeline:
         ]
         assert len(_fil(rows)) == 1
 
-    def test_only_first_assistant_scanned(self):
-        # Refusal in SECOND assistant turn → kept (filter only checks first).
-        rows = [
-            _row([
-                {
-                    'role': 'user',
-                    'content': 'q1'
-                },
-                {
-                    'role': 'assistant',
-                    'content': 'A clean reply.'
-                },
-                {
-                    'role': 'user',
-                    'content': 'q2'
-                },
-                {
-                    'role': 'assistant',
-                    'content': "I can't help with that."
-                },
-            ])
-        ]
-        assert len(_fil(rows)) == 1
+    def _late_refusal_row(self):
+        # A clean first reply, then a refusal in the SECOND assistant turn.
+        return _row([
+            {
+                'role': 'user',
+                'content': 'q1'
+            },
+            {
+                'role': 'assistant',
+                'content': 'A clean reply.'
+            },
+            {
+                'role': 'user',
+                'content': 'q2'
+            },
+            {
+                'role': 'assistant',
+                'content': "I can't help with that."
+            },
+        ])
+
+    def test_late_refusal_dropped_by_default(self):
+        # scan_all_assistants defaults to True: a conversation that only refuses
+        # in a later turn is still a refusal.
+        assert _fil([self._late_refusal_row()]) == []
+
+    def test_late_refusal_kept_when_only_first_scanned(self):
+        assert len(_fil([self._late_refusal_row()], scan_all_assistants=False)) == 1
 
     def test_think_block_stripped(self):
         # Refusal phrasing inside <think>...</think> must NOT trigger.

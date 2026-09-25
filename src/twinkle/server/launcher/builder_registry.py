@@ -5,8 +5,8 @@ Extracted from the former single-file ``launcher.py`` (TIER 3 same-named-package
 decomposition). No logic change.
 
 The operator-facing YAML ``import_path`` literals (``"server"``, ``"model"``,
-``"sampler"``, ``"processor"``) are unchanged; only the internal builder
-function the ``"server"`` literal resolves to was renamed
+``"sampler"``, ``"processor"``, ``"data_plane"``) resolve to internal builder
+functions. The function selected by the ``"server"`` literal was renamed
 (``build_server_app`` → ``build_gateway_app``).
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ BUILDERS: dict[str, str] = {
     'model': 'build_model_app',
     'sampler': 'build_sampler_app',
     'processor': 'build_processor_app',
+    'data_plane': 'build_data_plane_app',
 }
 
 
@@ -28,6 +29,7 @@ def get_builders() -> dict[str, Callable]:
     Imported lazily so that importing the launcher package does not eagerly
     pull in every deployment module.
     """
+    from twinkle.server.data_plane import build_data_plane_app
     from twinkle.server.gateway import build_gateway_app
     from twinkle.server.model import build_model_app
     from twinkle.server.processor import build_processor_app
@@ -38,6 +40,7 @@ def get_builders() -> dict[str, Callable]:
         'build_model_app': build_model_app,
         'build_sampler_app': build_sampler_app,
         'build_processor_app': build_processor_app,
+        'build_data_plane_app': build_data_plane_app,
     }
 
 

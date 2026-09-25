@@ -51,3 +51,17 @@ class ConfigParseError(TwinkleServerError):
 class ResourceExhaustedError(TwinkleServerError):
     """Resource exhausted — queue full, insufficient memory, connection pool exhausted, etc."""
     pass
+
+
+class FullModeBusyError(TwinkleServerError):
+    """A full-parameter (exclusive) model deployment already has a holder.
+
+    Full-parameter training rewrites the shared base-model weights, so a single
+    deployment can only host one training task at a time.
+    """
+
+    def __init__(self, current_holder: str) -> None:
+        self.current_holder = current_holder
+        super().__init__('This deployment runs in full-parameter (exclusive) mode and is already '
+                         f'held by another training task ({current_holder}). Only one full-parameter '
+                         'training task is allowed at a time; retry after it is released.')

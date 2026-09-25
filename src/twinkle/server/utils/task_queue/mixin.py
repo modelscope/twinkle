@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-TaskQueueMixin: serial compute queue + background-task execution.
+"""TaskQueueMixin: serial compute queue plus admitted concurrent tasks.
 
-Two execution paths:
-  schedule_task() / schedule_task_and_wait()  -> serial compute queue (GPU ops)
-  schedule_background_task()                  -> fire-and-forget asyncio Task (I/O ops)
+``schedule_task`` serializes stateful Model operations. Detached tasks are
+used for I/O and for engines such as vLLM that own their compute concurrency
+and continuous batching internally.
 """
 from __future__ import annotations
 
@@ -39,8 +38,8 @@ class TaskQueueMixin:
        Use for GPU operations: forward, backward, step, save, load, etc.
 
     2. Background task (schedule_background_task):
-       asyncio.create_task, runs concurrently with compute queue.
-       Use for pure I/O: upload_to_hub, etc.
+       asyncio.create_task, runs concurrently with compute queue. Use for I/O
+       or an engine that provides its own safe concurrency and batching.
        Status is still tracked; clients can poll the same status endpoints.
 
     Requirements
@@ -99,6 +98,7 @@ class TaskQueueMixin:
         batch_size: int | None = None,
         data_world_size: int | None = None,
         batch_size_multiple: int | None = None,
+        persist_failure: bool = True,
     ) -> dict[str, Any] | None:
         """Run rate-limit and validation checks before queuing a task.
 
@@ -107,67 +107,128 @@ class TaskQueueMixin:
         if not token or not self._task_queue_config.enabled:
             return None
 
-        if input_tokens > self._task_queue_config.max_input_tokens:
-            error_msg = (f'Input tokens ({input_tokens}) exceed maximum allowed '
-                         f'({self._task_queue_config.max_input_tokens})')
+        async def reject(error_msg: str, queue_state: str) -> dict[str, Any]:
             error_payload = {'error': error_msg, 'category': 'User'}
-            await self.state.store_future_status(
-                request_id,
-                TaskStatus.FAILED.value,
-                model_id,
-                result=error_payload,
-                queue_state=QueueState.UNKNOWN.value,
-                queue_state_reason=error_msg,
-            )
-            return {'request_id': request_id, 'model_id': model_id}
-
-        if batch_size is not None and data_world_size is not None:
-            if batch_size < data_world_size:
-                error_msg = (f'Batch size {batch_size} must be >= data world size {data_world_size}')
-                error_payload = {'error': error_msg, 'category': 'User'}
+            if persist_failure:
                 await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,
                     model_id,
                     result=error_payload,
-                    queue_state=QueueState.UNKNOWN.value,
+                    queue_state=queue_state,
                     queue_state_reason=error_msg,
                 )
                 return {'request_id': request_id, 'model_id': model_id}
+            # Private marker consumed by schedule_task_and_wait().  It is not
+            # returned by the public polling-style schedule_task() API.
+            return {
+                'request_id': request_id,
+                'model_id': model_id,
+                '_error': error_msg,
+            }
+
+        if input_tokens > self._task_queue_config.max_input_tokens:
+            error_msg = (f'Input tokens ({input_tokens}) exceed maximum allowed '
+                         f'({self._task_queue_config.max_input_tokens})')
+            return await reject(error_msg, QueueState.UNKNOWN.value)
+
+        if batch_size is not None and data_world_size is not None:
+            if batch_size < data_world_size:
+                error_msg = (f'Batch size {batch_size} must be >= data world size {data_world_size}')
+                return await reject(error_msg, QueueState.UNKNOWN.value)
             if batch_size_multiple is not None:
                 required_multiple = data_world_size * batch_size_multiple
                 if batch_size % required_multiple != 0:
                     error_msg = (f'Batch size {batch_size} must be divisible by {required_multiple} '
                                  f'so each data-parallel shard gets a multiple of '
                                  f'{batch_size_multiple} examples')
-                    error_payload = {'error': error_msg, 'category': 'User'}
-                    await self.state.store_future_status(
-                        request_id,
-                        TaskStatus.FAILED.value,
-                        model_id,
-                        result=error_payload,
-                        queue_state=QueueState.UNKNOWN.value,
-                        queue_state_reason=error_msg,
-                    )
-                    return {'request_id': request_id, 'model_id': model_id}
+                    return await reject(error_msg, QueueState.UNKNOWN.value)
 
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
             if self._task_metrics:
                 self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
             error_msg = f'Rate limit exceeded: {reason}'
-            error_payload = {'error': error_msg, 'category': 'User'}
-            await self.state.store_future_status(
-                request_id,
-                TaskStatus.FAILED.value,
-                model_id,
-                result=error_payload,
-                queue_state=QueueState.PAUSED_RATE_LIMIT.value,
-                queue_state_reason=error_msg,
-            )
-            return {'request_id': request_id, 'model_id': model_id}
+            return await reject(error_msg, QueueState.PAUSED_RATE_LIMIT.value)
 
         return None
+
+    async def _schedule_task(
+        self,
+        coro_factory: Callable[[], Coroutine],
+        model_id: str | None = None,
+        token: str | None = None,
+        input_tokens: int = 0,
+        batch_size: int | None = None,
+        data_world_size: int | None = None,
+        batch_size_multiple: int | None = None,
+        task_type: str | None = None,
+        *,
+        completion: asyncio.Future[Any] | None = None,
+        persist_status: bool,
+    ) -> dict[str, Any]:
+        """Common enqueue path for polling and in-process wait callers."""
+        request_id = f'req_{uuid.uuid4().hex}'
+
+        preflight_result = await self._perform_preflight_checks(
+            request_id=request_id,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            batch_size=batch_size,
+            data_world_size=data_world_size,
+            batch_size_multiple=batch_size_multiple,
+            persist_failure=persist_status,
+        )
+        if preflight_result is not None:
+            return preflight_result
+
+        if self._event_loop is None:
+            self._event_loop = asyncio.get_running_loop()
+
+        if persist_status:
+            await self.state.store_future_status(
+                request_id,
+                TaskStatus.PENDING.value,
+                model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
+
+        queue_key = self._queue_key(model_id=model_id, token=token)
+        self._compute_worker.ensure_queue_registered(queue_key)
+        await self._compute_worker.ensure_started()
+
+        q = self._compute_worker.task_queues[queue_key]
+        await q.put(
+            QueuedTask(
+                request_id=request_id,
+                coro_factory=coro_factory,
+                model_id=model_id,
+                token=token,
+                input_tokens=input_tokens,
+                task_type=task_type,
+                created_at=time.monotonic(),
+                completion=completion,
+                persist_status=persist_status,
+            ))
+        if persist_status:
+            await self.state.store_future_status(
+                request_id,
+                TaskStatus.QUEUED.value,
+                model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
+        logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
+                    f'model_id={model_id}, queue_key={queue_key}, '
+                    f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
+
+        self._compute_worker.new_task_event.set()
+
+        if self._task_metrics:
+            total_depth = sum(q.qsize() for q in self._compute_worker.task_queues.values())
+            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+
+        return {'request_id': request_id, 'model_id': model_id}
 
     async def schedule_task(
         self,
@@ -198,47 +259,17 @@ class TaskQueueMixin:
         Returns:
             {'request_id': str, 'model_id': str | None}
         """
-        request_id = f'req_{uuid.uuid4().hex}'
-
-        preflight_result = await self._perform_preflight_checks(request_id, model_id, token, input_tokens, batch_size,
-                                                                data_world_size, batch_size_multiple)
-        if preflight_result is not None:
-            return preflight_result
-
-        if self._event_loop is None:
-            self._event_loop = asyncio.get_running_loop()
-
-        await self.state.store_future_status(
-            request_id, TaskStatus.PENDING.value, model_id, queue_state=QueueState.ACTIVE.value)
-
-        queue_key = self._queue_key(model_id=model_id, token=token)
-        self._compute_worker.ensure_queue_registered(queue_key)
-        await self._compute_worker.ensure_started()
-
-        q = self._compute_worker.task_queues[queue_key]
-        await q.put(
-            QueuedTask(
-                request_id=request_id,
-                coro_factory=coro_factory,
-                model_id=model_id,
-                token=token,
-                input_tokens=input_tokens,
-                task_type=task_type,
-                created_at=time.monotonic(),
-            ))
-        await self.state.store_future_status(
-            request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
-        logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
-                    f'model_id={model_id}, queue_key={queue_key}, '
-                    f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
-
-        self._compute_worker.new_task_event.set()
-
-        if self._task_metrics:
-            total_depth = sum(q.qsize() for q in self._compute_worker.task_queues.values())
-            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
-
-        return {'request_id': request_id, 'model_id': model_id}
+        return await self._schedule_task(
+            coro_factory,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            batch_size=batch_size,
+            data_world_size=data_world_size,
+            batch_size_multiple=batch_size_multiple,
+            task_type=task_type,
+            persist_status=True,
+        )
 
     async def schedule_task_and_wait(
         self,
@@ -254,12 +285,14 @@ class TaskQueueMixin:
         """Schedule a compute task and block until it completes.
 
         Twinkle-side counterpart to schedule_task(). Enqueues the task through
-        the serial worker, polls until a terminal state, and returns the result.
+        the same serial worker but delivers the result through an in-process
+        Future. Large model outputs therefore never enter ServerState.
 
         Raises:
             RuntimeError: If the task fails or scheduling is rejected.
         """
-        future_ref = await self.schedule_task(
+        completion = asyncio.get_running_loop().create_future()
+        task_ref = await self._schedule_task(
             coro_factory,
             model_id=model_id,
             token=token,
@@ -268,25 +301,13 @@ class TaskQueueMixin:
             data_world_size=data_world_size,
             batch_size_multiple=batch_size_multiple,
             task_type=task_type,
+            completion=completion,
+            persist_status=False,
         )
-        request_id = future_ref.get('request_id')
-        if request_id is None:
-            raise RuntimeError(f'Task scheduling failed: {future_ref}')
-
-        poll_interval = 0.05
-        max_poll_interval = 1.0
-        while True:
-            record = await self.state.get_future(request_id)
-            if record and record.get('status') not in ('pending', 'queued', 'running'):
-                break
-            await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 2, max_poll_interval)
-
-        if record['status'] == 'failed':
-            error = record.get('result', {}).get('error', 'Unknown error')
+        if error := task_ref.get('_error'):
+            completion.cancel()
             raise RuntimeError(error)
-
-        return record['result']
+        return await completion
 
     async def schedule_background_task(
         self,
@@ -294,12 +315,12 @@ class TaskQueueMixin:
         model_id: str | None = None,
         task_type: str | None = None,
     ) -> dict[str, Any]:
-        """Schedule a fire-and-forget background task (bypasses compute queue).
+        """Schedule a fire-and-forget task outside the serial queue.
 
-        Designed for pure I/O operations such as upload_to_hub that do not
-        require GPU serialization. The task is launched immediately as an
-        asyncio.create_task so it runs concurrently with the compute queue
-        without blocking any other user's training operations.
+        The task is launched immediately as an asyncio task. This is suitable
+        for pure I/O and for an inference engine such as vLLM that performs its
+        own safe request concurrency and continuous batching. Stateful Model
+        operations must continue to use :meth:`schedule_task`.
 
         Status is tracked via state.store_future_status so clients can poll
         progress through the same status endpoints as schedule_task().
@@ -317,7 +338,11 @@ class TaskQueueMixin:
                     f'type={task_type or "unknown"}, model_id={model_id}')
 
         await self.state.store_future_status(
-            request_id, TaskStatus.RUNNING.value, model_id, queue_state=QueueState.ACTIVE.value)
+            request_id,
+            TaskStatus.RUNNING.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
 
         async def _run() -> None:
             try:
@@ -327,7 +352,8 @@ class TaskQueueMixin:
                     TaskStatus.COMPLETED.value,
                     model_id,
                     result=result,
-                    queue_state=QueueState.ACTIVE.value)
+                    queue_state=QueueState.ACTIVE.value,
+                )
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
             except Exception:
                 error_payload = task_error_payload(traceback.format_exc())
@@ -336,7 +362,8 @@ class TaskQueueMixin:
                     TaskStatus.FAILED.value,
                     model_id,
                     result=error_payload,
-                    queue_state=QueueState.ACTIVE.value)
+                    queue_state=QueueState.ACTIVE.value,
+                )
                 logger.error(f'[TaskQueue] Background task {request_id} FAILED, type={task_type or "unknown"}:\n'
                              f'{traceback.format_exc(limit=3)}')
 
