@@ -8,7 +8,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle import get_logger
-from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
+from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                           SamplingParams, StopReason, pooling_to_list)
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
@@ -78,6 +79,7 @@ class VLLMEngine(BaseSamplerEngine):
         quantization: Optional[str] = None,
         load_format: str = 'auto',
         logprobs_mode: Optional[str] = None,
+        runner: Optional[str] = None,
         **kwargs,
     ):
         from twinkle.hub import HubOperation
@@ -98,6 +100,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.quantization = quantization
         self.load_format = load_format
         self.logprobs_mode = logprobs_mode or 'processed_logprobs'
+        self.runner = runner
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
@@ -162,7 +165,14 @@ class VLLMEngine(BaseSamplerEngine):
         if self.enable_sleep_mode:
             engine_config['enable_sleep_mode'] = True
 
-        if self.logprobs_mode is not None:
+        # A pooling model (embedding/seq_cls/reranker/reward) is loaded by vLLM as a "pooling" runner,
+        # which swaps the LM head for the pooling head and routes requests through ``encode`` instead of
+        # ``generate``. logprobs_mode is a generation-only knob and is dropped here so vLLM does not
+        # reject it against a pooling model. ``runner`` reaches AsyncEngineArgs through the signature
+        # filter below, so an older vLLM that lacks it warns and ignores rather than failing to build.
+        if self.runner is not None:
+            engine_config['runner'] = self.runner
+        if self.logprobs_mode is not None and self.runner != 'pooling':
             engine_config['logprobs_mode'] = self.logprobs_mode
 
         if self.enable_lora:
@@ -354,6 +364,76 @@ class VLLMEngine(BaseSamplerEngine):
             prompt_logprobs=result_prompt_logprobs,
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
+
+    async def encode(self,
+                     prompt: Union[List[int], str],
+                     pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+                     request_id: Optional[str] = None,
+                     priority: int = 0,
+                     *,
+                     lora_request: Optional[Any] = None,
+                     multi_modal_data: Optional[Dict[str, Any]] = None,
+                     mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+                     **kwargs) -> PoolingResponse:
+        """Run a pooling forward (embedding / classify) and return the pooled output.
+
+        The pooling counterpart of :meth:`sample`. It requires the engine to have been built as a
+        pooling runner (``runner='pooling'``); against a generation engine vLLM has no pooling head to
+        run and raises. ``encode`` returns an async generator just like ``generate``, so the final
+        ``PoolingRequestOutput`` is drained the same way and its ``outputs.data`` tensor flattened.
+
+        Args:
+            prompt: Input token IDs or a string.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            request_id: Optional request ID for tracking.
+            priority: Request priority (higher = more urgent).
+            lora_request: LoRARequest for multi-tenant pooling adapters.
+            multi_modal_data: Optional multimodal data for a multimodal embedding model.
+            mm_processor_kwargs: Optional kwargs forwarded to vLLM's multimodal processor.
+        """
+        from vllm.inputs import TextPrompt, TokensPrompt
+
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+        vllm_pooling = pooling_params.to_vllm(**kwargs)
+
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+
+        prompt_token_ids = None
+        if isinstance(prompt, str):
+            prompt_obj = TextPrompt(prompt=prompt)
+        else:
+            prompt_token_ids = list(prompt)
+            prompt_obj = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if multi_modal_data:
+            prompt_obj['multi_modal_data'] = multi_modal_data
+        if mm_processor_kwargs:
+            prompt_obj['mm_processor_kwargs'] = mm_processor_kwargs
+
+        if lora_request is not None and not self.enable_lora:
+            logger.warning('lora_request provided but enable_lora is False — LoRA will be ignored for '
+                           'this pooling request')
+            lora_request = None
+
+        generator = self.engine.encode(
+            prompt=prompt_obj,
+            pooling_params=vllm_pooling,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+        result = None
+        async for output in generator:
+            result = output
+        if result is None:
+            raise RuntimeError('Pooling encode did not produce a result')
+
+        data = pooling_to_list(result.outputs.data, normalize=pooling_params.normalize)
+        return PoolingResponse(data=data, task=pooling_params.task, prompt_token_ids=prompt_token_ids)
 
     async def generate_stream(self,
                               prompt: Union[List[int], str],

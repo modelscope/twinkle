@@ -5,7 +5,8 @@ from typing import Any, List, Optional, Type, Union
 
 import twinkle
 from twinkle import remote_function
-from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampleResponse, SamplingParams,
+                                 Trajectory)
 from twinkle.patch import Patch
 from twinkle.template import Template
 from twinkle.utils import construct_class
@@ -42,6 +43,30 @@ class Sampler(ABC):
             Total sequences = len(inputs) * num_samples.
         """
         pass
+
+    def encode(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[PoolingParams] = None,
+        adapter_name: str = '',
+    ) -> List[PoolingResponse]:
+        """Run a pooling (non-generative) forward and return the pooled output per input.
+
+        The pooling counterpart of :meth:`sample`: one forward per input, no decoding, producing an
+        embedding vector / class scores / a relevance score. Only samplers whose backend can serve a
+        pooling head (vLLM, SGLang) override this; the default raises so a backend without pooling
+        support fails loudly rather than silently returning hidden states that look like embeddings.
+
+        Args:
+            inputs: Either InputFeature(s) or Trajectory(s), as for :meth:`sample`.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            adapter_name: Optional LoRA adapter name.
+
+        Returns:
+            One PoolingResponse per input, in input order.
+        """
+        raise NotImplementedError(f'{type(self).__name__} does not support pooling/encode; use a vLLM or '
+                                  'SGLang sampler, or a HF forward via build_model(task=...).')
 
     @abstractmethod
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:

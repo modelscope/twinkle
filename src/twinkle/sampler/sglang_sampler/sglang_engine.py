@@ -4,7 +4,8 @@ import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from twinkle import get_logger, requires
-from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
+from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                           SamplingParams, StopReason, pooling_to_list)
 from twinkle.sampler.base_engine import BaseSamplerEngine
 
 logger = get_logger()
@@ -193,6 +194,83 @@ class SGLangEngine(BaseSamplerEngine):
             prompt_logprobs=prompt_logprobs,
             topk_prompt_logprobs=topk_prompt_logprobs,
         )
+
+    async def encode(
+        self,
+        prompt: Union[List[int], str, List[str], List[List[str]]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        request_id: Optional[str] = None,
+        *,
+        image_data: Optional[Any] = None,
+        lora_name: Optional[str] = None,
+        **kwargs,
+    ) -> PoolingResponse:
+        """Run a pooling forward on sglang and return the pooled output.
+
+        The pooling counterpart of :meth:`sample`. sglang has no separate offline ``encode`` coroutine
+        that takes token ids -- its ``Engine.encode``/``async_encode`` wrap ``EmbeddingReqInput`` and
+        only expose a *text* argument -- so this goes straight to ``tokenizer_manager.generate_request``
+        with an ``EmbeddingReqInput`` built here, which is the same handle :meth:`update_weights` and
+        :meth:`sleep` already use and the only way to feed sglang pre-tokenised input. The pooled output
+        comes back under ``embedding`` for every non-cross-encoder task (an embedding vector, or the
+        class logits for a classify model).
+
+        The engine must have been started with ``is_embedding=True`` for these models; that flag is what
+        routes the model to sglang's pooling forward, and it is passed through ``engine_kwargs``.
+
+        A cross-encoder request (``pooling_params.is_cross_encoder``) is the exception: sglang scores a
+        *pair* of texts, not token ids, so ``prompt`` must then be the text pair(s) (``[query, doc]`` or
+        a list of them) and is passed as ``is_cross_encoder_request=True``.
+
+        Args:
+            prompt: Token ids or text for embed/classify; a text pair (or list of pairs) when
+                ``pooling_params.is_cross_encoder``.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            request_id: Passed to sglang as ``rid``.
+            image_data: Images for a multimodal embedding model, in any form sglang accepts.
+            lora_name: Name of a LoRA adapter already registered by ``load_lora_adapter``.
+        """
+        from sglang.srt.managers.io_struct import EmbeddingReqInput
+
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+        task = pooling_params.task
+
+        prompt_token_ids: Optional[List[int]] = None
+        if pooling_params.is_cross_encoder:
+            # Cross-encoder: sglang wants the raw text pair(s), not token ids.
+            obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
+        else:
+            req: Dict[str, Any] = {}
+            if isinstance(prompt, str) or (isinstance(prompt, list) and prompt and isinstance(prompt[0], str)):
+                req['text'] = prompt
+            else:
+                prompt_token_ids = list(prompt)
+                req['input_ids'] = prompt_token_ids
+            if image_data is not None:
+                req['image_data'] = image_data
+            if pooling_params.dimensions is not None:
+                req['dimensions'] = pooling_params.dimensions
+            if lora_name:
+                req['lora_path'] = lora_name
+            if request_id is not None:
+                req['rid'] = request_id
+            obj = EmbeddingReqInput(**req)
+
+        generator = self._manager.generate_request(obj, None)
+        output = await generator.__anext__()
+
+        raw = output.get('embedding') if isinstance(output, dict) else output
+        if raw is None:
+            raise RuntimeError('sglang pooling returned no embedding; was the engine started with '
+                               'is_embedding=True for this model?')
+        data = pooling_to_list(raw, normalize=pooling_params.normalize)
+        if prompt_token_ids is None and isinstance(output, dict):
+            meta = output.get('meta_info') or {}
+            prompt_token_ids = meta.get('prompt_token_ids')
+        return PoolingResponse(data=data, task=task, prompt_token_ids=prompt_token_ids)
 
     async def generate_stream(self,
                               prompt: Union[List[int], str],

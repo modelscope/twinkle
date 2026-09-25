@@ -11,7 +11,8 @@ import numpy as np
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                 SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.sampler.base import Sampler
@@ -305,6 +306,98 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             return await asyncio.gather(*tasks)
 
         return self._run_in_loop(_sample_all())
+
+    async def _encode_single(
+        self,
+        feat: Dict[str, Any],
+        pooling_params: PoolingParams,
+        *,
+        image_data: Optional[List[Any]] = None,
+        lora_name: Optional[str] = None,
+    ) -> PoolingResponse:
+        """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
+        return await self.engine.encode(
+            prompt=feat['input_ids'],
+            pooling_params=pooling_params,
+            image_data=image_data,
+            lora_name=lora_name,
+        )
+
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    def encode(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[PoolingResponse]:
+        """Run a pooling forward (embedding / classify) for each input.
+
+        The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
+        registration and image extraction. The engine must have been started with ``is_embedding=True``
+        in ``engine_args`` for these models; that flag is what routes the model to sglang's pooling
+        forward. Without it sglang has no pooling head to run and :meth:`SGLangEngine.encode` raises.
+
+        Args:
+            inputs: Either InputFeature(s) or Trajectory(s). Trajectories are encoded with
+                ``add_generation_prompt=False`` -- a pooling forward scores the whole sequence, so it
+                must not end on a generation prompt.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            adapter_name: LoRA adapter name to encode with; must already be registered.
+            adapter_path: Optional LoRA adapter path, registered under ``adapter_name`` before encoding.
+            adapter_paths: Per-input LoRA paths, one entry per input, sliced in lockstep with ``inputs``.
+
+        Returns:
+            One PoolingResponse per input, in input order.
+        """
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        if adapter_paths is not None:
+            if adapter_path is not None:
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
+            if len(adapter_paths) != len(inputs_list):
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
+
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
+
+        if is_trajectory:
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
+            encoded_inputs = [
+                self.encode_trajectory_for_sglang(traj, adapter_name, add_generation_prompt=False)
+                for traj in inputs_list
+            ]
+        else:
+            encoded_inputs = inputs_list
+
+        if adapter_paths is not None:
+            lora_names = [self._register_lora(path) for path in adapter_paths]
+        else:
+            registered = self._register_lora(adapter_path, adapter_name)
+            lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
+
+        async def _encode_all():
+            tasks = [
+                self._encode_single(
+                    feat,
+                    pooling_params,
+                    image_data=image_data,
+                    lora_name=lora_name,
+                ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)
+            ]
+            return await asyncio.gather(*tasks)
+
+        return self._run_in_loop(_encode_all())
 
     def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
         """Register an adapter with sglang and return the name to send as ``lora_path``.

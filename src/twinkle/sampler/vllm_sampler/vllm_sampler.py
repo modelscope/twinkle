@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                 SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
@@ -381,6 +382,98 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results
+
+    async def _encode_single(
+        self,
+        feat: Dict[str, Any],
+        pooling_params: PoolingParams,
+        lora_request: Optional[Any] = None,
+        *,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
+    ) -> PoolingResponse:
+        """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
+        return await self.engine.encode(
+            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+            pooling_params=pooling_params,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=feat.get('mm_processor_kwargs'),
+        )
+
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    def encode(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[PoolingResponse]:
+        """Run a pooling forward (embedding / classify) for each input.
+
+        The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
+        resolution and multimodal extraction. It requires the engine to have been built as a pooling
+        runner (``runner='pooling'`` in ``engine_args``); against a generation engine vLLM has no
+        pooling head to run and raises.
+
+        Args:
+            inputs: Either InputFeature(s) or Trajectory(s). Trajectories are encoded with
+                ``add_generation_prompt=False`` -- a pooling forward scores the whole sequence, so it
+                must not end on a generation prompt.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            adapter_name: Optional LoRA adapter name.
+            adapter_path: Optional LoRA adapter path, applied to every input in this call.
+            adapter_paths: Per-input LoRA paths, one entry per input, sliced in lockstep with ``inputs``.
+
+        Returns:
+            One PoolingResponse per input, in input order.
+        """
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        if adapter_paths is not None:
+            if adapter_path is not None:
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
+            if len(adapter_paths) != len(inputs_list):
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
+
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
+
+        if is_trajectory:
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
+            encoded_inputs = [
+                self.encode_trajectory_for_vllm(traj, adapter_name, add_generation_prompt=False)
+                for traj in inputs_list
+            ]
+        else:
+            encoded_inputs = inputs_list
+
+        if adapter_paths is not None:
+            lora_requests = [self._load_lora(path) for path in adapter_paths]
+        else:
+            lora_requests = [self._load_lora(adapter_path)] * len(encoded_inputs)
+
+        async def _encode_all():
+            tasks = [
+                self._encode_single(
+                    feat,
+                    pooling_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)
+            ]
+            return await asyncio.gather(*tasks)
+
+        return self._run_in_loop(_encode_all())
 
     def _load_lora(self, adapter_path: Optional[str]):
         """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.

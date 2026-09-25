@@ -221,3 +221,126 @@ class SampleResponse:
     prompt_token_ids: Optional[List[int]] = None
     prompt_logprobs: Optional[List[Optional[float]]] = None
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
+
+
+#: The pooling heads a backend can serve, in vLLM's vocabulary -- and deliberately only the two vLLM's
+#: engine accepts for a whole-sequence forward. ``embed`` returns a sentence vector, ``classify`` the
+#: per-class logits/probs. A cross-encoder relevance *score* is NOT a separate task: vLLM serves it as
+#: ``classify`` on a scoring model (its own score/rerank API builds ``PoolingParams(task='classify')``),
+#: and it is flagged with :attr:`PoolingParams.is_cross_encoder` for the backend (sglang) that routes on
+#: the flag rather than inferring it from the model. dev maps its ``task_type`` onto these
+#: (embedding->embed, seq_cls/reranker->classify). A *generative* reranker is not a pooling task at all
+#: -- it is a decoder-only causal LM scored by the yes/no logprob difference of its first generated
+#: token, so it runs on the generation path, never through ``encode``.
+PoolingTask = Literal['embed', 'classify']
+
+
+def pooling_to_list(raw: Any, normalize: bool = False) -> List[float]:
+    """Coerce a backend's pooled output to a flat ``List[float]``.
+
+    The three pooling backends disagree on the container: vLLM hands back a torch tensor under
+    ``outputs.data``, sglang a python list / numpy array under ``embedding``, and a scalar score arrives
+    as a bare number rather than a one-element list. Everything downstream (Ray's result boundary, jsonl
+    output) wants plain floats, so the lot is flattened here once instead of at each call site.
+
+    ``normalize`` L2-normalises the vector, which is what an embedding model served for retrieval needs
+    and what the backends do not all do by default.
+    """
+    values = raw
+    if hasattr(values, 'detach'):
+        values = values.detach()
+    if hasattr(values, 'float'):
+        try:
+            values = values.float()
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    if hasattr(values, 'cpu'):
+        try:
+            values = values.cpu()
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    if hasattr(values, 'tolist'):
+        values = values.tolist()
+    if isinstance(values, (int, float)):
+        values = [float(values)]
+    else:
+        values = [float(v) for v in values]
+    if normalize:
+        import math
+        norm = math.sqrt(sum(v * v for v in values))
+        if norm > 0:
+            values = [v / norm for v in values]
+    return values
+
+
+@dataclass
+class PoolingParams:
+    """Parameters for a pooling (non-generative) forward -- the counterpart of :class:`SamplingParams`.
+
+    Where ``SamplingParams`` says how to decode tokens, this says which pooled head to run and how to
+    post-process it. ``task`` uses vLLM's pooling vocabulary directly so the mapping to a backend is a
+    pass-through rather than a second translation table.
+
+    ``use_activation`` applies the head's activation (sigmoid on a cross-encoder score, softmax on
+    class logits); the backends spell it differently (vLLM ``use_activation``/older ``activation``), so
+    :meth:`to_vllm` picks whichever the installed version takes. ``is_cross_encoder`` marks the request
+    as a (query, document) relevance score rather than a plain classify; vLLM infers this from the
+    scoring model so the flag is a no-op there, but sglang routes on it explicitly (it wants the raw
+    text pair, not token ids). ``dimensions`` truncates an embedding (Matryoshka-style); ``normalize``
+    L2-normalises the returned vector.
+    """
+    task: PoolingTask = 'embed'
+    use_activation: bool = False
+    is_cross_encoder: bool = False
+    dimensions: Optional[int] = None
+    normalize: bool = False
+
+    def __post_init__(self):
+        valid = ('embed', 'classify')
+        if self.task not in valid:
+            raise ValueError(f'task must be one of {valid}, got {self.task!r}')
+        if self.dimensions is not None:
+            if not isinstance(self.dimensions, int) or isinstance(self.dimensions, bool):
+                raise ValueError(f'dimensions must be an int or None, got {type(self.dimensions)}')
+            if self.dimensions <= 0:
+                raise ValueError(f'dimensions must be > 0, got {self.dimensions}')
+
+    def to_vllm(self, **kwargs):
+        """Convert to vLLM's ``PoolingParams``, keeping only the fields the installed version takes."""
+        import inspect
+
+        from vllm.pooling_params import PoolingParams as VLLMPoolingParams
+
+        params = dict(kwargs)
+        signature = inspect.signature(VLLMPoolingParams).parameters
+        if 'task' in signature:
+            params['task'] = self.task
+        if self.use_activation:
+            if 'use_activation' in signature:
+                params['use_activation'] = True
+            elif 'activation' in signature:
+                params['activation'] = True
+        if self.dimensions is not None and 'dimensions' in signature:
+            params['dimensions'] = self.dimensions
+        return VLLMPoolingParams(**params)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'PoolingParams':
+        """Create PoolingParams from a dict, ignoring keys that are not fields."""
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in valid_fields}
+        return cls(**filtered)
+
+
+@dataclass
+class PoolingResponse:
+    """Response from a pooling (encode) request.
+
+    ``data`` is a flat list of floats whose meaning follows ``task``: an embedding vector for ``embed``,
+    or the per-class logits/probs for ``classify`` (a cross-encoder relevance score is the single value
+    a ``classify`` scoring model returns). Plain python so it crosses Ray's result boundary and
+    serialises to jsonl without further conversion.
+    """
+    data: List[float]
+    task: PoolingTask = 'embed'
+    prompt_token_ids: Optional[List[int]] = None
