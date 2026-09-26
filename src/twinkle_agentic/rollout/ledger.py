@@ -101,6 +101,35 @@ class TurnLedger:
             return False
         return len(self._pif.get('input_ids') or []) >= self.max_tokens
 
+    # ------------------------------------------------------- text operations
+    #
+    # The loop needs three things that only the template knows how to do: read a
+    # tool call out of a reply's text, report markup that did not parse, and
+    # decode a generation back to text. They are delegated here so the loop talks
+    # to one mode-aware collaborator (the ledger) instead of reaching for
+    # ``self.template`` directly -- :class:`MessageLedger` answers the same three
+    # trivially, because it has no template. The implementations stay in the
+    # template; nothing is moved, this is a forwarding surface.
+
+    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+        """Structured tool calls the model emitted in ``decoded`` (template markup)."""
+        return self.template.parse_tool_call(decoded)
+
+    def tool_call_errors(self, decoded: str) -> List[str]:
+        """Malformed tool-call markup errors in ``decoded`` (template-specific)."""
+        return self.template.tool_call_errors(decoded)
+
+    def decode_tokens(self, seq: SampledSequence) -> str:
+        """Text of a generation, decoded from its tokens without the special tokens.
+
+        Falls back to ``seq.decoded`` when there is no tokenizer or no tokens, so
+        the loop's ``content`` rewrite works for a reply that carries text only.
+        """
+        tokenizer = getattr(self.template, 'tokenizer', None)
+        if tokenizer is None or not seq.tokens:
+            return seq.decoded or ''
+        return tokenizer.decode(seq.tokens, skip_special_tokens=True)
+
     # ---------------------------------------------------------------- writing
 
     def open(self, trajectory: Trajectory, *, tools: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -277,6 +306,143 @@ class TurnLedger:
                                'by (labels != -100) & completion_mask.')
 
 
+class MessageLedger:
+    """The message-level counterpart of :class:`TurnLedger`: an episode account
+    with no tokens in it.
+
+    Some backends produce text only -- a remote OpenAI-compatible teacher, say,
+    returns a finished reply and no token ids, and there is no local tokenizer to
+    encode with. Such a backend cannot feed :class:`TurnLedger`, whose
+    :meth:`record` requires ``new_input_feature.input_ids`` and whose whole reason
+    for existing is that a trajectory is trainable down to the sampled id. It can
+    still drive a multi-turn conversation, and the loop that does so is identical
+    down to the bookkeeping -- so this keeps the same call surface (``open`` /
+    ``record`` / ``observe`` / ``merge`` / ``input_feature`` / ``turns`` / ``full``
+    plus the three text operations) and accounts in messages instead of tokens.
+
+    What it deliberately does not do: it never encodes; ``merge`` emits no
+    ``input_ids`` / ``labels`` / ``logprobs``; ``audit`` is a no-op (there is no
+    logprob-to-token alignment to check); ``full`` is always False (there is no
+    token budget to hit). A trajectory it produces is a transcript, not a
+    trainable sample. Tool calls cannot be parsed from text without a template,
+    so they must arrive structurally: the backend puts them on the assistant
+    message it returns (through ``new_input_feature['messages']``), which the loop
+    already reads before falling back to text parsing.
+
+    Duck-typed against :class:`TurnLedger`, not subclassed: the two share a call
+    surface, not state -- one holds an encoded feature, the other a message list
+    -- and a common base would be thinner than the disagreement between them.
+    """
+
+    def __init__(self, *, label: str = 'trajectory', max_tokens: Optional[int] = None) -> None:
+        self.label = label
+        # Taken for signature parity with TurnLedger and ignored: there are no
+        # tokens to budget at the message level.
+        self.max_tokens = max_tokens
+        # One live dict, handed out by ``input_feature`` and annotated in place by
+        # the loop (it withdraws tool schemas with ``['tools'] = []`` and rewrites
+        # the last message). ``messages`` is the very list the writer methods
+        # append to, so those annotations stay visible.
+        self._feature: Dict[str, Any] = {'messages': [], 'tools': []}
+        self._turns = 0
+
+    # ---------------------------------------------------------------- reading
+
+    @property
+    def input_feature(self) -> Dict[str, Any]:
+        """The episode so far as a live ``{'messages', 'tools'}`` dict.
+
+        Live rather than a copy because the loop annotates it in place. There are
+        no token arrays in it to protect, which is the one freedom message-level
+        accounting has over :class:`TurnLedger`.
+        """
+        return self._feature
+
+    @property
+    def messages(self) -> List[Dict[str, Any]]:
+        return list(self._feature['messages'])
+
+    @property
+    def logprobs(self) -> List[Any]:
+        """Always empty: a text-only backend reports no logprobs."""
+        return []
+
+    @property
+    def turns(self) -> int:
+        """Replies banked."""
+        return self._turns
+
+    def full(self) -> bool:
+        """Never full: there is no token budget at the message level."""
+        return False
+
+    # ------------------------------------------------------- text operations
+
+    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+        """No template, so no text parser: tool calls arrive structurally only."""
+        return []
+
+    def tool_call_errors(self, decoded: str) -> List[str]:
+        """No markup to validate without a template."""
+        return []
+
+    def decode_tokens(self, seq: SampledSequence) -> str:
+        """No tokenizer: the reply's text is all there is."""
+        return seq.decoded or ''
+
+    # ---------------------------------------------------------------- writing
+
+    def open(self, trajectory: Trajectory, *, tools: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Take the opening messages as they are -- nothing is encoded."""
+        self._feature = {
+            'messages': list(trajectory.get('messages') or []),
+            'tools': list(tools if tools is not None else (trajectory.get('tools') or [])),
+        }
+        self._turns = 0
+
+    def record(self, seq: SampledSequence) -> None:
+        """Bank one reply as an assistant message.
+
+        ``new_input_feature`` is optional here, unlike :class:`TurnLedger`. When
+        the backend supplies it as ``{'messages': [...]}`` -- the conversation plus
+        the assistant turn it just produced, carrying any structured ``tool_calls``
+        -- those messages are adopted wholesale, which is how a text-only backend
+        gets tool calls into the episode. Otherwise the reply is appended as a
+        plain assistant message built from ``seq.decoded``.
+        """
+        feature = seq.new_input_feature
+        if isinstance(feature, dict) and feature.get('messages'):
+            self._feature['messages'] = list(feature['messages'])
+            if 'tools' in feature:
+                self._feature['tools'] = list(feature['tools'])
+        else:
+            self._feature['messages'].append({'role': 'assistant', 'content': seq.decoded or ''})
+        self._turns += 1
+
+    def observe(self, messages: Sequence[Dict[str, Any]]) -> bool:
+        """Append messages the model did not write. Always fits: no token budget."""
+        self._feature['messages'].extend(dict(m) for m in messages)
+        return True
+
+    # ---------------------------------------------------------------- closing
+
+    def merge(self, trajectory: Trajectory, **fields: Any) -> Trajectory:
+        """The trajectory plus the transcript. No token fields, and no audit.
+
+        ``audit`` is a no-op because there is no logprob-to-token alignment to
+        check, and ``input_ids`` / ``labels`` / ``logprobs`` are absent so a
+        downstream consumer sees a transcript rather than an encoded feature.
+        """
+        out = dict(trajectory)
+        out['messages'] = list(self._feature['messages'])
+        out.update(fields)
+        return out
+
+    def audit(self) -> None:
+        """Nothing to align at the message level."""
+        return
+
+
 class LedgerBook:
     """Ledgers filed under a key, for episodes whose turns arrive unannounced.
 
@@ -371,4 +537,4 @@ class LedgerBook:
         return TurnLedger(self.template, label=label, max_tokens=self.max_tokens)
 
 
-__all__ = ['LedgerBook', 'TurnLedger']
+__all__ = ['LedgerBook', 'MessageLedger', 'TurnLedger']

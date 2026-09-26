@@ -11,7 +11,7 @@ from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
-from .ledger import TurnLedger
+from .ledger import MessageLedger, TurnLedger
 from .trace import TraceWriter
 
 ResponseCallback = Callable[..., SampledSequence]
@@ -190,15 +190,26 @@ class MultiTurnRollout(Rollout):
             if api is not None:
                 raise ValueError('the positional backend and api= both specify an API')
             api, sampler = sampler, None
-        if template is None:
-            raise ValueError('MultiTurnRollout requires a local Template instance')
+        # A local Template is what makes a trajectory trainable: it encodes the
+        # opening turn, reads tool-call markup, and owns the tokenizer. Without one
+        # the rollout still drives a conversation, but accounts in messages rather
+        # than tokens (see MessageLedger) -- the mode a text-only backend such as a
+        # remote teacher runs in. ``api=`` cannot work without a template, since
+        # APISampler formats the call with it.
+        message_only = template is None
+        if message_only and api is not None:
+            raise ValueError('api=/APISampler requires a local Template to format the call; '
+                             'message-only mode (template=None) has none.')
         if response_callback is None and sampler is None and api is None:
             raise ValueError('MultiTurnRollout requires a sampler or API when response_callback is omitted')
         if sampler is not None:
             sample = getattr(type(sampler), 'sample', None)
             if sample is None:
                 raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
-            if not getattr(sample, '_enable_continous_work', False):
+            # A message-only backend is a local text sampler, not a slice_dp GPU
+            # worker, so the one-request-per-call spreading this guards against does
+            # not apply; only the token-level path needs the declaration.
+            if not message_only and not getattr(sample, '_enable_continous_work', False):
                 raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
                                  'enable_continous_work=True: this rollout samples one trajectory per '
                                  'call, and a slice_dp sampler raises when a worker gets nothing from '
@@ -212,6 +223,8 @@ class MultiTurnRollout(Rollout):
         self._init_common(max_turns=max_turns, sampling_params=sampling_params, concurrency=concurrency, tracer=tracer)
         self.sampler = sampler
         self.template = template
+        # No template -> account in messages, not tokens (see ``_new_ledger``).
+        self._message_only = message_only
         if isinstance(api, APISampler):
             if api_kwargs:
                 raise ValueError('api_kwargs belongs on the APISampler when api= is already adapted')
@@ -305,9 +318,10 @@ class MultiTurnRollout(Rollout):
         # list -- 41 of 146 such replies dispatched something in a measured run --
         # which would rewrite the very state the text is about.
         self.followup_fn = followup_fn
-        assert self.template.truncation_strategy != 'split', (
-            "MultiTurnRollout does not support truncation_strategy='split'; "
-            'use left/right/delete/raise on the template.')
+        if self.template is not None:
+            assert self.template.truncation_strategy != 'split', (
+                "MultiTurnRollout does not support truncation_strategy='split'; "
+                'use left/right/delete/raise on the template.')
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
@@ -347,6 +361,20 @@ class MultiTurnRollout(Rollout):
             return [harness] * n
         return self._broadcast(harness, n, name='harness', per_trajectory=True)
 
+    def _new_ledger(self, index: int):
+        """The episode account for one trajectory: token-level or message-level.
+
+        With a template the trajectory is trainable and every id passes through a
+        :class:`TurnLedger`; without one (a text-only backend) there is nothing to
+        encode, so a :class:`MessageLedger` keeps the same call surface over a
+        message list. The loop below is identical either way -- it talks only to
+        the ledger, never to ``self.template`` directly.
+        """
+        label = f'trajectory {index}'
+        if self._message_only:
+            return MessageLedger(label=label, max_tokens=self.max_trajectory_tokens)
+        return TurnLedger(self.template, label=label, max_tokens=self.max_trajectory_tokens)
+
     def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
         # A harness from a pool is leased for the episode and returned after, so
         # its per-episode state (an agent's memory, say) never leaks into the
@@ -366,7 +394,7 @@ class MultiTurnRollout(Rollout):
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
         # that decides when to add one. See ``ledger.py``.
-        ledger = TurnLedger(self.template, label=f'trajectory {index}', max_tokens=self.max_trajectory_tokens)
+        ledger = self._new_ledger(index)
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         # A harness may shape the opening (system prompt, tool schema) before
@@ -466,7 +494,7 @@ class MultiTurnRollout(Rollout):
             last_msg = msgs[-1] if msgs else None
             tool_calls = (last_msg.get('tool_calls') if isinstance(last_msg, dict) else None)
             if not tool_calls:
-                tool_calls = self.template.parse_tool_call(seq.decoded or '')
+                tool_calls = ledger.parse_tool_call(seq.decoded or '')
             # After a follow-up, a parsed call is not a call: the tools were
             # withdrawn for these stages on purpose (see ``followup_fn``), and
             # dispatching python that the model wrote as *an answer* would edit
@@ -487,12 +515,10 @@ class MultiTurnRollout(Rollout):
                     # writes a message: ``seq.decoded`` keeps the closing
                     # ``<|im_end|>``, and putting that in the content put it in
                     # the problem statements ex13 handed to solvers -- 7 of 7 of
-                    # them ended in a literal '<|im_end|>'.
-                    tok = getattr(self.template, 'tokenizer', None)
-                    if tok is not None and seq.tokens:
-                        last_msg['content'] = tok.decode(seq.tokens, skip_special_tokens=True)
-                    else:
-                        last_msg['content'] = seq.decoded or ''
+                    # them ended in a literal '<|im_end|>'. The ledger decodes
+                    # through the template's tokenizer, falling back to
+                    # ``seq.decoded`` when there is none (message-only mode).
+                    last_msg['content'] = ledger.decode_tokens(seq)
                     last_msg.pop('tool_calls', None)
 
             # Let the harness normalize the assistant turn's message metadata
@@ -525,7 +551,7 @@ class MultiTurnRollout(Rollout):
                 # the call again. Not after a follow-up: tools are withdrawn
                 # there on purpose (see ``followup_fn``), so a reply that looks
                 # like a call is meant to be read as text.
-                parse_errors = ([] if followups else self.template.tool_call_errors(seq.decoded or ''))
+                parse_errors = ([] if followups else ledger.tool_call_errors(seq.decoded or ''))
                 if parse_errors and malformed_turns < self.max_malformed_retries:
                     malformed_turns += 1
                     if not ledger.observe([_malformed_tool_message(parse_errors)]):
