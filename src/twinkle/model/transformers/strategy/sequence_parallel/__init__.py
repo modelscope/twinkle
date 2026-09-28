@@ -55,6 +55,12 @@ def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_pos
     )
 
 
+# `attn_implementation` values that follow the FlashAttention contract (transposed q/k/v, optional
+# 2D padding mask, `cu_seq_lens_*` for packed batches). They share transformers' single
+# `flash_attention_forward` entry point and differ only in the leaf kernel, so SP treats them alike.
+FLASH_ATTENTION_IMPLS = ('flash_attention_2', 'flash_attention_3')
+
+
 # main content copied from ms-swift
 class SequenceParallel:
 
@@ -331,10 +337,17 @@ class SequenceParallel:
                 query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
                 *args, **kwargs), None
 
+        # `flash_attention_2/3` all hold the same `flash_attention_forward` object in transformers; the
+        # concrete kernel is picked at call time from `module.config._attn_implementation`. So the SP
+        # wrapper has to be registered under every FlashAttention name: `AttentionInterface.get_interface`
+        # is an exact-key lookup, so an FA3 config left unwrapped would silently train *without* sequence
+        # parallelism. One `_origin` alias is enough because `local_flash_attn` dispatches through the
+        # module config, not through the key it was reached by.
         ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'] = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         ALL_ATTENTION_FUNCTIONS['sdpa_origin'] = ALL_ATTENTION_FUNCTIONS['sdpa']
-        ALL_ATTENTION_FUNCTIONS['flash_attention_2'] = partial(
-            local_flash_attn, dist_attn=DistributedAttention(None, self))
+        for _impl in FLASH_ATTENTION_IMPLS:
+            ALL_ATTENTION_FUNCTIONS[_impl] = partial(
+                local_flash_attn, dist_attn=DistributedAttention(None, self))
         ALL_ATTENTION_FUNCTIONS['sdpa'] = partial(local_sdpa_attn, dist_attn=DistributedAttention(None, self))
 
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
@@ -750,7 +763,7 @@ class SequenceParallel:
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
             local_cache_position = torch.arange(0, attn_shape, device=inputs.device)
-            # FlashAttention2 expects a 2D padding mask (or None). Converting it to a 4D causal mask here breaks
+            # FlashAttention expects a 2D padding mask (or None). Converting it to a 4D causal mask here breaks
             # the later per-rank sequence split and changes the attention contract relative to the baseline path.
             if (cache_position is None and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
                     and not is_flash_attention_implementation(self.attn_implementation)):
