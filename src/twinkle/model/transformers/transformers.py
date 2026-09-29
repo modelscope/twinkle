@@ -374,6 +374,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
         # config reference aligned with the config that the model actually uses.
         self.hf_config = self.model.config
+        logger.info_once(
+            f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
+            f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
