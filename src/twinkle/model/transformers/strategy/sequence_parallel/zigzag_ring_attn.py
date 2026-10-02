@@ -6,6 +6,10 @@ import torch.nn.functional as F
 from functools import cache
 from typing import Optional, Tuple
 
+from twinkle.utils import get_logger
+
+logger = get_logger()
+
 
 class RingComm:
 
@@ -139,6 +143,23 @@ def squeeze_batch(*tensors):
     return tuple(squeezed)
 
 
+def _resolve_backend(backend):
+    """Return ('fa2'|'fa3', forward_op, backward_op) for a flash-attention implementation name.
+
+    fa2 exposes dedicated varlen internals; fa3 (hopper, module `flash_attn_interface`) has a single
+    unified op that goes varlen when `cu_seqlens_*` are passed, returns `(out, lse, out_accum,
+    lse_accum)`, and computes gradients by mutating the dq/dk/dv buffers it is given.
+    """
+    if backend == 'flash_attention_3':
+        from flash_attn_interface import _flash_attn_backward, _flash_attn_forward
+        logger.info_once('[zigzag ring] attention backend: flash_attention_3 '
+                         '(flash_attn_interface unified op, gradients via dq/dk/dv buffer mutation)')
+        return 'fa3', _flash_attn_forward, _flash_attn_backward
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_backward, _flash_attn_varlen_forward
+    logger.info_once(f'[zigzag ring] attention backend: {backend} (flash_attn varlen internals)')
+    return 'fa2', _flash_attn_varlen_forward, _flash_attn_varlen_backward
+
+
 def padding(tensor, cu_seqlens, padding_value, front):
     if len(cu_seqlens) == 2:
         if front:
@@ -163,30 +184,50 @@ def padding(tensor, cu_seqlens, padding_value, front):
     return torch.cat(output)
 
 
-def forward(
-    q,
-    k,
-    v,
-    causal,
-    cu_seqlens,
-    max_seqlen,
-    block_seq_len,
-    dropout_p,
-    softmax_scale,
-    alibi_slopes,
-    window_size,
-):
-    seqlen_q = q.shape[0]
-    seqlen_kv = k.shape[0]
+def _half_seq_params(seqlen_q, seqlen_kv, cu_seqlens, max_seqlen, block_seq_len):
+    """Halve cu_seqlens/max_seqlen for q/kv that only cover one zigzag half-block."""
     half_cu_seqlens = cu_seqlens // 2
     half_max_seqlen = max_seqlen // 2
     cu_seqlens_q = half_cu_seqlens if seqlen_q == block_seq_len else cu_seqlens
     max_seqlen_q = half_max_seqlen if seqlen_q == block_seq_len else max_seqlen
     cu_seqlens_kv = half_cu_seqlens if seqlen_kv == block_seq_len else cu_seqlens
     max_seqlen_kv = half_max_seqlen if seqlen_kv == block_seq_len else max_seqlen
-    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+    return cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
 
-    params = get_default_args(_flash_attn_varlen_forward).copy()
+
+def _fa3_varlen_forward(fwd_op, q, k, v, causal, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+                        dropout_p, softmax_scale, alibi_slopes, window_size):
+    # fa3 has no dropout / alibi support; lse is always returned.
+    assert dropout_p == 0, 'flash_attention_3 does not support dropout'
+    assert alibi_slopes is None, 'flash_attention_3 does not support alibi_slopes'
+    outputs = fwd_op(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_kv,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+    )
+    # (out, softmax_lse, out_accum, softmax_lse_accum); lse must match fa2's varlen layout
+    # (nheads, total_q) since update_out_and_lse transposes it.
+    block_out, block_lse = outputs[0], outputs[1]
+    assert block_lse.shape == (q.shape[1], q.shape[0]), (
+        f'unexpected fa3 varlen lse layout {tuple(block_lse.shape)}; update_out_and_lse assumes '
+        f'(nheads, total_q) like fa2')
+    return block_out, block_lse
+
+
+def _fa2_varlen_forward(fwd_op, q, k, v, causal, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+                        dropout_p, softmax_scale, alibi_slopes, window_size):
+    # Params are seeded from the installed fa2 version's signature defaults to tolerate signature
+    # drift across flash-attn 2.x releases (window_size tuple vs window_size_left/right, extra
+    # knobs like block_table/zero_tensors that we leave at their defaults).
+    params = get_default_args(fwd_op).copy()
     params.update({
         'q': q,
         'k': k,
@@ -212,7 +253,7 @@ def forward(
     assert q.shape[-0] == cu_seqlens_q[-1]
     assert max_seqlen_q == (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     assert max_seqlen_kv == (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).max().item()
-    outputs = _flash_attn_varlen_forward(**params)
+    outputs = fwd_op(**params)
     if len(outputs) == 8:
         block_out, _, _, _, _, block_lse, _, _ = outputs
     else:
@@ -221,38 +262,63 @@ def forward(
     return block_out, block_lse
 
 
-def backward(
-    dout,
+def forward(
     q,
     k,
     v,
-    out,
-    softmax_lse,
     causal,
     cu_seqlens,
     max_seqlen,
     block_seq_len,
-    dq_buffer,
-    dk_buffer,
-    dv_buffer,
     dropout_p,
     softmax_scale,
     alibi_slopes,
-    deterministic,
     window_size,
+    backend='flash_attention_2',
 ):
-    seqlen_q = q.shape[0]
-    seqlen_kv = k.shape[0]
+    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = _half_seq_params(
+        q.shape[0], k.shape[0], cu_seqlens, max_seqlen, block_seq_len)
+    kind, fwd_op, _ = _resolve_backend(backend)
+    fwd_fn = _fa3_varlen_forward if kind == 'fa3' else _fa2_varlen_forward
+    return fwd_fn(fwd_op, q, k, v, causal, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, dropout_p,
+                  softmax_scale, alibi_slopes, window_size)
 
-    half_cu_seqlens = cu_seqlens // 2
-    half_max_seqlen = max_seqlen // 2
-    cu_seqlens_q = half_cu_seqlens if seqlen_q == block_seq_len else cu_seqlens
-    max_seqlen_q = half_max_seqlen if seqlen_q == block_seq_len else max_seqlen
-    cu_seqlens_kv = half_cu_seqlens if seqlen_kv == block_seq_len else cu_seqlens
-    max_seqlen_kv = half_max_seqlen if seqlen_kv == block_seq_len else max_seqlen
-    from flash_attn.flash_attn_interface import _flash_attn_varlen_backward
 
-    params = get_default_args(_flash_attn_varlen_backward).copy()
+def _fa3_varlen_backward(bwd_op, dout, q, k, v, out, softmax_lse, causal, cu_seqlens_q, cu_seqlens_kv,
+                         max_seqlen_q, max_seqlen_kv, dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale,
+                         alibi_slopes, deterministic, window_size):
+    assert dropout_p == 0, 'flash_attention_3 does not support dropout'
+    assert alibi_slopes is None, 'flash_attention_3 does not support alibi_slopes'
+    assert softmax_lse.shape[1] == q.shape[0]
+    # fa3's backward mutates the dq/dk/dv it is given; zero the slices first in case the
+    # kernel accumulates instead of overwriting (fa2's varlen backward overwrites).
+    bwd_op(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_kv,
+        dq=dq_buffer[:q.shape[0]].zero_(),
+        dk=dk_buffer[:k.shape[0]].zero_(),
+        dv=dv_buffer[:k.shape[0]].zero_(),
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        deterministic=deterministic,
+    )
+
+
+def _fa2_varlen_backward(bwd_op, dout, q, k, v, out, softmax_lse, causal, cu_seqlens_q, cu_seqlens_kv,
+                         max_seqlen_q, max_seqlen_kv, dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale,
+                         alibi_slopes, deterministic, window_size):
+    # Same defaults-seeding trick as _fa2_varlen_forward for 2.x signature drift.
+    params = get_default_args(bwd_op).copy()
     params.update({
         'dout': dout,
         'q': q,
@@ -260,9 +326,9 @@ def backward(
         'v': v,
         'out': out,
         'softmax_lse': softmax_lse,
-        'dq': dq_buffer[:seqlen_q],
-        'dk': dk_buffer[:seqlen_kv],
-        'dv': dv_buffer[:seqlen_kv],
+        'dq': dq_buffer[:q.shape[0]],
+        'dk': dk_buffer[:k.shape[0]],
+        'dv': dv_buffer[:k.shape[0]],
         'cu_seqlens_q': cu_seqlens_q,
         'cu_seqlens_k': cu_seqlens_kv,
         'max_seqlen_q': max_seqlen_q,
@@ -287,7 +353,37 @@ def backward(
             'window_size_left': window_size[0],
             'window_size_right': window_size[1],
         })
-    _flash_attn_varlen_backward(**params)
+    bwd_op(**params)
+
+
+def backward(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    causal,
+    cu_seqlens,
+    max_seqlen,
+    block_seq_len,
+    dq_buffer,
+    dk_buffer,
+    dv_buffer,
+    dropout_p,
+    softmax_scale,
+    alibi_slopes,
+    deterministic,
+    window_size,
+    backend='flash_attention_2',
+):
+    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = _half_seq_params(
+        q.shape[0], k.shape[0], cu_seqlens, max_seqlen, block_seq_len)
+    kind, _, bwd_op = _resolve_backend(backend)
+    bwd_fn = _fa3_varlen_backward if kind == 'fa3' else _fa2_varlen_backward
+    bwd_fn(bwd_op, dout, q, k, v, out, softmax_lse, causal, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q,
+           max_seqlen_kv, dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale, alibi_slopes, deterministic,
+           window_size)
 
 
 def lse_grad(out, lse, block_out, block_lse, sig, grad_out, grad_lse):
@@ -315,6 +411,7 @@ def zigzag_ring_flash_attn_varlen_forward(
         window_size=(-1, -1),
         alibi_slopes=None,
         deterministic=False,
+        backend='flash_attention_2',
 ):
     assert causal, 'zigzag ring is meaningless for causal=False'
     comm = RingComm(process_group)
@@ -332,17 +429,17 @@ def zigzag_ring_flash_attn_varlen_forward(
             next_k, next_v = comm.send_recv_kv(k, v)
         if step == 0:
             block_out, block_lse = forward(q, k, v, True, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             out, lse, _ = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= comm.rank:
             k0 = k[half_index0]
             v0 = v[half_index0]
             block_out, block_lse = forward(q, k0, v0, False, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             out, lse, _ = update_out_and_lse(out, lse, block_out, block_lse)
         else:
             block_out, block_lse = forward(q1, k, v, False, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             out[half_index1], lse[half_index1], _ = update_out_and_lse(out[half_index1], lse[half_index1], block_out,
                                                                        block_lse)
 
@@ -373,6 +470,7 @@ def zigzag_ring_flash_attn_varlen_backward(
         window_size=(-1, -1),
         alibi_slopes=None,
         deterministic=False,
+        backend='flash_attention_2',
 ):
     assert causal, 'zigzag ring is meaningless for causal=False'
     kv_comm = RingComm(process_group)
@@ -402,17 +500,17 @@ def zigzag_ring_flash_attn_varlen_backward(
 
         if step == 0:
             block_out, block_lse = forward(q, k, v, True, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             fout, flse, sig_diff = update_out_and_lse(fout, flse, block_out, block_lse)
         elif step <= kv_comm.rank:
             k0 = k[half_index0]
             v0 = v[half_index0]
             block_out, block_lse = forward(q, k0, v0, False, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             fout, flse, sig_diff = update_out_and_lse(fout, flse, block_out, block_lse)
         else:
             block_out, block_lse = forward(q1, k, v, False, cu_seqlens, max_seqlen, block_seq_len, dropout_p,
-                                           softmax_scale, alibi_slopes, window_size)
+                                           softmax_scale, alibi_slopes, window_size, backend)
             fout[half_index1], flse[half_index1], sig_diff = update_out_and_lse(fout[half_index1], flse[half_index1],
                                                                                 block_out, block_lse)
 
@@ -470,8 +568,9 @@ def zigzag_ring_flash_attn_varlen_backward(
 
         if step == 0:
             backward(
-                block_dout.to(dout.dtype), q, k, v, block_out, block_lse, True, cu_seqlens, max_seqlen, block_seq_len,
-                dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale, alibi_slopes, deterministic, window_size)
+                block_dout.to(dout.dtype), q, k, v, block_out, block_lse, True, cu_seqlens, max_seqlen,
+                block_seq_len, dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale, alibi_slopes,
+                deterministic, window_size, backend)
             dq = dq_buffer.to(torch.float32)
             dk = dk_buffer.to(torch.float32)
             dv = dv_buffer.to(torch.float32)
@@ -484,13 +583,13 @@ def zigzag_ring_flash_attn_varlen_backward(
                 backward(
                     block_dout.to(dout.dtype), q, k0, v0, block_out, block_lse, False, cu_seqlens, max_seqlen,
                     block_seq_len, dq_buffer, dk_buffer, dv_buffer, dropout_p, softmax_scale, alibi_slopes,
-                    deterministic, window_size)
+                    deterministic, window_size, backend)
                 dq += dq_buffer
             else:
                 backward(block_dout[half_index1].to(dout.dtype), q1, k, v, block_out[half_index1],
                          get_half_lse(block_lse, cu_seqlens,
                                       front=False), False, cu_seqlens, max_seqlen, block_seq_len, dq_buffer, dk_buffer,
-                         dv_buffer, dropout_p, softmax_scale, alibi_slopes, deterministic, window_size)
+                         dv_buffer, dropout_p, softmax_scale, alibi_slopes, deterministic, window_size, backend)
                 dq[half_index1] += dq_buffer[:block_seq_len]
 
             d_kv_comm.wait()
@@ -536,6 +635,7 @@ class ZigZagRingFlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        backend='flash_attention_2',
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1]**(-0.5)
@@ -561,6 +661,7 @@ class ZigZagRingFlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            backend=backend,
         )
         is_half_index_tensor = isinstance(half_index0, torch.Tensor)
         ctx.is_half_index_tensor = is_half_index_tensor
@@ -578,6 +679,7 @@ class ZigZagRingFlashAttnVarlenFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.backend = backend
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -606,8 +708,9 @@ class ZigZagRingFlashAttnVarlenFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            backend=ctx.backend,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def zigzag_ring_flash_attn_varlen_func(
@@ -624,6 +727,7 @@ def zigzag_ring_flash_attn_varlen_func(
         deterministic=False,
         return_attn_probs=False,
         group=None,
+        backend='flash_attention_2',
 ):
     return ZigZagRingFlashAttnVarlenFunc.apply(
         q,
@@ -639,4 +743,5 @@ def zigzag_ring_flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         group,
+        backend,
     )
