@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from twinkle.advantage.group_admission import GroupAdmissionPolicy
 from twinkle.data_format import SamplingParams, Trajectory, attach_user_data, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse
 from twinkle.utils import get_logger
@@ -191,6 +192,7 @@ class AgenticChallenger(Challenger):
         pass_band: Tuple[float, float] = (1.0, 7.0),
         pass_rate_width: float = 0.3,
         max_empty_rounds: int = 0,
+        group_admission_policy: Optional[GroupAdmissionPolicy] = None,
         followup_params: Optional[SamplingParams] = None,
         checker: Optional[Callable[[Trajectory], bool]] = None,
         save_dir: Optional[str] = None,
@@ -203,6 +205,7 @@ class AgenticChallenger(Challenger):
             num_solver_rollouts=num_solver_rollouts,
             pass_band=pass_band,
             max_empty_rounds=max_empty_rounds,
+            group_admission_policy=group_admission_policy,
         )
         if check_retries < 0:
             raise ValueError(f'check_retries must be >= 0, got {check_retries}')

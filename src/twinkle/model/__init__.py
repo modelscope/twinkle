@@ -7,13 +7,17 @@ if TYPE_CHECKING:
     from .base import TwinkleModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
     from .micro_batch import MicroBatchConfig
-    from .transformers import MultiLoraTransformersModel, TransformersModel, TransformersValueModel
+    from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
+                               TransformersValueModel)
 
 else:
     _import_structure = {
         'base': ['TwinkleModel'],
         'micro_batch': ['MicroBatchConfig'],
-        'transformers': ['TransformersModel', 'MultiLoraTransformersModel', 'TransformersValueModel'],
+        'transformers': [
+            'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',
+            'TransformersValueModel'
+        ],
         'megatron': ['MegatronModel', 'MultiLoraMegatronModel'],
     }
 

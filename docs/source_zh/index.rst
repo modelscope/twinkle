@@ -17,6 +17,7 @@ Twinkle DOCUMENTATION
    使用指引/Agentic RL部署与训练.md
    使用指引/Agentic评测.md
    使用指引/Qwen3.5最佳实践.md
+   使用指引/Hybrid LoRA训练.md
    使用指引/Embedding训练.md
 
 .. toctree::

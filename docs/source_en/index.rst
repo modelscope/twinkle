@@ -17,6 +17,7 @@ Twinkle DOCUMENTATION
    Usage Guide/Agentic-RL-Deployment-and-Training.md
    Usage Guide/Agentic-Evaluator.md
    Usage Guide/Introduction-with-Qwen3.5.md
+   Usage Guide/Hybrid-LoRA-Training.md
    Usage Guide/Embedding-Training.md
 
 .. toctree::

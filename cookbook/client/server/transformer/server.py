@@ -7,7 +7,7 @@
 
 import os
 
-os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '0'
+os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '1'
 
 from twinkle.server import launch_server
 
