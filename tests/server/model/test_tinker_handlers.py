@@ -234,7 +234,7 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
     else:
         body = types.ForwardRequest(
             model_id='model1',
-            forward_input=types.ForwardInput(data=[_datum()], loss_fn='cross_entropy'),
+            forward_input=types.ForwardBackwardInput(data=[_datum()], loss_fn='cross_entropy'),
         )
         path = '/tinker/forward'
     route = next(route for route in app.routes if getattr(route, 'path', None) == path)
