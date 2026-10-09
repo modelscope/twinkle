@@ -191,7 +191,7 @@ persistence:
 # Application list: Each entry defines a service component deployed on the Server
 applications:
 
-  # 1. TinkerCompatServer: Central API service
+  # 1. GatewayServer: Central API service
   # Handles client connections, training run tracking, checkpoint management, etc.
   # route_prefix uses /api/v1, compatible with both Tinker and Twinkle clients
   - name: server
@@ -203,7 +203,7 @@ applications:
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1

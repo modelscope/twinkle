@@ -1,8 +1,11 @@
+import pytest
 import torch
 from tinker import types
+from unittest.mock import Mock
 
 from twinkle.server.model.tinker_datum import extract_rl_features_for_loss
 from twinkle.server.model.backends.common import TwinkleCompatModelBase
+from twinkle.server.exceptions import RequestRejectedError
 
 
 def _datum(seq_len: int, *, ref_logps=None, old_logps=None, advantages=None):
@@ -20,6 +23,36 @@ def _datum(seq_len: int, *, ref_logps=None, old_logps=None, advantages=None):
         model_input=types.ModelInput.from_ints(list(range(seq_len))),
         loss_fn_inputs=loss_fn_inputs,
     )
+
+
+@pytest.mark.parametrize('loss_fn', ['ppo', 'cispo', 'dro', 'typo'])
+def test_tinker_backend_rejects_unsupported_loss_before_changing_adapter(loss_fn):
+    model = TwinkleCompatModelBase()
+    model.set_loss = Mock()
+    kwargs = {'beta': 0.1}
+
+    with pytest.raises(RequestRejectedError, match='Unsupported Tinker loss_fn'):
+        model._tinker_setup_loss(loss_fn, [_datum(2, advantages=[-1, -1])], 'adapter', kwargs)
+
+    model.set_loss.assert_not_called()
+    assert kwargs == {'beta': 0.1}
+
+
+@pytest.mark.parametrize('dpo', [False, True])
+def test_tinker_backend_preserves_existing_importance_sampling_loss(dpo):
+    model = TwinkleCompatModelBase()
+    model.set_loss = Mock()
+    model._ensure_dpo_metric = Mock()
+    inputs = [_datum(2, ref_logps=[-0.1, -0.2]) for _ in range(2)] if dpo else [_datum(2)]
+
+    model._tinker_setup_loss('importance_sampling', inputs, 'adapter', {})
+
+    if dpo:
+        model.set_loss.assert_called_once_with(
+            'DPOLoss', adapter_name='adapter', beta=0.1, loss_type='sigmoid', sft_weight=0.0)
+        model._ensure_dpo_metric.assert_called_once_with('adapter', 0.1)
+    else:
+        model.set_loss.assert_called_once_with('GRPOLoss', adapter_name='adapter', epsilon=0.2, beta=0.0)
 
 
 def test_tinker_build_output_handles_tensor_rows_from_transformers_backend():

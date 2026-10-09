@@ -1,8 +1,7 @@
 # Twinkle Client - Embedding (InfoNCE contrastive) Training Example
 #
-# Client counterpart of the ray-local core-lib example
-# ``cookbook/exp/embedding/train_embedding_full_ddp.py`` and the client section
-# of ``docs/source_zh/使用指引/Embedding训练.md``. Instead of building a local
+# HTTP client example described in the client section of
+# ``docs/source_zh/使用指引/Embedding训练.md``. Instead of building a local
 # ``TransformersModel``/``MegatronModel`` + Ray, it drives the SAME training flow
 # over HTTP through the Twinkle client:
 #

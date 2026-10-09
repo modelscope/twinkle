@@ -100,8 +100,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 sampling_params = None
                 if body.sampling_params:
                     sampling_params = SamplingParams(
-                        max_tokens=body.sampling_params.max_tokens or 256,
-                        temperature=body.sampling_params.temperature or 1.0,
+                        max_tokens=body.sampling_params.max_tokens
+                        if body.sampling_params.max_tokens is not None else 256,
+                        temperature=body.sampling_params.temperature
+                        if body.sampling_params.temperature is not None else 1.0,
                         top_p=body.sampling_params.top_p,
                         top_k=body.sampling_params.top_k,
                         stop=body.sampling_params.stop,

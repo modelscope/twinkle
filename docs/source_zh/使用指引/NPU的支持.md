@@ -208,19 +208,18 @@ export TWINKLE_NPU_GATED_RMSNorm_FP32=1
 
 ## 快速开始
 
-**重要提示**：以下示例均来自 `cookbook/` 目录，已在实际 NPU 环境中验证通过。建议直接运行 cookbook 中的脚本，而不是复制粘贴代码片段。
+仓库提供了 [`cookbook/megatron/ascend/`](https://github.com/modelscope/twinkle/tree/main/cookbook/megatron/ascend) 下的 Megatron NPU smoke 示例。进入该目录运行稠密模型示例：
 
-### SFT LoRA 微调
+```bash
+cd cookbook/megatron/ascend
+bash tp_npu.sh
+```
 
-当前 NPU 文档不再提供这类 SFT cookbook 示例；这部分能力需要结合实际可用的 cookbook 示例或后续补充的 NPU 脚本来说明。
-
-### GRPO 强化学习训练
-
-当前 NPU 文档不再提供这类 GRPO cookbook 示例；这部分能力需要结合实际可用的 cookbook 示例或后续补充的 NPU 脚本来说明。
+脚本使用八张 NPU，运行结合 TP/PP/DP 并行的短程 LoRA 训练循环。当前暂未提供 NPU 专用的 GRPO 和 Tinker 服务端配置示例。
 
 ### 更多示例
 
-查看 `cookbook/remote/tinker/ascend/` 目录了解远程训练服务端配置。
+MoE 训练 smoke 示例参见 `cookbook/megatron/ascend/tp_moe_npu.py` 和 `cookbook/megatron/ascend/tp_moe_cp_npu.py`。
 
 ## 并行策略
 
@@ -306,16 +305,11 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 
 ## 示例代码
 
-Twinkle 在 NPU 上已验证的示例目前聚焦 Megatron smoke 路径；SFT 和 GRPO cookbook 示例暂无对应文件。
+当前可用的 NPU smoke 示例：
 
-### 远程训练（Tinker 协议）
-- **服务端配置**：[cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
-  - 提供 HTTP API 接口
-  - 支持远程训练和推理
-  - 适用于生产环境部署
-
-**运行示例**：
-暂无对应命令示例。
+- [稠密模型：`tp_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_npu.py)
+- [MoE 模型：`tp_moe_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_moe_npu.py)
+- [MoE 加上下文并行：`tp_moe_cp_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_moe_cp_npu.py)
 
 
 ## 参考资源

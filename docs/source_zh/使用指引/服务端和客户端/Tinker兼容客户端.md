@@ -1,6 +1,14 @@
 # Tinker 客户端
 
-Tinker Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker_client` 初始化后，会对 Tinker SDK 进行 patch，使其指向 Twinkle Server，**其余代码可直接复用已有的 Tinker 训练代码**。
+Tinker Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker_client` 初始化后，会对 Tinker SDK 进行 patch，使其指向 Twinkle Server。复用训练循环前，请先确认下面的 loss 兼容范围。
+
+## Loss 兼容范围
+
+兼容层接受 `cross_entropy` 和 `importance_sampling`。兼容层尚未实现 `ppo`、`cispo`、`dro`，会在任务入队、修改梯度之前返回 HTTP 400，不会自动替换成交叉熵。
+
+为兼容已有 Twinkle cookbook，`importance_sampling` 保留 Twinkle 的 **GRPO loss**：使用 PPO 风格裁剪（默认 `epsilon=0.2`）、可选 KL 惩罚（默认 `beta=0`），并按序列取平均。这与 Tinker 的[不裁剪、按 token 求和的 IS 目标](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)不同，不能作为 Tinker IS 的完全等价替代。
+
+Twinkle 的 DPO 扩展也使用 `importance_sampling`，要求**每条** datum 都提供 `ref_logps`，并按 chosen/rejected 交替排列。每个数据并行分片都必须收到完整配对，单卡同样如此。普通 RL 样本不需要配对：数据并行数为 1 时，batch 为 1 或 3 均有效，但仍受通常的 token 和速率限制。
 
 ## 初始化
 
@@ -30,7 +38,7 @@ for item in service_client.get_server_capabilities().supported_models:
 1. **Patch Tinker SDK**：绕过 Tinker 的 `tinker://` 前缀校验，使其可以连接到标准 HTTP 地址
 2. **设置请求头**：注入 `X-Ray-Serve-Request-Id` 和 `Authorization` 等必要的认证头
 
-初始化之后，直接导入 `from tinker import ServiceClient` 即可连接到 Twinkle Server，**所有已有的 Tinker 训练代码都可以直接使用**，无需任何修改。
+初始化之后，导入 `from tinker import ServiceClient` 即可连接到 Twinkle Server。训练代码可复用已支持的接口，但需要遵守上述 loss 兼容范围。
 
 ## 完整训练示例
 

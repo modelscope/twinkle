@@ -22,6 +22,7 @@ from twinkle.server.checkpoint import create_checkpoint_manager, create_training
 from twinkle.server.exceptions import FullModeBusyError
 from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.utils import get_template_for_model
+from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -204,6 +205,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
         input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
         batch_size = len(datum_list)
         loss_fn = body.forward_backward_input.loss_fn
+        is_dpo = validate_tinker_loss(loss_fn, datum_list, data_world_size=self.data_world_size)
         return await self.schedule_task(
             _do_forward_backward,
             model_id=body.model_id,
@@ -211,7 +213,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             input_tokens=input_tokens,
             batch_size=batch_size,
             data_world_size=self.data_world_size,
-            batch_size_multiple=2 if loss_fn == 'importance_sampling' else None,
+            batch_size_multiple=2 if is_dpo else None,
             task_type='forward_backward',
         )
 

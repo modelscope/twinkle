@@ -4,7 +4,7 @@
 # through the Twinkle client-server architecture.
 # The server must be running first (see server.py and server_config.yaml).
 #
-# This is the client/server equivalent of cookbook/legacy/sampler/sampler_demo.py.
+# This is the client/server equivalent of cookbook/sample/sample.py.
 # Instead of running everything locally, the sampler runs on the server side
 # while the client sends requests over HTTP.
 

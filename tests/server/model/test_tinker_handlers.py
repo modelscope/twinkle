@@ -1,40 +1,61 @@
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 from tinker import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
+from twinkle.server.deployment import twinkle_server_error_handler
+from twinkle.server.exceptions import BatchSizeError, TwinkleServerError
+from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.mixin import TaskQueueMixin
 
 
 class _DummyManagement:
 
-    def __init__(self):
+    def __init__(self, data_world_size=2):
         self.scheduled = []
-        self.data_world_size = 2
+        self.data_world_size = data_world_size
+        self._task_queue_config = TaskQueueConfig(enabled=True)
+        self._rate_limiter = AsyncMock()
+        self._rate_limiter.check_and_record.return_value = (True, '')
 
     async def _on_request_start(self, request):
         return 'token1'
 
     async def schedule_task(self, task, **kwargs):
+        await TaskQueueMixin._perform_preflight_checks(
+            self,
+            model_id=kwargs.get('model_id'),
+            token=kwargs.get('token'),
+            input_tokens=kwargs.get('input_tokens', 0),
+            batch_size=kwargs.get('batch_size'),
+            data_world_size=kwargs.get('data_world_size'),
+            batch_size_multiple=kwargs.get('batch_size_multiple'),
+        )
         self.scheduled.append(kwargs)
         return {'request_id': 'req1', 'model_id': kwargs.get('model_id')}
 
 
-def _datum():
-    return types.Datum(model_input=types.ModelInput.from_ints([1, 2]), loss_fn_inputs={})
+def _datum(*, dpo=False):
+    loss_fn_inputs = {}
+    if dpo:
+        loss_fn_inputs['ref_logps'] = types.TensorData(data=[-0.1, -0.2], dtype='float32', shape=[2])
+    return types.Datum(model_input=types.ModelInput.from_ints([1, 2]), loss_fn_inputs=loss_fn_inputs)
 
 
 @pytest.mark.asyncio
-async def test_tinker_dpo_forward_backward_requires_per_dp_pairs():
-    management = _DummyManagement()
+@pytest.mark.parametrize('data_world_size,batch_size', [(1, 2), (2, 4)])
+async def test_tinker_dpo_forward_backward_requires_per_dp_pairs(data_world_size, batch_size):
+    management = _DummyManagement(data_world_size=data_world_size)
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: management)
 
     body = types.ForwardBackwardRequest(
         model_id='model1',
         forward_backward_input=types.ForwardBackwardInput(
-            data=[_datum(), _datum()],
+            data=[_datum(dpo=True) for _ in range(batch_size)],
             loss_fn='importance_sampling',
         ),
     )
@@ -44,9 +65,121 @@ async def test_tinker_dpo_forward_backward_requires_per_dp_pairs():
     response = await route.endpoint(request, body, management)
 
     assert response == {'request_id': 'req1', 'model_id': 'model1'}
-    assert management.scheduled[-1]['batch_size'] == 2
-    assert management.scheduled[-1]['data_world_size'] == 2
+    assert management.scheduled[-1]['batch_size'] == batch_size
+    assert management.scheduled[-1]['data_world_size'] == data_world_size
     assert management.scheduled[-1]['batch_size_multiple'] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('batch_size', [1, 3])
+async def test_tinker_rl_accepts_odd_batches_on_one_data_rank(batch_size):
+    management = _DummyManagement(data_world_size=1)
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(
+            data=[_datum() for _ in range(batch_size)], loss_fn='importance_sampling'),
+    )
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/forward_backward')
+
+    await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+
+    assert management.scheduled[-1]['batch_size'] == batch_size
+    assert management.scheduled[-1]['batch_size_multiple'] is None
+
+
+@pytest.mark.asyncio
+async def test_tinker_rl_does_not_require_pairs_on_multiple_data_ranks():
+    management = _DummyManagement(data_world_size=2)
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(
+            data=[_datum(), _datum()], loss_fn='importance_sampling'),
+    )
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/forward_backward')
+
+    await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+
+    assert management.scheduled[-1]['batch_size_multiple'] is None
+
+
+@pytest.mark.asyncio
+async def test_tinker_rl_still_rejects_batches_smaller_than_data_world_size():
+    management = _DummyManagement(data_world_size=2)
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(data=[_datum()], loss_fn='importance_sampling'),
+    )
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/forward_backward')
+
+    with pytest.raises(BatchSizeError, match='must be >= data world size'):
+        await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+
+    assert management.scheduled == []
+
+
+@pytest.mark.parametrize('loss_fn', ['ppo', 'cispo', 'dro'])
+def test_tinker_unsupported_loss_is_http_400_before_enqueue(loss_fn):
+    management = _DummyManagement(data_world_size=1)
+    app = FastAPI()
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(data=[_datum()], loss_fn=loss_fn),
+    )
+
+    response = TestClient(app).post('/tinker/forward_backward', json=body.model_dump(mode='json'))
+
+    assert response.status_code == 400
+    assert response.json()['category'] == 'user'
+    assert f"Unsupported Tinker loss_fn '{loss_fn}'" in response.json()['error']
+    assert management.scheduled == []
+    management._rate_limiter.check_and_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('data_world_size,batch_size', [(1, 1), (1, 3), (2, 2), (2, 6)])
+async def test_tinker_dpo_rejects_incomplete_per_rank_pairs_before_enqueue(data_world_size, batch_size):
+    management = _DummyManagement(data_world_size=data_world_size)
+    # Pair validation must also hold when rate limiting / task queue checks are disabled.
+    management._task_queue_config = TaskQueueConfig(enabled=False)
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(
+            data=[_datum(dpo=True) for _ in range(batch_size)], loss_fn='importance_sampling'),
+    )
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/forward_backward')
+
+    with pytest.raises(BatchSizeError, match='complete chosen/rejected pairs'):
+        await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+
+    assert management.scheduled == []
+
+
+def test_tinker_rejects_mixed_dpo_and_rl_before_enqueue():
+    management = _DummyManagement(data_world_size=1)
+    app = FastAPI()
+    app.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
+    _register_model_tinker_routes(app, lambda: management)
+    body = types.ForwardBackwardRequest(
+        model_id='model1',
+        forward_backward_input=types.ForwardBackwardInput(
+            data=[_datum(dpo=True), _datum()], loss_fn='importance_sampling'),
+    )
+
+    response = TestClient(app).post('/tinker/forward_backward', json=body.model_dump(mode='json'))
+
+    assert response.status_code == 400
+    assert 'cannot mix DPO and RL' in response.json()['error']
+    assert management.scheduled == []
 
 
 class _SaveWeightsDummyManagement:

@@ -33,7 +33,7 @@ applications:
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1

@@ -28,7 +28,7 @@ persistence:
 # Applications: each entry defines a service component deployed on the server
 applications:
 
-  # 1. TinkerCompatServer - The central API server
+  # 1. GatewayServer - The central API server
   #    Handles client connections, training run tracking, checkpoint listing.
   - name: server
     route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
@@ -39,7 +39,7 @@ applications:
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1                # Minimum number of replicas

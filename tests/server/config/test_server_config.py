@@ -299,13 +299,16 @@ def test_processor_queue_config_is_rejected() -> None:
     assert 'queue_config' in str(exc.value)
 
 
-def test_cookbook_examples_load() -> None:
+def test_cookbook_examples_load(monkeypatch) -> None:
     """Migrated cookbook configs all parse with the new field names."""
     here = Path(__file__).resolve().parents[3]
+    monkeypatch.setenv('TWINKLE_LOCAL_MODEL_PATH', '/tmp/twinkle-config-validation-model')
     examples = [
         here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config.yaml',
+        here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config_hybrid_lora.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config_4b.yaml',
+        here / 'cookbook' / 'client' / 'async_rl' / 'server_config.yaml',
     ]
     for p in examples:
         cfg = ServerConfig.from_yaml(p)
