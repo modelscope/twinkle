@@ -91,13 +91,22 @@ def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, 
 
 def test_removed_sampler_is_not_advertised_or_written(tmp_path, monkeypatch):
     from pathlib import Path
-    from pydantic import ValidationError
 
     start = next(tool['function'] for tool in TOOL_SCHEMAS if tool['function']['name'] == 'start_server')
     engines = start['parameters']['properties']['samplers']['items']['properties']['engine']['enum']
     assert 'torch' not in engines
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
-    with pytest.raises(ValidationError, match='sampler_type'):
+    with pytest.raises(ValueError, match='Unsupported sampler engine'):
         ToolExecutor._generate_server_config(
             'Qwen/student', train_gpus=1, samplers=[{'model_id': 'Qwen/teacher', 'engine': 'torch'}])
+    assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()
+
+
+@pytest.mark.parametrize('backend', ['torch', 'missing'])
+def test_unsupported_training_backend_is_not_written(tmp_path, monkeypatch, backend):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    with pytest.raises(ValueError, match='Unsupported training backend'):
+        ToolExecutor._generate_server_config('Qwen/student', train_gpus=1, backend=backend)
     assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()

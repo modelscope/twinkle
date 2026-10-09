@@ -366,6 +366,8 @@ class _ServerTools:
         from pathlib import Path
 
         sampler_list = samplers or []
+        if backend not in ('transformers', 'megatron'):
+            raise ValueError(f'Unsupported training backend: {backend!r}')
 
         # Sanitize model name for use in route/names
         def _short(mid: str) -> str:
@@ -478,6 +480,8 @@ class _ServerTools:
                 s_name = f'sampler-{s_short}'
 
             s_engine = sampler_cfg.get('engine', 'vllm')
+            if s_engine != 'vllm':
+                raise ValueError(f'Unsupported sampler engine: {s_engine!r}; supported engine: vllm')
             s_max_len = sampler_cfg.get('max_model_len', 16000)
 
             # Compute tp / dp / total GPUs:
@@ -615,11 +619,6 @@ class _ServerTools:
             },
             'applications': applications,
         }
-
-        # Use the same schema as the launcher before persisting a generated
-        # config or starting Ray. Removed backends must fail here, too.
-        from twinkle.server.config import ServerConfig
-        ServerConfig.model_validate(config)
 
         # Write to ~/.cache/twinkle/server_config.yaml
         config_dir = Path.home() / '.cache' / 'twinkle'
