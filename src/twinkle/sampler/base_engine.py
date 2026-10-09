@@ -8,7 +8,7 @@ Engines are the low-level components that handle token-based inference.
 
 import torch
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from twinkle.data_format import SampleResponse, SamplingParams
 
@@ -18,36 +18,29 @@ class BaseSamplerEngine(ABC):
     @abstractmethod
     async def sample(
         self,
-        prompt_token_ids: List[int],
-        sampling_params: Optional[SamplingParams] = None,
-        *,
-        num_samples: int = 1,
-        logprobs: bool = True,
-        include_prompt_logprobs: bool = False,
-        topk_prompt_logprobs: int = 0,
-        adapter_uri: Optional[str] = None,
+        prompt: Union[List[int], str],
+        sampling_params: Union[SamplingParams, Dict[str, Any]],
+        lora_request: Optional[Any] = None,
         request_id: Optional[str] = None,
-        images: Optional[List[Any]] = None,
-        videos: Optional[List[Any]] = None,
+        priority: int = 0,
+        *,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+        disable_lora: bool = False,
         **kwargs,
     ) -> SampleResponse:
         """
         Sample completions from the model.
 
         Args:
-            prompt_token_ids: Input token IDs.
+            prompt: Input token IDs or text.
             sampling_params: Sampling parameters.
-            num_samples: Number of samples to generate.
-            logprobs: Whether to return log probabilities for generated tokens.
-            include_prompt_logprobs: Whether to compute logprobs on prompt tokens.
-            topk_prompt_logprobs: If > 0, returns top-k logprobs for each prompt token.
-            adapter_uri: URI of LoRA adapter to use (for multi-tenant mode).
+            lora_request: Optional vLLM LoRA request.
             request_id: Optional request ID for tracking.
-            images: Optional list of images for multimodal models.
-                    Can be PIL.Image, file paths, URLs, or bytes.
-                    VLLMEngine passes these directly to vLLM.
-                    TransformersEngine requires pre-processed inputs via extra_model_inputs.
-            videos: Optional list of videos for multimodal models.
+            priority: Request scheduling priority.
+            multi_modal_data: Image/video data in the inference engine's format.
+            mm_processor_kwargs: Multimodal processor overrides.
+            disable_lora: Sample from base model weights.
             **kwargs: Additional engine-specific arguments.
 
         Returns:

@@ -284,7 +284,6 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 | DP 并行 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
 | FSDP 并行 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
 | Ray 分布式 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
-| TorchSampler | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
 | vLLMSampler | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
 | 全量微调 | ✅ | ✅ | - | 已验证可用 |
 | QLoRA | ✅ | ❌ | - | 量化算子暂不支持 |
@@ -330,7 +329,7 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 
 ## 下一步
 
-- 📖 阅读 [快速开始](Quick-start.md) 了解更多训练示例
-- 📖 阅读 [安装指南](Installation.md) 了解其他平台的安装
+- 📖 阅读 [快速开始](快速开始.md) 了解更多训练示例
+- 📖 阅读 [安装指南](安装.md) 了解其他平台的安装
 - 🚀 浏览 `cookbook/` 目录查看完整示例代码
 - 💡 查看 [Twinkle 文档](https://twinkle.readthedocs.io/) 了解高级功能

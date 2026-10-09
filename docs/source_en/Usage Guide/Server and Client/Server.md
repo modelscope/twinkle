@@ -257,7 +257,7 @@ applications:
     args:
       model_id: "ms://Qwen/Qwen3.5-4B"               # ModelScope model identifier
       nproc_per_node: 2                                # Number of GPU processes per node
-      sampler_type: vllm                               # Inference engine: vllm (high performance) or torch
+      sampler_type: vllm                               # Inference engine: vllm | vllm_async (mock for tests)
       engine_args:                                     # vLLM engine parameters
         max_model_len: 4096                            # Maximum sequence length
         gpu_memory_utilization: 0.5                    # GPU memory usage ratio (0.0-1.0)

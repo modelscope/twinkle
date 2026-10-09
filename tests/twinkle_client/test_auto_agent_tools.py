@@ -67,3 +67,37 @@ def test_tool_schema_names_are_unique_and_dispatchable():
     names = [item['function']['name'] for item in TOOL_SCHEMAS]
     assert len(names) == len(set(names))
     assert all(hasattr(ToolExecutor, f'_tool_{name}') for name in names)
+
+
+@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
+@pytest.mark.parametrize('samplers', [[], [{'model_id': 'Qwen/teacher', 'engine': 'vllm', 'tp': 2, 'dp': 2}]])
+def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, backend, samplers):
+    from pathlib import Path
+    from twinkle.server.config import ServerConfig
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    path = ToolExecutor._generate_server_config('Qwen/student', train_gpus=2, backend=backend, samplers=samplers)
+    config = ServerConfig.from_yaml(path)
+    gateway = next(app for app in config.applications if app.import_path == 'server')
+    assert gateway.deployments[0]['name'] == 'GatewayServer'
+    assert gateway.args.supported_models == ['Qwen/student'] + [s['model_id'] for s in samplers]
+    if samplers:
+        sampler = next(app for app in config.applications if app.import_path == 'sampler')
+        assert sampler.args.nproc_per_node == 4
+        assert sampler.args.device_mesh['tp_size'] == 2
+        assert sampler.args.device_mesh['dp_size'] == 2
+        assert sampler.args.engine_args['tensor_parallel_size'] == 2
+
+
+def test_removed_sampler_is_not_advertised_or_written(tmp_path, monkeypatch):
+    from pathlib import Path
+    from pydantic import ValidationError
+
+    start = next(tool['function'] for tool in TOOL_SCHEMAS if tool['function']['name'] == 'start_server')
+    engines = start['parameters']['properties']['samplers']['items']['properties']['engine']['enum']
+    assert 'torch' not in engines
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    with pytest.raises(ValidationError, match='sampler_type'):
+        ToolExecutor._generate_server_config(
+            'Qwen/student', train_gpus=1, samplers=[{'model_id': 'Qwen/teacher', 'engine': 'torch'}])
+    assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()

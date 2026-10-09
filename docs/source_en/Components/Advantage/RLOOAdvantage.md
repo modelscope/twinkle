@@ -10,7 +10,7 @@ from twinkle.advantage import RLOOAdvantage
 advantage_fn = RLOOAdvantage()
 
 rewards = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
-advantages = advantage_fn(rewards, num_generations=4)
+advantages = advantage_fn(rewards, num_generations=4, scale='none')
 
 # For each sample, the baseline is the mean of all other samples
 # First sample in first group: 0.0 - mean([1.0, 0.0, 1.0]) = 0.0 - 0.667 = -0.667
@@ -29,38 +29,8 @@ RLOO advantages:
 - More accurate counterfactual baseline estimation
 - Better performance when there are more samples
 
-## Training Example
+## Training Integration
 
-```python
-from twinkle.advantage import RLOOAdvantage
-from twinkle.model import TransformersModel
-from twinkle.sampler import vLLMSampler
-from twinkle.reward import MathReward
+Set `SamplingParams(num_samples=N, logprobs=1)` and read completions from each response's `sequences`. Training also requires aligned labels and old policy logprobs; advantages alone are insufficient.
 
-# Create components
-actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = MathReward()
-advantage_fn = RLOOAdvantage()
-dataloader = ...
-
-# Training loop
-for batch in dataloader:
-    # 1. Sample generation (generate more samples to improve RLOO effectiveness)
-    response = sampler.sample(batch, num_samples=8)
-
-    # 2. Calculate rewards
-    rewards = reward_fn(response.trajectories, batch.ground_truths)
-
-    # 3. Calculate advantages
-    advantages = advantage_fn(rewards, num_generations=8)
-
-    # 4. Policy optimization
-    loss = actor.forward_backward(
-        inputs=response.inputs,
-        advantages=advantages
-    )
-    actor.clip_grad_and_step()
-```
-
-> RLOO is theoretically superior but requires more samples (recommend 8 or more samples per prompt).
+See the maintained [GRPO training example](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/short_math_grpo.py) for the complete sampling, reward, and optimizer loop. To use RLOO, replace the advantage function with `RLOOAdvantage` and generate at least two samples per prompt.

@@ -300,7 +300,7 @@ def test_processor_queue_config_is_rejected() -> None:
 
 
 def test_cookbook_examples_load(monkeypatch) -> None:
-    """Migrated cookbook configs all parse with the new field names."""
+    """Cookbook, real E2E, and mock configs parse with the current schema."""
     here = Path(__file__).resolve().parents[3]
     monkeypatch.setenv('TWINKLE_LOCAL_MODEL_PATH', '/tmp/twinkle-config-validation-model')
     examples = [
@@ -310,6 +310,8 @@ def test_cookbook_examples_load(monkeypatch) -> None:
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config_4b.yaml',
         here / 'cookbook' / 'client' / 'async_rl' / 'server_config.yaml',
     ]
+    examples.extend(sorted((here / 'tests' / 'server' / 'config').glob('server_config_*.yaml')))
+    examples.extend(sorted((here / 'tests' / 'server' / 'fixtures').glob('server_config_*.yaml')))
     for p in examples:
         cfg = ServerConfig.from_yaml(p)
         assert isinstance(cfg, ServerConfig), p

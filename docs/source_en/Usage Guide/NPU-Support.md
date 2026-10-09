@@ -285,7 +285,6 @@ Feature support matrix based on actual code verification:
 | DP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
 | FSDP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
 | Ray Distributed | ✅ | ✅ | - | No corresponding cookbook example |
-| TorchSampler | ✅ | ✅ | - | No corresponding cookbook example |
 | vLLMSampler | ✅ | ✅ | - | No corresponding cookbook example |
 | Full Fine-tuning | ✅ | ✅ | - | Verified available |
 | QLoRA | ✅ | ❌ | - | Quantization operators not yet supported |

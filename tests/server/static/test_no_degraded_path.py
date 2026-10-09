@@ -60,9 +60,10 @@ def test_no_degraded_symbols_remain():
     assert not offenders, f'silent-degradation symbols still present: {offenders}'
 
 
-def test_no_fail_fast_switch_in_src_and_cookbook():
+def test_no_fail_fast_switch_in_src_cookbook_and_test_configs():
     offenders: list[str] = []
-    for path in list(_py_files(_TWINKLE_SRC)) + list(_cookbook_files()):
+    test_configs = list(_TESTS.rglob('*.yaml')) + list(_TESTS.rglob('*.yml'))
+    for path in list(_py_files(_TWINKLE_SRC)) + list(_cookbook_files()) + test_configs:
         if _FAIL_FAST.search(path.read_text()):
             offenders.append(str(path))
     assert not offenders, f'TWINKLE_FAIL_FAST still present: {offenders}'

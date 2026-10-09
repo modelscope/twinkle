@@ -261,10 +261,15 @@ class _ServerTools:
                              f'Model: {model_id}, GPUs: {t_gpus}, Samplers: {len(sampler_list)}.\n'
                              f'--- server.log tail ---\n{log_tail}')
                 return {
-                    'status': 'error',
-                    'error': error_msg,
-                    'log_path': log_path,
-                    'hint': 'Check if required packages are installed (pip install -e ".[all]").',
+                    'status':
+                    'error',
+                    'error':
+                    error_msg,
+                    'log_path':
+                    log_path,
+                    'hint':
+                    'Check required packages (pip install -e ".[client,server,rl]"; '
+                    'add the megatron extra for the Megatron backend).',
                 }
             try:
                 urllib.request.urlopen(f'{server_url}/api/v1/healthz', timeout=2)
@@ -389,7 +394,7 @@ class _ServerTools:
                 'supported_models': all_model_ids,
             },
             'deployments': [{
-                'name': 'TinkerCompatServer',
+                'name': 'GatewayServer',
                 'max_ongoing_requests': 50,
                 'autoscaling_config': {
                     'min_replicas': 1,
@@ -610,6 +615,11 @@ class _ServerTools:
             },
             'applications': applications,
         }
+
+        # Use the same schema as the launcher before persisting a generated
+        # config or starting Ray. Removed backends must fail here, too.
+        from twinkle.server.config import ServerConfig
+        ServerConfig.model_validate(config)
 
         # Write to ~/.cache/twinkle/server_config.yaml
         config_dir = Path.home() / '.cache' / 'twinkle'

@@ -16,6 +16,9 @@ class SamplingParams:
     top_k: int = -1
     top_p: float = 1.0
     repetition_penalty: float = 1.0
+    logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
+    num_samples: int = 1
 ```
 
 - max_tokens: 生成的最大 token 数量
@@ -32,7 +35,8 @@ SamplingParams 提供了转换方法来适配不同的推理引擎:
 
 ```python
 # 转换为 vLLM 的 SamplingParams
-vllm_params = params.to_vllm(num_samples=4, logprobs=True, prompt_logprobs=0)
+params = SamplingParams(num_samples=4, logprobs=1, prompt_logprobs=0)
+vllm_params = params.to_vllm()
 
 # 转换为 transformers 的 generate 参数
 gen_kwargs = params.to_transformers(tokenizer=tokenizer)
@@ -40,33 +44,36 @@ gen_kwargs = params.to_transformers(tokenizer=tokenizer)
 
 ## SampleResponse
 
-采样响应是采样器返回的结果数据结构。
+`sampler.sample(...)` 为每个输入 prompt 返回一个 `SampleResponse`。每个响应的 `sequences` 包含多个生成结果，每个结果是 `SampledSequence`：
 
 ```python
 @dataclass
+class SampledSequence:
+    stop_reason: StopReason
+    tokens: List[int]
+    logprobs: Optional[List[List[Tuple[int, float]]]] = None
+    decoded: str = None
+    new_input_feature: InputFeature = None
+
+@dataclass
 class SampleResponse:
-    trajectories: List[Trajectory]
-    logprobs: Optional[List[List[float]]] = None
-    prompt_logprobs: Optional[List[List[float]]] = None
-    stop_reason: Optional[List[StopReason]] = None
+    sequences: Sequence[SampledSequence]
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_logprobs: Optional[List[Optional[float]]] = None
+    topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
 ```
 
-- trajectories: 采样生成的轨迹列表
-- logprobs: 生成 token 的对数概率
-- prompt_logprobs: prompt token 的对数概率
-- stop_reason: 停止原因,可以是 "length" (达到最大长度) 或 "stop" (遇到停止序列)
-
-使用示例:
+`seq.tokens` 是生成的 token ID；请求 logprobs 后，`seq.logprobs` 保存每个 token 的 `(token_id, logprob)` 候选列表。`seq.stop_reason` 为 `length`、`stop`、`abort` 或 `error`。设置 `return_encoded=True` 后，`seq.new_input_feature` 包含可用于训练的输入特征。
 
 ```python
-from twinkle.data_format import SamplingParams, SampleResponse
-from twinkle.sampler import vLLMSampler
+from twinkle.data_format import SamplingParams
 
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-params = SamplingParams(max_tokens=512, temperature=0.7, top_p=0.9)
-response: SampleResponse = sampler.sample(trajectories, sampling_params=params, num_samples=4)
-
-# 访问生成的轨迹
-for traj in response.trajectories:
-    print(traj.messages)
+# 先配置 sampler 及其模板，参见 vLLMSampler 示例。
+params = SamplingParams(max_tokens=512, temperature=0.7, top_p=0.9, num_samples=4, logprobs=1)
+responses = sampler.sample(trajectories, sampling_params=params, return_encoded=True)
+for response in responses:
+    for seq in response.sequences:
+        print(sampler.decode_response(seq.tokens))
 ```
+
+采样器初始化见 [vLLMSampler](../采样器/vLLMSampler.md)。

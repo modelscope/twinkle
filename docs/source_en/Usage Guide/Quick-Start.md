@@ -495,7 +495,7 @@ Next, start the server:
 twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
 ```
 
-> For details on how to write `server_config.yaml`, see [Server Configuration](../Server%20and%20Client/Server.md).
+> For details on how to write `server_config.yaml`, see [Server Configuration](Server%20and%20Client/Server.md).
 
 The server will start three services: a sampler cluster, a model cluster, and a utility cluster.
 

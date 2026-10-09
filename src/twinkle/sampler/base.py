@@ -23,8 +23,10 @@ class Sampler(ABC):
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[SamplingParams] = None,
         adapter_name: str = '',
+        adapter_path: Optional[str] = None,
         *,
-        num_samples: int = 1,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -34,12 +36,14 @@ class Sampler(ABC):
                 - Trajectory: Must contain 'messages'. Requires template to be set.
             sampling_params: Sampling parameters.
             adapter_name: Optional LoRA adapter name.
-            num_samples: Number of completions to generate per input prompt.
-                        When > 1, returns num_samples sequences for each input.
+            adapter_path: Optional saved LoRA checkpoint path.
+            return_encoded: Include training input features in sampled sequences.
+            use_base_model: Sample without a LoRA adapter.
+            Set sampling_params.num_samples for multiple completions per prompt.
 
         Returns:
             SampleResponse containing sampled sequences.
-            Total sequences = len(inputs) * num_samples.
+            Total sequences = len(inputs) * sampling_params.num_samples.
         """
         pass
 
