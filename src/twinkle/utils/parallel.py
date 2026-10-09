@@ -171,6 +171,7 @@ def _is_local_master() -> bool:
 
 def _node_index() -> int:
     """Index of this rank's node. torchrun exports GROUP_RANK; derive it otherwise."""
+    ## GROUP_RANK和LOCAL_WORLD_SIZE谁设置的？会不会有无法使用的可能性，或者多机条件下
     group_rank = os.environ.get('GROUP_RANK')
     if group_rank is not None:
         return int(group_rank)
@@ -197,6 +198,7 @@ def _get_store():
         # client simply retries until rank 0 has its server up.
         _store = TCPStore(
             os.environ.get('MASTER_ADDR', '127.0.0.1'),
+            ## _COORD_PORT_OFFSET 干啥用的
             int(os.environ.get('MASTER_PORT', 29500)) + _COORD_PORT_OFFSET,
             world_size=None,
             is_master=(rank == 0),
@@ -226,6 +228,7 @@ def _ordered_by_store(key: str, sticky: bool):
     """Run the body on every rank, but ordered: global master, then node masters, then the rest."""
     store = _get_store()
     name = _sanitize_lock_name(key)
+    ## sticky的处理是什么意思
     if sticky:
         # The key already identifies the result (a repo id), and the work is idempotent, so one
         # flag serves the whole run: a rank arriving after the flag is set just proceeds.

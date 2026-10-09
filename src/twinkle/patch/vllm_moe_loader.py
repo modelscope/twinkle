@@ -108,14 +108,20 @@ class VLLMMoEWeights(Patch):
 
         DEFAULT_MLP_ATTR = 'mlp'
 
-        # Get inner model (either model.model or model.language_model)
+        # Get inner model (either model.model or model.language_model). Resolve it without raising: a
+        # pooling/embedding model (or any non-MoE model whose top level is not a ...ForCausalLM wrapper)
+        # exposes neither attribute, and this patch is a no-op for it. ``isinstance(None, ...)`` is False,
+        # so the membership check below safely bails out for such models before inner_model is dereferenced.
         inner_model = getattr(model, 'model', None) or getattr(model, 'language_model', None)
-        if inner_model is None:
-            raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
 
         if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model,
                                                                                  tuple(SUPPORTED_MOE_MODELS)):
             return
+
+        # Only a confirmed fused-MoE model is required to expose an inner stack to walk; reaching here
+        # with inner_model None means a supported MoE type arrived malformed, which is a real error.
+        if inner_model is None:
+            raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
 
         # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
         # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
