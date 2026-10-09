@@ -62,7 +62,9 @@ def test_no_degraded_symbols_remain():
 
 def test_no_fail_fast_switch_in_src_cookbook_and_test_configs():
     offenders: list[str] = []
-    test_configs = list(_TESTS.rglob('*.yaml')) + list(_TESTS.rglob('*.yml'))
+    # Match shipped config names, not the ignored _generated_e2e.yaml that
+    # start_e2e_server.py may have produced from an older checkout.
+    test_configs = list(_TESTS.rglob('server_config_*.yaml')) + list(_TESTS.rglob('server_config_*.yml'))
     for path in list(_py_files(_TWINKLE_SRC)) + list(_cookbook_files()) + test_configs:
         if _FAIL_FAST.search(path.read_text()):
             offenders.append(str(path))
