@@ -637,7 +637,7 @@ def _train_batch_with_config(
     *,
     model_data_parallel_size: int = 1,
 ) -> dict[str, Any]:
-    from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS
+    from twinkle.data_format import REQUIRED_MODEL_INPUT_FIELDS
 
     size = int(data.batch_size[0])
     inputs = [{name: data[name][index] for name in REQUIRED_MODEL_INPUT_FIELDS} for index in range(size)]

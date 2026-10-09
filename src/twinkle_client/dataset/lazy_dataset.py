@@ -1,137 +1,17 @@
-
-from typing import Any, Callable, Dict, Optional, Type, Union
-from twinkle_client.http import http_post
-from twinkle.dataset import Dataset
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from twinkle.dataset import DatasetMeta
-from twinkle.preprocessor import DataFilter
-from twinkle.preprocessor import Preprocessor
+from twinkle_client.http import ClientTransport
 from .base import Dataset
+
 
 class LazyDataset(Dataset):
     """Client wrapper for LazyDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
-        from twinkle_client.http import get_base_url
-
-        self.server_url = f'{get_base_url()}/processor/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data={
-                'processor_type': 'dataset',
-                'class_type': 'LazyDataset',
-                **{'dataset_meta': dataset_meta}, **kwargs
-            }
-        )
-        response.raise_for_status()
-        self.processor_id = response.json()['processor_id']
-
-    
-    def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'map',
-                **{'preprocess_func': preprocess_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'filter',
-                **{'filter_func': filter_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'add_dataset',
-                **{'dataset_meta': dataset_meta},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def mix_dataset(self, interleave = True):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'mix_dataset',
-                **{'interleave': interleave},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def encode(self, add_generation_prompt: bool = False, timeout: Optional[int] = 600, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'encode',
-                **{'add_generation_prompt': add_generation_prompt},
-                **kwargs
-            },
-            timeout=timeout
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def check(self, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'check',
-                **{},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def __getitem__(self, idx):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__getitem__',
-                **{'idx': idx},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
-
-    def __len__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__len__',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+    def __init__(
+        self,
+        dataset_meta: DatasetMeta = None,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        self._bind_remote('dataset', 'LazyDataset', dataset_meta=dataset_meta, transport=transport, **kwargs)

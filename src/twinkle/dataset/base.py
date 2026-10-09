@@ -11,8 +11,6 @@ from torch.utils.data import IterableDataset as TorchIterableDataset
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import twinkle
-from twinkle import preprocessor
-from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
@@ -197,6 +195,7 @@ class Dataset(TorchDataset):
                     kwargs['na_filter'] = False
                 dataset = load_dataset(file_type, **load_kwargs, **kwargs)
             else:
+                from twinkle.hub import HubOperation
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
 
         # fix: Some dataset sources return DatasetDict instead of Dataset, which breaks downstream select/map calls.

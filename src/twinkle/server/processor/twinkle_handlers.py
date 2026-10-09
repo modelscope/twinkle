@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Processor management handler mixin.
+"""Processor management routes for the Processor deployment.
 
-All endpoints are prefixed /twinkle/... and handle processor lifecycle
-(create, call). self_fn is injected via FastAPI Depends to obtain the
-ProcessorManagement instance at request time.
+Registered by ``_register_processor_routes(app, self_fn)`` -- module-level route
+registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
+inheritance relationship with the deployment class. All endpoints are prefixed
+/twinkle/... and handle processor lifecycle (create, call). ``self_fn`` is injected via
+FastAPI Depends to obtain the ProcessorManagement instance at request time.
 """
 from __future__ import annotations
 
@@ -18,12 +19,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .app import ProcessorManagement
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
+from twinkle.protocol.serialize import deserialize_object
+from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -45,7 +46,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_type_name = body.processor_type
         class_type = body.class_type
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.init_kwargs)
 
         assert processor_type_name in _PROCESSOR_TYPES, f'Invalid processor type: {processor_type_name}'
         processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
@@ -55,39 +56,63 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         session_id = get_session_id_from_request(request)
         processor_id = str(uuid.uuid4().hex)
 
-        # Register for lifecycle tracking (enforces per-user limit)
-        self.register_resource(processor_id, token, session_id)
+        # Reject malformed registrations before touching shared quota state.
+        self._validate_registration(processor_id, token, session_id)
+        await self.state.reserve_processor_quota(
+            token,
+            processor_id,
+            session_id,
+            limit=self._per_token_processor_limit,
+            lease_seconds=self._processor_quota_lease_seconds,
+        )
 
-        _kwargs.pop('remote_group', None)
-        _kwargs.pop('device_mesh', None)
+        try:
+            self.register_resource(processor_id, token, session_id)
 
-        resolved_kwargs = {}
-        for key, value in _kwargs.items():
-            if isinstance(value, str) and value.startswith('pid:'):
-                ref_id = value[4:]
-                resolved_kwargs[key] = self.resource_dict[ref_id]
-            else:
-                value = deserialize_object(value)
-                resolved_kwargs[key] = value
+            _kwargs.pop('remote_group', None)
+            _kwargs.pop('device_mesh', None)
 
-        # Run processor instantiation in a thread to avoid blocking the event loop,
-        # which would starve the session-liveness coroutines submitted by the
-        # countdown thread via asyncio.run_coroutine_threadsafe.
-        _remote_group = self.device_group.name
-        _device_mesh = self.device_mesh
+            resolved_kwargs = {}
+            for key, value in _kwargs.items():
+                if isinstance(value, str) and value.startswith('pid:'):
+                    ref_id = value[4:]
+                    resolved_kwargs[key] = self.resource_dict[ref_id]
+                else:
+                    value = deserialize_object(value)
+                    resolved_kwargs[key] = value
 
-        def _do_create():
-            return getattr(processor_module, class_type)(
-                remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
+            # Run processor instantiation in a thread to avoid blocking the event loop,
+            # which would starve the session-liveness coroutines submitted by the
+            # countdown thread via asyncio.run_coroutine_threadsafe.
+            _remote_group = self.device_group.name
+            _device_mesh = self.device_mesh
 
-        # Span the primary processor.create op with token + session correlation.
-        with traced_operation(
-                f'processor.create.{processor_type_name}.{class_type}', attrs={
-                    TOKEN_ID: token,
-                    SESSION_ID: session_id,
-                }):
-            processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
-        self.resource_dict[processor_id] = processor
+            def _do_create():
+                return getattr(processor_module, class_type)(
+                    remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
+
+            # Span the primary processor.create op with token + session correlation.
+            with traced_operation(
+                    f'processor.create.{processor_type_name}.{class_type}',
+                    attrs={
+                        TOKEN_ID: token,
+                        SESSION_ID: session_id,
+                    }):
+                processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
+            self.resource_dict[processor_id] = processor
+        except Exception:
+            self.resource_dict.pop(processor_id, None)
+            self.unregister_resource(processor_id)
+            try:
+                await self.state.release_processor_quota(
+                    token,
+                    processor_id,
+                    lease_seconds=self._processor_quota_lease_seconds,
+                )
+            except Exception as release_error:
+                logger.warning('Failed to release processor quota after create failure for %s: %r', processor_id,
+                               release_error)
+            raise
         return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
 
     @app.post('/twinkle/call', response_model=types.ProcessorCallResponse)
@@ -98,7 +123,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         processor_id = body.processor_id
         function_name = body.function
-        _kwargs = body.model_extra or {}
+        _kwargs = dict(body.call_kwargs)
         processor_id = processor_id[4:]
         self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)

@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Path constants, token hashing, client-save-dir resolution, and permission
 helpers for the checkpoint subsystem.
-
-Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
 

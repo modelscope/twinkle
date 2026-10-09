@@ -291,7 +291,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -372,7 +372,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -403,7 +403,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(**kwargs)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,

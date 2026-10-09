@@ -12,12 +12,17 @@ class _CapacityState:
 
     def __init__(self) -> None:
         self.capacities: dict[str, int] = {}
+        self.last_seen: set[str] = set()
 
     async def register_replica(self, replica_id: str, max_loras: int) -> None:
         self.capacities[replica_id] = max_loras
 
     async def unregister_replica(self, replica_id: str) -> None:
         self.capacities.pop(replica_id, None)
+        self.last_seen.discard(replica_id)
+
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        self.last_seen.add(replica_id)
 
     async def get_capacity_info(self) -> dict[str, int]:
         max_loras = sum(self.capacities.values())
@@ -31,6 +36,7 @@ def _make_lifecycle_manager(state: _CapacityState, replica_id: str, max_loras: i
     manager.max_loras = max_loras
     manager._replica_registered = False
     manager.data_plane = SimpleNamespace(close=AsyncMock())
+    manager.shutdown_task_queue = AsyncMock()
     return manager
 
 
@@ -42,6 +48,7 @@ async def test_replica_lifecycle_updates_shared_capacity() -> None:
 
     await first._register_replica_on_startup()
     assert await state.get_capacity_info() == {'max_loras': 3, 'used_loras': 0, 'free_loras': 3}
+    assert state.last_seen == {'replica-1'}
 
     await second._register_replica_on_startup()
     assert await state.get_capacity_info() == {'max_loras': 6, 'used_loras': 0, 'free_loras': 6}
@@ -52,9 +59,10 @@ async def test_replica_lifecycle_updates_shared_capacity() -> None:
 
 @pytest.mark.asyncio
 async def test_async_constructor_registers_replica_before_ready() -> None:
-    state = SimpleNamespace(register_replica=AsyncMock())
+    state = SimpleNamespace(register_replica=AsyncMock(), touch_replica_last_seen=AsyncMock())
     replica_context = SimpleNamespace(replica_id=SimpleNamespace(unique_id='replica-1'))
     manager = ModelManagement.__new__(ModelManagement)
+    manager._task_queue_config = SimpleNamespace(effective_execution_timeout=1800.0)
 
     with patch('twinkle.server.model.app.DeviceGroup', return_value=SimpleNamespace(name='group')), \
          patch('twinkle.server.model.app.init_twinkle_runtime', return_value=None), \
@@ -75,4 +83,5 @@ async def test_async_constructor_registers_replica_before_ready() -> None:
         )
 
     state.register_replica.assert_awaited_once_with('replica-1', 3)
+    state.touch_replica_last_seen.assert_awaited_once_with('replica-1')
     assert manager._replica_registered is True

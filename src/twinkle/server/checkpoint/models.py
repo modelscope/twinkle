@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Internal Pydantic base specs used as type constraints for the generic
 checkpoint / training-run managers.
-
-Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
 

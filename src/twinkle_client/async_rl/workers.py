@@ -37,10 +37,7 @@ class WorkerPipeline:
             raise ValueError(f'worker names must be unique, got {names}')
 
     async def run(self) -> None:
-        tasks = {
-            asyncio.create_task(worker.run(), name=worker.name): worker
-            for worker in self.workers
-        }
+        tasks = {asyncio.create_task(worker.run(), name=worker.name): worker for worker in self.workers}
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             failure = next(

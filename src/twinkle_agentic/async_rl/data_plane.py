@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from twinkle.data_format import (REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields,
+                                 rows_to_tq_fields)
 from .native_tq import (AsyncTQClient, append_fields, batch_size_for_groups, clear_partition, fetch_ready_batch,
                         metadata_size, preallocate_partition, set_sample_tags, split_batch_meta)
-from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, rows_to_tq_fields
 from .types import ClaimedBatch, LoraContext, PartitionAdmission, PreparedPartition, PromptGroup, RolloutOutput
 
 _REQUIRED_ROLLOUT_FIELDS = frozenset((*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs', 'rewards'))

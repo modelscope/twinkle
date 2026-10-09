@@ -202,14 +202,16 @@ class GRPOLoss(Loss):
             elif n_sample == n_pos:
                 # Response-only form (e.g. old_logps from vLLM).
                 result[i, pos] = sample
-            elif n_sample >= seq_len:
-                # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
-                result[i, pos] = sample[:seq_len][mask[i]]
+            elif n_pos == 0 or (n_sample > 0 and pos[-1].item() < n_sample):
+                # Variable-length full-sequence form. The processor right-pads the
+                # batch, but per-sample RL fields from Tinker remain unpadded. They
+                # are valid when every selected mask position exists in this row.
+                result[i, pos] = sample[pos]
             else:
                 raise AssertionError(f'data/mask length mismatch at sample {i}: '
                                      f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                                     '(expected n_sample == n_pos for response-only form, '
-                                     'or n_sample >= seq_len for full-sequence form)')
+                                     '(expected n_sample == n_pos for response-only form, or all masked positions '
+                                     'to exist in the per-sample full-sequence form)')
 
         return result
 

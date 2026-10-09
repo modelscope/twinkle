@@ -97,12 +97,3 @@ class SessionManager(BaseManager[SessionRecord]):
             if await self.remove(session_id):
                 removed += 1
         return removed
-
-    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
-        """Remove sessions whose last activity is older than ``cutoff_time``.
-
-        Returns:
-            Number of sessions removed.
-        """
-        _, removed = await self.collect_and_remove_expired(cutoff_time)
-        return removed

@@ -11,15 +11,14 @@ wrappers:
 """
 import torch
 from tinker import types
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model.megatron import MegatronModel, MultiLoraMegatronModel
-from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.utils.nccl_safe import nccl_safe_megatron
 
 
@@ -33,7 +32,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
     """
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
-    @nccl_safe_megatron(tinker=True)
+    @nccl_safe_megatron
     def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass."""
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
@@ -54,7 +53,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         return [results, loss]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    @nccl_safe_megatron(tinker=True)
+    @nccl_safe_megatron
     def tinker_forward_only(self, *, inputs: list[types.Datum], adapter_name: str = None, **kwargs):
         """Forward pass without gradient computation."""
         template = self.get_template(adapter_name)
@@ -102,26 +101,24 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)
 
-    @remote_function(dispatch='all', sync=True)
-    def tinker_load(self, checkpoint_dir: str, **kwargs):
-        """Load checkpoint with token-based isolation support."""
-        token = kwargs.pop('token', None)
-        if not token:
-            raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.checkpoint import create_checkpoint_manager
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-        resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
-        if resolved.is_twinkle_path:
-            return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
-        else:
-            return super().load(name=resolved.checkpoint_name, **kwargs)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
+    def tinker_load(self, *, checkpoint_name: str, output_dir: str | None = None, **kwargs):
+        """Load a checkpoint from an already-resolved location.
+
+        Path resolution (token isolation, twinkle-vs-external path shapes) belongs to the
+        handler layer: it is a server storage policy, and this class runs inside a Ray
+        actor as a compute backend.
+        """
+        if output_dir is not None:
+            return super().load(name=checkpoint_name, output_dir=output_dir, **kwargs)
+        return super().load(name=checkpoint_name, **kwargs)
 
     # ------------------------------------------------------------------
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    @nccl_safe_megatron(forward_only=True)
+    @nccl_safe_megatron
     def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
@@ -135,7 +132,7 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

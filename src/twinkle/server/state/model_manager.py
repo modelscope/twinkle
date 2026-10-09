@@ -11,7 +11,9 @@ actor in front.
 from __future__ import annotations
 
 import functools
+import time
 
+from twinkle.server.exceptions import ResourceQuotaExceededError
 from .backend.base import StateBackend
 from .base import BaseManager
 from .models import ModelRecord
@@ -34,6 +36,19 @@ def _counter_delta_transform(existing: object, *, delta: int) -> int:
     current = existing if isinstance(existing, int) else 0
     new = current + delta
     return new if new > 0 else 0
+
+
+async def _remove_with_record(manager: ModelManager, model_id: str, record: ModelRecord) -> bool:
+    """Remove a known record without exposing it in the public method signature."""
+    removed = await BaseManager.remove(manager, model_id)
+    if not removed:
+        return False
+    if record.token:
+        await manager._backend.update_atomic(
+            manager._token_count_key(record.token),
+            functools.partial(_counter_delta_transform, delta=-1),
+        )
+    return True
 
 
 class ModelManager(BaseManager[ModelRecord]):
@@ -101,6 +116,28 @@ class ModelManager(BaseManager[ModelRecord]):
             await self.remove(model_id)
         await self._replicas.unregister(replica_id)
 
+    async def touch_replica_last_seen(self, replica_id: str) -> None:
+        """Refresh a replica's liveness timestamp."""
+        await self._replicas.touch_last_seen(replica_id)
+
+    async def get_alive_replica_ids(self, liveness_threshold: float) -> set[str]:
+        """Return replicas considered alive.
+
+        A replica is alive when it has a ``last_seen`` within ``liveness_threshold``,
+        OR when it has a ``max_loras`` entry but no ``last_seen`` yet (registered
+        before this spec / before its first request -- treated as alive so an
+        upgrade does not orphan in-flight tasks).
+        """
+        registered = await self._replicas.get_all()
+        last_seen = await self._replicas.get_all_last_seen()
+        now = time.time()
+        alive: set[str] = set()
+        for rid in set(registered) | set(last_seen):
+            ls = last_seen.get(rid)
+            if (ls is None and rid in registered) or (ls is not None and (now - ls) <= liveness_threshold):
+                alive.add(rid)
+        return alive
+
     async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
         """Return the subset of ``candidate_ids`` that still have capacity.
 
@@ -133,12 +170,13 @@ class ModelManager(BaseManager[ModelRecord]):
         record is written, so two concurrent adds with the same token cannot
         both observe ``limit - 1`` and both succeed (the prior count-then-add
         race). If the increment would exceed the limit, it is rolled back and a
-        ``RuntimeError`` is raised; if the record write fails, the increment is
-        rolled back too so the counter never drifts above the real model count.
+        ``ResourceQuotaExceededError`` is raised; if the record write fails, the
+        increment is rolled back too so the counter never drifts above the real
+        model count.
 
         Raises:
-            RuntimeError: when adding ``record`` would exceed
-                ``per_token_model_limit`` for ``record.token``.
+            ResourceQuotaExceededError: when adding ``record`` would exceed the
+                configured per-token model quota.
         """
         token = record.token
         if not token:
@@ -157,7 +195,8 @@ class ModelManager(BaseManager[ModelRecord]):
             # Roll the speculative increment back and reject. ``new_count - 1``
             # is the count that was already present before this add.
             await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
-            raise RuntimeError(f'Model limit exceeded: {new_count - 1}/{self._per_token_model_limit} models')
+            raise ResourceQuotaExceededError(
+                f'Model quota exceeded for this token: {new_count - 1}/{self._per_token_model_limit} models')
 
         try:
             await super().add(model_id, record)
@@ -166,28 +205,18 @@ class ModelManager(BaseManager[ModelRecord]):
             await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
             raise
 
-    async def remove(self, model_id: str, *, _record: ModelRecord | None = None) -> bool:
-        """Remove a record by ID, decrementing its owning token's counter.
-
-        When the caller already holds the record (e.g. from a prior ``get_all``),
-        pass it via ``_record`` to skip the redundant backend fetch.
-        """
-        record = _record or await self.get(model_id)
+    async def remove(self, model_id: str) -> bool:
+        """Remove a record by ID and decrement its token quota counter."""
+        record = await self.get(model_id)
         if record is None:
             return False
-        await super().remove(model_id)
-        if record.token:
-            await self._backend.update_atomic(
-                self._token_count_key(record.token),
-                functools.partial(_counter_delta_transform, delta=-1),
-            )
-        return True
+        return await _remove_with_record(self, model_id, record)
 
     # ----- Cleanup -------------------------------------------------------- #
 
-    async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str] | None = None, **kwargs) -> int:
+    async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str]) -> int:
         """Remove models older than ``cutoff_time`` or whose owning session expired."""
-        session_set = set(expired_session_ids or [])
+        session_set = set(expired_session_ids)
         all_records = await self.get_all()
         expired_ids: list[str] = []
         for model_id, record in all_records.items():
@@ -198,16 +227,10 @@ class ModelManager(BaseManager[ModelRecord]):
             if created_at < cutoff_time:
                 expired_ids.append(model_id)
         for model_id in expired_ids:
-            await self.remove(model_id, _record=all_records[model_id])
+            await _remove_with_record(self, model_id, all_records[model_id])
         return len(expired_ids)
 
     # ----- Backend-derived helpers --------------------------------------- #
-
-    async def _count_models_for_token(self, token: str | None) -> int:
-        if not token:
-            return 0
-        all_records = await self.get_all()
-        return sum(1 for r in all_records.values() if r.token == token)
 
     async def _models_for_replica(self, replica_id: str) -> list[str]:
         all_records = await self.get_all()

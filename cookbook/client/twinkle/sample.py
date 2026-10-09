@@ -10,16 +10,13 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-
-dotenv.load_dotenv('.env')
-
 import os
 from transformers import AutoTokenizer
 
 from twinkle import get_logger
-from twinkle_client import init_twinkle_client
-from twinkle_client.sampler import vLLMSampler
+from twinkle import init_twinkle_client
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
@@ -31,6 +28,7 @@ MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 # Example:
 ADAPTER_URI = 'twinkle://20260301_142318-Qwen_Qwen3-4B-199d2cdb/weights/twinkle-lora-0'
 
+
 def sample():
     # Step 2: Initialize the Twinkle client to communicate with the remote server.
     client = init_twinkle_client(
@@ -39,7 +37,7 @@ def sample():
     )
 
     # Step 3: Create the sampler client pointing to the model on the server
-    sampler = vLLMSampler(model_id=MODEL_ID)
+    sampler = client.sampler(MODEL_ID)
 
     # Step 4: Set the chat template so the sampler can encode Trajectory inputs
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)

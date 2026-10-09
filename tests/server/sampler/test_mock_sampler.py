@@ -115,6 +115,12 @@ def test_mock_dispatch_returns_mock_sampler() -> None:
 
 
 def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
+    # Nothing here needs TransferQueue, but importing it is unavoidable: the
+    # `twinkle_agentic.async_rl` package eagerly pulls in `native_tq`, which subclasses
+    # `transfer_queue.GRPOGroupNSampler` at module level. That optional dependency lives
+    # in the `async-rl` extra, so skip when it is absent instead of failing a sampler test
+    # for a data-path dependency it does not use.
+    pytest.importorskip('transfer_queue')
     from twinkle_agentic.async_rl import vllm_sampler_tq as module
 
     captured = {}

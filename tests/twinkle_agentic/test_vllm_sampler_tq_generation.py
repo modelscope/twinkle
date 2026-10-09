@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import pytest
 import time
 from concurrent.futures import Future
-
-import pytest
 
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
@@ -14,15 +13,12 @@ from twinkle.infra import _dispatch_args
 from twinkle.server.sampler.twinkle_handlers import _await_generation
 from twinkle_agentic.async_rl import LoraContext
 from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup, RolloutPolicy
-from twinkle_agentic.async_rl.vllm_sampler_tq import (
-    VLLMSamplerTQ,
-    _GeneratedSample,
-    _PromptGroupRolloutStats,
-    _dispatch_generation,
-)
+from twinkle_agentic.async_rl.vllm_sampler_tq import (VLLMSamplerTQ, _dispatch_generation, _GeneratedSample,
+                                                      _PromptGroupRolloutStats)
 
 
 class LocalActorHandle:
+
     def __init__(self, target):
         self.target = target
 
@@ -30,6 +26,7 @@ class LocalActorHandle:
         method = getattr(self.target, name)
 
         class RemoteMethod:
+
             async def remote(_, *args, **kwargs):
                 result = method(*args, **kwargs)
                 return await result if inspect.isawaitable(result) else result
@@ -38,6 +35,7 @@ class LocalActorHandle:
 
 
 class PolicyProvider:
+
     def __init__(self, policies):
         self.policies = iter(policies)
         self.released = []
@@ -105,10 +103,11 @@ def test_generation_dispatch_allows_one_prompt_with_multiple_dp_workers() -> Non
         _dispatch_generation(
             3,
             worker_index,
-            ('submission', [{'input_ids': [1]}], 'params'),
+            ('submission', [{
+                'input_ids': [1]
+            }], 'params'),
             {},
-        )[0][1]
-        for worker_index in range(3)
+        )[0][1] for worker_index in range(3)
     ]
 
     assert shards == [[{'input_ids': [1]}], [], []]
@@ -128,7 +127,9 @@ def test_generation_submission_returns_before_generation_finishes() -> None:
 
     result = sampler.submit_generation(
         'submission-1',
-        [{'input_ids': [1]}],
+        [{
+            'input_ids': [1]
+        }],
         SamplingParams(max_tokens=4),
     )
 
@@ -155,7 +156,11 @@ def test_generation_keeps_one_response_per_prompt() -> None:
     sampler._sample_single = sample_single
     responses = asyncio.run(
         sampler._generate_inputs(
-            [{'input_ids': [10]}, {'input_ids': [20]}],
+            [{
+                'input_ids': [10]
+            }, {
+                'input_ids': [20]
+            }],
             SamplingParams(max_tokens=4),
             adapter_name='',
             adapter_path=None,
@@ -214,6 +219,15 @@ def test_native_prompt_group_sampling_requires_context_manager() -> None:
         sampler.submit_prompt_groups([], SamplingParams(max_tokens=4))
 
 
+class _DirectGenerationService:
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    async def call_backend(self, fn, /, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
 
     class Sampler:
@@ -237,14 +251,13 @@ def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
             self.futures.pop(submission_id, None)
 
     sampler = Sampler()
+    service = _DirectGenerationService(sampler)
 
     async def run():
         sampler.submit_generation('first')
         sampler.submit_generation('second')
-        first = asyncio.create_task(
-            _await_generation(sampler, 'first'))
-        second = asyncio.create_task(
-            _await_generation(sampler, 'second'))
+        first = asyncio.create_task(_await_generation(service, 'first', timeout=5))
+        second = asyncio.create_task(_await_generation(service, 'second', timeout=5))
         while len(sampler.submission_order) < 2:
             await asyncio.sleep(0)
         assert not first.done()
@@ -284,8 +297,8 @@ def test_server_waiter_retries_cancelled_status_poll() -> None:
 
     sampler = Sampler()
     sampler.submit_generation('submission')
-    result = asyncio.run(
-        _await_generation(sampler, 'submission'))
+    service = _DirectGenerationService(sampler)
+    result = asyncio.run(_await_generation(service, 'submission', timeout=5))
 
     assert result == ['completed']
     assert sampler.status_calls == 2
@@ -314,11 +327,11 @@ def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_si
     context = _context()
     admission = PartitionAdmission(context, context.partition_id(0), 0, 2, 2, 0)
     groups = [
-        PromptGroup(context, admission, f'{admission.partition_id}/group_{index}', {}, object())
-        for index in range(2)
+        PromptGroup(context, admission, f'{admission.partition_id}/group_{index}', {}, object()) for index in range(2)
     ]
 
     class RolloutMetricsHarness:
+
         def __init__(self):
             self.device_mesh = DeviceMesh.from_sizes(world_size=dp_size, dp_size=dp_size)
             self.events = []
@@ -375,28 +388,25 @@ def test_sampler_writes_one_atomic_rollout_file_per_prompt_group(tmp_path):
                 sequences=[SampledSequence('stop', [20 + index], decoded=f'completion-{index}')],
                 prompt_token_ids=[10, 11],
             ),
-            (policy,),
+            (policy, ),
             attempts=1,
             was_aborted=False,
             resumed_partial_output=False,
-        )
-        for index in range(2)
+        ) for index in range(2)
     ]
-    rows = [
-        {
-            'generation_idx': index,
-            'rollout_policy_version': 7,
-            'initial_policy_version': 7,
-            'final_policy_version': 7,
-            'rollout_policy_versions': [7],
-            'rollout_adapter_path': '/tmp/adapter-v7',
-            'stop_reason': 'stop',
-            'logprobs': [-0.1],
-        }
-        for index in range(2)
-    ]
+    rows = [{
+        'generation_idx': index,
+        'rollout_policy_version': 7,
+        'initial_policy_version': 7,
+        'final_policy_version': 7,
+        'rollout_policy_versions': [7],
+        'rollout_adapter_path': '/tmp/adapter-v7',
+        'stop_reason': 'stop',
+        'logprobs': [-0.1],
+    } for index in range(2)]
 
     class Template:
+
         @staticmethod
         def decode(token_ids, **_kwargs):
             return ' '.join(map(str, token_ids))
@@ -410,13 +420,8 @@ def test_sampler_writes_one_atomic_rollout_file_per_prompt_group(tmp_path):
     sampler._write_rollout_group('submission-2', group, generated, rows, [1.0, 0.0])
 
     output_path = (
-        tmp_path
-        / context.tenant_id
-        / context.training_run_id
-        / context.adapter_name
-        / 'policy_7'
-        / 'train_3-group_0.jsonl'
-    )
+        tmp_path / context.tenant_id / context.training_run_id / context.adapter_name / 'policy_7'
+        / 'train_3-group_0.jsonl')
     records = [json.loads(line) for line in output_path.read_text().splitlines()]
     assert len(records) == 2
     assert records[0]['submission_id'] == 'submission-2'
@@ -446,7 +451,10 @@ def test_aborted_generation_restarts_from_original_prompt_when_partial_is_disabl
         VLLMSamplerTQ._generate_sample(
             sampler,
             context,
-            {'input_ids': [1, 2], 'labels': [-100, -100]},
+            {
+                'input_ids': [1, 2],
+                'labels': [-100, -100]
+            },
             SamplingParams(max_tokens=4, logprobs=1),
             multi_modal_data=None,
             logprobs_only=False,
@@ -478,7 +486,10 @@ def test_aborted_generation_continues_from_partial_tokens_when_enabled():
         VLLMSamplerTQ._generate_sample(
             sampler,
             context,
-            {'input_ids': [1, 2], 'labels': [-100, -100]},
+            {
+                'input_ids': [1, 2],
+                'labels': [-100, -100]
+            },
             SamplingParams(max_tokens=4, logprobs=1),
             multi_modal_data=None,
             logprobs_only=False,

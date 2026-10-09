@@ -9,7 +9,7 @@ IMAGE_VERSION=ci_image
 MODELSCOPE_HOME_CACHE=~/.cache
 CI_TEST=True
 MODELSCOPE_SDK_DEBUG=True
-CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest tests'
+CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest -vv -o faulthandler_timeout=60 tests'
 MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'

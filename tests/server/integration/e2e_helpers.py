@@ -22,7 +22,9 @@ BASE_MODEL = 'Qwen/Qwen3.5-4B'
 MODEL_ID = f'ms://{BASE_MODEL}'
 BASE_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
 API_KEY = 'EMPTY_API_KEY'
-TIMEOUT = 120  # seconds per operation before declaring hang
+TIMEOUT = float(os.environ.get('TWINKLE_TEST_OPERATION_TIMEOUT', '120'))
+# Per-operation hang threshold. PPU Megatron cold JIT can exceed 300s; callers may
+# raise this without weakening the default CI/GPU bound.
 GRADIENT_ACCUMULATION_STEPS = 2  # Megatron requires GA >= 2
 
 
@@ -66,6 +68,17 @@ def log(msg: str) -> None:
 # Dataset Factories
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _local_arrow_dataset(path: str, data_slice):
+    """Load selected rows from cached Arrow without hub metadata access."""
+    from datasets import Dataset as HFDataset
+    from twinkle.dataset import Dataset, DatasetMeta
+
+    source = HFDataset.from_file(path)
+    indices = [index % len(source) for index in data_slice]
+    return Dataset(DatasetMeta(data=source.select(indices)))
+
+
 def create_sft_dataset(data_slice=range(100)):
     """Create SelfCognition SFT dataset (small slice for speed)."""
     from twinkle.dataloader import DataLoader
@@ -83,7 +96,11 @@ def create_dpo_dataset(data_slice=range(50)):
     from twinkle.dataset import Dataset, DatasetMeta
     from twinkle.preprocessor import EmojiDPOProcessor
 
-    dataset = Dataset(DatasetMeta('ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji', data_slice=data_slice))
+    local_arrow = os.environ.get('TWINKLE_TEST_DPO_ARROW')
+    if local_arrow:
+        dataset = _local_arrow_dataset(local_arrow, data_slice)
+    else:
+        dataset = Dataset(DatasetMeta('ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji', data_slice=data_slice))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=1024)
     dataset.map(EmojiDPOProcessor, init_args={'system': 'You are a helpful assistant.'})
     dataset.encode()
@@ -97,7 +114,11 @@ def create_grpo_dataset(data_slice=range(50)):
 
     system_prompt = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                      'and put your final answer within \\boxed{}.')
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=data_slice))
+    local_arrow = os.environ.get('TWINKLE_TEST_GRPO_ARROW')
+    if local_arrow:
+        dataset = _local_arrow_dataset(local_arrow, data_slice)
+    else:
+        dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=data_slice))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system=system_prompt))
     dataset.encode(add_generation_prompt=True)

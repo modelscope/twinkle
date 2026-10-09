@@ -2,93 +2,123 @@
 from __future__ import annotations
 
 import atexit
+import os
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import replace
+from typing import Any
+
 from twinkle import get_logger
-from twinkle_client.types.server import (CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse)
-from twinkle_client.types.session import (CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest,
-                                           SessionHeartbeatResponse)
-from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
-                                            TrainingRunsResponse, WeightsInfoResponse)
-from .http import get_api_key, get_base_url, http_delete, http_get, http_post, set_api_key, set_base_url, set_session_id
+from twinkle.protocol.types.server import CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse
+from twinkle.protocol.types.session import CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest
+from twinkle.protocol.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
+                                             WeightsInfoResponse)
+from twinkle_client.exceptions import TwinkleHTTPError
+from twinkle_client.http import ClientContext, ClientTransport
+from twinkle_client.http.context import (TWINKLE_SERVER_TOKEN, TWINKLE_SERVER_URL, clear_default_transport,
+                                         set_default_transport)
 
 logger = get_logger()
 
-class TwinkleClientError(Exception):
-    """Base exception for TwinkleManager errors."""
-    pass
-
 
 class TwinkleClient:
-    """
-    Client manager for interacting with Twinkle REST API.
+    """Owner of one connected transport, remote session, and heartbeat thread.
 
-    On initialization this client:
-    - Sets the base_url and api_key into the shared context so that all other
-      client objects (MultiLoraTransformersModel, vLLMSampler, processor clients)
-      automatically pick up the same configuration.
-    - Creates a server-side session and stores the session_id in context so that
-      every outgoing HTTP request carries it in the ``X-Twinkle-Session-Id`` header.
-    - Starts a lightweight background thread that touches the session every
-      ``session_heartbeat_interval`` seconds to keep it alive.
-
-    Args:
-        base_url: Base URL of the Twinkle server (e.g. "http://localhost:8000").
-                  Falls back to the ``TWINKLE_SERVER_URL`` environment variable.
-        api_key: API key for authentication.  Falls back to the
-                 ``TWINKLE_SERVER_TOKEN`` environment variable.
-        route_prefix: API route prefix (default: "/twinkle").
-        session_heartbeat_interval: Seconds between session touch calls (default: 30).
-        session_metadata: Optional metadata dict stored with the session on the server.
+    Use :meth:`connect` (normally through ``init_twinkle_client``) for remote I/O.
+    ``__init__`` only accepts already-established state, which keeps partial
+    connection failures from publishing a client or leaking a heartbeat thread.
     """
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        route_prefix: Optional[str] = '/twinkle',
+        *,
+        transport: ClientTransport,
+        heartbeat_transport: ClientTransport | None = None,
+        route_prefix: str = '/twinkle',
         session_heartbeat_interval: int = 10,
-        session_metadata: Optional[Dict[str, Any]] = None,
-    ):
-        # Resolve and store config, then propagate to context so all generated
-        # client objects that call get_base_url() / get_api_key() get these values.
-        if base_url:
-            set_base_url(base_url)
-        if api_key:
-            set_api_key(api_key)
-
-        self.base_url = get_base_url()
-        self.api_key = get_api_key()
+    ) -> None:
+        """Build an already-connected client without performing remote I/O."""
+        self._transport = transport
+        self._heartbeat_transport = heartbeat_transport or transport
+        self.base_url = transport.context.base_url
+        self.api_key = transport.context.api_key
         self.route_prefix = route_prefix.rstrip('/') if route_prefix else ''
-
-        # Create a server-side session.
-        self._session_id: str = self.create_session(session_metadata)
-        set_session_id(self._session_id)
-
-        # Start background session-touch thread.
+        self._session_id = transport.context.session_id
         self._heartbeat_interval = session_heartbeat_interval
         self._stop_event = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    @classmethod
+    def connect(
+        cls,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        route_prefix: str | None = '/twinkle',
+        session_heartbeat_interval: int = 10,
+        session_metadata: dict[str, Any] | None = None,
+    ) -> TwinkleClient:
+        """Create the remote session and atomically publish a connected client."""
+        context = ClientContext(
+            base_url=base_url or os.environ.get('TWINKLE_SERVER_URL', TWINKLE_SERVER_URL),
+            api_key=api_key or os.environ.get('TWINKLE_SERVER_TOKEN', TWINKLE_SERVER_TOKEN),
+        )
+        transport = ClientTransport(context)
+        prefix = route_prefix.rstrip('/') if route_prefix else ''
+        client = None
+        heartbeat_transport = None
+        try:
+            response = transport.post(
+                f'{context.base_url}{prefix}/create_session',
+                json_data=CreateSessionRequest(metadata=session_metadata).model_dump(),
+            )
+            session_id = CreateSessionResponse.model_validate(response.json()).session_id
+            transport.bind_context(replace(context, session_id=session_id))
+            heartbeat_transport = ClientTransport(transport.context)
+            client = cls(
+                transport=transport,
+                heartbeat_transport=heartbeat_transport,
+                route_prefix=prefix,
+                session_heartbeat_interval=session_heartbeat_interval,
+            )
+            set_default_transport(transport)
+            client._start_heartbeat()
+            atexit.register(client.close)
+            return client
+        except BaseException:
+            if client is None:
+                if heartbeat_transport is not None:
+                    heartbeat_transport.close()
+                transport.close()
+            else:
+                client.close()
+            raise
+
+    @property
+    def transport(self) -> ClientTransport:
+        return self._transport
+
+    def _start_heartbeat(self) -> None:
         self._heartbeat_thread = threading.Thread(
             target=self._touch_session_loop,
             daemon=True,
             name='TwinkleSessionHeartbeat',
         )
         self._heartbeat_thread.start()
-        atexit.register(self.close)
 
     def get_capacity_info(self) -> CapacityInfoResponse:
         """
         Get the server's global LoRA capacity information.
 
         Returns:
-            :class:`~twinkle_client.types.server.CapacityInfoResponse` with
+            :class:`~twinkle.protocol.types.server.CapacityInfoResponse` with
             ``max_loras``, ``used_loras``, and ``free_loras`` fields.
 
         Raises:
-            TwinkleClientError: If the request fails.
+            TwinkleHTTPError: If the request fails.
         """
-        response = http_get(self._get_url('/capacity_info'))
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url('/capacity_info'))
+        data = response.json()
         return CapacityInfoResponse(**data)
 
     # ------------------------------------------------------------------
@@ -99,18 +129,7 @@ class TwinkleClient:
         """Construct full URL for an endpoint."""
         return f'{self.base_url}{self.route_prefix}{endpoint}'
 
-    def _handle_response(self, response, expected_code: int = 200) -> dict[str, Any]:
-        """Handle HTTP response and raise appropriate errors."""
-        if response.status_code != expected_code:
-            try:
-                error_data = response.json()
-                detail = error_data.get('detail', str(error_data))
-            except Exception:
-                detail = response.text
-            raise TwinkleClientError(f'Request failed with status {response.status_code}: {detail}')
-        return response.json()
-
-    def create_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
+    def create_session(self, metadata: dict[str, Any] | None = None) -> str:
         """
         Create a server-side session.
 
@@ -121,13 +140,12 @@ class TwinkleClient:
             The session ID string.
 
         Raises:
-            TwinkleClientError: If the session creation request fails.
+            TwinkleHTTPError: If the session creation request fails.
         """
-        resp = http_post(
+        resp = self._transport.post(
             self._get_url('/create_session'),
             json_data=CreateSessionRequest(metadata=metadata).model_dump(),
         )
-        resp.raise_for_status()
         return CreateSessionResponse(**resp.json()).session_id
 
     def _touch_session_loop(self) -> None:
@@ -144,12 +162,11 @@ class TwinkleClient:
             success = False
             try:
                 logger.debug(f'[TwinkleClient] Touching session (session={self._session_id})...')
-                resp = http_post(
+                self._heartbeat_transport.post(
                     self._get_url('/session_heartbeat'),
                     json_data=SessionHeartbeatRequest(session_id=self._session_id).model_dump(),
                     timeout=min(self._heartbeat_interval, 10),
                 )
-                resp.raise_for_status()
                 success = True
             except Exception as e:
                 logger.error(f'[TwinkleClient] Session heartbeat error: {e}')
@@ -160,10 +177,38 @@ class TwinkleClient:
             self._stop_event.wait(timeout=sleep_time)
 
     def close(self) -> None:
-        """Stop the background heartbeat thread and clear session context."""
+        """Stop owned resources exactly once without affecting another client."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         self._stop_event.set()
-        if self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2)
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=max(2, min(self._heartbeat_interval, 10)))
+        clear_default_transport(self._transport)
+        if self._heartbeat_transport is not self._transport:
+            self._heartbeat_transport.close()
+        self._transport.close()
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
+
+    def __enter__(self) -> TwinkleClient:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def model(self, model_id: str, **kwargs: Any):
+        """Create a remote training model bound explicitly to this client."""
+        from twinkle_client.model import MultiLoraTransformersModel
+        return MultiLoraTransformersModel(model_id, transport=self._transport, **kwargs)
+
+    def sampler(self, model_id: str, **kwargs: Any):
+        """Create a remote sampler bound explicitly to this client."""
+        from twinkle_client.sampler import vLLMSampler
+        return vLLMSampler(model_id, transport=self._transport, **kwargs)
 
     # ------------------------------------------------------------------
     # Health Check
@@ -177,7 +222,7 @@ class TwinkleClient:
             True if server is healthy, False otherwise.
         """
         try:
-            response = http_get(self._get_url('/healthz'))
+            response = self._transport.get(self._get_url('/healthz'))
             return response.status_code == 200
         except Exception:
             return False
@@ -187,21 +232,25 @@ class TwinkleClient:
         Get the server's supported models and capabilities.
 
         Returns:
-            :class:`~twinkle_client.types.server.GetServerCapabilitiesResponse` with
+            :class:`~twinkle.protocol.types.server.GetServerCapabilitiesResponse` with
             ``supported_models`` field containing a list of supported model names.
 
         Raises:
-            TwinkleClientError: If the request fails.
+            TwinkleHTTPError: If the request fails.
         """
-        response = http_get(self._get_url('/get_server_capabilities'))
-        data = self._handle_response(response)
-        return GetServerCapabilitiesResponse(**data)
+        cached = self._transport.cached_capabilities
+        if isinstance(cached, GetServerCapabilitiesResponse):
+            return cached
+        response = self._transport.get(self._get_url('/get_server_capabilities'))
+        capabilities = GetServerCapabilitiesResponse.model_validate(response.json())
+        self._transport.cached_capabilities = capabilities
+        return capabilities
 
     # ------------------------------------------------------------------
     # Training Runs
     # ------------------------------------------------------------------
 
-    def list_training_runs(self, limit: int = 20, offset: int = 0, all_users: bool = False) -> List[TrainingRun]:
+    def list_training_runs(self, limit: int = 20, offset: int = 0, all_users: bool = False) -> list[TrainingRun]:
         """
         List training runs.
 
@@ -213,17 +262,17 @@ class TwinkleClient:
             all_users: If True, return all runs (if permission allows).
 
         Returns:
-            List of :class:`~twinkle_client.types.training.TrainingRun` objects.
+            List of :class:`~twinkle.protocol.types.training.TrainingRun` objects.
 
         Raises:
-            TwinkleClientError: If the request fails.
+            TwinkleHTTPError: If the request fails.
         """
-        params: Dict[str, Any] = {'limit': limit, 'offset': offset}
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
         if all_users:
             params['all_users'] = 'true'
 
-        response = http_get(self._get_url('/training_runs'), params=params)
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url('/training_runs'), params=params)
+        data = response.json()
 
         return [TrainingRun(**r) for r in data.get('training_runs', [])]
 
@@ -232,7 +281,7 @@ class TwinkleClient:
         limit: int = 20,
         offset: int = 0,
         all_users: bool = False,
-    ) -> Tuple[List[TrainingRun], Cursor]:
+    ) -> tuple[list[TrainingRun], Cursor]:
         """
         List training runs with pagination info.
 
@@ -245,14 +294,14 @@ class TwinkleClient:
             Tuple of (list of TrainingRun, Cursor with pagination info).
 
         Raises:
-            TwinkleClientError: If the request fails.
+            TwinkleHTTPError: If the request fails.
         """
-        params: Dict[str, Any] = {'limit': limit, 'offset': offset}
+        params: dict[str, Any] = {'limit': limit, 'offset': offset}
         if all_users:
             params['all_users'] = 'true'
 
-        response = http_get(self._get_url('/training_runs'), params=params)
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url('/training_runs'), params=params)
+        data = response.json()
 
         runs = [TrainingRun(**r) for r in data.get('training_runs', [])]
         cursor = Cursor(**data.get('cursor', {}))
@@ -266,20 +315,20 @@ class TwinkleClient:
             run_id: The training run identifier.
 
         Returns:
-            :class:`~twinkle_client.types.training.TrainingRun` object with run details.
+            :class:`~twinkle.protocol.types.training.TrainingRun` object with run details.
 
         Raises:
-            TwinkleClientError: If run not found or access denied.
+            TwinkleHTTPError: If run not found or access denied.
         """
-        response = http_get(self._get_url(f'/training_runs/{run_id}'))
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url(f'/training_runs/{run_id}'))
+        data = response.json()
         return TrainingRun(**data)
 
     # ------------------------------------------------------------------
     # Checkpoints
     # ------------------------------------------------------------------
 
-    def list_checkpoints(self, run_id: str) -> List[Checkpoint]:
+    def list_checkpoints(self, run_id: str) -> list[Checkpoint]:
         """
         List checkpoints for a training run.
 
@@ -287,13 +336,13 @@ class TwinkleClient:
             run_id: The training run identifier.
 
         Returns:
-            List of :class:`~twinkle_client.types.training.Checkpoint` objects.
+            List of :class:`~twinkle.protocol.types.training.Checkpoint` objects.
 
         Raises:
-            TwinkleClientError: If run not found or access denied.
+            TwinkleHTTPError: If run not found or access denied.
         """
-        response = http_get(self._get_url(f'/training_runs/{run_id}/checkpoints'))
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url(f'/training_runs/{run_id}/checkpoints'))
+        data = response.json()
         return [Checkpoint(**c) for c in data.get('checkpoints', [])]
 
     def get_checkpoint_path(self, run_id: str, checkpoint_id: str) -> ParsedCheckpointTwinklePath:
@@ -305,14 +354,14 @@ class TwinkleClient:
             checkpoint_id: The checkpoint identifier (e.g. "weights/20240101_120000").
 
         Returns:
-            :class:`~twinkle_client.types.training.ParsedCheckpointTwinklePath` with
+            :class:`~twinkle.protocol.types.training.ParsedCheckpointTwinklePath` with
             ``path`` (filesystem) and ``twinkle_path`` fields.
 
         Raises:
-            TwinkleClientError: If checkpoint not found or access denied.
+            TwinkleHTTPError: If checkpoint not found or access denied.
         """
-        response = http_get(self._get_url(f'/checkpoint_path/{run_id}/{checkpoint_id}'))
-        data = self._handle_response(response)
+        response = self._transport.get(self._get_url(f'/checkpoint_path/{run_id}/{checkpoint_id}'))
+        data = response.json()
         return ParsedCheckpointTwinklePath(
             path=data.get('path', ''),
             twinkle_path=data.get('twinkle_path', ''),
@@ -333,7 +382,7 @@ class TwinkleClient:
             Twinkle path string (e.g. "twinkle://run_id/weights/checkpoint_name").
 
         Raises:
-            TwinkleClientError: If checkpoint not found or access denied.
+            TwinkleHTTPError: If checkpoint not found or access denied.
         """
         return self.get_checkpoint_path(run_id, checkpoint_id).twinkle_path
 
@@ -346,14 +395,14 @@ class TwinkleClient:
             checkpoint_id: The checkpoint identifier.
 
         Returns:
-            :class:`~twinkle_client.types.server.DeleteCheckpointResponse` indicating success.
+            :class:`~twinkle.protocol.types.server.DeleteCheckpointResponse` indicating success.
 
         Raises:
-            TwinkleClientError: If checkpoint not found or access denied.
+            TwinkleHTTPError: If checkpoint not found or access denied.
         """
         url = self._get_url(f'/training_runs/{run_id}/checkpoints/{checkpoint_id}')
-        response = http_delete(url)
-        data = self._handle_response(response)
+        response = self._transport.delete(url)
+        data = response.json()
         return DeleteCheckpointResponse(**data)
 
     # ------------------------------------------------------------------
@@ -368,21 +417,21 @@ class TwinkleClient:
             twinkle_path: The twinkle:// path to the weights.
 
         Returns:
-            :class:`~twinkle_client.types.training.WeightsInfoResponse` with fields:
+            :class:`~twinkle.protocol.types.training.WeightsInfoResponse` with fields:
             ``training_run_id``, ``base_model``, ``model_owner``, ``is_lora``, ``lora_rank``.
 
         Raises:
-            TwinkleClientError: If weights not found or access denied.
+            TwinkleHTTPError: If weights not found or access denied.
         """
-        response = http_post(self._get_url('/weights_info'), json_data={'twinkle_path': twinkle_path})
-        data = self._handle_response(response)
+        response = self._transport.post(self._get_url('/weights_info'), json_data={'twinkle_path': twinkle_path})
+        data = response.json()
         return WeightsInfoResponse(**data)
 
     # ------------------------------------------------------------------
     # Convenience Methods
     # ------------------------------------------------------------------
 
-    def get_latest_checkpoint_path(self, run_id: str) -> Optional[str]:
+    def get_latest_checkpoint_path(self, run_id: str) -> str | None:
         """
         Get the filesystem path to the latest checkpoint for a training run.
 
@@ -395,7 +444,7 @@ class TwinkleClient:
             Filesystem path string to the latest checkpoint, or ``None`` if none exist.
 
         Raises:
-            TwinkleClientError: If run not found or access denied.
+            TwinkleHTTPError: If run not found or access denied.
         """
         checkpoints = self.list_checkpoints(run_id)
         if not checkpoints:
@@ -403,7 +452,7 @@ class TwinkleClient:
         latest = checkpoints[-1]
         return self.get_checkpoint_path(run_id, latest.checkpoint_id).path
 
-    def find_training_run_by_model(self, base_model: str) -> List[TrainingRun]:
+    def find_training_run_by_model(self, base_model: str) -> list[TrainingRun]:
         """
         Find training runs for a specific base model.
 
@@ -411,7 +460,7 @@ class TwinkleClient:
             base_model: The base model name to search for.
 
         Returns:
-            List of :class:`~twinkle_client.types.training.TrainingRun` objects
+            List of :class:`~twinkle.protocol.types.training.TrainingRun` objects
             matching the base model.
         """
         all_runs = self.list_training_runs(limit=100)

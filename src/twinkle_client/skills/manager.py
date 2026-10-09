@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from twinkle.utils.logger import get_logger
-
 from twinkle_client.skills.base import Skill, SkillProvider
 
 logger = get_logger()
@@ -72,10 +71,8 @@ class SkillManager:
         sections: list[str] = []
         sections.append('# Available Skills')
         sections.append('')
-        sections.append(
-            'The following skills provide you with specialized knowledge and capabilities. '
-            'Use them to better assist the user.'
-        )
+        sections.append('The following skills provide you with specialized knowledge and capabilities. '
+                        'Use them to better assist the user.')
         sections.append('')
 
         for skill in self._skills:

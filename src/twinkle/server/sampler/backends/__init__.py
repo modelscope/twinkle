@@ -1,15 +1,11 @@
-STREAM_SENTINEL = '__STREAM_END__'
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Sampler backend implementations.
 
+The cross-process streaming bridge lives in ``streaming`` and is re-exported here
+so a sibling backend module can import it from ``.streaming`` without importing
+this package root, while external consumers keep using
+``from twinkle.server.sampler.backends import stream_to_queue``.
+"""
+from .streaming import STREAM_SENTINEL, stream_to_queue
 
-def stream_to_queue(sampler, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
-    """Push streaming deltas from *sampler* to a cross-process Ray queue.
-
-    Works with any object that exposes a ``sample_stream`` iterator.
-    """
-    try:
-        for delta, reason in sampler.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
-            queue.put((delta, reason))
-    except Exception as e:
-        queue.put(e)
-    finally:
-        queue.put(STREAM_SENTINEL)
+__all__ = ['STREAM_SENTINEL', 'stream_to_queue']

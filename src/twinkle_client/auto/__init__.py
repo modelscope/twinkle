@@ -18,12 +18,16 @@ def _configure_logging(verbose: bool = False) -> None:
     from logging.handlers import RotatingFileHandler
 
     handler = RotatingFileHandler(
-        _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8',
+        _LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding='utf-8',
     )
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    ))
+    handler.setFormatter(
+        logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        ))
 
     level = logging.DEBUG if verbose else logging.INFO
     twinkle_logger = logging.getLogger('twinkle')
@@ -45,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     import sys
     import typer
+
     from twinkle.version import __version__
 
     app = typer.Typer(
@@ -61,43 +66,51 @@ def main(argv: list[str] | None = None) -> int:
     @app.command()
     def launch(
         run_id: str | None = typer.Option(
-            None, '--run-id', '-r',
+            None,
+            '--run-id',
+            '-r',
             envvar='TWINKLE_AUTO_RUN_ID',
             help='Attach to an existing training run by ID.',
         ),
         llm_base_url: str = typer.Option(
-            'http://localhost:11434/v1', '--llm-base-url',
+            'http://localhost:11434/v1',
+            '--llm-base-url',
             envvar='TWINKLE_LLM_BASE_URL',
             help='LLM API base URL.',
         ),
         llm_model: str = typer.Option(
-            'qwen3.5', '--llm-model',
+            'qwen3.5',
+            '--llm-model',
             envvar='TWINKLE_LLM_MODEL',
             help='LLM model name.',
         ),
         llm_api_key: str = typer.Option(
-            'not-needed', '--llm-api-key',
+            'not-needed',
+            '--llm-api-key',
             envvar='TWINKLE_LLM_API_KEY',
             help='LLM API key.',
         ),
         verbose: bool = typer.Option(
-            False, '--verbose', '-v',
+            False,
+            '--verbose',
+            '-v',
             envvar='TWINKLE_AUTO_VERBOSE',
             help='Enable verbose (DEBUG) logging.',
         ),
         version: bool = typer.Option(
-            False, '--version', '-V',
-            callback=_version_callback, is_eager=True,
+            False,
+            '--version',
+            '-V',
+            callback=_version_callback,
+            is_eager=True,
             help='Show version and exit.',
         ),
     ) -> None:
         """Launch Twinkle Auto."""
         _configure_logging(verbose=verbose)
         logger = get_logger()
-        logger.info(
-            f'Auto starting — model={llm_model}, base_url={llm_base_url}, '
-            f'run_id={run_id}, log_file={_LOG_FILE}'
-        )
+        logger.info(f'Auto starting — model={llm_model}, base_url={llm_base_url}, '
+                    f'run_id={run_id}, log_file={_LOG_FILE}')
 
         from twinkle_client.auto.app import TwinkleAuto
 

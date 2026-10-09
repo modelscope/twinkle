@@ -13,7 +13,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
 
 # ---------- defaults snapshot used by the default-value test -------------- #
 
@@ -22,6 +22,7 @@ DEFAULTS = {
     'tps_limit': 16000.0,
     'window_seconds': 1.0,
     'queue_timeout': 300.0,
+    'execution_timeout': 1800.0,
     'token_cleanup_interval': 60.0,
     'max_input_tokens': 16000,
 }
@@ -113,3 +114,15 @@ def test_extra_field_rejected() -> None:
     """``extra='forbid'`` rejects unknown keys."""
     with pytest.raises(ValidationError):
         TaskQueueConfig(unknown_field=1)
+
+
+def test_zero_execution_timeout_uses_finite_fallback() -> None:
+    assert TaskQueueConfig(execution_timeout=0).effective_execution_timeout == 3600
+
+
+def test_absolute_future_ttl_uses_conservative_backend_bound() -> None:
+    config = TaskQueueConfig(queue_timeout=10, execution_timeout=20)
+    assert config.absolute_future_ttl(collect_width=2) == 2 * (10 + 2 * 3600)
+
+    config = TaskQueueConfig(queue_timeout=10, execution_timeout=5000)
+    assert config.absolute_future_ttl(collect_width=2) == 2 * (10 + 2 * 5000)

@@ -82,6 +82,27 @@ class TestGRPOLoss:
         result = loss_fn(inputs, outputs, old_logps=old_logps, advantages=adv_list)
         assert torch.isfinite(result['loss'])
 
+    def test_pad_variable_length_full_sequence_rows(self):
+        """Unpadded per-sample rows align against a right-padded batch mask."""
+        mask = torch.tensor([
+            [False, True, True, False, False],
+            [False, False, True, True, True],
+        ])
+        rows = [
+            [-9.0, 0.1, 0.2],
+            [-9.0, -9.0, 0.3, 0.4, 0.5],
+        ]
+
+        got = GRPOLoss()._pad_and_align_to_batch(rows, mask, mask.device, torch.float32)
+
+        assert torch.equal(got[0], torch.tensor([0.0, 0.1, 0.2, 0.0, 0.0]))
+        assert torch.equal(got[1], torch.tensor([0.0, 0.0, 0.3, 0.4, 0.5]))
+
+    def test_pad_rejects_full_sequence_missing_a_masked_position(self):
+        mask = torch.tensor([[False, False, True, True, True]])
+        with pytest.raises(AssertionError, match='all masked positions'):
+            GRPOLoss()._pad_and_align_to_batch([[0.1, 0.2, 0.3, 0.4]], mask, mask.device, torch.float32)
+
     def test_grpo_weights_sequences_equally(self):
         labels = torch.tensor([
             [1, -100, -100],

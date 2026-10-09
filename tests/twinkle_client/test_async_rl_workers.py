@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-
 import pytest
 
 from twinkle_client.async_rl import Worker, WorkerPipeline
@@ -59,6 +58,7 @@ def test_worker_pipeline_cancels_peer_when_one_role_fails() -> None:
 
 
 def test_worker_pipeline_rejects_duplicate_role_names() -> None:
+
     async def noop():
         return None
 

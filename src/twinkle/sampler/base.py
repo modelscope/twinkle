@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Type, Union
 
 import twinkle
 from twinkle import remote_function
-from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory, is_encoded
 from twinkle.patch import Patch
 from twinkle.template import Template
 from twinkle.utils import construct_class
@@ -51,10 +51,11 @@ class Sampler(ABC):
     def _not_encoded(inputs: Any) -> bool:
         """Check if inputs are not yet encoded (i.e., is Trajectory, not InputFeature).
 
-        Aligned with TransformersModel._not_encoded for consistency.
+        Delegates to the single shared predicate so the three backends and the wire
+        schema cannot drift apart.
         """
         assert isinstance(inputs, dict), f'Expected dict, got {type(inputs)}'
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        return not is_encoded(inputs)
 
     def _is_trajectory(self, inputs: Any) -> bool:
         """Check if inputs are Trajectory type (not encoded)."""

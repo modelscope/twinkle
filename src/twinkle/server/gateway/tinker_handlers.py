@@ -2,13 +2,11 @@
 """
 Tinker-compatible gateway handlers.
 
-All endpoints are prefixed /* and registered via _register_tinker_routes(app, self_fn).
+All endpoints are prefixed /* and registered via _register_gateway_tinker_routes(app, self_fn).
 self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at request time.
 """
 from __future__ import annotations
 
-import asyncio
-import os
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types
@@ -19,14 +17,55 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
-from twinkle.server.utils.task_queue import QueueState
-from twinkle.server.utils.validation import get_token_from_request
+from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.task_errors import trim_traceback
 from twinkle.utils.logger import get_logger
+from .use_cases import delete_checkpoint
+from .use_cases import get_training_run as get_training_run_use_case
+from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
 logger = get_logger()
 
+# Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
+_TINKER_FAILURE_WIRE: dict[str, tuple[int, str]] = {
+    'invalid_request': (400, 'user'),
+    'request_rejected': (400, 'user'),
+    'resource_not_found': (404, 'user'),
+    'full_mode_busy': (409, 'user'),
+    'input_tokens_exceeded': (422, 'user'),
+    'batch_size_invalid': (422, 'user'),
+    'rate_limit_exceeded': (429, 'user'),
+    'resource_quota_exceeded': (429, 'user'),
+    'cancelled': (499, 'user'),
+    'endpoint_unavailable': (501, 'server'),
+    'state_contention': (503, 'server'),
+    'backend_gate_unavailable': (503, 'server'),
+    'orphaned_replica': (503, 'server'),
+    'execution_timeout': (504, 'server'),
+    'deadline_exceeded': (500, 'server'),
+    'internal_error': (500, 'server'),
+}
 
-def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
+
+def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any]:
+    """Map domain failure state to the existing Tinker-compatible error body."""
+    failure = FutureFailureRecord.model_validate(stored)
+    error_code, category = _TINKER_FAILURE_WIRE.get(failure.reason_code, (500, 'server'))
+    payload: dict[str, Any] = {
+        'error': failure.message[:1024],
+        'category': category,
+        'error_code': error_code,
+        'request_id': request_id,
+    }
+    if failure.details is not None:
+        payload['details'] = failure.details
+    if failure.diagnostic and category == 'server':
+        payload['traceback'] = trim_traceback(failure.diagnostic)
+    return payload
+
+
+def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register all /* Tinker routes on the given FastAPI app.
 
     self_fn is a zero-argument callable that returns the current GatewayServer
@@ -43,7 +82,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             request: Request,
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
-        # Convert twinkle_client.types.SupportedModel to tinker.types.SupportedModel
+        # Convert twinkle.protocol.types.SupportedModel to tinker.types.SupportedModel
         tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
         return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 
@@ -82,50 +121,24 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                               self: GatewayServer = Depends(self_fn)) -> Any:
         """Retrieve the result of an async task with long polling."""
         request_id = body.request_id
-        max_wait = float(os.environ.get('TWINKLE_LONG_POLL_TIMEOUT', '30'))
-        poll_interval = float(os.environ.get('TWINKLE_POLL_INTERVAL', '0.5'))
-        start = asyncio.get_running_loop().time()
-
-        while True:
-            record = await self.state.get_future(request_id)
-
+        outcome = await poll_future(self.state, request_id)
+        record = outcome.record
+        if outcome.timed_out:
+            response_data: dict[str, Any] = {'type': 'try_again'}
             if record is not None:
-                status = record.get('status')
-                if status not in ('pending', 'queued', 'running', 'rate_limited'):
-                    break
-
-            # ``record is None`` here means the future hasn't been written yet
-            # (cross-replica visibility lag) — fold into the long-poll loop
-            # rather than short-circuit ``try_again``: returning immediately
-            # lets the SDK hammer this endpoint at ~150 Hz.
-            if asyncio.get_running_loop().time() - start >= max_wait:
-                response_data: dict[str, Any] = {'type': 'try_again'}
-                if record is not None:
-                    if queue_state := record.get('queue_state'):
-                        response_data['queue_state'] = queue_state
-                    if queue_state_reason := record.get('queue_state_reason'):
-                        response_data['queue_state_reason'] = queue_state_reason
-                return response_data
-
-            await asyncio.sleep(poll_interval)
+                if queue_state := record.get('queue_state'):
+                    response_data['queue_state'] = queue_state
+                if queue_state_reason := record.get('queue_state_reason'):
+                    response_data['queue_state_reason'] = queue_state_reason
+            return response_data
 
         status = record.get('status')
-
-        if status == 'rate_limited':
-            return {
-                'type': 'try_again',
-                'queue_state': QueueState.PAUSED_RATE_LIMIT.value,
-                'queue_state_reason': record.get('reason', 'Rate limit exceeded')
-            }
-
         if status == 'failed':
-            result = record.get('result', {})
-            return {'error': result.get('error', 'Unknown error'), 'category': result.get('category', 'Server')}
+            return _tinker_error_from_failure(record.get('failure'), request_id=request_id)
 
         result = record.get('result')
         if result is None:
             raise HTTPException(status_code=500, detail='Task completed but no result found')
-
         if hasattr(result, 'model_dump'):
             return result.model_dump()
         return result
@@ -135,14 +148,12 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.get('/training_runs')
     async def get_training_runs(request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
         token = get_token_from_request(request)
-        training_run_manager = create_training_run_manager(token, client_type='tinker')
-        return training_run_manager.list_runs(limit=limit, offset=offset)
+        return list_training_runs(token, 'tinker', limit=limit, offset=offset)
 
     @app.get('/training_runs/{run_id}')
     async def get_training_run(request: Request, run_id: str) -> types.TrainingRun:
         token = get_token_from_request(request)
-        training_run_manager = create_training_run_manager(token, client_type='tinker')
-        run = training_run_manager.get(run_id)
+        run = get_training_run_use_case(token, 'tinker', run_id)
         if not run:
             raise HTTPException(status_code=404, detail=f'Training run {run_id} not found')
         return run
@@ -150,8 +161,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.get('/training_runs/{run_id}/checkpoints')
     async def get_run_checkpoints(request: Request, run_id: str) -> types.CheckpointsListResponse:
         token = get_token_from_request(request)
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-        response = checkpoint_manager.list_checkpoints(run_id)
+        response = list_checkpoints(token, 'tinker', run_id)
         if not response:
             raise HTTPException(status_code=404, detail=f'Training run {run_id} not found')
         return response
@@ -159,8 +169,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.delete('/training_runs/{run_id}/checkpoints/{checkpoint_id:path}')
     async def delete_run_checkpoint(request: Request, run_id: str, checkpoint_id: str) -> Any:
         token = get_token_from_request(request)
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-        success = checkpoint_manager.delete(run_id, checkpoint_id)
+        success = delete_checkpoint(token, 'tinker', run_id, checkpoint_id)
         if not success:
             raise HTTPException(status_code=404, detail=f'Checkpoint {checkpoint_id} not found for run {run_id}')
         return None
@@ -168,9 +177,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     @app.post('/weights_info')
     async def weights_info(request: Request, body: dict[str, Any]) -> types.WeightsInfoResponse:
         token = get_token_from_request(request)
-        checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
         tinker_path = body.get('tinker_path')
-        response = checkpoint_manager.get_weights_info(tinker_path)
+        response = get_weights_info(token, 'tinker', tinker_path)
         if not response:
             raise HTTPException(status_code=404, detail=f'Weights at {tinker_path} not found')
         return response

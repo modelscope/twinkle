@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Base file manager and abstract training-run manager.
-
-Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
 

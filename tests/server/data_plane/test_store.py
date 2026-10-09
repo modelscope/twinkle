@@ -8,7 +8,11 @@ from twinkle.server.data_plane.store import TQDataRefStore, _partition
 
 @pytest.mark.asyncio
 async def test_data_ref_round_trip_append_release_and_ref_isolation(monkeypatch) -> None:
-    import transfer_queue as tq
+    # TransferQueue ships in the `async-rl` extra, not in `server` / `client`, so an
+    # environment installed without that extra must SKIP here rather than fail. A bare
+    # import turned an absent optional dependency into a permanently red test, which
+    # teaches readers to ignore red.
+    tq = pytest.importorskip('transfer_queue')
 
     records = {}
 
@@ -99,7 +103,7 @@ async def test_data_ref_round_trip_append_release_and_ref_isolation(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_append_rejects_row_count_mismatch() -> None:
-    from twinkle_client.types import DataRef
+    from twinkle.protocol.types import DataRef
 
     store = TQDataRefStore.__new__(TQDataRefStore)
     ref = DataRef(ref_id='r', size=2, fields=['x'])
@@ -108,7 +112,7 @@ async def test_append_rejects_row_count_mismatch() -> None:
 
 
 def test_partition_is_stable_and_scoped_by_data_ref() -> None:
-    from twinkle_client.types import DataRef
+    from twinkle.protocol.types import DataRef
 
     first = DataRef(ref_id='a', size=1, fields=['x'])
     same = DataRef(ref_id='a', size=99, fields=['other'])

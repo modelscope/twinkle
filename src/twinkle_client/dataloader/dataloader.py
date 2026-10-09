@@ -1,115 +1,50 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+from __future__ import annotations
 
-from typing import Callable, Type, Union
-from twinkle_client.http import http_post
-from twinkle.dataset import Dataset
-from twinkle.processor import InputProcessor
+from typing import TYPE_CHECKING, Callable, Type, Union
 
-class DataLoader(object):
+from twinkle_client.common.remote_component import RemoteComponent
+from twinkle_client.http import ClientTransport
+
+if TYPE_CHECKING:
+    from twinkle.processor import InputProcessor
+    from twinkle_client.dataset import Dataset
+
+
+class DataLoader(RemoteComponent):
     """Client wrapper for DataLoader that calls server HTTP endpoints."""
 
-    def __init__(self, dataset: Union[Dataset, Callable], **kwargs):
-        from twinkle_client.http import get_base_url
+    def __init__(
+        self,
+        dataset: Dataset | Callable,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        dataset_transport = getattr(dataset, '_transport', None)
+        if transport is not None and dataset_transport is not None and transport is not dataset_transport:
+            raise ValueError('DataLoader and its remote Dataset must use the same ClientTransport')
+        self._bind_remote(
+            'dataloader', 'DataLoader', dataset=dataset, transport=transport or dataset_transport, **kwargs)
 
-        self.server_url = f'{get_base_url()}/processor/twinkle'
-        response = http_post(
-            url=f'{self.server_url}/create',
-            json_data={
-                'processor_type': 'dataloader',
-                'class_type': 'DataLoader',
-                **{'dataset': dataset}, **kwargs
-            }
-        )
-        response.raise_for_status()
-        self.processor_id = response.json()['processor_id']
-
-    
     def __len__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__len__',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__len__')
 
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'set_processor',
-                **{'processor_cls': processor_cls},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+    def set_processor(self, processor_cls: type[InputProcessor] | str | InputProcessor | Callable, **kwargs):
+        return self._call('set_processor', processor_cls=processor_cls, **kwargs)
 
     def __iter__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__iter__',
-                **{},
-            }
-        )
-        response.raise_for_status()
+        self._call('__iter__')
         return self
-    
+
     def __next__(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': '__next__',
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('__next__')
 
     def skip_consumed_samples(self, consumed_train_samples: int):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'skip_consumed_samples',
-                **{'consumed_train_samples': consumed_train_samples},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('skip_consumed_samples', consumed_train_samples=consumed_train_samples)
 
     def resume_from_checkpoint(self, consumed_train_samples, **kwargs):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'resume_from_checkpoint',
-                **{'consumed_train_samples': consumed_train_samples},
-                **kwargs
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('resume_from_checkpoint', consumed_train_samples=consumed_train_samples, **kwargs)
 
     def get_state(self):
-        response = http_post(
-            url=f'{self.server_url}/call',
-            json_data={
-                'processor_id': self.processor_id,
-                'function': 'get_state',
-                **{},
-            }
-        )
-        response.raise_for_status()
-        return response.json()["result"]
-    
+        return self._call('get_state')

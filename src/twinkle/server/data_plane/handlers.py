@@ -5,7 +5,7 @@ from collections.abc import Callable
 from fastapi import Depends, FastAPI
 from typing import TYPE_CHECKING
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 
 if TYPE_CHECKING:
     from .app import DataPlaneManagement

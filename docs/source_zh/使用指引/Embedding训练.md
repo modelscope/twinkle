@@ -128,7 +128,7 @@ set_processor('InputProcessor')
 
 ```python
 from peft import LoraConfig
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle_client.model import MultiLoraTransformersModel
 
 # --- Connect to the running Twinkle server ---
