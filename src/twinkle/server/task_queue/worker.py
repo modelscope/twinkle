@@ -96,6 +96,7 @@ class ComputeWorker:
 
         self._worker_task: asyncio.Task | None = None
         self._started = False
+        self._stopping = False
         self._start_lock = asyncio.Lock()
 
     async def ensure_started(self) -> None:
@@ -105,11 +106,13 @@ class ComputeWorker:
         async with self._start_lock:
             if self._started and self._worker_task is not None and not self._worker_task.done():
                 return
+            self._stopping = False
             self._worker_task = asyncio.create_task(self._worker_loop())
             self._started = True
 
     async def stop(self) -> None:
         """Cancel the worker and wait for it to exit cleanly."""
+        self._stopping = True
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             try:
@@ -441,7 +444,9 @@ class ComputeWorker:
         """Main worker loop: wait for work, run one task, repeat."""
         logger.info(f'[ComputeWorker] Started, queue_timeout={self._config.queue_timeout}, '
                     f'execution_timeout={self._config.execution_timeout}')
-        while True:
+        # Python 3.10/3.11 wait_for can swallow cancellation when its child
+        # completes simultaneously. Do not wait for more work after stop().
+        while not self._stopping:
             try:
                 await self._wait_for_work()
                 executed = await self._try_run_one()
@@ -449,8 +454,8 @@ class ComputeWorker:
                     # All dequeued tasks were timed-out; yield briefly to avoid busy spin.
                     await asyncio.sleep(min(self._config.window_seconds, 0.1))
             except asyncio.CancelledError:
-                logger.info('[ComputeWorker] Worker stopped')
                 break
             except Exception:
                 logger.error(f'[ComputeWorker] Unexpected error:\n{traceback.format_exc(limit=3)}')
                 continue
+        logger.info('[ComputeWorker] Worker stopped')

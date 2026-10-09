@@ -56,6 +56,92 @@ class _DummyQueue(TaskQueueMixin):
 
 
 @pytest.mark.asyncio
+async def test_worker_stop_exits_when_wait_for_swallows_cancellation(monkeypatch):
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    worker = queue._compute_worker
+    completed = asyncio.Event()
+    stop_task = None
+
+    async def work():
+        return {'ok': True}
+
+    async def wait_for_with_completion_race(coro, timeout):
+        # Python 3.10/3.11 wait_for can return a completed child's result
+        # instead of propagating a simultaneous cancellation of its caller.
+        result = await coro
+        completed.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return result
+
+    monkeypatch.setattr(asyncio, 'wait_for', wait_for_with_completion_race)
+    ready_task = asyncio.create_task(completed.wait())
+    try:
+        ref = await queue.schedule_task(work, model_id='model1', token='token1')
+        done, _ = await asyncio.wait({ready_task}, timeout=1)
+        assert ready_task in done, 'worker did not execute the task'
+
+        stop_task = asyncio.create_task(worker.stop())
+        done, _ = await asyncio.wait({stop_task}, timeout=1)
+        assert stop_task in done, 'worker waited for new work after cancellation was swallowed'
+        await stop_task
+        assert (await queue.state.get_future(ref['request_id']))['result'] == {'ok': True}
+    finally:
+        ready_task.cancel()
+        if worker._worker_task is not None:
+            worker._worker_task.cancel()
+        if stop_task is not None:
+            await stop_task
+        else:
+            await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_can_restart_after_stopping_while_idle():
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    worker = queue._compute_worker
+
+    async def work():
+        return {'ok': True}
+
+    try:
+        await worker.ensure_started()
+        await asyncio.sleep(0)  # Let the idle worker wait for new work.
+        await asyncio.wait_for(worker.stop(), timeout=1)
+        env = await queue.submit_and_peek(work, model_id='model1', token='token1')
+        assert env.status == 'completed'
+        assert env.result == {'ok': True}
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_cancels_running_task():
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    try:
+        await queue.schedule_task(work, model_id='model1', token='token1')
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(queue._compute_worker.stop(), timeout=1)
+        assert cancelled.is_set()
+    finally:
+        await queue._compute_worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_preflight_rejects_batch_without_per_dp_multiple():
     queue = _DummyQueue()
     from twinkle.server.exceptions import BatchSizeError
