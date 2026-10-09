@@ -406,6 +406,7 @@ foundation for building customizable, enterprise-grade training services.
 | Component Type | Component Link                                                                                           | Component Function                                                                      | Author              |
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
+| Training recipe | [Intern-Decision on Ascend](cookbook/transformers/intern_decision_npu/README.md) | Text-only masked decision SFT, joint-field supervision and FSDP2 checkpoint recovery | — |
 
 ## Contributions
 
