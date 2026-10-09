@@ -213,6 +213,39 @@ class _SaveWeightsDummyManagement:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('backward', [False, True])
+async def test_tinker_loss_metric_survives_sdk_reduction(backward):
+    from tinker.lib.chunked_fwdbwd_helpers import combine_fwd_bwd_output_results
+
+    management = _SaveWeightsDummyManagement()
+    management.data_world_size = 1
+    management.set_resource_state = MagicMock()
+    outputs = [{'logprobs': types.TensorData(data=[-0.25, -0.5], dtype='float32', shape=[2])}]
+    management.model.tinker_forward_only.return_value = (outputs, 0.375)
+    management.model.tinker_forward_backward.return_value = (outputs, 0.375)
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    if backward:
+        body = types.ForwardBackwardRequest(
+            model_id='model1',
+            forward_backward_input=types.ForwardBackwardInput(data=[_datum()], loss_fn='cross_entropy'),
+        )
+        path = '/tinker/forward_backward'
+    else:
+        body = types.ForwardRequest(
+            model_id='model1',
+            forward_input=types.ForwardInput(data=[_datum()], loss_fn='cross_entropy'),
+        )
+        path = '/tinker/forward'
+    route = next(route for route in app.routes if getattr(route, 'path', None) == path)
+    response = await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+
+    # Use the pinned SDK's real combiner: unsupported reduction names are silently dropped.
+    combined = combine_fwd_bwd_output_results([response])
+    assert combined.metrics['loss:mean'] == pytest.approx(0.375)
+
+
+@pytest.mark.asyncio
 @patch('twinkle.server.model.tinker_handlers.create_checkpoint_manager')
 async def test_save_weights_for_sampler_path_mode_returns_path(mock_create_ckpt_mgr):
     """save_weights_for_sampler(name) mode: sampling_session_seq_id is None → returns path != None."""

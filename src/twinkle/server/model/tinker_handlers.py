@@ -148,7 +148,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type='CrossEntropyLossReturn',
                     loss_fn_outputs=output,
-                    metrics={'loss:avg': loss},
+                    metrics={'loss:mean': loss},
                 )
             except Exception:
                 logger.error(traceback.format_exc())
@@ -195,7 +195,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type=output_type,
                     loss_fn_outputs=output,
-                    metrics={'loss:avg': loss},
+                    metrics={'loss:mean': loss},
                 )
             except Exception:
                 logger.error(traceback.format_exc())
