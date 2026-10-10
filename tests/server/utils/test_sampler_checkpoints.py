@@ -181,6 +181,100 @@ async def test_publish_failure_preserves_existing_version(manager, monkeypatch):
     assert not list(Path(directory).parent.glob('.pending-*'))
 
 
+@pytest.mark.parametrize('name', ['x', None])
+@pytest.mark.asyncio
+async def test_cancelling_active_save_keeps_previous_checkpoint(manager, name):
+    uri, directory = await manager.save_sampler('run', name, _writer('first'))
+    runs = manager.training_run_manager
+    info_path = runs.get_model_dir('run') / runs.train_run_info_filename
+    before = info_path.read_bytes()
+    started = asyncio.Event()
+
+    async def partial_save(name, output_dir):
+        checkpoint = Path(output_dir) / name
+        checkpoint.mkdir()
+        (checkpoint / 'weights').write_text('unfinished')
+        started.set()
+        await asyncio.Event().wait()
+
+    pending = asyncio.create_task(manager.save_sampler('run', name, partial_save))
+    await started.wait()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert Path(manager.parse_adapter_uri(uri)[1], 'weights').read_text() == 'first'
+    assert info_path.read_bytes() == before
+    assert not list(Path(directory).parent.glob('.pending-*'))
+
+    # Cancellation must also release the shared lock for the next save.
+    _, current = await asyncio.wait_for(manager.save_sampler('run', name, _writer('next')), timeout=2)
+    assert Path(current, 'weights').read_text() == 'next'
+
+
+@pytest.mark.parametrize('name', ['x', None])
+@pytest.mark.asyncio
+async def test_metadata_failure_restores_legacy_checkpoint_directory(manager, monkeypatch, name):
+    checkpoint_name = name or 'latest'
+    directory = Path(manager.get_save_dir('run', is_sampler=True)) / checkpoint_name
+    directory.mkdir(parents=True)
+    (directory / 'weights').write_text('legacy')
+    uri = manager.save('run', checkpoint_name, is_sampler=True)
+    runs = manager.training_run_manager
+    info_path = runs.get_model_dir('run') / runs.train_run_info_filename
+    before = info_path.read_bytes()
+    checkpoint_before = (directory / 'checkpoint_metadata.json').read_bytes()
+
+    def fail(*args, **kwargs):
+        raise OSError('injected metadata failure')
+
+    monkeypatch.setattr(runs, 'update', fail)
+    with pytest.raises(OSError, match='metadata failure'):
+        await manager.save_sampler('run', name, _writer('new'))
+    assert directory.is_dir() and not directory.is_symlink()
+    assert Path(manager.parse_adapter_uri(uri)[1], 'weights').read_text() == 'legacy'
+    assert (directory / 'checkpoint_metadata.json').read_bytes() == checkpoint_before
+    assert info_path.read_bytes() == before
+    assert not list(directory.parent.glob('.pending-*'))
+    assert not list(directory.parent.joinpath('.versions').iterdir())
+
+
+@pytest.mark.parametrize('name', ['x', None])
+@pytest.mark.asyncio
+async def test_failed_first_save_does_not_publish_checkpoint(manager, monkeypatch, name):
+    runs = manager.training_run_manager
+    info_path = runs.get_model_dir('run') / runs.train_run_info_filename
+    before = info_path.read_bytes()
+
+    def fail(*args, **kwargs):
+        raise OSError('injected metadata failure')
+
+    monkeypatch.setattr(runs, 'update', fail)
+    with pytest.raises(OSError, match='metadata failure'):
+        await manager.save_sampler('run', name, _writer('uncommitted'))
+    save_dir = Path(manager.get_save_dir('run', is_sampler=True))
+    assert info_path.read_bytes() == before
+    assert not manager.list_checkpoints('run').checkpoints
+    assert not list(save_dir.glob('.pending-*'))
+    assert not list(save_dir.joinpath('.versions').iterdir())
+    assert not any(path.is_symlink() for path in save_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_missing_backend_weights_does_not_publish_checkpoint(manager):
+    runs = manager.training_run_manager
+    info_path = runs.get_model_dir('run') / runs.train_run_info_filename
+    before = info_path.read_bytes()
+
+    async def save_without_weights(*, name, output_dir):
+        return str(Path(output_dir) / name)
+
+    with pytest.raises(RuntimeError, match='did not materialize'):
+        await manager.save_sampler('run', 'x', save_without_weights)
+    assert info_path.read_bytes() == before
+    assert not manager.list_checkpoints('run').checkpoints
+    assert not list(Path(manager.get_save_dir('run', is_sampler=True)).glob('.pending-*'))
+
+
 @pytest.mark.asyncio
 async def test_same_uri_uses_new_weights_with_unchanged_vllm_cache(manager):
     from types import SimpleNamespace

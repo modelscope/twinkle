@@ -462,13 +462,14 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             if body.is_sampler:
 
-                async def save_weights(**save_kwargs):
+                async def save_weights(*, name: str, output_dir: str):
                     return await self.call_backend(
                         self.model.save,
+                        name=name,
+                        output_dir=output_dir,
                         adapter_name=self.resolve_model_adapter_name(adapter_name),
                         save_optimizer=body.save_optimizer,
-                        **backend_kwargs(body),
-                        **save_kwargs)
+                        **backend_kwargs(body))
 
                 path, checkpoint_dir = await checkpoint_manager.save_sampler(adapter_name, body.name, save_weights)
                 return {'twinkle_path': path, 'checkpoint_dir': checkpoint_dir}

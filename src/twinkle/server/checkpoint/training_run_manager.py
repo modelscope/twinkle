@@ -215,8 +215,9 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
                 self._write_json_atomic(pointer_path, pointer_data)
 
     @staticmethod
-    def _write_json_atomic(path: Path, data: dict[str, Any]):
-        pending = None
+    def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+        """Replace a complete JSON file, leaving the previous file on failure."""
+        pending: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                     mode='w', dir=path.parent, prefix=f'.{path.name}-', delete=False) as stream:
