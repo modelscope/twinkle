@@ -1053,12 +1053,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             ep_clip_kwargs = self.strategy.get_ep_clip_kwargs(self.model) if hasattr(
                 self.strategy, 'get_ep_clip_kwargs') else {}
 
+            grad_norm_group = optimizer_config._dp_group
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) and (
+                    self.device_mesh is None or self.device_mesh.world_size == self.device_mesh.dp_world_size):
+                # Pure DDP gradients are replicated; only token counts need DP reduction.
+                grad_norm_group = None
+
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,
                 num_tokens=num_tokens,
                 max_grad_norm=max_grad_norm,
                 norm_type=norm_type,
-                group=optimizer_config._dp_group,
+                group=grad_norm_group,
                 **ep_clip_kwargs,
             )
             optimizer_config._last_grad_norm = grad_norm
