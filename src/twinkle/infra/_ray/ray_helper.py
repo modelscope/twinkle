@@ -3,6 +3,7 @@ import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
+from .. import _torch_setup
 from .resource_manager import ResourceManager
 
 T = TypeVar('T')
@@ -266,8 +267,7 @@ class RayHelper:
                        execute: Literal['all', 'peer', 'first'],
                        *args,
                        instance_id,
-                       seed=42,
-                       full_determinism=False,
+                       extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                        max_concurrency: Optional[int] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
@@ -328,10 +328,8 @@ class RayHelper:
                     ','.join([str(r) for r in deploy_pg['gpu_rank']]),
                     'TWINKLE_MODE':
                     'ray',
-                    'TWINKLE_SEED':
-                    str(seed),
-                    'TWINKLE_FULL_DETERMINISM':
-                    str(int(full_determinism)),
+                    _torch_setup.EXTRA_TORCH_KWARGS_ENV:
+                    _torch_setup.to_env_value(extra_torch_kwargs),
                 })
 
                 env_vars['MASTER_ADDR'] = ip
@@ -395,8 +393,7 @@ class RayHelper:
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',
-                    'TWINKLE_SEED': str(seed),
-                    'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
+                    _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
                     **_visible_device_env
                 })
                 if max_concurrency is not None:

@@ -10,3 +10,5 @@ no attributes, so every optimizer here is unreachable by name and the module-lev
 from .galore import (GaLoreAdafactor, GaLoreAdamW, GaLoreAdamW8bit, GaLoreConfig, GaLoreProjector, QGaLoreAdamW8bit,
                      create_galore_param_groups)
 from .muon import MaxLogitsTracker, MuonClip, MuonConfig, create_muon_param_groups
+from .param_groups import (apply_param_groups_spec, build_param_group_overrides, resolve_megatron_tower_prefixes,
+                           resolve_tower_prefixes, validate_param_groups_spec)

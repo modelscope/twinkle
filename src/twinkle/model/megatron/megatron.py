@@ -29,6 +29,7 @@ from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
+from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -176,7 +177,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             'recompute_num_layers': recompute_num_layers,
             'variable_seq_lengths': self.variable_seq_lengths,
         })
-        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        seed = kwargs.pop('seed', None) or seed_from_env(42)
         model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
         if config is not None:
             self.hf_config = config
@@ -1102,6 +1103,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             loss.process_group = optimizer_config._dp_group
         optimizer_config.loss_instance = loss
 
+    @remote_function(dispatch='all')
+    def empty_cache(self, **kwargs):
+        """Release the caching allocator's unused blocks on every worker.
+
+        dispatch='all' because each rank holds its own device memory and the driver only orchestrates.
+        Backend-agnostic through torch_util (cuda/npu); mirrors TransformersModel.empty_cache so the
+        training loop can call it identically on either backend.
+        """
+        torch_util.empty_cache()
+
     @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
@@ -1176,6 +1187,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     twinkle stays model-agnostic and forwards this verbatim to Megatron, so callers
                     describe their own parameter grouping (name globs / predicates) and per-group
                     ``max_lr`` / ``min_lr`` / ``wd_mult`` instead of relying on any hardcoded naming.
+                - param_groups_spec: The same backend-neutral, ordered grouping rules the transformers
+                    backend takes (per-tower LR, LoRA+). Translated here into ``config_overrides`` --
+                    each rule becomes an exclusive ``with_name_predicate`` so mcore's merge semantics
+                    reproduce first-match-wins -- and layered on top of ``get_standard_config_overrides``
+                    so the default bias / length-1 weight-decay skip is preserved. The tower role is
+                    resolved from the live model (``visual._vision_tower`` / ``_aligner``), never hardcoded.
 
         Returns:
             MegatronOptimizer instance.
@@ -1185,8 +1202,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
         self.use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
-        # Pop before building OptimizerConfig: this is a get_megatron_optimizer arg, not a config field.
+        # Pop before building OptimizerConfig: these are get_megatron_optimizer args, not config fields.
         config_overrides = kwargs.pop('config_overrides', None)
+        param_groups_spec = kwargs.pop('param_groups_spec', None)
 
         opt_config = OptimizerConfig(
             optimizer=kwargs.pop('optimizer', 'adam'),
@@ -1204,6 +1222,22 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             log_num_zeros_in_grad=kwargs.pop('log_num_zeros_in_grad', False),
             **kwargs,
         )
+
+        if param_groups_spec:
+            # Translate the backend-neutral spec into mcore overrides. Start from the standard defaults
+            # (bias / length-1 weight-decay skip) -- or a caller-supplied config_overrides -- and layer the
+            # spec's rules on top, so per-tower / LoRA+ learning rates do not silently drop the wd skip.
+            from megatron.core.optimizer import get_standard_config_overrides
+            from twinkle.module.optimizer import build_param_group_overrides, resolve_megatron_tower_prefixes
+            base_overrides = config_overrides if config_overrides is not None else get_standard_config_overrides(
+                opt_config)
+            spec_overrides = build_param_group_overrides(
+                param_groups_spec,
+                model_chunks=self.model,
+                tower_prefixes=resolve_megatron_tower_prefixes(self.model),
+                base_lr=opt_config.lr,
+                base_min_lr=opt_config.min_lr)
+            config_overrides = {**base_overrides, **spec_overrides}
 
         # Ensure each model chunk has ddp_config attached (required by Megatron optimizer)
         model_chunks = self.model
@@ -1926,9 +1960,26 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         assert adapter_name, 'Use a non-empty adapter_name'
+        # freeze_* drive the multimodal 'all-linear' target expansion in get_target_modules; popped so they
+        # do not leak into get_peft_model. Defaults match dev's TunerConfig defaults.
+        freeze_llm = kwargs.pop('freeze_llm', False)
+        freeze_vit = kwargs.pop('freeze_vit', True)
+        freeze_aligner = kwargs.pop('freeze_aligner', True)
         model = self.strategy.unwrap_model(self.model)
+        original_target_modules: List[str] = []
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
+        else:
+            if isinstance(config_or_dir, dict):
+                config_or_dir = LoraConfig(**config_or_dir)
+            # Capture the target spec as the caller wrote it ('all-linear' / a name list) BEFORE the loop:
+            # config.target_modules is reassigned to each chunk's expansion inside it, and a virtual-PP
+            # chunk has its own module names, so re-expanding a previous chunk's result would target the
+            # wrong layers and skip this chunk's freeze_* filtering.
+            if isinstance(config_or_dir.target_modules, str):
+                original_target_modules = [config_or_dir.target_modules]
+            else:
+                original_target_modules = list(config_or_dir.target_modules or [])
 
         _models = []
         for _model in model:
@@ -1937,19 +1988,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     _model, config_or_dir, adapter_name=adapter_name, is_trainable=kwargs.get('is_trainable', True))
                 config = _model.peft_config
             else:
-                if isinstance(config_or_dir, dict):
-                    config_or_dir = LoraConfig(**config_or_dir)
                 config = config_or_dir
 
-                # Expand target_modules (e.g., 'all-linear' -> actual module names)
-                if config.target_modules:
-                    if isinstance(config.target_modules, str):
-                        target_modules = [config.target_modules]
-                    else:
-                        target_modules = list(config.target_modules)
-
-                    expanded_modules = self.get_target_modules(_model, target_modules)
-                    config.target_modules = expanded_modules
+                # Expand target_modules (e.g., 'all-linear' -> this chunk's actual module names) per chunk.
+                if original_target_modules:
+                    config.target_modules = self.get_target_modules(
+                        _model,
+                        original_target_modules,
+                        freeze_llm=freeze_llm,
+                        freeze_vit=freeze_vit,
+                        freeze_aligner=freeze_aligner)
 
                 _model = get_peft_model(_model, config, adapter_name=adapter_name)  # noqa
             _models.append(_model)
@@ -2239,7 +2287,22 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return _peft_config
 
     @staticmethod
-    def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
+    def get_target_modules(model: 'torch.nn.Module',
+                           target_modules: List[str],
+                           *,
+                           freeze_llm: bool = False,
+                           freeze_vit: bool = True,
+                           freeze_aligner: bool = True) -> List[str]:
+        """Expand the ``all-*`` keywords into concrete module names, honouring the freeze_* partition.
+
+        On a plain LLM this is just the keyword expansion (every linear / embedding / router). On a
+        multimodal model an ``all-*`` keyword must respect ``freeze_llm`` / ``freeze_vit`` /
+        ``freeze_aligner`` -- by default only the language model is adapted -- which is the megatron
+        counterpart of the transformers backend's ``get_multimodal_target_regex``. The tower partition is
+        read from the live model (``model_meta.visual_cls._vision_tower`` / ``_aligner``), never hardcoded,
+        so twinkle stays model-agnostic; the expanded names are full mcore module paths, filtered to the
+        unfrozen towers.
+        """
         import torch
 
         def find_layers(model: torch.nn.Module, cond_fn) -> List[str]:
@@ -2271,14 +2334,36 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             return find_layers(model,
                                lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
 
-        result = target_modules.copy()
-        if 'all-linear' in result:
-            result.remove('all-linear')
-            result += find_all_linears(model)
-        if 'all-embedding' in result:
-            result.remove('all-embedding')
-            result += find_embedding(model)
-        if 'all-router' in result:
-            result.remove('all-router')
-            result += find_router(model)
-        return list(set(result))
+        keywords = ('all-linear', 'all-embedding', 'all-router')
+        # Names the caller spelled explicitly are kept verbatim; only the all-* keywords are expanded (and,
+        # on a multimodal model, filtered by tower).
+        explicit = [t for t in target_modules if t not in keywords]
+        expanded: List[str] = []
+        if 'all-linear' in target_modules:
+            expanded += find_all_linears(model)
+        if 'all-embedding' in target_modules:
+            expanded += find_embedding(model)
+        if 'all-router' in target_modules:
+            expanded += find_router(model)
+
+        from twinkle.module.optimizer import resolve_megatron_tower_prefixes
+        tower_prefixes = resolve_megatron_tower_prefixes([model])
+        is_multimodal = bool(tower_prefixes['vision_tower'] or tower_prefixes['aligner'])
+        if is_multimodal and any(keyword in target_modules for keyword in keywords):
+            if freeze_llm and freeze_vit and freeze_aligner:
+                raise ValueError('freeze_llm / freeze_vit / freeze_aligner are all True, so a multimodal '
+                                 'LoRA has no tower left to adapt. Unfreeze at least one of them.')
+            frozen = {'language_model': freeze_llm, 'vision_tower': freeze_vit, 'aligner': freeze_aligner}
+            # Longest prefix first, so the aligner (nested under the vision tower, e.g. visual.visual.merger
+            # under visual.visual) is classified as the aligner rather than the vision tower -- the list
+            # form of legacy's rejected=aligner. A module in no tower is dropped: legacy only walks the
+            # declared towers, so anything outside them is not a LoRA target.
+            ranked = sorted(((prefix, role) for role, prefixes in tower_prefixes.items() for prefix in prefixes),
+                            key=lambda item: -len(item[0]))
+            kept = []
+            for name in expanded:
+                role = next((r for prefix, r in ranked if name.startswith(prefix)), None)
+                if role is not None and not frozen[role]:
+                    kept.append(name)
+            expanded = kept
+        return list(set(explicit + expanded))

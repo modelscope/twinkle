@@ -229,6 +229,10 @@ class TrainableModel(ABC):
         ...
 
     @abstractmethod
+    def empty_cache(self, **kwargs) -> None:
+        ...
+
+    @abstractmethod
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
         ...
 

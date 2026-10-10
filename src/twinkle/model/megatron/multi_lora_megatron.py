@@ -19,6 +19,7 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
+from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
@@ -82,7 +83,7 @@ class MultiLoraMegatronModel(MegatronModel):
             'recompute_num_layers': recompute_num_layers,
             'variable_seq_lengths': self.variable_seq_lengths,
         })
-        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        seed = kwargs.pop('seed', None) or seed_from_env(42)
         model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
         if config is not None:
             self.hf_config = config

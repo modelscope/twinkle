@@ -6,10 +6,11 @@ import numpy as np
 import os
 import sys
 import threading
-from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
-from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_logger, requires
+from . import _torch_setup
 from .collectors import collect_dp_and_flatten, collect_tensor_dict
 
 logger = get_logger()
@@ -21,11 +22,13 @@ _mode: Optional[Literal['local', 'ray']] = 'local'
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
 
-_seed = 42
-
 _lazy_collect = True
 
-_full_determinism = False
+# Torch process-global init knobs (seed / determinism / tf32), bundled into one dict so a new knob never
+# means a new initialize()/create_workers() argument or a new env var. Each only takes effect in the
+# process that runs the compute, so the set is published to every Ray worker through the
+# EXTRA_TORCH_KWARGS env var and re-applied there; _torch_setup owns the whole mechanism.
+_extra_torch_kwargs: Dict[str, Any] = _torch_setup.normalize(None)
 
 _device_group: Optional[List[DeviceGroup]] = None
 
@@ -81,8 +84,7 @@ def _maybe_load_worker_notifier() -> None:
 def initialize(mode: Literal['local', 'ray'] = 'local',
                nproc_per_node: int = 8,
                ncpu_proc_per_node: int = 8,
-               seed: int = 42,
-               full_determinism: bool = False,
+               extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                groups: Optional[List[DeviceGroup]] = None,
                global_device_mesh: Optional[DeviceMesh] = None,
                lazy_collect: bool = True,
@@ -96,8 +98,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             'ray': Run in ray cluster.
         nproc_per_node: The GPU count(number of processes) per node.
         ncpu_proc_per_node: The CPU processes count per node.
-        seed: Seed everything with this.
-        full_determinism: Freeze the random, use determinism kernels, default `False`.
+        extra_torch_kwargs: Per-process PyTorch init knobs, bundled so a new one needs no new argument
+            (see ``_torch_setup``): ``seed`` (seed everything with this), ``full_determinism`` (freeze
+            the random, use determinism kernels, default `False`) and ``tf32`` (explicit matmul/conv
+            precision; None leaves torch's default). Applied here and re-applied on every Ray worker
+            through the EXTRA_TORCH_KWARGS env var, since each is a per-process global.
         groups: The device groups of the training.
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
@@ -107,11 +112,10 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _name, _notifier
+    global _mode, _device_group, _extra_torch_kwargs, _lazy_collect, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
     _name = name
-    _full_determinism = full_determinism
     _lazy_collect = lazy_collect
     _notifier = notifier
     if name is not None:
@@ -122,9 +126,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
 
-    if seed is not None:
-        _seed = seed
-        framework_util.seed_everything(seed, full_determinism)
+    # Seed + set determinism/tf32 in THIS process, and publish the knob set for the Ray workers (which
+    # inherit env, not this process's globals). In local/torchrun mode this process does the compute; in
+    # ray mode the driver still runs its own light compute (e.g. collect), so both want it applied here.
+    _extra_torch_kwargs = _torch_setup.apply(extra_torch_kwargs)
+    os.environ[_torch_setup.EXTRA_TORCH_KWARGS_ENV] = _torch_setup.to_env_value(_extra_torch_kwargs)
     if _mode == 'local':
         if groups is not None:
             _device_group = groups
@@ -900,23 +906,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # not remote_group: Ray mode with local component
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
-                    seed = int(os.environ.get('TWINKLE_SEED', _seed))
-                    determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
-                    framework_util.seed_everything(seed, bool(determinism))
-                    # Ensure torch.distributed is initialized inside Ray workers.
-                    if os.environ.get('WORKER_NAME'):
-                        # This will depress the warnings of megatron and reduce overhead.
-                        # setdefault, not assignment: this runs before the model is constructed, and
-                        # a sharded (FSDP) data-parallel wrapper needs this above 1 -- see
-                        # MegatronStrategy.apply_process_env, which corrects it while there is still
-                        # time (the CUDA driver latches the value when the context is created).
-                        # Cannot be delegated to the strategy from here: infra is below the model
-                        # layer and does not import it.
-                        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
-                        # This will prevent the unlimited threads started by torch
-                        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-                        # Use parallelism mode of tokenizers
-                        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+                    # All per-process torch setup (seed / determinism / tf32 / the worker CUDA-env pins)
+                    # is isolated in _torch_setup, so none of it leaks into the Ray dispatch logic here.
+                    _torch_setup.apply_in_worker(_extra_torch_kwargs)
                     if not device_mesh_name:
                         # pop the device_mesh
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
@@ -943,16 +935,16 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                     # Remove potential duplicate keys from kwargs before passing
                     kwargs_for_workers = kwargs.copy()
                     kwargs_for_workers.pop('instance_id', None)
-                    kwargs_for_workers.pop('seed', None)
-                    kwargs_for_workers.pop('full_determinism', None)
+                    # create_workers takes extra_torch_kwargs explicitly, so strip it from the forwarded
+                    # component kwargs to avoid a duplicate-keyword collision.
+                    kwargs_for_workers.pop('extra_torch_kwargs', None)
 
                     _actors = RayHelper.create_workers(
                         cls,
                         remote_group,
                         execute,
                         instance_id=instance_id,
-                        seed=_seed,
-                        full_determinism=_full_determinism,
+                        extra_torch_kwargs=_extra_torch_kwargs,
                         max_concurrency=max_concurrency,
                         *args,
                         **kwargs_for_workers)
