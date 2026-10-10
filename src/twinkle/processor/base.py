@@ -86,6 +86,15 @@ class InputProcessor:
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
+        return self._process(inputs, **kwargs)
+
+    def _process(self, inputs: Union[InputFeature, List[InputFeature]],
+                 **kwargs) -> Union[InputFeature, List[InputFeature]]:
+        """Run locally with objects already owned by the model worker.
+
+        The public remote entry point still validates caller-supplied objects.
+        Internal forwards also need the worker's callable model for SP hooks.
+        """
         for pipe in self.process_pipeline:
             inputs = pipe(inputs, **kwargs)
         return inputs
