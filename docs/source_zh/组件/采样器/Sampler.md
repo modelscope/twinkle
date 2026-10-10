@@ -2,16 +2,17 @@
 
 Sampler (采样器) 是 Twinkle 中用于生成模型输出的组件,主要用于 RLHF 训练中的样本生成。当前采样器实现使用 vLLM。
 
-## 基本接口
+## vLLMSampler 采样接口
+
+具体的 `vLLMSampler` 提供以下采样接口：
 
 ```python
-class Sampler(ABC):
+class vLLMSampler:
 
-    @abstractmethod
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
         adapter_path: Optional[str] = None,
         *,

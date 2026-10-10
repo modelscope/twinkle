@@ -63,14 +63,14 @@ class SampleResponse:
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
 ```
 
-`seq.tokens` contains generated token IDs; `seq.logprobs` contains `(token_id, logprob)` candidates for each token when requested. `seq.stop_reason` is `length`, `stop`, `abort`, or `error`. Set `return_encoded=True` to populate `seq.new_input_feature` for training.
+`seq.tokens` contains generated token IDs; `seq.logprobs` contains `(token_id, logprob)` candidates for each token when requested. `seq.stop_reason` is `length`, `stop`, `abort`, or `error`. When using `vLLMSampler` with a configured template, `seq.new_input_feature` contains the prompt and completion features for training.
 
 ```python
 from twinkle.data_format import SamplingParams
 
 # Configure sampler and its template first; see the vLLMSampler example.
 params = SamplingParams(max_tokens=512, temperature=0.7, top_p=0.9, num_samples=4, logprobs=1)
-responses = sampler.sample(trajectories, sampling_params=params, return_encoded=True)
+responses = sampler.sample(trajectories, sampling_params=params)
 for response in responses:
     for seq in response.sequences:
         print(sampler.decode_response(seq.tokens))

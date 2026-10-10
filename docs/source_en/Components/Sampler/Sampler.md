@@ -2,16 +2,17 @@
 
 Sampler is a component in Twinkle for generating model outputs, primarily used for sample generation in RLHF training. The current sampler implementation uses vLLM.
 
-## Basic Interface
+## vLLMSampler Sampling Interface
+
+The concrete `vLLMSampler` exposes the following sampling interface:
 
 ```python
-class Sampler(ABC):
+class vLLMSampler:
 
-    @abstractmethod
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
         adapter_path: Optional[str] = None,
         *,

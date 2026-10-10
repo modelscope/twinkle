@@ -63,14 +63,14 @@ class SampleResponse:
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
 ```
 
-`seq.tokens` 是生成的 token ID；请求 logprobs 后，`seq.logprobs` 保存每个 token 的 `(token_id, logprob)` 候选列表。`seq.stop_reason` 为 `length`、`stop`、`abort` 或 `error`。设置 `return_encoded=True` 后，`seq.new_input_feature` 包含可用于训练的输入特征。
+`seq.tokens` 是生成的 token ID；请求 logprobs 后，`seq.logprobs` 保存每个 token 的 `(token_id, logprob)` 候选列表。`seq.stop_reason` 为 `length`、`stop`、`abort` 或 `error`。使用已配置模板的 `vLLMSampler` 时，`seq.new_input_feature` 包含 prompt 和生成结果的训练输入特征。
 
 ```python
 from twinkle.data_format import SamplingParams
 
 # 先配置 sampler 及其模板，参见 vLLMSampler 示例。
 params = SamplingParams(max_tokens=512, temperature=0.7, top_p=0.9, num_samples=4, logprobs=1)
-responses = sampler.sample(trajectories, sampling_params=params, return_encoded=True)
+responses = sampler.sample(trajectories, sampling_params=params)
 for response in responses:
     for seq in response.sequences:
         print(sampler.decode_response(seq.tokens))
