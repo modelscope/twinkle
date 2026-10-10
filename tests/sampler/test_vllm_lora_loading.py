@@ -1,16 +1,22 @@
 import asyncio
 from unittest.mock import MagicMock
+from weakref import WeakValueDictionary
 
 from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
 
 
-def test_concurrent_lora_requests_share_one_load_task():
+def _engine():
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._lora_request_cache = {}
+    engine._lora_revisions = {}
+    engine._lora_path_locks = WeakValueDictionary()
+    engine.engine = MagicMock()
+    return engine
+
+
+def test_concurrent_lora_requests_load_once():
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
-        engine._lora_request_cache = {}
-        engine._lora_load_tasks = {}
-        engine._lora_path_locks = {}
-        engine._lora_revisions = {}
+        engine = _engine()
         request = object()
         load_count = 0
 
@@ -26,20 +32,16 @@ def test_concurrent_lora_requests_share_one_load_task():
         assert load_count == 1
         assert results == [request] * 8
         assert engine._lora_request_cache == {'/adapter': request}
-        assert engine._lora_load_tasks == {}
+        assert not engine._lora_path_locks
 
     asyncio.run(run())
 
 
 def test_unload_lora_accepts_synchronous_engine_api():
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
+        engine = _engine()
         request = MagicMock(lora_int_id=7)
         engine._lora_request_cache = {'/adapter': request}
-        engine._lora_load_tasks = {}
-        engine._lora_path_locks = {}
-        engine._lora_revisions = {}
-        engine.engine = MagicMock()
         engine.engine.remove_lora.return_value = True
 
         await engine.unload_lora_paths(['/adapter'])
@@ -50,23 +52,29 @@ def test_unload_lora_accepts_synchronous_engine_api():
     asyncio.run(run())
 
 
-def test_unload_lora_removes_a_just_completed_load():
+def test_unload_lora_waits_for_an_inflight_load():
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
+        engine = _engine()
         request = MagicMock(lora_int_id=9)
-        load_task = asyncio.create_task(asyncio.sleep(0, result=request))
-        await load_task
-        engine._lora_request_cache = {}
-        engine._lora_load_tasks = {'/adapter': load_task}
-        engine._lora_path_locks = {}
-        engine._lora_revisions = {}
-        engine.engine = MagicMock()
-        engine.engine.remove_lora.return_value = None
-
-        await engine.unload_lora_paths(['/adapter'])
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def load(_):
+            started.set()
+            await finish.wait()
+            return request
+        engine._load_lora = load
+        load_task = asyncio.create_task(engine._get_or_load_lora('/adapter'))
+        await started.wait()
+        unload = asyncio.create_task(engine.unload_lora_paths(['/adapter']))
+        await asyncio.sleep(0)
+        assert not unload.done()
+        finish.set()
+        assert await load_task is request
+        await unload
 
         engine.engine.remove_lora.assert_called_once_with(9)
-        assert engine._lora_load_tasks == {}
+        assert engine._lora_request_cache == {}
+        assert engine._lora_revisions == {}
+        assert not engine._lora_path_locks
 
     asyncio.run(run())
 
@@ -76,12 +84,7 @@ def test_named_checkpoint_overwrite_reloads_cached_lora(tmp_path):
     from types import SimpleNamespace
 
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
-        engine._lora_request_cache = {}
-        engine._lora_load_tasks = {}
-        engine._lora_path_locks = {}
-        engine._lora_revisions = {}
-        engine.engine = MagicMock()
+        engine = _engine()
         metadata = tmp_path / 'checkpoint_metadata.json'
         loaded = []
 
@@ -102,5 +105,6 @@ def test_named_checkpoint_overwrite_reloads_cached_lora(tmp_path):
         assert len(loaded) == 2
         assert all(result.weights == 'second' for result in results)
         engine.engine.remove_lora.assert_called_once_with(first.lora_int_id)
+        assert not engine._lora_path_locks
 
     asyncio.run(run())

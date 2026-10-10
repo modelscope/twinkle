@@ -109,3 +109,37 @@ print(int(module.try_claim_once('shared-process-key')))
         return int(result.stdout.strip())
     with ThreadPoolExecutor(max_workers=3) as executor:
         assert sum(executor.map(claim, range(3))) == 1
+
+
+def test_claim_cannot_evict_another_writer_empty_sentinel(monkeypatch, tmp_path):
+    from threading import Event
+    monkeypatch.setenv('TWINKLE_LOCK_DIR', str(tmp_path / 'locks'))
+    monkeypatch.setenv('TWINKLE_SESSION_ID', 'same-session')
+    writing, resume, second_started = Event(), Event(), Event()
+    write = os.write
+
+    def paused_write(fd, data):
+        if not writing.is_set():
+            writing.set()
+            assert resume.wait(5)
+        return write(fd, data)
+
+    monkeypatch.setattr(parallel.os, 'write', paused_write)
+
+    def second_claim():
+        second_started.set()
+        return parallel.try_claim_once('same-key')
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(parallel.try_claim_once, 'same-key')
+        try:
+            assert writing.wait(5)
+            second = executor.submit(second_claim)
+            assert second_started.wait(5)
+            from concurrent.futures import wait
+            done, _ = wait([second], timeout=.1)
+            assert not done, 'Second caller bypassed the claim writer'
+        finally:
+            resume.set()
+        assert first.result(timeout=5)
+        assert not second.result(timeout=5)

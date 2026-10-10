@@ -8,6 +8,7 @@ import re
 import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
+from weakref import WeakValueDictionary
 
 from twinkle import get_logger
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingMask, SamplingParams, StopReason
@@ -256,9 +257,8 @@ class VLLMEngine(BaseSamplerEngine):
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
-        self._lora_load_tasks: Dict[str, asyncio.Task] = {}
         self._lora_revisions: Dict[str, Optional[str]] = {}
-        self._lora_path_locks: Dict[str, asyncio.Lock] = {}
+        self._lora_path_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -647,15 +647,7 @@ class VLLMEngine(BaseSamplerEngine):
                     return self._lora_request_cache[lora_path]
                 await self._unload_lora_path(lora_path)
 
-            load_task = self._lora_load_tasks.get(lora_path)
-            if load_task is None:
-                load_task = asyncio.create_task(self._load_lora(lora_path))
-                self._lora_load_tasks[lora_path] = load_task
-            try:
-                lora_request = await load_task
-            finally:
-                if self._lora_load_tasks.get(lora_path) is load_task:
-                    self._lora_load_tasks.pop(lora_path)
+            lora_request = await self._load_lora(lora_path)
             if lora_request is not None:
                 self._lora_request_cache[lora_path] = lora_request
                 self._lora_revisions[lora_path] = revision
@@ -712,17 +704,6 @@ class VLLMEngine(BaseSamplerEngine):
         request = self._lora_request_cache.pop(normalized, None)
         if request is None:
             request = self._lora_request_cache.pop(adapter_path, None)
-        load_task = self._lora_load_tasks.pop(normalized, None)
-        if load_task is None:
-            load_task = self._lora_load_tasks.pop(adapter_path, None)
-        if load_task is not None and not load_task.done():
-            load_task.cancel()
-            await asyncio.gather(load_task, return_exceptions=True)
-        elif request is None and load_task is not None:
-            try:
-                request = load_task.result()
-            except (asyncio.CancelledError, Exception):
-                request = None
         if request is None:
             return
         try:

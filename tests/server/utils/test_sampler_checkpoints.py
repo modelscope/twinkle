@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from twinkle.server.checkpoint.tinker import TinkerCheckpointManager
-from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager
+from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
 
 
 class _Runs:
@@ -126,3 +126,90 @@ async def test_legacy_latest_and_alias_remain_readable(manager):
 async def test_reserved_name_does_not_write(manager):
     with pytest.raises(ValueError, match='reserved'):
         await manager.save_sampler('run', 'latest', _writer('unused'))
+
+
+@pytest.mark.parametrize('client', ['tinker', 'twinkle'])
+@pytest.mark.parametrize('name', ['x', None])
+@pytest.mark.parametrize('failure', ['write', 'flush', 'replace'])
+@pytest.mark.asyncio
+async def test_real_metadata_failure_preserves_run_and_checkpoint(monkeypatch, tmp_path, client, name, failure):
+    import twinkle.server.checkpoint.training_run_manager as run_module
+    monkeypatch.setattr(run_module, 'TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    run_cls, ckpt_cls = ((TinkerTrainingRunManager, TinkerCheckpointManager) if client == 'tinker' else
+                        (TwinkleTrainingRunManager, TwinkleCheckpointManager))
+    runs = run_cls('test-token')
+    runs._write_info('run', {'base_model': 'test-model', 'is_lora': True})
+    manager = ckpt_cls('test-token', runs)
+    old_uri, directory = await manager.save_sampler('run', name, _writer('first'))
+    info_path = runs.get_model_dir('run') / runs.train_run_info_filename
+    before = info_path.read_bytes()
+    before_checkpoint = Path(directory, 'checkpoint_metadata.json').read_bytes()
+
+    def fail(*args, **kwargs):
+        if failure == 'write':
+            stream = args[1]
+            stream.write('{')
+            stream.flush()
+        raise OSError('injected metadata failure')
+
+    target, attr = {'write': (run_module.json, 'dump'), 'flush': (run_module.os, 'fsync'),
+                    'replace': (run_module.os, 'replace')}[failure]
+    monkeypatch.setattr(target, attr, fail)
+    with pytest.raises(OSError, match='injected metadata failure'):
+        await manager.save_sampler('run', name, _writer('second'))
+    assert Path(directory, 'weights').read_text() == 'first'
+    assert Path(directory, 'checkpoint_metadata.json').read_bytes() == before_checkpoint
+    assert info_path.read_bytes() == before
+    assert manager.resolve_load_path(old_uri).checkpoint_name == old_uri.rsplit('/', 1)[1]
+    assert not list(info_path.parent.glob(f'.{info_path.name}-*'))
+    assert not list(Path(directory).parent.glob('.pending-*'))
+
+
+@pytest.mark.asyncio
+async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeypatch, tmp_path):
+    import twinkle.server.checkpoint.training_run_manager as run_module
+    monkeypatch.setattr(run_module, 'TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path / 'default'))
+    runs = TinkerTrainingRunManager('test-token')
+    (tmp_path / 'external').mkdir()
+    runs._write_info('run', {'base_model': 'test-model', 'save_dir': str(tmp_path / 'external')})
+    pointer = runs._default_model_dir('run') / runs.train_run_info_filename
+    original = pointer.read_bytes()
+    write_atomic = runs._write_json_atomic
+
+    def write(path, data):
+        if path == pointer:
+            raise PermissionError('Existing pointer is now read-only')
+        return write_atomic(path, data)
+
+    monkeypatch.setattr(runs, '_write_json_atomic', write)
+    manager = TinkerCheckpointManager('test-token', runs)
+    uri, directory = await manager.save_sampler('run', 'x', _writer('first'))
+    assert pointer.read_bytes() == original
+    assert Path(directory, 'weights').read_text() == 'first'
+    assert runs._read_info('run')['last_sampler_checkpoint']['tinker_path'] == uri
+
+
+@pytest.mark.asyncio
+async def test_reserved_sampler_name_is_a_user_failure_in_queue(tmp_path):
+    from tests.server.utils.test_task_queue_mixin import _DummyQueue
+    manager = TinkerCheckpointManager('test-token', _Runs(tmp_path))
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+
+    async def save():
+        return await manager.save_sampler('run', 'latest', _writer('unused'))
+
+    try:
+        await queue.schedule_task(save, model_id='run', token='test-token')
+        for _ in range(100):
+            failures = [kwargs['failure'] for args, kwargs in queue.state.records if args[1] == 'failed']
+            if failures:
+                break
+            await asyncio.sleep(0)
+        failure = failures[-1]
+        assert failure.reason_code == 'request_rejected'
+        assert failure.attribution == 'user'
+        assert failure.diagnostic is None
+        assert not (tmp_path / 'run').exists()
+    finally:
+        await queue._compute_worker.stop()

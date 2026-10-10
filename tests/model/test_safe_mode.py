@@ -8,6 +8,7 @@ import twinkle.infra as infra
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
+from twinkle import remote_function
 
 
 class _TinyModel(torch.nn.Module):
@@ -57,3 +58,53 @@ def test_safe_mode_public_processor_rejects_callable(monkeypatch, value):
     model, group = _cpu_model()
     with pytest.raises(ValueError, match='Callable or Type'):
         group.processor({'input_ids': [1]}, external=value)
+
+
+@pytest.mark.parametrize('mode', ['local', 'ray'])
+@pytest.mark.parametrize('decorated', [False, True])
+def test_custom_processor_entry_point_is_preserved(monkeypatch, mode, decorated):
+    monkeypatch.setattr(infra, '_mode', 'local')
+    model, group = _cpu_model()
+
+    class CustomProcessor(InputProcessor):
+        def __call__(self, inputs, **kwargs):
+            self.seen_model = kwargs['model']
+            return super().__call__(inputs, **kwargs)
+
+    if decorated:
+        CustomProcessor.__call__ = remote_function()(CustomProcessor.__call__)
+    processor = object.__new__(CustomProcessor)
+    processor.__dict__.update(group.processor.__dict__)
+    processor.seen_model = None
+    model.device_mesh = None
+    model.set_processor(processor)
+    monkeypatch.setattr(infra, '_mode', mode)
+    monkeypatch.setenv('TWINKLE_TRUST_REMOTE_CODE', '0')
+    model.forward(inputs={'input_ids': [1, 2], 'labels': [2, 3]})
+    assert processor.seen_model is model.model
+    if mode == 'ray':
+        with pytest.raises(ValueError, match='Callable or Type'):
+            InputProcessor.__call__(processor, {'input_ids': [1]}, external=lambda: None)
+
+
+def test_local_processor_scope_does_not_cover_other_objects(monkeypatch):
+    monkeypatch.setattr(infra, '_mode', 'ray')
+    monkeypatch.setenv('TWINKLE_TRUST_REMOTE_CODE', '0')
+    _, group = _cpu_model()
+    _, other = _cpu_model()
+
+    def pipeline(inputs, **kwargs):
+        other.processor(inputs, external=lambda: None)
+
+    group.processor.process_pipeline = [pipeline]
+    with pytest.raises(ValueError, match='Callable or Type'):
+        group.processor._process({'input_ids': [1]}, model=lambda: None)
+    with pytest.raises(ValueError, match='Callable or Type'):
+        group.processor({'input_ids': [1]}, external=lambda: None)
+
+
+def test_local_processor_call_rejects_remote_handles():
+    _, group = _cpu_model()
+    group.processor._actors = []
+    with pytest.raises(ValueError, match='remote handle'):
+        group.processor._process({'input_ids': [1]})

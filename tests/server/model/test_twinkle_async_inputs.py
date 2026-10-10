@@ -151,3 +151,45 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
         [-0.1, -0.2, -0.3],
         [-0.4, -0.5, -0.6],
     ]
+
+
+@pytest.mark.asyncio
+async def test_sampler_save_retains_names_and_forwards_backend_kwargs(monkeypatch, tmp_path):
+    from pathlib import Path
+    from tests.server.utils.test_sampler_checkpoints import _Runs
+    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager
+    import twinkle.server.model.twinkle_handlers as handlers
+
+    class Management(_SchedulingManagement):
+        def save(self, name, output_dir, **kwargs):
+            path = Path(output_dir) / name
+            path.mkdir()
+            self.model_calls.append((name, kwargs))
+            (path / 'weights').write_text(str(len(self.model_calls)))
+            return str(path)
+
+    manager = TwinkleCheckpointManager('token', _Runs(tmp_path))
+    monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
+    service = Management()
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: service)
+    endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/twinkle/save')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+
+    async def save(name):
+        body = types.SaveRequest(adapter_name='adapter', name=name, is_sampler=True,
+                                 save_optimizer=True, consumed_train_samples=7)
+        return await endpoint(request, body, service)
+
+    x, y, live = await save('x'), await save('y'), await save(None)
+    x_dir = Path(x.result['checkpoint_dir'])
+    assert x.result['twinkle_path'].endswith('/sampler_weights/x')
+    assert (x_dir / 'weights').read_text() == '1'
+    assert Path(y.result['checkpoint_dir'], 'weights').read_text() == '2'
+    assert Path(live.result['checkpoint_dir']).name == 'latest'
+    overwritten = await save('x')
+    assert overwritten.result['twinkle_path'] == x.result['twinkle_path']
+    assert (x_dir / 'weights').read_text() == '4'
+    assert service.model_calls[-1][1] == {'adapter_name': 'session-adapter',
+                                        'save_optimizer': True, 'consumed_train_samples': 7}

@@ -75,27 +75,21 @@ def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> 
 
 
 def _try_create_claim(path: str, session: str, payload: str) -> bool:
-    # At most one retry after evicting a stale claim.
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            try:
-                os.write(fd, f'{session}\n{payload}'.encode())
-            finally:
-                os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                with open(path, encoding='utf-8') as f:
-                    stored = f.readline().strip()
-                if stored == session:
-                    return False  # same session, genuine loser
-                os.unlink(path)  # stale from prior run → evict
-            except FileNotFoundError:
-                continue  # another process evicted, retry
-            except Exception:  # noqa: BLE001
+    # Creation and writing must share a lock: O_EXCL alone exposes an empty
+    # sentinel that another process could mistake for a stale session.
+    with FileLock(path + '.lock'):
+        if os.path.exists(path):
+            with open(path, encoding='utf-8') as f:
+                stored = f.readline().strip()
+            if stored == session:
                 return False
-    return True
+            os.unlink(path)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, f'{session}\n{payload}'.encode())
+        finally:
+            os.close(fd)
+        return True
 
 
 class PosixFileLock:
