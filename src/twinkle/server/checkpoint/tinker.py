@@ -51,7 +51,6 @@ class TinkerTrainingRunManager(BaseTrainingRunManager):
         for field in ['last_checkpoint', 'last_sampler_checkpoint']:
             if field in data and data[field] is not None:
                 ckpt = data[field].copy()
-                ckpt.pop('weights_revision', None)
                 if 'twinkle_path' in ckpt and 'tinker_path' not in ckpt:
                     ckpt['tinker_path'] = ckpt.pop('twinkle_path')
                 elif 'tinker_path' not in ckpt:
@@ -108,7 +107,6 @@ class TinkerCheckpointManager(BaseCheckpointManager):
 
     def _parse_checkpoint(self, data: dict[str, Any]) -> tinker_types.Checkpoint:
         data = data.copy()
-        data.pop('weights_revision', None)
         if 'twinkle_path' in data and 'tinker_path' not in data:
             data['tinker_path'] = data.pop('twinkle_path')
         elif 'tinker_path' not in data and 'path' in data:

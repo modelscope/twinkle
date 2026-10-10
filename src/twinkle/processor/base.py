@@ -90,12 +90,6 @@ class InputProcessor:
             inputs = pipe(inputs, **kwargs)
         return inputs
 
-    def _process(self, inputs: Union[InputFeature, List[InputFeature]],
-                 **kwargs) -> Union[InputFeature, List[InputFeature]]:
-        """Preserve custom entry points while processing worker-owned objects locally."""
-        from twinkle.infra import _call_local
-        return _call_local(self, '__call__', inputs, **kwargs)
-
     def prepare_outputs(self, inputs: List[InputFeature], **kwargs) -> Union[List[InputFeature], InputFeature]:
         if self.framework == 'transformers':
             return inputs[0]

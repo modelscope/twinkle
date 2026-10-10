@@ -6,7 +6,6 @@ import numpy as np
 import os
 import sys
 import threading
-from contextvars import ContextVar
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
@@ -18,24 +17,6 @@ logger = get_logger()
 T1 = TypeVar('T1', bound=object)
 
 _mode: Optional[Literal['local', 'ray']] = 'local'
-
-_local_call_targets = ContextVar('twinkle_local_call_targets', default=())
-
-
-def _is_local_call(instance):
-    return any(target is instance for target in _local_call_targets.get())
-
-
-def _call_local(instance, method_name, *args, **kwargs):
-    """Call a worker-owned object's normal entry point without redispatching it."""
-    if hasattr(instance, '_actors'):
-        raise ValueError('Local calls require a worker-owned object, not a remote handle.')
-    token = _local_call_targets.set(_local_call_targets.get() + (instance, ))
-    try:
-        return getattr(instance, method_name)(*args, **kwargs)
-    finally:
-        _local_call_targets.reset(token)
-
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
@@ -1044,7 +1025,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 _ctx = f'{_ctx} <- {_caller}'
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
-                if _mode == 'local' or _is_local_call(self):
+                if _mode == 'local':
                     return func(self, *args, **kwargs)
                 elif _mode == 'ray':
                     check_unsafe(*args, **kwargs)

@@ -1,7 +1,6 @@
-"""Real training and named-checkpoint sampling with server trust disabled.
+"""Real training and named-checkpoint sampling against an external server.
 
 Use the same external-server environment as test_tinker_rl_correctness_e2e.
-The model deployment must explicitly set TWINKLE_TRUST_REMOTE_CODE=0.
 """
 import json
 import os
@@ -12,7 +11,7 @@ import pytest
 from tests.server.integration.test_tinker_rl_correctness_e2e import _completion_logprobs, _datum
 
 pytestmark = pytest.mark.skipif(os.environ.get('TWINKLE_TEST_GPU_E2E') != '1',
-                                reason='Requires a real safe-mode trainer and vLLM sampler')
+                                reason='Requires a real trainer and vLLM sampler')
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -25,7 +24,7 @@ def _reset_canonical_state_actor():
     yield
 
 
-def test_safe_training_named_save_and_cached_overwrite():
+def test_named_save_and_cached_overwrite():
     from transformers import AutoTokenizer
     from twinkle import init_tinker_client
 
@@ -85,7 +84,7 @@ def test_safe_training_named_save_and_cached_overwrite():
     refreshed = sample(sampler_x)
     same(refreshed, trained)
     assert refreshed.tokens != first.tokens or not np.allclose(refreshed.logprobs, first.logprobs, atol=1e-4)
-    print('SAFE_CHECKPOINT_E2E ' + json.dumps({
+    print('SAMPLER_CHECKPOINT_E2E ' + json.dumps({
         'losses': losses, 'trainer_logprob_before': float(np.mean(before)),
         'trainer_logprob_after': float(np.mean(after)), 'named_paths': [x, y],
         'named_versions_survive_live_save': True, 'cached_overwrite_reloaded': True,

@@ -282,7 +282,7 @@ class SaveRequest(StrictRequest):
     adapter_name: str
     name: str | None = None
     save_optimizer: bool = False
-    is_sampler: bool = False  # Save sampling weights; named versions are retained
+    is_sampler: bool = False  # If True, delete existing sampler weights before saving
     consumed_train_samples: int | None = backend_kwarg(default=None, ge=0)
     merge_lora: bool | None = backend_only('megatron', default=None)
 

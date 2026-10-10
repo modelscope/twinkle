@@ -1,25 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import getpass
 import hashlib
 import inspect
 import os
 import re
-import tempfile
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 
-
-def _get_lock_dir() -> str:
-    """Resolve lazily so importing Twinkle never writes to the working directory."""
-    configured = os.environ.get('TWINKLE_LOCK_DIR')
-    if configured:
-        lock_dir = os.path.abspath(os.path.expanduser(configured))
-    else:
-        user = str(os.getuid()) if hasattr(os, 'getuid') else getpass.getuser()
-        scope = hashlib.sha256(os.path.realpath(os.getcwd()).encode()).hexdigest()[:16]
-        lock_dir = os.path.join(tempfile.gettempdir(), f'twinkle-locks-{user}', scope)
-    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
-    return lock_dir
+_LOCK_DIR = '.locks'
+os.makedirs(_LOCK_DIR, exist_ok=True)
 
 
 def _sanitize_lock_name(name: str) -> str:
@@ -68,28 +56,35 @@ def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> 
     try:
         session = _get_session_token()
         digest = hashlib.md5(_sanitize_lock_name(key).encode('utf-8')).hexdigest()[:16]
-        path = os.path.join(_get_lock_dir(), f'{namespace}_{digest}.once')
+        os.makedirs(_LOCK_DIR, exist_ok=True)
+        path = os.path.join(_LOCK_DIR, f'{namespace}_{digest}.once')
         return _try_create_claim(path, session, payload)
     except Exception:  # noqa: BLE001
         return True
 
 
 def _try_create_claim(path: str, session: str, payload: str) -> bool:
-    # Creation and writing must share a lock: O_EXCL alone exposes an empty
-    # sentinel that another process could mistake for a stale session.
-    with FileLock(path + '.lock'):
-        if os.path.exists(path):
-            with open(path, encoding='utf-8') as f:
-                stored = f.readline().strip()
-            if stored == session:
-                return False
-            os.unlink(path)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    # At most one retry after evicting a stale claim.
+    for _ in range(2):
         try:
-            os.write(fd, f'{session}\n{payload}'.encode())
-        finally:
-            os.close(fd)
-        return True
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, f'{session}\n{payload}'.encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                with open(path, encoding='utf-8') as f:
+                    stored = f.readline().strip()
+                if stored == session:
+                    return False  # same session, genuine loser
+                os.unlink(path)  # stale from prior run → evict
+            except FileNotFoundError:
+                continue  # another process evicted, retry
+            except Exception:  # noqa: BLE001
+                return False
+    return True
 
 
 class PosixFileLock:
@@ -161,7 +156,7 @@ def processing_lock(lock_file: str):
 
     """
     lock_name = _sanitize_lock_name(lock_file)
-    lock: FileLock = FileLock(os.path.join(_get_lock_dir(), f'{lock_name}.lock'))  # noqa
+    lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
 
     if acquire_lock(lock, False):
         try:

@@ -1,6 +1,5 @@
 """Real filesystem save transactions shared by Tinker and Twinkle handlers."""
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -54,14 +53,15 @@ async def test_named_and_live_versions_have_separate_lifetimes(manager):
 
 
 @pytest.mark.asyncio
-async def test_overwrite_updates_weights_and_revision(manager):
+async def test_overwrite_keeps_uri_but_changes_backend_path(manager):
     uri, directory = await manager.save_sampler('run', 'x', _writer('first'))
-    metadata = Path(directory, 'checkpoint_metadata.json')
-    before = json.loads(metadata.read_text())
+    previous = Path(manager.parse_adapter_uri(uri)[1])
     after_uri, after_dir = await manager.save_sampler('run', 'x', _writer('second'))
     assert (after_uri, after_dir) == (uri, directory)
     assert Path(directory, 'weights').read_text() == 'second'
-    assert json.loads(metadata.read_text())['weights_revision'] != before['weights_revision']
+    current = Path(manager.parse_adapter_uri(uri)[1])
+    assert current != previous and current.is_dir()
+    assert not previous.exists()
     assert not list(Path(directory).parent.glob('.pending-*'))
 
 
@@ -75,9 +75,36 @@ async def test_same_model_saves_are_serialized(manager):
         max_active = max(max_active, active)
         await _writer('same')(name, output_dir)
         active -= 1
-    results = await asyncio.gather(*(manager.save_sampler('run', 'x', save) for _ in range(3)))
+    other_cls = TwinkleCheckpointManager if isinstance(manager, TinkerCheckpointManager) else TinkerCheckpointManager
+    other = other_cls(manager.token, manager.training_run_manager)
+    results = await asyncio.gather(*(owner.save_sampler('run', 'x', save) for owner in (manager, other, manager)))
     assert max_active == 1
     assert len(set(results)) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_lock_waiter_does_not_block_following_saves(manager):
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def held_save(name, output_dir):
+        started.set()
+        await finish.wait()
+        return await _writer('first')(name, output_dir)
+
+    first = asyncio.create_task(manager.save_sampler('run', 'x', held_save))
+    await started.wait()
+    waiting = asyncio.create_task(manager.save_sampler('run', 'x', _writer('cancelled')))
+    try:
+        await asyncio.sleep(.06)
+        assert not waiting.done()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    finally:
+        finish.set()
+        await first
+    uri, directory = await manager.save_sampler('run', 'x', _writer('last'))
+    assert uri.endswith('/x') and Path(directory, 'weights').read_text() == 'last'
 
 
 @pytest.mark.asyncio
@@ -107,8 +134,12 @@ async def test_save_failure_preserves_run_and_checkpoint(manager, monkeypatch, n
     info_path = runs.get_model_dir('run') / runs.train_run_info_filename
     before = info_path.read_bytes()
     before_checkpoint = Path(directory, 'checkpoint_metadata.json').read_bytes()
+    versions = set(Path(directory).parent.joinpath('.versions').iterdir())
+    replace = run_module.os.replace
 
     def fail(*args, **kwargs):
+        if failure == 'replace' and Path(args[1]) != info_path:
+            return replace(*args, **kwargs)
         if failure == 'write':
             stream = args[1]
             stream.write('{')
@@ -127,6 +158,70 @@ async def test_save_failure_preserves_run_and_checkpoint(manager, monkeypatch, n
     assert manager.resolve_load_path(old_uri).checkpoint_name == old_uri.rsplit('/', 1)[1]
     assert not list(info_path.parent.glob(f'.{info_path.name}-*'))
     assert not list(Path(directory).parent.glob('.pending-*'))
+    assert set(Path(directory).parent.joinpath('.versions').iterdir()) == versions
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_preserves_existing_version(manager, monkeypatch):
+    uri, directory = await manager.save_sampler('run', 'x', _writer('first'))
+    previous = manager.parse_adapter_uri(uri)[1]
+    replace = Path.replace
+
+    def fail(path, target):
+        if path.name == '.new':
+            raise OSError('injected publish failure')
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, 'replace', fail)
+    with pytest.raises(OSError, match='publish failure'):
+        await manager.save_sampler('run', 'x', _writer('second'))
+    assert manager.parse_adapter_uri(uri)[1] == previous
+    assert Path(directory, 'weights').read_text() == 'first'
+    assert list(Path(directory).parent.joinpath('.versions').iterdir()) == [Path(previous)]
+    assert not list(Path(directory).parent.glob('.pending-*'))
+
+
+@pytest.mark.asyncio
+async def test_same_uri_uses_new_weights_with_unchanged_vllm_cache(manager):
+    from types import SimpleNamespace
+    from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._lora_request_cache = {}
+    engine._lora_load_tasks = {}
+    loaded = []
+
+    async def load(path):
+        request = SimpleNamespace(weights=Path(path, 'weights').read_text())
+        loaded.append(request)
+        return request
+
+    engine._load_lora = load
+    uri, _ = await manager.save_sampler('run', 'x', _writer('first'))
+
+    async def sample():
+        return await engine._get_or_load_lora(manager.parse_adapter_uri(uri)[1])
+
+    first = await sample()
+    assert await sample() is first
+    after, _ = await manager.save_sampler('run', 'x', _writer('second'))
+    assert after == uri
+    second = await sample()
+    assert first.weights == 'first' and second.weights == 'second'
+    assert await sample() is second and len(loaded) == 2
+
+
+@pytest.mark.asyncio
+async def test_reusing_live_alias_name_does_not_delete_latest_weights(manager):
+    live, _ = await manager.save_sampler('run', None, _writer('live'))
+    previous = Path(manager.parse_adapter_uri(live)[1])
+    name = manager.parse_path(live).checkpoint_id.rsplit('/', 1)[1]
+    named, _ = await manager.save_sampler('run', name, _writer('named'))
+    assert named == live
+    assert Path(manager.parse_adapter_uri(named)[1], 'weights').read_text() == 'named'
+    assert Path(manager.get_save_dir('run', is_sampler=True), 'latest', 'weights').read_text() == 'live'
+    await manager.save_sampler('run', None, _writer('new-live'))
+    assert not previous.exists()
+    assert Path(manager.parse_adapter_uri(named)[1], 'weights').read_text() == 'named'
 
 
 @pytest.mark.asyncio
