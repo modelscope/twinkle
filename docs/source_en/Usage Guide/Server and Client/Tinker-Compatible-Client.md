@@ -10,20 +10,6 @@ For compatibility with existing Twinkle cookbooks, `importance_sampling` retains
 
 Twinkle's DPO extension also uses `importance_sampling`, with `ref_logps` on **every** datum and interleaved chosen/rejected examples. Each data-parallel shard must receive complete pairs, including in single-rank training. Ordinary RL examples do not need pairs: batches of 1 or 3 are valid with one data rank, subject to the usual token and rate limits.
 
-## Sampler checkpoint lifetime
-
-`save_weights_for_sampler(name="step-1")` preserves a named checkpoint at
-`twinkle://<run>/sampler_weights/step-1`. Other named or unnamed saves do not delete it.
-Saving the same name replaces its weights; new sampling requests after the save completes
-reload that version, including sampling clients already using the same path.
-`latest` is reserved for unnamed saves. Names retain the existing filesystem normalization.
-
-Unnamed saves, including `save_weights_and_get_sampling_client()`, retain only the latest
-weights. Their generated paths are temporary and may expire on the next unnamed save.
-Use explicit names to retain evaluation snapshots and the existing checkpoint deletion API
-to release their disk space. Keep calling `init_tinker_client()`; unpatched SDK path parsing
-and checkpoint archive downloads are outside this compatibility bridge.
-
 ## Initialization
 
 ```python
