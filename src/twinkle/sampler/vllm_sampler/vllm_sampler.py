@@ -313,15 +313,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
             adapter_path: Optional LoRA adapter path.
 
-            return_encoded: Include training input features in sampled sequences.
-
-            use_base_model: Sample without a LoRA adapter.
-
-            Set sampling_params.num_samples for multiple completions per prompt.
+            num_samples: Number of completions to generate per input prompt.
+                When > 1, returns num_samples sequences for each input.
 
         Returns:
             SampleResponse containing sampled sequences.
-            Total sequences = len(inputs) * sampling_params.num_samples.
+            Total sequences = len(inputs) * num_samples.
 
         Note:
             In Ray mode with multiple workers (DP > 1):
