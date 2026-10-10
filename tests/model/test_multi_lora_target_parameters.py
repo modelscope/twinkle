@@ -3,7 +3,9 @@ import pytest
 import sys
 import torch
 import types
-from peft import LoraConfig, get_peft_model
+from packaging.version import Version
+from peft import LoraConfig, __version__ as peft_version, get_peft_model
+from peft.tuners.lora.layer import ParamWrapper
 from peft.utils import set_peft_model_state_dict
 from torch import nn
 
@@ -95,14 +97,34 @@ def test_peft_target_parameter_key_shapes_for_3d_experts():
     state = peft_model.state_dict()
     lora_shapes = {key: tuple(state[key].shape) for key in state if "lora_" in key}
 
-    # PEFT 0.18.1 follows Linear's (out_features, in_features) convention for
-    # target parameters: A projects input->rank and B projects rank->output.
-    assert lora_shapes == {
-        "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 4),
-        "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (12, 4),
-        "base_model.model.mlp.experts.lora_A.default.weight": (4, 6),
-        "base_model.model.mlp.experts.lora_B.default.weight": (4, 4),
-    }
+    # PEFT 0.19.1 corrected transpose detection for 3D target parameters.
+    # The factor orientation changed; the reconstructed update must still
+    # match the original parameter's shape and scaling on either version.
+    if Version(peft_version) >= Version('0.19.1'):
+        expected_shapes = {
+            "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 12),
+            "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (4, 4),
+            "base_model.model.mlp.experts.lora_A.default.weight": (4, 4),
+            "base_model.model.mlp.experts.lora_B.default.weight": (6, 4),
+        }
+    else:
+        expected_shapes = {
+            "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 4),
+            "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (12, 4),
+            "base_model.model.mlp.experts.lora_A.default.weight": (4, 6),
+            "base_model.model.mlp.experts.lora_B.default.weight": (4, 4),
+        }
+    assert lora_shapes == expected_shapes
+    wrappers = [module for module in peft_model.modules() if isinstance(module, ParamWrapper)]
+    assert len(wrappers) == 2
+    for wrapper in wrappers:
+        with torch.no_grad():
+            wrapper.lora_A['default'].weight.fill_(0.1)
+            wrapper.lora_B['default'].weight.fill_(0.1)
+        delta = wrapper.get_delta_weight('default')
+        assert delta.shape == wrapper.get_param().shape
+        # rank=2, alpha/rank=2: sum two products of 0.1 * 0.1, then scale.
+        torch.testing.assert_close(delta, torch.full_like(delta, 0.04))
 
 
 def _make_target_cfg(r=2):

@@ -11,7 +11,7 @@
 #   3. Configure model with GRPOLoss, optimizer, LR scheduler
 #   4. Training loop:
 #      a. Every SYNC_INTERVAL steps: model.save() → get twinkle_path
-#      b. sampler.sample(inputs, adapter_uri=twinkle_path, num_samples=N)
+#      b. sampler.sample(inputs, sampling_params=SamplingParams(num_samples=N), adapter_uri=twinkle_path)
 #      c. Compute rewards and advantages (client-side)
 #      d. model.forward_backward(inputs, advantages, old_logps)
 #      e. Optimizer step

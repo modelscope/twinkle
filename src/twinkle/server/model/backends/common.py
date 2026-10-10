@@ -11,6 +11,7 @@ from tinker import types
 from typing import Any, List
 
 from twinkle import DeviceMesh
+from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
 
 
@@ -155,11 +156,11 @@ class TwinkleCompatModelBase:
 
     def _tinker_setup_loss(self, loss_fn: str, inputs, adapter_name: str, kwargs: dict):
         """Set up loss function based on loss_fn; pops DPO/GRPO-specific params from kwargs in-place."""
+        is_dpo = validate_tinker_loss(loss_fn, inputs)
         if loss_fn == 'cross_entropy':
             self.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         elif loss_fn == 'importance_sampling':
-            has_ref_logps = any('ref_logps' in d.loss_fn_inputs for d in inputs)
-            if has_ref_logps:
+            if is_dpo:
                 beta = kwargs.pop('dpo_beta', 0.1)
                 loss_type = kwargs.pop('dpo_loss_type', 'sigmoid')
                 sft_weight = kwargs.pop('dpo_sft_weight', 0.0)
@@ -171,8 +172,6 @@ class TwinkleCompatModelBase:
                 epsilon = kwargs.pop('epsilon', 0.2)
                 grpo_beta = kwargs.pop('beta', 0.0)
                 self.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
-        else:
-            self.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
 
     def _ensure_dpo_metric(self, adapter_name: str, beta: float):
         """Add DPOMetric for the adapter if not already present.

@@ -141,7 +141,7 @@ The service only needs an allocation containing `s_fft`:
 The Qwen3.5-9B example configuration is located at:
 
 ```text
-cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 ```
 
 The relevant model configuration is:
@@ -174,10 +174,10 @@ Validate the configuration and start the service:
 
 ```bash
 twinkle-server check-config \
-  -c cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+  -c cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 
 twinkle-server launch \
-  -c cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+  -c cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 ```
 
 ### 3.3 Starting Hybrid LoRA training from a client

@@ -59,14 +59,15 @@ class _DummyManagement:
 
 
 @pytest.mark.asyncio
-async def test_tinker_asample_allows_base_model_session_without_model_path():
+@pytest.mark.parametrize('temperature,max_tokens', [(1.0, 2), (0.0, 2), (0.0, 0), (1.0, None)])
+async def test_tinker_asample_allows_base_model_session_without_model_path(temperature, max_tokens):
     management = _DummyManagement()
     app = FastAPI()
     _register_tinker_sampler_routes(app, lambda: management)
 
     body = types.SampleRequest(
         prompt=types.ModelInput.from_ints([1, 2, 3]),
-        sampling_params=types.SamplingParams(max_tokens=2),
+        sampling_params=types.SamplingParams(max_tokens=max_tokens, temperature=temperature),
         sampling_session_id='base-session',
         base_model='mock-model',
     )
@@ -77,5 +78,8 @@ async def test_tinker_asample_allows_base_model_session_without_model_path():
 
     assert isinstance(response, types.SampleResponse)
     assert response.sequences[0].tokens == [1, 2]
+    assert response.sequences[0].logprobs == [-0.1, -0.2]
     assert management.sampler.adapter_paths == [None]
     assert management.sampler.sampling_params[0].logprobs == 1
+    assert management.sampler.sampling_params[0].temperature == temperature
+    assert management.sampler.sampling_params[0].max_tokens == (max_tokens if max_tokens is not None else 256)

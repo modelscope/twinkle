@@ -1,6 +1,14 @@
 # Tinker Client
 
-The Tinker Client is suitable for scenarios with existing Tinker training code. After initializing with `init_tinker_client`, it patches the Tinker SDK to point to the Twinkle Server, **and the rest of the code can directly reuse existing Tinker training code**.
+The Tinker Client is suitable for scenarios with existing Tinker training code. After initializing with `init_tinker_client`, it patches the Tinker SDK to point to the Twinkle Server. Check the loss compatibility limits below before reusing a training loop.
+
+## Loss compatibility
+
+The bridge accepts `cross_entropy` and `importance_sampling`. `ppo`, `cispo`, and `dro` are not implemented by this bridge and return HTTP 400 before enqueueing or changing gradients; they are never replaced with cross-entropy.
+
+For compatibility with existing Twinkle cookbooks, `importance_sampling` retains Twinkle's **GRPO loss**: PPO-style clipping (`epsilon=0.2` by default), optional KL penalty (`beta=0` by default), and a mean over sequences. This differs from Tinker's [unclipped, token-summed IS objective](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/). It is not an exact replacement for Tinker IS.
+
+Twinkle's DPO extension also uses `importance_sampling`, with `ref_logps` on **every** datum and interleaved chosen/rejected examples. Each data-parallel shard must receive complete pairs, including in single-rank training. Ordinary RL examples do not need pairs: batches of 1 or 3 are valid with one data rank, subject to the usual token and rate limits.
 
 ## Initialization
 
@@ -30,7 +38,7 @@ When calling `init_tinker_client`, the following operations are automatically ex
 1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
 2. **Set Request Headers**: Inject necessary authentication headers such as `X-Ray-Serve-Request-Id` and `Authorization`
 
-After initialization, simply import `from tinker import ServiceClient` to connect to Twinkle Server, and **all existing Tinker training code can be used directly** without any modifications.
+After initialization, import `from tinker import ServiceClient` to connect to Twinkle Server. Training code can reuse the supported endpoints subject to the loss compatibility limits above.
 
 ## Complete Training Example
 

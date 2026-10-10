@@ -261,10 +261,15 @@ class _ServerTools:
                              f'Model: {model_id}, GPUs: {t_gpus}, Samplers: {len(sampler_list)}.\n'
                              f'--- server.log tail ---\n{log_tail}')
                 return {
-                    'status': 'error',
-                    'error': error_msg,
-                    'log_path': log_path,
-                    'hint': 'Check if required packages are installed (pip install -e ".[all]").',
+                    'status':
+                    'error',
+                    'error':
+                    error_msg,
+                    'log_path':
+                    log_path,
+                    'hint':
+                    'Check required packages (pip install -e ".[client,server,rl]"; '
+                    'add the megatron extra for the Megatron backend).',
                 }
             try:
                 urllib.request.urlopen(f'{server_url}/api/v1/healthz', timeout=2)
@@ -361,6 +366,8 @@ class _ServerTools:
         from pathlib import Path
 
         sampler_list = samplers or []
+        if backend not in ('transformers', 'megatron'):
+            raise ValueError(f'Unsupported training backend: {backend!r}')
 
         # Sanitize model name for use in route/names
         def _short(mid: str) -> str:
@@ -389,7 +396,7 @@ class _ServerTools:
                 'supported_models': all_model_ids,
             },
             'deployments': [{
-                'name': 'TinkerCompatServer',
+                'name': 'GatewayServer',
                 'max_ongoing_requests': 50,
                 'autoscaling_config': {
                     'min_replicas': 1,
@@ -473,6 +480,8 @@ class _ServerTools:
                 s_name = f'sampler-{s_short}'
 
             s_engine = sampler_cfg.get('engine', 'vllm')
+            if s_engine != 'vllm':
+                raise ValueError(f'Unsupported sampler engine: {s_engine!r}; supported engine: vllm')
             s_max_len = sampler_cfg.get('max_model_len', 16000)
 
             # Compute tp / dp / total GPUs:

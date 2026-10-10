@@ -1,5 +1,5 @@
 Server and Client
-===============
+=================
 .. toctree::
    :maxdepth: 1
 

@@ -1,4 +1,4 @@
-# Twinkle Server Configuration - Tinker-Compatible Transformers Backend
+# Twinkle Server Configuration - Megatron Backend
 
 # proxy_location: determines where the HTTP proxy runs.
 # "EveryNode" means each Ray node runs its own proxy (good for multi-node).
@@ -12,7 +12,7 @@ http_options:
 # Applications: each entry defines a service component deployed on the server
 applications:
 
-  # 1. TinkerCompatServer - The central API server
+  # 1. GatewayServer - The central API server
   #    Handles client connections, training run tracking, checkpoint listing.
   - name: server
     route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
@@ -23,7 +23,7 @@ applications:
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1                # Minimum number of replicas
@@ -32,8 +32,7 @@ applications:
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
 
-  # 2. Model Service (commented out) - Would host the base model for training.
-  #    Uncomment and configure if you need a training model worker.
+  # 2. Model Service - Hosts the base model for training.
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
@@ -77,7 +76,7 @@ applications:
     args:
       model_id: "ms://Qwen/Qwen3.5-4B"   # ModelScope model identifier
       nproc_per_node: 1               # Number of GPU processes per node
-      sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
+      sampler_type: vllm              # Inference engine: vllm
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 16000           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.7   # Fraction of GPU memory to use (0.0-1.0)

@@ -63,7 +63,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         'type':
                         'array',
                         'description': ('List of sampler/teacher models for RL/OPD. Each entry deploys '
-                                        'an inference service (vLLM or torch). Omit for simple SFT.'),
+                                        'a vLLM inference service. Omit for simple SFT.'),
                         'items': {
                             'type': 'object',
                             'properties': {
@@ -91,7 +91,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 },
                                 'engine': {
                                     'type': 'string',
-                                    'enum': ['vllm', 'torch'],
+                                    'enum': ['vllm'],
                                     'description': 'Inference engine. Default: vllm.',
                                 },
                                 'max_model_len': {

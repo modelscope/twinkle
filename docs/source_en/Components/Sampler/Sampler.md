@@ -1,26 +1,25 @@
 # Sampler
 
-Sampler is a component in Twinkle for generating model outputs, primarily used for sample generation in RLHF training. The sampler supports multiple inference engines, including vLLM and native PyTorch.
+Sampler is a component in Twinkle for generating model outputs, primarily used for sample generation in RLHF training. The current sampler implementation uses vLLM.
 
-## Basic Interface
+## vLLMSampler Sampling Interface
+
+The concrete `vLLMSampler` exposes the following sampling interface:
 
 ```python
-class Sampler(ABC):
+class vLLMSampler:
 
-    @abstractmethod
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
+        adapter_path: Optional[str] = None,
         *,
-        num_samples: int = 1,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
     ) -> List[SampleResponse]:
         """Sample from given inputs"""
-        ...
-
-    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs):
-        """Add LoRA adapter"""
         ...
 
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
@@ -28,11 +27,11 @@ class Sampler(ABC):
         ...
 ```
 
-The core method of the sampler is `sample`, which accepts input data and returns generated samples.
+The core method is `sample`, which returns a list of `SampleResponse` objects. Set `SamplingParams(num_samples=N)` to generate multiple sequences per prompt; each response contains `sequences`.
 
 ## Available Samplers
 
-Twinkle provides two sampler implementations:
+Twinkle provides the `vLLMSampler` implementation:
 
 ### vLLMSampler
 
@@ -45,19 +44,6 @@ vLLMSampler uses the vLLM engine for efficient inference, supporting high-throug
 
 See: [vLLMSampler](vLLMSampler.md)
 
-### TorchSampler
-
-TorchSampler uses native PyTorch and transformers for inference, suitable for small-scale sampling or debugging.
-
-- Easy to Use: Based on transformers' standard interface
-- High Flexibility: Easy to customize and extend
-- Low Memory Footprint: Suitable for small-scale sampling
-
-See: [TorchSampler](TorchSampler.md)
-
-## How to Choose
-
-- **vLLMSampler**: Suitable for production environments and large-scale training that require high throughput
-- **TorchSampler**: Suitable for debugging, small-scale experiments, or custom requirements
+Server configurations use `sampler_type: vllm` for standard sampling or `vllm_async` for async RL. `mock` is for tests. The former [TorchSampler](TorchSampler.md) example is unavailable.
 
 > In RLHF training, samplers are typically separated from the Actor model, using different hardware resources to avoid interference between inference and training.
