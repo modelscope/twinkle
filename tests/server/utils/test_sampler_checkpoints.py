@@ -9,24 +9,14 @@ from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrai
 from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
 
 
-class _Runs:
-    def __init__(self, root):
-        self.root = root
-        self.info = {'base_model': 'test-model', 'is_lora': True}
-
-    def get_model_dir(self, model_id):
-        return self.root / model_id
-
-    def _read_info(self, model_id):
-        return self.info.copy()
-
-    def update(self, model_id, changes):
-        self.info.update(changes)
-
-
-@pytest.fixture(params=[TinkerCheckpointManager, TwinkleCheckpointManager])
-def manager(request, tmp_path):
-    return request.param('test-token', _Runs(tmp_path))
+@pytest.fixture(params=[(TinkerTrainingRunManager, TinkerCheckpointManager),
+                        (TwinkleTrainingRunManager, TwinkleCheckpointManager)], ids=['tinker', 'twinkle'])
+def manager(request, monkeypatch, tmp_path):
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    run_cls, ckpt_cls = request.param
+    runs = run_cls('test-token')
+    runs._write_info('run', {'base_model': 'test-model', 'is_lora': True})
+    return ckpt_cls('test-token', runs)
 
 
 def _writer(value, fail=False):
@@ -56,7 +46,7 @@ async def test_named_and_live_versions_have_separate_lifetimes(manager):
     assert {ckpt.checkpoint_id for ckpt in listed} == {
         'sampler_weights/x', 'sampler_weights/y', manager.parse_path(latest).checkpoint_id}
     assert all(ckpt.size_bytes > 0 for ckpt in listed)
-    assert 'last_checkpoint' not in manager.training_run_manager.info
+    assert 'last_checkpoint' not in manager.training_run_manager._read_info('run')
     assert manager.delete('run', manager.parse_path(latest).checkpoint_id)
     assert Path(first_dir).exists()
     assert manager.delete('run', 'sampler_weights/x')
@@ -64,30 +54,15 @@ async def test_named_and_live_versions_have_separate_lifetimes(manager):
 
 
 @pytest.mark.asyncio
-async def test_overwrite_failure_preserves_weights_and_revision(manager):
+async def test_overwrite_updates_weights_and_revision(manager):
     uri, directory = await manager.save_sampler('run', 'x', _writer('first'))
     metadata = Path(directory, 'checkpoint_metadata.json')
     before = json.loads(metadata.read_text())
-    with pytest.raises(RuntimeError, match='injected'):
-        await manager.save_sampler('run', 'x', _writer('broken', fail=True))
-    assert Path(directory, 'weights').read_text() == 'first'
-    assert json.loads(metadata.read_text()) == before
     after_uri, after_dir = await manager.save_sampler('run', 'x', _writer('second'))
     assert (after_uri, after_dir) == (uri, directory)
     assert Path(directory, 'weights').read_text() == 'second'
     assert json.loads(metadata.read_text())['weights_revision'] != before['weights_revision']
     assert not list(Path(directory).parent.glob('.pending-*'))
-
-
-@pytest.mark.asyncio
-async def test_metadata_failure_rolls_back_published_weights(manager, monkeypatch):
-    _, directory = await manager.save_sampler('run', 'x', _writer('first'))
-    def fail(*args):
-        raise RuntimeError('metadata failure')
-    monkeypatch.setattr(manager.training_run_manager, 'update', fail)
-    with pytest.raises(RuntimeError, match='metadata failure'):
-        await manager.save_sampler('run', 'x', _writer('second'))
-    assert Path(directory, 'weights').read_text() == 'first'
 
 
 @pytest.mark.asyncio
@@ -122,24 +97,12 @@ async def test_legacy_latest_and_alias_remain_readable(manager):
     assert (latest.parent / 'named').exists()
 
 
-@pytest.mark.asyncio
-async def test_reserved_name_does_not_write(manager):
-    with pytest.raises(ValueError, match='reserved'):
-        await manager.save_sampler('run', 'latest', _writer('unused'))
-
-
-@pytest.mark.parametrize('client', ['tinker', 'twinkle'])
 @pytest.mark.parametrize('name', ['x', None])
-@pytest.mark.parametrize('failure', ['write', 'flush', 'replace'])
+@pytest.mark.parametrize('failure', ['backend', 'write', 'flush', 'replace'])
 @pytest.mark.asyncio
-async def test_real_metadata_failure_preserves_run_and_checkpoint(monkeypatch, tmp_path, client, name, failure):
+async def test_save_failure_preserves_run_and_checkpoint(manager, monkeypatch, name, failure):
     import twinkle.server.checkpoint.training_run_manager as run_module
-    monkeypatch.setattr(run_module, 'TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
-    run_cls, ckpt_cls = ((TinkerTrainingRunManager, TinkerCheckpointManager) if client == 'tinker' else
-                        (TwinkleTrainingRunManager, TwinkleCheckpointManager))
-    runs = run_cls('test-token')
-    runs._write_info('run', {'base_model': 'test-model', 'is_lora': True})
-    manager = ckpt_cls('test-token', runs)
+    runs = manager.training_run_manager
     old_uri, directory = await manager.save_sampler('run', name, _writer('first'))
     info_path = runs.get_model_dir('run') / runs.train_run_info_filename
     before = info_path.read_bytes()
@@ -152,11 +115,12 @@ async def test_real_metadata_failure_preserves_run_and_checkpoint(monkeypatch, t
             stream.flush()
         raise OSError('injected metadata failure')
 
-    target, attr = {'write': (run_module.json, 'dump'), 'flush': (run_module.os, 'fsync'),
-                    'replace': (run_module.os, 'replace')}[failure]
-    monkeypatch.setattr(target, attr, fail)
-    with pytest.raises(OSError, match='injected metadata failure'):
-        await manager.save_sampler('run', name, _writer('second'))
+    if failure != 'backend':
+        target, attr = {'write': (run_module.json, 'dump'), 'flush': (run_module.os, 'fsync'),
+                        'replace': (run_module.os, 'replace')}[failure]
+        monkeypatch.setattr(target, attr, fail)
+    with pytest.raises((OSError, RuntimeError), match='injected'):
+        await manager.save_sampler('run', name, _writer('second', fail=failure == 'backend'))
     assert Path(directory, 'weights').read_text() == 'first'
     assert Path(directory, 'checkpoint_metadata.json').read_bytes() == before_checkpoint
     assert info_path.read_bytes() == before
@@ -190,9 +154,8 @@ async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_reserved_sampler_name_is_a_user_failure_in_queue(tmp_path):
+async def test_reserved_sampler_name_is_a_user_failure_in_queue(manager):
     from tests.server.utils.test_task_queue_mixin import _DummyQueue
-    manager = TinkerCheckpointManager('test-token', _Runs(tmp_path))
     queue = _DummyQueue()
     queue.enable_compute_worker()
 
@@ -210,6 +173,6 @@ async def test_reserved_sampler_name_is_a_user_failure_in_queue(tmp_path):
         assert failure.reason_code == 'request_rejected'
         assert failure.attribution == 'user'
         assert failure.diagnostic is None
-        assert not (tmp_path / 'run').exists()
+        assert not Path(manager.get_save_dir('run', is_sampler=True)).exists()
     finally:
         await queue._compute_worker.stop()

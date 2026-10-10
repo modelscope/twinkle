@@ -156,8 +156,7 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
 @pytest.mark.asyncio
 async def test_sampler_save_retains_names_and_forwards_backend_kwargs(monkeypatch, tmp_path):
     from pathlib import Path
-    from tests.server.utils.test_sampler_checkpoints import _Runs
-    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager
+    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
     import twinkle.server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
@@ -168,7 +167,10 @@ async def test_sampler_save_retains_names_and_forwards_backend_kwargs(monkeypatc
             (path / 'weights').write_text(str(len(self.model_calls)))
             return str(path)
 
-    manager = TwinkleCheckpointManager('token', _Runs(tmp_path))
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    runs = TwinkleTrainingRunManager('token')
+    runs._write_info('session-adapter', {'base_model': 'test-model', 'is_lora': True})
+    manager = TwinkleCheckpointManager('token', runs)
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     service = Management()
     app = FastAPI()

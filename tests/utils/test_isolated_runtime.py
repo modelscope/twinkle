@@ -14,6 +14,18 @@ from twinkle.utils import parallel
 from twinkle.infra._ray.ray_helper import RayHelper
 
 
+def _run_parallel(script, **kwargs):
+    script = f'''import importlib.util
+spec = importlib.util.spec_from_file_location('parallel', {parallel.__file__!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+{script}
+'''
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=30, **kwargs)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
 def test_loopback_only_ip_is_valid_runtime_env(monkeypatch):
     monkeypatch.setattr('psutil.net_if_addrs', lambda: {
         'lo': [SimpleNamespace(family=socket.AF_INET, address='127.0.0.1')]})
@@ -78,35 +90,18 @@ def test_loopback_master_only_allowed_for_single_node(monkeypatch):
 def test_read_only_working_directory_can_import_and_lock(tmp_path):
     if hasattr(os, 'geteuid') and os.geteuid() == 0:
         pytest.skip('Unix permission test requires a non-root process')
-    source = parallel.__file__
-    script = f'''import importlib.util
-spec = importlib.util.spec_from_file_location('parallel', {source!r})
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-with module.processing_lock('readonly-test'):
-    pass
-'''
     tmp_path.chmod(0o555)
     try:
-        result = subprocess.run([sys.executable, '-c', script], cwd=tmp_path, capture_output=True, text=True, timeout=30)
-        assert result.returncode == 0, result.stderr
+        _run_parallel("with module.processing_lock('readonly-test'): pass", cwd=tmp_path)
         assert not (tmp_path / '.locks').exists()
     finally:
         tmp_path.chmod(0o755)
 
 
 def test_claim_has_one_winner_across_processes(tmp_path):
-    script = f'''import importlib.util
-spec = importlib.util.spec_from_file_location('parallel', {parallel.__file__!r})
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print(int(module.try_claim_once('shared-process-key')))
-'''
     env = dict(os.environ, TWINKLE_LOCK_DIR=str(tmp_path / 'locks'), TWINKLE_SESSION_ID='shared-session')
     def claim(_):
-        result = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True, timeout=30)
-        assert result.returncode == 0, result.stderr
-        return int(result.stdout.strip())
+        return int(_run_parallel("print(int(module.try_claim_once('shared-process-key')))", env=env))
     with ThreadPoolExecutor(max_workers=3) as executor:
         assert sum(executor.map(claim, range(3))) == 1
 
