@@ -1,13 +1,25 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import getpass
 import hashlib
 import inspect
 import os
 import re
+import tempfile
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 
-_LOCK_DIR = '.locks'
-os.makedirs(_LOCK_DIR, exist_ok=True)
+
+def _get_lock_dir() -> str:
+    """Resolve lazily so importing Twinkle never writes to the working directory."""
+    configured = os.environ.get('TWINKLE_LOCK_DIR')
+    if configured:
+        lock_dir = os.path.abspath(os.path.expanduser(configured))
+    else:
+        user = str(os.getuid()) if hasattr(os, 'getuid') else getpass.getuser()
+        scope = hashlib.sha256(os.path.realpath(os.getcwd()).encode()).hexdigest()[:16]
+        lock_dir = os.path.join(tempfile.gettempdir(), f'twinkle-locks-{user}', scope)
+    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    return lock_dir
 
 
 def _sanitize_lock_name(name: str) -> str:
@@ -56,8 +68,7 @@ def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> 
     try:
         session = _get_session_token()
         digest = hashlib.md5(_sanitize_lock_name(key).encode('utf-8')).hexdigest()[:16]
-        os.makedirs(_LOCK_DIR, exist_ok=True)
-        path = os.path.join(_LOCK_DIR, f'{namespace}_{digest}.once')
+        path = os.path.join(_get_lock_dir(), f'{namespace}_{digest}.once')
         return _try_create_claim(path, session, payload)
     except Exception:  # noqa: BLE001
         return True
@@ -156,7 +167,7 @@ def processing_lock(lock_file: str):
 
     """
     lock_name = _sanitize_lock_name(lock_file)
-    lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
+    lock: FileLock = FileLock(os.path.join(_get_lock_dir(), f'{lock_name}.lock'))  # noqa
 
     if acquire_lock(lock, False):
         try:

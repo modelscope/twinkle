@@ -188,10 +188,25 @@ class RayHelper:
 
         @ray.remote
         def get_node_address():
-            return find_node_ip(), find_free_port()
+            from ray.util import get_node_ip_address
+            ip = get_node_ip_address() or find_node_ip()
+            RayHelper._validate_master_address(ip)
+            return ip, find_free_port()
 
         ip, port = ray.get(get_node_address.options(placement_group=placement_group, num_cpus=0.01).remote())
         return ip, port
+
+    @staticmethod
+    def _validate_master_address(ip):
+        import ipaddress
+        import ray
+        try:
+            address = ipaddress.ip_address(ip)
+        except ValueError as exc:
+            raise ValueError(f'Invalid Ray master address: {ip!r}') from exc
+        if address.is_loopback and sum(node.get('Alive', False) for node in ray.nodes()) > 1:
+            raise ValueError('A loopback master address cannot be used in a multi-node Ray cluster. '
+                             'Configure a routable Ray node IP.')
 
     @staticmethod
     def do_get_and_collect_func(collect_func: Callable,
@@ -341,6 +356,7 @@ class RayHelper:
                     str(int(full_determinism)),
                 })
 
+                RayHelper._validate_master_address(ip)
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
 

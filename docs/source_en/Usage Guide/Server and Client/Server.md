@@ -1,5 +1,18 @@
 # Server
 
+## Isolated deployment
+
+Ray training supports a single-node loopback address when no non-loopback interface
+is available. Multi-node training requires a routable Ray node address.
+`TWINKLE_TRUST_REMOTE_CODE=0` keeps rejecting caller-supplied callable/type inputs;
+internal Transformers forwards do not require enabling remote-code trust.
+
+Importing Twinkle does not create `.locks` in the working directory. Locks are created
+lazily in a user-specific system temporary directory, scoped by the working directory.
+Set `TWINKLE_LOCK_DIR` to an absolute writable shared directory to override it; the
+launcher propagates this variable to Ray workers. Keep checkpoints and Ray runtime
+files in writable directories even when the working directory is read-only.
+
 ## Ray Cluster Configuration
 
 Before starting the Server, **you must first start and configure the Ray nodes**. Only after the Ray nodes are properly configured can the Server correctly allocate and occupy resources (GPU, CPU, etc.).

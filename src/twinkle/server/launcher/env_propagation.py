@@ -49,4 +49,6 @@ def build_propagated_env_vars() -> dict[str, str]:
     merged.update(build_telemetry_env_vars())
     merged.update(build_persistence_env_vars())
     merged.update(build_server_state_env_vars())
+    if 'TWINKLE_LOCK_DIR' in os.environ:
+        merged['TWINKLE_LOCK_DIR'] = os.environ['TWINKLE_LOCK_DIR']
     return merged
