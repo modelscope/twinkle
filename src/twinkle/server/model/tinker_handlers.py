@@ -288,17 +288,16 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_resource_exists(adapter_name)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-                checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
-                save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=True)
-                # Must save the checkpoint in the twinkle format before calling model.save()
-                tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=True)
-                logger.info(f'Saving weights to {save_dir}')
-                await self.call_backend(
-                    self.model.save,
-                    name='latest',
-                    output_dir=save_dir,
-                    adapter_name=self.resolve_model_adapter_name(adapter_name),
-                    save_optimizer=False)
+
+                async def save_weights(*, name: str, output_dir: str):
+                    return await self.call_backend(
+                        self.model.save,
+                        name=name,
+                        output_dir=output_dir,
+                        adapter_name=self.resolve_model_adapter_name(adapter_name),
+                        save_optimizer=False)
+
+                tinker_path, _ = await checkpoint_manager.save_sampler(body.model_id, body.path, save_weights)
                 payload = body.model_dump()
                 payload['model_path'] = tinker_path
                 metadata = await self.state.get_model_metadata(body.model_id) or {}

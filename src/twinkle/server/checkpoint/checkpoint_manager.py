@@ -3,22 +3,111 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import shutil
+import tempfile
+import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 from twinkle import get_logger
 from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
+from twinkle.server.task_queue.types import UserTaskError
+from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
 from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
 logger = get_logger()
+
+
+class _SamplerWeightSaver(Protocol):
+    """Backend callback writes weights into ``output_dir / name``."""
+
+    def __call__(self, *, name: str, output_dir: str) -> Awaitable[Any]:
+        ...
+
+
+def _remove_checkpoint_path(path: Path) -> None:
+    # Unlink directory symlinks without removing their targets.
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+class _SamplerCheckpointFiles:
+    """Filesystem publication and rollback for one sampler save.
+
+    The public checkpoint path is a link to an immutable physical version.
+    Keep its previous target until the caller commits the run metadata. A
+    failure before that commit restores the old link (or legacy directory).
+    Staging-directory lifetime and save serialization belong to the caller.
+    """
+
+    def __init__(self, save_dir: Path, staging_dir: Path, name: str, version_id: str, live_alias_name: str | None):
+        self.staged_checkpoint = staging_dir / name
+        self.checkpoint_path = save_dir / name
+        self._save_dir = save_dir
+        self._version_dir = save_dir / '.versions' / version_id
+        self._version_dir.parent.mkdir(exist_ok=True)
+        self._previous_version = self.checkpoint_path.resolve() if self.checkpoint_path.exists() else None
+        self._backup_path = staging_dir / '.previous'
+        self._new_link = staging_dir / '.new'
+        self._live_alias = save_dir / live_alias_name if live_alias_name else None
+        self._link_published = False
+
+    def publish(self, metadata: dict[str, Any]) -> None:
+        """Publish the complete weights; retain a backup until metadata commits."""
+        metadata_path = self.staged_checkpoint / CHECKPOINT_INFO_FILENAME
+        metadata_path.write_text(json.dumps(metadata, indent=2))
+        self.staged_checkpoint.rename(self._version_dir)
+        self._new_link.symlink_to(os.path.relpath(self._version_dir, self._save_dir), target_is_directory=True)
+
+        if self.checkpoint_path.is_symlink():
+            self._backup_path.symlink_to(os.readlink(self.checkpoint_path), target_is_directory=True)
+        elif self.checkpoint_path.exists():
+            # Legacy saves are real directories; move them aside for rollback.
+            self.checkpoint_path.rename(self._backup_path)
+        self._new_link.replace(self.checkpoint_path)
+        self._link_published = True
+        if self._live_alias is not None:
+            self._live_alias.symlink_to('latest', target_is_directory=True)
+
+    def rollback(self) -> None:
+        """Restore the previous public path and discard the uncommitted version."""
+        if self._live_alias is not None and self._live_alias.is_symlink():
+            self._live_alias.unlink()
+        if self._link_published:
+            _remove_checkpoint_path(self.checkpoint_path)
+        if self._backup_path.exists() or self._backup_path.is_symlink():
+            self._backup_path.replace(self.checkpoint_path)
+        shutil.rmtree(self._version_dir, ignore_errors=True)
+
+    def cleanup_obsolete(self) -> None:
+        """After commit, remove unreferenced weights and older ephemeral aliases."""
+        previous = self._previous_version
+        versions_dir = self._version_dir.parent.resolve()
+        if previous is not None and previous.parent == versions_dir:
+            still_referenced = any(path.is_symlink() and path.resolve() == previous
+                                   for path in self._save_dir.iterdir())
+            if not still_referenced:
+                shutil.rmtree(previous, ignore_errors=True)
+
+        if self._live_alias is not None:
+            current_version = self.checkpoint_path.resolve()
+            for path in self._save_dir.iterdir():
+                # Includes legacy timestamp aliases. Named saves point elsewhere.
+                if path in (self._live_alias, self.checkpoint_path):
+                    continue
+                if path.is_symlink() and path.resolve() == current_version:
+                    path.unlink()
 
 
 class BaseCheckpointManager(BaseFileManager, ABC):
@@ -208,44 +297,20 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         with open(meta_path, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def save(self, model_id: str, name: str, is_sampler: bool = False, public: bool = False) -> str:
-        """
-        Save checkpoint metadata.
-
-        Args:
-            model_id: The model identifier
-            name: Checkpoint name. For sampler checkpoints this is ignored; weights are
-                always stored under the fixed name ``'latest'`` and a per-save timestamp
-                symlink is created in the same ``sampler_weights/`` directory.
-            is_sampler: Whether this is a sampler checkpoint
-            public: Whether the checkpoint is public
-
-        Returns:
-            The ``twinkle://`` path for the checkpoint. For sampler checkpoints this
-            points to the timestamp symlink so callers always receive a unique path
-            and bypass any filesystem-path-based weight cache.
-        """
-        # Validate path safety
+    def _build_checkpoint_metadata(self,
+                                   model_id: str,
+                                   name: str,
+                                   checkpoint_path: Path,
+                                   is_sampler: bool,
+                                   public: bool = False) -> dict[str, Any]:
         if not validate_user_path(self.token, name):
             raise ValueError(f'Invalid checkpoint name: {name}')
-
         weights_type = 'sampler_weights' if is_sampler else 'weights'
         checkpoint_type = 'sampler' if is_sampler else 'training'
-        # Sampler weights are always stored under the fixed name 'latest' so only one
-        # version exists on disk at a time; cleanup is handled by _delete_existing_sampler_weights.
-        effective_name = 'latest' if is_sampler else name
-        checkpoint_id = f'{weights_type}/{effective_name}'
+        checkpoint_id = f'{weights_type}/{name}'
         path = f'{self.path_prefix}{model_id}/{checkpoint_id}'
-        checkpoint_path = self.get_ckpt_dir(model_id, checkpoint_id)
-
-        # For sampler checkpoints, delete existing sampler weights for this model_id
-        if is_sampler:
-            self._delete_existing_sampler_weights(model_id)
-
-        # Read training run info to include in checkpoint metadata
         run_info = self.training_run_manager._read_info(model_id)
-
-        ckpt_data = self._create_checkpoint(
+        return self._create_checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
             path=path,
@@ -258,47 +323,69 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             train_mlp=run_info.get('train_mlp'),
             train_attn=run_info.get('train_attn'),
             user_metadata=run_info.get('user_metadata'))
+
+    def save(self, model_id: str, name: str, is_sampler: bool = False, public: bool = False) -> str:
+        """Record checkpoint metadata. Sampler handlers use ``save_sampler``."""
+        weights_type = 'sampler_weights' if is_sampler else 'weights'
+        checkpoint_id = f'{weights_type}/{name}'
+        ckpt_data = self._build_checkpoint_metadata(
+            model_id=model_id,
+            name=name,
+            checkpoint_path=self.get_ckpt_dir(model_id, checkpoint_id),
+            is_sampler=is_sampler,
+            public=public)
         self._write_ckpt_info(model_id, checkpoint_id, ckpt_data)
+        field = 'last_sampler_checkpoint' if is_sampler else 'last_checkpoint'
+        self.training_run_manager.update(model_id, {field: ckpt_data})
+        return f'{self.path_prefix}{model_id}/{checkpoint_id}'
 
-        # Update last_checkpoint in run info
-        self.training_run_manager.update(model_id, {'last_checkpoint': ckpt_data})
+    async def save_sampler(self, model_id: str, name: str | None, save_weights: _SamplerWeightSaver) -> tuple[str, str]:
+        """Save weights, publish their link, then commit the run metadata.
 
-        if is_sampler:
-            # Create a per-save timestamp symlink in sampler_weights/ so callers always
-            # receive a unique twinkle:// path and bypass any filesystem-path-based cache.
-            save_dir = self.get_save_dir(model_id, is_sampler=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            fixed_path = os.path.join(save_dir, 'latest')
-            symlink_path = os.path.join(save_dir, timestamp)
-            if os.path.islink(symlink_path):
-                os.unlink(symlink_path)
-            os.symlink(fixed_path, symlink_path)
-            return f'{self.path_prefix}{model_id}/sampler_weights/{timestamp}'
-
-        return path
-
-    def _delete_existing_sampler_weights(self, model_id: str):
+        Named saves persist; unnamed saves replace ``latest`` and return a unique
+        live URI. Return the public URI and checkpoint path. Resolving that URI
+        yields a new physical path on overwrite, so backend caches see new weights.
+        Both client dialects share the lock and the failure rollback below.
         """
-        Delete all existing sampler weights for a model_id.
-
-        Args:
-            model_id: The model identifier
-        """
-        run_dir = self.training_run_manager.get_model_dir(model_id)
-        sampler_weights_dir = run_dir / 'sampler_weights'
-
-        if sampler_weights_dir.exists() and sampler_weights_dir.is_dir():
-            for item in sampler_weights_dir.iterdir():
-                if item.is_symlink():
-                    # Unlink symlinks explicitly; shutil.rmtree on a symlink-to-directory
-                    # can follow the link and unexpectedly delete the target contents.
-                    item.unlink()
-                elif item.is_dir():
-                    meta_path = item / CHECKPOINT_INFO_FILENAME
-                    if meta_path.exists():
-                        meta_path.unlink()
-                    shutil.rmtree(item)
-            logger.info(f'Deleted existing sampler weights for model_id: {model_id}')
+        explicit_name = self.get_ckpt_name(name) if name else None
+        if explicit_name == 'latest':
+            raise UserTaskError('Checkpoint name "latest" is reserved for unnamed sampler saves.')
+        version_id = uuid.uuid4().hex
+        checkpoint_name = explicit_name or 'latest'
+        uri_name = explicit_name or f'live_{version_id}'
+        live_alias_name = None if explicit_name else uri_name
+        save_dir = Path(self.get_save_dir(model_id, is_sampler=True))
+        save_dir.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(save_dir / '.save.lock'))
+        # Use the shared helpers; blocking acquisition would stall async saves.
+        while not acquire_lock(lock, blocking=False):
+            await asyncio.sleep(0.05)
+        try:
+            with tempfile.TemporaryDirectory(prefix='.pending-', dir=save_dir, ignore_cleanup_errors=True) as staging:
+                files = _SamplerCheckpointFiles(
+                    save_dir=save_dir,
+                    staging_dir=Path(staging),
+                    name=checkpoint_name,
+                    version_id=version_id,
+                    live_alias_name=live_alias_name)
+                try:
+                    await save_weights(name=checkpoint_name, output_dir=staging)
+                    if not files.staged_checkpoint.is_dir():
+                        raise RuntimeError('Backend did not materialize the sampler checkpoint.')
+                    metadata = self._build_checkpoint_metadata(
+                        model_id=model_id, name=uri_name, checkpoint_path=files.staged_checkpoint, is_sampler=True)
+                    files.publish(metadata)
+                    # Commit point: backups must survive until this atomic write succeeds.
+                    self.training_run_manager.update(model_id, {'last_sampler_checkpoint': metadata})
+                except BaseException:
+                    # Cancellation must restore the previous version too.
+                    files.rollback()
+                    raise
+            files.cleanup_obsolete()
+        finally:
+            release_lock(lock)
+        uri = f'{self.path_prefix}{model_id}/sampler_weights/{uri_name}'
+        return uri, files.checkpoint_path.as_posix()
 
     def get(self, model_id: str, checkpoint_id: str) -> Any | None:
         """
@@ -337,10 +424,10 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             if not type_dir.exists() or not type_dir.is_dir():
                 continue
             for d in type_dir.iterdir():
-                if d.is_dir() and (d / CHECKPOINT_INFO_FILENAME).exists():
+                if not d.name.startswith('.') and d.is_dir() and (d / CHECKPOINT_INFO_FILENAME).exists():
                     checkpoint_id = f'{weights_type}/{d.name}'
                     ckpt = self.get(model_id, checkpoint_id)
-                    if ckpt:
+                    if ckpt and ckpt.checkpoint_id == checkpoint_id:
                         checkpoints.append(ckpt)
 
         # Sort by creation time
@@ -366,16 +453,27 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         ckpt_dir = self.get_ckpt_dir(model_id, checkpoint_id)
 
         if ckpt_dir.exists():
-            if ckpt_dir.is_dir():
+            if ckpt_dir.is_symlink():
+                target = ckpt_dir.resolve()
+                ckpt_dir.unlink()
+                latest = self.get_ckpt_dir(model_id, 'sampler_weights/latest')
+                if target == latest.resolve() and latest.exists():
+                    _remove_checkpoint_path(latest)
+                if target.parent == (ckpt_dir.parent / '.versions').resolve():
+                    shutil.rmtree(target)
+            elif ckpt_dir.is_dir():
                 shutil.rmtree(ckpt_dir)
             else:
                 ckpt_dir.unlink()
 
             # Update last_checkpoint in run info
             all_ckpts = self.list_checkpoints(model_id)
-            last_ckpt = all_ckpts.checkpoints[-1] if all_ckpts and all_ckpts.checkpoints else None
-            self.training_run_manager.update(
-                model_id, {'last_checkpoint': last_ckpt.model_dump(mode='json') if last_ckpt else None})
+            kind = 'sampler' if checkpoint_id.startswith('sampler_weights/') else 'training'
+            remaining = [ckpt for ckpt in all_ckpts.checkpoints if ckpt.checkpoint_type == kind] if all_ckpts else []
+            last_ckpt = remaining[-1] if remaining else None
+            field = 'last_sampler_checkpoint' if kind == 'sampler' else 'last_checkpoint'
+            self.training_run_manager.update(model_id,
+                                             {field: last_ckpt.model_dump(mode='json') if last_ckpt else None})
             return True
         return False
 
@@ -479,8 +577,10 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             parsed = self.parse_path(adapter_uri)
             if parsed:
                 # Get the filesystem path using get_ckpt_dir
-                lora_path = str(self.get_ckpt_dir(parsed.training_run_id, parsed.checkpoint_id))
-                return parsed.training_run_id, lora_path
+                checkpoint_dir = self.get_ckpt_dir(parsed.training_run_id, parsed.checkpoint_id)
+                if parsed.checkpoint_type == 'sampler':
+                    checkpoint_dir = checkpoint_dir.resolve()
+                return parsed.training_run_id, str(checkpoint_dir)
             else:
                 # Fallback: parse manually for non-standard formats
                 suffix = adapter_uri[len(self.path_prefix):]

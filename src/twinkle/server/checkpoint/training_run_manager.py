@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -199,9 +201,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         model_dir = self.get_model_dir(model_id, save_dir=save_dir)
         model_dir.mkdir(parents=True, exist_ok=True)
         metadata_path = model_dir / self.train_run_info_filename
-        with open(metadata_path, 'w') as f:
-            json.dump(data, f, indent=2)
-
+        self._write_json_atomic(metadata_path, data)
         if save_dir:
             pointer_dir = self._default_model_dir(model_id)
             if pointer_dir.resolve() != model_dir.resolve():
@@ -212,8 +212,23 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
                     'training_run_id': model_id,
                     'save_dir': save_dir,
                 }
-                with open(pointer_path, 'w') as f:
-                    json.dump(pointer_data, f, indent=2)
+                self._write_json_atomic(pointer_path, pointer_data)
+
+    @staticmethod
+    def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+        """Replace a complete JSON file, leaving the previous file on failure."""
+        pending: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', dir=path.parent, prefix=f'.{path.name}-', delete=False) as stream:
+                pending = Path(stream.name)
+                json.dump(data, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(pending, path)
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
 
     def save(self, model_id: str, run_config: Any):
         """
@@ -254,8 +269,15 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """
         info = self._read_info(model_id)
         if info:
+            save_dir = info.get('save_dir')
             info.update(updates)
-            self._write_info(model_id, info)
+            if info.get('save_dir') == save_dir:
+                # Ordinary updates commit only the run-info file. Its existing
+                # save-dir pointer is neither changed nor rewritten afterwards.
+                path = self.get_model_dir(model_id) / self.train_run_info_filename
+                self._write_json_atomic(path, info)
+            else:
+                self._write_info(model_id, info)
 
     def list_runs(self, limit: int = 20, offset: int = 0) -> Any:
         """

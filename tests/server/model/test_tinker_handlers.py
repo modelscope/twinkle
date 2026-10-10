@@ -252,7 +252,8 @@ async def test_save_weights_for_sampler_path_mode_returns_path(mock_create_ckpt_
     mock_ckpt_mgr = MagicMock()
     mock_ckpt_mgr.get_ckpt_name.return_value = 'step-1'
     mock_ckpt_mgr.get_save_dir.return_value = '/tmp/save_dir'
-    mock_ckpt_mgr.save.return_value = 'twinkle://model1/sampler_weights/20260101_000000'
+    mock_ckpt_mgr.save_sampler = AsyncMock(return_value=(
+        'twinkle://model1/sampler_weights/step-1', '/tmp/save_dir/step-1'))
     mock_create_ckpt_mgr.return_value = mock_ckpt_mgr
 
     management = _SaveWeightsDummyManagement()
@@ -269,7 +270,8 @@ async def test_save_weights_for_sampler_path_mode_returns_path(mock_create_ckpt_
     request = Request({'type': 'http', 'headers': []})
     response = await route.endpoint(request, body, management)
 
-    assert response.path == 'twinkle://model1/sampler_weights/20260101_000000'
+    assert response.path == 'twinkle://model1/sampler_weights/step-1'
+    assert mock_ckpt_mgr.save_sampler.await_args.args[:2] == ('model1', 'step-1')
     assert response.sampling_session_id == 'session-123'
 
 
@@ -280,7 +282,8 @@ async def test_save_weights_for_sampler_session_mode_returns_none_path(mock_crea
     mock_ckpt_mgr = MagicMock()
     mock_ckpt_mgr.get_ckpt_name.return_value = 'step-1'
     mock_ckpt_mgr.get_save_dir.return_value = '/tmp/save_dir'
-    mock_ckpt_mgr.save.return_value = 'twinkle://model1/sampler_weights/20260101_000000'
+    mock_ckpt_mgr.save_sampler = AsyncMock(return_value=(
+        'twinkle://model1/sampler_weights/live_test', '/tmp/save_dir/latest'))
     mock_create_ckpt_mgr.return_value = mock_ckpt_mgr
 
     management = _SaveWeightsDummyManagement()
@@ -298,3 +301,4 @@ async def test_save_weights_for_sampler_session_mode_returns_none_path(mock_crea
 
     assert response.path is None
     assert response.sampling_session_id == 'session-123'
+    assert mock_ckpt_mgr.save_sampler.await_args.args[:2] == ('model1', None)
