@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import inspect
+import json
 import os
 import re
 import torch
@@ -256,6 +257,8 @@ class VLLMEngine(BaseSamplerEngine):
 
         self._lora_request_cache: Dict[str, Any] = {}
         self._lora_load_tasks: Dict[str, asyncio.Task] = {}
+        self._lora_revisions: Dict[str, Optional[str]] = {}
+        self._lora_path_locks: Dict[str, asyncio.Lock] = {}
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -635,22 +638,37 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             ``LoRARequest`` or ``None`` if loading fails.
         """
-        if lora_path in self._lora_request_cache:
-            logger.debug(f'Using cached LoRA request for {lora_path}')
-            return self._lora_request_cache[lora_path]
+        lora_path = os.path.abspath(os.path.expanduser(lora_path))
+        async with self._lora_path_locks.setdefault(lora_path, asyncio.Lock()):
+            revision = self._read_lora_revision(lora_path)
+            if lora_path in self._lora_request_cache:
+                if self._lora_revisions.get(lora_path) == revision:
+                    logger.debug(f'Using cached LoRA request for {lora_path}')
+                    return self._lora_request_cache[lora_path]
+                await self._unload_lora_path(lora_path)
 
-        load_task = self._lora_load_tasks.get(lora_path)
-        if load_task is None:
-            load_task = asyncio.create_task(self._load_lora(lora_path))
-            self._lora_load_tasks[lora_path] = load_task
+            load_task = self._lora_load_tasks.get(lora_path)
+            if load_task is None:
+                load_task = asyncio.create_task(self._load_lora(lora_path))
+                self._lora_load_tasks[lora_path] = load_task
+            try:
+                lora_request = await load_task
+            finally:
+                if self._lora_load_tasks.get(lora_path) is load_task:
+                    self._lora_load_tasks.pop(lora_path)
+            if lora_request is not None:
+                self._lora_request_cache[lora_path] = lora_request
+                self._lora_revisions[lora_path] = revision
+            return lora_request
+
+    @staticmethod
+    def _read_lora_revision(lora_path: str) -> Optional[str]:
         try:
-            lora_request = await load_task
-        finally:
-            if self._lora_load_tasks.get(lora_path) is load_task:
-                self._lora_load_tasks.pop(lora_path)
-        if lora_request is not None:
-            self._lora_request_cache[lora_path] = lora_request
-        return lora_request
+            with open(os.path.join(lora_path, 'checkpoint_metadata.json')) as metadata:
+                return json.load(metadata).get('weights_revision')
+        except FileNotFoundError:
+            # External and pre-revision checkpoints retain the old cache behavior.
+            return None
 
     async def _load_lora(self, lora_path: str):
         from vllm.lora.request import LoRARequest
@@ -685,28 +703,34 @@ class VLLMEngine(BaseSamplerEngine):
         """Evict selected LoRA requests without requiring their files to exist."""
         for adapter_path in adapter_paths:
             normalized = os.path.abspath(os.path.expanduser(adapter_path))
-            request = self._lora_request_cache.pop(normalized, None)
-            if request is None:
-                request = self._lora_request_cache.pop(adapter_path, None)
-            load_task = self._lora_load_tasks.pop(normalized, None)
-            if load_task is None:
-                load_task = self._lora_load_tasks.pop(adapter_path, None)
-            if load_task is not None and not load_task.done():
-                load_task.cancel()
-                await asyncio.gather(load_task, return_exceptions=True)
-            elif request is None and load_task is not None:
-                try:
-                    request = load_task.result()
-                except (asyncio.CancelledError, Exception):
-                    request = None
-            if request is None:
-                continue
+            async with self._lora_path_locks.setdefault(normalized, asyncio.Lock()):
+                await self._unload_lora_path(normalized)
+
+    async def _unload_lora_path(self, adapter_path: str) -> None:
+        normalized = os.path.abspath(os.path.expanduser(adapter_path))
+        self._lora_revisions.pop(normalized, None)
+        request = self._lora_request_cache.pop(normalized, None)
+        if request is None:
+            request = self._lora_request_cache.pop(adapter_path, None)
+        load_task = self._lora_load_tasks.pop(normalized, None)
+        if load_task is None:
+            load_task = self._lora_load_tasks.pop(adapter_path, None)
+        if load_task is not None and not load_task.done():
+            load_task.cancel()
+            await asyncio.gather(load_task, return_exceptions=True)
+        elif request is None and load_task is not None:
             try:
-                result = self.engine.remove_lora(request.lora_int_id)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception as exc:
-                logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
+                request = load_task.result()
+            except (asyncio.CancelledError, Exception):
+                request = None
+        if request is None:
+            return
+        try:
+            result = self.engine.remove_lora(request.lora_int_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
 
     async def sleep(self, level: int = 2) -> None:
         """

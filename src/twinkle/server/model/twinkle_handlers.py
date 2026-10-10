@@ -460,16 +460,26 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
 
         async def _call(self, body, adapter_name, token):
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            if body.is_sampler:
+
+                async def save_weights(**save_kwargs):
+                    return await self.call_backend(
+                        self.model.save,
+                        adapter_name=self.resolve_model_adapter_name(adapter_name),
+                        save_optimizer=body.save_optimizer,
+                        **backend_kwargs(body),
+                        **save_kwargs)
+
+                path, checkpoint_dir = await checkpoint_manager.save_sampler(adapter_name, body.name, save_weights)
+                return {'twinkle_path': path, 'checkpoint_dir': checkpoint_dir}
             checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
             save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=body.is_sampler)
             # Must save the checkpoint in the twinkle format before calling model.save()
             twinkle_path = checkpoint_manager.save(
                 model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
-            # For sampler weights the actual data is always written to 'latest/'.
-            model_save_name = 'latest' if body.is_sampler else checkpoint_name
             checkpoint_dir = await self.call_backend(
                 self.model.save,
-                name=model_save_name,
+                name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 save_optimizer=body.save_optimizer,

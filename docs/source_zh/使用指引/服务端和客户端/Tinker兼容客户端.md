@@ -10,6 +10,18 @@ Tinker Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker
 
 Twinkle 的 DPO 扩展也使用 `importance_sampling`，要求**每条** datum 都提供 `ref_logps`，并按 chosen/rejected 交替排列。每个数据并行分片都必须收到完整配对，单卡同样如此。普通 RL 样本不需要配对：数据并行数为 1 时，batch 为 1 或 3 均有效，但仍受通常的 token 和速率限制。
 
+## 采样 checkpoint 的生命周期
+
+`save_weights_for_sampler(name="step-1")` 将命名版本保存在
+`twinkle://<run>/sampler_weights/step-1`，后续其他命名或未命名保存不会删除它。
+同名保存会覆盖权重；保存成功后的新采样请求会重新加载该版本，包括已经使用此路径的采样客户端。
+`latest` 保留给未命名保存，名称继续使用原有文件系统规范化规则。
+
+未命名保存（包括 `save_weights_and_get_sampling_client()`）只保留最新权重，
+其自动生成的路径可能在下一次未命名保存后失效。
+需要保留评测快照时请显式命名，并通过现有 checkpoint 删除接口释放空间。
+仍需调用 `init_tinker_client()`；原生 SDK 路径解析及 archive 下载不在此兼容桥的支持范围内。
+
 ## 初始化
 
 ```python
