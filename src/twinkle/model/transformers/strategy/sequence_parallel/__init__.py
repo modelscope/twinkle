@@ -1,13 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import threading
 import torch
 import torch.distributed as dist
 from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
-from functools import partial
 from transformers import PreTrainedTokenizer
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
+from weakref import WeakKeyDictionary
+
+from functools import partial
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
@@ -18,6 +21,53 @@ from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch, _iter_qwen35_
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
                     is_moe_config, post_all2all)
+
+
+# ---------------------------------------------------------------------------
+# Per-model SP context routing
+#
+# Each ``SequenceParallel`` instance is the SP context of exactly one model.
+# The global transformers patch points (``ALL_ATTENTION_FUNCTIONS``,
+# ``masking_utils``, ``modeling_flash_attention_utils``) are installed once per
+# process and resolve the owning context at call time:
+#   * attention functions receive ``module`` -> ``_MODULE_TO_CTX`` lookup;
+#   * mask helpers / ``_flash_attention_forward`` receive no module argument ->
+#     thread-local ctx stack pushed/popped by each model's forward hooks.
+# A missing context means the calling model is not SP-enabled: the wrapper
+# falls through to the original transformers implementation untouched, so
+# SP-enabled and non-SP models can be interleaved freely.
+# ---------------------------------------------------------------------------
+_MODULE_TO_CTX: WeakKeyDictionary = WeakKeyDictionary()
+_CTX_LOCAL = threading.local()
+
+
+def _ctx_stack() -> list:
+    stack = getattr(_CTX_LOCAL, 'stack', None)
+    if stack is None:
+        stack = _CTX_LOCAL.stack = []
+    return stack
+
+
+def _push_ctx(ctx) -> None:
+    _ctx_stack().append(ctx)
+
+
+def _pop_ctx(ctx) -> None:
+    stack = _ctx_stack()
+    for i in range(len(stack) - 1, -1, -1):
+        if stack[i] is ctx:
+            stack.pop(i)
+            return
+
+
+def _current_ctx():
+    stack = _ctx_stack()
+    return stack[-1] if stack else None
+
+
+def _register_module_tree(model: torch.nn.Module, ctx) -> None:
+    for module in model.modules():
+        _MODULE_TO_CTX[module] = ctx
 
 
 def is_qwen3_vl(model):
@@ -78,6 +128,7 @@ class SequenceParallel:
         self.num_heads = None
         self.causal_mask_func = None
         self.extra_kwargs = {}
+        self._dist_attns = {}
 
     @property
     def real_position_ids(self) -> torch.Tensor:
@@ -88,6 +139,8 @@ class SequenceParallel:
     def _extract_real_position_ids(position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if position_ids is None or not torch.is_tensor(position_ids):
             return position_ids
+        # Cached real positions are already 2D, so only reduce the original
+        # three-axis mRoPE representation.
         if position_ids.dim() == 3:
             return position_ids[0]
         return position_ids
@@ -100,7 +153,214 @@ class SequenceParallel:
     def rp_rank(self) -> int:
         return self._rp_rank
 
-    def _prepare_flash_attn(self, base_model: torch.nn.Module):
+    def _get_dist_attn(self, key: str, local_attention=None) -> DistributedAttention:
+        """Per-context DistributedAttention cache (one per attention entry point)."""
+        dist_attn = self._dist_attns.get(key)
+        if dist_attn is None:
+            dist_attn = DistributedAttention(local_attention, self)
+            self._dist_attns[key] = dist_attn
+        return dist_attn
+
+    @staticmethod
+    def _sdpa_mask_impl(sp, origin_sdpa, origin_uses_cache_position, batch_size, q_length=None, kv_length=None, *args,
+                        **kwargs):
+        q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
+        device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
+        if device is None and sp is not None:
+            device = sp.real_position_ids.device
+
+        cache_position = None
+        if sp is not None and sp.world_size > 1:
+            padded_position_ids = sp.pad(
+                sp.real_position_ids[0],
+                padding_value=-1,
+                position_ids=sp.real_position_ids,
+                dim=0,
+            )
+            global_length = padded_position_ids.shape[0]
+            if origin_uses_cache_position:
+                cache_position = torch.arange(0, global_length, device=device)
+                kv_length = global_length
+            else:
+                # Newer Transformers passes q_length/q_offset instead of cache_position. In SP training,
+                # create_causal_mask may still see the local shard length, so restore the global query length
+                # only for the no-cache prefill path; cache/sliding paths keep their upstream offsets.
+                q_offset = kwargs.get('q_offset', 0)
+                kv_offset = kwargs.get('kv_offset', 0)
+                no_cache_offsets = ((not torch.is_tensor(q_offset) and q_offset == 0)
+                                    and (not torch.is_tensor(kv_offset) and kv_offset == 0))
+                if no_cache_offsets:
+                    q_length = global_length
+                    attention_mask = kwargs.get('attention_mask')
+                    if attention_mask is not None and torch.is_tensor(attention_mask):
+                        kv_length = attention_mask.shape[-1]
+                    else:
+                        kv_length = global_length
+
+        # padding_mask may be an AttentionMask wrapper instead of Tensor
+        _pm = kwargs.get('padding_mask')
+        if _pm is not None and not isinstance(_pm, torch.Tensor):
+            if hasattr(_pm, 'to_tensor'):
+                kwargs['padding_mask'] = _pm.to_tensor()
+            elif hasattr(_pm, 'mask'):
+                kwargs['padding_mask'] = _pm.mask
+
+        if origin_uses_cache_position:
+            if cache_position is None:
+                cache_position = q_length if torch.is_tensor(q_length) else torch.arange(q_length, device=device)
+            return origin_sdpa(batch_size, cache_position, kv_length, *args, **kwargs)
+
+        return origin_sdpa(batch_size, q_length, kv_length, *args, device=device, **kwargs)
+
+    @staticmethod
+    def _create_causal_mask_impl(sp,
+                                 config,
+                                 input_embeds,
+                                 attention_mask,
+                                 cache_position_or_past_key_values=None,
+                                 *args,
+                                 **kwargs):
+        from transformers import masking_utils
+
+        if sp is None or sp.world_size == 1:
+            return _call_create_causal_mask(
+                masking_utils.origin_create_causal_mask,
+                config,
+                input_embeds,
+                attention_mask,
+                cache_position_or_past_key_values,
+                *args,
+                **kwargs,
+            )
+        input_embeds = torch.ones(
+            (input_embeds.shape[0], input_embeds.shape[1] * sp.sp_world_size, input_embeds.shape[2]),
+            dtype=input_embeds.dtype,
+            device=input_embeds.device)
+        if has_signature_parameter(masking_utils.origin_create_causal_mask, 'cache_position'):
+            cache_position_or_past_key_values = torch.arange(
+                0,
+                input_embeds.shape[1],
+                device=input_embeds.device,
+            )
+        return _call_create_causal_mask(
+            masking_utils.origin_create_causal_mask,
+            config,
+            input_embeds,
+            attention_mask,
+            cache_position_or_past_key_values,
+            *args,
+            **kwargs,
+        )
+
+    def _local_flash_attn_impl(self, module, query_states, key_states, value_states, attention_mask, *args, **kwargs):
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        dist_attn = self._get_dist_attn('flash_attention_2')
+        if dist_attn.local_attn is None:
+
+            # Pass the current layer at call time. Capturing it in this cached
+            # closure would keep a weak-registry key alive through its context.
+            def _attention(query, key, value, *args, _sp_module, **kwargs):
+                query = query.transpose(1, 2)
+                key = key.transpose(1, 2)
+                value = value.transpose(1, 2)
+                if self.rp_world_size > 1:
+                    from .zigzag_ring_attn import zigzag_ring_flash_attn_varlen_func
+
+                    position_ids = kwargs.get('position_ids')
+                    if position_ids is None:
+                        position_ids = self.real_position_ids
+                    position_ids = self._extract_real_position_ids(position_ids)
+                    cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
+                    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                    position_ids = self._split_packed(position_ids, cu_seqlens, dim=-1)
+                    mask = position_ids != -1
+                    query = query.transpose(1, 2)
+                    key = key.transpose(1, 2)
+                    value = value.transpose(1, 2)
+                    query, key, value = self._mask_qkv(query, key, value, mask)
+                    return zigzag_ring_flash_attn_varlen_func(
+                        query,
+                        key,
+                        value,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        dropout_p=kwargs.get('dropout', 0.0),
+                        softmax_scale=kwargs.get('scaling'),
+                        causal=_sp_module.is_causal,
+                        window_size=kwargs.get('sliding_window') or (-1, -1),
+                        group=self._rp_group,
+                    )
+                elif self.extra_kwargs.get('padding_free', False) or 'cu_seq_lens_q' in kwargs:
+                    position_ids = kwargs.get('position_ids')
+                    if position_ids is None:
+                        position_ids = self.real_position_ids
+                    if position_ids is None:
+                        raise ValueError('Packed/varlen flash_attention_2 requires position_ids to derive '
+                                         'cu_seq_lens_q.')
+                    position_ids = self._extract_real_position_ids(position_ids)
+                    position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
+                    cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(
+                        dtype=torch.int32,
+                        device=query.device,
+                    )
+                    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                    total_tokens = int(cu_seqlens[-1].item())
+                    if query.shape[2] != total_tokens:
+                        raise ValueError('Packed/varlen flash_attention_2 expects query sequence length to match '
+                                         f'cu_seqlens total tokens, got query_seq_len={query.shape[2]} '
+                                         f'and cu_seqlens_total={total_tokens}.')
+                    kwargs['cu_seq_lens_q'] = cu_seqlens
+                    kwargs['cu_seq_lens_k'] = cu_seqlens
+                    kwargs['max_length_q'] = max_seqlen
+                    kwargs['max_length_k'] = max_seqlen
+                    if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
+                        args = (None, *args[1:])
+                return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](_sp_module, query, key, value, *args,
+                                                                           **kwargs)[0]
+
+            dist_attn.local_attn = _attention
+
+        return dist_attn(
+            query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
+            *args, _sp_module=module, **kwargs), None
+
+    def _local_sdpa_attn_impl(self, module, query_states, key_states, value_states, attention_mask, *args, **kwargs):
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        # Policy: packed (PackingDataset/padding-free) batches require FlashAttention2 varlen/packed semantics.
+        # SDPA does not have a native packed/varlen interface; supporting packed batches would require building a
+        # large block-diagonal causal mask (slow / memory heavy).
+        if self.extra_kwargs.get('padding_free', False):
+            raise RuntimeError('SequenceParallel: detected padding_free/packed batch. '
+                               'SDPA backend is not supported for padding_free/packed batches; please use '
+                               'flash_attention_2.')
+        dist_attn = self._get_dist_attn('sdpa')
+        if dist_attn.local_attn is None:
+
+            # The cache is per context, not per layer; do not bind the first
+            # layer or retain it through the global weak-key registry.
+            def _attention(query, key, value, *args, _sp_module, **kwargs):
+                query = query.transpose(1, 2)
+                key = key.transpose(1, 2)
+                value = value.transpose(1, 2)
+                if self.rp_world_size > 1:
+                    raise NotImplementedError('SDPA does not support derived ring attention.')
+                return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](_sp_module, query, key, value, *args, **kwargs)[0]
+
+            dist_attn.local_attn = _attention
+        return dist_attn(
+            query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
+            *args, _sp_module=module, **kwargs), None
+
+    def _prepare_flash_attn(self):
+        """Install the global SP-aware attention/mask wrappers (once per process).
+
+        The installed wrappers carry no per-model state; they resolve the owning
+        SequenceParallel context at call time via ``_MODULE_TO_CTX`` (attention
+        functions) or the thread-local ctx stack (mask helpers), so multiple
+        SP-enabled models (and non-SP models) can coexist in one process.
+        """
         try:
             from transformers import masking_utils
 
@@ -108,54 +368,8 @@ class SequenceParallel:
             origin_uses_cache_position = has_signature_parameter(origin_sdpa, 'cache_position')
 
             def sdpa_mask(batch_size, q_length=None, kv_length=None, *args, **kwargs):
-                q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
-                device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
-                if device is None:
-                    device = self.real_position_ids.device
-
-                cache_position = None
-                if self.world_size > 1:
-                    padded_position_ids = self.pad(
-                        self.real_position_ids[0],
-                        padding_value=-1,
-                        position_ids=self.real_position_ids,
-                        dim=0,
-                    )
-                    global_length = padded_position_ids.shape[0]
-                    if origin_uses_cache_position:
-                        cache_position = torch.arange(0, global_length, device=device)
-                        kv_length = global_length
-                    else:
-                        # Newer Transformers passes q_length/q_offset instead of cache_position. In SP training,
-                        # create_causal_mask may still see the local shard length, so restore the global query length
-                        # only for the no-cache prefill path; cache/sliding paths keep their upstream offsets.
-                        q_offset = kwargs.get('q_offset', 0)
-                        kv_offset = kwargs.get('kv_offset', 0)
-                        no_cache_offsets = ((not torch.is_tensor(q_offset) and q_offset == 0)
-                                            and (not torch.is_tensor(kv_offset) and kv_offset == 0))
-                        if no_cache_offsets:
-                            q_length = global_length
-                            attention_mask = kwargs.get('attention_mask')
-                            if attention_mask is not None and torch.is_tensor(attention_mask):
-                                kv_length = attention_mask.shape[-1]
-                            else:
-                                kv_length = global_length
-
-                # padding_mask may be an AttentionMask wrapper instead of Tensor
-                _pm = kwargs.get('padding_mask')
-                if _pm is not None and not isinstance(_pm, torch.Tensor):
-                    if hasattr(_pm, 'to_tensor'):
-                        kwargs['padding_mask'] = _pm.to_tensor()
-                    elif hasattr(_pm, 'mask'):
-                        kwargs['padding_mask'] = _pm.mask
-
-                if origin_uses_cache_position:
-                    if cache_position is None:
-                        cache_position = q_length if torch.is_tensor(q_length) else torch.arange(
-                            q_length, device=device)
-                    return origin_sdpa(batch_size, cache_position, kv_length, *args, **kwargs)
-
-                return origin_sdpa(batch_size, q_length, kv_length, *args, device=device, **kwargs)
+                return SequenceParallel._sdpa_mask_impl(_current_ctx(), origin_sdpa, origin_uses_cache_position,
+                                                        batch_size, q_length, kv_length, *args, **kwargs)
 
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'] = origin_sdpa
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
@@ -166,45 +380,13 @@ class SequenceParallel:
                                    cache_position_or_past_key_values=None,
                                    *args,
                                    **kwargs):
-                if self.world_size == 1:
-                    return _call_create_causal_mask(
-                        masking_utils.origin_create_causal_mask,
-                        config,
-                        input_embeds,
-                        attention_mask,
-                        cache_position_or_past_key_values,
-                        *args,
-                        **kwargs,
-                    )
-                input_embeds = torch.ones(
-                    (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
-                    dtype=input_embeds.dtype,
-                    device=input_embeds.device)
-                if has_signature_parameter(masking_utils.origin_create_causal_mask, 'cache_position'):
-                    cache_position_or_past_key_values = torch.arange(
-                        0,
-                        input_embeds.shape[1],
-                        device=input_embeds.device,
-                    )
-                return _call_create_causal_mask(
-                    masking_utils.origin_create_causal_mask,
-                    config,
-                    input_embeds,
-                    attention_mask,
-                    cache_position_or_past_key_values,
-                    *args,
-                    **kwargs,
-                )
+                return SequenceParallel._create_causal_mask_impl(_current_ctx(), config, input_embeds, attention_mask,
+                                                                 cache_position_or_past_key_values, *args, **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
         except ImportError:
             pass
-
-        if hasattr(base_model, 'language_model'):
-            text_model = base_model.language_model
-        else:
-            text_model = base_model
 
         from transformers.modeling_flash_attention_utils import is_flash_attn_available
         if is_flash_attn_available():
@@ -213,168 +395,103 @@ class SequenceParallel:
             # more work for maintaining.
             from transformers import modeling_flash_attention_utils
             from transformers.modeling_flash_attention_utils import _flash_attention_forward
-            _distributed_flash_attention = DistributedAttention(_flash_attention_forward, self)
 
             modeling_flash_attention_utils._flash_attention_forward_origin = _flash_attention_forward
 
             def flash_attention_forward(query_states: torch.Tensor, key_states: torch.Tensor,
                                         value_states: torch.Tensor, attention_mask: Optional[torch.Tensor], q_len,
                                         *args, **kwargs):
-                if self.world_size == 1:
+                sp = _current_ctx()
+                if sp is None or sp.world_size == 1:
                     return _flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len,
                                                     *args, **kwargs)
-                return _distributed_flash_attention(query_states, key_states, value_states, attention_mask,
-                                                    q_len * self.sp_world_size, *args, **kwargs)
+                dist_attn = sp._get_dist_attn('flash_attention_utils', _flash_attention_forward)
+                return dist_attn(query_states, key_states, value_states, attention_mask, q_len * sp.sp_world_size,
+                                 *args, **kwargs)
 
             modeling_flash_attention_utils._flash_attention_forward = flash_attention_forward
 
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
         def local_flash_attn(module: torch.nn.Module, query_states, key_states, value_states, attention_mask, *args,
-                             dist_attn, **kwargs):
-            if self.world_size == 1 or module.__class__ not in [m.__class__ for m in text_model.modules()]:
+                             **kwargs):
+            sp = _MODULE_TO_CTX.get(module)
+            if sp is None or sp.world_size == 1:
                 return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query_states, key_states,
                                                                            value_states, attention_mask, *args,
                                                                            **kwargs)
-            if dist_attn.local_attn is None:
-
-                def _attention(query, key, value, *args, **kwargs):
-                    query = query.transpose(1, 2)
-                    key = key.transpose(1, 2)
-                    value = value.transpose(1, 2)
-                    if self.rp_world_size > 1:
-                        from .zigzag_ring_attn import zigzag_ring_flash_attn_varlen_func
-
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
-                        position_ids = self._extract_real_position_ids(position_ids)
-                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
-                        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-                        position_ids = self._split_packed(position_ids, cu_seqlens, dim=-1)
-                        mask = position_ids != -1
-                        query = query.transpose(1, 2)
-                        key = key.transpose(1, 2)
-                        value = value.transpose(1, 2)
-                        query, key, value = self._mask_qkv(query, key, value, mask)
-                        return zigzag_ring_flash_attn_varlen_func(
-                            query,
-                            key,
-                            value,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
-                            dropout_p=kwargs.get('dropout', 0.0),
-                            softmax_scale=kwargs.get('scaling'),
-                            causal=module.is_causal,
-                            window_size=kwargs.get('sliding_window') or (-1, -1),
-                            group=self._rp_group,
-                        )
-                    elif self.extra_kwargs.get('padding_free', False) or 'cu_seq_lens_q' in kwargs:
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
-                        if position_ids is None:
-                            raise ValueError('Packed/varlen flash_attention_2 requires position_ids to derive '
-                                             'cu_seq_lens_q.')
-                        position_ids = self._extract_real_position_ids(position_ids)
-                        position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
-                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(
-                            dtype=torch.int32,
-                            device=query.device,
-                        )
-                        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-                        total_tokens = int(cu_seqlens[-1].item())
-                        if query.shape[2] != total_tokens:
-                            raise ValueError('Packed/varlen flash_attention_2 expects query sequence length to match '
-                                             f'cu_seqlens total tokens, got query_seq_len={query.shape[2]} '
-                                             f'and cu_seqlens_total={total_tokens}.')
-                        kwargs['cu_seq_lens_q'] = cu_seqlens
-                        kwargs['cu_seq_lens_k'] = cu_seqlens
-                        kwargs['max_length_q'] = max_seqlen
-                        kwargs['max_length_k'] = max_seqlen
-                        if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
-                            args = (None, *args[1:])
-                    return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
-                                                                               **kwargs)[0]
-
-                dist_attn.local_attn = _attention
-
-            return dist_attn(
-                query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
-                *args, **kwargs), None
+            return sp._local_flash_attn_impl(module, query_states, key_states, value_states, attention_mask, *args,
+                                             **kwargs)
 
         def local_sdpa_attn(module: torch.nn.Module, query_states, key_states, value_states, attention_mask, *args,
-                            dist_attn, **kwargs):
-            # Bypass SP logic when world_size == 1 (SP disabled) or module not in text_model
-            if self.world_size == 1 or module.__class__ not in [m.__class__ for m in text_model.modules()]:
+                            **kwargs):
+            sp = _MODULE_TO_CTX.get(module)
+            if sp is None or sp.world_size == 1:
                 return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](module, query_states, key_states, value_states,
                                                               attention_mask, *args, **kwargs)
-            # Policy: packed (PackingDataset/padding-free) batches require FlashAttention2 varlen/packed semantics.
-            # SDPA does not have a native packed/varlen interface; supporting packed batches would require building a
-            # large block-diagonal causal mask (slow / memory heavy).
-            if self.extra_kwargs.get('padding_free', False):
-                raise RuntimeError(
-                    'SequenceParallel: detected padding_free/packed batch. '
-                    'SDPA backend is not supported for padding_free/packed batches; please use flash_attention_2.')
-            if dist_attn.local_attn is None:
-
-                def _attention(query, key, value, *args, **kwargs):
-                    query = query.transpose(1, 2)
-                    key = key.transpose(1, 2)
-                    value = value.transpose(1, 2)
-                    if self.rp_world_size > 1:
-                        raise NotImplementedError('SDPA does not support derived ring attention.')
-                    return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](module, query, key, value, *args, **kwargs)[0]
-
-                dist_attn.local_attn = _attention
-            return dist_attn(
-                query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
-                *args, **kwargs), None
+            return sp._local_sdpa_attn_impl(module, query_states, key_states, value_states, attention_mask, *args,
+                                            **kwargs)
 
         ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'] = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         ALL_ATTENTION_FUNCTIONS['sdpa_origin'] = ALL_ATTENTION_FUNCTIONS['sdpa']
-        ALL_ATTENTION_FUNCTIONS['flash_attention_2'] = partial(
-            local_flash_attn, dist_attn=DistributedAttention(None, self))
-        ALL_ATTENTION_FUNCTIONS['sdpa'] = partial(local_sdpa_attn, dist_attn=DistributedAttention(None, self))
+        ALL_ATTENTION_FUNCTIONS['flash_attention_2'] = local_flash_attn
+        ALL_ATTENTION_FUNCTIONS['sdpa'] = local_sdpa_attn
 
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
 
         def pre_forward_split_hook(_self, args, kwargs):
-            if self.world_size == 1:
+            # Make this model's SP context visible to the global mask/attention
+            # wrappers for the whole duration of the forward.
+            _push_ctx(self)
+            try:
+                if self.world_size == 1:
+                    return args, kwargs
+                # Pad to multiple of SP size and split inputs per SP rank before forward.
+                input_ids = kwargs.get('input_ids', None)
+                inputs_embeds = kwargs.get('inputs_embeds', None)
+                position_ids = kwargs['position_ids']
+                real_position_ids = self._extract_real_position_ids(position_ids)
+                attention_mask = kwargs.get('attention_mask', None)
+                cache_position = kwargs.get('cache_position', None)
+                if hasattr(_self, 'language_model'):
+                    embed_tokens = getattr(_self.language_model, 'embed_tokens', None)
+                else:
+                    embed_tokens = getattr(_self, 'embed_tokens', None)
+                input_ids, inputs_embeds, _, position_ids, attention_mask, _, _ = self.pad_and_split_inputs(
+                    input_ids,
+                    inputs_embeds,
+                    None,
+                    position_ids,
+                    attention_mask,
+                    None,
+                    embed_tokens=embed_tokens,
+                    real_position_ids=real_position_ids,
+                    cache_position=cache_position)
+                kwargs['input_ids'] = input_ids
+                kwargs['inputs_embeds'] = inputs_embeds
+                kwargs['position_ids'] = position_ids
+                kwargs['attention_mask'] = attention_mask
                 return args, kwargs
-            # Pad to multiple of SP size and split inputs per SP rank before forward.
-            input_ids = kwargs.get('input_ids', None)
-            inputs_embeds = kwargs.get('inputs_embeds', None)
-            position_ids = kwargs['position_ids']
-            real_position_ids = self._extract_real_position_ids(position_ids)
-            attention_mask = kwargs.get('attention_mask', None)
-            cache_position = kwargs.get('cache_position', None)
-            if hasattr(_self, 'language_model'):
-                embed_tokens = getattr(_self.language_model, 'embed_tokens', None)
-            else:
-                embed_tokens = getattr(_self, 'embed_tokens', None)
-            input_ids, inputs_embeds, _, position_ids, attention_mask, _, _ = self.pad_and_split_inputs(
-                input_ids,
-                inputs_embeds,
-                None,
-                position_ids,
-                attention_mask,
-                None,
-                embed_tokens=embed_tokens,
-                real_position_ids=real_position_ids,
-                cache_position=cache_position)
-            kwargs['input_ids'] = input_ids
-            kwargs['inputs_embeds'] = inputs_embeds
-            kwargs['position_ids'] = position_ids
-            kwargs['attention_mask'] = attention_mask
-            return args, kwargs
+            except BaseException:
+                # PyTorch does not guarantee forward hooks run when a pre-hook
+                # itself raises. Restore the previous model context immediately.
+                _pop_ctx(self)
+                raise
 
-        base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
+        def post_forward_pop_hook(_self, args, output):
+            _pop_ctx(self)
+            return output
+
+        base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True, prepend=True)
+        # PyTorch also calls this hook if a pre-hook or the forward raises.
+        base_model.register_forward_hook(post_forward_pop_hook, always_call=True)
+
 
     def _prepare_multimodal_deepstack(self, base_model: torch.nn.Module):
         if not is_qwen3_vl(base_model):
             return
         apply_patch(base_model, Qwen3VLDeepstackSPPatch, sequence_parallel=self)
+
 
     @staticmethod
     def _is_qwen35_model(model: torch.nn.Module) -> bool:
@@ -390,6 +507,7 @@ class SequenceParallel:
         model_module = getattr(model.__class__, '__module__', '') or ''
         return 'transformers.models.qwen3_5' in model_module or 'transformers.models.qwen3_5_moe' in model_module
 
+
     def _prepare_qwen35_linear_attention(self, model: torch.nn.Module):
         has_qwen35_linear_attention = self._is_qwen35_model(model)
         if not has_qwen35_linear_attention:
@@ -404,6 +522,7 @@ class SequenceParallel:
                 'SequenceParallel: Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
                 '(derived ring attention).')
         apply_patch(None, Qwen3_5GatedDeltaNetUlyssesPatch, sequence_parallel=self)
+
 
     def _prepare_moe_aux_loss(self, base_model: torch.nn.Module):
 
@@ -427,7 +546,7 @@ class SequenceParallel:
                 _bs_logits = [logit[_slice] for logit in router_logits]
                 compute_device = _bs_logits[0].device
                 _bs_logits = torch.stack([layer_gate.to(compute_device) for layer_gate in _bs_logits], dim=0)
-                _bs_logits, _ = GatherLoss.apply(_bs_logits, None, 1, self.real_position_ids)
+                _bs_logits, _ = GatherLoss.apply(self, _bs_logits, None, 1, self.real_position_ids)
                 _gathered_logits.append(_bs_logits)
             router_logits = torch.stack(_gathered_logits, dim=0)
             if self.real_position_ids is not None:
@@ -437,6 +556,7 @@ class SequenceParallel:
             return output
 
         base_model.register_forward_hook(moe_aux_loss_hook, with_kwargs=True)
+
 
     def prepare(
         self,
@@ -486,14 +606,12 @@ class SequenceParallel:
         self._init_device_mesh(device_mesh)
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
-            self._prepare_flash_attn(llm_model)
+            self._prepare_flash_attn()
             SequenceParallel._global_inited = True
         self._prepare_qwen35_linear_attention(llm_model)
-
         self._prepare_forward_hook(llm_model)
         self._prepare_multimodal_deepstack(llm_model)
-
-        if is_moe_config(getattr(model, 'config', None)):
+        if is_moe_config(getattr(llm_model, 'config', None)):
             self._prepare_moe_aux_loss(llm_model)
 
         self.model_dtype = next(model.parameters()).dtype
@@ -502,6 +620,20 @@ class SequenceParallel:
             attn_impl = getattr(model.config, '_attn_implementation', None)
             if attn_impl != 'flash_attention_2':
                 raise NotImplementedError('Derived ring attention only supports flash_attention_2 backend.')
+
+        # Route this model's text-side attention modules to this context. The
+        # registry is instance-based (not class-based), so a second model of the
+        # same architecture gets its own context instead of silently sharing
+        # this one's extra_kwargs, and modules of other models (e.g. vision
+        # towers) fall through to the origin attention.
+        text_model = llm_model.language_model if hasattr(llm_model, 'language_model') else llm_model
+        _register_module_tree(text_model, self)
+        if self is not sequence_parallel:
+            # Compat: keep the legacy module-level singleton reflecting the most
+            # recently prepared context (extra_kwargs is shared by reference, so
+            # legacy readers observe live per-forward state). New code should
+            # use explicit contexts instead.
+            sequence_parallel.__dict__.update(self.__dict__)
 
     def _mask_qkv(self, query, key, value, mask):
         mask = mask.unsqueeze(2).unsqueeze(3)
@@ -679,6 +811,19 @@ class SequenceParallel:
                                                     f'world size ({self.sp_world_size}), cannot split tensor evenly')
         tensor_list = torch.split(input, dim_size // self.sp_world_size, dim=dim)
         return tensor_list[self.sp_rank].contiguous()
+
+    def _pad_key(self, value, spec, position_ids=None):
+        if value is None:
+            return None
+        pad_value = self.tokenizer.pad_token_id if spec.pad_value == 'tokenizer' else spec.pad_value
+        return self.pad(value, padding_value=pad_value, dim=spec.sequence_dim(value.dim()), position_ids=position_ids)
+
+    def _split_key(self, value, spec, position_ids=None, legacy_roll=False):
+        if value is None or not spec.need_split:
+            return value
+        if spec.need_roll or legacy_roll:
+            value = torch.roll(value, shifts=-1, dims=spec.split_dim)
+        return self.split(value, dim=spec.split_dim, position_ids=position_ids)
 
     def pad_and_split_inputs(self,
                              input_ids,
@@ -880,6 +1025,9 @@ class SequenceParallelStrategy:
         self._tokenizer_id = tokenizer_id
         self._tokenizer = None
         self._initialized = False
+        # Per-model SP context. The module-level ``sequence_parallel`` singleton
+        # is only kept as a compat mirror of the most recently prepared context.
+        self._ctx = SequenceParallel()
 
     def _get_tokenizer(self) -> Optional[PreTrainedTokenizer]:
         if self._tokenizer is not None:
@@ -906,7 +1054,7 @@ class SequenceParallelStrategy:
         tokenizer = self._get_tokenizer()
         if tokenizer is None:
             raise RuntimeError('SequenceParallelStrategy requires a tokenizer to initialize.')
-        sequence_parallel.prepare(
+        self._ctx.prepare(
             self.ulysses_size,
             self._model_ref,
             tokenizer,
@@ -915,10 +1063,54 @@ class SequenceParallelStrategy:
         self._initialized = True
         return True
 
+    # -- SP context delegates -------------------------------------------------
+    # Processors / router replay access SP state through the strategy. These
+    # delegates forward to this model's own context (they previously did not
+    # exist, silently disabling SP-aware paths such as last-token pooling).
+
+    @property
+    def world_size(self) -> int:
+        return self._ctx.world_size or 1
+
+    @property
+    def sp_world_size(self) -> int:
+        return self._ctx.sp_world_size or 1
+
+    @property
+    def rp_world_size(self) -> int:
+        return self._ctx.rp_world_size or 1
+
+    @property
+    def _sp_group(self):
+        return self._ctx._sp_group
+
+    @property
+    def _rp_group(self):
+        return self._ctx._rp_group
+
+    @property
+    def real_position_ids(self):
+        return self._ctx.real_position_ids
+
+    def pad(self, tensor, *args, **kwargs):
+        if self._ctx.world_size is None:
+            return tensor
+        return self._ctx.pad(tensor, *args, **kwargs)
+
+    def split(self, tensor, *args, **kwargs):
+        if self._ctx.world_size is None:
+            return tensor
+        return self._ctx.split(tensor, *args, **kwargs)
+
+    def gather(self, tensor, *args, **kwargs):
+        if self._ctx.world_size is None:
+            return tensor
+        return self._ctx.gather(tensor, *args, **kwargs)
+
     def preprocess_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not self.enabled or self.ulysses_size <= 1:
             return inputs
-        return sequence_parallel.prepare_inputs(inputs)
+        return self._ctx.prepare_inputs(inputs)
 
     def postprocess_outputs(self, outputs: Any) -> Any:
         if (not self.enabled or self.ulysses_size <= 1 or not self.sp_config.get('gather_logits', True)):
@@ -931,24 +1123,23 @@ class SequenceParallelStrategy:
         logits = outputs.get('logits', None)
         if logits is None or not torch.is_tensor(logits) or logits.dim() < 2:
             return outputs
-        gathered = sequence_parallel.gather(logits, dim=1, position_ids=sequence_parallel.real_position_ids)
+        gathered = self._ctx.gather(logits, dim=1, position_ids=self._ctx.real_position_ids)
         # Scheme A: SP pads to make seq_len divisible by sp_size. Trim back to the original
         # (unpadded) length using the cached real_position_ids.
-        real_pos = sequence_parallel.real_position_ids
+        real_pos = self._ctx.real_position_ids
         if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
             gathered = gathered[:, :real_pos.shape[1]].contiguous()
         outputs['logits'] = gathered
         return outputs
 
-    @staticmethod
-    def _trim_gathered_sequence_padding(tensor: torch.Tensor, real_position_ids: torch.Tensor) -> torch.Tensor:
+    def _trim_gathered_sequence_padding(self, tensor: torch.Tensor, real_position_ids: torch.Tensor) -> torch.Tensor:
         if real_position_ids is None or not torch.is_tensor(real_position_ids) or real_position_ids.dim() < 2:
             return tensor
-        if sequence_parallel.rp_world_size > 1:
+        if self._ctx.rp_world_size > 1:
             cu_seqlens = get_cu_seqlens_from_position_ids(real_position_ids)
             pieces = []
             padded_offset = 0
-            divisor = sequence_parallel.world_size * 2
+            divisor = self._ctx.world_size * 2
             for i in range(len(cu_seqlens) - 1):
                 real_len = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
                 padded_len = math.ceil(real_len / divisor) * divisor
@@ -982,8 +1173,8 @@ class SequenceParallelStrategy:
             hidden = outputs['logits']
             inputs = copy(inputs)
             outputs = copy(outputs)
-            real_position_ids = sequence_parallel.real_position_ids
-            gathered_hidden, gathered_labels = GatherLoss.apply(hidden, labels, 1, real_position_ids)
+            real_position_ids = self._ctx.real_position_ids
+            gathered_hidden, gathered_labels = GatherLoss.apply(self._ctx, hidden, labels, 1, real_position_ids)
             gathered_hidden = self._trim_gathered_sequence_padding(gathered_hidden, real_position_ids)
             gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
             outputs['logits'] = gathered_hidden
@@ -996,15 +1187,15 @@ class SequenceParallelStrategy:
                             f'sequence tensor, got type={type(logps)} shape={getattr(logps, "shape", None)}')
         inputs = copy(inputs)
         outputs = copy(outputs)
-        real_position_ids = sequence_parallel.real_position_ids
-        gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
+        real_position_ids = self._ctx.real_position_ids
+        gathered_logps, gathered_labels = GatherLoss.apply(self._ctx, logps, labels, 1, real_position_ids)
         gathered_logps = self._trim_gathered_sequence_padding(gathered_logps, real_position_ids)
         gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
         entropies = outputs.get('entropies')
         if entropies is not None and torch.is_tensor(entropies) and entropies.dim() >= 2:
-            gathered_entropies, _ = GatherLoss.apply(entropies, labels, 1, real_position_ids)
+            gathered_entropies, _ = GatherLoss.apply(self._ctx, entropies, labels, 1, real_position_ids)
             outputs['entropies'] = self._trim_gathered_sequence_padding(gathered_entropies, real_position_ids)
         return inputs, outputs
 

@@ -340,7 +340,11 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
                 _origin_forward=origin_forward,
                 **extra_kwargs,
             ):
-                sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', sequence_parallel)
+                # The class patch is shared by every model, including models
+                # without SP. Resolve the owner instead of capturing the first
+                # model's context in this process-wide closure.
+                from . import _MODULE_TO_CTX
+                sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', _MODULE_TO_CTX.get(mod))
                 if not _sp_is_enabled(sequence_parallel_context):
                     return _origin_forward(
                         mod,

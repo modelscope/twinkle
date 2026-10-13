@@ -77,6 +77,7 @@ def get_replay_state(block_name: str) -> _RouterReplayState | None:
 def set_router_replay_data(
     routed_experts: torch.Tensor,
     model: nn.Module,
+    sp_context=None,
 ) -> None:
     """Slice *routed_experts* into per-block
     ``target_indices`` and inject them into the registered MoE blocks of *model*.
@@ -96,7 +97,10 @@ def set_router_replay_data(
                          f'got {tuple(routed_experts.shape)}')
 
     # SP: slice full-sequence routed_experts to local SP rank tokens.
-    from ..strategy.sequence_parallel import sequence_parallel as sp
+    # Setup runs before the model's forward hook pushes its context.
+    # An unregistered model is non-SP, even if another SP model was prepared.
+    from ..strategy.sequence_parallel import _MODULE_TO_CTX
+    sp = sp_context if sp_context is not None else _MODULE_TO_CTX.get(model)
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
         _, _, _, _, _, _, extra_values = sp.pad_and_split_inputs(
@@ -128,7 +132,7 @@ def set_router_replay_data(
             state.target_indices = target
 
 
-def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | None:
+def get_router_replay_data(model: nn.Module, batch_size=1, sp_context=None) -> torch.Tensor | None:
     """Collect ``recorded_indices`` from all registered MoE blocks in *model*.
 
     . note::
@@ -158,7 +162,8 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | Non
     routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
 
     # SP: all-gather local routing data across SP ranks along seq_len dim.
-    from ..strategy.sequence_parallel import sequence_parallel as sp
+    from ..strategy.sequence_parallel import _MODULE_TO_CTX
+    sp = sp_context if sp_context is not None else _MODULE_TO_CTX.get(model)
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
         routed_experts = sp.gather(routed_experts, dim=1, position_ids=sp.real_position_ids)

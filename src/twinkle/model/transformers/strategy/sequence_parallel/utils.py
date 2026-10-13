@@ -237,33 +237,39 @@ def head_to_seq_shard(tensor: torch.Tensor, sequence_parallel) -> torch.Tensor:
 
 
 class GatherLoss(torch.autograd.Function):
-    """Gather loss from sequence group."""
+    """Gather loss from sequence group.
+
+    The owning ``SequenceParallel`` context is passed explicitly as the first
+    argument: backward() runs after other models may have forwarded, so reading
+    the process-global singleton here could pick up the wrong context in
+    multi-model training (DPO/PPO/GKD).
+    """
 
     @staticmethod
-    def forward(ctx, loss, labels, gather_idx=None, position_ids=None):
-        from . import sequence_parallel
+    def forward(ctx, sp, loss, labels, gather_idx=None, position_ids=None):
+        ctx.sp = sp
         ctx.scatter_shape = loss.shape[gather_idx or 0]
         ctx.gather_idx = gather_idx or 0
         if position_ids is not None:
-            position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
+            position_ids = sp.pad(position_ids, padding_value=-1, position_ids=position_ids)
         ctx.position_ids = position_ids
-        output = sequence_parallel.gather(loss, dim=ctx.gather_idx, position_ids=position_ids)
+        output = sp.gather(loss, dim=ctx.gather_idx, position_ids=position_ids)
         if labels is not None:
-            labels_output = sequence_parallel.gather(labels, dim=ctx.gather_idx, position_ids=position_ids)
+            labels_output = sp.gather(labels, dim=ctx.gather_idx, position_ids=position_ids)
         else:
             labels_output = None
         return output, labels_output
 
     @staticmethod
     def backward(ctx, *grad_output):
-        from . import sequence_parallel
-        _grad = grad_output[0] * sequence_parallel.world_size
-        if sequence_parallel.rp_world_size > 1:
-            _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
+        sp = ctx.sp
+        _grad = grad_output[0] * sp.world_size
+        if sp.rp_world_size > 1:
+            _grad = sp.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
         else:
             _grad = _grad.split(
-                ctx.scatter_shape, dim=ctx.gather_idx)[dist.get_rank(group=sequence_parallel._sp_group)].contiguous()
-        return _grad, None, None, None
+                ctx.scatter_shape, dim=ctx.gather_idx)[dist.get_rank(group=sp._sp_group)].contiguous()
+        return None, _grad, None, None, None
 
 
 def _generate_layout_params(scatter_idx, seq_world_size, input):

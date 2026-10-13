@@ -479,15 +479,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
                                         get_router_replay_data, set_global_router_replay_action, set_router_replay_data)
         unwrapped = self.strategy.unwrap_model(self.model)
+        sp_context = getattr(self.sp_strategy, '_ctx', None)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped)
+            set_router_replay_data(routed_experts, unwrapped, sp_context=sp_context)
 
         def cleanup():
             recorded = None
             if router_replay_action == RouterReplayAction.RECORD:
-                recorded = get_router_replay_data(unwrapped, batch_size)
+                recorded = get_router_replay_data(unwrapped, batch_size, sp_context=sp_context)
             if not manual_cleanup:
                 clear_global_router_replay_action()
                 clear_global_indices()
