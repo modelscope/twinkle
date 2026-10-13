@@ -100,12 +100,14 @@ def train():
     logger.info(f'Total steps: {len(dataloader)}')
 
     if _use_fused_ce:
+        import torch
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
             _dist.barrier()
         if Torch.is_npu_available():
-            import torch_npu
             torch.npu.synchronize()
+        if Torch.is_gpu_available():
+            torch.cuda.synchronize()
 
     for step, batch in enumerate(dataloader):
         model.forward_backward(inputs=batch, task=_task, adapter_name=args.lora.adapter_name)
