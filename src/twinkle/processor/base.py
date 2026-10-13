@@ -77,7 +77,7 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
-            self.prepare_transformers_padding_free_patch,
+            self.prepare_transformers_packed_args,
             self.drop_causal_4d_mask,
             self.split_cp,
             self.apply_transformers_sp,
@@ -472,11 +472,8 @@ class InputProcessor:
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
         return inputs
 
-    def prepare_transformers_padding_free_patch(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        if self.framework != 'transformers':
-            return inputs
-        model = kwargs.get('model')
-        if model is None:
+    def prepare_transformers_packed_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        if self.framework != 'transformers' or 'hf_config' not in kwargs:
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         if not padding_free or bool(kwargs.get('enable_sp', False)):
@@ -489,18 +486,10 @@ class InputProcessor:
                                f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
                                'logical sequences after they are concatenated into one physical row.')
 
-        if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-            from twinkle.patch import apply_patch
-            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
-
-            apply_patch(
-                model,
-                GatedDeltaNetPaddingFreePatch,
-                hf_config=kwargs.get('hf_config'),
-                enable_sp=False,
-            )
-            if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-                return inputs
+        # Model patching belongs to the model worker. Only emit GatedDeltaNet
+        # boundary metadata for the model families supported by that patch.
+        if 'qwen3_5' not in getattr(hf_config, 'model_type', ''):
+            return inputs
 
         for _inp in inputs:
             position_ids = _inp.get('position_ids')

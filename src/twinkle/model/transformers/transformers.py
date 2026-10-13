@@ -651,6 +651,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             tokenizer_id=self.tokenizer_id,
         )
 
+    def _ensure_gdn_padding_free_patch(self, inputs: Dict[str, Any]) -> None:
+        """Install the GatedDeltaNet patch locally when packed batch args are present."""
+        if getattr(self, '_enable_sp', False) or 'cu_seq_lens_q' not in inputs:
+            return
+        if getattr(self.model, '_twinkle_gdn_padding_free_patched', False):
+            return
+        from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+        apply_patch(self.model, GatedDeltaNetPaddingFreePatch,
+                    hf_config=self.hf_config, enable_sp=False)
+
     def _get_default_group(self):
         """Get the only group, else return the default one"""
         if len(self.optimizer_group) == 1:
@@ -860,10 +871,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         inputs: Dict[str, Any] = processor(
             inputs,
             sp_strategy=self.sp_strategy,
-            model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
         )
+        self._ensure_gdn_padding_free_patch(inputs)
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
@@ -997,10 +1008,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
-                model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
             )
+            self._ensure_gdn_padding_free_patch(inputs)
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
