@@ -9,9 +9,17 @@ Provides:
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
+
+# Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server.
+try:
+    from ray.exceptions import GetTimeoutError as _RayGetTimeout
+    BACKEND_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (asyncio.TimeoutError, _RayGetTimeout)
+except Exception:  # pragma: no cover - ray always present in server runtime
+    BACKEND_TIMEOUT_EXCEPTIONS = (asyncio.TimeoutError, )
 
 
 class TaskStatus(Enum):

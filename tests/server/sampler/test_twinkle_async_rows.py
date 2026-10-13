@@ -64,6 +64,8 @@ def test_async_sampler_rejects_group_id_count_mismatch() -> None:
 class _SamplerManagement:
 
     def __init__(self):
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        self.sampling_guard = SamplerConcurrency()
         self.sampler = self
         self.data_plane = self
         self.enabled = True

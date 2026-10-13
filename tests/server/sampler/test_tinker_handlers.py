@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
@@ -5,6 +6,7 @@ from tinker import types
 
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle.server.sampler.concurrency import SamplerConcurrency
 
 
 class _DummyState:
@@ -21,12 +23,13 @@ class _DummySampler:
     def __init__(self):
         self.adapter_paths = []
         self.sampling_params = []
+        self.calls = []
 
     def set_template(self, *args, **kwargs):
-        return None
+        self.calls.append('set_template')
 
     def reset_prefix_cache(self):
-        return None
+        self.calls.append('reset_prefix_cache')
 
     def sample(self, inputs, sampling_params=None, adapter_name='', *, adapter_path=None, **kwargs):
         self.adapter_paths.append(adapter_path)
@@ -47,15 +50,22 @@ class _DummyManagement:
         self.model_id = 'mock-model'
         self.state = _DummyState()
         self.sampler = _DummySampler()
+        self.tinker_setup_lock = asyncio.Lock()
+        self.tinker_template_set = False
+        self.sampling_guard = SamplerConcurrency()
 
     async def _on_request_start(self, request):
         return 'EMPTY_TOKEN'
 
-    async def schedule_task(self, task, **kwargs):
+    async def schedule_concurrent_task(self, task, **kwargs):
         return await task()
 
     async def call_backend(self, fn, /, *args, **kwargs):
-        return fn(*args, **kwargs)
+        async def call():
+            return fn(*args, **kwargs)
+        if self.sampling_guard.owns_job():
+            return await call()
+        return await self.sampling_guard.run(call, exclusive=True)
 
 
 @pytest.mark.asyncio
@@ -83,3 +93,24 @@ async def test_tinker_asample_allows_base_model_session_without_model_path(tempe
     assert management.sampler.sampling_params[0].logprobs == 1
     assert management.sampler.sampling_params[0].temperature == temperature
     assert management.sampler.sampling_params[0].max_tokens == (max_tokens if max_tokens is not None else 256)
+
+
+@pytest.mark.asyncio
+async def test_tinker_asample_sets_template_once_without_prefix_cache_reset():
+    """Both calls would wait for every in-flight generation, serializing requests."""
+    management = _DummyManagement()
+    app = FastAPI()
+    _register_tinker_sampler_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/asample')
+    body = types.SampleRequest(
+        prompt=types.ModelInput.from_ints([1, 2, 3]),
+        sampling_params=types.SamplingParams(max_tokens=2),
+        sampling_session_id='base-session',
+        base_model='mock-model',
+    )
+    request = Request({'type': 'http', 'headers': []})
+
+    await asyncio.gather(*(route.endpoint(request, body, management) for _ in range(3)))
+
+    assert management.sampler.calls == ['set_template']
+    assert len(management.sampler.adapter_paths) == 3

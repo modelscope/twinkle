@@ -17,15 +17,15 @@ from typing import TYPE_CHECKING, Any, Callable, Deque
 from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import (BatchSizeError, EndpointUnavailableError, FullModeBusyError,
                                        InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
-                                       ResourceNotFoundError, ResourceQuotaExceededError, StateBackendError,
-                                       TrainModeMismatchError, TwinkleServerError)
+                                       ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
+                                       StateBackendError, TrainModeMismatchError, TwinkleServerError)
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
-from .types import BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
+from .types import BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -55,14 +55,6 @@ def _reason_code_for_server_error(exc: TwinkleServerError) -> str:
     return 'internal_error'
 
 
-# Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server.
-try:
-    from ray.exceptions import GetTimeoutError as _RayGetTimeout
-    _TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (asyncio.TimeoutError, _RayGetTimeout)
-except Exception:  # pragma: no cover - ray always present in server runtime
-    _TIMEOUT_EXCEPTIONS = (asyncio.TimeoutError, )
-
-
 class ComputeWorker:
     """Serial background worker that processes GPU compute tasks.
 
@@ -70,9 +62,10 @@ class ComputeWorker:
     queues so that no single user's long-running task (e.g. save/load) can
     starve other users waiting in different queues.
 
-    Only one task is executed at a time to preserve serial GPU semantics.
-    Upload and other pure-I/O tasks should NOT be submitted here; use the
-    background-task path in TaskQueueMixin instead.
+    Only one queued task is executed at a time to preserve serial GPU semantics;
+    :meth:`run_detached` runs a task outside that order. Upload and other
+    pure-I/O tasks should NOT be submitted here; use the background-task path
+    in TaskQueueMixin instead.
     """
 
     def __init__(
@@ -98,6 +91,10 @@ class ComputeWorker:
         self._started = False
         self._stopping = False
         self._start_lock = asyncio.Lock()
+        # Strong references to tasks started by run_detached(); the event loop
+        # only keeps weak ones.
+        self._detached_tasks: dict[asyncio.Task, QueuedTask] = {}
+        self._detached_reserved = 0
 
     async def ensure_started(self) -> None:
         """Ensure the background worker coroutine is running."""
@@ -111,7 +108,7 @@ class ComputeWorker:
             self._started = True
 
     async def stop(self) -> None:
-        """Cancel the worker and wait for it to exit cleanly."""
+        """Cancel the worker and any detached tasks, and wait for them to exit."""
         self._stopping = True
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
@@ -119,6 +116,17 @@ class ComputeWorker:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+        detached = list(self._detached_tasks.items())
+        for running, _ in detached:
+            running.cancel()
+        await asyncio.gather(*(running for running, _ in detached), return_exceptions=True)
+        for running, task in detached:
+            if running.cancelled() and not await self._is_record_terminal(task.request_id):
+                await self._store_task_failed(
+                    task,
+                    'Sampler task stopped during replica shutdown.',
+                    QueueState.ACTIVE.value,
+                    reason_code='orphaned_replica')
         self._worker_task = None
         self._started = False
         self.task_queues.clear()
@@ -265,18 +273,69 @@ class ComputeWorker:
         q.task_done()
 
     async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
-        """Execute a single task: update status, run coroutine, record metrics.
+        """Execute a dequeued task, then release its queue slot."""
+        try:
+            await self._process_task(task, queue_key)
+        finally:
+            q.task_done()
 
-        Handles execution timeout, general exceptions, and always calls
-        q.task_done() in the finally block.
+    async def submit_detached(self, task: QueuedTask, queue_key: str, *, replica_id: str | None,
+                              absolute_deadline: float) -> None:
+        """Own admission, future persistence and startup as one lifecycle."""
+        self.reserve_detached()
+        wrote_status = False
+        try:
+            await self._state.store_future_status(
+                task.request_id,
+                TaskStatus.PENDING.value,
+                task.model_id,
+                queue_state=QueueState.ACTIVE.value,
+                replica_id=replica_id,
+                absolute_deadline=absolute_deadline)
+            wrote_status = True
+            self.run_detached(task, queue_key)
+        except BaseException:
+            self.release_detached()
+            if wrote_status:
+                await self._store_task_failed(
+                    task,
+                    'Replica stopped before the concurrent task could start.',
+                    QueueState.ACTIVE.value,
+                    reason_code='orphaned_replica')
+            raise
+
+    def reserve_detached(self) -> None:
+        """Reserve before the future write, so capacity rejection leaves no record."""
+        if self._stopping or self._detached_reserved >= self._config.concurrent_task_limit:
+            raise ResourceExhaustedError('Concurrent compute capacity is unavailable on this replica.')
+        self._detached_reserved += 1
+
+    def release_detached(self) -> None:
+        self._detached_reserved -= 1
+
+    def run_detached(self, task: QueuedTask, queue_key: str) -> None:
+        """Start ``task`` now, beside the serial loop instead of in its turn.
+
+        For backends that batch concurrent requests themselves (vLLM). The task
+        gets the same status records, execution timeout and failure mapping as a
+        queued one.
         """
-        await self._state.store_future_status(
-            task.request_id,
-            TaskStatus.RUNNING.value,
-            task.model_id,
-            queue_state=QueueState.ACTIVE.value,
-        )
+        if self._stopping:
+            raise ResourceExhaustedError('The replica is shutting down.')
+        running = asyncio.create_task(self._process_task(task, queue_key))
+        self._detached_tasks[running] = task
 
+        def done(completed: asyncio.Task) -> None:
+            self._detached_tasks.pop(completed, None)
+            self.release_detached()
+
+        running.add_done_callback(done)
+
+    async def _process_task(self, task: QueuedTask, queue_key: str) -> None:
+        """Run a single task: update status, run coroutine, record metrics.
+
+        Handles execution timeout and general exceptions.
+        """
         task_type = task.task_type or 'unknown'
         exec_start = time.monotonic()
         task_status = 'completed'
@@ -293,6 +352,12 @@ class ComputeWorker:
         handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
         handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
         try:
+            await self._state.store_future_status(
+                task.request_id,
+                TaskStatus.RUNNING.value,
+                task.model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
             with traced_operation('task_queue.execute', attrs=queue_attrs):
                 logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
                              f'type={task_type}, queue_key={queue_key}')
@@ -310,7 +375,17 @@ class ComputeWorker:
                 result=result,
                 queue_state=QueueState.ACTIVE.value,
             )
-        except _TIMEOUT_EXCEPTIONS:
+        except asyncio.CancelledError:
+            task_status = 'cancelled'
+            exec_time = time.monotonic() - exec_start
+            if not await self._is_record_terminal(task.request_id):
+                await self._store_task_failed(
+                    task,
+                    'Task stopped during replica shutdown.' if self._stopping else 'Backend generation was cancelled.',
+                    QueueState.ACTIVE.value,
+                    reason_code='orphaned_replica' if self._stopping else 'backend_cancelled')
+            raise
+        except BACKEND_TIMEOUT_EXCEPTIONS:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
             error = (f'Backend call timed out (bound {self._config.effective_execution_timeout}s), '
@@ -380,7 +455,6 @@ class ComputeWorker:
                 traceback_text=traceback.format_exc(),
             )
         finally:
-            q.task_done()
             self._record_execution_time(task_type, exec_time)
             self._record_tasks_total(task_type, task_status)
 

@@ -36,10 +36,10 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
 
 
-@remote_class(max_concurrency=_MAX_CONCURRENCY)
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
@@ -289,6 +289,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
+    @staticmethod
+    async def _gather_samples(samples) -> List[SampleResponse]:
+        """Finish every prompt before exposing the batch's result or failure."""
+        results = await asyncio.gather(*samples, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
     def sample(
         self,
@@ -375,7 +384,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     disable_lora=use_base_model,
                 ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
             ]
-            return await asyncio.gather(*tasks)
+            return await self._gather_samples(tasks)
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results

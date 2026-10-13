@@ -17,7 +17,7 @@ from twinkle import DeviceMesh, get_logger, remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams, user_data_get
 from twinkle.hub import HubOperation
 from twinkle.metric import MetricBuffer, MetricRecord
-from twinkle.sampler.vllm_sampler import vLLMSampler
+from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY, vLLMSampler
 from .data_plane import TQDataPlane
 from .metrics import rollout_metrics
 from .types import LoraContext, PromptGroup, RolloutOutput, RolloutPolicy
@@ -85,6 +85,14 @@ def _compute_reward_metrics(
     return dict(metric_payload(rollout_rows, rewards=rewards, context=context))
 
 
+@dataclass
+class _GenerationSubmission:
+    """Separate a cancellation request from actual coroutine completion."""
+    future: Future | None = None
+    task: asyncio.Task | None = None
+    cancel_requested: bool = False
+
+
 @dataclass(frozen=True)
 class _GeneratedSample:
     response: SampleResponse
@@ -113,13 +121,14 @@ class _PromptGroupRolloutStats:
     policy_versions: tuple[int, ...]
 
 
-@remote_class()
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class VLLMSamplerTQ(vLLMSampler):
-    """vLLM sampler that writes async RL rollout results directly to TransferQueue.
+    """vLLM sampler for native async RL and client-server generation.
 
-    ``sample()`` is intentionally fire-and-forget: it schedules generation work
-    on the sampler actor's vLLM event loop and returns submission metadata
-    without waiting for any prompt group to finish.
+    ``submit_prompt_groups()`` schedules native rollouts and returns metadata;
+    their results go to TransferQueue. Inherited ``sample()`` returns completed
+    responses. The client-server path uses ``submit_generation()``, status
+    polling and ``collect_generation()`` for non-blocking admission.
     """
 
     def __init__(
@@ -157,7 +166,7 @@ class VLLMSamplerTQ(vLLMSampler):
         # path. Unlike ``_background_submissions`` above, their results must
         # remain available until SamplerManagement collects them and writes
         # them to the opaque client DataPlane.
-        self._generation_submissions: dict[str, Future[list[SampleResponse]]] = {}
+        self._generation_submissions: dict[str, _GenerationSubmission] = {}
         self.metric_buffer = MetricBuffer()
         self._failure: str | None = None
 
@@ -249,27 +258,34 @@ class VLLMSamplerTQ(vLLMSampler):
         """
         if submission_id in self._generation_submissions:
             raise KeyError(f'generation submission already exists: {submission_id}')
-        future = self._submit_in_loop(
-            self._generate_inputs(
+        submission = _GenerationSubmission()
+
+        async def generate():
+            submission.task = asyncio.current_task()
+            if submission.cancel_requested:
+                raise asyncio.CancelledError
+            return await self._generate_inputs(
                 inputs,
                 sampling_params,
                 adapter_name=adapter_name,
                 adapter_path=adapter_path,
-                use_base_model=use_base_model,
-            ))
-        self._generation_submissions[submission_id] = future
+                use_base_model=use_base_model)
+
+        submission.future = self._submit_in_loop(generate())
+        self._generation_submissions[submission_id] = submission
         return {'submission_id': submission_id, 'status': 'running'}
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def get_generation_status(self, submission_id: str) -> dict[str, Any]:
         """Return this DP worker's submission state without waiting."""
-        future = self._generation_submissions.get(submission_id)
-        if future is None:
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
             return {
                 'submission_id': submission_id,
                 'status': 'missing',
                 'error': f'unknown generation submission: {submission_id}',
             }
+        future = submission.future
         if future.cancelled():
             return {'submission_id': submission_id, 'status': 'cancelled'}
         if not future.done():
@@ -286,9 +302,10 @@ class VLLMSamplerTQ(vLLMSampler):
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
     def collect_generation(self, submission_id: str) -> list[SampleResponse]:
         """Consume completed responses from every DP worker."""
-        future = self._generation_submissions.get(submission_id)
-        if future is None:
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
             raise KeyError(f'unknown generation submission: {submission_id}')
+        future = submission.future
         if not future.done():
             raise RuntimeError(f'generation submission is still running: {submission_id}')
         try:
@@ -298,30 +315,34 @@ class VLLMSamplerTQ(vLLMSampler):
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def cancel_generation(self, submission_id: str) -> dict[str, Any]:
-        """Cancel and forget one generation submission on every DP worker."""
-        future = self._generation_submissions.pop(submission_id, None)
-        if future is None:
+        """Request cancellation; forget only after vLLM's coroutine has exited.
+
+        Cancelling run_coroutine_threadsafe's Future reports success before the
+        coroutine's abort/finally runs. Cancel the loop-owned Task instead so the
+        Future becomes terminal only after actual cleanup.
+        """
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
             return {'submission_id': submission_id, 'status': 'missing'}
-        was_done = future.done()
-        cancelled = future.cancel()
-        if cancelled:
-            status = 'cancelled'
-        elif was_done:
-            status = 'completed'
-        else:
-            status = 'cancellation_requested'
-        return {
-            'submission_id': submission_id,
-            'status': status,
-        }
+        if submission.future.done():
+            self._generation_submissions.pop(submission_id, None)
+            return {'submission_id': submission_id, 'status': 'completed'}
+        if not submission.cancel_requested:
+            submission.cancel_requested = True
+
+            def cancel():
+                if submission.task is not None and not submission.task.done():
+                    submission.task.cancel()
+
+            self._async_loop.call_soon_threadsafe(cancel)
+        return {'submission_id': submission_id, 'status': 'cancellation_requested'}
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def cancel_all_generations(self) -> dict[str, int]:
-        """Cancel all retained CS submissions during replica shutdown."""
-        submissions = list(self._generation_submissions.values())
-        self._generation_submissions.clear()
-        cancelled = sum(future.cancel() for future in submissions if not future.done())
-        return {'submissions': len(submissions), 'cancelled': cancelled}
+        """Request cancellation of retained submissions during shutdown."""
+        ids = list(self._generation_submissions)
+        requested = sum(self.cancel_generation(key)['status'] == 'cancellation_requested' for key in ids)
+        return {'submissions': len(ids), 'cancelled': requested}
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
     def evaluate(
@@ -388,14 +409,15 @@ class VLLMSamplerTQ(vLLMSampler):
                 logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, '
                                'sampling will proceed without LoRA')
 
-        return await asyncio.gather(*(self._sample_single(
-            feat,
-            sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            logprobs_only=logprobs_only,
-            disable_lora=use_base_model,
-        ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)))
+        return await self._gather_samples(
+            self._sample_single(
+                feat,
+                sampling_params,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                logprobs_only=logprobs_only,
+                disable_lora=use_base_model,
+            ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list))
 
     def _on_submission_done(self, submission_id: str):
 

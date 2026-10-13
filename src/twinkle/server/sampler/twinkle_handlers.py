@@ -29,7 +29,7 @@ from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
-from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle.server.sampler.weights import sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
@@ -166,11 +166,15 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
 async def _await_generation(service: SamplerManagement, submission_id: str, timeout: float):
     """Poll one admitted generation through the backend boundary."""
     collected = False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
 
     async def poll():
         nonlocal collected
         poll_interval = 0.01
         while True:
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError
             try:
                 states = _submission_states(await service.call_backend(service.sampler.get_generation_status,
                                                                        submission_id))
@@ -196,14 +200,24 @@ async def _await_generation(service: SamplerManagement, submission_id: str, time
             poll_interval = min(poll_interval * 1.5, 0.25)
 
     try:
-        return await asyncio.wait_for(poll(), timeout=timeout)
+        return await poll()
     finally:
         if not collected:
+
+            async def cancel_and_wait():
+                while True:
+                    states = _submission_states(await service.call_backend(service.sampler.cancel_generation,
+                                                                           submission_id))
+                    if states and all(state.get('status') in ('completed', 'missing') for state in states):
+                        return
+                    await asyncio.sleep(0.01)
+
             try:
-                await asyncio.wait_for(
-                    service.call_backend(service.sampler.cancel_generation, submission_id), timeout=4.0)
-            except Exception:
-                logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
+                await asyncio.wait_for(cancel_and_wait(), timeout=4.0)
+            except BaseException:
+                service.sampling_guard.poison()
+                logger.warning('Generation cleanup did not confirm completion: %s', submission_id, exc_info=True)
+                # Preserve the original generation error, including cancellation.
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -230,7 +244,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         async def _task():
             # Resolve adapter
-            adapter_path = None
+            resolved_uri = None
             adapter_name = body.adapter_name or ''
             full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
@@ -238,9 +252,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-                # Reset prefix cache only when new weights are loaded.
-                await self.call_backend(self.sampler.reset_prefix_cache)
-                adapter_path = await resolve_sampler_weights(self, resolved_uri)
 
             # Parse inputs (shared seam; batch form)
             inputs = to_backend_inputs(body.inputs)
@@ -251,19 +262,22 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params = SamplingParams.from_dict(body.sampling_params)
 
             # Sample
-            responses = await self.call_backend(
-                self.sampler.sample,
-                inputs,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
+            async def generate(adapter_path):
+                return await self.call_backend(
+                    self.sampler.sample,
+                    inputs,
+                    params,
+                    adapter_name=full_adapter_name,
+                    adapter_path=adapter_path,
+                )
+
+            responses = await sample_with_weights(self, resolved_uri, generate)
             return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        return await self.submit_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
+        return await self.submit_concurrent_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(
@@ -298,15 +312,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # vLLM async engine owns generation concurrency, so the whole
             # admit -> await -> store sequence runs as one background future
             # (outside the serial compute queue) and its result is the DataRef.
-            await self.call_backend(
-                self.sampler.submit_generation,
-                submission_id,
-                inputs,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
-            responses = await _await_generation(self, submission_id, self.task_queue_config.effective_execution_timeout)
+            async def generate():
+                await self.call_backend(
+                    self.sampler.submit_generation,
+                    submission_id,
+                    inputs,
+                    params,
+                    adapter_name=full_adapter_name,
+                    adapter_path=adapter_path,
+                )
+                return await _await_generation(self, submission_id, self.task_queue_config.effective_execution_timeout)
+
+            responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(
                 _to_sample_response_models(responses),
                 group_ids=body.group_ids,

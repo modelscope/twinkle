@@ -13,7 +13,7 @@ from twinkle.infra import _dispatch_args
 from twinkle.server.sampler.twinkle_handlers import _await_generation
 from twinkle_agentic.async_rl import LoraContext
 from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup, RolloutPolicy
-from twinkle_agentic.async_rl.vllm_sampler_tq import (VLLMSamplerTQ, _dispatch_generation, _GeneratedSample,
+from twinkle_agentic.async_rl.vllm_sampler_tq import (_GenerationSubmission, VLLMSamplerTQ, _dispatch_generation, _GeneratedSample,
                                                       _PromptGroupRolloutStats)
 
 
@@ -174,7 +174,7 @@ def test_generation_failure_is_isolated_and_consumed() -> None:
     sampler = _bare_sampler()
     failed = Future()
     failed.set_exception(ValueError('bad prompt'))
-    sampler._generation_submissions['failed'] = failed
+    sampler._generation_submissions['failed'] = _GenerationSubmission(future=failed)
 
     state = sampler.get_generation_status('failed')
     assert state['status'] == 'failed'
@@ -185,29 +185,43 @@ def test_generation_failure_is_isolated_and_consumed() -> None:
     assert 'failed' not in sampler._generation_submissions
 
 
-def test_generation_can_be_cancelled_without_waiting() -> None:
+def test_cancellation_waits_for_actual_coroutine_cleanup() -> None:
+    async def run():
+        sampler = _bare_sampler()
+        sampler._async_loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        async def generate(*args, **kwargs):
+            try:
+                entered.set()
+                await asyncio.Future()
+            finally:
+                await release.wait()
+        sampler._generate_inputs = generate
+        sampler.submit_generation('pending', [], SamplingParams())
+        await entered.wait()
+        assert sampler.cancel_generation('pending')['status'] == 'cancellation_requested'
+        await asyncio.sleep(.01)
+        assert sampler.get_generation_status('pending')['status'] == 'running'
+        assert sampler.cancel_generation('pending')['status'] == 'cancellation_requested'
+        release.set()
+        for _ in range(100):
+            if sampler.get_generation_status('pending')['status'] == 'cancelled':
+                break
+            await asyncio.sleep(.001)
+        assert sampler.cancel_generation('pending')['status'] == 'completed'
+        assert not sampler._generation_submissions
+    asyncio.run(run())
+
+
+def test_all_completed_generations_are_forgotten_on_shutdown() -> None:
     sampler = _bare_sampler()
-    pending = Future()
-    sampler._generation_submissions['pending'] = pending
-
-    state = sampler.cancel_generation('pending')
-
-    assert state == {'submission_id': 'pending', 'status': 'cancelled'}
-    assert pending.cancelled()
-    assert 'pending' not in sampler._generation_submissions
-
-
-def test_all_generations_are_cancelled_on_shutdown() -> None:
-    sampler = _bare_sampler()
-    first = Future()
-    second = Future()
-    sampler._generation_submissions.update(first=first, second=second)
-
-    state = sampler.cancel_all_generations()
-
-    assert state == {'submissions': 2, 'cancelled': 2}
-    assert first.cancelled()
-    assert second.cancelled()
+    first, second = Future(), Future()
+    first.set_result([])
+    second.set_exception(ValueError('bad input'))
+    sampler._generation_submissions.update(
+        first=_GenerationSubmission(future=first), second=_GenerationSubmission(future=second))
+    assert sampler.cancel_all_generations() == {'submissions': 2, 'cancelled': 0}
     assert sampler._generation_submissions == {}
 
 

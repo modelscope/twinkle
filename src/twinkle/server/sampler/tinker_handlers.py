@@ -4,7 +4,7 @@
 Registered by ``_register_tinker_sampler_routes(app, self_fn)`` -- module-level route
 registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
 inheritance relationship with the deployment class. Provides POST /tinker/asample using
-schedule_task() returning UntypedAPIFuture.
+schedule_concurrent_task() returning UntypedAPIFuture.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle.server.sampler.weights import sample_with_weights
 from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
@@ -70,15 +70,6 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 # Extract prompt token IDs from ModelInput
                 prompt_inputs = {'input_ids': body.prompt.to_ints()}
 
-                # Set template for sampler based on model type
-                template = get_template_for_model(self.model_id)
-                await self.call_backend(self.sampler.set_template, template, model_id=self.model_id)
-                # Reset prefix cache unconditionally on every tinker request (by
-                # design): the tinker dialect does not signal whether weights
-                # changed, so it always invalidates. This differs from the twinkle
-                # endpoints, which reset only when an adapter_uri is supplied.
-                await self.call_backend(self.sampler.reset_prefix_cache)
-
                 # Get model_path from body or sampling session
                 model_path = body.model_path
                 if not model_path and body.sampling_session_id:
@@ -113,18 +104,28 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         logprobs=1,
                     )
 
-                # LoRA adapter dir vs full-parameter checkpoint (shared helper);
-                # a full checkpoint is loaded into the base model and yields no
-                # LoRA path.
-                lora_path = await resolve_sampler_weights(self, adapter_uri)
+                # Requests run concurrently, so sampler setup is serialized here.
+                # The template depends only on the model and is set once: every
+                # set_template or reset_prefix_cache call first waits for all
+                # in-flight generations (infra ``_cw_barrier``), so doing it per
+                # request would serialize sampling again. No prefix-cache reset is
+                # needed: vLLM caches LoRA requests under their own adapter name,
+                # and load_full_weights_from_path resets the cache itself.
+                async with self.tinker_setup_lock:
+                    if not self.tinker_template_set:
+                        template = get_template_for_model(self.model_id)
+                        await self.call_backend(self.sampler.set_template, template, model_id=self.model_id)
+                        self.tinker_template_set = True
 
-                responses = await self.call_backend(
-                    self.sampler.sample,
-                    inputs=[prompt_inputs] * body.num_samples,
-                    sampling_params=sampling_params,
-                    adapter_path=lora_path,
-                )
+                async def generate(lora_path):
+                    return await self.call_backend(
+                        self.sampler.sample,
+                        inputs=[prompt_inputs] * body.num_samples,
+                        sampling_params=sampling_params,
+                        adapter_path=lora_path,
+                    )
 
+                responses = await sample_with_weights(self, adapter_uri, generate)
                 tinker_sequences = []
                 for response in responses:
                     # twinkle logprobs are ``List[List[Tuple[int, float]]]``
@@ -159,7 +160,8 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 raise
 
         input_tokens = len(body.prompt.to_ints())
-        return await self.schedule_task(
+        # Not the serial compute queue: vLLM batches concurrent requests itself.
+        return await self.schedule_concurrent_task(
             _do_sample,
             token=token,
             input_tokens=input_tokens,

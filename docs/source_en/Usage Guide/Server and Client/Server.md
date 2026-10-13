@@ -479,3 +479,10 @@ raises. During that window newly arriving tasks fail fast with a `server`/503 er
 Each persisted future stores its immutable `absolute_deadline` when it is created.
 Cleanup therefore reaches the same decision regardless of which deployment process
 holds the cleanup lease.
+
+### Sampler concurrency and weight changes
+
+- Ordinary Tinker and Twinkle `sample()` requests support concurrency without changing response schemas or future polling. `queue_config.concurrent_task_limit` limits unfinished concurrent tasks per sampler replica and defaults to `128`; capacity exhaustion returns `server`/503. Training compute remains serial.
+- During ordinary sampling, full-checkpoint switches wait for existing ordinary and DataPlane generation to finish. Loading a full checkpoint and generating with it cannot overlap these requests. LoRA uses adapter checkpoints; full checkpoints are for full-parameter or merged models.
+- After an ordinary sampling request times out, backend cleanup may still be running. New requests are temporarily refused during cleanup. If resource release or the integrity of weights after a failed update cannot be confirmed, the replica keeps returning `server`/503 and must be restarted.
+- Unexpected backend cancellation leaves a `failed` future and requires a replica restart. Ordinary generation errors allow subsequent requests once cleanup finishes.

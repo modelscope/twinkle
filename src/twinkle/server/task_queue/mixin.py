@@ -34,7 +34,7 @@ logger = get_logger()
 
 
 class TaskQueueMixin:
-    """Mixin providing two task execution paths.
+    """Mixin providing three task execution paths.
 
     Execution paths
     ---------------
@@ -42,7 +42,12 @@ class TaskQueueMixin:
        Single background worker, serial execution, round-robin across queues.
        Use for GPU operations: forward, backward, step, save, load, etc.
 
-    2. Background task (schedule_background_task):
+    2. Concurrent compute task (schedule_concurrent_task):
+       Same admission, status tracking and failure handling as the compute
+       queue, but starts immediately. Use for a backend that batches
+       concurrent requests itself, such as vLLM sampling.
+
+    3. Background task (schedule_background_task):
        asyncio.create_task, runs concurrently with compute queue. Use for I/O
        or an engine that provides its own safe concurrency and batching.
        Status is still tracked; clients can poll the same status endpoints.
@@ -305,10 +310,56 @@ class TaskQueueMixin:
             request_id=request_id,
         )
 
+    async def schedule_concurrent_task(
+        self,
+        coro_factory: Callable[[], Coroutine],
+        model_id: str | None = None,
+        token: str | None = None,
+        input_tokens: int = 0,
+        task_type: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Schedule a compute task that runs now instead of in serial order.
+
+        Use for a backend that batches concurrent requests itself, such as the
+        vLLM sampler: through the serial queue it would only ever see one
+        request at a time. Preflight checks, the persisted future, the execution
+        timeout and failure mapping are the same as :meth:`schedule_task`.
+
+        Returns:
+            {'request_id': str, 'model_id': str | None}
+        """
+        request_id = request_id or f'req_{uuid.uuid4().hex}'
+
+        # Decision_Boundary: raises RequestRejectedError before any state write.
+        await self._perform_preflight_checks(model_id=model_id, token=token, input_tokens=input_tokens)
+
+        await self._compute_worker.submit_detached(
+            QueuedTask(
+                request_id=request_id,
+                coro_factory=coro_factory,
+                model_id=model_id,
+                token=token,
+                input_tokens=input_tokens,
+                task_type=task_type,
+                created_at=time.monotonic()),
+            self._queue_key(model_id=model_id, token=token),
+            replica_id=getattr(self, 'replica_id', None),
+            absolute_deadline=self._future_deadline())
+        logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
+                    f'model_id={model_id}, input_tokens={input_tokens}')
+        return {'request_id': request_id, 'model_id': model_id}
+
     # Poll cadence *inside* the Inline_Fast_Path window. Much smaller than the window
     # itself so a task that finishes early is noticed promptly; the window bound
     # (config.inline_fast_path_timeout) is what actually caps submit latency.
     _INLINE_FAST_PATH_POLL = 0.005
+
+    async def submit_concurrent_and_peek(self, coro_factory: Callable[[], Coroutine],
+                                         **schedule_kwargs) -> TaskEnvelope:
+        """Concurrent compute submission with the existing Twinkle future envelope."""
+        ref = await self.schedule_concurrent_task(coro_factory, **schedule_kwargs)
+        return await self._peek_terminal(ref['request_id'], fallback_status='pending')
 
     async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope:
         """Poll a record up to the Inline_Fast_Path window; return a terminal envelope

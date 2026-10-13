@@ -7,6 +7,7 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
+import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
@@ -19,8 +20,10 @@ from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle.server.task_queue.types import BACKEND_TIMEOUT_EXCEPTIONS
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger
+from .concurrency import SamplerConcurrency
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 
@@ -73,7 +76,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     Manages:
     - mock or vLLM sampler initialization and lifecycle
     - Tinker inference requests (/tinker/asample) with rate limiting via TaskQueueMixin
-    - Twinkle inference requests (/twinkle/*) calling sampler directly
+    - Concurrent Twinkle inference requests (/twinkle/*) with future polling
     - Template configuration for trajectory encoding
     """
 
@@ -128,18 +131,48 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             collect_width=len(actors) if actors else 1,
         )
         self.sampler._ray_get_timeout = self.task_queue_config.effective_execution_timeout
+        self.sampling_guard = SamplerConcurrency(self.task_queue_config.concurrent_task_limit)
+        # Serialize only the one-time Tinker template initialization.
+        self.tinker_setup_lock = asyncio.Lock()
+        self.tinker_template_set = False
 
     async def shutdown(self) -> None:
+        self.sampling_guard.close()
         try:
             cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
             if callable(cancel_all):
-                await self.call_backend(cancel_all)
+                await self.call_backend(cancel_all, admit=False)
         finally:
             try:
                 await self.state.unregister_replica(self.replica_id)
             finally:
                 await self.shutdown_task_queue()
                 await self.data_plane.close()
+
+    async def call_backend(self, fn, /, *args, admit: bool = True, mutation: bool = False, **kwargs):
+
+        if not admit:
+            return await super().call_backend(fn, *args, admit=False, **kwargs)
+
+        async def call():
+            try:
+                return await super(SamplerManagement, self).call_backend(fn, *args, admit=admit, **kwargs)
+            except asyncio.CancelledError:
+                self.sampling_guard.poison()
+                raise
+            except BACKEND_TIMEOUT_EXCEPTIONS:
+                self.sampling_guard.poison()
+                raise
+            except Exception:
+                if mutation:
+                    self.sampling_guard.poison()
+                raise
+
+        if self.sampling_guard.owns_job():
+            return await call()
+        # Control-plane operations also own their backend lifetime. Sampling
+        # calls inside a job reuse its access rather than acquiring another lock.
+        return await self.sampling_guard.run(call, exclusive=True)
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
