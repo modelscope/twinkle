@@ -1,14 +1,10 @@
 """Real Tinker/Twinkle concurrency, weight isolation and lifecycle checks."""
 from __future__ import annotations
 
-import concurrent.futures
-import json
 import math
 import os
 import threading
 import time
-from contextlib import contextmanager
-from pathlib import Path
 
 import pytest
 
@@ -41,7 +37,6 @@ def test_both_dialects_batch_independent_requests(clients, count, dialect):
         assert throughput > 1.5 * clients['single_throughput'][dialect], 'independent requests still appear serial'
 
 
-
 @pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
 def test_concurrent_request_mapping(clients, dialect):
     words = ['apple', 'banana', 'orange', 'purple', 'yellow', 'green', 'blue', 'red']
@@ -51,7 +46,6 @@ def test_concurrent_request_mapping(clients, dialect):
     results, elapsed = _parallel(jobs)
     assert all(result[0][0] == solo[i % len(solo)] for i, result in enumerate(results))
     _report(check='mapping', dialect=dialect, count=32, unique_prompts=8, seconds=elapsed, solo_equal=True)
-
 
 
 def test_mixed_dialects_and_multiple_samples(clients):
@@ -69,7 +63,6 @@ def test_mixed_dialects_and_multiple_samples(clients):
                             num_samples=4, temperature=0.7) for i in range(16)])
     assert sum(len(result) for result in results) == 64
     _report(check='mixed_multiple_samples', requests=16, sequences=64, seconds=elapsed)
-
 
 
 @pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
@@ -92,7 +85,6 @@ def test_full_checkpoints_are_isolated_across_dialects(clients, full_checkpoints
         _sample(clients, 'twinkle', ids, 2, adapter=full_checkpoints[0])
 
 
-
 @pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
 def test_invalid_generation_does_not_disable_sampler(clients, dialect):
     ids = _prompt(clients, 'Reply with exactly this word and nothing else: apple')
@@ -100,7 +92,6 @@ def test_invalid_generation_does_not_disable_sampler(clients, dialect):
         _sample(clients, dialect, [10**9], 4)
     assert _sample(clients, dialect, ids, 4)[0][0]
     _report(check='failure_recovery', dialect=dialect)
-
 
 
 def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
@@ -157,19 +148,6 @@ def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
         ray.shutdown()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_data_plane_http_generation_and_failure_recovery(clients):
     from twinkle_client.data_plane import DataPlaneClient
     store = DataPlaneClient(transport=clients['twinkle']._transport)
@@ -202,10 +180,6 @@ def test_data_plane_http_generation_and_failure_recovery(clients):
     ])
     assert results == [2, 2, expected, expected]
     _report(check='data_plane_http', requests=4, sequences=6, recovered=True, seconds=elapsed)
-
-
-
-
 
 
 def test_backend_self_cancellation_terminates_both_sdk_futures(clients):

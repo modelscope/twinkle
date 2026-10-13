@@ -1,5 +1,6 @@
 import asyncio
 import pytest
+import pytest_asyncio
 
 from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
@@ -362,10 +363,27 @@ async def test_submit_and_peek_honors_explicit_request_id():
     assert env.status == 'completed'
 
 
+@pytest_asyncio.fixture
+async def make_concurrent_queue():
+    """Keep concurrent worker setup and teardown in one place."""
+    queues = []
+
+    def create(config=None):
+        queue = _DummyQueue()
+        if config is not None:
+            queue._task_queue_config = config
+        queue.enable_compute_worker()
+        queues.append(queue)
+        return queue
+
+    yield create
+    for queue in reversed(queues):
+        await queue._compute_worker.stop()
+
+
 @pytest.mark.asyncio
-async def test_concurrent_tasks_run_side_by_side():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_concurrent_tasks_run_side_by_side(make_concurrent_queue):
+    queue = make_concurrent_queue()
     started = []
     both_started = asyncio.Event()
 
@@ -377,18 +395,15 @@ async def test_concurrent_tasks_run_side_by_side():
         await asyncio.wait_for(both_started.wait(), timeout=1)
         return {'index': index}
 
-    try:
-        refs = [
-            await queue.schedule_concurrent_task(lambda i=i: work(i), token='token1', task_type='sample')
-            for i in range(2)
-        ]
-        for _ in range(100):
-            records = [await queue.state.get_future(ref['request_id']) for ref in refs]
-            if all(record['status'] == 'completed' for record in records):
-                break
-            await asyncio.sleep(0.01)
-    finally:
-        await queue._compute_worker.stop()
+    refs = [
+        await queue.schedule_concurrent_task(lambda i=i: work(i), token='token1', task_type='sample')
+        for i in range(2)
+    ]
+    for _ in range(100):
+        records = [await queue.state.get_future(ref['request_id']) for ref in refs]
+        if all(record['status'] == 'completed' for record in records):
+            break
+        await asyncio.sleep(0.01)
 
     assert [record['result'] for record in records] == [{'index': 0}, {'index': 1}]
     # The serial worker loop is never involved.
@@ -396,22 +411,18 @@ async def test_concurrent_tasks_run_side_by_side():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_task_keeps_queue_failure_mapping():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_concurrent_task_keeps_queue_failure_mapping(make_concurrent_queue):
+    queue = make_concurrent_queue()
 
     async def work():
         raise UserTaskError('invalid request')
 
-    try:
-        await queue.schedule_concurrent_task(work, token='token1')
-        for _ in range(100):
-            failed = [kwargs for args, kwargs in queue.state.records if args[1] == 'failed']
-            if failed:
-                break
-            await asyncio.sleep(0)
-    finally:
-        await queue._compute_worker.stop()
+    await queue.schedule_concurrent_task(work, token='token1')
+    for _ in range(100):
+        failed = [kwargs for args, kwargs in queue.state.records if args[1] == 'failed']
+        if failed:
+            break
+        await asyncio.sleep(0)
 
     assert [args[1] for args, _ in queue.state.records] == ['pending', 'running', 'failed']
     failure = failed[-1]['failure']
@@ -420,10 +431,9 @@ async def test_concurrent_task_keeps_queue_failure_mapping():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_task_preflight_rejection_raises_without_writing():
+async def test_concurrent_task_preflight_rejection_raises_without_writing(make_concurrent_queue):
     from twinkle.server.exceptions import InputTokensExceededError
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+    queue = make_concurrent_queue()
 
     async def work():
         raise AssertionError('preflight rejection must not execute the task')
@@ -437,9 +447,8 @@ async def test_concurrent_task_preflight_rejection_raises_without_writing():
 
 
 @pytest.mark.asyncio
-async def test_worker_stop_cancels_concurrent_task():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_worker_stop_cancels_concurrent_task(make_concurrent_queue):
+    queue = make_concurrent_queue()
     entered = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -458,11 +467,9 @@ async def test_worker_stop_cancels_concurrent_task():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_capacity_rejects_before_future_write_and_is_reusable():
+async def test_concurrent_capacity_rejects_before_future_write_and_is_reusable(make_concurrent_queue):
     from twinkle.server.exceptions import ResourceExhaustedError
-    queue = _DummyQueue()
-    queue._task_queue_config = TaskQueueConfig(concurrent_task_limit=1)
-    queue.enable_compute_worker()
+    queue = make_concurrent_queue(TaskQueueConfig(concurrent_task_limit=1))
     release = asyncio.Event()
 
     async def work():
@@ -483,13 +490,11 @@ async def test_concurrent_capacity_rejects_before_future_write_and_is_reusable()
         assert envelope.status == 'completed'
     finally:
         release.set()
-        await queue._compute_worker.stop()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_reservation_is_released_when_state_write_fails():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_concurrent_reservation_is_released_when_state_write_fails(make_concurrent_queue):
+    queue = make_concurrent_queue()
 
     async def fail(*args, **kwargs):
         raise RuntimeError('state unavailable')
@@ -502,10 +507,9 @@ async def test_concurrent_reservation_is_released_when_state_write_fails():
 
 
 @pytest.mark.asyncio
-async def test_stop_between_future_write_and_start_leaves_terminal_record():
+async def test_stop_between_future_write_and_start_leaves_terminal_record(make_concurrent_queue):
     from twinkle.server.exceptions import ResourceExhaustedError
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+    queue = make_concurrent_queue()
     original = queue.state.store_future_status
 
     async def write_then_stop(*args, **kwargs):
@@ -521,9 +525,8 @@ async def test_stop_between_future_write_and_start_leaves_terminal_record():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_cancel_before_task_start_leaves_failed_future():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_shutdown_cancel_before_task_start_leaves_failed_future(make_concurrent_queue):
+    queue = make_concurrent_queue()
     executed = False
     async def work():
         nonlocal executed
@@ -537,9 +540,8 @@ async def test_shutdown_cancel_before_task_start_leaves_failed_future():
 
 
 @pytest.mark.asyncio
-async def test_cancel_preserves_existing_terminal_record():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_cancel_preserves_existing_terminal_record(make_concurrent_queue):
+    queue = make_concurrent_queue()
     entered = asyncio.Event()
     async def work():
         entered.set()
@@ -553,9 +555,8 @@ async def test_cancel_preserves_existing_terminal_record():
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_running_status_write_leaves_failed_future():
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
+async def test_cancel_during_running_status_write_leaves_failed_future(make_concurrent_queue):
+    queue = make_concurrent_queue()
     entered = asyncio.Event()
     original = queue.state.store_future_status
     async def write(*args, **kwargs):

@@ -2,13 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import queue
 import threading
-from types import SimpleNamespace
 
-import pytest
+import pytest_asyncio
 from fastapi import FastAPI
-from ray.exceptions import GetTimeoutError
 from starlette.requests import Request
 from tinker import types as tinker_types
 
@@ -20,7 +17,6 @@ from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_rout
 from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.server.task_queue.backend_gate import BackendGate
 from twinkle.server.task_queue.config import TaskQueueConfig
-from twinkle.server.task_queue.types import BackendBusyError
 from twinkle.server.task_queue.worker import ComputeWorker
 
 
@@ -29,7 +25,6 @@ async def _until(predicate):
         while not predicate():
             await asyncio.sleep(0.001)
     await asyncio.wait_for(wait(), 3)
-
 
 
 class _State:
@@ -43,11 +38,9 @@ class _State:
         return self.records.get(request_id)
 
 
-
 class _Limiter:
     async def check_and_record(self, *args):
         return True, None
-
 
 
 class _Sampler:
@@ -85,7 +78,6 @@ class _Sampler:
         finally:
             with self._lock:
                 self.active -= 1
-
 
 
 class _Service(SamplerManagement):
@@ -138,10 +130,24 @@ class _Service(SamplerManagement):
         self._backend_gate.shutdown()
 
 
-
 def _tokens(record, dialect):
     assert record['status'] == 'completed', record
     result = record['result']
     if dialect == 'tinker':
         return result.sequences[0].tokens
     return result['samples'][0]['sequences'][0]['tokens']
+
+
+@pytest_asyncio.fixture
+async def make_service():
+    """Create services and close them even when a test assertion fails."""
+    services = []
+
+    def create(**kwargs):
+        service = _Service(**kwargs)
+        services.append(service)
+        return service
+
+    yield create
+    for service in reversed(services):
+        await service.close()

@@ -13,19 +13,18 @@ import pytest
 
 @pytest.fixture(scope='session', autouse=True)
 def _ray_runtime():
+    """Use the external server; do not start the parent conftest's local Ray."""
     yield
-
 
 
 @pytest.fixture(autouse=True)
 def _reset_canonical_state_actor():
+    """Keep external server state intact across E2E requests."""
     yield
-
 
 
 def _report(**values):
     print('SAMPLER_CONCURRENCY ' + json.dumps(values, sort_keys=True), flush=True)
-
 
 
 @pytest.fixture(scope='module')
@@ -47,12 +46,10 @@ def clients():
     }
 
 
-
 def _prompt(clients, text):
     return clients['tokenizer'].apply_chat_template(
         [{'role': 'user', 'content': text}], tokenize=True, add_generation_prompt=True,
         enable_thinking=False, return_dict=False)
-
 
 
 def _sample(clients, dialect, ids, max_tokens=128, *, adapter=None, num_samples=1, temperature=0):
@@ -77,7 +74,6 @@ def _sample(clients, dialect, ids, max_tokens=128, *, adapter=None, num_samples=
     return sequences
 
 
-
 def _parallel(jobs):
     barrier = threading.Barrier(len(jobs))
     def run(job):
@@ -87,7 +83,6 @@ def _parallel(jobs):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         results = list(pool.map(run, jobs))
     return results, time.perf_counter() - started
-
 
 
 @pytest.fixture(scope='module')
@@ -124,7 +119,6 @@ def adapters(clients):
     return paths
 
 
-
 @pytest.fixture(scope='module')
 def full_checkpoints(clients):
     """Two complete HF checkpoints with different, observable model weights."""
@@ -147,13 +141,11 @@ def full_checkpoints(clients):
     return [str(source), str(target)]
 
 
-
 def _checkpoint_handles(clients, dialect, paths):
     if dialect == 'tinker':
         return [clients['service'].create_sampling_client(base_model=clients['model_id'], model_path=path)
                 for path in paths]
     return paths
-
 
 
 def _assert_adapter_isolation(clients, adapters, dialect):
