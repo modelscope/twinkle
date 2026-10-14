@@ -572,3 +572,34 @@ async def test_cancel_during_running_status_write_leaves_failed_future(make_conc
     assert record['status'] == 'failed'
     assert record['failure']['reason_code'] == 'orphaned_replica'
     assert [args[1] for args, _ in queue.state.records] == ['pending', 'failed']
+
+
+@pytest.mark.asyncio
+async def test_cancel_winning_running_write_race_skips_execution(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    executed = False
+    original = queue.state.store_future_status
+
+    async def cancel_before_running(*args, **kwargs):
+        if args[1] == 'running':
+            # Mirror FutureManager: cancel_if_pending wins, then the terminal record refuses 'running'.
+            queue.state._latest[args[0]] = {'status': 'cancelled', 'result': None, 'failure': None}
+            return
+        await original(*args, **kwargs)
+
+    async def work():
+        nonlocal executed
+        executed = True
+        return {'ok': True}
+
+    queue.state.store_future_status = cancel_before_running
+    ref = await queue.schedule_concurrent_task(work, token='token1')
+    for _ in range(100):
+        if queue._compute_worker._detached_reserved == 0:
+            break
+        await asyncio.sleep(0.001)
+
+    assert not executed
+    assert queue.state._latest[ref['request_id']]['status'] == 'cancelled'
+    assert queue._compute_worker._detached_reserved == 0
+    assert not queue._compute_worker._detached_tasks

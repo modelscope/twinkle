@@ -177,7 +177,7 @@ def _real_sampler_actors():
     ray.init(address=os.environ['RAY_ADDRESS'], namespace='default', ignore_reinit_error=True,
              log_to_driver=False)
     actors = list_actors(address=os.environ['TWINKLE_TEST_RAY_DASHBOARD_URL'],
-                         filters=[('class_name', '=', os.environ.get('TWINKLE_TEST_SAMPLER_CLASS', 'VLLMSamplerTQ')),
+                         filters=[('class_name', '=', os.environ.get('TWINKLE_TEST_SAMPLER_CLASS', 'ServerVLLMSampler')),
                                   ('state', '=', 'ALIVE')],
                          detail=True)
     assert len(actors) == int(os.environ.get('TWINKLE_TEST_DP', '1'))

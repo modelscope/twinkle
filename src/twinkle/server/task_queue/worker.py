@@ -387,6 +387,14 @@ class ComputeWorker:
                 task.model_id,
                 queue_state=QueueState.ACTIVE.value,
             )
+            # A client cancel (or orphan cleanup) can win the race against the
+            # running write; the terminal record is kept, so do not start work
+            # nobody will collect. Once running is stored, cancel_if_pending can
+            # no longer succeed, so this read closes the window.
+            if await self._is_record_terminal(task.request_id):
+                task_status = 'cancelled'
+                logger.info(f'[ComputeWorker] Task {task.request_id} became terminal before start; skipping.')
+                return
             with traced_operation('task_queue.execute', attrs=queue_attrs):
                 logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
                              f'type={task_type}, queue_key={queue_key}')
