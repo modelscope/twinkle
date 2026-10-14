@@ -26,7 +26,7 @@ class _FakeService:
         # The helper only routes load_full_weights_from_path through call_backend.
         if getattr(fn, '__name__', None) == 'load_full_weights_from_path':
             self.full_weight_loads.append(args[0])
-        return fn(*args)
+        return fn(*args, **kwargs)
 
 
 @pytest.mark.asyncio

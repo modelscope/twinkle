@@ -89,8 +89,6 @@ async def test_stream_timeout_returns_error_payload_and_closes_queue():
 class _GenerationService:
 
     def __init__(self) -> None:
-        from twinkle.server.sampler.concurrency import SamplerConcurrency
-        self.sampling_guard = SamplerConcurrency()
         self.cancelled = False
         self.sampler = SimpleNamespace(
             get_generation_status=lambda _submission_id: {'status': 'running'},
@@ -101,9 +99,8 @@ class _GenerationService:
     async def call_backend(self, fn, /, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    def _cancel(self, _submission_id: str):
+    def _cancel(self, _submission_id: str) -> None:
         self.cancelled = True
-        return {'status': 'completed'}
 
 
 @pytest.mark.asyncio

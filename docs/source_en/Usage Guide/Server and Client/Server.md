@@ -479,9 +479,3 @@ raises. During that window newly arriving tasks fail fast with a `server`/503 er
 Each persisted future stores its immutable `absolute_deadline` when it is created.
 Cleanup therefore reaches the same decision regardless of which deployment process
 holds the cleanup lease.
-
-### Sampler concurrency and weight changes
-
-- Ordinary Tinker and Twinkle `sample()` requests support concurrency with unchanged response schemas and future polling; training compute remains serial. `queue_config.concurrent_task_limit` defaults to `128` and bounds admitted, unfinished tasks per replica; exhaustion returns `server`/503. Actual execution concurrency also depends on the backend thread pool, actor, and vLLM settings.
-- Full checkpoint loading and generation exclusively own the weights and wait for existing ordinary and DataPlane generation to finish. LoRA uses adapter checkpoints without replacing base weights on each request.
-- A sampling timeout fails only its future; capacity stays reserved until the backend finishes, while other sampling can continue. Invalid checkpoints are rejected before writes. A failed weight write fails the health check so Ray Serve replaces the replica.

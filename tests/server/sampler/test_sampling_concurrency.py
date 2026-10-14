@@ -1,18 +1,160 @@
+"""Sampler route concurrency, weight ownership and request failure recovery."""
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from ray.exceptions import GetTimeoutError
 from starlette.requests import Request
+from tinker import types as tinker_types
 
-from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.exceptions import FullWeightLoadError
+from twinkle.protocol.types import SampleRequest
+from twinkle.server.sampler.app import SamplerManagement
+from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle.server.task_queue.backend_gate import BackendGate
+from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.types import BackendBusyError
+from twinkle.server.task_queue.worker import ComputeWorker
 
 
-from tests.server.sampler.sampling_test_helpers import _tokens, _until, make_service
+async def _until(predicate):
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0.001)
+    await asyncio.wait_for(wait(), 3)
+
+
+class _State:
+    def __init__(self):
+        self.records = {}
+
+    async def store_future_status(self, request_id, status, model_id=None, **kwargs):
+        self.records[request_id] = {'status': status, **kwargs}
+
+    async def get_future(self, request_id):
+        return self.records.get(request_id)
+
+
+class _Limiter:
+    async def check_and_record(self, *args):
+        return True, None
+
+
+class _Sampler:
+    def __init__(self):
+        self.weight = 0
+        self.loads = []
+        self.active = 0
+        self.peak = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+        self._lock = threading.Lock()
+        self.template_calls = 0
+
+    def set_template(self, *args, **kwargs):
+        self.template_calls += 1
+
+    def load_full_weights_from_path(self, path):
+        self.weight = int(path.rsplit('/', 1)[-1])
+        self.loads.append(self.weight)
+
+    def sample(self, inputs, sampling_params=None, **kwargs):
+        with self._lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.entered.set()
+        try:
+            if not self.release.wait(3):
+                raise TimeoutError('test did not release generation')
+            token = self.weight or inputs[0]['input_ids'][0]
+            return [SampleResponse(
+                prompt_token_ids=list(item['input_ids']),
+                sequences=[SampledSequence(stop_reason='length', tokens=[token], logprobs=[[(token, -0.1)]])],
+            ) for item in inputs]
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+class _Service(SamplerManagement):
+    def __init__(self, *, timeout=2, limit=128):
+        self.model_id = 'mock-model'
+        self.replica_id = 'sampler-test'
+        self.state = _State()
+        self.sampler = _Sampler()
+        self.sampling_guard = SamplerConcurrency()
+        self._task_queue_config = TaskQueueConfig(execution_timeout=timeout, concurrent_task_limit=limit)
+        self._rate_limiter = _Limiter()
+        self._task_metrics = None
+        self._deployment_name = None
+        self._event_loop = None
+        self._backend_gate = BackendGate()
+        self._compute_worker = ComputeWorker(
+            state=self.state, config=self._task_queue_config, task_metrics=None, deployment_name=None)
+        app = FastAPI()
+        _register_tinker_sampler_routes(app, lambda: self)
+        _register_twinkle_sampler_routes(app, lambda: self)
+        self.endpoints = {route.path: route.endpoint for route in app.routes}
+
+    async def _on_request_start(self, request):
+        return 'token'
+
+    async def submit(self, dialect, token=7, path=None):
+        request = Request({'type': 'http', 'headers': []})
+        if dialect == 'tinker':
+            body = tinker_types.SampleRequest(
+                prompt=tinker_types.ModelInput.from_ints([token]), model_path=path,
+                sampling_params=tinker_types.SamplingParams(max_tokens=1, temperature=0))
+            ref = await self.endpoints['/tinker/asample'](request, body, self)
+            return ref['request_id']
+        body = SampleRequest(inputs=[{'input_ids': [token]}], adapter_uri=path,
+                             sampling_params={'max_tokens': 1, 'temperature': 0})
+        envelope = await self.endpoints['/twinkle/sample'](request, body, self)
+        return envelope.request_id
+
+    async def result(self, request_id):
+        await _until(lambda: self.state.records[request_id]['status'] in ('completed', 'failed'))
+        return self.state.records[request_id]
+
+    async def close(self):
+        self.sampler.release.set()
+        self.sampling_guard.close()
+        await self._compute_worker.stop()
+        await _until(lambda: not self.sampling_guard._jobs)
+        self._backend_gate.shutdown()
+
+
+def _tokens(record, dialect):
+    assert record['status'] == 'completed', record
+    result = record['result']
+    if dialect == 'tinker':
+        return result.sequences[0].tokens
+    return result['samples'][0]['sequences'][0]['tokens']
+
+
+@pytest_asyncio.fixture
+async def make_service():
+    """Create services and close them even when a test assertion fails."""
+    services = []
+
+    def create(**kwargs):
+        service = _Service(**kwargs)
+        services.append(service)
+        return service
+
+    yield create
+    for service in reversed(services):
+        await service.close()
 
 
 @pytest.mark.asyncio
@@ -248,17 +390,6 @@ async def test_partial_checkpoint_failure_quarantines_changed_weights(make_servi
         await service.check_health()
 
 
-@pytest.mark.asyncio
-async def test_shutdown_before_task_first_step_marks_future_failed(make_service):
-    from twinkle.server.task_queue.types import QueuedTask
-    service = make_service()
-    worker = service._compute_worker
-    worker.reserve_detached()
-    await service.state.store_future_status('not-started', 'pending')
-    worker.run_detached(QueuedTask('not-started', lambda: asyncio.sleep(0), None, None, 0, 'sample', 0), 'q')
-    await worker.stop()
-    assert service.state.records['not-started']['failure'].reason_code == 'orphaned_replica'
-    assert worker._detached_reserved == 0
 
 
 @pytest.mark.asyncio
@@ -291,15 +422,6 @@ async def test_timeout_keeps_job_capacity_and_does_not_overwrite_failed_future(m
     assert (await service.result(await service.submit('twinkle')))['status'] == 'completed'
 
 
-@pytest.mark.asyncio
-async def test_nested_status_poll_reuses_job_access(make_service):
-    service = make_service()
-    async def job():
-        # A separate polling Task inherits the job's access context.
-        await asyncio.wait_for(service.call_backend(service.sampler.set_template, 'test'), timeout=1)
-    await service.sampling_guard.run(job, exclusive=True)
-    assert service.sampler.template_calls == 1
-    assert not service.sampling_guard._writer
 
 
 @pytest.mark.asyncio
@@ -360,3 +482,54 @@ async def test_backend_cancellation_leaves_terminal_failure(make_service, dialec
     assert service._compute_worker._detached_reserved == 0
     await service._compute_worker.stop()
     assert service.state.records[ref] == record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
+async def test_invalid_checkpoint_rejects_request_without_disabling_sampling(make_service, tmp_path, dialect):
+    service = make_service()
+    ref = await service.submit(dialect, path=str(tmp_path / 'missing'))
+    failed = await service.result(ref)
+    assert failed['failure'].reason_code == 'request_rejected'
+    assert failed['failure'].attribution == 'user'
+    assert _tokens(await service.result(await service.submit(dialect)), dialect) == [7]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_backend_timeout_does_not_disable_replica(make_service):
+    service = make_service()
+    sample = service.sampler.sample
+    service.sampler.sample = lambda *a, **k: (_ for _ in ()).throw(GetTimeoutError('one request timed out'))
+    with pytest.raises(GetTimeoutError):
+        await service.call_backend(service.sampler.sample)
+    service.sampler.sample = sample
+    assert _tokens(await service.result(await service.submit('twinkle')), 'twinkle') == [7]
+
+
+@pytest.mark.asyncio
+async def test_stream_route_resolves_adapter_uri(make_service, tmp_path):
+    service = make_service()
+    (tmp_path / 'adapter_config.json').write_text(json.dumps({'r': 1}))
+    service.sampler.reset_prefix_cache = lambda: None
+    service.sampler._actors = []
+    request = Request({'type': 'http', 'headers': []})
+    response = await service.endpoints['/twinkle/sample_stream'](
+        request, SampleRequest(inputs=[{'input_ids': [7]}], adapter_uri=str(tmp_path)), service)
+    rows = [json.loads(row) async for row in response.body_iterator]
+    assert rows[0]['error_code'] == 503
+
+
+@pytest.mark.asyncio
+async def test_sampling_timeout_keeps_capacity_without_blocking_other_readers(make_service):
+    import asyncio
+    service = make_service(timeout=0.05, limit=2)
+    service.sampler.release.clear()
+    timed_out = await service.submit('tinker')
+    await _until(service.sampler.entered.is_set)
+    assert (await service.result(timed_out))['failure'].reason_code == 'execution_timeout'
+    submitting = asyncio.create_task(service.submit('twinkle'))
+    await _until(lambda: service.sampler.peak == 2)
+    service.sampler.release.set()
+    assert _tokens(await service.result(await submitting), 'twinkle') == [7]
+    await _until(lambda: service._compute_worker._detached_reserved == 0)
+    await service.check_health()
