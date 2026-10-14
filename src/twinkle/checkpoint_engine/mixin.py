@@ -12,10 +12,14 @@ class CheckpointEngineMixin:
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
         if self._checkpoint_engine is None:
-            if Platform.get_platform().__name__ == 'GPU':
+            platform_name = Platform.get_platform().__name__
+            if platform_name == 'GPU':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
                 self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
-            elif Platform.get_platform().__name__ == 'NPU':
+            elif platform_name == 'XPU':
+                from twinkle.checkpoint_engine import XCCLCheckpointEngine
+                self._checkpoint_engine = XCCLCheckpointEngine(self._bucket_size)
+            elif platform_name == 'NPU':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
 
                 # Reusing HCCL communicator across sync steps avoids frequent

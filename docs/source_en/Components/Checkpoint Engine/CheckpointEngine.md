@@ -39,7 +39,7 @@ class CheckpointEngine(ABC):
 
 ## Available Checkpoint Engines
 
-Twinkle provides two checkpoint engine implementations:
+Twinkle provides three checkpoint engine implementations:
 
 ### NCCLCheckpointEngine
 
@@ -61,10 +61,21 @@ A checkpoint engine that uses HCCL for weight transfer between Ascend NPUs.
 
 See: [HCCLCheckpointEngine](HCCLCheckpointEngine.md)
 
+### XCCLCheckpointEngine
+
+A checkpoint engine that transfers weights over BKCL (XCCL) on Kunlunxin XPU.
+
+- XPU Support: Drop-in for NCCLCheckpointEngine on the cuda-alike XPU route
+- Relay Fallback: Handles duplicate local device indices via a stateless `ProcessGroupXCCL` plus a socket relay
+- Compatible Interface: Inherits `NCCLCheckpointEngine`, reusing bucketing and metadata handshake
+
+See: [XCCLCheckpointEngine](XCCLCheckpointEngine.md)
+
 ## How to Choose
 
 - **NCCLCheckpointEngine**: Suitable for GPU environments, provides the highest transfer performance
 - **HCCLCheckpointEngine**: Suitable for Ascend NPU environments
+- **XCCLCheckpointEngine**: Suitable for Kunlunxin XPU environments (selected automatically)
 
 > Checkpoint engine is a key component of RLHF training infrastructure, ensuring that trainers and samplers use consistent model weights.
 > Currently, synchronization is divided into two cases based on merge_and_sync=True/False. When set to True, the LoRA is merged into the base model and then synchronized.

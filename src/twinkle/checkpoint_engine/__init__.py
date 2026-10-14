@@ -19,6 +19,7 @@ from .manager import CheckpointEngineManager
 from .mixin import CheckpointEngineMixin
 # Import backend implementations to register them
 from .nccl_checkpoint_engine import NCCLCheckpointEngine
+from .xpu_checkpoint_engine import XCCLCheckpointEngine
 
 __all__ = [
     'CheckpointEngine',
@@ -26,5 +27,6 @@ __all__ = [
     'CheckpointEngineManager',
     'NCCLCheckpointEngine',
     'HCCLCheckpointEngine',
+    'XCCLCheckpointEngine',
     'TensorMeta',
 ]

@@ -17,7 +17,7 @@ class Platform(ABC):
 
     @staticmethod
     def get_platform_names() -> List[str]:
-        return ['GPU', 'NPU', 'MPS']
+        return ['GPU', 'NPU', 'XPU', 'MPS']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
@@ -27,6 +27,10 @@ class Platform(ABC):
                 from .npu import NPU, ensure_npu_backend
                 ensure_npu_backend()
                 return NPU
+            elif shutil.which('xpu-smi'):
+                from .xpu import XPU, ensure_xpu_compat
+                ensure_xpu_compat()
+                return XPU
             elif shutil.which('nvidia-smi'):
                 from .gpu import GPU
                 return GPU
@@ -43,6 +47,10 @@ class Platform(ABC):
             from .npu import NPU, ensure_npu_backend
             ensure_npu_backend()
             return NPU
+        elif platform.upper() == 'XPU':
+            from .xpu import XPU, ensure_xpu_compat
+            ensure_xpu_compat()
+            return XPU
         elif platform.upper() == 'MPS':
             from .mps import MPS
             return MPS
