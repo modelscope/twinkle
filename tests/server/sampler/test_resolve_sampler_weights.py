@@ -17,6 +17,8 @@ class _FakeService:
     """Minimal stand-in exposing the two attributes the helper touches."""
 
     def __init__(self):
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        self.sampling_guard = SamplerConcurrency()
         self.sampler = _FakeSampler()
         self.full_weight_loads: list[str] = []
 
@@ -38,7 +40,8 @@ async def test_lora_dir_returns_adapter_path_and_loads_no_full_weights(tmp_path)
 
 @pytest.mark.asyncio
 async def test_full_checkpoint_loads_weights_and_returns_none(tmp_path):
-    # A directory without adapter_config.json is a full-parameter checkpoint.
+    (tmp_path / 'model.safetensors').touch()
+    # The fake backend supplies loading; the helper checks the checkpoint layout.
     svc = _FakeService()
     result = await resolve_sampler_weights(svc, str(tmp_path))
     assert result is None

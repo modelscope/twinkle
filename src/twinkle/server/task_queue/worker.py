@@ -12,6 +12,7 @@ import asyncio
 import time
 import traceback
 from collections import deque
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.protocol.types.errors import ErrorCategory
@@ -322,7 +323,35 @@ class ComputeWorker:
         """
         if self._stopping:
             raise ResourceExhaustedError('The replica is shutting down.')
-        running = asyncio.create_task(self._process_task(task, queue_key))
+        execution = None
+
+        def start():
+            nonlocal execution
+            execution = asyncio.create_task(task.coro_factory())
+            return asyncio.shield(execution)
+
+        async def run():
+            try:
+                await self._process_task(replace(task, coro_factory=start), queue_key)
+            finally:
+                # A timeout ends the client future, not the backend operation.
+                # Retain this task's sole capacity reservation until it exits.
+                if execution is not None:
+                    if not execution.done():
+                        execution.cancel()
+                    while not execution.done():
+                        try:
+                            await asyncio.shield(execution)
+                        except asyncio.CancelledError:
+                            if not execution.done() and not execution.cancelling():
+                                execution.cancel()
+                            continue
+                        except Exception:
+                            break
+                    if not execution.cancelled():
+                        execution.exception()
+
+        running = asyncio.create_task(run())
         self._detached_tasks[running] = task
 
         def done(completed: asyncio.Task) -> None:

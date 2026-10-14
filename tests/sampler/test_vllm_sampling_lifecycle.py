@@ -1,34 +1,39 @@
-"""A batch owns generation until all of its prompts have exited."""
+"""Batch failure cancels siblings and waits for their actual cleanup."""
+import asyncio
+
 import pytest
+from twinkle.sampler.vllm_sampler import vLLMSampler
 
 
 @pytest.mark.asyncio
-async def test_failed_prompt_waits_for_sibling_generation_to_exit():
-    import asyncio
-    from twinkle.data_format import SamplingParams
-    from twinkle.sampler.vllm_sampler import vLLMSampler
-    sampler = object.__new__(vLLMSampler)
-    sampler.template = None
-    sampler._run_in_loop = lambda coroutine: coroutine
+@pytest.mark.parametrize('cancel_batch', [False, True])
+async def test_batch_waits_for_cancelled_sibling_cleanup(cancel_batch):
     entered = asyncio.Event()
     release = asyncio.Event()
+    cleanup = asyncio.Event()
     finished = asyncio.Event()
-    async def single(feat, *args, **kwargs):
-        if feat['input_ids'][0] == 1:
-            raise ValueError('bad prompt')
-        entered.set()
-        await release.wait()
-        finished.set()
-        return object()
-    sampler._sample_single = single
-    generation = asyncio.create_task(sampler.sample(
-        [{'input_ids': [1]}, {'input_ids': [2]}], SamplingParams(max_tokens=1)))
+    async def failed():
+        await entered.wait()
+        if cancel_batch:
+            await asyncio.Future()
+        raise ValueError('bad prompt')
+    async def sibling():
+        try:
+            entered.set()
+            await asyncio.Future()
+        finally:
+            cleanup.set()
+            await release.wait()
+            finished.set()
+    generation = asyncio.create_task(vLLMSampler._gather_samples([failed(), sibling()]))
     try:
         await entered.wait()
-        await asyncio.sleep(.01)
-        assert not generation.done(), 'a failed prompt returned while its sibling was still generating'
+        if cancel_batch:
+            generation.cancel()
+        await asyncio.wait_for(cleanup.wait(), 1)
+        assert not generation.done()
         release.set()
-        with pytest.raises(ValueError, match='bad prompt'):
+        with pytest.raises(asyncio.CancelledError if cancel_batch else ValueError):
             await generation
         assert finished.is_set()
     finally:

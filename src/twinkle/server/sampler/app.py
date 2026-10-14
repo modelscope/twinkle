@@ -7,7 +7,6 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
-import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
@@ -20,8 +19,7 @@ from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.task_queue.types import BACKEND_TIMEOUT_EXCEPTIONS
-from twinkle.server.utils import wrap_builder_with_device_group_env
+from twinkle.server.utils import get_template_for_model, wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger
 from .concurrency import SamplerConcurrency
 from .tinker_handlers import _register_tinker_sampler_routes
@@ -44,9 +42,9 @@ def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
 
 def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
     """Construct the vLLM backend with non-blocking generation admission."""
-    from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
+    from .backends.vllm_async import ServerVLLMSampler
 
-    return VLLMSamplerTQ(**kw, context_manager=None)
+    return ServerVLLMSampler(**kw, context_manager=None)
 
 
 # Single validate-then-dispatch selector for the sampler backend.
@@ -80,16 +78,16 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     - Template configuration for trajectory encoding
     """
 
-    def __init__(self,
-                 model_id: str,
-                 nproc_per_node: int,
-                 device_group: dict[str, Any],
-                 device_mesh: dict[str, Any],
-                 sampler_type: str,
-                 engine_args: dict[str, Any] | None = None,
-                 queue_config: TaskQueueConfig | None = None,
-                 data_plane_url: str | None = None,
-                 **kwargs):
+    async def __init__(self,
+                       model_id: str,
+                       nproc_per_node: int,
+                       device_group: dict[str, Any],
+                       device_mesh: dict[str, Any],
+                       sampler_type: str,
+                       engine_args: dict[str, Any] | None = None,
+                       queue_config: TaskQueueConfig | None = None,
+                       data_plane_url: str | None = None,
+                       **kwargs):
         self.device_group = DeviceGroup(**device_group)
         self.device_mesh = init_twinkle_runtime(
             is_mock=(sampler_type == 'mock'),
@@ -130,11 +128,12 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             deployment_name='Sampler',
             collect_width=len(actors) if actors else 1,
         )
-        self.sampler._ray_get_timeout = self.task_queue_config.effective_execution_timeout
-        self.sampling_guard = SamplerConcurrency(self.task_queue_config.concurrent_task_limit)
-        # Serialize only the one-time Tinker template initialization.
-        self.tinker_setup_lock = asyncio.Lock()
-        self.tinker_template_set = False
+        # ComputeWorker bounds the client future. Keep collecting the actual
+        # backend result so a timed-out request cannot release live weights.
+        self.sampler._ray_get_timeout = None
+        self.sampling_guard = SamplerConcurrency()
+        if sampler_type != 'mock':
+            await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
 
     async def shutdown(self) -> None:
         self.sampling_guard.close()
@@ -147,32 +146,11 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                 await self.state.unregister_replica(self.replica_id)
             finally:
                 await self.shutdown_task_queue()
+                await self.sampling_guard.wait_closed()
                 await self.data_plane.close()
 
-    async def call_backend(self, fn, /, *args, admit: bool = True, mutation: bool = False, **kwargs):
-
-        if not admit:
-            return await super().call_backend(fn, *args, admit=False, **kwargs)
-
-        async def call():
-            try:
-                return await super(SamplerManagement, self).call_backend(fn, *args, admit=admit, **kwargs)
-            except asyncio.CancelledError:
-                self.sampling_guard.poison()
-                raise
-            except BACKEND_TIMEOUT_EXCEPTIONS:
-                self.sampling_guard.poison()
-                raise
-            except Exception:
-                if mutation:
-                    self.sampling_guard.poison()
-                raise
-
-        if self.sampling_guard.owns_job():
-            return await call()
-        # Control-plane operations also own their backend lifetime. Sampling
-        # calls inside a job reuse its access rather than acquiring another lock.
-        return await self.sampling_guard.run(call, exclusive=True)
+    async def check_health(self) -> None:
+        self.sampling_guard.check_available()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):

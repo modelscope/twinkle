@@ -121,7 +121,7 @@ def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
     # in the `async-rl` extra, so skip when it is absent instead of failing a sampler test
     # for a data-path dependency it does not use.
     pytest.importorskip('transfer_queue')
-    from twinkle_agentic.async_rl import vllm_sampler_tq as module
+    from twinkle.server.sampler.backends import vllm_async as module
 
     captured = {}
 
@@ -129,7 +129,7 @@ def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
         captured.update(kwargs)
         return 'vllm-tq'
 
-    monkeypatch.setattr(module, 'VLLMSamplerTQ', construct)
+    monkeypatch.setattr(module, 'ServerVLLMSampler', construct)
 
     sampler = _construct_sampler_backend(
         'vllm_async',

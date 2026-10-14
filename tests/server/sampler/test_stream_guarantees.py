@@ -111,6 +111,6 @@ async def test_generation_poll_has_total_timeout_and_cancels():
     service = _GenerationService()
 
     with pytest.raises(asyncio.TimeoutError):
-        await _await_generation(service, 'submission', timeout=0.05)
+        await asyncio.wait_for(_await_generation(service, 'submission'), timeout=0.05)
 
     assert service.cancelled is True

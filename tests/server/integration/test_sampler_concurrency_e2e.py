@@ -94,13 +94,115 @@ def test_invalid_generation_does_not_disable_sampler(clients, dialect):
     _report(check='failure_recovery', dialect=dialect)
 
 
+@pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
+def test_invalid_checkpoint_does_not_disable_sampler(clients, tmp_path, dialect):
+    ids = _prompt(clients, 'Reply with exactly this word and nothing else: apple')
+    corrupt = tmp_path / 'corrupt'
+    corrupt.mkdir()
+    (corrupt / 'model.safetensors').write_text('invalid checkpoint')
+    for path in (str(tmp_path), str(tmp_path / 'missing'), str(corrupt)):
+        handle = _checkpoint_handles(clients, dialect, [path])[0]
+        with pytest.raises(Exception):
+            _sample(clients, dialect, ids, 2, adapter=handle)
+        assert _sample(clients, dialect, ids, 2)[0][0]
+    _report(check='invalid_checkpoint_recovery', dialect=dialect)
+
+
+def test_tinker_tokens_do_not_use_native_template(clients):
+    import ray
+    actors = _real_sampler_actors()
+    ids = _prompt(clients, 'Reply with exactly this word and nothing else: apple')
+    expected = _sample(clients, 'tinker', ids, 2)[0][0]
+
+    def install(actor):
+        class OtherClientTemplate:
+            def get_vllm_input_ids(self, *args):
+                raise AssertionError('Tinker used the native template')
+            def concat_input_feature(self, *args):
+                raise AssertionError('Tinker built unused training features')
+            def decode(self, *args):
+                raise AssertionError('Tinker decoded unused text')
+        actor._e2e_template = actor.template
+        actor.template = OtherClientTemplate()
+
+    def restore(actor):
+        actor.template = actor._e2e_template
+        del actor._e2e_template
+
+    ray.get([actor.__ray_call__.remote(install) for actor in actors], timeout=10)
+    try:
+        assert _sample(clients, 'tinker', ids, 2)[0][0] == expected
+    finally:
+        ray.get([actor.__ray_call__.remote(restore) for actor in actors], timeout=10)
+        ray.shutdown()
+
+
+@pytest.mark.parametrize('dialect', ['tinker', 'twinkle'])
+def test_sampling_timeout_keeps_backend_owned_without_blocking_readers(clients, dialect):
+    import ray
+    from ray.util.state import list_actors
+    _real_sampler_actors()
+    replicas = [a for a in list_actors(address=os.environ['TWINKLE_TEST_RAY_DASHBOARD_URL'], detail=True)
+                if a.state == 'ALIVE' and a.class_name.startswith('ServeReplica') and 'SamplerManagement' in a.class_name]
+    assert len(replicas) == 1
+    replica = ray.get_actor(replicas[0].name, namespace='serve')
+
+    def install(actor):
+        service = actor._replica_impl._user_callable_wrapper._callable
+        service._e2e_timeout = service.task_queue_config.execution_timeout
+        service._e2e_sample = service.sampler.sample
+        service._e2e_release = threading.Event()
+        service._e2e_entered = threading.Event()
+        service.task_queue_config.execution_timeout = .1
+        original, entered, release = service._e2e_sample, service._e2e_entered, service._e2e_release
+        def held(*args, **kwargs):
+            result = original(*args, **kwargs)
+            entered.set()
+            assert release.wait(60)
+            return result
+        service.sampler.sample = held
+
+    def allow_next(actor):
+        service = actor._replica_impl._user_callable_wrapper._callable
+        service.task_queue_config.execution_timeout = service._e2e_timeout
+        service.sampler.sample = service._e2e_sample
+        return service._e2e_entered.is_set(), service._compute_worker._detached_reserved
+
+    def restore(actor):
+        service = actor._replica_impl._user_callable_wrapper._callable
+        service._e2e_release.set()
+        service.task_queue_config.execution_timeout = service._e2e_timeout
+        service.sampler.sample = service._e2e_sample
+        for name in ('_e2e_timeout', '_e2e_sample', '_e2e_release', '_e2e_entered'):
+            delattr(service, name)
+
+    ids = _prompt(clients, 'Reply with exactly this word and nothing else: apple')
+    ray.get(replica.__ray_call__.remote(install), timeout=10)
+    try:
+        with pytest.raises(Exception, match='timed out|timeout'):
+            _sample(clients, dialect, ids, 2)
+        deadline = time.monotonic() + 30
+        while True:
+            entered, reserved = ray.get(replica.__ray_call__.remote(allow_next), timeout=10)
+            if entered:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert reserved == 1
+        assert _sample(clients, dialect, ids, 2)[0][0]
+        _report(check='sampling_timeout_recovery', dialect=dialect, retained_capacity=reserved)
+    finally:
+        ray.get(replica.__ray_call__.remote(restore), timeout=10)
+        ray.shutdown()
+
+
 def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
     import ray
     from ray.util.state import list_actors
     ray.init(address=os.environ['RAY_ADDRESS'], namespace='default', ignore_reinit_error=True,
              log_to_driver=False)
     actors = list_actors(address=os.environ.get('TWINKLE_TEST_RAY_DASHBOARD_URL', 'http://127.0.0.1:8395'),
-                         filters=[('class_name', '=', 'VLLMSamplerTQ'), ('state', '=', 'ALIVE')], detail=True)
+                         filters=[('class_name', '=', os.environ.get('TWINKLE_TEST_SAMPLER_CLASS', 'ServerVLLMSampler')), ('state', '=', 'ALIVE')], detail=True)
     assert len(actors) == int(os.environ.get('TWINKLE_TEST_DP', '1'))
     assert all(actor.state == 'ALIVE' for actor in actors)
     actor = ray.get_actor(actors[0].name, namespace='default')
@@ -124,8 +226,6 @@ def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
         batch = actor.sample.remote(
             [{'input_ids': ids}, {'input_ids': [10**9]}],
             {'max_tokens': 1024, 'temperature': 0})
-        ready, _ = ray.wait([batch], timeout=.2)
-        assert not ready, 'ordinary batch returned before its sibling generation exited'
         with pytest.raises(ray.exceptions.RayTaskError):
             ray.get(batch, timeout=30)
 
@@ -133,9 +233,8 @@ def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
              {'max_tokens': 1024, 'temperature': 0})
         time.sleep(.1)
         assert call('get_generation_status', 'e2e-cancel')['status'] == 'running'
-        assert call('cancel_generation', 'e2e-cancel')['status'] == 'cancellation_requested'
-        wait_status('e2e-cancel', {'cancelled'})
-        assert call('cancel_generation', 'e2e-cancel')['status'] == 'completed'
+        assert call('cancel_generation', 'e2e-cancel')['status'] == 'cancelled'
+        assert call('get_generation_status', 'e2e-cancel')['status'] == 'missing'
         call('submit_generation', 'e2e-after', [{'input_ids': ids}],
              {'max_tokens': 8, 'temperature': 0})
         wait_status('e2e-after', {'completed'})
@@ -183,11 +282,7 @@ def test_data_plane_http_generation_and_failure_recovery(clients):
 
 
 def test_backend_self_cancellation_terminates_both_sdk_futures(clients):
-    """Cancel at the driver boundary after both requests performed real PPU generation.
-
-    Submit both requests before cancellation quarantines the replica. This test
-    runs last because uncertain backend cancellation requires a replica restart.
-    """
+    """A backend cancellation terminates futures and allows subsequent sampling."""
     import ray
     from ray.util.state import list_actors
     actors = _real_sampler_actors()
@@ -212,15 +307,16 @@ def test_backend_self_cancellation_terminates_both_sdk_futures(clients):
 
     def restore(actor):
         service = actor._replica_impl._user_callable_wrapper._callable
-        service.sampler.sample = service.sampler._e2e_original_sample
-        del service.sampler._e2e_original_sample
+        if hasattr(service.sampler, '_e2e_original_sample'):
+            service.sampler.sample = service.sampler._e2e_original_sample
+            del service.sampler._e2e_original_sample
 
     def status(actor):
         service = actor._replica_impl._user_callable_wrapper._callable
         return {'jobs': len(service.sampling_guard._jobs),
                 'detached': len(service._compute_worker._detached_tasks),
                 'reserved': service._compute_worker._detached_reserved,
-                'quarantined': service.sampling_guard._uncertain}
+                'weights_invalid': service.sampling_guard._weights_error is not None}
 
     ids = _prompt(clients, 'Reply with exactly this word and nothing else: apple')
     ray.get(replica.__ray_call__.remote(install), timeout=10)
@@ -239,13 +335,13 @@ def test_backend_self_cancellation_terminates_both_sdk_futures(clients):
                 break
             assert time.monotonic() < deadline, state
             time.sleep(.01)
-        assert state['quarantined']
+        assert not state['weights_invalid']
         engine_requests = ray.get([actor.__ray_call__.remote(
             lambda sampler: len(sampler.engine.engine.output_processor.request_states)) for actor in actors], timeout=10)
         assert engine_requests == [0] * len(actors)
+        ray.get(replica.__ray_call__.remote(restore), timeout=10)
         for dialect in ('tinker', 'twinkle'):
-            with pytest.raises(Exception):
-                _sample(clients, dialect, ids, 2)
+            assert _sample(clients, dialect, ids, 2)[0][0]
         _report(check='backend_self_cancellation', results=results, state=state,
                 engine_requests=engine_requests, seconds=elapsed)
     finally:

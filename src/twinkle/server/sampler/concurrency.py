@@ -1,116 +1,92 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Let each background sampling job own access until its backend has exited."""
+"""Coordinate sampling with changes to shared sampler state."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine
-from contextvars import ContextVar
-from typing import Any
 
-from twinkle.server.exceptions import ResourceExhaustedError
 from twinkle.server.task_queue.types import BackendBusyError
 
 
 class SamplerConcurrency:
-    """Stable weights admit readers; changing base weights requires one writer.
+    """Readers share stable weights; mutations wait for every reader to finish.
 
-    A job owns its entire load/generate/cleanup sequence. Cancelling its waiter
-    leaves that job running, so a request timeout cannot release live weights.
-    All bookkeeping runs on the replica's event loop.
+    Jobs retain their lock if an HTTP waiter leaves. Admission and execution
+    timeouts belong to ComputeWorker, not this lock.
     """
 
-    def __init__(self, limit: int = 128):
-        self._limit = limit
+    def __init__(self):
         self._readers = 0
         self._writer = False
         self._waiting_writers = 0
-        self._changed = asyncio.Event()
+        self._condition = asyncio.Condition()
         self._jobs: set[asyncio.Task] = set()
-        self._draining: set[asyncio.Task] = set()
-        # Nested polling tasks inherit the owner, without passing lock handles
-        # through every backend call. Membership prevents use after job exit.
-        self._owner: ContextVar[asyncio.Task | None] = ContextVar('sampler_job', default=None)
-        self._uncertain = False
+        self._weights_error: Exception | None = None
         self._closed = False
 
-    def owns_job(self) -> bool:
-        owner = self._owner.get()
-        return owner is not None and not owner.done() and owner in self._jobs
-
-    def _notify(self) -> None:
-        self._changed.set()
-        self._changed = asyncio.Event()
-
-    def check_available(self, *, admitted: bool = False) -> None:
+    def check_available(self):
         if self._closed:
             raise BackendBusyError('The sampler is shutting down.')
-        if self._uncertain:
-            raise BackendBusyError('Sampler weights or backend completion are uncertain; restart this replica.')
-        if self._draining and not admitted:
-            raise BackendBusyError('The sampler is waiting for backend resource release.')
+        if self._weights_error is not None:
+            raise BackendBusyError('A checkpoint write failed; the sampler is restarting.')
 
-    def poison(self) -> None:
-        self._uncertain = True
-        self._notify()
+    def invalidate_weights(self, error: Exception):
+        self._weights_error = error
 
-    def close(self) -> None:
+    def close(self):
         self._closed = True
-        self._notify()
-
-    async def _acquire(self, exclusive: bool) -> None:
-        if exclusive:
-            self._waiting_writers += 1
-        try:
-            while True:
-                self.check_available(admitted=True)
-                if asyncio.current_task() in self._draining:
-                    raise BackendBusyError('Sampling request exited before its job could start.')
-                if not self._writer and (self._readers == 0 if exclusive else self._waiting_writers == 0):
-                    if exclusive:
-                        self._writer = True
-                    else:
-                        self._readers += 1
-                    return
-                await self._changed.wait()
-        finally:
-            if exclusive:
-                self._waiting_writers -= 1
-                self._notify()
 
     async def _execute(self, factory, exclusive: bool):
-        await self._acquire(exclusive)
-        token = self._owner.set(asyncio.current_task())
+        async with self._condition:
+            if exclusive:
+                self._waiting_writers += 1
+            try:
+                await self._condition.wait_for(lambda: not self._writer and
+                                               (self._readers == 0 if exclusive else self._waiting_writers == 0))
+                self.check_available()
+                if exclusive:
+                    self._writer = True
+                else:
+                    self._readers += 1
+            finally:
+                if exclusive:
+                    self._waiting_writers -= 1
+                    self._condition.notify_all()
         try:
             return await factory()
         finally:
-            self._owner.reset(token)
-            if exclusive:
-                self._writer = False
-            else:
-                self._readers -= 1
-            self._notify()
+            async with self._condition:
+                if exclusive:
+                    self._writer = False
+                else:
+                    self._readers -= 1
+                self._condition.notify_all()
 
-    def _finished(self, job: asyncio.Task) -> None:
-        self._jobs.discard(job)
-        self._draining.discard(job)
-        if not job.cancelled():
-            job.exception()  # Observe failures even when its waiter already left.
-        self._notify()
-
-    async def run(self, factory: Callable[[], Coroutine[Any, Any, Any]], *, exclusive: bool = False):
-        """Wait for one owned job without transferring cancellation to it."""
+    async def run(self, factory, *, exclusive: bool = False):
         self.check_available()
-        # Unlike the future queue's admission count, this capacity is retained
-        # until actual backend cleanup, including jobs outliving request timeout.
-        if len(self._jobs) >= self._limit:
-            raise ResourceExhaustedError('Concurrent sampling capacity is unavailable on this replica.')
-        job = asyncio.create_task(self._execute(factory, exclusive))
+        started = False
+
+        async def call():
+            nonlocal started
+            started = True
+            return await factory()
+
+        job = asyncio.create_task(self._execute(call, exclusive))
         self._jobs.add(job)
-        job.add_done_callback(self._finished)
+
+        def finished(task):
+            self._jobs.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        job.add_done_callback(finished)
         try:
             return await asyncio.shield(job)
         except asyncio.CancelledError:
-            if not job.done():
-                self._draining.add(job)
-                self._notify()
+            if not started:
+                job.cancel()
+            # The blocking backend may still be using the locked weights.
+            await asyncio.gather(job, return_exceptions=True)
             raise
+
+    async def wait_closed(self):
+        await asyncio.gather(*self._jobs, return_exceptions=True)

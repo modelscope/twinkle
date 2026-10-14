@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import traceback
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -29,7 +28,7 @@ from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
-from twinkle.server.sampler.weights import sample_with_weights
+from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
@@ -163,18 +162,14 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
             pass
 
 
-async def _await_generation(service: SamplerManagement, submission_id: str, timeout: float):
+async def _await_generation(service: SamplerManagement, submission_id: str):
     """Poll one admitted generation through the backend boundary."""
     collected = False
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
 
     async def poll():
         nonlocal collected
         poll_interval = 0.01
         while True:
-            if loop.time() >= deadline:
-                raise asyncio.TimeoutError
             try:
                 states = _submission_states(await service.call_backend(service.sampler.get_generation_status,
                                                                        submission_id))
@@ -204,20 +199,10 @@ async def _await_generation(service: SamplerManagement, submission_id: str, time
     finally:
         if not collected:
 
-            async def cancel_and_wait():
-                while True:
-                    states = _submission_states(await service.call_backend(service.sampler.cancel_generation,
-                                                                           submission_id))
-                    if states and all(state.get('status') in ('completed', 'missing') for state in states):
-                        return
-                    await asyncio.sleep(0.01)
-
             try:
-                await asyncio.wait_for(cancel_and_wait(), timeout=4.0)
-            except BaseException:
-                service.sampling_guard.poison()
-                logger.warning('Generation cleanup did not confirm completion: %s', submission_id, exc_info=True)
-                # Preserve the original generation error, including cancellation.
+                await service.call_backend(service.sampler.cancel_generation, submission_id)
+            except Exception:
+                logger.warning('Failed to clear generation %s', submission_id, exc_info=True)
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -321,7 +306,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     adapter_name=full_adapter_name,
                     adapter_path=adapter_path,
                 )
-                return await _await_generation(self, submission_id, self.task_queue_config.effective_execution_timeout)
+                return await _await_generation(self, submission_id)
 
             responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(
@@ -333,7 +318,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             ref = await self.data_plane.put([json_safe(item) for item in rows], kind='rollout', tags=tags)
             return ref.model_dump()
 
-        return await self.submit_background_and_peek(
+        return await self.submit_concurrent_and_peek(
             _generate_and_store, model_id=full_adapter_name or None, task_type='sample_to_data_plane')
 
     @app.post('/twinkle/unload_adapter_paths')
@@ -353,7 +338,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             resolved_paths.append(adapter_path)
         unload = getattr(self.sampler, 'unload_adapter_paths', None)
         if unload is not None:
-            await self.call_backend(unload, resolved_paths)
+            await self.sampling_guard.run(lambda: self.call_backend(unload, resolved_paths), exclusive=True)
         return {'status': 'ok'}
 
     @app.post('/twinkle/set_template', response_model=sampler_types.SamplerSetTemplateResponse)
@@ -364,7 +349,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> sampler_types.SamplerSetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
         with traced_operation('sampler.set_template'):
-            await self.call_backend(self.sampler.set_template, body.template_cls, **backend_kwargs(body))
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.set_template, body.template_cls, **backend_kwargs(body)),
+                exclusive=True)
         return sampler_types.SamplerSetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=sampler_types.SamplerAddAdapterResponse)
@@ -385,7 +372,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
-            await self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config)
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config),
+                exclusive=True)
 
         return sampler_types.SamplerAddAdapterResponse(adapter_name=full_adapter_name)
 
@@ -397,7 +386,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> None:
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
-            await self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body))
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body)), exclusive=True)
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(

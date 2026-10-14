@@ -482,7 +482,6 @@ holds the cleanup lease.
 
 ### Sampler concurrency and weight changes
 
-- Ordinary Tinker and Twinkle `sample()` requests support concurrency without changing response schemas or future polling. `queue_config.concurrent_task_limit` limits unfinished concurrent tasks per sampler replica and defaults to `128`; capacity exhaustion returns `server`/503. Training compute remains serial.
-- During ordinary sampling, full-checkpoint switches wait for existing ordinary and DataPlane generation to finish. Loading a full checkpoint and generating with it cannot overlap these requests. LoRA uses adapter checkpoints; full checkpoints are for full-parameter or merged models.
-- After an ordinary sampling request times out, backend cleanup may still be running. New requests are temporarily refused during cleanup. If resource release or the integrity of weights after a failed update cannot be confirmed, the replica keeps returning `server`/503 and must be restarted.
-- Unexpected backend cancellation leaves a `failed` future and requires a replica restart. Ordinary generation errors allow subsequent requests once cleanup finishes.
+- Ordinary Tinker and Twinkle `sample()` requests support concurrency with unchanged response schemas and future polling; training compute remains serial. `queue_config.concurrent_task_limit` defaults to `128` and bounds admitted, unfinished tasks per replica; exhaustion returns `server`/503. Actual execution concurrency also depends on the backend thread pool, actor, and vLLM settings.
+- Full checkpoint loading and generation exclusively own the weights and wait for existing ordinary and DataPlane generation to finish. LoRA uses adapter checkpoints without replacing base weights on each request.
+- A sampling timeout fails only its future; capacity stays reserved until the backend finishes, while other sampling can continue. Invalid checkpoints are rejected before writes. A failed weight write fails the health check so Ray Serve replaces the replica.

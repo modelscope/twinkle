@@ -86,9 +86,7 @@ class _Service(SamplerManagement):
         self.replica_id = 'sampler-test'
         self.state = _State()
         self.sampler = _Sampler()
-        self.sampling_guard = SamplerConcurrency(limit)
-        self.tinker_setup_lock = asyncio.Lock()
-        self.tinker_template_set = True
+        self.sampling_guard = SamplerConcurrency()
         self._task_queue_config = TaskQueueConfig(execution_timeout=timeout, concurrent_task_limit=limit)
         self._rate_limiter = _Limiter()
         self._task_metrics = None

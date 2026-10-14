@@ -76,7 +76,7 @@ class _SamplerManagement:
     async def _on_request_start(self, _request):
         return 'token'
 
-    async def submit_background_and_peek(self, coro_factory, *, model_id=None, task_type=None):
+    async def submit_concurrent_and_peek(self, coro_factory, *, model_id=None, task_type=None):
         self.scheduled.append({'model_id': model_id, 'task_type': task_type})
         result = await coro_factory()
         from twinkle.protocol.types.lifecycle import TaskEnvelope
