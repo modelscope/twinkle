@@ -246,7 +246,7 @@ class NativeFSDPStrategy:
         return StateDictOptions(
             full_state_dict=True,
             cpu_offload=not for_load,
-            broadcast_from_rank0=for_load,
+            broadcast_from_rank0=for_load and dist.is_initialized(),
         )
 
     def needs_wrapped_optimizer_state(self) -> bool:
