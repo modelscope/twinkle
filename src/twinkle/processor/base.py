@@ -149,7 +149,7 @@ class InputProcessor:
         return results
 
     def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
-                              **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
+                              sp_gather_keys=(), **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """Adjust SP tensors after forward and before loss computation.
 
         Pipeline: SP gather → packed-sequence unpack.
@@ -169,7 +169,7 @@ class InputProcessor:
         if task == 'generative_reranker':
             return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
         if self.framework == 'transformers' and sp_strategy is not None:
-            return sp_strategy.gather_loss_tensors(inputs, outputs)
+            return sp_strategy.gather_loss_tensors(inputs, outputs, sp_gather_keys=sp_gather_keys)
         return inputs, outputs
 
     @staticmethod

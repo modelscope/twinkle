@@ -79,6 +79,10 @@ class SafeLossWrapper(Loss):
         self.require_entropy = getattr(loss_instance, 'require_entropy', False)
         self.require_logits = getattr(loss_instance, 'require_logits', False)
         self.reduction = getattr(loss_instance, 'reduction', 'mean')
+        # Preserve the loss's SP data contract through the NCCL-safe wrapper.
+        self.sp_gather_keys = getattr(loss_instance, 'sp_gather_keys', ())
+        self.sp_input_key_specs = getattr(loss_instance, 'sp_input_key_specs', ())
+        self.sp_output_key_specs = getattr(loss_instance, 'sp_output_key_specs', ())
         self._nccl_safe_wrapped = True
 
     def __call__(self, inputs, outputs, **kwargs):

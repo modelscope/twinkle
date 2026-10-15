@@ -46,6 +46,9 @@ class PPOValueLoss(Loss):
     # Reads the per-token value head output outputs['logits'] ([B, T]); never per-token logps.
     require_logits = True
     require_logps = False
+    # PPO regresses per-token value predictions stored in outputs['logits'].
+    # Gather the local sequence shards before aligning them with response labels.
+    sp_gather_keys = ('logits',)
 
     def __init__(self, cliprange_value: float = 0.2, vf_coef: float = 0.1, ignore_index: int = -100, **kwargs):
         super().__init__()

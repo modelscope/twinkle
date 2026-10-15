@@ -1017,6 +1017,22 @@ class SequenceParallelStrategy:
     def output_key_specs(self) -> Tuple[DataKeySpec, ...]:
         return tuple(self._ctx.output_key_registry)
 
+    def register_loss_key_specs(self, loss) -> None:
+        """Register sequence input/output contracts declared by a loss."""
+        for attr, register, expected_side in (
+                ('sp_input_key_specs', self.register_input_key, 'input'),
+                ('sp_output_key_specs', self.register_output_key, 'output')):
+            specs = getattr(loss, attr, ()) or ()
+            if isinstance(specs, DataKeySpec):
+                specs = (specs,)
+            for spec in specs:
+                if not isinstance(spec, DataKeySpec):
+                    raise TypeError(f'{type(loss).__name__}.{attr} must contain DataKeySpec values')
+                if spec.side != expected_side:
+                    raise ValueError(f'{type(loss).__name__}.{attr} contains {spec.side!r} key {spec.name!r}; '
+                                     f'expected {expected_side!r}')
+                register(spec)
+
     @property
     def model_sp_adapters(self) -> Tuple[ModelSPAdapter, ...]:
         """The model-family adapters selected during context preparation."""
@@ -1080,6 +1096,7 @@ class SequenceParallelStrategy:
         self,
         inputs: Dict[str, Any],
         outputs: Dict[str, Any],
+        sp_gather_keys=(),
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if inputs is None or outputs is None:
             return inputs, outputs
@@ -1098,9 +1115,27 @@ class SequenceParallelStrategy:
         # selects the registered logits rule without gathering real vocabulary
         # logits in the ordinary logps path.
         fused_hidden = outputs.get('logps') is None and 'lm_head' in outputs and inputs.get('labels') is not None
+        if isinstance(sp_gather_keys, str):
+            sp_gather_keys = (sp_gather_keys,)
+        else:
+            sp_gather_keys = tuple(sp_gather_keys)
+        if any(not isinstance(key, str) or not key for key in sp_gather_keys):
+            raise TypeError('sp_gather_keys must contain non-empty output key names')
+        required_keys = set(sp_gather_keys)
+        output_specs = {spec.name: spec for spec in self.output_key_specs}
+        unknown_keys = required_keys - output_specs.keys()
+        if unknown_keys:
+            raise KeyError(
+                f'Loss requested SP gather for unregistered output key(s) {sorted(unknown_keys)}. '
+                'Register a sequence-aligned DataKeySpec with SequenceParallelStrategy.register_output_key().')
+        missing_keys = {key for key in required_keys if outputs.get(key) is None}
+        if missing_keys:
+            raise KeyError(f'Loss declared SP gather key(s) {sorted(missing_keys)}, '
+                           'but the model output is missing them.')
         for spec in self.output_key_specs:
             value = outputs.get(spec.name)
-            if value is not None and (spec.need_gather or (spec.name == 'logits' and fused_hidden)):
+            if value is not None and (spec.need_gather or spec.name in required_keys
+                                      or (spec.name == 'logits' and fused_hidden)):
                 outputs[spec.name] = self._gather_key(value, spec, real_position_ids)
         return inputs, outputs
 

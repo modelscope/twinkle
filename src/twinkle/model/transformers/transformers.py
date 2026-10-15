@@ -365,16 +365,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _ensure_sp_strategy(self) -> None:
         if not getattr(self, '_enable_sp', False):
             return
-        if self.sp_strategy is not None:
-            return
-        from .strategy.sequence_parallel import SequenceParallelStrategy
+        if self.sp_strategy is None:
+            from .strategy.sequence_parallel import SequenceParallelStrategy
 
-        self.sp_strategy = SequenceParallelStrategy(
-            self.device_mesh,
-            {},
-            model=self.model,
-            tokenizer_id=self.tokenizer_id,
-        )
+            self.sp_strategy = SequenceParallelStrategy(
+                self.device_mesh,
+                {},
+                model=self.model,
+                tokenizer_id=self.tokenizer_id,
+            )
+        for optimizer_group in self.optimizer_group.values():
+            self.sp_strategy.register_loss_key_specs(optimizer_group.loss_instance)
 
     def _get_default_group(self):
         """Get the only group, else return the default one"""
@@ -601,6 +602,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             outputs,
             sp_strategy=self.sp_strategy,
             task=task,
+            sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
         )
         inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task, sp_strategy=self.sp_strategy)
         optimizer_config.train_status.inputs = inputs
@@ -708,6 +710,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 outputs,
                 sp_strategy=self.sp_strategy,
                 task=task,
+                sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
             )
             inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task,
                                                                 sp_strategy=self.sp_strategy)
@@ -1035,6 +1038,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        if self.sp_strategy is not None:
+            self.sp_strategy.register_loss_key_specs(optimizer_config.loss_instance)
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
