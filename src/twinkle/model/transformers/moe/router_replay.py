@@ -103,16 +103,14 @@ def set_router_replay_data(
     sp = sp_context if sp_context is not None else _MODULE_TO_CTX.get(model)
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
-        _, _, _, _, _, _, extra_values = sp.pad_and_split_inputs(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            real_position_ids=sp.real_position_ids,
-            extra_split_values=[(routed_experts, 0, 1)])
-        routed_experts = extra_values[0]
+        from ..strategy.sequence_parallel.data_keys import DataKeySpec, SPKeyCollection, SPKeyValue
+
+        spec = DataKeySpec('routed_experts', split_dim=1, pad_value=0, stage='router_replay',
+                           pad_at='router_replay', split_at='router_replay')
+        keys = SPKeyCollection()
+        keys.add(SPKeyValue(spec, routed_experts))
+        sp.pad_and_split_inputs(keys, boundary='router_replay', real_position_ids=sp.real_position_ids)
+        routed_experts = keys.get_value('routed_experts')
 
     # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
     routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())

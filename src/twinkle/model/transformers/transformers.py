@@ -557,6 +557,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
+        sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
         optimizer_config.accumulate_metrics(True)
 
         # Routing replay: respects router_replay_action regardless of caller
@@ -575,6 +576,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         recorded_routing = rr_cleanup()
 
         inputs['labels'] = labels
+        inputs.update(sp_auxiliary_inputs)
         if loss_scale is not None:
             inputs['loss_scale'] = loss_scale
         if channel is not None:
@@ -594,8 +596,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+        inputs, outputs = processor.postprocess_tensor_sp(
+            inputs,
+            outputs,
+            sp_strategy=self.sp_strategy,
+            task=task,
+        )
+        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task, sp_strategy=self.sp_strategy)
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
@@ -654,6 +661,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
+            sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
@@ -675,6 +683,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             recorded_routing = rr_cleanup()
 
             inputs['labels'] = labels
+            inputs.update(sp_auxiliary_inputs)
             if loss_scale is not None:
                 inputs['loss_scale'] = loss_scale
             if channel is not None:
@@ -694,8 +703,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
-            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+            inputs, outputs = processor.postprocess_tensor_sp(
+                inputs,
+                outputs,
+                sp_strategy=self.sp_strategy,
+                task=task,
+            )
+            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task,
+                                                                sp_strategy=self.sp_strategy)
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
