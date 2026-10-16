@@ -7,7 +7,7 @@ module-level op cache for model/tokenizer reuse.
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import msg_content_text
+from twinkle_agentic.utils.message_utils import msg_content_text
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 

@@ -85,6 +85,18 @@ def _get_liger_module():
     return _LigerFLCEModule
 
 
+def _align_hidden_dtype(hidden, weight):
+    """Cast hidden states to the projection weight's dtype.
+
+    Under autocast the final RMSNorm emits fp32 hidden states, and
+    ``TransformersFusedCEPatch`` replaces ``lm_head.forward`` with identity — so
+    the ``Linear`` that autocast would normally cast down to the weight dtype
+    never runs. Liger's bare fused kernel (autocast-free) and the ``F.linear``
+    fallback both require matching dtypes, so re-apply that skipped cast here.
+    """
+    return hidden if hidden.dtype == weight.dtype else hidden.to(weight.dtype)
+
+
 class LigerFusedLinearCrossEntropyLoss(Loss):
     """Fused lm_head + cross-entropy loss (Liger kernel).
 
@@ -152,7 +164,8 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         bias = getattr(lm_head, 'bias', None)
         if bias is not None and hasattr(bias, 'full_tensor'):
             bias = bias.full_tensor()
-        logits = F.linear(hidden.reshape(-1, hidden.shape[-1]), weight, bias=bias)
+        hidden_flat = _align_hidden_dtype(hidden.reshape(-1, hidden.shape[-1]), weight)
+        logits = F.linear(hidden_flat, weight, bias=bias)
         out = dict(outputs)
         out['logits'] = logits.view(*hidden.shape[:-1], -1)
         return CrossEntropyLoss(ignore_index=self.ignore_index, reduction=self.reduction)(inputs, out, **kwargs)
@@ -179,9 +192,10 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
             weight = lm_head.weight
             if hasattr(weight, 'full_tensor'):
                 weight = weight.full_tensor()
+            hidden_flat = _align_hidden_dtype(hidden_flat, weight)
             try:
                 loss = self._liger(weight, hidden_flat, labels_flat)
-            except Exception:  # defensive, device-agnostic
+            except Exception as e:  # defensive, device-agnostic
                 if not self._warned:
                     self._warned = True
                     logger.warning(

@@ -125,6 +125,31 @@ def clean_metrics(metrics: dict) -> dict:
 class TwinkleCompatModelBase:
     """Base class containing common logic for Twinkle compatibility wrappers."""
 
+    @staticmethod
+    def _normalize_ref_outputs(kwargs: dict) -> None:
+        """Convert HTTP/Ray-serialized reference logps to one padded tensor."""
+        ref_outputs = kwargs.get('ref_outputs')
+        if not isinstance(ref_outputs, dict):
+            return
+
+        logps = ref_outputs.get('logps')
+        if not isinstance(logps, (list, tuple)) or not logps or isinstance(logps[0], torch.Tensor):
+            return
+
+        rows = []
+        for item in logps:
+            if isinstance(item, (list, tuple)) and item and isinstance(item[0], (list, tuple)):
+                rows.extend(item)
+            else:
+                rows.append(item)
+
+        from twinkle.utils import pad_and_stack_tensors
+        ref_outputs['logps'] = pad_and_stack_tensors(
+            [torch.as_tensor(row, dtype=torch.float32) for row in rows],
+            pad_value=0.0,
+            concat=False,
+        )
+
     def get_template(self, adapter_name: str) -> Template:
         return self.optimizer_group[adapter_name].template
 

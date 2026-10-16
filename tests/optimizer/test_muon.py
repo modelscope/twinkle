@@ -39,7 +39,7 @@ class Tiny(nn.Module):
 
 
 def param_groups(model):
-    """Decay / no-decay groups, the way `TwinkleModel._create_param_group` builds them."""
+    """Decay / no-decay groups, the way `TrainableModel._create_param_group` builds them."""
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         (no_decay if ('bias' in name or 'norm' in name) else decay).append((name, param))

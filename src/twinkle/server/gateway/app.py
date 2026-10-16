@@ -42,6 +42,10 @@ class GatewayServer(LazyCleanupMixin):
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models)
         self._supported_model_names = frozenset(m.model_name for m in self.supported_models)
+        # OpenAI-compat surface knobs: ``api_key`` gates every inference route with a Bearer check
+        # (None = unauthenticated), ``owned_by`` is the ``owned_by`` field of ``/models`` entries.
+        self.api_key = kwargs.get('api_key')
+        self.owned_by = kwargs.get('owned_by') or 'twinkle'
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
 

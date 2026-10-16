@@ -9,8 +9,9 @@ from transformers import PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 from weakref import WeakKeyDictionary
 
-from twinkle.utils import DeviceMesh
-from twinkle.utils.transformers_utils import get_llm_model
+from twinkle.patch import apply_patch
+from twinkle.utils import DeviceMesh, get_logger
+from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
 from .adapters import ModelSPAdapter, adapters_for_model, register_model_sp_adapter
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
@@ -55,6 +56,8 @@ def _pop_ctx(ctx) -> None:
             stack.pop(i)
             return
 
+logger = get_logger()
+
 
 def _current_ctx():
     stack = _ctx_stack()
@@ -89,6 +92,12 @@ def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_pos
         *args,
         **kwargs,
     )
+
+
+# `attn_implementation` values that follow the FlashAttention contract (transposed q/k/v, optional
+# 2D padding mask, `cu_seq_lens_*` for packed batches). They share transformers' single
+# `flash_attention_forward` entry point and differ only in the leaf kernel, so SP treats them alike.
+FLASH_ATTENTION_IMPLS = ('flash_attention_2', 'flash_attention_3')
 
 
 # main content copied from ms-swift
@@ -279,6 +288,7 @@ class SequenceParallel:
                         causal=_sp_module.is_causal,
                         window_size=kwargs.get('sliding_window') or (-1, -1),
                         group=self._rp_group,
+                        backend=self.attn_implementation,
                     )
                 elif self.extra_kwargs.get('padding_free', False) or 'cu_seq_lens_q' in kwargs:
                     position_ids = kwargs.get('position_ids')
@@ -305,8 +315,10 @@ class SequenceParallel:
                     kwargs['max_length_k'] = max_seqlen
                     if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
                         args = (None, *args[1:])
-                return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](_sp_module, query, key, value, *args,
-                                                                           **kwargs)[0]
+                backend = getattr(getattr(_sp_module, 'config', None), '_attn_implementation', None)
+                origin = ALL_ATTENTION_FUNCTIONS.get(f'{backend}_origin',
+                                                     ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'])
+                return origin(_sp_module, query, key, value, *args, **kwargs)[0]
 
             dist_attn.local_attn = _attention
 
@@ -406,9 +418,10 @@ class SequenceParallel:
                              **kwargs):
             sp = _MODULE_TO_CTX.get(module)
             if sp is None or sp.world_size == 1:
-                return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query_states, key_states,
-                                                                           value_states, attention_mask, *args,
-                                                                           **kwargs)
+                backend = getattr(getattr(module, 'config', None), '_attn_implementation', None)
+                origin = ALL_ATTENTION_FUNCTIONS.get(f'{backend}_origin',
+                                                     ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'])
+                return origin(module, query_states, key_states, value_states, attention_mask, *args, **kwargs)
             return sp._local_flash_attn_impl(module, query_states, key_states, value_states, attention_mask, *args,
                                              **kwargs)
 
@@ -421,10 +434,22 @@ class SequenceParallel:
             return sp._local_sdpa_attn_impl(module, query_states, key_states, value_states, attention_mask, *args,
                                             **kwargs)
 
+        # `flash_attention_2/3` all hold the same `flash_attention_forward` object in transformers; the
+        # concrete kernel is picked at call time from `module.config._attn_implementation`. So the SP
+        # wrapper has to be registered under every FlashAttention name: `AttentionInterface.get_interface`
+        # is an exact-key lookup, so an FA3 config left unwrapped would silently train *without* sequence
+        # parallelism. One `_origin` alias is enough because `local_flash_attn` dispatches through the
+        # module config, not through the key it was reached by.
         ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'] = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         ALL_ATTENTION_FUNCTIONS['sdpa_origin'] = ALL_ATTENTION_FUNCTIONS['sdpa']
-        ALL_ATTENTION_FUNCTIONS['flash_attention_2'] = local_flash_attn
+        for _impl in FLASH_ATTENTION_IMPLS:
+            if _impl not in ALL_ATTENTION_FUNCTIONS:
+                continue
+            ALL_ATTENTION_FUNCTIONS[f'{_impl}_origin'] = ALL_ATTENTION_FUNCTIONS[_impl]
+            ALL_ATTENTION_FUNCTIONS[_impl] = local_flash_attn
         ALL_ATTENTION_FUNCTIONS['sdpa'] = local_sdpa_attn
+        logger.info_once(f'[SequenceParallel] attention wrappers registered: {list(FLASH_ATTENTION_IMPLS)} -> '
+                         'local_flash_attn, sdpa -> local_sdpa_attn (SP-aware)')
 
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
 
@@ -535,8 +560,13 @@ class SequenceParallel:
         self.tokenizer = tokenizer
         if self.rp_world_size > 1:
             attn_impl = getattr(model.config, '_attn_implementation', None)
-            if attn_impl != 'flash_attention_2':
-                raise NotImplementedError('Derived ring attention only supports flash_attention_2 backend.')
+            if attn_impl not in FLASH_ATTENTION_IMPLS:
+                raise NotImplementedError(
+                    f'Derived ring attention only supports {"/".join(FLASH_ATTENTION_IMPLS)} backends, '
+                    f'got {attn_impl!r}.')
+        logger.info_once(f'[SequenceParallel] enabled: world_size={self.world_size} '
+                         f'(ulysses={self.sp_world_size} x ring={self.rp_world_size}), '
+                         f'attn_implementation={getattr(model.config, "_attn_implementation", None)!r}')
 
         # Route this model's text-side attention modules to this context. The
         # registry is instance-based (not class-based), so a second model of the
@@ -766,7 +796,6 @@ class SequenceParallel:
         if self.rp_world_size > 1 and batch_size is not None and batch_size > 1:
             raise NotImplementedError(
                 'Derived ring attention only supports padding-free / packed batches with batch_size == 1.')
-
         split_is_due = any(item.spec.split_at == boundary and item.value is not None for item in keys.values())
         padded_positions = (self.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
                             if real_position_ids is not None and split_is_due else None)
@@ -809,7 +838,7 @@ class SequenceParallel:
                 attention_mask = attn_item.value
             local_cache_position = torch.arange(0, padded_model_inputs.shape[1], device=padded_model_inputs.device)
             if (cache_position is None and self.causal_mask_func is not None
-                    and self.attn_implementation != 'flash_attention_2'):
+                    and not is_flash_attention_implementation(self.attn_implementation)):
                 attention_mask = self.causal_mask_func(attention_mask, padded_model_inputs.to(self.model_dtype),
                                                        local_cache_position, None, None)
                 attn_item.value = attention_mask
@@ -853,14 +882,14 @@ class SequenceParallel:
         return False
 
     def prepare_inputs(self, inputs):
-        """Cache position context and run keys declared for the prepare boundary."""
+        """Cache position context and process all keys declared for prepare."""
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         padding_free = bool(inputs.pop('padding_free', False))
-        if padding_free and self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+        if padding_free and not is_flash_attention_implementation(self.attn_implementation):
             raise RuntimeError('Transformers SequenceParallel does not support padding_free/packed inputs with '
                                f'attn_implementation={self.attn_implementation!r}. '
-                               'Use flash_attention_2 or flash_attention_3, or disable padding_free/packing. '
+                               'Use a FlashAttention backend, or disable padding_free/packing. '
                                'SDPA/eager attention cannot safely preserve packed sequence boundaries in this path.')
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
@@ -1092,6 +1121,19 @@ class SequenceParallelStrategy:
             gathered = self._ctx.gather(value, dim=dim, position_ids=real_position_ids)
         return self._trim_gathered_sequence_padding(gathered, real_position_ids, dim=dim)
 
+    def _gather_completion_mask(self, inputs: Dict[str, Any], real_position_ids) -> None:
+        """Gather ``completion_mask`` in place, mirroring the labels gather.
+
+        Deliberately not routed through :class:`GatherLoss`: the mask carries no
+        gradient, and reusing that autograd Function would attach a second backward
+        path to whichever tensor were passed alongside it, double-scaling its grad.
+        """
+        mask = inputs.get('completion_mask')
+        if mask is None or not torch.is_tensor(mask) or mask.dim() < 2:
+            return
+        gathered = sequence_parallel.gather(mask, dim=1, position_ids=real_position_ids)
+        inputs['completion_mask'] = self._trim_gathered_sequence_padding(gathered, real_position_ids)
+
     def gather_loss_tensors(
         self,
         inputs: Dict[str, Any],
@@ -1104,16 +1146,11 @@ class SequenceParallelStrategy:
             return inputs, outputs
         inputs, outputs = copy(inputs), copy(outputs)
         real_position_ids = self._ctx.real_position_ids
-        # Gather only auxiliary inputs whose contracts request it. Forward
-        # keys remain model-owned; task-specific pooled outputs are handled upstream.
         for spec in self.input_key_specs:
             value = inputs.get(spec.name)
             if spec.stage == 'auxiliary' and spec.need_gather and value is not None:
                 inputs[spec.name] = self._gather_key(value, spec, real_position_ids)
 
-        # Fused CE stores hidden states in the logits slot. This legacy switch
-        # selects the registered logits rule without gathering real vocabulary
-        # logits in the ordinary logps path.
         fused_hidden = outputs.get('logps') is None and 'lm_head' in outputs and inputs.get('labels') is not None
         if isinstance(sp_gather_keys, str):
             sp_gather_keys = (sp_gather_keys,)
@@ -1125,18 +1162,17 @@ class SequenceParallelStrategy:
         output_specs = {spec.name: spec for spec in self.output_key_specs}
         unknown_keys = required_keys - output_specs.keys()
         if unknown_keys:
-            raise KeyError(
-                f'Loss requested SP gather for unregistered output key(s) {sorted(unknown_keys)}. '
-                'Register a sequence-aligned DataKeySpec with SequenceParallelStrategy.register_output_key().')
+            raise KeyError(f'Loss requested SP gather for unregistered output key(s) {sorted(unknown_keys)}. '
+                           'Register a sequence-aligned DataKeySpec with SequenceParallelStrategy.register_output_key().')
         missing_keys = {key for key in required_keys if outputs.get(key) is None}
         if missing_keys:
-            raise KeyError(f'Loss declared SP gather key(s) {sorted(missing_keys)}, '
-                           'but the model output is missing them.')
+            raise KeyError(f'Loss declared SP gather key(s) {sorted(missing_keys)}, but the model output is missing them.')
         for spec in self.output_key_specs:
             value = outputs.get(spec.name)
             if value is not None and (spec.need_gather or spec.name in required_keys
                                       or (spec.name == 'logits' and fused_hidden)):
                 outputs[spec.name] = self._gather_key(value, spec, real_position_ids)
+        self._gather_completion_mask(inputs, real_position_ids)
         return inputs, outputs
 
     def wrap_model(self, model, optimizer=None):
@@ -1149,10 +1185,16 @@ class SequenceParallelStrategy:
     def needs_wrapped_optimizer_state(self) -> bool:
         return False
 
-    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         from twinkle.utils.platforms import Platform
+        from ..optimizer_state import remap_optimizer_state_names
         if Platform.is_master():
-            torch.save(optimizer.state_dict(), output_path)
+            optim_state = optimizer.state_dict()
+            remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            torch.save(optim_state, output_path)
 
-    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
-        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
+        from ..optimizer_state import remap_optimizer_state_names
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        optimizer.load_state_dict(optim_state)

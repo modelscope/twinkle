@@ -10,7 +10,7 @@ import torch
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from twinkle.data_format import SampleResponse, SamplingParams
+from twinkle.data_format import PoolingParams, PoolingResponse, SampleResponse, SamplingParams
 
 
 class BaseSamplerEngine(ABC):
@@ -54,6 +54,39 @@ class BaseSamplerEngine(ABC):
             SampleResponse containing sequences and optionally prompt_logprobs.
         """
         pass
+
+    async def encode(
+        self,
+        prompt_token_ids: List[int],
+        pooling_params: Optional[PoolingParams] = None,
+        *,
+        request_id: Optional[str] = None,
+        images: Optional[List[Any]] = None,
+        videos: Optional[List[Any]] = None,
+        **kwargs,
+    ) -> PoolingResponse:
+        """Run a pooling (non-generative) forward and return the pooled output.
+
+        The pooling counterpart of :meth:`sample`: one forward, no decoding, producing an embedding
+        vector / class scores / a relevance score instead of tokens. Only engines whose backend can
+        serve a pooling head (vLLM, SGLang) implement this. The default raises so a backend without
+        pooling support fails loudly here rather than silently returning hidden states that look like
+        embeddings and rank nothing correctly.
+
+        Args:
+            prompt_token_ids: Input token IDs (or, for a cross-encoder ``score`` task on SGLang, the
+                text pair the backend scores).
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            request_id: Optional request ID for tracking.
+            images: Optional images for multimodal embedding models.
+            videos: Optional videos for multimodal embedding models.
+            **kwargs: Additional engine-specific arguments.
+
+        Returns:
+            PoolingResponse whose ``data`` is the pooled vector/values as plain floats.
+        """
+        raise NotImplementedError(f'{type(self).__name__} does not support pooling/encode; use a vLLM or '
+                                  'SGLang engine, or a HF forward via build_model(task=...).')
 
     @abstractmethod
     async def get_tokenizer(self):

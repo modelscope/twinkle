@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch
 from dataclasses import dataclass, field
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -69,6 +70,16 @@ class BaseOptimizerGroup:
         """Accumulate metrics for train/eval status. Override in subclass if needed."""
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            # forward_kwargs is the raw kwargs the forward was called with. A caller that drives
+            # gradient accumulation threads gradient_accumulation_steps through it (the Megatron
+            # forward_backward pops it for do_grad_sync, but the dict stored on train_status still
+            # carries it). It must not be forwarded to the metric verbatim: this method passes the
+            # authoritative self.gradient_accumulation_steps explicitly, so a second copy inside
+            # **forward_kwargs raises "got multiple values for keyword argument". Pop it here -- the
+            # TransformersOptimizerGroup override does the same -- so both backends accumulate metrics
+            # identically (basic principle: backend equivalence, no per-backend special casing).
+            forward_kwargs = dict(status.forward_kwargs)
+            forward_kwargs.pop('gradient_accumulation_steps', None)
             for metric in status.metrics:
                 metric.accumulate(
                     status.inputs,
@@ -77,12 +88,28 @@ class BaseOptimizerGroup:
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     grad_norm=self._last_grad_norm,
-                    **status.forward_kwargs)
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
+                    **forward_kwargs)
 
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""
         self.accumulate_metrics(is_training)
         status = self.train_status if is_training else self.eval_status
+        # The metrics below gather over the DP group, and that gather is the first
+        # use of its NCCL communicator: NCCL connects it with its own cudaMalloc,
+        # which draws on device memory torch's caching allocator has *not* taken, so
+        # it fails on whichever rank has the least left -- and it fails where nothing
+        # reports it. Measured on 8xH20 with one padded trajectory per micro batch:
+        # 16 mini batches of 7k-19k tokens left the allocator holding 87.8 GiB
+        # reserved against 29.0 GiB live, one rank down to 164 MiB free, and that
+        # rank raised inside all_gather_object while the other seven waited in it
+        # forever -- 54 minutes, no log line, GPUs at 0% with their memory held,
+        # because calculate_metric is collected 'last_pp_first' so the driver never
+        # fetches the failing rank's exception. Releasing the cache first puts every
+        # rank above 54 GiB free and the same step completes in 5 ms. The cost is one
+        # re-allocation per optimizer step, which is once per iteration here.
+        if status.metrics and torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())

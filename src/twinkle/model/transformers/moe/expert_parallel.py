@@ -533,10 +533,26 @@ def _run_router(
     # Lazy import to avoid circular dependency with router_replay.py
     from .router_replay import RouterReplayAction
 
-    # --- REPLAY_FORWARD: use injected selected_experts ---
+    # --- REPLAY (forward / backward): use injected selected_experts ---
     if (replay_state is not None and replay_state.action != RouterReplayAction.RECORD
             and replay_state.target_indices is not None):
         selected_experts = replay_state.target_indices
+        replay_mask = getattr(replay_state, 'target_mask', None)
+        if replay_mask is not None:
+            # Blend per token: masked-in tokens replay the reference routing, masked-out tokens keep the
+            # native routing recomputed from the current (drifting) weights. Mirrors the Megatron
+            # MaskedRouterReplay.get_replay_topk blend so both backends behave identically.
+            if isinstance(gate_out, tuple) and len(gate_out) >= 3:
+                native_indices = gate_out[2]
+            else:
+                native_probs = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+                _, native_indices = torch.topk(native_probs, top_k, dim=-1)
+            if selected_experts.shape != native_indices.shape or replay_mask.numel() != router_logits.shape[0]:
+                raise RuntimeError(
+                    'Router replay tensors are not aligned: '
+                    f'logits={tuple(router_logits.shape)}, targets={tuple(selected_experts.shape)}, '
+                    f'native={tuple(native_indices.shape)}, mask={tuple(replay_mask.shape)}')
+            selected_experts = torch.where(replay_mask.bool().unsqueeze(-1), selected_experts, native_indices)
         routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
         routing_weights = routing_weights.gather(-1, selected_experts)
         if norm_topk_prob:

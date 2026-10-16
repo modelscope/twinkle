@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
+from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
 @dataclass
@@ -44,6 +45,7 @@ class InputProcessor:
         'input_features': 0.0,
         'feature_attention_mask': 0,
         'routed_experts': 0,
+        'replay_mask': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch
@@ -105,7 +107,6 @@ class InputProcessor:
         registered_keys = {spec.name for spec in getattr(kwargs.get('sp_strategy'), 'input_key_specs', BUILTIN_INPUT_KEYS)}
 
         def to_tensor(_input):
-            import torch
             for key in list(_input.keys()):
                 value = _input[key]
                 # Ray/pyarrow can return numpy or list scalars; normalize to tensors.
@@ -117,6 +118,16 @@ class InputProcessor:
                     value = torch.from_numpy(value)
                 elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                     value = torch.tensor(value)
+                elif (key == 'labels' and isinstance(value, (int, float, np.number))
+                      and not isinstance(value, (bool, np.bool_))):
+                    # seq_cls / regression / reranker emit ONE scalar label per sequence (a class index or
+                    # a regression target), not a per-token sequence. The branches above only catch ndarray
+                    # and numeric LIST values, so a bare scalar would fall through, get collated into a
+                    # plain list/numpy [B] object, be skipped by to_device, and then blow up in the loss on
+                    # `labels.to(device)` (numpy has no `.to`). Wrap it as a 1-element tensor so it rides the
+                    # normal tensor path to a batched [B, 1] device tensor; SeqClsLoss reduces it back with
+                    # view(-1) / squeeze. bool is excluded because it subclasses int.
+                    value = torch.tensor([value])
                 elif key == 'position_ids' and not isinstance(value, torch.Tensor):
                     if value is None:
                         continue
@@ -476,6 +487,13 @@ class InputProcessor:
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
 
+        hf_config = kwargs.get('hf_config')
+        attn_implementation = getattr(hf_config, '_attn_implementation', None)
+        if not is_flash_attention_implementation(attn_implementation):
+            raise RuntimeError('Transformers padding_free/packed batches require a FlashAttention backend; '
+                               f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
+                               'logical sequences after they are concatenated into one physical row.')
+
         if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
             from twinkle.patch import apply_patch
             from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
@@ -522,7 +540,6 @@ class InputProcessor:
                 sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
-            import torch
             max_len = max([s.shape[0] for s in sequences])
 
             padded_sequences = []
@@ -535,7 +552,6 @@ class InputProcessor:
 
     @staticmethod
     def _create_4d_attention_mask(attention_mask):
-        import torch
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
         device = attention_mask[0].device
@@ -653,9 +669,10 @@ class InputProcessor:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
-        Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
-        from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
-        Keys that are ``None`` are silently skipped.
+        Unpacks ``labels``, ``completion_mask`` and any present output keys
+        (``logps``, ``logits``) from ``[1, total_tokens, ...]`` to
+        ``[num_sequences, max_seq_len, ...]``. Keys that are ``None`` are silently
+        skipped.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op. Same for
@@ -738,6 +755,9 @@ class InputProcessor:
                 'max_length_k',
                 'packed_seq_params',
                 'routed_experts',
+                'replay_mask',
+                'mm_token_type_ids',
+                'second_per_grid_ts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS) + registered_keys + list(PROCESSOR_PASSTHROUGH_KEYS)
             for key in list(_input.keys()):
                 if key not in _keys:
@@ -789,6 +809,46 @@ class InputProcessor:
             padded.append(result)
         return torch.stack(padded)
 
+    # when training on mixed text + multimodal data, some fields (e.g. mm_token_type_ids)
+    # only exist on multimodal samples. We pad those fields for the missing samples instead of
+    # letting collate blow up with a KeyError.
+    def _fill_optional_sequence_fields(self, batch: List[InputFeature]) -> None:
+        if len(batch) < 2:
+            return
+        seq_fields = set(self.padding_map) - set(self.VLM_CONCAT_FIELDS)
+        present = {k for feat in batch for k in feat if k in seq_fields}
+        for key in present:
+            missing = [feat for feat in batch if feat.get(key) is None]
+            if not missing or len(missing) == len(batch):
+                continue  # all-present (no gap) or all-absent (nothing to align to) -> leave as is
+            pad_value = self.padding_map[key]
+            for feat in missing:
+                input_ids = feat.get('input_ids')
+                if input_ids is None:
+                    continue
+                # Match the row's device/dtype: prepare_inputs may already have moved rows to the
+                # accelerator, and a CPU fill would break the cat inside the collate below.
+                reference = input_ids if isinstance(input_ids, torch.Tensor) else None
+                length = reference.shape[-1] if reference is not None else len(input_ids)
+                device = reference.device if reference is not None else None
+                # completion_mask is the one field with a derivation rule: every other layer
+                # (template, grpo, metric, ledger) reads "absent" as "whatever is scored is the
+                # policy's own completion", so a zero fill would silently drop the row from the
+                # loss instead of aligning it with the rest of the batch.
+                labels = feat.get('labels') if key == 'completion_mask' else None
+                if labels is not None:
+                    labels = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(np.asarray(labels))
+                    if labels.shape[-1] == length:
+                        feat[key] = (labels.reshape(-1) != -100).to(dtype=torch.long, device=device)
+                        continue
+                feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
+
+    #: Audio fields whose leading dim is the audio count and must survive collate under the batched
+    #: Qwen-audio contract (see _collate_macro_batch). The gemma4 channels-last contract instead
+    #: relies on the blanket squeeze folding a single-audio leading dim away, so the squeeze is only
+    #: skipped for these fields when the batch is on the Qwen-audio contract.
+    _QWEN_AUDIO_FIELDS = ('input_features', 'feature_attention_mask')
+
     def _collate_macro_batch(self, inputs: List[InputFeature], sp_strategy=None) -> InputFeature:
         import torch
         from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
@@ -796,11 +856,31 @@ class InputProcessor:
         builtin_names = {spec.name for spec in BUILTIN_INPUT_KEYS}
         key_specs = {spec.name: spec for spec in getattr(sp_strategy, 'input_key_specs', BUILTIN_INPUT_KEYS)
                      if spec.stage == 'auxiliary' or (spec.stage == 'forward' and spec.name not in builtin_names)}
-
+        # Two mutually-exclusive audio contracts share the `input_features` field name and are told
+        # apart by the mask field that rides alongside it:
+        #   * gemma4 (mcore-bridge mm_gpts/gemma4.py) pairs `input_features` with `input_features_mask`
+        #     and wants channels-last features -- per-sample 2-D [plane0, plane1] given a trailing
+        #     singleton, the 1-D mask expanded to the feature plane, batch folded into dim 0.
+        #   * Qwen2.5-Omni / Qwen-audio pairs `input_features` with `feature_attention_mask` and
+        #     transformers' Qwen2_5OmniThinker.get_audio_features wants per-audio-batched
+        #     [N, freq, time] features + [N, time] mask, plain dim-0 concat (no reshape).
+        # Detect the contract once, before the squeeze: the squeeze would strip Qwen-audio's leading
+        # audio-count dim ([1, freq, time] -> [freq, time]), which the concat then folds into dim 0
+        # ([freq*N, time, 1]) and get_audio_features rejects against the [N, time] mask.
+        qwen_audio = any('feature_attention_mask' in _input for _input in inputs)
+        # Work on local copies so squeezing doesn't mutate the caller's original samples.
+        squeezed = []
         for _input in inputs:
+            _input = dict(_input)
             for key in list(_input.keys()):
-                if isinstance(_input[key], torch.Tensor) and key not in key_specs:
-                    _input[key] = _input[key].squeeze()
+                if isinstance(_input[key], torch.Tensor):
+                    if qwen_audio and key in self._QWEN_AUDIO_FIELDS:
+                        continue  # keep the audio-count leading dim intact for get_audio_features
+                    if key not in key_specs:
+                        _input[key] = _input[key].squeeze()
+            squeezed.append(_input)
+        inputs = squeezed
+        self._fill_optional_sequence_fields(inputs)
 
         vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
         text_inputs = []
@@ -865,14 +945,22 @@ class InputProcessor:
             if values:
                 _values = []
                 for i, value in enumerate(values):
-                    if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
-                        assert len(value.shape) == 2
-                        value = value.unsqueeze(-1)
-                    if field == 'input_features_mask':  # [freq_bins,] -> [freq_bins, time_steps]
-                        assert len(value.shape) == 1
-                        input_features_shape = vlm_fields['input_features'][i].shape
-                        assert value.shape[0] == input_features_shape[0]
-                        value = value.unsqueeze(1).expand(input_features_shape[:2])
+                    if not qwen_audio:
+                        # gemma4 channels-last audio contract: per-sample features are 2-D and get a
+                        # trailing singleton; the 1-D mask is expanded to the feature plane. Batch is
+                        # folded into dim 0 by the concat below.
+                        if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
+                            assert len(value.shape) == 2
+                            value = value.unsqueeze(-1)
+                        if field == 'input_features_mask':  # [freq_bins,] -> [freq_bins, time_steps]
+                            assert len(value.shape) == 1
+                            input_features_shape = vlm_fields['input_features'][i].shape
+                            assert value.shape[0] == input_features_shape[0]
+                            value = value.unsqueeze(1).expand(input_features_shape[:2])
+                    # Qwen-audio contract: `input_features` is already [N, freq, time] and
+                    # `feature_attention_mask` is [N, time] (both kept un-squeezed above); the concat
+                    # below stacks them on dim 0 into the [sum(N), freq, time] / [sum(N), time] layout
+                    # get_audio_features expects. No reshape here.
                     if value.dim() == 1:
                         # image_thw may be squeezed
                         value = value.unsqueeze(0)
@@ -956,19 +1044,38 @@ class InputProcessor:
             routed_experts = _input.get('routed_experts', None)
             input_ids = _input.get('input_ids', None)
             input_seq_len = input_ids.shape[-1] if input_ids is not None else 0
-            if routed_experts is not None:
-                # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
-                # This gap of 1 is expected
-                # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
-                experts_seq_len = routed_experts.shape[0]
-                # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
-                padding_routed_experts = routed_experts
-                padding_len = input_seq_len - experts_seq_len
-                if padding_len > 0:
-                    padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
-                                                                     'constant',
-                                                                     self.padding_map.get('routed_experts', 0))
-                _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+            if routed_experts is None:
+                # No reference routing to replay, so a stray mask is meaningless (and would reach the model
+                # as an unexpected column) -- drop it.
+                _input.pop('replay_mask', None)
+                return _input
+            # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
+            # This gap of 1 is expected
+            # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
+            experts_seq_len = routed_experts.shape[0]
+            # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
+            padding_routed_experts = routed_experts
+            padding_len = input_seq_len - experts_seq_len
+            if padding_len > 0:
+                padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
+                                                                 'constant',
+                                                                 self.padding_map.get('routed_experts', 0))
+            _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+
+            # The per-token replay_mask rides alongside routed_experts and must stay token-aligned with it:
+            # pad it to the SAME input_seq_len, and clamp away every row that has no reference routing -- the
+            # sampler's short-by-one tail (PR 28284) plus the CP padding -- so those tokens recompute their
+            # routing natively instead of replaying zero-filled expert ids. prepare_inputs already gave the
+            # mask a leading batch dim ([1, seq]); restore that shape after the seq-axis pad. Kept as long
+            # (0/1) to match routed_experts' int64 through the CP/SP scatter; consumers call ``.bool()``.
+            replay_mask = _input.get('replay_mask', None)
+            if replay_mask is not None:
+                mask = replay_mask.reshape(-1)[:experts_seq_len]
+                mask_pad_len = input_seq_len - mask.shape[0]
+                if mask_pad_len > 0:
+                    mask = torch.nn.functional.pad(mask, (0, mask_pad_len), 'constant',
+                                                   self.padding_map.get('replay_mask', 0))
+                _input['replay_mask'] = mask.to(torch.long).unsqueeze(0)
 
             return _input
 

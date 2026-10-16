@@ -8,9 +8,19 @@ making it easy to maintain and extend template configurations.
 
 # Template mapping for different model families
 # Key: model name pattern to match, Value: template name
+# Qwen3.6 / Qwen3.8 share Qwen3.5's architecture (``Qwen3_5ForConditionalGeneration``,
+# ``model_type: qwen3_5``) and therefore its template. Qwen3.8 differs from Qwen3.6
+# only in chat_template semantics (``reasoning_effort``, ``preserve_thinking`` default),
+# which the jinja template itself handles.
 MODEL_TEMPLATE_MAPPING = {
     'Qwen3.5': 'Qwen3_5Template',
     'Qwen3.6': 'Qwen3_5Template',
+    'Qwen3.8': 'Qwen3_5Template',
+    # DeepSeek-V4 uses its own chat markup, so it maps to DeepseekV4Template rather than the default.
+    # Substring match is case-sensitive, so cover the org-prefixed and bare spellings callers use.
+    'DeepSeek-V4': 'DeepseekV4Template',
+    'deepseek-v4': 'DeepseekV4Template',
+    'Deepseek-V4': 'DeepseekV4Template',
     # Add more model-template mappings here as needed
     # 'ModelName': 'TemplateName',
 }

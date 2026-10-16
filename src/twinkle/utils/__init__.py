@@ -4,15 +4,16 @@ from .device_mesh import DeviceGroup, DeviceMesh, is_last_rank, is_master
 from .framework import Framework as framework_util
 from .framework import Torch as torch_util
 from .import_utils import exists, requires
-from .loader import Plugin, construct_class
+from .loader import Plugin, construct_class, load_module
 from .logger import get_logger
 from .network import find_free_port, find_node_ip, is_valid_ipv6_address
 from .parallel import processing_lock
 from .platforms import GPU, NPU, Platform, ensure_hccl_socket_env, ensure_npu_backend
 from .safetensors import LazyTensor, SafetensorLazyLoader, StreamingSafetensorSaver
-from .torch_utils import (clone_state_dict_to_cpu, pad_and_stack_tensors, pad_sequence_to_length, selective_log_softmax,
+from .torch_utils import (clone_state_dict_to_cpu, pad_and_stack_tensors, pad_sequence_to_length,
+                          prepare_replayed_selective_log_softmax, replayed_selective_log_softmax, selective_log_softmax,
                           split_cp_inputs, stateless_init_process_group, to_device)
 from .transformers_utils import find_all_linears, find_layers, get_modules_to_not_convert
 from .unsafe import check_unsafe, trust_remote_code
-from .utils import copy_files_by_pattern, deep_getattr, get_runtime_meta
+from .utils import copy_files_by_pattern, deep_getattr, get_runtime_meta, run_sync
 from .vision_tools import load_image, load_mm_file

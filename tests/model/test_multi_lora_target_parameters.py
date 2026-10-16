@@ -9,6 +9,7 @@ from torch import nn
 
 print(f"sys.path: {sys.path}")
 
+
 class FakePackedExperts(nn.Module):
 
     def __init__(self, num_experts=2, hidden=4, intermediate=6, *, is_transposed=False):
@@ -133,7 +134,7 @@ def test_multilora_releases_target_parameter_slot_to_initial_weights():
             else:
                 assert torch.count_nonzero(param.detach()) == 0
 
-# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support 
+# Note: PEFT (Parameter-Efficient Fine-Tuning) does not natively support
 # installing multiple LoRA slots on target parameters.
 # def test_target_parameter_state_dict_loads_with_peft():
 #     from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
@@ -183,6 +184,46 @@ def _make_multilora_for_target_parameters(model):
     ]
     multi_lora.patch_target_parameters(model, _make_target_cfg().target_parameters)
     return multi_lora
+
+
+def _make_dense_multilora_without_target_parameters():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    config = LoraConfig(r=2, lora_alpha=4, target_modules=['weight'])
+    multi_lora = MultiLora(max_loras=1, max_r=4)
+    multi_lora.module = nn.Linear(4, 4)
+    multi_lora.loras = [
+        LoraTenant(
+            index=0,
+            adapter_name='lora_0',
+            config=config,
+            tenant_adapter_name='dense',
+            tenant_config=config,
+        )
+    ]
+
+    class RejectTargetParameterState:
+
+        def get_state_dict(self, tenant_adapter_name):
+            raise KeyError(tenant_adapter_name)
+
+        def set_state_dict(self, tenant_adapter_name, state_dict):
+            raise KeyError(tenant_adapter_name)
+
+    multi_lora.target_parameter_manager = RejectTargetParameterState()
+    return multi_lora
+
+
+def test_dense_multilora_get_state_dict_skips_target_parameter_manager():
+    multi_lora = _make_dense_multilora_without_target_parameters()
+
+    assert multi_lora.get_state_dict('dense') == {}
+
+
+def test_dense_multilora_set_state_dict_skips_target_parameter_manager():
+    multi_lora = _make_dense_multilora_without_target_parameters()
+
+    multi_lora.set_state_dict('dense', {})
 
 
 def test_multilora_state_dict_round_trips_target_parameters():
@@ -260,10 +301,30 @@ def test_multilora_transformers_installs_target_parameters_once():
     else:
         raise AssertionError("different target_parameters should be rejected")
 
-# Run in the local environment.
-if __name__ == "__main__":
-    assert test_peft_target_parameter_key_shapes_for_3d_experts() == True
-    assert test_target_parameter_multi_lora_updates_only_active_adapter() == True
-    assert test_multilora_releases_target_parameter_slot_to_initial_weights() == True
-    assert test_multilora_state_dict_round_trips_target_parameters() == True
-    assert test_multilora_transformers_installs_target_parameters_once() == True
+
+def test_multilora_transformers_optimizer_includes_target_parameter_slots():
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+
+    model = FakeModel()
+    manager = _make_multilora_for_target_parameters(model)
+    manager.acquire_lora("adapter_a", _make_target_cfg(r=2))
+
+    instance = object.__new__(MultiLoraTransformersModel)
+    instance.multi_adapter = manager
+    instance.strategy = type("Strategy", (), {"unwrap_model": lambda _self, inner: inner})()
+    instance.__dict__["model"] = model
+
+    selected = instance._get_trainable_parameters("adapter_a")
+    expected = dict(manager.target_parameter_manager.named_slot_parameters("adapter_a"))
+
+    assert expected
+    assert {id(value) for value in selected.values()} == {id(value) for value in expected.values()}
+
+
+def test_target_parameter_only_adapter_does_not_require_linear_targets():
+    from twinkle.model.multi_lora import MultiLora
+
+    manager = MultiLora(max_loras=1, max_r=4)
+    manager.module = FakeModel()
+
+    manager.validate_tenant_target_modules([], target_parameters=_make_target_cfg().target_parameters)

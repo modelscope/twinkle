@@ -235,6 +235,32 @@ def test_launcher_accepts_typed_config() -> None:
     assert launcher.config is cfg
 
 
+def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
+    app = ApplicationSpec.model_validate({
+        'name': 'data-plane',
+        'route_prefix': '/api/v1/data-plane',
+        'import_path': 'data_plane',
+        'args': {
+            'config': {
+                'backend': {
+                    'SimpleStorage': {
+                        'num_data_storage_units': 2,
+                    },
+                },
+            },
+        },
+    })
+    assert app.import_path == 'data_plane'
+    assert app.args.config['backend']['SimpleStorage']['num_data_storage_units'] == 2
+
+    with pytest.raises(ValidationError):
+        ApplicationSpec.model_validate({
+            'name': 'data-plane',
+            'import_path': 'data_plane',
+            'args': {'unknown': True},
+        })
+
+
 def test_cookbook_examples_load() -> None:
     """Migrated cookbook configs all parse with the new field names."""
     here = Path(__file__).resolve().parents[3]

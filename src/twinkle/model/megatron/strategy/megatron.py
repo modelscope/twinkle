@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
 from twinkle.utils import get_logger
-from .._mindspeed_runtime import configure_mindspeed_runtime_args
 
 logger = get_logger()
 
@@ -105,6 +104,10 @@ class MegatronStrategy:
         variable_seq_lengths: bool = True,
         config: PreTrainedConfig = None,
         ddp_config: Dict[str, Any] = None,
+        bridge_backend='mcore-bridge',
+        align_grad_reduce: bool = True,
+        nccl_comm_warmup: bool = False,
+        attn_impl: Optional[str] = None,
         **kwargs,
     ):
         from megatron.core import mpu
@@ -115,6 +118,24 @@ class MegatronStrategy:
         self.seed = seed
         self.variable_seq_lengths = variable_seq_lengths
         self.ddp_config = ddp_config or {}
+        # The bridge backend owns model construction: get_model_config / create_megatron_model below
+        # delegate to it. Accepted as a NAME string or a live instance -- the string is what survives
+        # the Ray worker boundary (@remote_class forwards constructor kwargs, not built objects),
+        # while an instance allows local/test injection. Resolved before get_model_config runs.
+        if isinstance(bridge_backend, str):
+            from ..bridge import resolve_bridge_backend
+            self._backend = resolve_bridge_backend(bridge_backend)
+        else:
+            self._backend = bridge_backend
+        self._align_grad_reduce = align_grad_reduce
+        # FlashAttention version pin: flips transformer_engine MODULE GLOBALS, so it must run in this
+        # (the model-building) process -- in Ray mode the worker, not the driver. attn_impl is a
+        # caller field name ModelConfig does not have, so it is consumed here and never forwarded
+        # into the config; the kernel choice arrives separately as attention_backend.
+        from .._flash_attn import apply_flash_version_pin
+        pinned = apply_flash_version_pin(attn_impl)
+        if pinned is not None:
+            logger.info(f'Forcing Flash Attention v{pinned} as the attention backend.')
         if config is None:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(self.model_dir, trust_remote_code=True)
@@ -177,6 +198,8 @@ class MegatronStrategy:
         self.config = self.get_model_config(self.hf_config, parallel_kwargs, **kwargs)
         self._finalize_quantized_param_config()
         self._check_fsdp()
+        if nccl_comm_warmup:
+            self._warmup_communicators()
 
     def _check_fsdp(self):
         """Reject Megatron-FSDP combinations that cannot work.
@@ -248,6 +271,11 @@ class MegatronStrategy:
     @property
     def bridge(self):
         return self.config.bridge
+
+    @property
+    def backend(self):
+        """The BridgeBackend this strategy delegates model construction to."""
+        return self._backend
 
     @property
     def params_type(self) -> torch.dtype:
@@ -353,6 +381,12 @@ class MegatronStrategy:
             self.config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]  # noqa
             if len(model) == 1:
                 self.config.grad_sync_func = self.config.grad_sync_func[0]  # noqa
+            if not self._align_grad_reduce:
+                # align_grad_reduce=False opts out of bucket-aligned reduction. grad_sync_func is the
+                # hook driving the aligned overlap, so clear it (legacy does the same). Placed inside
+                # the overlap_grad_reduce branch -- and before the overlap_param_gather block, which
+                # can early-return -- so it always runs when there is something to undo.
+                self.config.grad_sync_func = None
         if ddp_config['overlap_param_gather'] and ddp_config['align_param_gather']:
             # Only DDP exposes start_param_sync. Megatron-FSDP has no equivalent because it drives
             # its own parameter all-gathers from the module hooks rather than being prompted by the
@@ -418,8 +452,20 @@ class MegatronStrategy:
         count = local_count.clamp(min=1).to(torch.int64)
         cp_size = self.device_mesh.cp_world_size or 1
         grad_count = (count // cp_size).clamp(min=1) if cp_size > 1 else count
+        # The reported loss MUST be a real copy (.clone()), not a storage-sharing .detach() view of
+        # local_loss. This 3-tuple is the (loss, num_tokens, loss_reduced) contract Megatron-core's
+        # forward_step_calc_loss consumes: it takes the FIRST element as output_tensor and scales it
+        # IN PLACE for gradient accumulation -- `output_tensor /= clamp(num_tokens); /= num_microbatches`
+        # (schedules.py). local_loss IS that first element, so a bare local_loss.detach() in the dict
+        # shares its storage and gets silently divided by num_microbatches (and num_tokens) too, corrupting
+        # the logged/metric loss. It only showed up at num_microbatches>1 (a single microbatch divides by 1)
+        # and only for losses that report num_tokens=0 (mean-reduced preference/RL losses like DPO, whose
+        # per-microbatch value is already the batch mean); per-token-sum losses hide it because their
+        # num_tokens scaling is folded back out downstream. clone() snapshots the true value before mcore
+        # touches the backward tensor. logits/logps are separate tensors mcore never scales, so detach
+        # suffices for them.
         return local_loss, grad_count, {
-            'loss': local_loss.detach(),
+            'loss': local_loss.detach().clone(),
             'logits': logits.detach() if logits is not None else None,
             'logps': logps.detach() if logps is not None else None,
             'num_tokens': count
@@ -431,63 +477,52 @@ class MegatronStrategy:
         parallel_kwargs: Dict[str, Any],
         **kwargs,
     ):
-        from mcore_bridge import ModelConfig, hf_to_mcore_config
-        config_kwargs = hf_to_mcore_config(hf_config)
-        config_kwargs.update(kwargs)
-        if 'calculate_per_token_loss' not in config_kwargs:
-            config_kwargs['calculate_per_token_loss'] = True
-
-        if 'moe_token_dispatcher_type' not in config_kwargs:
-            config_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
-        model_config = ModelConfig(
-            use_cpu_initialization=True,
-            params_dtype=self.params_type,
-            sequence_parallel=self.sequence_parallel,
-            finalize_model_grads_func=finalize_model_grads_for_lora,
-            variable_seq_lengths=self.variable_seq_lengths,
-            **parallel_kwargs,
-            **config_kwargs,
-        )
-        if Platform.device_prefix() == 'npu':
-            # After Twinkle stops feeding the dense 4D causal mask, MindSpeed's
-            # patched TE attention should generate its own compressed causal
-            # mask. In 0.15.3 that path is gated by ``use_flash_attn`` on the
-            # model config itself. If we leave it unset, MindSpeed falls back to
-            # the non-flash mask generator and aborts the first 8-card forward
-            # with: "Please set micro_batch_size or set use_flash_attn=True in
-            # config." Keep the TE flash path enabled and let it synthesize the
-            # mask it expects.
-            model_config.use_flash_attn = True
-        configure_mindspeed_runtime_args(model_config)
-        return model_config
+        return self._backend.build_model_config(hf_config, parallel_kwargs, self, **kwargs)
 
     def create_megatron_model(
         self,
         load_weights: bool = True,
     ) -> List[nn.Module]:
-        import torch.distributed as dist
-        from mcore_bridge import get_mcore_model
-        mg_models = get_mcore_model(self.config)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        _models = []
-        for _model in mg_models:
-            _model = self._move_model_to_gpu(_model)
-            _models.append(_model)
-
-        if load_weights:
-            # Load weights
-            bridge = self.config.bridge
-            bridge.load_weights(mg_models, self.model_dir)
-        return _models
+        return self._backend.create_model(
+            self.config, self.model_dir, load_weights=load_weights, move_to_gpu=self._move_model_to_gpu)
 
     @staticmethod
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
         model = model.to(Platform.get_local_device())
         torch_util.synchronize()
         return model
+
+    @staticmethod
+    def _warmup_communicators() -> None:
+        """Run a dummy all-reduce on every NCCL communicator so the first real step does not pay the
+        connection-setup cost and skew initial timings. Opt-in via ``nccl_comm_warmup``; requires mpu
+        to be initialized (it is, by __init__, before this is called)."""
+        from megatron.core import mpu
+
+        dummy = torch.zeros(1, device=torch_util.get_current_device())
+        warmed = 0
+        for getter, kwargs in (
+            (mpu.get_data_parallel_group, {
+                'with_context_parallel': True
+            }),
+            (mpu.get_data_parallel_group, {}),
+            (mpu.get_context_parallel_group, {}),
+            (mpu.get_tensor_model_parallel_group, {}),
+            (mpu.get_pipeline_model_parallel_group, {}),
+            (mpu.get_model_parallel_group, {}),
+            (mpu.get_embedding_group, {}),
+            (mpu.get_position_embedding_group, {}),
+        ):
+            try:
+                groups = getter(**kwargs)
+            except (AssertionError, ValueError, TypeError):
+                continue
+            for group in groups if isinstance(groups, list) else [groups]:
+                if group is not None:
+                    torch.distributed.all_reduce(dummy, group=group)
+                    warmed += 1
+        torch_util.synchronize()
+        logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
 
     @torch.no_grad()
     def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
@@ -591,12 +626,31 @@ class MegatronStrategy:
             inner = getattr(_optimizer, 'optimizer', _optimizer)
             if inner is None or getattr(_optimizer, 'is_stub_optimizer', False):
                 continue
-            # The fp32 master copies of the fp16/bf16 parameters live in the inner param_groups.
+            # The inner param_groups hold the optimizer's own handle on each parameter. For
+            # bf16/fp16 training under a DistributedOptimizer these are separate fp32 master shards
+            # (``shard_fp32_from_float16_groups``, allocated with ``.clone().float()``): they own
+            # their storage, so offloading only the DDP param/grad buffers would leave the master
+            # weights (and below, the momentum) resident -- hence this walk.
+            #
+            # For FP32 training the DistributedOptimizer does NOT clone. It aliases its inner params
+            # to VIEWS of the DDP flat param buffer (``_build_model_and_main_param_groups`` slices
+            # ``model_param.view(-1)[start:end]`` straight into ``shard_fp32_params``). The
+            # ``buffer.offload_to_cpu()`` above already copied that buffer to pinned host memory and
+            # freed its device storage (``param_data.storage().resize_(0)``), so those views now
+            # dangle and a D2H copy of one raises CUDA "invalid argument". Their bytes are safe in
+            # the buffer's host copy and reappear on ``reload_from_cpu()``, so skip exactly the params
+            # whose storage was freed and move only the ones still owning live storage (the
+            # bf16/fp16 master shards). Skipping is required for correctness, not just to dodge the
+            # crash: reassigning a freed view's ``.data`` to a fresh host tensor would detach it from
+            # the buffer the model itself reads, so ``reload_from_cpu()`` would restore the model's
+            # weights while the optimizer kept stepping on an orphaned copy.
             for group in inner.param_groups:
                 for param in group['params']:
-                    if isinstance(param, torch.Tensor):
+                    if isinstance(param, torch.Tensor) and param.untyped_storage().size() > 0:
                         param.data = param.data.to(device, non_blocking=True)
+            # Momentum/variance (exp_avg, exp_avg_sq, ...) are always fresh allocations, never buffer
+            # views, so the freed-storage guard is a no-op here; it just keeps the walk uniform.
             for state in inner.state.values():
                 for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                    if isinstance(value, torch.Tensor) and value.untyped_storage().size() > 0:
                         state[key] = value.to(device, non_blocking=True)

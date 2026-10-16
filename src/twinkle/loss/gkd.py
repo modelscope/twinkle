@@ -29,6 +29,10 @@ class GKDLoss(Loss):
         temperature: Softmax temperature applied to logits before divergence (default: 1.0).
         ignore_index: Token index to ignore in the loss mask (default: -100).
         chunk_size: Number of valid tokens processed per chunk to reduce peak memory (default: 512).
+        sft_alpha: Weight of an auxiliary supervised cross-entropy term added on dataset-sourced
+            rounds (default: 0.0, i.e. pure distillation). The caller enables it per round via the
+            ``apply_sft_loss`` argument to :meth:`__call__`, so a run can mix on-policy student
+            generations (distillation only) with labelled dataset rows (distillation + SFT).
     """
 
     require_logits = True
@@ -39,6 +43,7 @@ class GKDLoss(Loss):
         temperature: float = 1.0,
         ignore_index: int = -100,
         chunk_size: int = 512,
+        sft_alpha: float = 0.0,
         **kwargs,
     ):
         if not (0.0 <= beta <= 1.0):
@@ -49,6 +54,7 @@ class GKDLoss(Loss):
         self.temperature = temperature
         self.ignore_index = ignore_index
         self.chunk_size = chunk_size
+        self.sft_alpha = sft_alpha
 
     def __call__(
         self,
@@ -59,6 +65,7 @@ class GKDLoss(Loss):
         teacher_topk_logprobs: Optional['torch.Tensor'] = None,
         teacher_topk_indices: Optional['torch.Tensor'] = None,
         topk: Optional[int] = None,
+        apply_sft_loss: bool = False,
         **kwargs,
     ) -> LossOutput:
         """Compute GKD / JSD distillation loss.
@@ -104,7 +111,21 @@ class GKDLoss(Loss):
             teacher_topk_logprobs=teacher_topk_logprobs,
             teacher_topk_indices=teacher_topk_indices,
         )
+        if apply_sft_loss and self.sft_alpha > 0:
+            loss = loss + self.sft_alpha * self._supervised_ce(inputs['labels'], outputs['logits'])
         return LossOutput(loss=loss, num_tokens=0)
+
+    def _supervised_ce(self, labels, logits):
+        """Mean cross-entropy on the labelled rows, the auxiliary SFT term scaled by ``sft_alpha``."""
+        import torch.nn.functional as F
+        # Align the seq dimension the same way the JSD path does: some MLLMs return extra prefix logits.
+        if logits.shape[1] != labels.shape[1]:
+            logits = logits[:, -labels.shape[1]:]
+        return F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            ignore_index=self.ignore_index,
+            reduction='mean')
 
     @staticmethod
     def _generalized_jsd_loss(

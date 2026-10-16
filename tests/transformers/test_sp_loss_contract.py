@@ -97,7 +97,8 @@ def test_declared_but_unregistered_or_missing_output_fails_loudly():
 
 
 def test_ppo_value_loss_declares_per_token_value_collection():
-    assert PPOValueLoss.sp_gather_keys == ('logits',)
+    assert PPOValueLoss.sp_gather_keys == ('values',)
+    assert PPOValueLoss.sp_output_key_specs[0].name == 'values'
 
 
 class _ToyValueModel(torch.nn.Module):
@@ -132,7 +133,7 @@ def _ppo_value_worker(rank, port):
 
         baseline = _ToyValueModel()
         base_logits = baseline(ids, positions)['logits']
-        base_loss = loss_fn({'labels': labels}, {'logits': base_logits},
+        base_loss = loss_fn({'labels': labels}, {'values': base_logits},
                             returns=returns, old_values=old_values)['loss']
         base_loss.backward()
         base_grad = baseline.scale.grad.clone()
@@ -145,9 +146,11 @@ def _ppo_value_worker(rank, port):
         )
         strategy._get_tokenizer = lambda: SimpleNamespace(pad_token_id=0)
         assert strategy.initialize()
+        strategy.register_loss_key_specs(loss_fn)
         prepared = strategy.preprocess_inputs({'input_ids': ids, 'position_ids': positions, 'labels': labels})
         local_labels = prepared.pop('labels')
         local_outputs = model(**{key: prepared[key] for key in ('input_ids', 'position_ids')})
+        local_outputs['values'] = local_outputs.pop('logits')
         loss_inputs, loss_outputs = InputProcessor().postprocess_tensor_sp(
             {'labels': local_labels},
             local_outputs,
@@ -255,7 +258,7 @@ def _ppo_training_pipeline_worker(rank, port):
 
         loss_fn = PPOValueLoss(cliprange_value=0.2, vf_coef=0.5)
         baseline_values = baseline(input_ids=ids, position_ids=positions, use_cache=False).logits[..., 0]
-        baseline_loss = loss_fn({'labels': labels}, {'logits': baseline_values},
+        baseline_loss = loss_fn({'labels': labels}, {'values': baseline_values},
                                 returns=returns, old_values=old_values)['loss']
         baseline_loss.backward()
         baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=1e-3)
@@ -264,7 +267,7 @@ def _ppo_training_pipeline_worker(rank, port):
         training_model.forward_backward(inputs=batch, returns=returns, old_values=old_values)
         optimizer_group = training_model.optimizer_group[training_model._get_default_group()]
         assert optimizer_group.train_status.inputs['labels'].shape == labels.shape
-        assert optimizer_group.train_status.outputs['logits'].shape == labels.shape
+        assert optimizer_group.train_status.outputs['values'].shape == labels.shape
         optimizer_group.optimizer = torch.optim.SGD(training_model.model.parameters(), lr=1e-3)
         for parameter in training_model.model.parameters():
             assert parameter.grad is not None

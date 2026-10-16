@@ -75,35 +75,38 @@ def _patch_gdn_kernels_for_cu_seqlens(
     else:
         causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
 
-    old_conv_fn = mod.causal_conv1d_fn
-    old_chunk_rule = mod.chunk_gated_delta_rule
+    # The Qwen3.5 modeling code references ``causal_conv1d_fn`` (and, for transformers
+    # < 5.9.0, ``chunk_gated_delta_rule``) as *module-level* globals inside the layer
+    # forward, not as instance attributes.  Patch them in the forward's global
+    # namespace so the swapped-in, ``cu_seqlens``-aware kernels are picked up, then
+    # restore afterwards.
+    modeling_globals = origin_forward.__globals__
+    old_conv_fn = modeling_globals.get('causal_conv1d_fn')
+    old_chunk_rule = modeling_globals.get('chunk_gated_delta_rule') if patch_chunk_rule else None
 
     if is_npu:
 
-        def causal_conv1d_wrapper(*args, **kwargs):
-            x = kwargs.pop('x')
-            del kwargs['seq_idx']
-            del kwargs['backend']
-
-            if len(args) > 0:
-                kwargs['weight'] = args[0]
-                args = args[1:]
-            if len(args) > 0:
-                kwargs['bias'] = args[0]
+        def causal_conv1d_wrapper(hidden_states, weight, bias=None, activation=None, **kwargs):
+            kwargs.pop('seq_idx', None)
+            kwargs.pop('backend', None)
             return npu_causal_conv1d_fn(
-                x=x,
-                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
-                **kwargs,
+                x=hidden_states,
+                weight=weight,
+                bias=bias,
+                activation=activation,
+                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=hidden_states.device),
             )
     else:
 
-        def causal_conv1d_wrapper(*args, **kwargs):
-            x = kwargs.pop('x')
+        def causal_conv1d_wrapper(hidden_states, weight, bias=None, activation=None, **kwargs):
+            kwargs.pop('seq_idx', None)
+            kwargs.pop('backend', None)
             output = causal_conv1d(
-                *args,
-                x=x.transpose(1, 2).contiguous(),
-                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
-                **kwargs,
+                x=hidden_states.transpose(1, 2).contiguous(),
+                weight=weight,
+                bias=bias,
+                activation=activation,
+                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=hidden_states.device),
             )
             if isinstance(output, tuple):
                 output = output[0]
@@ -120,15 +123,15 @@ def _patch_gdn_kernels_for_cu_seqlens(
             kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
             return chunk_gated_delta_rule(query, key, value, **kwargs)
 
-    mod.causal_conv1d_fn = causal_conv1d_wrapper
-    if patch_chunk_rule:
-        mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
+    modeling_globals['causal_conv1d_fn'] = causal_conv1d_wrapper
+    if patch_chunk_rule and old_chunk_rule is not None:
+        modeling_globals['chunk_gated_delta_rule'] = chunk_gated_delta_rule_wrapper
     try:
         return call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
-        mod.causal_conv1d_fn = old_conv_fn
-        if patch_chunk_rule:
-            mod.chunk_gated_delta_rule = old_chunk_rule
+        modeling_globals['causal_conv1d_fn'] = old_conv_fn
+        if patch_chunk_rule and old_chunk_rule is not None:
+            modeling_globals['chunk_gated_delta_rule'] = old_chunk_rule
 
 
 class GatedDeltaNetPaddingFreePatch(Patch):

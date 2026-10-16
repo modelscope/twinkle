@@ -4,4 +4,5 @@ from .galore_adamw import GaLoreAdamW
 from .galore_projector import GaLoreProjector
 from .galore_utils import GaLoreConfig, create_galore_param_groups
 from .galore_adamw8bit import GaLoreAdamW8bit
+from .galore_qadamw8bit import QGaLoreAdamW8bit
     

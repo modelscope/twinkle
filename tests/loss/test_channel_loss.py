@@ -107,7 +107,9 @@ def test_loss_metric_aggregates_channels_and_resets():
 
     result = metric.calculate()
 
-    assert result['loss'] == '2.0000'
+    # The headline loss is formatted with 5 decimals while per-channel losses use 4; the
+    # two precisions are intentional (finer resolution on the most-watched number).
+    assert result['loss'] == '2.00000'
     assert result['loss_math'] == '1.6667'
     assert result['loss_code'] == '4.0000'
     assert metric.channel_loss == {}

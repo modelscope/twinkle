@@ -23,12 +23,30 @@ class GaLoreConfig:
         update_proj_gap: The projection update interval for galore.
         galore_scale: The scale of the projected gradient.
         proj_type: The projection type, one of `std`, `reverse_std`, `right`, `left`, `full`.
+        quantize: Enable QGaLore (quantized low-rank projection). The in-repo GaLore optimizers project
+            the full-precision gradient; quantization is implemented only by the external
+            `q_galore_torch.QGaLoreAdamW8bit` (provisioned here as `QGaLoreAdamW8bit`), which reads the
+            `proj_*`/`cos_threshold`/`gamma_proj`/`queue_size` knobs below off the param group. Inert
+            when False, so a plain GaLore run ignores them.
+        proj_quant: Quantize the projection itself (forwarded to QGaLore as its `quant` group key).
+        proj_bits: Bit-width of the quantized projection.
+        proj_group_size: Group size for block-wise quantization of the projection.
+        cos_threshold: Cosine-similarity threshold QGaLore uses to decide subspace reuse.
+        gamma_proj: QGaLore projection rescale factor.
+        queue_size: Length of the gradient queue QGaLore tracks for its subspace estimate.
     """
     rank: int = 128
     target_modules: Optional[Union[str, List[str]]] = None
     update_proj_gap: int = 50
     galore_scale: float = 1.0
     proj_type: str = 'std'
+    quantize: bool = False
+    proj_quant: bool = False
+    proj_bits: int = 4
+    proj_group_size: int = 256
+    cos_threshold: float = 0.4
+    gamma_proj: int = 2
+    queue_size: int = 5
 
     def __post_init__(self):
         if self.target_modules is None:
@@ -69,6 +87,16 @@ def create_galore_param_groups(model: nn.Module, param_groups: List[Dict[str, An
         'scale': config.galore_scale,
         'proj_type': config.proj_type,
     }
+    if config.quantize:
+        # QGaLore reads its quantization settings off the param group, exactly where it reads rank /
+        # proj_type. The key names are q_galore_torch's, not ours, so they are spelled verbatim; the
+        # plain GaLore optimizers never see them (this branch is gated on config.quantize).
+        galore_defaults['quant'] = config.proj_quant
+        galore_defaults['quant_n_bit'] = config.proj_bits
+        galore_defaults['quant_group_size'] = config.proj_group_size
+        galore_defaults['cos_threshold'] = config.cos_threshold
+        galore_defaults['gamma_proj'] = config.gamma_proj
+        galore_defaults['queue_size'] = config.queue_size
 
     new_param_groups = []
     enabled_names = []

@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared deployment-application construction.
 
-Top-level, central deployment-construction infrastructure shared by all four
-deployments (Gateway, Model, Sampler, Processor). It is intentionally NOT under
+Top-level deployment-construction infrastructure shared by Gateway, Model,
+Sampler, Processor, and DataPlane. It is intentionally NOT under
 ``utils/`` — it is core to how every deployment is built, not a generic helper.
 
-It consolidates, in one place, the construction logic the four App_Builders
+It consolidates, in one place, the construction logic the App_Builders
 used to repeat:
 
 - ``get_servable()`` — the single servable-object accessor;

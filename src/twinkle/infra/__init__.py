@@ -5,11 +5,13 @@ import json
 import numpy as np
 import os
 import sys
-from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
+import threading
+from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
-from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
-from .collectors import collect_tensor_dict
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_logger, requires
+from . import _torch_setup
+from .collectors import collect_dp_and_flatten, collect_tensor_dict
 
 logger = get_logger()
 
@@ -20,11 +22,13 @@ _mode: Optional[Literal['local', 'ray']] = 'local'
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
 
-_seed = 42
-
 _lazy_collect = True
 
-_full_determinism = False
+# Torch process-global init knobs (seed / determinism / tf32), bundled into one dict so a new knob never
+# means a new initialize()/create_workers() argument or a new env var. Each only takes effect in the
+# process that runs the compute, so the set is published to every Ray worker through the
+# EXTRA_TORCH_KWARGS env var and re-applied there; _torch_setup owns the whole mechanism.
+_extra_torch_kwargs: Dict[str, Any] = _torch_setup.normalize(None)
 
 _device_group: Optional[List[DeviceGroup]] = None
 
@@ -80,8 +84,7 @@ def _maybe_load_worker_notifier() -> None:
 def initialize(mode: Literal['local', 'ray'] = 'local',
                nproc_per_node: int = 8,
                ncpu_proc_per_node: int = 8,
-               seed: int = 42,
-               full_determinism: bool = False,
+               extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                groups: Optional[List[DeviceGroup]] = None,
                global_device_mesh: Optional[DeviceMesh] = None,
                lazy_collect: bool = True,
@@ -95,8 +98,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             'ray': Run in ray cluster.
         nproc_per_node: The GPU count(number of processes) per node.
         ncpu_proc_per_node: The CPU processes count per node.
-        seed: Seed everything with this.
-        full_determinism: Freeze the random, use determinism kernels, default `False`.
+        extra_torch_kwargs: Per-process PyTorch init knobs, bundled so a new one needs no new argument
+            (see ``_torch_setup``): ``seed`` (seed everything with this), ``full_determinism`` (freeze
+            the random, use determinism kernels, default `False`) and ``tf32`` (explicit matmul/conv
+            precision; None leaves torch's default). Applied here and re-applied on every Ray worker
+            through the EXTRA_TORCH_KWARGS env var, since each is a per-process global.
         groups: The device groups of the training.
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
@@ -106,11 +112,10 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _name, _notifier
+    global _mode, _device_group, _extra_torch_kwargs, _lazy_collect, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
     _name = name
-    _full_determinism = full_determinism
     _lazy_collect = lazy_collect
     _notifier = notifier
     if name is not None:
@@ -121,9 +126,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
 
-    if seed is not None:
-        _seed = seed
-        framework_util.seed_everything(seed, full_determinism)
+    # Seed + set determinism/tf32 in THIS process, and publish the knob set for the Ray workers (which
+    # inherit env, not this process's globals). In local/torchrun mode this process does the compute; in
+    # ray mode the driver still runs its own light compute (e.g. collect), so both want it applied here.
+    _extra_torch_kwargs = _torch_setup.apply(extra_torch_kwargs)
+    os.environ[_torch_setup.EXTRA_TORCH_KWARGS_ENV] = _torch_setup.to_env_value(_extra_torch_kwargs)
     if _mode == 'local':
         if groups is not None:
             _device_group = groups
@@ -151,6 +158,19 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         _device_group = groups
         RayHelper.initialize(
             nproc_per_node=nproc_per_node, ncpu_proc_per_node=ncpu_proc_per_node, device_groups=_device_group)
+
+
+def get_device_mesh() -> Optional[DeviceMesh]:
+    """The global default device mesh set by ``initialize`` (None before init).
+
+    A ``@remote_class`` model receives this mesh automatically: its wrapped ``__init__`` injects it
+    whenever the caller passes ``device_mesh=None`` (see ``_new_init_body``). A model that builds
+    *outside* that wrapper -- one overriding ``__init__`` rather than inheriting the wrapped base --
+    resolves its mesh through this accessor to uphold the same invariant: a constructed model holds a
+    real mesh, so the InputProcessor / OptimizerGroup it builds get proper DP placement instead of
+    silently degrading to single-rank loss normalisation and no metric aggregation.
+    """
+    return _device_mesh
 
 
 def get_device_placement(device_group=None) -> str:
@@ -298,6 +318,254 @@ def _get_workers(workers, execute):
         return workers[Platform.get_peer_index(len(workers))]
     else:
         raise ValueError(f'Unsupported execute method: {execute}')
+
+
+# Guards creating the per-handle state below. Without it two threads arriving at
+# once each build their own state, with their own lock, and one overwrites the
+# other -- after which the two are no longer excluding each other and the requests
+# charged to the discarded one are never given back.
+_CW_CREATE_LOCK = threading.Lock()
+
+# Prefix of the awaitable companion generated for a continuous-work method. The
+# companion is what the driver actually calls on the worker; see
+# ``_make_worker_async_companion``.
+_WORKER_ASYNC_PREFIX = '_twinkle_async_'
+
+
+def _worker_executor(self, ):
+    """Threads for running a blocking worker method off the actor's event loop.
+
+    Sized from ``TWINKLE_ACTOR_MAX_CONCURRENCY``, which ``create_workers`` sets to
+    the actor's ``max_concurrency``: any fewer threads than that would throttle
+    below the concurrency the actor was configured for. A private executor rather
+    than the loop's default one, so this never changes behaviour for anything else
+    running on that loop.
+    """
+    executor = getattr(self, '_twinkle_worker_executor', None)
+    if executor is not None:
+        return executor
+    with _CW_CREATE_LOCK:
+        executor = getattr(self, '_twinkle_worker_executor', None)
+        if executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            n = int(os.environ.get('TWINKLE_ACTOR_MAX_CONCURRENCY') or 0) or 1
+            executor = ThreadPoolExecutor(max_workers=n, thread_name_prefix='twinkle-worker')
+            self._twinkle_worker_executor = executor
+        return executor
+
+
+def _make_worker_async_companion(func, wrapper):
+    """Wrap a blocking worker method so the actor can run several of them at once.
+
+    Ray makes a class with any ``async def`` into an asyncio actor, and there a
+    blocking method holds the actor's single event loop for its whole duration --
+    so calls queue and run one after another however high ``max_concurrency`` is.
+    Measured on this sampler: four concurrent one-prompt calls took 3.98x as long
+    as one, while the same four prompts in a single call took 1.02x. Handing the
+    blocking body to a thread leaves the loop free to accept the next call, which
+    is what puts several requests in the worker's engine together.
+    """
+    import asyncio
+
+    @functools.wraps(func)
+    async def companion(self, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_worker_executor(self), functools.partial(wrapper, self, *args, **kwargs))
+
+    companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
+    return companion
+
+
+def _cw_state(self, n_workers: int):
+    """Driver-side bookkeeping for ``enable_continous_work``, created on first use.
+
+    ``load`` counts requests handed to each worker and not yet returned, which is
+    what picks the next worker. ``inflight`` keeps those counts honest per method
+    name, and is also what the barrier reads: a method other than the one with
+    requests in flight must wait for them, because the worker now runs methods
+    side by side and something like receiving weights or sleeping would otherwise
+    land on an engine mid-generation.
+
+    The state's own lock is a plain ``Lock``: nothing here takes it while already
+    holding it, so re-entrance is not needed.
+    """
+    state = getattr(self, '_continous_work_state', None)
+    if state is not None and len(state['load']) == n_workers:
+        return state
+    with _CW_CREATE_LOCK:
+        # Re-read: another thread may have created it while this one waited.
+        state = getattr(self, '_continous_work_state', None)
+        if state is None or len(state['load']) != n_workers:
+            state = {
+                'lock': threading.Lock(),
+                'load': [0] * n_workers,
+                'inflight': {},  # method name -> list of pending object refs
+            }
+            self._continous_work_state = state
+        return state
+
+
+def _cw_barrier(self, current_func: str) -> None:
+    """Drain every other method's in-flight work before proceeding.
+
+    Best effort by construction: another thread may submit again the moment this
+    returns. It removes the case this exists for -- a weight update or a sleep
+    issued while generations are still running -- but it is not a global lock on
+    the worker.
+    """
+    state = getattr(self, '_continous_work_state', None)
+    if not state:
+        return
+    with state['lock']:
+        others = {name: list(refs) for name, refs in state['inflight'].items() if name != current_func and refs}
+    if not others:
+        return
+    import ray
+    flat = [ref for refs in others.values() for ref in refs]
+    logger.debug(f'continous_work barrier: {current_func} waits for {len(flat)} pending request(s) '
+                 f'from {sorted(others)}')
+    ray.get(flat)
+    # They are finished now, so drop them instead of re-getting them on every
+    # later call. The owning thread's own cleanup tolerates them being gone.
+    with state['lock']:
+        for name, refs in others.items():
+            pending = state['inflight'].get(name)
+            if pending is None:
+                continue
+            for ref in refs:
+                if ref in pending:
+                    pending.remove(ref)
+            if not pending:
+                state['inflight'].pop(name, None)
+
+
+def _cw_object_refs(result) -> List[Any]:
+    """Every ObjectRef inside a dispatch result, tuples included."""
+    import ray
+    refs = []
+    for item in (result or []):
+        for candidate in (item if isinstance(item, tuple) else (item, )):
+            if isinstance(candidate, ray.ObjectRef):
+                refs.append(candidate)
+    return refs
+
+
+def _cw_register(self, func_name: str, result) -> List[Any]:
+    """Record a non-continuous call's refs so a later different method waits for it.
+
+    Needed because a lazily collected method returns before its work finishes:
+    ``receive_weights`` hands back a handle while the worker is still swapping
+    weights, and with actor concurrency on, a sample issued right after would read
+    them half written.
+    """
+    refs = _cw_object_refs(result)
+    if not refs:
+        return refs
+    state = _cw_state(self, len(getattr(self, '_actors', ())) or 1)
+    with state['lock']:
+        state['inflight'].setdefault(func_name, []).extend(refs)
+    return refs
+
+
+def _cw_unregister(self, func_name: str, refs: List[Any]) -> None:
+    state = getattr(self, '_continous_work_state', None)
+    if not state or not refs:
+        return
+    with state['lock']:
+        pending = state['inflight'].get(func_name)
+        if pending is None:
+            return
+        for ref in refs:
+            if ref in pending:
+                pending.remove(ref)
+        if not pending:
+            state['inflight'].pop(func_name, None)
+
+
+def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]:
+    """Assign each request to the worker holding the fewest, updating ``load``.
+
+    Least-loaded-first, one request at a time, so a call of one request goes to
+    one worker instead of being padded up to the worker count, and a call of many
+    spreads out. ``load`` is mutated by the caller's lock holder.
+    """
+    per_worker: List[List[int]] = [[] for _ in range(n_workers)]
+    for idx in range(batch_len):
+        target = min(range(n_workers), key=lambda w: load[w])
+        per_worker[target].append(idx)
+        load[target] += 1
+    return per_worker
+
+
+def _cw_batch_len(args, kwargs) -> Optional[int]:
+    """Length of the request list, i.e. the first list argument's length.
+
+    Same convention as ``dispatch='slice'``: list arguments are the batch and
+    everything else is broadcast. Returns None when there is no list to split,
+    which is how the caller knows to fall back to the normal dispatch.
+    """
+    for arg in list(args) + list(kwargs.values()):
+        if isinstance(arg, list):
+            return len(arg)
+    return None
+
+
+def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
+    """The arguments for one worker: list arguments indexed, the rest as-is."""
+
+    def pick(arg):
+        if isinstance(arg, list) and len(arg) == batch_len:
+            return [arg[i] for i in indices]
+        return arg
+
+    return tuple(pick(a) for a in args), {k: pick(v) for k, v in kwargs.items()}
+
+
+def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
+                        ray_get_timeout: Optional[float]):
+    """Submit one call per chosen worker and return results in the caller's order.
+
+    Submission happens under the lock so that picking a worker and charging it are
+    one step -- several caller threads land here at once, and a split of the two
+    would let them all pick the same idle worker. Waiting happens outside it.
+    """
+    import ray
+
+    state = _cw_state(self, len(workers))
+    submitted = []
+    # The awaitable form, so the worker can hold several of these at once. Book-
+    # keeping still uses the plain name, which is what callers and the barrier see.
+    remote_name = _WORKER_ASYNC_PREFIX + func_name
+    with state['lock']:
+        plan = _cw_plan(len(workers), state['load'], batch_len)
+        for worker_index, indices in enumerate(plan):
+            if not indices:
+                continue
+            sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
+            ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
+            submitted.append((worker_index, indices, ref))
+        state['inflight'].setdefault(func_name, []).extend(ref for _, _, ref in submitted)
+
+    try:
+        ordered: List[Any] = [None] * batch_len
+        for _, indices, ref in submitted:
+            part = ray.get(ref, timeout=ray_get_timeout) if ray_get_timeout else ray.get(ref)
+            if not isinstance(part, (list, tuple)) or len(part) != len(indices):
+                raise TypeError(f'{func_name}: enable_continous_work needs one result per request, but a worker given '
+                                f'{len(indices)} request(s) returned {type(part).__name__} of length '
+                                f'{len(part) if isinstance(part, (list, tuple)) else "n/a"}.')
+            for local_index, original_index in enumerate(indices):
+                ordered[original_index] = part[local_index]
+        return ordered
+    finally:
+        with state['lock']:
+            pending = state['inflight'].get(func_name, [])
+            for worker_index, indices, ref in submitted:
+                state['load'][worker_index] -= len(indices)
+                if ref in pending:
+                    pending.remove(ref)
+            if not pending:
+                state['inflight'].pop(func_name, None)
 
 
 def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
@@ -504,14 +772,32 @@ def _prepare_lazy_collect(args, kwargs):
         return args, kwargs
 
 
-def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
+def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurrency: Optional[int] = None):
     """Patch each class used in remote clusters with this decorator.
 
     Use this decorator to wrap your class to enable it to execute in a remote cluster.
 
+    Args:
+        execute: which workers the class runs on.
+        max_concurrency: Ray actor concurrency, i.e. how many of this class's
+            methods one worker may run at once. ``None`` leaves Ray's default of
+            1, under which concurrent calls to the same worker queue and run one
+            after another. Only set it for a class whose methods tolerate running
+            side by side: a class holding NCCL collectives does not, because two
+            collectives interleaving on one rank deadlock. It is what
+            ``enable_continous_work`` needs to reach the worker's engine
+            concurrently instead of stopping at the actor boundary.
     """
 
     def decorator(cls):
+        # Give every continuous-work method its awaitable form on the class, so Ray
+        # has something to await instead of a call that would sit on the actor's
+        # event loop and make the others wait behind it.
+        for _name in dir(cls):
+            _attr = getattr(cls, _name, None)
+            _companion = getattr(_attr, '_worker_async_companion', None)
+            if _companion is not None:
+                setattr(cls, _WORKER_ASYNC_PREFIX + _name, _companion)
         # Get device mesh parameter name
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
         init_method = cls.__init__
@@ -546,7 +832,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                         kwargs['min_batch_size'] = device_mesh.data_world_size
                     init_method(self, *args, **kwargs)
                 else:
-                    # Pop the device_mesh
+                    if device_mesh is not None:
+                        logger.warning(f'{cls.__name__} was given a device_mesh but it is being DROPPED: twinkle '
+                                       'holds no device group, so call twinkle.initialize(...) before '
+                                       'constructing it. Training will otherwise run with device_mesh=None '
+                                       '(single-rank loss normalisation and no metric aggregation).')
                     args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                     kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
@@ -616,23 +906,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # not remote_group: Ray mode with local component
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
-                    seed = int(os.environ.get('TWINKLE_SEED', _seed))
-                    determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
-                    framework_util.seed_everything(seed, bool(determinism))
-                    # Ensure torch.distributed is initialized inside Ray workers.
-                    if os.environ.get('WORKER_NAME'):
-                        # This will depress the warnings of megatron and reduce overhead.
-                        # setdefault, not assignment: this runs before the model is constructed, and
-                        # a sharded (FSDP) data-parallel wrapper needs this above 1 -- see
-                        # MegatronStrategy.apply_process_env, which corrects it while there is still
-                        # time (the CUDA driver latches the value when the context is created).
-                        # Cannot be delegated to the strategy from here: infra is below the model
-                        # layer and does not import it.
-                        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
-                        # This will prevent the unlimited threads started by torch
-                        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-                        # Use parallelism mode of tokenizers
-                        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+                    # All per-process torch setup (seed / determinism / tf32 / the worker CUDA-env pins)
+                    # is isolated in _torch_setup, so none of it leaks into the Ray dispatch logic here.
+                    _torch_setup.apply_in_worker(_extra_torch_kwargs)
                     if not device_mesh_name:
                         # pop the device_mesh
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
@@ -659,19 +935,25 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                     # Remove potential duplicate keys from kwargs before passing
                     kwargs_for_workers = kwargs.copy()
                     kwargs_for_workers.pop('instance_id', None)
-                    kwargs_for_workers.pop('seed', None)
-                    kwargs_for_workers.pop('full_determinism', None)
+                    # create_workers takes extra_torch_kwargs explicitly, so strip it from the forwarded
+                    # component kwargs to avoid a duplicate-keyword collision.
+                    kwargs_for_workers.pop('extra_torch_kwargs', None)
 
                     _actors = RayHelper.create_workers(
                         cls,
                         remote_group,
                         execute,
                         instance_id=instance_id,
-                        seed=_seed,
-                        full_determinism=_full_determinism,
+                        extra_torch_kwargs=_extra_torch_kwargs,
+                        max_concurrency=max_concurrency,
                         *args,
                         **kwargs_for_workers)
                     self._actors = _actors
+                    # Remembered so remote_function knows this class's workers run
+                    # methods side by side, and that it must therefore track what is
+                    # in flight. Without concurrency Ray orders calls per actor and
+                    # the tracking would be dead weight.
+                    self._max_concurrency = max_concurrency
                     if hasattr(cls, '__iter__'):
                         # wraps again, because ray uses cls method to call remote
                         cls.__iter__ = remote_function(dispatch=_dispatch, execute=_execute, collect='none')(__iter__)
@@ -698,7 +980,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
                     sync: bool = False,
                     lazy_collect: Optional[bool] = None,
-                    timeout: Optional[float] = None):
+                    timeout: Optional[float] = None,
+                    enable_continous_work: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -725,6 +1008,19 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
         lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
         timeout: Timeout in seconds for ray.get() when collecting results. Instance attribute ``_ray_get_timeout`` overrides this.
+        enable_continous_work: Route each request to the least busy worker instead
+            of slicing the batch over all of them, and return the results in the
+            caller's order. This is what lets a batch smaller than the worker
+            count through: ``slice_dp`` would hand some ranks nothing and raise,
+            which is why callers pad a single request up to the worker count and
+            throw the duplicate generations away. Requires the class to be
+            declared with ``max_concurrency`` above 1, otherwise the requests
+            queue at the actor and run one at a time instead of reaching the
+            worker's engine together. Only for methods that take a list of
+            independent requests and return one result each, and whose workers
+            need no collective between them -- data-parallel sampling, not a
+            method with an all-reduce in it. While one such method has requests in
+            flight, calling any other method on the same handle waits for them.
     """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -760,6 +1056,23 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         # This is the driver
                         from ._ray import RayHelper
                         execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                        # Only classes whose workers run methods side by side need
+                        # this; elsewhere Ray already orders calls per actor.
+                        _concurrent_actor = bool(getattr(self, '_max_concurrency', None))
+                        if _concurrent_actor:
+                            # Every method waits here, not just the continuous ones:
+                            # the point is to keep a weight update or a sleep from
+                            # reaching a worker that still has generations running.
+                            _cw_barrier(self, func.__name__)
+                        if enable_continous_work and not RayHelper.has_ref(args, kwargs):
+                            assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
+                                              'which exists for collectives that must run in lock step.')
+                            _workers = _get_workers(self._actors, execute)
+                            _batch_len = _cw_batch_len(args, kwargs)
+                            if _batch_len:
+                                return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
+                                                           _batch_len,
+                                                           getattr(self, '_ray_get_timeout', None) or timeout)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -771,6 +1084,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                 _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
 
                         result = execute_method(func.__name__, _workers_and_args)
+                        # Tracked from here so that a different method called next
+                        # waits for this one. It matters most for the lazily
+                        # collected methods, which return while the worker is still
+                        # busy.
+                        _tracked_refs = _cw_register(self, func.__name__, result) if _concurrent_actor else []
                         # This is a result future, call it to get the actual result
                         _rgt = getattr(self, '_ray_get_timeout', None) or timeout
                         result_func = RayHelper.do_get_and_collect_func(
@@ -814,12 +1132,17 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                     _tag_exc(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
+                                finally:
+                                    _cw_unregister(self, func.__name__, _tracked_refs)
 
                             for _attr in ('_futures', ):
                                 if hasattr(_orig_result_func, _attr):
                                     setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
                             return _notifying_result_func
-                        return result_func()
+                        try:
+                            return result_func()
+                        finally:
+                            _cw_unregister(self, func.__name__, _tracked_refs)
                 else:
                     raise NotImplementedError(f'Unsupported mode {_mode}')
             except StopIteration:
@@ -834,6 +1157,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._dispatch = dispatch
         wrapper._lazy_collect = _lazy_collect
         wrapper._sync = sync
+        wrapper._enable_continous_work = enable_continous_work
+        if enable_continous_work:
+            # Attached to the class by remote_class, and called instead of this
+            # method when the driver routes requests worker by worker.
+            wrapper._worker_async_companion = _make_worker_async_companion(func, wrapper)
         return wrapper
 
     return decorator

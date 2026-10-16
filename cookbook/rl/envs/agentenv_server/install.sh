@@ -10,10 +10,14 @@ REPO_ROOT="${REPO_ROOT:-$HOME/AgentENV}"
 CONFIG_DIR="${CONFIG_DIR:-/var/lib/aenv/config}"
 
 SKIP_INSTALL=0
+SKIP_BUILD=0
 REBUILD=0
 for arg in "$@"; do
     case "$arg" in
         --skip-install) SKIP_INSTALL=1 ;;
+        # Bootstrap the host but build no template: used by cookbook setups that
+        # bring their own Dockerfile and only need the server installed once.
+        --skip-build) SKIP_BUILD=1 ;;
         --rebuild) REBUILD=1 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
@@ -47,6 +51,11 @@ if [ -f "$HOME/.config/aenv/credentials" ]; then
     echo "    already authenticated ($HOME/.config/aenv/credentials)"
 else
     aenv auth
+fi
+
+if [ "$SKIP_BUILD" = "1" ]; then
+    echo "==> Skipping template build (--skip-build)"
+    exit 0
 fi
 
 if [ "$REBUILD" = "1" ]; then

@@ -82,6 +82,25 @@ class TestGRPOLoss:
         result = loss_fn(inputs, outputs, old_logps=old_logps, advantages=adv_list)
         assert torch.isfinite(result['loss'])
 
+    def test_grpo_weights_sequences_equally(self):
+        labels = torch.tensor([
+            [1, -100, -100],
+            [1, 1, 1],
+        ])
+        logps = torch.zeros_like(labels, dtype=torch.float32)
+        inputs = {'labels': labels}
+        outputs = {'logps': logps}
+        advantages = torch.tensor([[1.0], [3.0]])
+
+        result = GRPOLoss()(
+            inputs,
+            outputs,
+            old_logps=logps,
+            advantages=advantages,
+        )
+
+        assert result['loss'].item() == pytest.approx(-2.0)
+
     def test_grpo_entropy_coef(self):
         loss_fn = GRPOLoss(epsilon=0.2, entropy_coef=0.01)
         inputs, outputs, old_logps, _, advantages = _make_rl_batch()

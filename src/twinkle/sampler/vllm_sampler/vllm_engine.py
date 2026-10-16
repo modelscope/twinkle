@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import contextlib
 import inspect
 import os
@@ -8,10 +9,12 @@ import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle import get_logger
-from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
+from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleResponse, SamplingMask,
+                                          SamplingParams, StopReason, pooling_to_list)
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
+from twinkle.utils.parallel import PosixFileLock
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
@@ -27,6 +30,156 @@ def _map_finish_reason(reason: str | None) -> StopReason:
     if reason is None:
         return 'length'
     return _FINISH_REASON_MAP.get(str(reason), 'length')
+
+
+def _filter_engine_config(
+    engine_config: Dict[str, Any],
+    valid_args,
+    enable_sampling_replay: bool,
+):
+    valid_args = set(valid_args)
+    invalid_args = set(engine_config) - valid_args
+    if enable_sampling_replay and 'enable_return_sampling_mask' in invalid_args:
+        raise RuntimeError('Sampling replay requires a vLLM build whose AsyncEngineArgs accepts '
+                           'enable_return_sampling_mask')
+    filtered_engine_config = {key: value for key, value in engine_config.items() if key in valid_args}
+    return filtered_engine_config, invalid_args
+
+
+def _to_list(value):
+    return value.tolist() if hasattr(value, 'tolist') else value
+
+
+def _as_flat_int_list(values, field_name: str) -> List[int]:
+    values = _to_list(values)
+    if not isinstance(values, (list, tuple)) or any(isinstance(_to_list(value), (list, tuple)) for value in values):
+        raise RuntimeError(f'vLLM sampling mask {field_name} must be a flat integer list')
+    return [int(value) for value in values]
+
+
+def _validate_sampling_mask_csr(token_ids: List[int], offsets: List[int], num_tokens: int) -> None:
+    num_rows = len(offsets) - 1
+    if num_rows != num_tokens:
+        raise RuntimeError(f'vLLM sampling mask has {num_rows} rows for {num_tokens} sampled tokens')
+    if not offsets or offsets[0] != 0 or offsets[-1] != len(token_ids):
+        raise RuntimeError('vLLM sampling mask has invalid CSR endpoints')
+    if any(start >= end for start, end in zip(offsets, offsets[1:])):
+        raise RuntimeError('vLLM sampling mask contains an empty or invalid CSR row')
+
+
+def _parse_flat_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    return (
+        _as_flat_int_list(raw_token_ids, 'token_ids'),
+        _as_flat_int_list(raw_offsets, 'offsets'),
+    )
+
+
+def _parse_token_rows(raw_token_ids, num_tokens: int) -> tuple[List[int], List[int]]:
+    rows = _to_list(raw_token_ids)
+    if not isinstance(rows, (list, tuple)) or len(rows) != num_tokens:
+        raise RuntimeError('vLLM sampling mask without offsets must provide one token-id row '
+                           'per sampled token')
+
+    token_ids = []
+    offsets = [0]
+    for row in rows:
+        token_row = _as_flat_int_list(row, 'token-id row')
+        token_ids.extend(token_row)
+        offsets.append(offsets[-1] + len(token_row))
+    return token_ids, offsets
+
+
+def _parse_chunked_csr(raw_token_ids, raw_offsets) -> tuple[List[int], List[int]]:
+    token_chunks = _to_list(raw_token_ids)
+    offset_chunks = _to_list(raw_offsets)
+    if not isinstance(token_chunks, (list, tuple)) or not isinstance(offset_chunks, (list, tuple)) \
+            or len(token_chunks) != len(offset_chunks):
+        raise RuntimeError('vLLM chunked sampling mask must have matching token-id and offset chunks')
+
+    token_ids = []
+    offsets = [0]
+    for chunk_idx, (token_chunk, offset_chunk) in enumerate(zip(token_chunks, offset_chunks)):
+        chunk_token_ids = _as_flat_int_list(token_chunk, f'token_ids chunk {chunk_idx}')
+        chunk_offsets = _as_flat_int_list(offset_chunk, f'offsets chunk {chunk_idx}')
+        if (not chunk_offsets or chunk_offsets[0] != 0 or chunk_offsets[-1] != len(chunk_token_ids)
+                or any(start >= end for start, end in zip(chunk_offsets, chunk_offsets[1:]))):
+            raise RuntimeError(f'vLLM sampling mask chunk {chunk_idx} has invalid CSR offsets')
+        base_offset = offsets[-1]
+        token_ids.extend(chunk_token_ids)
+        offsets.extend(base_offset + offset for offset in chunk_offsets[1:])
+    return token_ids, offsets
+
+
+def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[SamplingMask]:
+    if mask is None:
+        if required:
+            raise RuntimeError('vLLM output is missing sampling mask while sampling replay is enabled')
+        return None
+
+    raw_token_ids = _to_list(mask.token_ids)
+    raw_offsets = _to_list(getattr(mask, 'offsets', None))
+    if raw_offsets is None:
+        token_ids, offsets = _parse_token_rows(raw_token_ids, num_tokens)
+    elif any(isinstance(_to_list(offset), (list, tuple)) for offset in raw_offsets):
+        # Some vLLM builds preserve local CSR tensors for each output chunk.
+        token_ids, offsets = _parse_chunked_csr(raw_token_ids, raw_offsets)
+    else:
+        token_ids, offsets = _parse_flat_csr(raw_token_ids, raw_offsets)
+
+    _validate_sampling_mask_csr(token_ids, offsets, num_tokens)
+    return SamplingMask(token_ids=token_ids, offsets=offsets)
+
+
+def _set_sampling_replay_output_kind(vllm_params, enable_sampling_replay: bool) -> None:
+    """Use the only vLLM output mode that carries the full sampling mask."""
+    if not enable_sampling_replay:
+        return
+    from vllm.sampling_params import RequestOutputKind
+    vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
+
+
+def _validate_sampling_replay_params(sampling_params, extra_kwargs: Dict[str, Any]) -> None:
+    """Reject score-changing logits processors that a support mask cannot replay."""
+    neutral_values = {
+        'repetition_penalty': 1.0,
+        'presence_penalty': 0.0,
+        'frequency_penalty': 0.0,
+        'logit_bias': None,
+        'logits_processor': None,
+        'logits_processors': None,
+    }
+    incompatible = []
+    for name, neutral in neutral_values.items():
+        values = []
+        if isinstance(sampling_params, dict):
+            if name in sampling_params:
+                values.append(sampling_params[name])
+        elif hasattr(sampling_params, name):
+            values.append(getattr(sampling_params, name))
+        if name in extra_kwargs:
+            values.append(extra_kwargs[name])
+
+        if neutral is None:
+            enabled = any(bool(value) for value in values)
+        else:
+            enabled = any(value is not None and value != neutral for value in values)
+        if enabled:
+            incompatible.append(name)
+
+    if incompatible:
+        names = ', '.join(incompatible)
+        raise ValueError('sampling replay does not support score-changing logits processors; '
+                         f'disable these options: {names}')
+
+    if 'top_k' in extra_kwargs:
+        top_k = extra_kwargs['top_k']
+    elif isinstance(sampling_params, dict):
+        top_k = sampling_params.get('top_k')
+    else:
+        top_k = getattr(sampling_params, 'top_k', None)
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError('sampling distribution replay requires top_k > 0 to bound sampling mask size, '
+                         'reduce transfer overhead, and avoid potential OOMs')
 
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
@@ -78,6 +231,8 @@ class VLLMEngine(BaseSamplerEngine):
         quantization: Optional[str] = None,
         load_format: str = 'auto',
         logprobs_mode: Optional[str] = None,
+        runner: Optional[str] = None,
+        enable_sampling_replay: bool = False,
         **kwargs,
     ):
         from twinkle.hub import HubOperation
@@ -97,10 +252,13 @@ class VLLMEngine(BaseSamplerEngine):
         self.dtype = dtype
         self.quantization = quantization
         self.load_format = load_format
-        self.logprobs_mode = logprobs_mode or 'processed_logprobs'
+        self.enable_sampling_replay = enable_sampling_replay
+        self.logprobs_mode = 'processed_logprobs' if enable_sampling_replay else (logprobs_mode or 'processed_logprobs')
+        self.runner = runner
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
+        self._lora_load_tasks: Dict[str, asyncio.Task] = {}
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -130,6 +288,8 @@ class VLLMEngine(BaseSamplerEngine):
     def _create_engine(self):
         """Create and return the vLLM engine."""
         os.environ['VLLM_USE_V1'] = '1'
+        if self.enable_sampling_replay:
+            os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '1'
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -162,7 +322,14 @@ class VLLMEngine(BaseSamplerEngine):
         if self.enable_sleep_mode:
             engine_config['enable_sleep_mode'] = True
 
-        if self.logprobs_mode is not None:
+        # A pooling model (embedding/seq_cls/reranker/reward) is loaded by vLLM as a "pooling" runner,
+        # which swaps the LM head for the pooling head and routes requests through ``encode`` instead of
+        # ``generate``. logprobs_mode is a generation-only knob and is dropped here so vLLM does not
+        # reject it against a pooling model. ``runner`` reaches AsyncEngineArgs through the signature
+        # filter below, so an older vLLM that lacks it warns and ignores rather than failing to build.
+        if self.runner is not None:
+            engine_config['runner'] = self.runner
+        if self.logprobs_mode is not None and self.runner != 'pooling':
             engine_config['logprobs_mode'] = self.logprobs_mode
 
         if self.enable_lora:
@@ -175,19 +342,26 @@ class VLLMEngine(BaseSamplerEngine):
             'twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension')
 
         engine_config.update(self.engine_kwargs)
+        if self.enable_sampling_replay:
+            engine_config['enable_return_sampling_mask'] = True
+            engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
-        filtered_engine_config = {k: v for k, v in engine_config.items() if k in valid_args}
-        invalid_args = set(engine_config.keys()) - set(valid_args)
+        filtered_engine_config, invalid_args = _filter_engine_config(
+            engine_config,
+            valid_args,
+            self.enable_sampling_replay,
+        )
         if invalid_args:
             logger.warning(f'VLLMEngine: Filtered out invalid arguments: {invalid_args}')
         # Create engine using vLLM v1 API
         engine_args = AsyncEngineArgs(**filtered_engine_config)
         vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
 
-        engine = AsyncLLM.from_vllm_config(
-            vllm_config=vllm_config,
-            usage_context=UsageContext.OPENAI_API_SERVER,
-        )
+        with PosixFileLock('/tmp/twinkle-vllm-engine-init.lock'):
+            engine = AsyncLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=UsageContext.OPENAI_API_SERVER,
+            )
 
         logger.info(f'VLLMEngine initialized: model={self.model_id}')
         return engine
@@ -207,6 +381,21 @@ class VLLMEngine(BaseSamplerEngine):
     # =========================================================================
     # Core Sampling API
     # =========================================================================
+
+    async def abort_request(self, request_id: str) -> None:
+        """Abort an in-flight request so its ``generate()`` finishes with ``finish_reason='abort'``.
+
+        This is the trigger half of partial rollout (the resume/merge half is
+        :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`). vLLM v1's ``AsyncLLM.abort`` is a
+        coroutine; under the hood ``OutputProcessor.abort_requests`` enqueues a final ``RequestOutput`` with
+        ``FinishReason.ABORT`` that carries the tokens decoded so far -- and because that output counts as
+        finished, it is emitted even in ``FINAL_ONLY`` mode -- so the caller gets ``stop_reason='abort'``
+        plus the partial tokens it needs to resume from. ``request_id`` is the external id passed to
+        :meth:`sample`; aborting one already finished is a harmless no-op.
+        """
+        if self.engine is None:
+            return
+        await self.engine.abort(request_id)
 
     async def sample(self,
                      prompt: Union[List[int], str],
@@ -239,11 +428,14 @@ class VLLMEngine(BaseSamplerEngine):
         from vllm.inputs import TextPrompt, TokensPrompt
 
         # Convert to vLLM params
+        if self.enable_sampling_replay:
+            _validate_sampling_replay_params(sampling_params, kwargs)
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0
         logprobs = sampling_params.logprobs or 0
         vllm_params = sampling_params.to_vllm(**kwargs)
+        _set_sampling_replay_output_kind(vllm_params, self.enable_sampling_replay)
 
         # Build request
         if request_id is None:
@@ -291,6 +483,11 @@ class VLLMEngine(BaseSamplerEngine):
         sequences = []
         for output in result.outputs:
             token_ids = list(output.token_ids)
+            sampling_mask = _copy_sampling_mask(
+                getattr(output, 'sampling_mask', None),
+                num_tokens=len(token_ids),
+                required=self.enable_sampling_replay,
+            )
 
             # Extract logprobs
             seq_logprobs = None
@@ -319,6 +516,7 @@ class VLLMEngine(BaseSamplerEngine):
                     tokens=token_ids,
                     logprobs=seq_logprobs,
                     routed_experts=routed_experts,
+                    sampling_mask=sampling_mask,
                 ))
 
         # Extract prompt logprobs if requested
@@ -354,6 +552,76 @@ class VLLMEngine(BaseSamplerEngine):
             prompt_logprobs=result_prompt_logprobs,
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
+
+    async def encode(self,
+                     prompt: Union[List[int], str],
+                     pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+                     request_id: Optional[str] = None,
+                     priority: int = 0,
+                     *,
+                     lora_request: Optional[Any] = None,
+                     multi_modal_data: Optional[Dict[str, Any]] = None,
+                     mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+                     **kwargs) -> PoolingResponse:
+        """Run a pooling forward (embedding / classify) and return the pooled output.
+
+        The pooling counterpart of :meth:`sample`. It requires the engine to have been built as a
+        pooling runner (``runner='pooling'``); against a generation engine vLLM has no pooling head to
+        run and raises. ``encode`` returns an async generator just like ``generate``, so the final
+        ``PoolingRequestOutput`` is drained the same way and its ``outputs.data`` tensor flattened.
+
+        Args:
+            prompt: Input token IDs or a string.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            request_id: Optional request ID for tracking.
+            priority: Request priority (higher = more urgent).
+            lora_request: LoRARequest for multi-tenant pooling adapters.
+            multi_modal_data: Optional multimodal data for a multimodal embedding model.
+            mm_processor_kwargs: Optional kwargs forwarded to vLLM's multimodal processor.
+        """
+        from vllm.inputs import TextPrompt, TokensPrompt
+
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+        vllm_pooling = pooling_params.to_vllm(**kwargs)
+
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+
+        prompt_token_ids = None
+        if isinstance(prompt, str):
+            prompt_obj = TextPrompt(prompt=prompt)
+        else:
+            prompt_token_ids = list(prompt)
+            prompt_obj = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if multi_modal_data:
+            prompt_obj['multi_modal_data'] = multi_modal_data
+        if mm_processor_kwargs:
+            prompt_obj['mm_processor_kwargs'] = mm_processor_kwargs
+
+        if lora_request is not None and not self.enable_lora:
+            logger.warning('lora_request provided but enable_lora is False — LoRA will be ignored for '
+                           'this pooling request')
+            lora_request = None
+
+        generator = self.engine.encode(
+            prompt=prompt_obj,
+            pooling_params=vllm_pooling,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+        result = None
+        async for output in generator:
+            result = output
+        if result is None:
+            raise RuntimeError('Pooling encode did not produce a result')
+
+        data = pooling_to_list(result.outputs.data, normalize=pooling_params.normalize)
+        return PoolingResponse(data=data, task=pooling_params.task, prompt_token_ids=prompt_token_ids)
 
     async def generate_stream(self,
                               prompt: Union[List[int], str],
@@ -462,12 +730,25 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             ``LoRARequest`` or ``None`` if loading fails.
         """
-        from vllm.lora.request import LoRARequest
-
-        # Fast path: return cached request for this path.
         if lora_path in self._lora_request_cache:
-            logger.info(f'Using cached LoRA request for {lora_path}')
+            logger.debug(f'Using cached LoRA request for {lora_path}')
             return self._lora_request_cache[lora_path]
+
+        load_task = self._lora_load_tasks.get(lora_path)
+        if load_task is None:
+            load_task = asyncio.create_task(self._load_lora(lora_path))
+            self._lora_load_tasks[lora_path] = load_task
+        try:
+            lora_request = await load_task
+        finally:
+            if self._lora_load_tasks.get(lora_path) is load_task:
+                self._lora_load_tasks.pop(lora_path)
+        if lora_request is not None:
+            self._lora_request_cache[lora_path] = lora_request
+        return lora_request
+
+    async def _load_lora(self, lora_path: str):
+        from vllm.lora.request import LoRARequest
 
         if not os.path.exists(lora_path):
             logger.error(f'LoRA path does not exist: {lora_path}')
@@ -487,13 +768,40 @@ class VLLMEngine(BaseSamplerEngine):
             lora_path=lora_path,
         )
 
+        logger.info(f'Loading LoRA from {lora_path}')
         try:
             await self.engine.add_lora(lora_request)
-            self._lora_request_cache[lora_path] = lora_request
             return lora_request
         except Exception as e:
             logger.error(f'Failed to load LoRA from {lora_path}: {e}')
             return None
+
+    async def unload_lora_paths(self, adapter_paths: list[str]) -> None:
+        """Evict selected LoRA requests without requiring their files to exist."""
+        for adapter_path in adapter_paths:
+            normalized = os.path.abspath(os.path.expanduser(adapter_path))
+            request = self._lora_request_cache.pop(normalized, None)
+            if request is None:
+                request = self._lora_request_cache.pop(adapter_path, None)
+            load_task = self._lora_load_tasks.pop(normalized, None)
+            if load_task is None:
+                load_task = self._lora_load_tasks.pop(adapter_path, None)
+            if load_task is not None and not load_task.done():
+                load_task.cancel()
+                await asyncio.gather(load_task, return_exceptions=True)
+            elif request is None and load_task is not None:
+                try:
+                    request = load_task.result()
+                except (asyncio.CancelledError, Exception):
+                    request = None
+            if request is None:
+                continue
+            try:
+                result = self.engine.remove_lora(request.lora_int_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
 
     async def sleep(self, level: int = 2) -> None:
         """
@@ -846,13 +1154,19 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.engine is not None:
             try:
-                # vLLM v1 AsyncLLM has shutdown() method
+                # vLLM v1 AsyncLLM has shutdown() method. It is synchronous on vLLM>=0.23 (returns
+                # None) but was a coroutine on older versions, so only await an awaitable result --
+                # blindly awaiting the sync return raises "NoneType can't be used in 'await'".
                 if hasattr(self.engine, 'shutdown'):
-                    await self.engine.shutdown()
+                    result = self.engine.shutdown()
+                    if inspect.isawaitable(result):
+                        await result
                 elif hasattr(self.engine, 'engine_core'):
                     # For older versions, try to stop engine core
                     if hasattr(self.engine.engine_core, 'shutdown'):
-                        await self.engine.engine_core.shutdown()
+                        result = self.engine.engine_core.shutdown()
+                        if inspect.isawaitable(result):
+                            await result
             except Exception as e:
                 logger.warning(f'Error during engine shutdown: {e}')
             finally:

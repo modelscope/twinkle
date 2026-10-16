@@ -191,7 +191,7 @@ env.close()
 ```python
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_agentic.rollout.api_multi_turn import APIMultiTurnRollout
+from twinkle_agentic.rollout import MultiTurnRollout
 
 env.reset()
 
@@ -200,7 +200,7 @@ env_tools = EnvTool.from_env(env)
 manager = ToolManager(env_tools)
 
 # 在 rollout 中使用
-rollout = APIMultiTurnRollout(api=api, tool_manager=manager, max_turns=10)
+rollout = MultiTurnRollout(api=api, template=template, tool_manager=manager, max_turns=10)
 results = rollout(trajectories)
 ```
 
@@ -223,7 +223,7 @@ results = rollout(trajectories)
 
 OpenEnv 的 `coding_env` 底层是 smolagents 的 `LocalPythonExecutor`，**一个 AST 解释器，而非操作系统级沙箱**。它对 `decorator_list` 没有任何处理，**装饰器会被静默忽略**——`@patch` 不生效、测试不报错，reward 产出一个形式正常的错误数值。这类隐形错误比崩溃难以定位。它适用于约束「仅允许 import 白名单」，不适用于执行对抗性代码。当测试依赖装饰器，或模型需要写文件、装包、开子进程时，使用 `AgentEnv`。
 
-训练前需具备三个条件（均为一次性工作，在训练循环之外完成）：AgentENV 服务端已部署、模板已构建（`aenv pull ubuntu:22.04 --name my-env`）、训练侧已执行 `pip install e2b`。
+训练前需具备三个条件（均为一次性工作，在训练循环之外完成）：AgentENV 服务端已部署、模板已构建（`aenv pull ubuntu:22.04 --name my-env`）、训练侧已执行 `pip install 'e2b>=2.7'`（2.7 起 SDK 才支持将端点作为参数传入，而非只能从环境变量读）。
 
 ```python
 from twinkle_agentic.envs import AgentEnv
@@ -244,6 +244,7 @@ env.close()                                # 销毁沙箱
 | `template` | `str` | AgentENV 模板名/ID。必填——需先通过 `aenv build` / `aenv pull` 构建。 |
 | `api_url` | `str` | server 或 gateway 的基础 URL。缺省读 `E2B_API_URL`。 |
 | `api_key` | `str` | AgentENV 不做任何鉴权，任意非空字符串均可。缺省读 `E2B_API_KEY`，默认 `'dummy'`。 |
+| `sandbox_url` | `str` | 数据面地址，用于沙箱 gateway 与 API 不在同一主机的部署。缺省等于 `api_url`。 |
 | `sandbox_timeout` | `int` | 沙箱空闲超时（秒），默认 300。空闲沙箱会被**pause 而非销毁**，访问时自动恢复。 |
 | `command_timeout` | `int` | 单条命令超时（秒），默认 120。 |
 | `setup_commands` | `List[str]` | 每次 `reset` 后执行一次的命令，输出作为 reset 的 observation。 |

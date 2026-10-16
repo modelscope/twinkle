@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle import Platform
 from twinkle.utils import get_logger
@@ -41,6 +41,10 @@ class _RouterReplayState:
     action: RouterReplayAction = None
     recorded_indices: torch.Tensor | None = None  # [num_tokens, topk]
     target_indices: torch.Tensor | None = None  # [num_tokens, topk]
+    # Per-token mask: True = replay ``target_indices`` for this token, False = recompute the routing
+    # natively from the current (drifting) weights. ``None`` = replay every token, which is byte-identical
+    # to the pre-mask behaviour. Shape ``[num_tokens]``, layer-independent (shared by every MoE block).
+    target_mask: torch.Tensor | None = None
 
 
 _registry: dict[str, _RouterReplayState] = {}
@@ -67,6 +71,7 @@ def clear_global_indices() -> None:
     for state in _registry.values():
         state.recorded_indices = None
         state.target_indices = None
+        state.target_mask = None
 
 
 def get_replay_state(block_name: str) -> _RouterReplayState | None:
@@ -74,9 +79,31 @@ def get_replay_state(block_name: str) -> _RouterReplayState | None:
     return _registry.get(block_name)
 
 
+def resolve_router_replay_action(action: Any) -> Optional[RouterReplayAction]:
+    """Resolve a backend-neutral action token to this backend's ``RouterReplayAction`` enum.
+
+    Callers (swift/dev) stay backend-agnostic per basic principle 1, so they pass the action as a plain
+    string (``'record'`` / ``'replay_forward'`` / ``'replay_backward'``) rather than importing a
+    backend-specific enum -- and they MUST: the Megatron backend's ``RouterReplayAction`` is a different
+    class (mcore's), so no single enum instance can drive both backends. ``None`` passes through (replay
+    disabled for this forward); an already-enum value passes through; a string is looked up by value.
+    Mirrors ``twinkle.model.megatron.moe.router_replay.resolve_router_replay_action``.
+    """
+    if action is None or isinstance(action, RouterReplayAction):
+        return action
+    if isinstance(action, str):
+        try:
+            return RouterReplayAction(action)
+        except ValueError:
+            raise ValueError(f'Unknown router_replay_action {action!r}; expected one of '
+                             f'{[a.value for a in RouterReplayAction]} or None.') from None
+    raise TypeError(f'router_replay_action must be a str, RouterReplayAction or None, got {type(action).__name__}.')
+
+
 def set_router_replay_data(
     routed_experts: torch.Tensor,
     model: nn.Module,
+    replay_mask: torch.Tensor = None,
     sp_context=None,
 ) -> None:
     """Slice *routed_experts* into per-block
@@ -84,6 +111,10 @@ def set_router_replay_data(
 
     Each block receives a ``[num_tokens, topk]`` slice covering the tokens
     processed by that layer.
+
+    *replay_mask* (``[bs, seq_len]``, optional) is the per-token mask selecting which tokens replay the
+    reference routing vs recompute natively. It is split by the SAME SP call as *routed_experts* so it
+    stays token-aligned with the indices, then broadcast to every block (the mask is layer-independent).
     """
     if routed_experts is None:
         return
@@ -96,7 +127,8 @@ def set_router_replay_data(
         raise ValueError(f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
                          f'got {tuple(routed_experts.shape)}')
 
-    # SP: slice full-sequence routed_experts to local SP rank tokens.
+    # SP: slice full-sequence routed_experts and replay mask with one declared
+    # collection so both token-aligned tensors use identical pad/split rules.
     # Setup runs before the model's forward hook pushes its context.
     # An unregistered model is non-SP, even if another SP model was prepared.
     from ..strategy.sequence_parallel import _MODULE_TO_CTX
@@ -109,11 +141,17 @@ def set_router_replay_data(
                            pad_at='router_replay', split_at='router_replay')
         keys = SPKeyCollection()
         keys.add(SPKeyValue(spec, routed_experts))
+        if replay_mask is not None:
+            mask_spec = DataKeySpec('replay_mask', split_dim=1, pad_value=0, stage='router_replay',
+                                    pad_at='router_replay', split_at='router_replay')
+            keys.add(SPKeyValue(mask_spec, replay_mask))
         sp.pad_and_split_inputs(keys, boundary='router_replay', real_position_ids=sp.real_position_ids)
         routed_experts = keys.get_value('routed_experts')
 
     # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
     routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())
+    # [bs, seq_len] -> [total_seq]; per-token (layer-independent), shared by every block.
+    local_mask = replay_mask.flatten(0, 1).to(Platform.get_local_device()) if replay_mask is not None else None
 
     num_layers_in_data = routed_experts.shape[1]
 
@@ -128,6 +166,7 @@ def set_router_replay_data(
         target = routed_experts[:, layer_idx, :].to(torch.int64)
         if target.numel() > 0:
             state.target_indices = target
+            state.target_mask = local_mask
 
 
 def get_router_replay_data(model: nn.Module, batch_size=1, sp_context=None) -> torch.Tensor | None:

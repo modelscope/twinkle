@@ -28,25 +28,75 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
+from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
-from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, create_galore_param_groups, create_muon_param_groups)
+from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
+                                      create_muon_param_groups, resolve_tower_prefixes)
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
+from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
+                           replayed_selective_log_softmax, selective_log_softmax, torch_util)
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
+
+CHECKPOINT_ADAPTER_NAME = 'default'
+
+
+def _get_vocab_size(config: PretrainedConfig) -> int:
+    """Resolve the LM vocabulary size without running a sharded model forward."""
+    vocab_size = getattr(config, 'vocab_size', None)
+    if vocab_size is None:
+        text_config = getattr(config, 'text_config', None)
+        vocab_size = getattr(text_config, 'vocab_size', None)
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError('sampling replay requires a positive vocab_size in the model config')
+    return vocab_size
+
+
+def _prepare_sampling_replay(
+    labels: torch.Tensor,
+    sampling_masks,
+    temperature: float,
+    vocab_size: int,
+    allow_packed_masks: bool,
+):
+    """Build the labels and metadata shared by training and evaluation replay."""
+    if labels is None:
+        raise ValueError('labels are required when sampling replay is enabled')
+    loss_mask = (labels != -100).bool()
+    masked_labels = labels.masked_fill(~loss_mask, 0)
+    metadata = prepare_replayed_selective_log_softmax(
+        labels=labels,
+        loss_mask=loss_mask,
+        sampling_masks=sampling_masks,
+        temperature=temperature,
+        vocab_size=vocab_size,
+        allow_packed_masks=allow_packed_masks,
+    )
+    return loss_mask, masked_labels, metadata
+
+
+#: Tasks whose forward output is NOT a vocab log-softmax distribution, so ``selective_log_softmax`` logps
+#: must be skipped: classification/score heads (``seq_cls``/``reranker``/``generative_reranker`` emit
+#: ``[B, num_labels]``), the PPO ``value`` head (per-token ``V``), and pooled ``embedding`` features. Only a
+#: causal-LM head has a vocab axis to gather label logps from. The megatron backend dispatches exactly these
+#: tasks away from its logps branch (see megatron.py ``forward`` -- ``task in ('seq_cls', 'reranker', ...)``),
+#: so excluding them here keeps the two backends equivalent. This matters for a FROZEN seq_cls reward/value
+#: model: it carries no loss, ``require_logps`` defaults True, so without this guard its ``forward_only``
+#: would try to gather vocab logps out of a ``[B, 1]`` score and raise a shape error.
+_NON_LOGPS_TASKS = frozenset({'embedding', 'seq_cls', 'reranker', 'generative_reranker', 'value'})
 
 
 def _resolve_task_context(model, task, template=None):
@@ -123,6 +173,7 @@ class OptimizerGroup(BaseOptimizerGroup):
     scaler_has_nan: bool = False
     checkpoint_engine: CheckpointEngine = None
     _handler: Any = None
+    acc_strategy: str = 'token'
 
     def __post_init__(self):
         self._ensure_dp_group()
@@ -131,14 +182,14 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _build_metrics(self):
         train_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
-            Accuracy(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
-            Accuracy(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.eval_status = TrainStatus(metrics=eval_metrics)
@@ -190,10 +241,52 @@ class OptimizerGroup(BaseOptimizerGroup):
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
+# How many prompts go into one padded generate() during an in-model rollout. Matches the transformers
+# sampler's default; larger is faster until the padding waste from mixed prompt lengths outweighs it.
+_GENERATION_MAX_BATCH_SIZE = 8
+
+
+def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+    """Read a full HuggingFace checkpoint directory into a CPU state dict.
+
+    Supports both single-file and sharded ``safetensors`` layouts, falling back
+    to ``pytorch_model.bin`` variants. Returns tensors on CPU.
+    """
+    import json
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    st_index = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+    st_single = os.path.join(checkpoint_dir, 'model.safetensors')
+    bin_index = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+    bin_single = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+    if os.path.exists(st_index) or os.path.exists(st_single):
+        from safetensors.torch import load_file
+        if os.path.exists(st_index):
+            with open(st_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(load_file(os.path.join(checkpoint_dir, shard), device='cpu'))
+        else:
+            state_dict.update(load_file(st_single, device='cpu'))
+    elif os.path.exists(bin_index) or os.path.exists(bin_single):
+        if os.path.exists(bin_index):
+            with open(bin_index) as f:
+                weight_map = json.load(f)['weight_map']
+            shards = sorted(set(weight_map.values()))
+            for shard in shards:
+                state_dict.update(
+                    torch.load(os.path.join(checkpoint_dir, shard), map_location='cpu', weights_only=True))
+        else:
+            state_dict.update(torch.load(bin_single, map_location='cpu', weights_only=True))
+    else:
+        raise FileNotFoundError(f'No safetensors/bin weights found in {checkpoint_dir}')
+    return state_dict
 
 
 @remote_class()
-class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
+class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
 
     Args:
@@ -232,9 +325,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             deepspeed_config: Dict[str, Any] = None,
-            model_loader: Optional[Any] = None,
+            model_loader: Optional[ModelLoaderProtocol] = None,
+            gradient_checkpointing: bool = True,
+            gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+            vit_gradient_checkpointing: Optional[bool] = None,
+            vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+            model_arch: Optional[Dict[str, Any]] = None,
+            neftune_noise_alpha: Optional[float] = None,
+            acc_strategy: str = 'token',
+            new_special_tokens: Optional[List[str]] = None,
+            init_strategy: Optional[str] = None,
+            use_liger_kernel: bool = False,
+            liger_kernel_config: Optional[Dict[str, Any]] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
+        # equivalent): sporadic `mha_graph.execute` RuntimeError on Blackwell + CUDA 13
+        # (ablate12 E7 crashed at update 21 mid-forward). Env-gated to keep default behavior.
+        if os.environ.get('TWINKLE_DISABLE_CUDNN_SDP', '0') == '1':
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         # The Default tokenizer will be used to save with a model if no template was set.
@@ -243,6 +352,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
+        self._acc_strategy = acc_strategy
+        self.model_arch = dict(model_arch or {})
+        for _role in ('language_model', 'vision_tower', 'aligner'):
+            _value = self.model_arch.get(_role)
+            self.model_arch[_role] = [_value] if isinstance(_value, str) else list(_value or [])
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
@@ -255,8 +369,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if config is not None:
             self.hf_config = config
         elif model_loader is not None and model_id is not None:
-            # A caller-supplied loader (duck-typed: build_config/build_processor/build_model +
-            # process_* hooks -- dev's ModelLoader) owns construction. It reads the config off the
+            # A caller-supplied loader (see ModelLoaderProtocol: build_config/build_processor/build_model
+            # + process_* hooks -- dev's ModelLoader) owns construction. It reads the config off the
             # downloaded dir and may rewrite it (process_config), e.g. to flip remote-code flags.
             self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
         else:
@@ -288,7 +402,49 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **load_kwargs)
-        self.model.gradient_checkpointing_enable()
+        # ``from_pretrained``/``from_config`` may deepcopy the supplied config before
+        # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
+        # config reference aligned with the config that the model actually uses.
+        self.hf_config = self.model.config
+        logger.info_once(
+            f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
+            f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
+        # Gated worker-side so the flag is honored under Ray too, where a driver-side post-construction
+        # reach into ``model.model`` only touches the proxy stub and silently no-ops.
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        vision_tower_names = self.model_arch.get('vision_tower')
+        if vit_gradient_checkpointing is not None and vision_tower_names:
+            from twinkle.utils import deep_getattr
+            for tower_name in vision_tower_names:
+                tower = deep_getattr(self.model, tower_name)
+                if tower is None:
+                    continue
+                try:
+                    if vit_gradient_checkpointing:
+                        if vit_gradient_checkpointing_kwargs:
+                            tower.gradient_checkpointing_enable(
+                                gradient_checkpointing_kwargs=vit_gradient_checkpointing_kwargs)
+                        else:
+                            tower.gradient_checkpointing_enable()
+                    else:
+                        tower.gradient_checkpointing_disable()
+                except (NotImplementedError, AttributeError, ValueError) as exc:
+                    logger.warning(f'vision-tower gradient checkpointing skipped for {tower_name}: {exc}')
+
+        if neftune_noise_alpha:
+            self._activate_neftune(neftune_noise_alpha)
+        # Post-load module surgery (Liger op kernels, token-vocab growth, weight re-init) is gated
+        # worker-side for the same reason as gradient_checkpointing above: under Ray the driver holds a
+        # proxy stub, so reaching into ``model.model`` there only mutates the stub and silently no-ops.
+        # All three run before the optimizer group is built so it sees the final parameters. The order
+        # mirrors the legacy post-construction sequence: kernelize, then grow the vocab, then re-init.
+        if use_liger_kernel:
+            self._apply_liger_kernel(liger_kernel_config)
+        if new_special_tokens:
+            self._apply_new_special_tokens(new_special_tokens)
+        if init_strategy is not None:
+            self._apply_init_strategy(init_strategy)
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {
@@ -296,6 +452,119 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _activate_neftune(self, neftune_noise_alpha: float) -> None:
+        """Add NEFTune uniform noise to the embedding output during training only.
+
+        Mirrors ``transformers.integrations.neftune.neftune_post_forward_hook``: scale is
+        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op when the module is in eval mode, so
+        validation and generation see clean embeddings. Registered on the input-embedding module object,
+        which a later LoRA/DDP wrap preserves (they wrap Linear layers / the top model, not this module).
+        """
+        embeddings = self.model.get_input_embeddings()
+        if embeddings is None:
+            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; skipping NEFTune.')
+            return
+
+        def neftune_post_forward_hook(module, input, output):
+            if not module.training:
+                return output
+            dims = torch.tensor(output.size(1) * output.size(2))
+            mag_norm = neftune_noise_alpha / torch.sqrt(dims)
+            return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+
+        embeddings.register_forward_hook(neftune_post_forward_hook)
+
+    def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
+        """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
+
+        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of Liger's
+        default set; None keeps the default. ``kernelize`` mutates the module in place (class / forward
+        replacement), which is why it belongs at the end of construction, before the optimizer is built.
+        The fused-linear-CE op is deliberately not a target here -- it skips the lm_head GEMM rather than
+        swapping a layer, so it is a loss-path selection, not a kernelize op.
+        """
+        from twinkle.kernel import kernelize
+        kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
+
+    @staticmethod
+    def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
+        """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
+
+        Returning None rather than a copy of the default matters: ``kernelize`` logs family-skips at DEBUG
+        on the default path but raises them to WARNING for any explicit mapping. 'fused_linear_cross_entropy'
+        is not a kernelize op, so it matches no DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss
+        side consumes it instead).
+        """
+        if not liger_kernel_config:
+            return None
+        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
+        disabled = {op for op, enabled in liger_kernel_config.items() if not enabled}
+        return {
+            target: choice
+            for target, choice in DEFAULT_KERNEL_CONFIG.items()
+            if getattr(choice, 'op', None) not in disabled
+        }
+
+    def _apply_new_special_tokens(self, new_special_tokens: List[str]) -> None:
+        """Grow the tokenizer's vocabulary with ``new_special_tokens`` and resize the embeddings to match.
+
+        ``new_special_tokens`` is an already-resolved token list -- any ``.txt`` file expansion happens on
+        the caller (driver) side, so only serializable strings cross the Ray boundary. The embedding is
+        resized to a multiple of 128, and only when tokens were actually added, leaving the checkpoint's
+        own vocab untouched otherwise. When no processor was loaded (the plain model_cls path) a tokenizer
+        is built from ``tokenizer_id`` and kept as the default so ``save`` writes a matching vocab.
+        """
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        added = tokenizer.add_special_tokens({'additional_special_tokens': list(new_special_tokens)})
+        if added:
+            vocab_size = ((len(tokenizer) + 127) // 128) * 128
+            self.model.resize_token_embeddings(vocab_size)
+
+    def _apply_init_strategy(self, init_strategy: str) -> None:
+        """Re-initialize the weights a blank / partially-loaded config left uninitialized.
+
+        Only parameters whose scale is non-finite or absurdly large (> 1e7) are touched, so a properly
+        loaded checkpoint is left intact -- this is the from-config init path, not a re-randomize of
+        pretrained weights. Runs on the real module (worker-side under Ray; see ``__init__``).
+        """
+        from torch import nn
+
+        def high_dim(param, init):
+            if param.dim() > 1:
+                init(param)
+            elif param.dim() == 1 and param.numel() > 0:
+                nn.init.zeros_(param)
+
+        initializers = {
+            'zero': nn.init.zeros_,
+            'uniform': lambda param: nn.init.uniform_(param, -0.1, 0.1),
+            'normal': lambda param: nn.init.normal_(param, 0.0, 0.01),
+            'xavier_uniform': lambda param: high_dim(param, nn.init.xavier_uniform_),
+            'xavier_normal': lambda param: high_dim(param, nn.init.xavier_normal_),
+            'kaiming_uniform': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_uniform_(value, mode='fan_out', nonlinearity='leaky_relu',
+                                                              a=0.1)),
+            'kaiming_normal': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_normal_(value, mode='fan_in', nonlinearity='relu')),
+            'orthogonal': lambda param: high_dim(param, nn.init.orthogonal_),
+        }
+        if init_strategy not in initializers:
+            raise ValueError(f'Unknown init_strategy={init_strategy!r}; expected one of {sorted(initializers)}.')
+        initialize = initializers[init_strategy]
+        with torch.no_grad():
+            for param in self.model.parameters():
+                if param.numel() == 0:
+                    continue
+                mean_abs = param.abs().mean()
+                std = param.std()
+                if not torch.isfinite(mean_abs) or not torch.isfinite(std) or mean_abs > 1e7 or std > 1e7:
+                    initialize(param)
 
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
@@ -322,6 +591,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _decide_strategy(self,
                          strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'],
                          deepspeed_config: Dict[str, Any] = None):
+        if self.device_mesh is not None and self.device_mesh.pp_world_size > 1:
+            raise ValueError(
+                f'The transformers backend has no pipeline-parallel runtime (pp_world_size='
+                f'{self.device_mesh.pp_world_size}): its strategies wire dp/fsdp/tp/cp/sp only, and transformers '
+                '5.x ships pp_plan as a declaration layer with no training scheduler. Run pp>1 with '
+                '--backend megatron.')
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)
@@ -390,8 +665,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     @staticmethod
     def _not_encoded(inputs):
+        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
+        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
+        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
+        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
+        while isinstance(inputs, (list, tuple)):
+            if not inputs:
+                return False
+            inputs = inputs[0]
         assert isinstance(inputs, dict)
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
+        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
+        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
+        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
+        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
+        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
+        return not any(
+            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
+            for k in inputs)
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
@@ -463,7 +754,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         apply_router_replay_patch(model)
         self._router_replay_applied = True
 
-    def _router_replay_setup(self, router_replay_action, routed_experts=None, batch_size=1, manual_cleanup=False):
+    def _router_replay_setup(self,
+                             router_replay_action,
+                             routed_experts=None,
+                             batch_size=1,
+                             manual_cleanup=False,
+                             replay_mask=None):
         """Set up routing replay before a model forward.
 
         Returns ``cleanup_fn``.
@@ -478,13 +774,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return lambda: None
 
         from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
-                                        get_router_replay_data, set_global_router_replay_action, set_router_replay_data)
+                                        get_router_replay_data, resolve_router_replay_action,
+                                        set_global_router_replay_action, set_router_replay_data)
+        # Callers (swift/dev) pass a backend-neutral string token (basic principle 1: the two backends are
+        # driven identically, and Megatron's RouterReplayAction is a different class), so resolve it to this
+        # backend's enum before the ``== RouterReplayAction.*`` comparisons and the per-block state below.
+        router_replay_action = resolve_router_replay_action(router_replay_action)
         unwrapped = self.strategy.unwrap_model(self.model)
         sp_context = getattr(self.sp_strategy, '_ctx', None)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped, sp_context=sp_context)
+            set_router_replay_data(routed_experts, unwrapped, replay_mask=replay_mask, sp_context=sp_context)
 
         def cleanup():
             recorded = None
@@ -512,6 +813,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh),
             _device_mesh=self.device_mesh,
+            acc_strategy=self._acc_strategy,
         )
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -527,6 +829,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -547,6 +850,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+        if enable_sampling_replay:
+            if sampling_masks is None:
+                raise ValueError('sampling_masks are required when sampling replay is enabled')
+            cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+            if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                raise ValueError('sampling replay does not support sequence or context parallelism')
+        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -559,16 +870,29 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
         sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
+        # Not a model argument; the loss reads it back off `inputs` further down.
+        completion_mask = inputs.pop('completion_mask', None)
+        replay_metadata = replay_loss_mask = replay_masked_labels = None
+        if enable_sampling_replay:
+            replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
+                labels=labels,
+                sampling_masks=sampling_masks,
+                temperature=temperature,
+                vocab_size=_get_vocab_size(self.hf_config),
+                allow_packed_masks=(processor.padding_free
+                                    or processor._is_packed_position_ids(inputs.get('position_ids'))),
+            )
         optimizer_config.accumulate_metrics(True)
 
         # Routing replay: respects router_replay_action regardless of caller
         router_replay_action = kwargs.pop('router_replay_action', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         routed_experts = inputs.pop('routed_experts', None)
+        replay_mask = inputs.pop('replay_mask', None)
         batch_size = labels.shape[0] if labels is not None else (
             inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
         rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                               router_replay_manual_cleanup)
+                                               router_replay_manual_cleanup, replay_mask)
 
         with _resolve_task_context(self.model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(self.model, optimizer_config.template):
@@ -582,18 +906,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs['loss_scale'] = loss_scale
         if channel is not None:
             inputs['channel'] = channel
-        if task != 'embedding' and labels is not None and loss_require_logps:
-            loss_mask = (labels != -100).bool()
-            masked_labels = labels.clone()
-            masked_labels[~loss_mask] = 0
+        if completion_mask is not None:
+            inputs['completion_mask'] = completion_mask
+        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+            loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
+            masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
             logits = outputs['logits']
-            logits.div_(temperature)
-            if loss_require_entropy:
+            if enable_sampling_replay:
+                outputs['logps'] = replayed_selective_log_softmax(
+                    logits=logits,
+                    labels=masked_labels,
+                    loss_mask=loss_mask,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    metadata=replay_metadata,
+                )
+            elif loss_require_entropy:
+                logits.div_(temperature)
                 outputs['logps'], outputs['entropies'] = selective_log_softmax(
                     logits, masked_labels, return_entropy=True)
             else:
+                logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
+        if loss_require_values:
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -616,7 +954,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
+    # receive the materialized dict. The lazy default returns an un-collected callable instead, which a
+    # driver reading ``out['logps']``/``out['logits']`` (reference/teacher/reward/critic scoring) would
+    # silently mis-read as "no such key". Mirrors calculate_metric, the other return-value method.
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, lazy_collect=False)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -631,6 +973,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
+        sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -653,6 +996,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_require_logits = getattr(loss_instance, 'require_logits', False)
             loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
+            if enable_sampling_replay:
+                if sampling_masks is None:
+                    raise ValueError('sampling_masks are required when sampling replay is enabled')
+                cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+                if getattr(self, '_enable_sp', False) or cp_world_size > 1:
+                    raise ValueError('sampling replay does not support sequence or context parallelism')
+            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -664,6 +1015,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
             sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
+            # Not a model argument; the loss reads it back off `inputs` further down.
+            completion_mask = inputs.pop('completion_mask', None)
+            replay_metadata = replay_loss_mask = replay_masked_labels = None
+            if enable_sampling_replay:
+                packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
+                replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
+                    labels=labels,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    vocab_size=_get_vocab_size(self.hf_config),
+                    allow_packed_masks=processor.padding_free or packed_position_ids,
+                )
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
@@ -671,10 +1034,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             router_replay_action = kwargs.pop('router_replay_action', None)
             router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
             routed_experts = inputs.pop('routed_experts', None)
+            replay_mask = inputs.pop('replay_mask', None)
             batch_size = labels.shape[0] if labels is not None else (
                 inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
             rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                                   router_replay_manual_cleanup)
+                                                   router_replay_manual_cleanup, replay_mask)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()
@@ -690,18 +1054,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs['loss_scale'] = loss_scale
             if channel is not None:
                 inputs['channel'] = channel
-            if task != 'embedding' and labels is not None and loss_require_logps:
-                loss_mask = (labels != -100).bool()
-                masked_labels = labels.clone()
-                masked_labels[~loss_mask] = 0
+            if completion_mask is not None:
+                inputs['completion_mask'] = completion_mask
+            if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+                loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
+                masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
                 logits = outputs['logits']
-                logits.div_(temperature)
-                if loss_require_entropy:
+                if enable_sampling_replay:
+                    outputs['logps'] = replayed_selective_log_softmax(
+                        logits=logits,
+                        labels=masked_labels,
+                        loss_mask=loss_mask,
+                        sampling_masks=sampling_masks,
+                        temperature=temperature,
+                        metadata=replay_metadata,
+                    )
+                elif loss_require_entropy:
+                    logits.div_(temperature)
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
                         logits, masked_labels, return_entropy=True)
                 else:
+                    logits.div_(temperature)
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
+            if loss_require_values:
+                values = outputs['logits']
+                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
@@ -724,6 +1102,147 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if recorded_routing is not None:
                 return_outputs['routed_experts'] = recorded_routing
             return return_outputs
+
+    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
+    def generate(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+        strict: bool = True,
+    ) -> List[SampleResponse]:
+        """Generate completions on the weights this model already holds, inside its own workers.
+
+        This is the target a :class:`~twinkle.sampler.TransformersSampler` facade forwards to when it is
+        built with ``model=<TransformersModel>`` instead of ``model_id``. The point is to sample during
+        training without a second copy of the model and without a weight sync: there is only ever one set
+        of weights, these, so a ``TransformersEngine`` is wrapped around them per call and runs
+        ``generate()`` in place. Unlike :meth:`MegatronModel.generate`, which refuses because Megatron
+        shards weights under its own parameter names, a transformers model keeps a layout
+        ``AutoModelForCausalLM.generate`` reads directly -- so in-place generation is sound here.
+
+        Distribution. ``dispatch='slice_dp'`` splits ``inputs`` across data ranks, so each worker only
+        generates for its own shard; ``collect=collect_dp_and_flatten`` then deduplicates the ranks that
+        share one data shard (TP / PP / ulysses peers produce the same result) and flattens the per-worker
+        lists back into one, in input order. A single-GPU or FSDP model is the degenerate case: one data
+        rank, nothing to dedup. ``inputs`` must therefore be a *list* -- a bare ``Trajectory`` dict would
+        be recursed into by the slicing and its ``messages`` split across ranks. The facade normalizes to
+        a list before forwarding; direct callers must too.
+
+        Args:
+            inputs: A list of encoded ``InputFeature`` rows, or of ``Trajectory`` rows to encode first
+                (which requires ``set_template`` to have been called, since the engine also needs the
+                template's tokenizer to left-pad prompts and decode completions).
+            sampling_params: A ``SamplingParams`` or a dict for ``SamplingParams.from_dict``.
+                ``max_tokens == 0`` means score-only, matching the vLLM backend and
+                :meth:`TransformersSampler.sample`: one token is generated and discarded so the prompt
+                gets its logprobs.
+            adapter_name: Selects the optimizer group / template to encode with, exactly as
+                :meth:`forward_only` does. Defaults to the only group, else the active one.
+            adapter_path: Rejected. See below.
+            return_encoded: Accepted for signature parity with the sampler; the encoded feature is always
+                attached to each sequence as ``new_input_feature``, so there is nothing extra to return.
+            use_base_model: Ignore the active peft adapter for this call, generating from the base weights
+                (via ``disable_adapter()``, the same mechanism ``forward_only``'s ``disable_lora`` uses).
+            adapter_paths: Rejected. See below.
+            strict: When False, an input that fails to encode or generate yields an empty ``SampleResponse``
+                with ``stop_reason='error'`` instead of aborting the batch, preserving positions so one bad
+                row cannot discard a long rollout.
+
+        Returns:
+            One ``SampleResponse`` per input, in input order, each holding ``num_samples`` sequences.
+        """
+        # Deferred: the model package must not import the sampler package at module load (it would be a
+        # cycle), and both are only needed once generation is actually requested.
+        from twinkle.sampler import generation
+        from twinkle.sampler.transformers_sampler.transformers_engine import TransformersEngine
+
+        if adapter_path is not None or adapter_paths is not None:
+            # A training model's weights are live; loading an external adapter from disk onto it would
+            # wrap it in a second PeftModel and pollute the model under training. Sample the weights as
+            # they are (or their base, via use_base_model); use a TransformersSampler(model_id=...) with
+            # adapter_path to generate from a separate on-disk adapter.
+            raise NotImplementedError(
+                'TransformersModel.generate samples the weights this model already holds; it cannot load '
+                'an external adapter_path on top of a live training model. Drop adapter_path/adapter_paths '
+                'to sample the current (or, with use_base_model=True, the base) weights, or use a '
+                'TransformersSampler(model_id=...) for a separate adapter.')
+
+        adapter_name = adapter_name or self._get_default_group()
+        template = self.optimizer_group[adapter_name].template
+        if template is None:
+            raise ValueError('Set a template with set_template() before generate(): a Trajectory input '
+                             'needs it to encode, and the engine needs its tokenizer to pad and decode.')
+        inputs_list = [inputs] if isinstance(inputs, dict) else list(inputs)
+        if not inputs_list:
+            return []
+        if isinstance(sampling_params, dict):
+            params = SamplingParams.from_dict(sampling_params)
+        elif sampling_params is None:
+            params = SamplingParams()
+        else:
+            params = sampling_params
+        logprobs_only = params.max_tokens == 0
+        if logprobs_only:
+            params = copy(params)
+            params.max_tokens = 1
+
+        self._lazy_wrap_model()
+        self.model.eval()
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        # FSDP2 fully_shard is in place, so self.model still exposes .generate and its all-gather hooks
+        # must run -- generate on the wrapped model. A DDP/DeepSpeed wrapper has no .generate, so fall
+        # back to the unwrapped module (the wrapper only exists for gradient sync, irrelevant here).
+        generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
+        engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
+
+        encoded, failures = generation.encode_all(template, inputs_list, logprobs_only=logprobs_only, strict=strict)
+        results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
+        for index, response in failures.items():
+            results[index] = response
+        pending = [index for index in range(len(inputs_list)) if results[index] is None]
+
+        def call_batch(prompts, extra):
+            # The engine's synchronous core, driven inline: this worker has no event loop to keep
+            # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
+            # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
+            return engine.generate_batch(
+                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                extra_model_inputs=extra or None)
+
+        lora_ctx = (unwrapped_model.disable_adapter()
+                    if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
+        with lora_ctx:
+            for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
+                for index, response in zip(
+                        chunk, generation.run_chunk(chunk, encoded, params, template, call_batch, strict=strict)):
+                    results[index] = response
+
+        if not logprobs_only:
+            generation.attach_features(template, results, encoded)
+        return [
+            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
+        ]
+
+    def generate_stream(self, *args, **kwargs):
+        """Refuse streaming in-place generation rather than half-build it.
+
+        The streaming counterpart of :meth:`generate`, and the target a facade's ``sample_stream``
+        forwards to. Batch generation slices cleanly across data-parallel workers and collects once;
+        streaming would have to merge per-rank token streams back through the same remote boundary in
+        lockstep, which is not something to approximate. Deliberately a plain method, not a generator
+        function, so the refusal fires at the call site instead of only when a returned iterator is
+        consumed -- the same choice :meth:`MegatronModel.generate_stream` makes.
+        """
+        raise NotImplementedError(
+            'TransformersModel.generate does not stream: generation is sliced across data-parallel '
+            'workers and collected as a batch. Call generate() for the whole completion, or use a '
+            'TransformersSampler(model_id=...) whose sample_stream runs on a single engine.')
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -796,8 +1315,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
-        optimizer_config.cur_step += 1
-        should_sync = optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+        increment_step = kwargs.pop('_increment_step', True)
+        if increment_step:
+            optimizer_config.cur_step += 1
+        sync_gradients = kwargs.pop('sync_gradients', None)
+        should_sync = (
+            optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+            if sync_gradients is None else bool(sync_gradients))
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
@@ -821,6 +1345,117 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optimizer_config.train_status.loss_value = None
 
+    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        processor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
+        optimizer_config._ensure_dp_group()
+        dp_group = optimizer_config._dp_group
+        min_micro_batches = 1
+        while True:
+            try:
+                plan = plan_micro_batches(
+                    inputs,
+                    config,
+                    padding_free=processor.padding_free,
+                    min_micro_batches=min_micro_batches,
+                )
+                planning_error = None
+            except Exception as exc:
+                if dp_group is None:
+                    raise
+                plan = None
+                planning_error = f'{type(exc).__name__}: {exc}'
+
+            if dp_group is None:
+                return plan
+
+            local_state = {
+                'micro_batch_count': len(plan) if plan is not None else None,
+                'input_count': len(inputs),
+                'error': planning_error,
+            }
+            states = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(states, local_state, group=dp_group)
+            errors = [
+                f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
+            ]
+            if errors:
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
+
+            counts = [state['micro_batch_count'] for state in states]
+            if all(count == len(plan) for count in counts):
+                return plan
+            min_micro_batches = max(counts)
+            if any(min_micro_batches > state['input_count'] for state in states):
+                raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
+                                 'make the input batch divisible by the model data-parallel size')
+
+    def _forward_backward_micro_batch(
+        self,
+        *,
+        inputs,
+        optimizer_config,
+        loss_scale,
+        sync_gradients,
+        increment_step,
+        **kwargs,
+    ):
+        outputs = self.forward(
+            inputs=inputs,
+            router_replay_manual_cleanup=True,
+            **kwargs,
+        )
+        previous_normalizer = optimizer_config.train_status.num_tokens
+        loss = self.calculate_loss(**kwargs)
+        normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
+        optimizer_config.train_status.loss_value = (optimizer_config.train_status.loss_value * loss_scale)
+        optimizer_config.train_status.num_tokens = (previous_normalizer + normalizer_delta * loss_scale)
+        outputs['loss'] = loss * loss_scale
+        self.backward(
+            sync_gradients=sync_gradients,
+            _increment_step=increment_step,
+            **kwargs,
+        )
+        return outputs
+
+    def _forward_backward_micro_batches(
+        self,
+        *,
+        inputs,
+        config,
+        sync_gradients,
+        loss_scale,
+        **kwargs,
+    ):
+        adapter_name = kwargs.get('adapter_name')
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        optimizer_config = self.optimizer_group[adapter_name]
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)
+
+        local_batch_size = len(inputs)
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        outputs = {}
+        loss_instance = optimizer_config.loss_instance
+        for micro_batch_index, indices in enumerate(plan):
+            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_loss_scale = loss_scale * loss_instance.micro_batch_scale(inputs, indices)
+            is_last_micro_batch = micro_batch_index == len(plan) - 1
+            outputs = self._forward_backward_micro_batch(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                loss_scale=micro_loss_scale,
+                sync_gradients=sync_gradients if is_last_micro_batch else False,
+                increment_step=is_last_micro_batch,
+                **micro_kwargs,
+            )
+        return outputs
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
@@ -831,10 +1466,26 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 gradient_accumulation_steps: Number of gradient accumulation steps.
+                micro_batch_size: Maximum samples processed per rank in one forward/backward.
+                dynamic_batching: Pack sequences by token cost instead of fixed sample slices.
+                max_tokens_per_micro_batch: Per-rank token limit used by dynamic batching.
+                packing_algorithm: Dynamic packing algorithm.
+                sync_gradients: Override gradient synchronization on the final micro-batch.
+                loss_scale: Weight applied to this input batch's loss.
                 Any parameters needed for the specific loss type.
         Returns:
             The output of the model forward.
         """
+        micro_batch_config = MicroBatchConfig.from_kwargs(kwargs)
+        if micro_batch_config is not None:
+            return self._forward_backward_micro_batches(
+                inputs=inputs,
+                config=micro_batch_config,
+                sync_gradients=kwargs.pop('sync_gradients', None),
+                loss_scale=float(kwargs.pop('loss_scale', 1.0)),
+                **kwargs,
+            )
+
         outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss
@@ -969,7 +1620,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optim_params = kwargs.pop('optim_params', {})
         if optim_params:
-            assert isinstance(optimizer, (AdamW, Adam))
+            # After _lazy_wrap_model the optimizer may be wrapped (e.g.
+            # accelerate's AcceleratedOptimizer); check the inner instance.
+            inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            assert isinstance(inner_optimizer, (AdamW, Adam)), \
+                f'optim_params is only supported for Adam/AdamW, got {type(inner_optimizer).__name__}'
             for group in optimizer.param_groups:
                 group['lr'] = optim_params['lr']
                 if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
@@ -1048,11 +1703,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Args:
             optimizer_cls: An optimizer class name, an optimizer plugin id, or an optimizer class type/instance.
                 Besides `torch.optim` optimizers, the GaLore optimizers (`GaLoreAdamW`, `GaLoreAdafactor`,
-                `GaLoreAdamW8bit`) and `MuonClip` in `twinkle.module.optimizer` are supported.
+                `GaLoreAdamW8bit`, `QGaLoreAdamW8bit`) and `MuonClip` in `twinkle.module.optimizer` are supported.
             **kwargs:
                 adapter_name: Lora adapter name.
                 lr: Learning rate
                 weight_decay: Weight decay
+                param_groups_spec: An ordered list of backend-neutral grouping rules (first match wins)
+                    that split the decay / no-decay param groups into per-rule sub-groups with their own
+                    lr / weight_decay -- e.g. per-tower learning rates or LoRA+. Matched here on the
+                    worker against the real parameters (see `twinkle.module.optimizer.param_groups`), so
+                    the driver only ships data. Applied before galore_config / muon_config reshaping.
                 galore_config: A `GaLoreConfig` or a dict of its fields, enabling GaLore low-rank gradient
                     projection on the matched param groups. Only takes effect for the GaLore optimizers.
                 muon_config: A `MuonConfig` or a dict of its fields, marking which param groups take the
@@ -1061,9 +1721,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metric copies the dp group at construction, and OptimizerGroup builds metrics before
+        # dist init -- so rebuild here (first path that runs post-init on every backend) to get
+        # dp-wide token-weighted logging. Logging only; gradients are unaffected.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         galore_config = kwargs.pop('galore_config', None)
         muon_config = kwargs.pop('muon_config', None)
+        param_groups_spec = kwargs.pop('param_groups_spec', None)
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
             return
@@ -1073,6 +1738,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lr = kwargs.get('lr', DEFAULT_LEARNING_RATE)
             weight_decay = kwargs.get('weight_decay', DEFAULT_WEIGHT_DECAY)
             params = self._create_param_group(adapter_name, lr=lr, weight_decay=weight_decay)
+        if param_groups_spec:
+            # Split the decay / no-decay groups by the spec before GaLore / Muon reshape them, so a
+            # per-tower lr or LoRA+ rule owns its parameters first. tower_prefixes come from the threaded
+            # ModelArch; the match itself runs here on the worker against the real (unwrapped) parameters.
+            params = apply_param_groups_spec(
+                params,
+                param_groups_spec,
+                model=self.strategy.unwrap_model(self.model),
+                tower_prefixes=resolve_tower_prefixes(self.model_arch))
         if galore_config is not None:
             if isinstance(galore_config, dict):
                 galore_config = GaLoreConfig(**galore_config)
@@ -1095,7 +1769,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         is_default = adapter_name == _default_adapter_name
         # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
         # parameters to be missed by the optimizer.
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}')
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -1126,10 +1800,27 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
         apply_patch(self.model, patch_cls, **kwargs)
 
+    @remote_function(dispatch='all')
+    def empty_cache(self, **kwargs):
+        """Release the caching allocator's unused blocks on every worker.
+
+        dispatch='all' because each rank holds its own device memory; the driver only orchestrates (in
+        Ray mode it may not even hold a GPU), so the release has to run where the tensors live. Backend
+        -agnostic through torch_util (cuda/npu).
+        """
+        torch_util.empty_cache()
+
     def __del__(self):
         HubOperation.wait_for()
 
-    @remote_function(collect='first')
+    # lazy_collect=False: save is a persistence side-effect the caller acts on immediately (it rotates
+    # old checkpoints, writes args.json INTO the dir, and returns a path `swift infer` reloads), so the
+    # driver must block until the write lands. A deferred (lazy) handle only materializes when its result
+    # is consumed or a LATER remote call forces it -- so the final save of a run, which nothing follows,
+    # would be torn down with the actor before writing, leaving an empty checkpoint-final. Megatron's save
+    # is sync=True for the same reason; keeping the transformers backend non-lazy preserves that backend
+    # equivalence.
+    @remote_function(collect='first', lazy_collect=False)
     def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 
@@ -1201,11 +1892,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Avoid collecting the full base model for large FSDP/EP jobs.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
+        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
         processed_state_dict = {}
         for key, value in adapter_state.items():
-            normalized = key.replace(adapter_suffix, '.')
+            if modules_to_save_infix in key:
+                normalized = key.replace(modules_to_save_infix, '.')
+            else:
+                normalized = key.replace(adapter_suffix, '.')
             processed_state_dict[normalized] = value
         return processed_state_dict
+
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """Map runtime optimizer parameter names to checkpoint names."""
+        return {}
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1215,7 +1914,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if optimizer is not None:
             optimizer_path = os.path.join(output_dir, 'optimizer.pt')
-            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
+            name_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            self.strategy.save_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=name_mapping,
+            )
         if Platform.is_master():
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
@@ -1287,10 +1992,30 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
             self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
-            raise NotImplementedError
+            # Full-parameter model: load a plain HF checkpoint in-place.
+            state_dict = _read_hf_state_dict(checkpoint_dir)
+            self.strategy.load_full_state_dict(self.model, state_dict)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+
+    @remote_function()
+    def reload_initial_weights(self, **kwargs):
+        """Reload the base model weights from ``self.model_id``.
+
+        Used by full-parameter server deployments after a tenant releases the
+        (exclusive) model, so the next tenant starts from clean pretrained
+        weights instead of the previous tenant's trained weights.
+        """
+        if not self.model_id:
+            logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
+            return
+        state_dict = _read_hf_state_dict(self.model_id)
+        self.strategy.load_full_state_dict(self.model, state_dict)
+        # Drop any leftover gradients from the previous tenant so they cannot
+        # leak into the next tenant's first optimizer step.
+        for param in self.model.parameters():
+            param.grad = None
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1310,7 +2035,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
-            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
+            optimizer = optimizer_config.optimizer
+            save_mapping = self._optimizer_param_name_mapping(adapter_name, optimizer)
+            load_mapping = {logical_name: physical_name for physical_name, logical_name in save_mapping.items()}
+            self.strategy.load_optimizer_checkpoint(
+                self.model,
+                optimizer,
+                optimizer_path,
+                param_name_mapping=load_mapping,
+            )
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
@@ -1393,7 +2126,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         return trainer_state
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    # lazy_collect=False: resume_from_checkpoint returns the training-state dict the driver consumes
+    # immediately -- assembly.resume_model() hands it straight to loop.resume(), which subscripts
+    # state['cur_step']. The lazy default returns an un-collected callable instead, so subscripting
+    # raises "'function' object is not subscriptable". Mirrors forward_only/calculate_metric, the other
+    # methods whose return value the driver reads. sync=True orders the workers but does not materialize
+    # the result; the megatron/hybrid/multi_lora variants are non-lazy for the same backend equivalence.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
@@ -1452,6 +2191,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
+        freeze_llm = kwargs.pop('freeze_llm', False)
+        freeze_vit = kwargs.pop('freeze_vit', True)
+        freeze_aligner = kwargs.pop('freeze_aligner', True)
         unwrapped_model = self.strategy.unwrap_model(self.model)
         if not isinstance(config_or_dir, str):
             config_or_dir = self.strategy.prepare_adapter_config(
@@ -1477,6 +2219,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             config = _adapted_model.peft_config
         else:
             config = config_or_dir
+            self._expand_multimodal_lora_target(
+                config,
+                unwrapped_model,
+                freeze_llm=freeze_llm,
+                freeze_vit=freeze_vit,
+                freeze_aligner=freeze_aligner)
+            self._expand_modules_to_save(config, unwrapped_model)
             if not isinstance(unwrapped_model, PeftModel):
                 assert unwrapped_model is self.model, 'Cannot wrap model with peft after DDP/FSDP!'
                 self.model = get_peft_model(unwrapped_model, config, adapter_name=adapter_name)
@@ -1491,6 +2240,74 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
+                                       freeze_aligner: bool) -> None:
+        """Rewrite a multimodal ``'all-linear'`` LoRA target into the freeze_*-aware regex, in place.
+
+        PEFT expands ``'all-linear'`` to every linear in the model, which on a multimodal model would
+        also adapt the vision tower and the aligner -- but legacy swift targets only the *unfrozen*
+        towers (by default the language model alone), and that partition is what ``freeze_*`` express.
+        The expansion needs the real modules, so it runs here on the worker, not on the driver's PROXY.
+
+        Left untouched (so PEFT's own behaviour stands) when the target is not ``'all-linear'`` -- an
+        explicit user regex or name list is respected verbatim -- or when ``model_arch`` declares no
+        vision tower / aligner, i.e. a plain LLM where ``'all-linear'`` already means the right thing.
+        """
+        target = getattr(config, 'target_modules', None)
+        is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
+        if not is_all_linear:
+            return
+        if not (self.model_arch.get('vision_tower') or self.model_arch.get('aligner')):
+            return
+        from twinkle.model.transformers.target_modules import get_multimodal_target_regex
+        # Walk the base model: target prefixes in model_arch are base-relative, and when an adapter is
+        # added to an already-peft model the towers live under the wrapped base, not the PeftModel.
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
+        config.target_modules = get_multimodal_target_regex(
+            base_model,
+            self.model_arch,
+            freeze_llm=freeze_llm,
+            freeze_vit=freeze_vit,
+            freeze_aligner=freeze_aligner,
+            include_embedding=include_embedding)
+
+    def _expand_modules_to_save(self, config, model) -> None:
+        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
+
+        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
+        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
+        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
+        module names here first. The expansion needs the real modules, so it runs on the worker, not the
+        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
+        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
+        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
+        """
+        modules_to_save = getattr(config, 'modules_to_save', None)
+        if not modules_to_save:
+            return
+        shorthands = ('all-norm', 'all-embedding')
+        if not any(name in shorthands for name in modules_to_save):
+            return
+        from twinkle.model.transformers.target_modules import find_embedding, find_norm
+        # Walk to the base model: when an adapter is added to an already-peft model the real modules
+        # live under the wrapped base, not the PeftModel.
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        expanded = [name for name in modules_to_save if name not in shorthands]
+        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
+            if shorthand not in modules_to_save:
+                continue
+            found = finder(base_model)
+            if not found:
+                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
+            expanded += found
+        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
+        config.modules_to_save = list(dict.fromkeys(expanded))
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
@@ -1674,10 +2491,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
-            else:
-                if 'conv1d.weight' in name:
-                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
-                        name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
+            return name
+
+        def _add_base_layer_suffix(name):
+            # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
+            # only their ``.base_layer.*`` param, even when PEFT does not target
+            # them on the training side (e.g. linear-attn ``conv1d`` /
+            # ``in_proj_qkvz``).  Rename to match whenever the sampler exposes
+            # the ``.base_layer.`` variant.
+            base_layer_name = None
+            if name.endswith('.weight'):
+                base_layer_name = f'{name[:-7]}.base_layer.weight'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            elif name.endswith('.bias'):
+                base_layer_name = f'{name[:-5]}.base_layer.bias'
+                if not model_keys or base_layer_name in model_keys:
+                    name = base_layer_name
+            if 'experts' in name and base_layer_name is not None:
+                return base_layer_name
             return name
 
         def _print_weight_example(names):
@@ -1722,11 +2554,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     _print_weight_example(names)
 
         else:
-            # First full base-model sync.  Whether to keep ``.base_layer.``
-            # depends on whether the sampler uses ``enable_lora``:
-            #   merge_and_sync=True  → enable_lora=False → strip .base_layer
-            #   merge_and_sync=False → enable_lora=True  → keep .base_layer
-            keep_base_layer = not merge_and_sync
+            # First full base-model sync.  When the sampler runs with
+            # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
+            # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
+            # (detected via ``model_keys``); otherwise send canonical names.
+            add_base_layer = not merge_and_sync
             state_dict = model.state_dict()
 
             def weight_generator():
@@ -1735,7 +2567,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    name = _normalize(name, keep_base_layer=keep_base_layer)
+                    name = _normalize(name, keep_base_layer=False)
+                    if add_base_layer:
+                        name = _add_base_layer_suffix(name)
                     names.append(name)
                     yield name, tensor
                 _print_weight_example(names)

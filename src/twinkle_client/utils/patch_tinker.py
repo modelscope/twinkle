@@ -138,6 +138,62 @@ def _make_patched_service_client_init(original):
     return _patched_service_client_init
 
 
+def _create_full_training_client_submit(self, base_model, seed=None, user_metadata=None):
+    """Submit a full-parameter (non-LoRA) training-client creation request.
+
+    Mirrors the SDK's ``_create_lora_training_client_submit`` but sends
+    ``lora_config=None`` so the Twinkle server routes to a full-parameter
+    (``train_mode: full``) deployment. Returns the same ``TrainingClient`` so
+    the training loop (forward_backward / optim_step / save_weights / ...) is
+    identical to the LoRA path.
+    """
+    from tinker.lib.public_interfaces import service_client as _sc
+    from tinker.lib.internal_client_holder import ClientConnectionPoolType
+
+    session_id = self.holder.get_session_id()
+    model_seq_id = self.holder.get_training_client_id()
+
+    async def _create_full_training_client_async():
+        start_time = _sc.time.time()
+        with self.holder.aclient(ClientConnectionPoolType.TRAIN) as client:
+            request = _sc.types.CreateModelRequest(
+                session_id=session_id,
+                model_seq_id=model_seq_id,
+                base_model=base_model,
+                lora_config=None,
+                user_metadata=user_metadata,
+            )
+            future = await client.models.create(request=request)
+        create_model_response = await _sc._APIFuture(
+            _sc.types.CreateModelResponse,
+            self.holder,
+            future,
+            request_start_time=start_time,
+            request_type='CreateModel',
+            queue_state_observer=_sc.QueueStateLogger(base_model, 'Model creation'),
+        ).result_async()
+        model_id = create_model_response.model_id
+        from tinker.lib.public_interfaces.training_client import TrainingClient
+
+        training_client = TrainingClient(self.holder, model_seq_id=model_seq_id, model_id=model_id)
+        _sc.logger.info(f'Full-parameter TrainingClient initialized for model {model_id}')
+        return training_client
+
+    return self.holder.run_coroutine_threadsafe(_create_full_training_client_async())
+
+
+def _create_full_training_client(self, base_model, seed=None, user_metadata=None):
+    """Create a full-parameter (non-LoRA) training client (blocking)."""
+    return _create_full_training_client_submit(
+        self, base_model, seed=seed, user_metadata=user_metadata).result()
+
+
+async def _create_full_training_client_async(self, base_model, seed=None, user_metadata=None):
+    """Async variant of ``create_full_training_client``."""
+    return await _create_full_training_client_submit(
+        self, base_model, seed=seed, user_metadata=user_metadata).result_async()
+
+
 def patch_tinker():
     """
     Apply patches to tinker library.
@@ -147,6 +203,7 @@ def patch_tinker():
     2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
     3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
     4. _get_default_headers to inject Twinkle-specific headers
+    5. ServiceClient.create_full_training_client to enable full-parameter (non-LoRA) training
 
     This patch is idempotent - calling it multiple times has no additional effect.
     """
@@ -170,6 +227,10 @@ def patch_tinker():
         # Patch 4: inject Twinkle-specific headers by patching ServiceClient.__init__.
         from tinker.lib.public_interfaces.service_client import ServiceClient
         ServiceClient.__init__ = _make_patched_service_client_init(ServiceClient.__init__)
+
+        # Patch 5: add a full-parameter (non-LoRA) training-client entrypoint.
+        ServiceClient.create_full_training_client = _create_full_training_client
+        ServiceClient.create_full_training_client_async = _create_full_training_client_async
 
         _patched = True
     except ImportError:

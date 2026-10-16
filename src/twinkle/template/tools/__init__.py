@@ -6,6 +6,7 @@ narrower / stronger formats first so round-robin detection prefers them
 over weaker fallbacks.
 """
 from .base import ToolCallParser, ToolCallRegistry
+from .bracket_dsl import BracketDslParser
 from .cline import ClineParser
 from .qwen import HermesQwenParser
 from .react import ReActParser
@@ -17,6 +18,9 @@ ToolCallRegistry.register(HermesQwenParser())
 ToolCallRegistry.register(ClineParser())
 ToolCallRegistry.register(VCPParser())
 ToolCallRegistry.register(ReActParser())
+# Last: the bracketed call list carries no markup of its own, so it must only
+# claim text that no marked-up format recognised.
+ToolCallRegistry.register(BracketDslParser())
 
 __all__ = [
     'ToolCallParser',
@@ -25,4 +29,5 @@ __all__ = [
     'ClineParser',
     'VCPParser',
     'ReActParser',
+    'BracketDslParser',
 ]

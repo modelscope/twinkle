@@ -72,4 +72,6 @@ def init_twinkle_client(
     )
 
 
-__all__ = ['init_tinker_client', 'init_twinkle_client']
+from .data_plane import DataPlaneClient
+
+__all__ = ['DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']

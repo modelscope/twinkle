@@ -4,16 +4,20 @@ import atexit
 import numpy as np
 import os
 import threading
+import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                 SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.generation_submission import GenerationSubmissionMixin
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -36,8 +40,43 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-@remote_class()
-class vLLMSampler(Sampler, CheckpointEngineMixin):
+def _unwrap_mm_ref(entry: Any) -> Any:
+    """Unwrap an HF-datasets media cell ``{'bytes': ..., 'path': ...}`` to its loadable payload.
+
+    HF datasets serialises a media column cell (``images``/``videos``) as ``{'bytes': ..., 'path': ...}``; the
+    vLLM engine forwards ``multi_modal_data`` verbatim to the HF processor, whose ``fetch_images`` rejects a
+    dict (``TypeError: only a single or a list of entries is supported but got type=<class 'dict'>``) and
+    accepts only a PIL image / path / URL / bytes. Extracting ``bytes or path`` -- the same unwrap the
+    template's ``preprocess_image`` does -- yields a form the engine can load; any other entry (already a PIL
+    image / path / bytes) passes through untouched, so text-only and pre-loaded media are unaffected.
+    """
+    if isinstance(entry, dict) and ('bytes' in entry or 'path' in entry):
+        return entry.get('bytes') or entry.get('path')
+    return entry
+
+
+def _load_vllm_image(entry: Any) -> Any:
+    """Decode one image entry to a PIL image, the canonical ``multi_modal_data['image']`` form.
+
+    A raw ``bytes`` payload is not something the HF image processor's ``fetch_images`` accepts either, so an
+    image is loaded all the way to PIL rather than merely unwrapped. This reuses twinkle's ``load_image`` --
+    the SAME loader the template's ``preprocess_image`` runs -- so the engine conditions generation on exactly
+    the RGB pixels the template encoded the prompt's ``<image>`` pad count from, keeping vLLM's re-expanded
+    vision grid identical to the one frozen into ``input_ids``. A non-str/bytes entry (an already-loaded PIL
+    image) passes through. Video is not a single image, so it only needs :func:`_unwrap_mm_ref`.
+    """
+    from twinkle.utils.vision_tools import load_image
+    unwrapped = _unwrap_mm_ref(entry)
+    if isinstance(unwrapped, (str, bytes, bytearray)):
+        return load_image(unwrapped)
+    return unwrapped
+
+
+_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+
+
+@remote_class(max_concurrency=_MAX_CONCURRENCY)
+class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -74,6 +113,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
         self._async_thread.start()
+
+        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
+        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
+        self._generation_submissions: Dict[str, Any] = {}
+
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
+        # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
+        self._inflight_request_ids: set = set()
 
         from .vllm_engine import VLLMEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -215,9 +262,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         mm_data = {}
         if images:
-            mm_data['image'] = images
+            image_list = images if isinstance(images, (list, tuple)) else [images]
+            mm_data['image'] = [_load_vllm_image(im) for im in image_list]
         if videos:
-            mm_data['video'] = videos
+            video_list = videos if isinstance(videos, (list, tuple)) else [videos]
+            mm_data['video'] = [_unwrap_mm_ref(video) for video in video_list]
         return mm_data or None
 
     async def _sample_single(
@@ -229,16 +278,29 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
         disable_lora: bool = False,
+        request_id: Optional[str] = None,
     ) -> SampleResponse:
-        """Sample a single input asynchronously."""
-        response = await self.engine.sample(
-            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            mm_processor_kwargs=feat.get('mm_processor_kwargs'),
-            disable_lora=disable_lora,
-        )
+        """Sample a single input asynchronously.
+
+        ``request_id`` is this generation's engine handle: auto-generated when not given, and registered as
+        in-flight for the duration of the call so :meth:`abort_all_inflight` (PartialRolloutMixin) can
+        interrupt it and let a partial rollout resume from the tokens it produced before the abort.
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        self._register_inflight(request_id)
+        try:
+            response = await self.engine.sample(
+                prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+                sampling_params=sampling_params,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                mm_processor_kwargs=feat.get('mm_processor_kwargs'),
+                disable_lora=disable_lora,
+                request_id=request_id,
+            )
+        finally:
+            self._unregister_inflight(request_id)
 
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:
@@ -269,6 +331,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     logprobs=seq.logprobs,
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
+                    sampling_mask=seq.sampling_mask,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(
@@ -277,7 +340,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -288,6 +351,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         return_encoded: bool = False,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -323,12 +387,54 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             - ``adapter_paths`` is a list too, so it is sliced in lockstep with ``inputs`` and stays
               aligned with them on every rank.
         """
+        # One sampling path: the blocking sample is the async core driven to completion on the loop. The
+        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
+        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        return self._run_in_loop(
+            self._generate_inputs(
+                inputs,
+                sampling_params,
+                adapter_name,
+                adapter_path,
+                return_encoded=return_encoded,
+                use_base_model=use_base_model,
+                adapter_paths=adapter_paths,
+                allow_partial_rollout=allow_partial_rollout))
+
+    async def _generate_inputs(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
+    ) -> List[SampleResponse]:
+        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+
+        ``sample`` drives this coroutine to completion on the background loop; ``submit_generation``
+        (GenerationSubmissionMixin) schedules the very same coroutine and collects it later, so an
+        overlapped RL rollout and a plain blocking call cannot drift apart. LoRA is resolved with the
+        async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
+        the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
+
+        With ``allow_partial_rollout`` each input is driven through
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
+        a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
+        of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
+        """
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         inputs_list = self._normalize_inputs(inputs)
+        if not inputs_list:
+            return []
+
         if adapter_paths is not None:
             if adapter_path is not None:
                 raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
@@ -346,16 +452,131 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             sampling_params.max_tokens = 1
             logprobs_only = True
 
-        multi_modal_data_list = []
-        for feat in inputs_list:
-            multi_modal_data_list.append(self._extract_multi_modal_data(feat))
+        multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
 
         if is_trajectory:
-            template = self.template
-            assert template is not None, \
+            assert self.template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
             encoded_inputs = [
                 self.encode_trajectory_for_vllm(traj, adapter_name, not logprobs_only) for traj in inputs_list
+            ]
+        else:
+            encoded_inputs = inputs_list
+
+        if adapter_paths is not None:
+            lora_requests = [await self._aload_lora(path) for path in adapter_paths]
+        else:
+            lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
+
+        async def _generate_one(feat, multi_modal_data, lora_request):
+            if not allow_partial_rollout:
+                return await self._sample_single(
+                    feat,
+                    sampling_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
+                )
+
+            # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
+            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
+            # path carries no per-attempt control-plane state, so run_attempt returns None for it.
+            async def run_attempt(current_input, attempt_params, attempt):
+                response = await self._sample_single(
+                    current_input,
+                    attempt_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
+                )
+                return response, None
+
+            outcome = await self._run_partial_rollout(
+                feat,
+                sampling_params,
+                run_attempt=run_attempt,
+                allow_partial_rollout=True,
+                max_retries=self.rollout_max_retries,
+                retry_delay_s=self.rollout_retry_delay_s,
+            )
+            return outcome.response
+
+        return await asyncio.gather(*(
+            _generate_one(feat, multi_modal_data, lora_request) for feat, multi_modal_data, lora_request in
+            zip(encoded_inputs, multi_modal_data_list, lora_requests)))
+
+    async def _encode_single(
+        self,
+        feat: Dict[str, Any],
+        pooling_params: PoolingParams,
+        lora_request: Optional[Any] = None,
+        *,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
+    ) -> PoolingResponse:
+        """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
+        return await self.engine.encode(
+            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+            pooling_params=pooling_params,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=feat.get('mm_processor_kwargs'),
+        )
+
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    def encode(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[PoolingResponse]:
+        """Run a pooling forward (embedding / classify) for each input.
+
+        The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
+        resolution and multimodal extraction. It requires the engine to have been built as a pooling
+        runner (``runner='pooling'`` in ``engine_args``); against a generation engine vLLM has no
+        pooling head to run and raises.
+
+        Args:
+            inputs: Either InputFeature(s) or Trajectory(s). Trajectories are encoded with
+                ``add_generation_prompt=False`` -- a pooling forward scores the whole sequence, so it
+                must not end on a generation prompt.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            adapter_name: Optional LoRA adapter name.
+            adapter_path: Optional LoRA adapter path, applied to every input in this call.
+            adapter_paths: Per-input LoRA paths, one entry per input, sliced in lockstep with ``inputs``.
+
+        Returns:
+            One PoolingResponse per input, in input order.
+        """
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        if adapter_paths is not None:
+            if adapter_path is not None:
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
+            if len(adapter_paths) != len(inputs_list):
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
+
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
+
+        if is_trajectory:
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
+            encoded_inputs = [
+                self.encode_trajectory_for_vllm(traj, adapter_name, add_generation_prompt=False)
+                for traj in inputs_list
             ]
         else:
             encoded_inputs = inputs_list
@@ -365,22 +586,33 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         else:
             lora_requests = [self._load_lora(adapter_path)] * len(encoded_inputs)
 
-        # Sample all inputs in parallel using background event loop
-        async def _sample_all():
+        async def _encode_all():
             tasks = [
-                self._sample_single(
+                self._encode_single(
                     feat,
-                    sampling_params,
+                    pooling_params,
                     lora_request=lora_request,
                     multi_modal_data=multi_modal_data,
-                    logprobs_only=logprobs_only,
-                    disable_lora=use_base_model,
                 ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)
             ]
             return await asyncio.gather(*tasks)
 
-        sample_results = self._run_in_loop(_sample_all())
-        return sample_results
+        return self._run_in_loop(_encode_all())
+
+    async def _aload_lora(self, adapter_path: Optional[str]):
+        """Async :meth:`_load_lora`: resolve an adapter path to a vLLM ``LoRARequest`` on the event loop.
+
+        Split out so the async generation core (``_generate_inputs``) can ``await`` it directly; calling
+        the blocking ``_load_lora`` from inside the loop would re-enter ``_run_in_loop`` and deadlock.
+        """
+        if adapter_path is None:
+            return None
+        logger.info(f'Loading LoRA from {adapter_path}')
+        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
+        lora_request = await self.engine._get_or_load_lora(local_path)
+        if lora_request is None:
+            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
+        return lora_request
 
     def _load_lora(self, adapter_path: Optional[str]):
         """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.
@@ -388,14 +620,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         ``_get_or_load_lora`` caches by path, so repeating the same path across a batch of per-input
         adapters costs one ``add_lora`` RPC, not one per input.
         """
-        if adapter_path is None:
-            return None
-        logger.info(f'Loading LoRA from {adapter_path}')
-        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        lora_request = self._run_in_loop(self.engine._get_or_load_lora(local_path))
-        if lora_request is None:
-            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
-        return lora_request
+        return self._run_in_loop(self._aload_lora(adapter_path))
 
     def sample_stream(
         self,
@@ -517,6 +742,85 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 self.engine.invalidate_synced_lora()
 
         self._run_in_loop(_receive_and_load())
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Unload policy snapshots from vLLM and clear cached requests."""
+        self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def load_full_weights_from_path(self, path: Optional[str] = None) -> int:
+        """Load a full (non-LoRA) HF checkpoint into the engine's base model.
+
+        Unlike :meth:`receive_weights`, this does **not** involve the training model:
+        weights are read from disk and streamed straight into vLLM. That is what lets
+        a sampler be restored to a known checkpoint without a trainer round-trip --
+        no ``save``/``load`` on the training model, so training weights and optimizer
+        state are never touched. Full-parameter training uses the same entry point:
+        its checkpoint is a plain HF directory (no ``adapter_config.json``), so it
+        replaces the base weights instead of loading as a LoRA adapter.
+
+        Weights are yielded **lazily** one tensor at a time (never materialising a full
+        state dict) because ``VLLMEngine.update_weights`` accepts a generator and packs
+        tensors into fixed-size transfer buckets itself. Tensors stay on CPU, so the
+        engine takes its shared-memory path rather than CUDA IPC.
+
+        Names are passed through untouched: safetensors files already store canonical
+        HF names, which is exactly what the worker's ``model.load_weights()`` expects
+        (it does the q/k/v -> qkv and gate/up -> gate_up stacking internally).
+
+        Idempotent: repeated calls with the same resolved path are skipped.
+
+        Args:
+            path: Local checkpoint dir or a hub model id. Defaults to the ``model_id``
+                the sampler was constructed with, i.e. the original pretrained weights.
+
+        Returns:
+            1 if weights were (re)loaded, 0 if that path was already loaded.
+        """
+        import glob
+        import json
+        from safetensors import safe_open
+
+        path = path or self.model_id
+        resolved = path if os.path.exists(path) else HubOperation.download_model(path)
+        if getattr(self, '_loaded_full_weights_path', None) == resolved:
+            return 0
+
+        # Resolve the shard list eagerly so a bad path fails here rather than
+        # part-way through streaming tensors into a live engine.
+        index_path = os.path.join(resolved, 'model.safetensors.index.json')
+        if os.path.exists(index_path):
+            with open(index_path, encoding='utf-8') as f:
+                weight_map = json.load(f)['weight_map']
+            shards = [os.path.join(resolved, s) for s in sorted(set(weight_map.values()))]
+        else:
+            shards = sorted(glob.glob(os.path.join(resolved, '*.safetensors')))
+        if not shards:
+            raise FileNotFoundError(f'No .safetensors weights found under {resolved}')
+
+        def _iter_weights():
+            # safe_open + get_tensor reads one tensor at a time (mmap-backed), so peak
+            # host memory is a single tensor rather than the whole shard.
+            for shard in shards:
+                with safe_open(shard, framework='pt', device='cpu') as f:
+                    for name in f.keys():
+                        yield name, f.get_tensor(name)
+
+        async def _load():
+            await self.engine.update_weights(_iter_weights(), peft_config=None, base_sync_done=False)
+            # A base-model swap invalidates any previously synced LoRA adapter,
+            # mirroring the `not base_sync_done` branch of receive_weights().
+            self.engine.invalidate_synced_lora()
+
+        logger.info(f'Loading full-parameter weights into sampler base model from {resolved}')
+        self._run_in_loop(_load())
+        self._loaded_full_weights_path = resolved
+        # Prefixes cached under the previous weights would decode against a model
+        # that no longer exists; drop them before the next sample().
+        self.reset_prefix_cache()
+        logger.info(f'Reloaded base weights from {resolved} ({len(shards)} shard(s))')
+        return 1
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):

@@ -86,7 +86,7 @@ class LossMetric(Metric):
         self.reset()
         results = {}
         if avg_loss is not None:
-            results['loss'] = f'{avg_loss:.4f}'
+            results['loss'] = f'{avg_loss:.5f}'
         if grad_norm > 0:
             results['grad_norm'] = f'{grad_norm:.6f}'
         for channel in sorted(channel_loss, key=lambda value: '' if value is None else str(value)):

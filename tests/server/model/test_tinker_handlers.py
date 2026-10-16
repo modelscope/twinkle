@@ -52,6 +52,8 @@ async def test_tinker_dpo_forward_backward_requires_per_dp_pairs():
 class _SaveWeightsDummyManagement:
     """Dummy management that actually executes the task to test save_weights_for_sampler logic."""
 
+    is_full_mode = False
+
     def __init__(self):
         self.model = MagicMock()
         self.state = MagicMock()
@@ -62,6 +64,9 @@ class _SaveWeightsDummyManagement:
         return 'token1'
 
     def get_adapter_name(self, adapter_name=None):
+        return adapter_name
+
+    def resolve_model_adapter_name(self, adapter_name):
         return adapter_name
 
     def assert_resource_exists(self, adapter_name):

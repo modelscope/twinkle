@@ -27,6 +27,24 @@ from .env_propagation import build_propagated_env_vars
 logger = get_logger()
 
 
+def build_ray_runtime_env() -> dict[str, Any]:
+    """The ``runtime_env`` every Ray worker in a twinkle server needs.
+
+    Bundles the Ray Serve monkey-patches (which must be re-applied inside worker processes such as the
+    Serve ProxyActor) with the telemetry/persistence env vars propagated from the driver. Shared by the
+    launcher's own ``ray.init`` and by any caller that starts a local Ray head before handing off to
+    :func:`launch_server` (e.g. swift's deploy recipe), so both seed worker processes identically rather
+    than each re-deriving the merge.
+    """
+    runtime_env = get_runtime_env_for_patches()
+    propagated_env_vars = build_propagated_env_vars()
+    if propagated_env_vars:
+        merged_env_vars = dict(runtime_env.get('env_vars') or {})
+        merged_env_vars.update(propagated_env_vars)
+        runtime_env['env_vars'] = merged_env_vars
+    return runtime_env
+
+
 class ServerLauncher:
     """
     Unified server launcher.
@@ -89,13 +107,7 @@ class ServerLauncher:
         if not ray.is_initialized():
             # Use runtime_env to apply patches in worker processes
             # This is required because Ray Serve's ProxyActor runs in separate processes
-            runtime_env = get_runtime_env_for_patches()
-            # Propagate telemetry + persistence env vars to all Ray workers
-            propagated_env_vars = build_propagated_env_vars()
-            if propagated_env_vars:
-                merged_env_vars = dict(runtime_env.get('env_vars') or {})
-                merged_env_vars.update(propagated_env_vars)
-                runtime_env['env_vars'] = merged_env_vars
+            runtime_env = build_ray_runtime_env()
             # Connect to existing cluster if available, otherwise start local instance
             ray.init(
                 address='auto',

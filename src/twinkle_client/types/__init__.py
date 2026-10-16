@@ -16,6 +16,8 @@ from .model import (
     ClipGradNormResponse,
     CreateRequest,
     CreateResponse,
+    DataPlaneForwardOnlyRequest,
+    DataPlaneForwardRequest,
     ForwardBackwardResponse,
     ForwardOnlyRequest,
     ForwardRequest,
@@ -92,3 +94,13 @@ from .training import (
 )
 
 from .checkpoint import ResolvedLoadPath
+from .component import (
+    DataAppendRequest,
+    DataGetRequest,
+    DataPlaneSampleRequest,
+    DataPutRequest,
+    DataRef,
+    DataReleaseRequest,
+    DataRowsResponse,
+    UnloadAdapterPathsRequest,
+)

@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING
@@ -22,31 +23,57 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle_client.types as types
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.data_format import InputFeature, PoolingParams, SamplingParams, Trajectory
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
+from twinkle_client.common.json_utils import json_safe
 
 logger = get_logger()
 
 
+#: Sentinel for a value that cannot cross the HTTP boundary and must be omitted from its container.
+_DROP = object()
+_JSON_PRIMITIVES = (str, int, float, bool, type(None))
+
+
+def _json_safe_value(value):
+    """Recursively convert one InputFeature value into JSON-safe form.
+
+    numpy arrays and torch tensors become nested lists and mappings/sequences are walked, so a media
+    field nested inside ``messages`` is reached too. Anything else that JSON cannot represent -- above
+    all the raw ``PIL.Image`` objects a multimodal encode leaves in ``messages``/``images`` -- is
+    dropped (``_DROP``): the token-level features (``input_ids``/``labels``/``completion_mask``/...) are
+    what a token-in-token-out caller re-feeds, and the client already holds the media it sent, so the
+    un-serializable pixels add nothing to the response and would otherwise fail ``dump_json``.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Mapping):
+        out = {}
+        for key, item in value.items():
+            safe = _json_safe_value(item)
+            if safe is not _DROP:
+                out[key] = safe
+        return out
+    if isinstance(value, (list, tuple)):
+        return [safe for safe in (_json_safe_value(item) for item in value) if safe is not _DROP]
+    if isinstance(value, _JSON_PRIMITIVES):
+        return value
+    tolist = getattr(value, 'tolist', None)
+    if callable(tolist):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    return _DROP
+
+
 def _serialize_input_feature(feature: dict) -> dict:
-    """Convert numpy arrays / torch tensors in an InputFeature to plain Python lists."""
-    result = {}
-    for k, v in feature.items():
-        if isinstance(v, np.ndarray):
-            result[k] = v.tolist()
-        else:
-            try:
-                import torch
-                if isinstance(v, torch.Tensor):
-                    result[k] = v.tolist()
-                    continue
-            except ImportError:
-                pass
-            result[k] = v
-    return result
+    """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
+    safe = _json_safe_value(feature)
+    return safe if isinstance(safe, dict) else {}
 
 
 def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None) -> str | None:
@@ -55,6 +82,145 @@ def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None
         return None
     owner_id = get_session_id_from_request(request) or request.state.request_id
     return owner_id + '-' + adapter_name
+
+
+def _coerce_inputs(inputs):
+    """Normalize a request's ``inputs`` into a list of ``InputFeature`` / ``Trajectory``.
+
+    A payload may carry pre-encoded token ids (``input_ids``) or a chat ``messages`` trajectory, as a
+    single dict or a list; the shape of the first entry decides which. The sample, sample_to_data_plane
+    and encode routes all accept exactly this surface, so the branching lives here once.
+    """
+    if isinstance(inputs, list) and inputs:
+        first = inputs[0]
+        if isinstance(first, dict) and 'input_ids' in first:
+            return [InputFeature(**item) for item in inputs]
+        return [Trajectory(**item) for item in inputs]
+    if isinstance(inputs, dict):
+        return [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
+    return inputs
+
+
+def _build_rollout_rows_and_tags(
+    sample_models: list[types.SampleResponseModel],
+    *,
+    group_ids: list[str] | None,
+    policy_version: int | None,
+    adapter_uri: str | None,
+) -> tuple[list[dict], list[dict]]:
+    """Flatten sampler output to one TQ row per generated sequence."""
+    resolved_group_ids = group_ids or [uuid.uuid4().hex for _ in sample_models]
+    if len(resolved_group_ids) != len(sample_models):
+        raise ValueError(f'group_ids contains {len(resolved_group_ids)} values for '
+                         f'{len(sample_models)} sampler inputs')
+    rows = []
+    tags = []
+    for prompt_index, (response, group_id) in enumerate(zip(sample_models, resolved_group_ids)):
+        for generation_idx, sequence in enumerate(response.sequences):
+            sampled_logprobs = [
+                0.0 if not position else float(position[0][1]) for position in (sequence.logprobs or [])
+            ]
+            rows.append({
+                'train_input': sequence.new_input_feature,
+                'sampled_logprobs': sampled_logprobs,
+                'tokens': sequence.tokens,
+                'decoded': sequence.decoded,
+                'stop_reason': sequence.stop_reason,
+                'prompt_logprobs': response.prompt_logprobs,
+                'topk_prompt_logprobs': response.topk_prompt_logprobs,
+            })
+            tags.append({
+                'record_type': 'sample',
+                'group_id': group_id,
+                'prompt_index': prompt_index,
+                'generation_idx': generation_idx,
+                'rollout_status': 'ROLLOUT_DONE',
+                'rollout_policy_version': policy_version,
+                'rollout_adapter_uri': adapter_uri,
+            })
+    return rows, tags
+
+
+def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
+    """Convert internal sampler responses to the HTTP response schema."""
+    sample_models = []
+    for response in responses:
+        sequences = [
+            types.SampledSequenceModel(
+                stop_reason=sequence.stop_reason,
+                tokens=list(sequence.tokens),
+                logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
+                decoded=sequence.decoded,
+                new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
+                                   if sequence.new_input_feature is not None else None),
+            ) for sequence in response.sequences
+        ]
+        sample_models.append(
+            types.SampleResponseModel(
+                sequences=sequences,
+                # The prompt's own ids, which is what makes a reply served over
+                # HTTP trainable: paired with a sequence's tokens they are the
+                # exact ids the model ran on, so a caller never has to re-encode
+                # the text and hope the tokenizer agrees with itself.
+                prompt_token_ids=(list(response.prompt_token_ids) if response.prompt_token_ids is not None else None),
+                prompt_logprobs=response.prompt_logprobs,
+                topk_prompt_logprobs=response.topk_prompt_logprobs,
+            ))
+    return sample_models
+
+
+def _submission_states(value) -> list[dict]:
+    """Normalize Twinkle's single-worker unwrapping to a list of states."""
+    return value if isinstance(value, list) else [value]
+
+
+async def _await_generation(
+    sampler,
+    submission_id: str,
+):
+    """Poll an admitted generation without occupying the sampler admission queue."""
+    collected = False
+    try:
+        poll_interval = 0.01
+        while True:
+            try:
+                states = _submission_states(await asyncio.to_thread(sampler.get_generation_status, submission_id))
+            except Exception as error:
+                # A pending read-only actor call can be cancelled by Ray while
+                # the generation submitted just above remains alive.  Treating
+                # that as a generation failure makes the finally block discard
+                # otherwise valid rollout work.  Retry only Ray's explicit task
+                # cancellation; actor death and application errors must still
+                # propagate immediately.
+                from ray.exceptions import TaskCancelledError
+                if not isinstance(error, TaskCancelledError):
+                    raise
+                logger.warning(
+                    'Generation status poll was cancelled; retrying submission %s',
+                    submission_id,
+                )
+                await asyncio.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.5, 0.25)
+                continue
+            failed = next(
+                (state for state in states if state.get('status') not in ('running', 'completed')),
+                None,
+            )
+            if failed is not None:
+                error = failed.get('error') or failed.get('status', 'unknown failure')
+                raise RuntimeError(f'generation {submission_id} failed: {error}')
+            if states and all(state.get('status') == 'completed' for state in states):
+                responses = await asyncio.to_thread(sampler.collect_generation, submission_id)
+                collected = True
+                return responses
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 0.25)
+    finally:
+        if not collected:
+            try:
+                await asyncio.to_thread(sampler.cancel_generation, submission_id)
+            except Exception:
+                logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -101,25 +267,22 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
+                import os
+
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-                _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+                _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
                 # Reset prefix cache only when new weights are loaded
                 self.sampler.reset_prefix_cache()
+                # LoRA adapter dir (has adapter_config.json) vs full-parameter
+                # HF checkpoint. Full checkpoints replace the sampler base model.
+                if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
+                    adapter_path = resolved_uri
+                elif resolved_uri:
+                    self.sampler.load_full_weights_from_path(resolved_uri)
 
             # Parse inputs
-            inputs = body.inputs
-            if isinstance(inputs, list) and inputs:
-                first = inputs[0]
-                if isinstance(first, dict) and 'input_ids' in first:
-                    inputs = [InputFeature(**item) for item in inputs]
-                else:
-                    inputs = [Trajectory(**item) for item in inputs]
-            elif isinstance(inputs, dict):
-                if 'input_ids' in inputs:
-                    inputs = [InputFeature(**inputs)]
-                else:
-                    inputs = [Trajectory(**inputs)]
+            inputs = _coerce_inputs(body.inputs)
 
             # Build sampling params
             params = None
@@ -133,26 +296,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-
-            sample_models = []
-            for response in responses:
-                sequences = [
-                    types.SampledSequenceModel(
-                        stop_reason=seq.stop_reason,
-                        tokens=list(seq.tokens),
-                        logprobs=list(seq.logprobs) if seq.logprobs is not None else None,
-                        decoded=seq.decoded,
-                        new_input_feature=_serialize_input_feature(seq.new_input_feature)
-                        if seq.new_input_feature is not None else None,
-                    ) for seq in response.sequences
-                ]
-                sample_models.append(
-                    types.SampleResponseModel(
-                        sequences=sequences,
-                        prompt_logprobs=response.prompt_logprobs,
-                        topk_prompt_logprobs=response.topk_prompt_logprobs,
-                    ))
-            return types.SampleResponseModelList(samples=sample_models)
+            return types.SampleResponseModelList(samples=_to_sample_response_models(responses))
 
         # Calculate metrics for queue scheduling
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -165,14 +309,147 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 task_type='sample',
             ))
 
+    @app.post('/twinkle/sample_to_data_plane', response_model=types.DataRef)
+    async def sample_to_data_plane(
+            request: Request,
+            body: types.DataPlaneSampleRequest,
+            self: SamplerManagement = Depends(self_fn),
+    ) -> types.DataRef:
+        """Generate a complete group, store it server-side, and return its DataRef."""
+        token = await self._on_request_start(request)
+        if not self.data_plane.enabled:
+            raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
+        if not callable(getattr(self.sampler, 'submit_generation', None)):
+            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async or sglang_async')
+
+        adapter_path = None
+        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
+        if body.adapter_uri:
+            from twinkle.server.checkpoint import create_checkpoint_manager
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+
+        inputs = (await self.data_plane.get(body.input_ref) if body.input_ref is not None else body.inputs)
+        inputs = _coerce_inputs(inputs)
+
+        params_dict = dict(body.sampling_params or {})
+        params_dict['num_samples'] = body.num_samples
+        params = SamplingParams.from_dict(params_dict)
+        submission_id = uuid.uuid4().hex
+
+        async def _admit():
+            await asyncio.to_thread(
+                self.sampler.submit_generation,
+                submission_id,
+                inputs,
+                params,
+                adapter_name=full_adapter_name,
+                adapter_path=adapter_path,
+            )
+            return submission_id
+
+        inline_inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = (
+            body.input_ref.num_tokens if body.input_ref is not None else sum(
+                len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict)))
+        await run_task(
+            self.schedule_task_and_wait(
+                _admit,
+                model_id=full_adapter_name or None,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='sample_admission',
+            ))
+
+        responses = await _await_generation(self.sampler, submission_id)
+        rows, tags = _build_rollout_rows_and_tags(
+            _to_sample_response_models(responses),
+            group_ids=body.group_ids,
+            policy_version=body.policy_version,
+            adapter_uri=body.adapter_uri,
+        )
+        return await self.data_plane.put(
+            [json_safe(item) for item in rows],
+            kind='rollout',
+            tags=tags,
+        )
+
+    @app.post('/twinkle/encode')
+    async def encode(
+            request: Request,
+            self: SamplerManagement = Depends(self_fn),
+    ):
+        """Run a pooling forward (embedding / classify) and return the pooled output per input.
+
+        The pooling counterpart of ``/twinkle/sample``: it accepts the same Trajectory / InputFeature
+        ``inputs`` plus a ``pooling_params`` block, calls ``sampler.encode``, and returns one flat float
+        list per input under ``data``. Only a sampler built with a pooling head (vLLM ``runner='pooling'``
+        / SGLang ``is_embedding``) can serve it; a generation-only sampler raises, which ``run_task``
+        surfaces as a 500 rather than returning hidden states that would look like embeddings.
+        """
+        token = await self._on_request_start(request)
+        body = await request.json()
+
+        async def _task():
+            inputs = _coerce_inputs(body.get('inputs'))
+            pooling_params = (PoolingParams.from_dict(body['pooling_params'])
+                              if body.get('pooling_params') else None)
+            adapter_name = _get_twinkle_sampler_adapter_name(request, body.get('adapter_name')) or ''
+            responses = self.sampler.encode(inputs, pooling_params, adapter_name=adapter_name)
+            return {'data': [list(response.data) for response in responses]}
+
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                token=token,
+                input_tokens=0,
+                task_type='encode',
+            ))
+
+    @app.post('/twinkle/unload_adapter_paths')
+    async def unload_adapter_paths(
+            request: Request,
+            body: types.UnloadAdapterPathsRequest,
+            self: SamplerManagement = Depends(self_fn),
+    ) -> dict[str, str]:
+        """Best-effort eviction of published LoRA snapshots from sampler caches."""
+        token = await self._on_request_start(request)
+        resolved_paths = []
+        for adapter_path in body.adapter_paths:
+            if adapter_path.startswith('twinkle://'):
+                from twinkle.server.checkpoint import create_checkpoint_manager
+                checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+                _, adapter_path = checkpoint_manager.parse_adapter_uri(adapter_path)
+            resolved_paths.append(adapter_path)
+        unload = getattr(self.sampler, 'unload_adapter_paths', None)
+        if unload is not None:
+            unload(resolved_paths)
+        return {'status': 'ok'}
+
     @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
     async def set_template(
             request: Request,
             body: types.SetTemplateRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> types.SetTemplateResponse:
-        """Set the chat template for encoding Trajectory inputs."""
+        """Set the chat template for encoding Trajectory inputs.
+
+        A deployment that pinned its template at construction (``SamplerArgs.template``) ignores this
+        call: the pinned template was chosen deliberately and the gateway's name-based fallback must
+        not clobber it. The response is still success, so a caller that sets templates lazily is
+        unaffected either way.
+        """
+        if getattr(self, '_template_pinned', False):
+            logger.debug('set_template ignored: this sampler was configured with a pinned template.')
+            return types.SetTemplateResponse()
         extra_kwargs = body.model_extra or {}
+        # Multi-tenant safety: this sampler replica is shared, and set_template mutates a single
+        # self.template (it is not keyed per adapter), so one client's call would otherwise change the
+        # encoding every other client sees. The guard above is what makes this safe: a deployment pins
+        # its template at construction (SamplerArgs.template -> _template_pinned), so this mutable path is
+        # only reachable for a deployment that deliberately did NOT pin one. The supported model is one
+        # fixed template per sampler, set once at construction; a per-adapter/per-LoRA template would need
+        # set_template to key by adapter, which is future work.
         with traced_operation('sampler.set_template'):
             self.sampler.set_template(body.template_cls, **extra_kwargs)
         return types.SetTemplateResponse()
@@ -227,10 +504,16 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
         if body.adapter_uri:
+            import os
+
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+            _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
             self.sampler.reset_prefix_cache()
+            if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
+                adapter_path = resolved_uri
+            elif resolved_uri:
+                self.sampler.load_full_weights_from_path(resolved_uri)
 
         inputs = body.inputs
         if isinstance(inputs, list):

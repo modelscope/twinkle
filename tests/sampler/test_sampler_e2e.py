@@ -30,8 +30,10 @@ os.environ.setdefault('TRUST_REMOTE_CODE', '1')
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen2.5-0.5B')
 MAX_MODEL_LEN = int(os.environ.get('TWINKLE_MAX_MODEL_LEN', '512'))
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy vLLM/Transformers e2e sampler test (model download + GPU); not viable on dual-V100 CI, run manually.')
+# Heavy: real model load + GPU generation. Gated by the project's own tiering (see tests/conftest.py)
+# rather than an unconditional skip, so a capable box actually runs it while ``pytest -m 'not slow'``
+# (CI) and CPU-only boxes (accel) deselect/skip it. A hard skip here would mean the e2e never runs anywhere.
+pytestmark = [pytest.mark.slow, pytest.mark.accel(1)]
 
 
 def _skip_slow_if_requested():
@@ -40,13 +42,34 @@ def _skip_slow_if_requested():
         pytest.skip('TWINKLE_SKIP_SLOW_TESTS=1')
 
 
+def _model_is_cached() -> bool:
+    """True when MODEL_ID already sits in a local hub cache, so loading needs no network.
+
+    This project resolves weights from ModelScope by default (``VLLM_USE_MODELSCOPE``); dev/CI boxes are
+    commonly offline with a warm cache. ModelScope lays models out as ``<cache>/models/<org>--<name>``.
+    """
+    ms_cache = os.environ.get('MODELSCOPE_CACHE')
+    if ms_cache and os.path.isdir(os.path.join(ms_cache, 'models', MODEL_ID.replace('/', '--'))):
+        return True
+    hf_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+    return os.path.isdir(os.path.join(hf_home, 'hub', f'models-{MODEL_ID.replace("/", "-")}'))
+
+
 def _skip_if_no_network(timeout: int = 5):
-    """Skip if HuggingFace is unreachable (avoids long hangs on model load)."""
+    """Skip only when the model must be downloaded but the hub is unreachable (avoids long hangs).
+
+    A warm cache resolves offline regardless of network state, so it is checked first; probing
+    huggingface.co unconditionally would wrongly skip an offline box that already has the model.
+    """
+    if _model_is_cached():
+        return
+    host = 'https://www.modelscope.cn' if os.environ.get('VLLM_USE_MODELSCOPE', '').lower() == 'true' \
+        else 'https://huggingface.co'
     try:
         import urllib.request
-        urllib.request.urlopen('https://huggingface.co', timeout=timeout)
+        urllib.request.urlopen(host, timeout=timeout)
     except Exception as e:
-        pytest.skip(f'HuggingFace unreachable (timeout={timeout}s): {e}')
+        pytest.skip(f'{host} unreachable and {MODEL_ID} not cached (timeout={timeout}s): {e}')
 
 
 @pytest.mark.skipif(not __import__('torch').cuda.is_available(), reason='Requires CUDA')
@@ -79,7 +102,7 @@ def test_vllm_engine_with_input_ids():
         print(f'  Input IDs: {input_ids}')
 
         response = await engine.sample(
-            prompt_token_ids=input_ids,
+            prompt=input_ids,
             sampling_params=SamplingParams(max_tokens=32, temperature=0.7),
         )
         return response, tokenizer
@@ -209,7 +232,7 @@ def test_vllm_engine_batch():
         # Sample all in parallel
         tasks = [
             engine.sample(
-                prompt_token_ids=tokenizer.encode(p, add_special_tokens=True),
+                prompt=tokenizer.encode(p, add_special_tokens=True),
                 sampling_params=sampling_params,
             ) for p in prompts
         ]

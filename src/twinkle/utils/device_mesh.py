@@ -7,6 +7,24 @@ from typing import Dict, List, Optional, Union
 
 from .platforms import Platform
 
+# Parallel-spec string vocabulary for DeviceMesh.parse_spec / from_spec: each size key maps to a
+# from_sizes keyword, and 'sp' is the Megatron sequence-parallel boolean flag (a bare key, no size).
+# Separators between tokens are ignored, so 'dp2tp2' and 'dp2_tp2' parse identically.
+_SPEC_SIZE_KEYS = {
+    'dp': 'dp_size',
+    'fsdp': 'fsdp_size',
+    'tp': 'tp_size',
+    'pp': 'pp_size',
+    'cp': 'cp_size',
+    'ep': 'ep_size',
+    'etp': 'etp_size',
+    'epfsdp': 'ep_fsdp_size',
+    'vpp': 'vpp_size',
+    'ul': 'ulysses_size',
+}
+_SPEC_FLAG_KEYS = {'sp': 'sequence_parallel'}
+_SPEC_SEPARATORS = '_-,. \t'
+
 
 @dataclass
 class DeviceMesh:
@@ -119,6 +137,80 @@ class DeviceMesh:
             ulysses_size=ulysses_size,
             sequence_parallel=sequence_parallel,
         )
+
+    @staticmethod
+    def parse_spec(spec: str) -> Dict[str, object]:
+        """Parse a parallel-layout string into ``from_sizes`` keyword arguments.
+
+        The grammar is a concatenation of ``key`` + ``size`` tokens, e.g. ``dp4tp2pp2`` or
+        ``dp2_cp2_tp2`` (the separators ``_ - , .`` and whitespace are ignored). Every size key takes a
+        positive integer; ``sp`` is a bare boolean flag (Megatron sequence parallelism) and rejects a
+        size. Parsing is strict -- an unknown key, a repeated key, a missing or non-positive size, or a
+        size attached to ``sp`` raises ``ValueError`` instead of being silently dropped.
+
+        The returned dict never contains ``world_size``: the caller either passes it explicitly to
+        :meth:`from_spec` or lets :meth:`from_sizes` infer it from the mesh dimensions. So
+        ``from_sizes(**DeviceMesh.parse_spec(s))`` is exactly equivalent to spelling the sizes out.
+        """
+        import re
+        if not isinstance(spec, str) or not spec.strip():
+            raise ValueError('parallel spec must be a non-empty string.')
+        text = spec.strip().lower()
+        token_re = re.compile(r'([a-z]+)(\d*)')
+        kwargs: Dict[str, object] = {}
+        pos, length = 0, len(text)
+        while pos < length:
+            char = text[pos]
+            if char in _SPEC_SEPARATORS:
+                pos += 1
+                continue
+            match = token_re.match(text, pos)
+            if match is None or not match.group(1):
+                raise ValueError(f'invalid parallel spec {spec!r}: unexpected character {char!r} at offset {pos}.')
+            key, digits = match.group(1), match.group(2)
+            pos = match.end()
+            if key in _SPEC_FLAG_KEYS:
+                if digits:
+                    raise ValueError(f'invalid parallel spec {spec!r}: {key!r} is a boolean flag and takes no '
+                                     f'size (got {digits!r}).')
+                kwarg = _SPEC_FLAG_KEYS[key]
+                if kwarg in kwargs:
+                    raise ValueError(f'invalid parallel spec {spec!r}: duplicate key {key!r}.')
+                kwargs[kwarg] = True
+            elif key in _SPEC_SIZE_KEYS:
+                if not digits:
+                    raise ValueError(f'invalid parallel spec {spec!r}: size key {key!r} requires a positive '
+                                     'integer (e.g. "tp2").')
+                size = int(digits)
+                if size <= 0:
+                    raise ValueError(f'invalid parallel spec {spec!r}: size key {key!r} must be >= 1 (got {size}).')
+                kwarg = _SPEC_SIZE_KEYS[key]
+                if kwarg in kwargs:
+                    raise ValueError(f'invalid parallel spec {spec!r}: duplicate key {key!r}.')
+                kwargs[kwarg] = size
+            else:
+                raise ValueError(f'invalid parallel spec {spec!r}: unknown key {key!r}. Valid size keys are '
+                                 f'{sorted(_SPEC_SIZE_KEYS)} plus the boolean flag {sorted(_SPEC_FLAG_KEYS)}.')
+        if not kwargs:
+            raise ValueError(f'invalid parallel spec {spec!r}: no parallel dimensions found.')
+        return kwargs
+
+    @staticmethod
+    def from_spec(spec: str, *, world_size: Optional[int] = None,
+                  device_type: Optional[str] = None) -> 'DeviceMesh':
+        """Build a DeviceMesh from a parallel-layout string -- sugar over :meth:`from_sizes`.
+
+        ``DeviceMesh.from_spec('dp2tp2pp2')`` equals ``DeviceMesh.from_sizes(dp_size=2, tp_size=2,
+        pp_size=2)``. When ``world_size`` is omitted it is inferred from the mesh dimensions exactly as
+        :meth:`from_sizes` does (the product of the real mesh dims; ulysses/ep/etp/vpp are attributes
+        rather than rank dims, so they do not multiply into it). See :meth:`parse_spec` for the grammar.
+        """
+        kwargs = DeviceMesh.parse_spec(spec)
+        if world_size is not None:
+            kwargs['world_size'] = world_size
+        if device_type is not None:
+            kwargs['device_type'] = device_type
+        return DeviceMesh.from_sizes(**kwargs)
 
     def __post_init__(self):
         if self.device_type is None:

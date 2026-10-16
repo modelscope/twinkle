@@ -7,6 +7,7 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
+import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
@@ -37,6 +38,26 @@ def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
     return vLLMSampler(**kw)
 
 
+def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
+    """Construct the vLLM backend with non-blocking generation admission."""
+    from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
+
+    return VLLMSamplerTQ(**kw, context_manager=None)
+
+
+def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
+    from twinkle.sampler import SGLangSampler
+
+    return SGLangSampler(**kw)
+
+
+def _make_sglang_async_sampler(kw: dict[str, Any]) -> Any:
+    """Construct the sglang backend with non-blocking generation admission (for the data plane)."""
+    from twinkle_agentic.async_rl.sglang_sampler_tq import SGLangSamplerTQ
+
+    return SGLangSamplerTQ(**kw)
+
+
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
     from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
 
@@ -49,9 +70,22 @@ SAMPLER_SELECTOR = BackendSelector(
     {
         'mock': _make_mock_sampler,
         'vllm': _make_vllm_sampler,
+        'vllm_async': _make_vllm_async_sampler,
+        'sglang': _make_sglang_sampler,
+        'sglang_async': _make_sglang_async_sampler,
         'torch': _make_torch_sampler,
     },
 )
+
+
+def _construct_sampler_backend(
+    sampler_type: str,
+    sampler_kwargs: dict[str, Any],
+    data_plane_url: str | None,
+) -> Any:
+    # Backend selection is explicit. DataPlane config controls where results
+    # are stored, not which sampler implementation is instantiated.
+    return SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
 
 
 class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
@@ -72,6 +106,8 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                  sampler_type: str,
                  engine_args: dict[str, Any] | None = None,
                  queue_config: TaskQueueConfig | None = None,
+                 data_plane_url: str | None = None,
+                 template: dict[str, Any] | None = None,
                  **kwargs):
         self.device_group = DeviceGroup(**device_group)
         self.device_mesh = init_twinkle_runtime(
@@ -101,12 +137,32 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             )
         else:
             sampler_kwargs.update(kwargs)
-        self.sampler = SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
+        self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
+
+        # Pin the chat template at construction when the deployment configured one, so the replica
+        # serves Trajectory inputs from its first request without waiting for the gateway's lazy
+        # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
+        # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
+        self._template_pinned = False
+        if template and hasattr(self.sampler, 'set_template'):
+            template_kwargs = dict(template)
+            template_cls = template_kwargs.pop('template_cls', None)
+            if template_cls is not None:
+                self.sampler.set_template(template_cls, **template_kwargs)
+                self._template_pinned = True
 
         self.state: ServerState = get_server_state()
+        from twinkle.server.data_plane import DataPlaneProxy
+        self.data_plane = DataPlaneProxy(data_plane_url)
 
         # Initialize task queue mixin
         self._init_task_queue(queue_config, deployment_name='Sampler')
+
+    async def shutdown(self) -> None:
+        cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+        if callable(cancel_all):
+            await asyncio.to_thread(cancel_all)
+        await self.data_plane.close()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -131,6 +187,8 @@ def build_sampler_app(model_id: str,
                       sampler_type: str,
                       engine_args: dict[str, Any] | None = None,
                       queue_config: TaskQueueConfig | None = None,
+                      data_plane_url: str | None = None,
+                      template: dict[str, Any] | None = None,
                       **kwargs):
     """Build a unified sampler application for text generation inference.
 
@@ -143,11 +201,16 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``torch``.
-            Validated up front; bad values raise :class:`ConfigError` before
-            any side effect.
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``sglang`` |
+            ``sglang_async`` | ``torch``. Validated up front; bad values raise :class:`ConfigError`
+            before any side effect. The ``*_async`` variants add the non-blocking ``submit_generation``
+            that ``sample_to_data_plane`` requires; the plain ``vllm`` / ``sglang`` variants serve
+            Trajectory / InputFeature sampling but cannot back the data plane.
         engine_args: Additional engine arguments for the sampler
         queue_config: Validated :class:`TaskQueueConfig` (rps_limit, tps_limit, etc.)
+        template: a serializable chat-template spec (``{'template_cls': <name>, **kwargs}``) pinned on
+            the sampler at construction. Forwarded to ``SamplerManagement`` below so the replica encodes
+            Trajectory inputs from its first request and so ``/twinkle/set_template`` cannot clobber it.
         **kwargs: Additional arguments passed to the sampler
 
     Returns:
@@ -172,6 +235,7 @@ def build_sampler_app(model_id: str,
             'version': '1.0.0',
         },
         attach_replica_id_header=True,
+        on_shutdown=lambda servable: servable.shutdown(),
     )
 
     return bind_deployment(
@@ -179,8 +243,11 @@ def build_sampler_app(model_id: str,
         SamplerManagement,
         deploy_options,
         deployment_name='SamplerManagement',
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config),
-        bind_kwargs=kwargs,
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config,
+                   data_plane_url),
+        # ``template`` is an explicit named parameter, so it is not in ``kwargs``; forward it explicitly
+        # or the pinned-template branch in ``SamplerManagement.__init__`` never runs.
+        bind_kwargs={**kwargs, 'template': template},
     )
 
 

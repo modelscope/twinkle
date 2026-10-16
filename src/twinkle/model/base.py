@@ -3,9 +3,9 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
-from twinkle import Platform, torch_util
+from twinkle import Platform, remote_function, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     import torch
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
+    from transformers import PreTrainedModel, PretrainedConfig
 
 
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
@@ -50,7 +51,95 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
         shutil.rmtree(checkpoint_path)
 
 
-class TwinkleModel(ABC):
+def _freeze_then_activate(named_params,
+                          *,
+                          freeze_ratio: float = 0.0,
+                          freeze_names=(),
+                          freeze_regex: Optional[str] = None,
+                          trainable_names=(),
+                          trainable_regex: Optional[str] = None) -> None:
+    """Mutate ``requires_grad`` on a list of ``(name, param)`` pairs: freeze_* then trainable_*.
+
+    The pure core of :meth:`TrainableModel.freeze_parameters`, split out so the ordering / matching
+    rules live in one testable place independent of how a backend gathers its parameters. Mirrors
+    legacy swift's ``freeze_parameters`` + ``activate_parameters`` (cumulative-element-count ratio via
+    bisect, name-prefix ``startswith``, regex ``search``), except an invalid regex raises here rather
+    than being warned-and-skipped -- a bad pattern should fail the run, not silently freeze nothing.
+    """
+    from bisect import bisect_right
+
+    if freeze_ratio > 0:
+        cumulative = []
+        running = 0
+        for _, param in named_params:
+            running += param.numel()
+            cumulative.append(running)
+        n_freeze = int(running * freeze_ratio)
+        idx = bisect_right(cumulative, n_freeze)
+        for _, param in named_params[:idx]:
+            param.requires_grad = False
+
+    if freeze_names:
+        for name, param in named_params:
+            if any(name.startswith(prefix) for prefix in freeze_names):
+                param.requires_grad = False
+
+    if freeze_regex is not None:
+        pattern = re.compile(freeze_regex)
+        for name, param in named_params:
+            if pattern.search(name):
+                param.requires_grad = False
+
+    if trainable_names:
+        for name, param in named_params:
+            if any(name.startswith(prefix) for prefix in trainable_names):
+                param.requires_grad = True
+
+    if trainable_regex is not None:
+        pattern = re.compile(trainable_regex)
+        for name, param in named_params:
+            if pattern.search(name):
+                param.requires_grad = True
+
+
+class ModelLoaderProtocol(Protocol):
+    """The construction hooks twinkle's model backends call on a caller-supplied ``model_loader``.
+
+    A backend hands checkpoint construction back to the caller by accepting a ``model_loader``. The
+    transformers backend calls all six hooks (build config -> processor -> model, each paired with a
+    ``process_*`` post-hook); the megatron backend calls only ``build_config`` / ``process_config``
+    (mcore builds the module itself and the bridge loads the weights). This Protocol names exactly that
+    consumer-defined surface -- and nothing more -- so the seam is type-checked instead of duck-typed
+    ``Any``, and a misspelled hook is caught statically rather than at load time.
+
+    It is a structural contract, deliberately NOT a base class: twinkle never imports the concrete
+    loader and never ``isinstance``-checks it, so the dependency stays one-directional (caller ->
+    twinkle). swift/dev's ``ModelLoader`` -- the family-registry base, which additionally carries
+    ``model_arch`` / ``model_info`` / registration metadata that twinkle does not consume -- satisfies
+    this Protocol structurally without inheriting it.
+    """
+
+    def build_config(self, model_dir: str, **kwargs) -> 'PretrainedConfig':
+        ...
+
+    def process_config(self, config: 'PretrainedConfig') -> 'PretrainedConfig':
+        ...
+
+    def build_processor(self, model_dir: str, config: 'PretrainedConfig', **kwargs) -> Any:
+        ...
+
+    def process_tokenizer(self, tokenizer: Any) -> Any:
+        ...
+
+    def build_model(self, model_dir: str, config: 'PretrainedConfig', processor: Any,
+                    **kwargs) -> 'PreTrainedModel':
+        ...
+
+    def process_model(self, model: 'PreTrainedModel') -> 'PreTrainedModel':
+        ...
+
+
+class TrainableModel(ABC):
 
     _checkpoint_engine = None
 
@@ -140,6 +229,10 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
+    def empty_cache(self, **kwargs) -> None:
+        ...
+
+    @abstractmethod
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
         ...
 
@@ -173,6 +266,154 @@ class TwinkleModel(ABC):
                 repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
         else:
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def offload_to_cpu(self) -> None:
+        """Hand this rank's training memory back so a colocated process can use the device.
+
+        Colocation -- an online-RL rollout engine, or an in-training generative-eval sampler, sharing
+        the trainer's GPU -- cannot fit both at once, so the trainer steps aside between steps and
+        :meth:`reload_to_gpu` brings it back. The device work is the strategy's: only it knows where
+        this backend keeps the parameters (Megatron pools them into flat per-bucket buffers; the
+        transformers backends hold them on the wrapped module), and an offload that moved the wrong
+        object would report success while freeing nothing. The optimizer state travels with them -- it
+        dwarfs the weight bytes, so offloading the weights alone would reclaim almost nothing.
+
+        This is the driver-facing handle over ``strategy.offload_to_cpu(model, optimizer)``; both
+        concrete models carry the ``strategy`` / ``model`` / ``optimizer_group`` / ``_get_default_group``
+        shape it reads. A strategy with no offload of its own (deepspeed, native FSDP -- whose sharded
+        parameters need backend-specific handling, not a plain move) leaves nothing to delegate to.
+
+        ``@remote_function`` is what makes the handle reach the workers: under Ray the model on the
+        driver is a proxy with no ``strategy`` of its own, so an undecorated method would run against
+        that empty stub. ``dispatch='all'`` runs it on every rank (each offloads its own shard) and
+        ``lazy_collect=False`` blocks until they finish -- the colocated sampler is a SEPARATE actor,
+        so Ray's per-actor ordering cannot guarantee the GPU is actually free before the caller wakes
+        the engine and lets it allocate its KV cache.
+        """
+        self.strategy.offload_to_cpu(self.model, self._colocation_optimizer())
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def reload_to_gpu(self) -> None:
+        """Bring back what :meth:`offload_to_cpu` released, to the device it was moved off.
+
+        Decorated for the same reason as :meth:`offload_to_cpu`, and blocking so the trainer's next
+        step cannot start on weights the workers have not finished moving back.
+        """
+        self.strategy.reload_to_gpu(self.model, self._colocation_optimizer())
+
+    def _colocation_optimizer(self) -> Optional['Optimizer']:
+        """The default group's optimizer, or None before one exists.
+
+        Resolved through the group on every call rather than cached: a model offloaded before its
+        optimizer is built -- a frozen reference model, or the rollout phase of a colocated step --
+        offloads its weights alone and returns None here instead of raising on a missing optimizer.
+        """
+        group = self.optimizer_group.get(self._get_default_group())
+        return group.optimizer if group is not None else None
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def freeze_parameters(self,
+                          *,
+                          freeze_ratio: float = 0.0,
+                          freeze_names=(),
+                          freeze_regex: Optional[str] = None,
+                          trainable_names=(),
+                          trainable_regex: Optional[str] = None) -> None:
+        """Set ``requires_grad`` on this rank's parameters for full-parameter freeze / activate.
+
+        This is the driver-facing handle for a full-parameter run's ``freeze_parameters`` /
+        ``trainable_parameters`` knobs. It runs on every rank (``dispatch='all'``) because under Ray
+        the model on the driver is a proxy with no parameters of its own, and it blocks
+        (``lazy_collect=False``) so the caller's next step -- building the optimizer, which reads
+        ``requires_grad`` to choose its param groups -- cannot run before the freeze has landed on the
+        workers. It must therefore be called BEFORE the optimizer is constructed.
+
+        The order is legacy's and is load-bearing: freeze first (by ratio, then name-prefix, then
+        regex), then activate (name-prefix, then regex), so ``trainable_*`` WINS over ``freeze_*``.
+
+        One deliberate divergence from legacy's full branch: it calls ``requires_grad_(True)`` on the
+        whole model first, which would undo a loader's intentional freeze (e.g. the Qwen3-TTS
+        ``speaker_encoder``). This does not reset -- a freshly built model is already all-trainable
+        except what its loader froze, so the common case is identical while loader-level freezes
+        survive.
+
+        ``freeze_ratio`` counts by cumulative element count in ``named_parameters()`` order and is
+        only meaningful when every rank holds the same slice of the model; a pipeline-parallel run
+        (each rank holding different layers) must reject it at the config layer, not here.
+        """
+        model = self.strategy.unwrap_model(self.model)
+        modules = model if isinstance(model, (list, tuple)) else [model]
+        named = []
+        for module in modules:
+            named.extend(module.named_parameters())
+        _freeze_then_activate(
+            named,
+            freeze_ratio=freeze_ratio,
+            freeze_names=freeze_names,
+            freeze_regex=freeze_regex,
+            trainable_names=trainable_names,
+            trainable_regex=trainable_regex)
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def attach_profiler(self, *, spec: Optional[Dict[str, Any]] = None) -> None:
+        """Attach a forward-hook profiler to this rank's real model.
+
+        ``@remote_function`` is what makes the handle reach the workers: under Ray
+        the model on the driver is a proxy with no ``self.model`` of its own, so an
+        undecorated method would hook nothing. ``dispatch='all'`` runs it on every
+        rank (each profiles its own shard) and ``lazy_collect=False`` blocks until
+        the hooks are registered, so training cannot start before profiling is live.
+
+        ``self.model`` is unwrapped through the strategy (as :meth:`freeze_parameters`
+        does) and may be a list of chunks on Megatron; ``ModuleProfiler.attach``
+        accepts both a single module and a list.
+
+        ``spec`` must be serializable (no lambdas / live objects) because it crosses
+        the process boundary: ``select`` and the profiler class travel as strings and
+        are resolved worker-side by :func:`twinkle.perf.build_module_profiler`.
+        """
+        from twinkle.perf import build_module_profiler
+        model = self.strategy.unwrap_model(self.model)
+        self._profiler = build_module_profiler(spec).attach(model)
+
+    @remote_function(dispatch='all', collect='none')
+    def advance_profiler_step(self) -> None:
+        """Advance the profiler's step counter on every rank (once per training step).
+
+        Left non-blocking (no ``lazy_collect=False``): it runs on the SAME actor as
+        the next ``forward_backward``, and Ray's per-actor FIFO ordering guarantees
+        the increment lands before that forward reads the step, so no cross-actor
+        sync -- and no per-step ``ray.get`` -- is needed. No-op when no profiler is
+        attached, so calling it unconditionally is safe.
+        """
+        profiler = getattr(self, '_profiler', None)
+        if profiler is not None:
+            profiler.advance_step()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def collect_perf_summary(self) -> Dict[str, float]:
+        """Return each rank's profiler summary to the driver.
+
+        ``collect='none'`` (NOT ``'flatten'``) is deliberate: ``flatten`` concatenates
+        per-rank LISTS by iterating each result, so on a dict it would iterate the
+        keys and fail to rebuild -- it cannot carry dict results. ``none`` returns the
+        per-rank dicts as a list, or a single unwrapped dict when there is one rank,
+        which the caller tags by rank and merges. ``lazy_collect=False`` materializes
+        it (blocking) so the caller can fold it into step metrics immediately. Each
+        rank returns an empty dict when no profiler is attached, so calling this
+        unconditionally is safe.
+        """
+        profiler = getattr(self, '_profiler', None)
+        return profiler.flat_summary() if profiler is not None else {}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def detach_profiler(self) -> None:
+        """Remove all profiler hooks on every rank; blocking so hooks are gone on return."""
+        profiler = getattr(self, '_profiler', None)
+        if profiler is not None:
+            profiler.detach()
+            self._profiler = None
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         return backend in ('nccl', 'hccl')

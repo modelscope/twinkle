@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import os
 import threading
+import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -11,10 +12,13 @@ import numpy as np
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                 SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.generation_submission import GenerationSubmissionMixin
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -38,7 +42,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -86,6 +90,14 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
         self._async_thread.start()
+
+        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
+        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
+        self._generation_submissions: Dict[str, Any] = {}
+
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
+        # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
+        self._inflight_request_ids: set = set()
 
         from .sglang_engine import SGLangEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -179,14 +191,28 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         image_data: Optional[List[Any]] = None,
         lora_name: Optional[str] = None,
         logprobs_only: bool = False,
+        request_id: Optional[str] = None,
     ) -> SampleResponse:
-        """Sample a single input asynchronously."""
-        response = await self.engine.sample(
-            prompt=feat['input_ids'],
-            sampling_params=sampling_params,
-            image_data=image_data,
-            lora_name=lora_name,
-        )
+        """Sample a single input asynchronously.
+
+        ``request_id`` is this generation's engine handle (sglang's ``rid``): auto-generated when not given,
+        and registered as in-flight for the duration of the call so :meth:`abort_all_inflight`
+        (PartialRolloutMixin) can interrupt it and let a partial rollout resume from the tokens it produced
+        before the abort. Mirrors ``vLLMSampler._sample_single`` so the resume loop is backend-agnostic.
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        self._register_inflight(request_id)
+        try:
+            response = await self.engine.sample(
+                prompt=feat['input_ids'],
+                sampling_params=sampling_params,
+                image_data=image_data,
+                lora_name=lora_name,
+                request_id=request_id,
+            )
+        finally:
+            self._unregister_inflight(request_id)
 
         if 'input_ids' not in feat:
             feat['input_ids'] = response.prompt_token_ids
@@ -215,7 +241,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -224,6 +250,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         adapter_path: Optional[str] = None,
         *,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -252,12 +279,50 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             (dispatch='slice_dp'), so each worker receives its own shard of ``inputs``.
             ``adapter_paths`` is a list too and is sliced in lockstep, staying aligned with ``inputs``.
         """
+        # One sampling path: the blocking sample is the async core driven to completion on the loop. The
+        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
+        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        return self._run_in_loop(
+            self._generate_inputs(
+                inputs,
+                sampling_params,
+                adapter_name,
+                adapter_path,
+                adapter_paths=adapter_paths,
+                allow_partial_rollout=allow_partial_rollout))
+
+    async def _generate_inputs(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
+    ) -> List[SampleResponse]:
+        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+
+        Mirrors :meth:`vLLMSampler._generate_inputs`. Adapters are registered with the async
+        ``_aregister_lora`` rather than the blocking ``_register_lora`` because this already runs inside
+        the event loop -- ``_register_lora`` would call ``_run_in_loop`` and deadlock on itself.
+        ``use_base_model`` drops the adapter so the base weights are sampled.
+
+        With ``allow_partial_rollout`` each input is driven through
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
+        a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
+        of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
+        """
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         inputs_list = self._normalize_inputs(inputs)
+        if not inputs_list:
+            return []
+
         if adapter_paths is not None:
             if adapter_path is not None:
                 raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
@@ -286,28 +351,149 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         else:
             encoded_inputs = inputs_list
 
+        if use_base_model:
+            lora_names = [None] * len(encoded_inputs)
+        elif adapter_paths is not None:
+            lora_names = [await self._aregister_lora(path) for path in adapter_paths]
+        else:
+            registered = await self._aregister_lora(adapter_path, adapter_name)
+            lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
+
+        async def _generate_one(feat, image_data, lora_name):
+            if not allow_partial_rollout:
+                return await self._sample_single(
+                    feat,
+                    sampling_params,
+                    image_data=image_data,
+                    lora_name=lora_name,
+                    logprobs_only=logprobs_only,
+                )
+
+            # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
+            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
+            # path carries no per-attempt control-plane state, so run_attempt returns None for it.
+            async def run_attempt(current_input, attempt_params, attempt):
+                response = await self._sample_single(
+                    current_input,
+                    attempt_params,
+                    image_data=image_data,
+                    lora_name=lora_name,
+                    logprobs_only=logprobs_only,
+                )
+                return response, None
+
+            outcome = await self._run_partial_rollout(
+                feat,
+                sampling_params,
+                run_attempt=run_attempt,
+                allow_partial_rollout=True,
+                max_retries=self.rollout_max_retries,
+                retry_delay_s=self.rollout_retry_delay_s,
+            )
+            return outcome.response
+
+        return await asyncio.gather(*(
+            _generate_one(feat, image_data, lora_name)
+            for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)))
+
+    async def _encode_single(
+        self,
+        feat: Dict[str, Any],
+        pooling_params: PoolingParams,
+        *,
+        image_data: Optional[List[Any]] = None,
+        lora_name: Optional[str] = None,
+    ) -> PoolingResponse:
+        """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
+        return await self.engine.encode(
+            prompt=feat['input_ids'],
+            pooling_params=pooling_params,
+            image_data=image_data,
+            lora_name=lora_name,
+        )
+
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    def encode(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[PoolingResponse]:
+        """Run a pooling forward (embedding / classify) for each input.
+
+        The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
+        registration and image extraction. The engine must have been started with ``is_embedding=True``
+        in ``engine_args`` for these models; that flag is what routes the model to sglang's pooling
+        forward. Without it sglang has no pooling head to run and :meth:`SGLangEngine.encode` raises.
+
+        Args:
+            inputs: Either InputFeature(s) or Trajectory(s). Trajectories are encoded with
+                ``add_generation_prompt=False`` -- a pooling forward scores the whole sequence, so it
+                must not end on a generation prompt.
+            pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
+            adapter_name: LoRA adapter name to encode with; must already be registered.
+            adapter_path: Optional LoRA adapter path, registered under ``adapter_name`` before encoding.
+            adapter_paths: Per-input LoRA paths, one entry per input, sliced in lockstep with ``inputs``.
+
+        Returns:
+            One PoolingResponse per input, in input order.
+        """
+        if pooling_params is None:
+            pooling_params = PoolingParams()
+        elif isinstance(pooling_params, dict):
+            pooling_params = PoolingParams.from_dict(pooling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        if adapter_paths is not None:
+            if adapter_path is not None:
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
+            if len(adapter_paths) != len(inputs_list):
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
+
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
+
+        if is_trajectory:
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
+            encoded_inputs = [
+                self.encode_trajectory_for_sglang(traj, adapter_name, add_generation_prompt=False)
+                for traj in inputs_list
+            ]
+        else:
+            encoded_inputs = inputs_list
+
         if adapter_paths is not None:
             lora_names = [self._register_lora(path) for path in adapter_paths]
         else:
             registered = self._register_lora(adapter_path, adapter_name)
             lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
 
-        async def _sample_all():
+        async def _encode_all():
             tasks = [
-                self._sample_single(
+                self._encode_single(
                     feat,
-                    sampling_params,
+                    pooling_params,
                     image_data=image_data,
                     lora_name=lora_name,
-                    logprobs_only=logprobs_only,
                 ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)
             ]
             return await asyncio.gather(*tasks)
 
-        return self._run_in_loop(_sample_all())
+        return self._run_in_loop(_encode_all())
 
-    def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
-        """Register an adapter with sglang and return the name to send as ``lora_path``.
+    async def _aregister_lora(self, adapter_path: Optional[str],
+                              adapter_name: Optional[str] = None) -> Optional[str]:
+        """Async :meth:`_register_lora`: register an adapter on the event loop, return its ``lora_path``.
+
+        Split out so the async generation core (``_generate_inputs``) can ``await`` it directly; calling
+        the blocking ``_register_lora`` from inside the loop would re-enter ``_run_in_loop`` and deadlock.
 
         Cached by path: ``load_lora_adapter`` on an already-registered name is an error, and per-input
         adapters would otherwise re-register the same adapter once per request. When no name is given
@@ -319,10 +505,20 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             return self._registered_loras[adapter_path]
         lora_name = adapter_name or f'lora_{len(self._registered_loras)}'
         logger.info(f'Loading LoRA {lora_name!r} from {adapter_path}')
-        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        self._run_in_loop(self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path))
+        # Offload the (blocking) hub download off the event loop so it cannot stall other in-flight
+        # generations sharing this loop.
+        local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
+        await self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path)
         self._registered_loras[adapter_path] = lora_name
         return lora_name
+
+    def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
+        """Register an adapter with sglang and return the name to send as ``lora_path``.
+
+        Blocking wrapper over :meth:`_aregister_lora` for callers outside the event loop (``encode``,
+        ``sample_stream``).
+        """
+        return self._run_in_loop(self._aregister_lora(adapter_path, adapter_name))
 
     def sample_stream(
         self,

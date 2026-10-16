@@ -32,9 +32,10 @@ from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
+from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
 
 logger = get_logger()
@@ -191,9 +192,12 @@ class TransformersSampler(Sampler):
             # Everything below -- encoding, adapter grouping, chunking -- is what the model runs on its
             # own side, so it is forwarded whole rather than half-done here. This does not double-slice:
             # a facade owns no actors, so the decorator above runs it in place and only the model's
-            # ``generate`` dispatches.
+            # ``generate`` dispatches. ``inputs`` is normalized to a list first because ``generate``
+            # slices by data rank at its own decorator boundary: a bare ``Trajectory`` dict would be
+            # recursed into and its ``messages`` split across ranks, whereas a list is sliced as the
+            # batch it is.
             return self.model.generate(
-                inputs,
+                self._normalize_inputs(inputs),
                 sampling_params=sampling_params,
                 adapter_name=adapter_name,
                 adapter_path=adapter_path,
@@ -219,7 +223,8 @@ class TransformersSampler(Sampler):
             params = copy(params)
             params.max_tokens = 1
 
-        encoded, failures = self._encode_all(inputs_list, adapter_name, logprobs_only, strict)
+        encoded, failures = generation.encode_all(self.template, inputs_list, logprobs_only=logprobs_only,
+                                                  strict=strict)
 
         results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
         for index, response in failures.items():
@@ -227,15 +232,17 @@ class TransformersSampler(Sampler):
 
         pending = [index for index in range(len(inputs_list)) if results[index] is None]
         # One bucket per distinct adapter: a batch can only run under a single active adapter.
-        for path, indices in _group_by_adapter(pending, adapter_paths, adapter_path).items():
+        for path, indices in generation.group_by_adapter(pending, adapter_paths, adapter_path).items():
             adapter_uri = self._resolve_adapter(path, adapter_name, use_base_model)
-            for chunk in _chunks(indices, self.max_batch_size):
+            for chunk in generation.chunks(indices, self.max_batch_size):
                 for index, response in zip(chunk, self._run_chunk(chunk, encoded, params, adapter_uri, strict)):
                     results[index] = response
 
         if not logprobs_only:
-            self._attach_features(results, encoded)
-        return [r if r is not None else _error_response(encoded.get(i, {})) for i, r in enumerate(results)]
+            generation.attach_features(self.template, results, encoded)
+        return [
+            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
+        ]
 
     def sample_stream(
         self,
@@ -315,25 +322,6 @@ class TransformersSampler(Sampler):
             return SamplingParams.from_dict(sampling_params)
         return sampling_params
 
-    def _encode_all(self, inputs_list: List[Dict[str, Any]], adapter_name: str, logprobs_only: bool,
-                    strict: bool) -> tuple:
-        """Encode trajectories to features, isolating per-input encode failures when not strict."""
-        encoded: Dict[int, Dict[str, Any]] = {}
-        failures: Dict[int, SampleResponse] = {}
-        for index, item in enumerate(inputs_list):
-            if not self._not_encoded(item):
-                encoded[index] = item
-                continue
-            try:
-                encoded[index] = self.encode_trajectory(item, adapter_name, add_generation_prompt=not logprobs_only)
-            except Exception as exc:
-                if strict:
-                    raise
-                logger.warning(f'TransformersSampler: dropping input {index}, encode failed: {exc}')
-                encoded[index] = {}
-                failures[index] = _error_response({})
-        return encoded, failures
-
     def _resolve_adapter(self, adapter_path: Optional[str], adapter_name: str, use_base_model: bool) -> Optional[str]:
         if use_base_model or adapter_path is None:
             return None
@@ -343,8 +331,8 @@ class TransformersSampler(Sampler):
     def _run_chunk(self, chunk: List[int], encoded: Dict[int, Dict[str, Any]], params: SamplingParams,
                    adapter_uri: Optional[str], strict: bool) -> List[SampleResponse]:
         """Generate for one padded batch, falling back to one-at-a-time to isolate a bad input."""
-        prompts = [self._prompt_ids(encoded[i]) for i in chunk]
-        try:
+
+        def call_batch(prompts, extra):
             return self._run_in_loop(
                 self.engine.batch_sample(
                     prompts,
@@ -352,79 +340,7 @@ class TransformersSampler(Sampler):
                     num_samples=params.num_samples,
                     logprobs=params.logprobs is not None,
                     adapter_uri=adapter_uri,
+                    extra_model_inputs=extra or None,
                 ))
-        except Exception as exc:
-            if strict or len(chunk) == 1:
-                raise
-            logger.warning(f'TransformersSampler: batch of {len(chunk)} failed ({exc}); retrying individually '
-                           'to isolate the offending input')
-            out = []
-            for prompt in prompts:
-                try:
-                    out.append(
-                        self._run_in_loop(
-                            self.engine.batch_sample(
-                                [prompt],
-                                params,
-                                num_samples=params.num_samples,
-                                logprobs=params.logprobs is not None,
-                                adapter_uri=adapter_uri,
-                            ))[0])
-                except Exception as inner:
-                    logger.warning(f'TransformersSampler: input dropped, generate failed: {inner}')
-                    out.append(_error_response({}))
-            return out
 
-    def _prompt_ids(self, feat: Dict[str, Any]) -> List[int]:
-        input_ids = feat['input_ids']
-        if self.template is not None:
-            input_ids = self.template.get_vllm_input_ids(input_ids)
-        return input_ids.tolist() if hasattr(input_ids, 'tolist') else list(input_ids)
-
-    def _attach_features(self, results: List[Optional[SampleResponse]], encoded: Dict[int, Dict[str, Any]]) -> None:
-        """Fill in ``new_input_feature`` so downstream training code can consume the samples directly.
-
-        Matches ``vLLMSampler._sample_single``: the prompt feature plus the generated tokens, run
-        through the template so labels and any post-pipeline stay consistent.
-        """
-        if self.template is None:
-            return
-        for index, response in enumerate(results):
-            feat = encoded.get(index)
-            if response is None or not feat:
-                continue
-            for seq in response.sequences:
-                if seq.tokens:
-                    seq.new_input_feature = self.template.concat_input_feature(feat, seq.tokens)
-
-
-def _group_by_adapter(pending: List[int], adapter_paths: Optional[List[Optional[str]]],
-                      adapter_path: Optional[str]) -> Dict[Optional[str], List[int]]:
-    """Bucket the pending input indices by which adapter they need.
-
-    Insertion order is preserved per bucket, so results still land at their original positions. When
-    every input shares one adapter (the common case) this is a single bucket and costs nothing.
-    """
-    if adapter_paths is None:
-        return {adapter_path: pending}
-    groups: Dict[Optional[str], List[int]] = {}
-    for index in pending:
-        groups.setdefault(adapter_paths[index], []).append(index)
-    return groups
-
-
-def _chunks(items: List[int], size: int):
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def _error_response(feat: Dict[str, Any]) -> SampleResponse:
-    """The placeholder a dropped input gets under ``strict=False``.
-
-    Empty tokens and ``stop_reason='error'`` rather than an exception, so the caller's zip against the
-    input list stays aligned and the failure is visible in the data instead of ending the run.
-    """
-    return SampleResponse(
-        sequences=[SampledSequence(stop_reason='error', tokens=[], decoded='')],
-        prompt_token_ids=list(feat.get('input_ids') or []),
-    )
+        return generation.run_chunk(chunk, encoded, params, self.template, call_batch, strict=strict)
