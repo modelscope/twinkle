@@ -57,11 +57,14 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         results = {}
         all_healthy = True
 
-        for model in self.supported_models:
+        for model in self.training_models:
             model_name = model.model_name
             try:
                 resp = await self.proxy.proxy_request(request, 'healthz', model_name, 'model')
                 healthy = (resp.status_code == 200)
+                if healthy:
+                    import json
+                    healthy = json.loads(resp.body).get('healthy', True)
                 if not healthy:
                     all_healthy = False
                 results[model_name] = {
@@ -86,7 +89,7 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
         return types.GetServerCapabilitiesResponse(
-            supported_models=self.supported_models,
+            supported_models=self.training_models,
             protocol_version=1,
             features=types.ClientFeatures(
                 task_envelope=True,
@@ -139,6 +142,7 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         finish. See ``poll_config`` for the numbers.
         """
         request_id = body.request_id
+        await self.state.assert_future_owner(request_id, get_token_from_request(request))
         outcome = await poll_future(self.state, request_id)
         if outcome.record is None:
             raise ResourceNotFoundError(f'request_id {request_id} not found or expired')
@@ -156,6 +160,7 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         running or already-terminal task is reported but never interrupted, so cancel
         can never corrupt in-flight GPU/optimizer state.
         """
+        await self.state.assert_future_owner(body.request_id, get_token_from_request(request))
         result = await self.state.cancel_future(body.request_id)
         return types.CancelResponse(**result)
 

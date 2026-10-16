@@ -373,8 +373,6 @@ class _ServerTools:
         def _short(mid: str) -> str:
             return mid.split('/')[-1] if '/' in mid else mid
 
-        model_short = _short(model_id)
-
         # Collect all model IDs for supported_models
         all_model_ids = [model_id] + [s['model_id'] for s in sampler_list]
 
@@ -409,62 +407,41 @@ class _ServerTools:
             }],
         })
 
-        # 2. Build GPU-requiring applications (model + samplers),
+        # 2. Build static GPU-requiring sampler applications,
         #    then sort by GPU count DESCENDING before appending.
         #    Largest PG deploys first → it has the fewest node choices →
         #    avoids GPU scheduling deadlock on single-machine multi-node.
         gpu_apps: list[tuple[int, dict]] = []  # (gpu_count, app_config)
 
-        # 2a. Training model worker (student)
-        gpu_apps.append((
-            train_gpus,
-            {
-                'name':
-                f'models-{model_short}',
-                'route_prefix':
-                f'/api/v1/model/{model_id}',
-                'import_path':
-                'model',
-                'args': {
-                    'backend': backend,
-                    'model_id': f'ms://{model_id}',
-                    'max_length': 500000,  # total tokens per forward pass (must match max_input_tokens)
-                    'nproc_per_node': train_gpus,
-                    'device_group': {
-                        'name': 'model',
-                        'ranks': train_gpus,
-                        'device_type': 'cuda',
-                    },
-                    'device_mesh': {
-                        'device_type': 'cuda',
-                        'dp_size': train_gpus,
-                    },
-                    'queue_config': {
-                        'rps_limit': 100,
-                        'tps_limit': 100000,
-                        'max_input_tokens': 500000,
-                    },
-                    'adapter_config': {
-                        'adapter_timeout': 600,
-                    },
+        applications.append({
+            'name': f'model-{_short(model_id)}',
+            'route_prefix': f'/api/v1/model/{model_id}',
+            'import_path': 'model',
+            'args': {
+                'model_id': f'ms://{model_id}',
+                'backend': backend,
+                'device_type': 'cuda',
+                'env_vars': {
+                    'TWINKLE_TRUST_REMOTE_CODE': '1'
                 },
-                'deployments': [{
-                    'name': 'ModelManagement',
-                    'autoscaling_config': {
-                        'min_replicas': 1,
-                        'max_replicas': 1,
-                        'target_ongoing_requests': 16,
-                    },
-                    'ray_actor_options': {
-                        'num_cpus': 0.1,
-                        'runtime_env': {
-                            'env_vars': {
-                                'TWINKLE_TRUST_REMOTE_CODE': '1'
-                            },
+                'modes': {
+                    'lora': {
+                        'num_devices': train_gpus,
+                        'device_mesh': {
+                            'device_type': 'cuda',
+                            'dp_size': train_gpus
                         },
-                    },
-                }],
-            }))
+                        'max_length': 500000,
+                        'idle_timeout_s': 600,
+                        'queue_config': {
+                            'rps_limit': 100,
+                            'tps_limit': 100000,
+                            'max_input_tokens': 500000
+                        },
+                    }
+                },
+            },
+        })
 
         # 2b. Sampler/teacher models
         sampler_name_count: dict[str, int] = {}

@@ -29,6 +29,11 @@ logger = get_logger()
 
 # Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
 _TINKER_FAILURE_WIRE: dict[str, tuple[int, str]] = {
+    'capacity_unavailable': (409, 'user'),
+    'training_expired': (404, 'user'),
+    'startup_failed': (500, 'server'),
+    'startup_timeout': (504, 'server'),
+    'protocol_mismatch': (400, 'user'),
     'invalid_request': (400, 'user'),
     'request_rejected': (400, 'user'),
     'resource_not_found': (404, 'user'),
@@ -83,7 +88,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
         # Convert twinkle.protocol.types.SupportedModel to tinker.types.SupportedModel
-        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
+        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.training_models]
         return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 
     @app.post('/telemetry')
@@ -121,6 +126,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
                               self: GatewayServer = Depends(self_fn)) -> Any:
         """Retrieve the result of an async task with long polling."""
         request_id = body.request_id
+        await self.state.assert_future_owner(request_id, get_token_from_request(request))
         outcome = await poll_future(self.state, request_id)
         record = outcome.record
         if outcome.timed_out:

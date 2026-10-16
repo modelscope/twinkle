@@ -1,0 +1,40 @@
+# On-demand training: applications stays the public configuration entry.
+training:
+  allocation_timeout_s: 3
+  startup_timeout_s: 1800
+  shutdown_timeout_s: 60
+  sweep_interval_s: 5
+applications:
+  - name: model-qwen
+    route_prefix: /api/v1/model/Qwen/Qwen3-1.7B
+    import_path: model
+    args:
+      model_id: ms://Qwen/Qwen3-1.7B
+      backend: transformers
+      device_type: cuda
+      modes:
+        lora:
+          num_devices: 2
+          device_mesh: {device_type: cuda, dp_size: 2}
+          min_replicas: 1
+          max_loras: 5
+          max_r: 32
+          idle_timeout_s: 1800
+          target_modules: all-linear
+        full:
+          num_devices: 4
+          device_mesh: {device_type: cuda, dp_size: 4}
+          min_replicas: 0
+          idle_timeout_s: 1800
+  - name: model-small
+    route_prefix: /api/v1/model/Qwen/Qwen3-0.6B
+    import_path: model
+    args:
+      model_id: ms://Qwen/Qwen3-0.6B
+      backend: megatron
+      device_type: cuda
+      modes:
+        lora:
+          num_devices: 2
+          device_mesh: {device_type: cuda, dp_size: 2}
+          max_loras: 5

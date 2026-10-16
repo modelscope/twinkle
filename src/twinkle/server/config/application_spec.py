@@ -11,12 +11,13 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
-import math
 import os
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
 from twinkle.server.task_queue.config import TaskQueueConfig
+from .hybrid import SpectralHybridArgs
+from .training import TrainingModes
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any
 # Ray worker (model / sampler / processor), not just the gateway, applies the
@@ -55,21 +56,6 @@ class HttpOptions(BaseModel):
 # ---------- per-deployment args schemas ------------------------------------ #
 
 
-class SpectralHybridArgs(_ArgsBase):
-    """Strict server-owned Spectral Hybrid allocation and optimizer defaults."""
-
-    allocation_path: str = Field(min_length=1)
-    default_lr_lora: float = Field(default=2.5e-5, gt=0)
-    default_lr_fft: float = Field(default=1.0e-6, gt=0)
-
-    @field_validator('default_lr_lora', 'default_lr_fft')
-    @classmethod
-    def _finite_learning_rate(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError('learning rate must be finite')
-        return value
-
-
 class ModelArgs(_ArgsBase):
     """Args for the ``model`` deployment.
 
@@ -83,6 +69,12 @@ class ModelArgs(_ArgsBase):
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
+    device_type: Literal['cuda', 'npu', 'mps', 'cpu'] | None = None
+    env_vars: dict[str, str] = Field(default_factory=dict)
+    modes: TrainingModes | None = None
+    min_replicas: int | None = Field(default=None, ge=0, strict=True)
+    max_replicas: int | None = Field(default=None, gt=0, strict=True)
+    idle_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
     strategy: Literal['accelerate', 'native_fsdp'] | None = None
     adapter_config: dict[str, Any] | None = None
@@ -94,8 +86,18 @@ class ModelArgs(_ArgsBase):
     hybrid: SpectralHybridArgs | None = None
     data_plane_url: str | None = None
 
+    @model_validator(mode='before')
+    @classmethod
+    def _mode_resources(cls, data):
+        if isinstance(data, dict) and data.get('modes') is not None:
+            return {'device_group': {}, 'device_mesh': {}, **data}
+        return data
+
     @model_validator(mode='after')
     def _validate_spectral_backend(self):
+        if self.modes is not None and any(
+                mode.idle_timeout_s is None for mode in (self.modes.lora, self.modes.full) if mode is not None):
+            raise ValueError('modes require a finite positive idle_timeout_s')
         if self.strategy is not None and self.backend != 'transformers':
             raise ValueError('strategy is only supported by the transformers backend')
         if self.hybrid is not None:
@@ -269,23 +271,3 @@ class ApplicationSpec(BaseModel):
         # ``schema.model_validate`` rejects a non-dict itself with a clean
         # error, so no separate non-dict guard is needed here.
         return {**data, 'args': schema.model_validate(raw_args)}
-
-    @model_validator(mode='after')
-    def _validate_full_mode_single_replica(self) -> ApplicationSpec:
-        """``train_mode: full`` requires exactly one replica.
-
-        The exclusive-tenant lock lives in per-replica memory
-        (``ModelManagement._resource_records``), so more than one replica would
-        silently allow one full-parameter tenant per replica, each rewriting
-        its own copy of the base weights. Reject that at config-load time.
-        """
-        if not (isinstance(self.args, ModelArgs) and self.args.train_mode == 'full'):
-            return self
-        for dep in self.deployments:
-            num_replicas = dep.get('num_replicas')
-            max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
-            if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
-                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
-                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
-                                 'max_replicas to 1.')
-        return self

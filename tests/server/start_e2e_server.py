@@ -38,6 +38,8 @@ TRANSFORMERS_BASE = "tests/server/config/server_config_4b_e2e.yaml"
 MEGATRON_BASE = "tests/server/config/server_config_4b_e2e_megatron.yaml"
 _FULL = {
     "train_mode": "full",
+    "idle_timeout_s": 3600,
+    "max_replicas": 1,
     # Full-parameter training holds the deployment exclusively; use long
     # timeouts so the tenant is not expired mid-test.
     "adapter_config.adapter_timeout": 3600,

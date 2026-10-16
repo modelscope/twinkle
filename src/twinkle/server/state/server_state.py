@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
-from twinkle.server.exceptions import ResourceQuotaExceededError
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError, ResourceQuotaExceededError
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
@@ -172,6 +172,17 @@ class ServerState:
 
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
+
+    @property
+    def backend(self) -> StateBackend:
+        return self._backend
+
+    async def register_model_record(self, model_id: str, record: ModelRecord) -> None:
+        """Reserve quota for a complete model record, including managed training state."""
+        await self._model_mgr.add(model_id, record)
+
+    async def rebuild_model_indexes(self) -> None:
+        await self._model_mgr.rebuild_indexes()
 
     # ----- Session Management -----
 
@@ -429,7 +440,12 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
-    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int) -> str | None:
+    async def assert_future_owner(self, request_id: str, token: str) -> None:
+        owner = await self._backend.get(f'future_owner::{request_id}')
+        if owner is not None and owner != token:
+            raise ResourceNotFoundError('Unknown future')
+
+    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int | None) -> str | None:
         """Idempotency claim for a client seq_id.
 
         Atomically records ``dedup_key -> request_id`` if unseen and returns ``None``
@@ -445,6 +461,23 @@ class ServerState:
         """Drop a seq dedup claim (used when the claimed request never enqueued, e.g.
         preflight rejected it) so a retry can be admitted rather than see a phantom."""
         await self._backend.delete(dedup_key)
+
+    async def claim_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str,
+                                 retention: float) -> str | None:
+        from .sequence import claim_sequence
+        ledger = await self._backend.update_atomic(
+            f'seq_ledger::{training_id}::{stream}',
+            functools.partial(
+                claim_sequence, sequence=sequence, request_id=request_id, now=time.time(), retention=retention))
+        receipt = ledger['receipts'].get(str(sequence))
+        if receipt is None:
+            raise RequestRejectedError('Sequence retry window expired; the operation will not be executed again')
+        return None if receipt['request_id'] == request_id else receipt['request_id']
+
+    async def release_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str) -> None:
+        from .sequence import release_sequence
+        await self._backend.update_atomic(f'seq_ledger::{training_id}::{stream}',
+                                          functools.partial(release_sequence, sequence=sequence, request_id=request_id))
 
     async def cancel_future(self, request_id: str) -> dict[str, Any]:
         """Best-effort cancel: drop the task iff it has not started running.

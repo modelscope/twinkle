@@ -68,3 +68,5 @@ class QueuedTask:
     input_tokens: int
     task_type: str | None
     created_at: float
+    on_finished: Callable[[bool, bool], Coroutine] | None = None
+    on_enqueued: Callable[[], Coroutine] | None = None

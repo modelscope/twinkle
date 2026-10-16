@@ -85,6 +85,7 @@ class ComputeWorker:
         self._on_backend_timeout = on_backend_timeout
 
         self.task_queues: dict[str, asyncio.Queue] = {}
+        self._request_ids: set[str] = set()
         self.queue_order: Deque[str] = deque()
         self.new_task_event: asyncio.Event = asyncio.Event()
 
@@ -148,6 +149,13 @@ class ComputeWorker:
         indexing the worker's internal ``task_queues`` container directly.
         """
         return self.task_queues[queue_key]
+
+    def track_task(self, request_id: str) -> None:
+        self._request_ids.add(request_id)
+
+    def has_task(self, request_id: str) -> bool:
+        """True while a task is queued or executing, including a terminal-future race."""
+        return request_id in self._request_ids
 
     def total_queued(self) -> int:
         """Total number of pending tasks across all per-key queues."""
@@ -246,6 +254,9 @@ class ComputeWorker:
         for task in drained:
             await self._store_task_failed(task, reason, QueueState.UNKNOWN.value, queue_state_reason=reason)
             q.task_done()
+            self._request_ids.discard(task.request_id)
+            if task.on_finished is not None:
+                await task.on_finished(False, False)
 
         self.task_queues.pop(queue_key, None)
         try:
@@ -272,6 +283,9 @@ class ComputeWorker:
         await self._store_task_failed(task, error, QueueState.PAUSED_CAPACITY.value, queue_state_reason=error)
         self._record_tasks_total(task.task_type or 'unknown', 'timeout')
         q.task_done()
+        self._request_ids.discard(task.request_id)
+        if task.on_finished is not None:
+            await task.on_finished(False, False)
 
     async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
         """Execute a dequeued task, then release its queue slot."""
@@ -369,6 +383,7 @@ class ComputeWorker:
         exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
+        executed = False
         # One span per queued task execution, tagged `<deployment>.<task_type>`
         # (e.g. `model.forward`, `sampler.sample`).
         queue_attrs = {
@@ -399,6 +414,7 @@ class ComputeWorker:
                 logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
                              f'type={task_type}, queue_key={queue_key}')
                 with traced_operation(handler_span_name, attrs=handler_attrs):
+                    executed = True
                     coro = task.coro_factory()
                     # effective_execution_timeout is always positive (0 -> finite fallback),
                     # so wait_for is always in effect.
@@ -492,6 +508,9 @@ class ComputeWorker:
                 traceback_text=traceback.format_exc(),
             )
         finally:
+            self._request_ids.discard(task.request_id)
+            if task.on_finished is not None:
+                await task.on_finished(executed, executed and task_status in ('timeout', 'cancelled'))
             self._record_execution_time(task_type, exec_time)
             self._record_tasks_total(task_type, task_status)
 
@@ -529,6 +548,9 @@ class ComputeWorker:
             if await self._is_record_terminal(task.request_id):
                 logger.info(f'[ComputeWorker] Task {task.request_id} already terminal on dequeue; skipping.')
                 q.task_done()
+                self._request_ids.discard(task.request_id)
+                if task.on_finished is not None:
+                    await task.on_finished(False, False)
                 continue
 
             # Execute the task (serial: stops after the first execution)

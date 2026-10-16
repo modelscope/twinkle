@@ -20,9 +20,7 @@ if TYPE_CHECKING:
     from .app import ModelManagement
 
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
-from twinkle.server.exceptions import FullModeBusyError
-from twinkle.server.task_queue.types import UserTaskError
-from twinkle.server.utils import get_template_for_model
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.utils.logger import get_logger
 
@@ -42,60 +40,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.CreateModelRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        token = await self._on_request_start(request)
-
-        async def _create_adapter():
-            _model_id = None
-            try:
-                # Validate lora_config against the deployment's train_mode up front.
-                if self.is_full_mode and body.lora_config:
-                    raise UserTaskError('This deployment runs in full-parameter (exclusive) mode; do not pass '
-                                        'lora_config. Use create_full_training_client (or omit lora_config).')
-                if (not self.is_full_mode) and (not body.lora_config):
-                    raise UserTaskError('This deployment runs in LoRA mode; lora_config is required. '
-                                        'Use create_lora_training_client.')
-                # Exclusive full-parameter training: reject early (before touching
-                # state) if another tenant already holds the deployment.
-                if self.is_full_mode:
-                    self.assert_full_mode_available()
-
-                _model_id = await self.state.register_model(
-                    body.model_dump(), token=token, replica_id=self.replica_id, session_id=body.session_id)
-                adapter_name = self.get_adapter_name(adapter_name=_model_id)
-                model_adapter = self.resolve_model_adapter_name(adapter_name)
-                # Select template based on model type
-                template = get_template_for_model(self.base_model)
-                if self.is_full_mode:
-                    self.register_resource(adapter_name, token, session_id=body.session_id)
-                    await self.call_backend(
-                        self.model.set_template, template, adapter_name=model_adapter, model_id=self.base_model)
-                    await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=model_adapter)
-                    await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=model_adapter)
-                    self.set_resource_state(adapter_name, 'grad_ready', False)
-                else:
-                    from peft import LoraConfig
-                    lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
-                    self.register_resource(adapter_name, token, session_id=body.session_id)
-                    await self.call_backend(
-                        self.model.add_adapter_to_model, adapter_name=adapter_name, config_or_dir=lora_cfg)
-                    await self.call_backend(
-                        self.model.set_template, template, adapter_name=adapter_name, model_id=self.base_model)
-                    await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=adapter_name)
-                    await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=adapter_name)
-                    self.set_resource_state(adapter_name, 'grad_ready', False)
-                training_run_manager = create_training_run_manager(token, client_type='tinker')
-                training_run_manager.save(_model_id, body)
-                return types.CreateModelResponse(model_id=_model_id)
-            except FullModeBusyError as e:
-                raise UserTaskError(str(e)) from e
-            except Exception:
-                if _model_id:
-                    adapter_name = self.get_adapter_name(adapter_name=_model_id)
-                    await self._cleanup_adapter(adapter_name)
-                logger.error(traceback.format_exc())
-                raise
-
-        return await self.schedule_task(_create_adapter, token=token, task_type='create_model')
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     @app.post('/tinker/get_info')
     async def get_info(request: Request, body: types.GetInfoRequest,
@@ -123,14 +68,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.UnloadModelRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        token = await self._on_request_start(request)
-
-        async def _do_unload():
-            adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-            await self._cleanup_adapter(adapter_name)
-            return types.UnloadModelResponse(model_id=body.model_id)
-
-        return await self.schedule_task(_do_unload, model_id=body.model_id, token=token, task_type='unload_model')
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     @app.post('/tinker/forward')
     async def forward(request: Request, body: types.ForwardRequest,

@@ -14,6 +14,7 @@ offending name pointed at.
 """
 from __future__ import annotations
 
+from functools import cached_property
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
@@ -23,6 +24,8 @@ from twinkle.server.task_queue.config import TaskQueueConfig
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
 from .telemetry import TelemetryConfig
+from .training import TrainingConfig, TrainingOptions
+from .training_normalization import normalize_model_application
 
 
 class ServerConfig(BaseModel):
@@ -36,6 +39,7 @@ class ServerConfig(BaseModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     task_queue: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    training: TrainingOptions = Field(default_factory=TrainingOptions)
     applications: list[ApplicationSpec] = Field(default_factory=list)
 
     # ---- loading ---------------------------------------------------------- #
@@ -71,7 +75,23 @@ class ServerConfig(BaseModel):
     def _validate_cross_field(self) -> ServerConfig:
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
+        if self.training_config.models:
+            static = [app for app in self.applications if app.import_path != 'model']
+            names = {app.name for app in static}
+            for model in self.training_config.models:
+                if model.name in names:
+                    raise ValueError(f'training model name conflicts with application: {model.name}')
+                path = model.route_prefix
+                if any(app.route_prefix.rstrip('/') == path for app in static):
+                    raise ValueError(f'training route conflicts with application: {path}')
         return self
+
+    @cached_property
+    def training_config(self) -> TrainingConfig:
+        """Normalize old and extended model args into one runtime catalog."""
+        return TrainingConfig(
+            **self.training.model_dump(),
+            models=[normalize_model_application(app) for app in self.applications if app.import_path == 'model'])
 
     # ---- round-trip / serialization -------------------------------------- #
 

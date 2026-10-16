@@ -139,6 +139,10 @@ class TaskQueueMixin:
         """
         return self._task_queue_config
 
+    @property
+    def sequence_retention_s(self) -> float:
+        return self.state.expiration_timeout + self._future_absolute_ttl
+
     async def call_backend(self, fn: Callable[..., Any], /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
         """Run one backend call outside the event loop.
 
@@ -227,9 +231,32 @@ class TaskQueueMixin:
             batch_size_multiple=batch_size_multiple,
         )
 
+        task = QueuedTask(
+            request_id=request_id,
+            coro_factory=coro_factory,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            task_type=task_type,
+            created_at=time.monotonic())
+        await self._prepare_queued_task(task)
+
         if self._event_loop is None:
             self._event_loop = asyncio.get_running_loop()
 
+        try:
+            await self._enqueue_prepared_task(task)
+        except BaseException:
+            if task.on_finished is not None and await self.state.get_future(request_id) is None:
+                await task.on_finished(False, False)
+            raise
+        return {'request_id': request_id, 'model_id': model_id}
+
+    async def _prepare_queued_task(self, task: QueuedTask) -> None:
+        """Optional owner admission, after preflight and before any future write."""
+
+    async def _enqueue_prepared_task(self, task: QueuedTask) -> None:
+        request_id, model_id = task.request_id, task.model_id
         await self.state.store_future_status(
             request_id,
             TaskStatus.PENDING.value,
@@ -239,34 +266,26 @@ class TaskQueueMixin:
             absolute_deadline=self._future_deadline(),
         )
 
-        queue_key = self._queue_key(model_id=model_id, token=token)
+        queue_key = self._queue_key(model_id=model_id, token=task.token)
         self._compute_worker.ensure_queue_registered(queue_key)
         await self._compute_worker.ensure_started()
 
         q = self._compute_worker.get_queue(queue_key)
-        await q.put(
-            QueuedTask(
-                request_id=request_id,
-                coro_factory=coro_factory,
-                model_id=model_id,
-                token=token,
-                input_tokens=input_tokens,
-                task_type=task_type,
-                created_at=time.monotonic(),
-            ))
+        self._compute_worker.track_task(request_id)
+        await q.put(task)
+        if task.on_enqueued is not None:
+            await task.on_enqueued()
         await self.state.store_future_status(
             request_id,
             TaskStatus.QUEUED.value,
             model_id,
             queue_state=QueueState.ACTIVE.value,
         )
-        logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
+        logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
                     f'model_id={model_id}, queue_key={queue_key}, '
-                    f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
+                    f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
 
         self._compute_worker.notify_new_task()
-
-        return {'request_id': request_id, 'model_id': model_id}
 
     async def schedule_task(
         self,

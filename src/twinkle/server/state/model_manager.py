@@ -94,6 +94,7 @@ class ModelManager(BaseManager[ModelRecord]):
     async def get_capacity_info(self) -> dict[str, int]:
         """Return global LoRA capacity across all registered replicas."""
         replicas = await self._replicas.get_all()
+        replicas = {identity: capacity for identity, capacity in replicas.items() if capacity > 0}
         loaded_per_replica = await self._loaded_per_replica()
         total_max = sum(replicas.values())
         total_used = sum(loaded_per_replica.get(rid, 0) for rid in replicas)
@@ -220,6 +221,9 @@ class ModelManager(BaseManager[ModelRecord]):
         all_records = await self.get_all()
         expired_ids: list[str] = []
         for model_id, record in all_records.items():
+            if record.controller_epoch is not None:
+                # Managed training has one lifecycle writer: TrainingController.
+                continue
             if record.session_id and record.session_id in session_set:
                 expired_ids.append(model_id)
                 continue

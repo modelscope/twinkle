@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -58,6 +59,9 @@ class MultiLoraTransformersModel:
         self.model_id = model_id
         self.server_url = f'{self._transport.context.base_url}/model/{model_id}/twinkle'
         self.adapter_name = None
+        self._training_ids: dict[str, str] = {}
+        self._creating: set[str] = set()
+        self._training_lock = threading.Lock()
         # Per-client monotonic sequence for idempotent dedup of stateful training ops:
         # the server dedups on (session_id, seq_id) so a retried grad/step call is
         # applied at most once. Reserved once per call and reused on retry.
@@ -84,12 +88,21 @@ class MultiLoraTransformersModel:
         with self._create_lock:
             if self._created:
                 return
-            self._transport.post(f'{self.server_url}/create')
+            response = self._transport.post(f'{self.server_url}/create', json_data={'training_handles': True})
+            if response.json().get('training_handles') is not True:
+                raise RuntimeError('Server does not support training handles; upgrade Twinkle server and SDK together.')
             self._created = True
 
     def _submit(self, endpoint: str, model_cls, response_cls, **values):
         """Build, send, and resolve one twinkle-native request."""
         self._ensure_created()
+        if issubclass(model_cls, model_types.TrainingRequest):
+            name = values.get('adapter_name')
+            with self._training_lock:
+                training_id = values.get('training_id') or self._training_ids.get(name)
+            if training_id is None:
+                raise RuntimeError('Create this training with add_adapter_to_model on this object before using it.')
+            values['training_id'] = training_id
         body = build_request(model_cls, **values)
         response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
         return self._await_task(response, response_cls)
@@ -132,22 +145,38 @@ class MultiLoraTransformersModel:
         save_dir = kwargs.pop('save_dir', None)
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()
-        self._submit(
-            'add_adapter_to_model',
-            model_types.AddAdapterRequest,
-            None,
-            adapter_name=adapter_name,
-            config=config,
-            save_dir=save_dir,
-            **kwargs)
-        self.adapter_name = adapter_name
+        with self._training_lock:
+            if adapter_name in self._creating:
+                raise RuntimeError('A training with this adapter_name is already being created on this object.')
+            self._creating.add(adapter_name)
+        try:
+            result = self._submit(
+                'add_adapter_to_model',
+                model_types.AddAdapterRequest,
+                model_types.TrainingHandleResponse,
+                client_create_id=uuid.uuid4().hex,
+                adapter_name=adapter_name,
+                config=config,
+                save_dir=save_dir,
+                **kwargs)
+            with self._training_lock:
+                self._training_ids[adapter_name] = result.training_id
+                self.adapter_name = adapter_name
+        finally:
+            with self._training_lock:
+                self._creating.discard(adapter_name)
 
     def remove_adapter(self, adapter_name: str | None = None) -> None:
         """Release one client-owned adapter from the training component."""
         name = adapter_name or self.adapter_name
-        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name)
-        if name == self.adapter_name:
-            self.adapter_name = None
+        with self._training_lock:
+            training_id = self._training_ids.get(name)
+        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+        with self._training_lock:
+            if self._training_ids.get(name) == training_id:
+                self._training_ids.pop(name, None)
+                if name == self.adapter_name:
+                    self.adapter_name = None
 
     # ------------------------------------------------------------------ #
     # Inline forward family

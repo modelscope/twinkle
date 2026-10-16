@@ -168,7 +168,7 @@ async def run_submit(
     not implemented by every backend.
     """
     token = await self._on_request_start(request)
-    adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
+    adapter_name = getattr(body, 'training_id', None) or resolve_twinkle_adapter_name(request, body.adapter_name)
 
     # ---- Preflight: decidable from the body plus this deployment's backend, so it
     # runs before any state write and before the enqueue. ----
@@ -197,9 +197,15 @@ async def run_submit(
     dedup_key = None
     if seq_id is not None:
         session_id = get_session_id_from_request(request) or request.state.request_id
-        dedup_key = f'seq::{session_id}::{adapter_name or "-"}::{seq_id}'
-        ttl = int(self.task_queue_config.effective_execution_timeout) + 60
-        prior_request_id = await self.state.claim_seq(dedup_key, request_id, ttl)
+        dedup_key = f'seq::{session_id}::{adapter_name or "-"}::{task_type}::{seq_id}'
+        training_id = getattr(body, 'training_id', None)
+        if training_id is not None:
+            stream = f'native::{session_id}::{task_type}'
+            retention = self.sequence_retention_s
+            prior_request_id = await self.state.claim_training_seq(training_id, stream, seq_id, request_id, retention)
+        else:
+            ttl = int(self.task_queue_config.effective_execution_timeout) + 60
+            prior_request_id = await self.state.claim_seq(dedup_key, request_id, ttl)
         if prior_request_id is not None:
             return await self._peek_terminal(prior_request_id, fallback_status='pending')
 
@@ -216,5 +222,8 @@ async def run_submit(
         # there would let a retry enqueue a duplicate -> the exact double-apply this
         # dedup prevents. When unsure (record exists), keep the claim.
         if dedup_key is not None and await self.state.get_future(request_id) is None:
-            await self.state.release_seq(dedup_key)
+            if training_id is not None:
+                await self.state.release_training_seq(training_id, stream, seq_id, request_id)
+            else:
+                await self.state.release_seq(dedup_key)
         raise

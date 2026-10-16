@@ -22,12 +22,9 @@ if TYPE_CHECKING:
 
 import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object
-from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
-                                       validate_user_path)
-from twinkle.server.exceptions import RequestRejectedError, TrainModeMismatchError
-from twinkle.server.lifecycle.submit import (backend_kwargs, input_metrics, resolve_twinkle_adapter_name, run_submit,
-                                             to_backend_inputs)
-from twinkle.server.middleware.auth import get_session_id_from_request
+from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.lifecycle.submit import backend_kwargs, input_metrics, run_submit, to_backend_inputs
 from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
                                                     resolve_data_plane_model_inputs, select_output_rows)
 from twinkle.server.validation import BackendCapability
@@ -74,8 +71,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
     @app.post('/twinkle/create', response_model=types.CreateResponse)
     async def create(request: Request, body: types.CreateRequest,
                      self: ModelManagement = Depends(self_fn)) -> types.CreateResponse:
-        await self._on_request_start(request)
-        return types.CreateResponse()
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     # ------------------------------------------------------------------ #
     # Inline data / forward family
@@ -514,14 +510,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
     @app.post('/twinkle/remove_adapter', response_model=types.TaskEnvelope)
     async def remove_adapter(
         request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
-        """Release a drained tenant's in-memory training adapter."""
-
-        async def _call(self, body, adapter_name, token):
-            await self._cleanup_adapter(adapter_name)
-            return {'status': 'ok'}
-
-        return await run_submit(
-            self, request, body, task_type='remove_adapter', backend_call=_call, assert_resource=False)
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     @app.post('/twinkle/add_adapter_to_model', response_model=types.TaskEnvelope)
     async def add_adapter_to_model(
@@ -538,64 +527,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         # alone, so it owes the caller a real 400. A bare `assert` would surface as a 500
         # ('the server broke') and would vanish entirely under `python -O`, letting an
         # empty adapter_name through to the backend.
-        if not body.adapter_name:
-            raise RequestRejectedError('`adapter_name` is required and must be non-empty.')
-        token = await self._on_request_start(request)
-        if not validate_user_path(token, body.adapter_name):
-            raise RequestRejectedError(f'Invalid adapter_name: {body.adapter_name}')
-        adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
-        session_id = get_session_id_from_request(request)
-        try:
-            resolved_save_dir = _resolve_client_save_dir(body.save_dir).as_posix() if body.save_dir else None
-        except ValueError as exc:
-            raise RequestRejectedError(str(exc)) from exc
-
-        config = deserialize_object(body.config)
-
-        # ---- Decision_Boundary left: validate against the deployment's train_mode ----
-        if self.is_full_mode and config is not None:
-            raise TrainModeMismatchError('This deployment runs in full-parameter (exclusive) mode; pass '
-                                         'config=None (do not send a LoraConfig).')
-        if (not self.is_full_mode) and config is None:
-            raise TrainModeMismatchError('This deployment runs in LoRA mode; a LoraConfig is required.')
-        if self.is_full_mode:
-            # Raises FullModeBusyError (409) if another tenant holds the exclusive deployment.
-            self.assert_full_mode_available(adapter_name)
-
-        async def _task():
-            from peft import LoraConfig
-            extra_kwargs = backend_kwargs(body)
-            training_run_manager = create_training_run_manager(token, client_type='twinkle')
-            lora_config = None
-            if isinstance(config, LoraConfig):
-                lora_config = types.LoraConfig(rank=config.r, train_unembed=False, train_mlp=True, train_attn=True)
-            run_config = types.CreateModelRequest(
-                base_model=self.base_model,
-                lora_config=lora_config,
-                save_dir=resolved_save_dir,
-                user_metadata={'adapter_name': body.adapter_name})
-            await self.state.register_model(
-                run_config.model_dump(),
-                token=token,
-                model_id=adapter_name,
-                replica_id=self.replica_id,
-                session_id=session_id,
-            )
-            try:
-                self.register_resource(adapter_name, token, session_id)
-                if self.is_full_mode:
-                    # No PEFT adapter to add; the default optimizer group is used.
-                    self.set_resource_state(adapter_name, 'grad_ready', False)
-                else:
-                    await self.call_backend(self.model.add_adapter_to_model, adapter_name, config, **extra_kwargs)
-            except Exception:
-                self.unregister_resource(adapter_name)
-                await self.state.unload_model(adapter_name)
-                raise
-            training_run_manager.save(adapter_name, run_config)
-            return {'status': 'ok', 'adapter_name': adapter_name}
-
-        return await self.submit_and_peek(_task, model_id=adapter_name, token=token, task_type='add_adapter_to_model')
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     # ------------------------------------------------------------------ #
     # Hub upload (pure I/O -> background task; state-tracked via Retrieve_Endpoint)

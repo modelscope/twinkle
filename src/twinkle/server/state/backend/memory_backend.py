@@ -121,21 +121,26 @@ class RayActorBackend(StateBackend):
     persistence mode literal for this backend is still ``"memory"``.)
     """
 
-    def __init__(self, key_prefix: str = '') -> None:
+    def __init__(self, key_prefix: str = '', namespace: str | None = None) -> None:
         if not ray.is_initialized():
             raise RuntimeError('RayActorBackend requires an initialized Ray runtime — call '
                                'ray.init() first, switch persistence to "redis", or rely on '
                                'the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)
         try:
-            self._actor = ray.get_actor(name)
+            self._actor = ray.get_actor(name, namespace=namespace)
         except ValueError:
             try:
-                self._actor = _StateActor.options(name=name, lifetime='detached').remote()
+                self._actor = _StateActor.options(
+                    name=name,
+                    namespace=namespace,
+                    lifetime='detached',
+                    max_restarts=-1 if namespace else 0,
+                    max_task_retries=0).remote()
             except ValueError:
                 # Lost the create race against another worker — the actor is
                 # now resolvable.
-                self._actor = ray.get_actor(name)
+                self._actor = ray.get_actor(name, namespace=namespace)
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         await self._actor.set.remote(key, value, ttl)

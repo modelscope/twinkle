@@ -12,6 +12,7 @@ import os
 
 # Telemetry env var keys that need to be propagated to Ray worker processes.
 TELEMETRY_ENV_KEYS: tuple[str, ...] = (
+    'TWINKLE_STATE_RAY_NAMESPACE',
     'TWINKLE_TELEMETRY_ENABLED',
     'TWINKLE_TELEMETRY_DEBUG',
     'TWINKLE_TELEMETRY_SERVICE',

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from twinkle import get_logger
-from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
+from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map, extract_model_alias
 from twinkle.patch.ray_serve import apply_ray_serve_patches, get_runtime_env_for_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
@@ -146,6 +146,10 @@ class ServerLauncher:
         name = app_spec.name
         route_prefix = app_spec.route_prefix
         import_path = app_spec.import_path
+        if import_path == 'model':
+            # Model applications are specifications. _deploy_training creates
+            # their CPU routes and the controller owns all device instances.
+            return
         # Shallow-dump the typed args to a kwargs dict WITHOUT recursing into
         # nested models: ``dict(model)`` yields top-level (field, value) pairs
         # with nested models left as instances, so ``queue_config`` stays a
@@ -187,6 +191,12 @@ class ServerLauncher:
         # Pass http_options to server apps for internal proxy routing
         if import_path == 'server':
             args.setdefault('http_options', self.config.http_options.model_dump())
+            if self.config.training_config.models:
+                args['training_models'] = [model.name for model in self.config.training_config.models]
+                sampler_apps = [app for app in self.config.applications if app.import_path == 'sampler']
+                args['supported_models'] = list(
+                    dict.fromkeys(
+                        alias for app in sampler_apps if (alias := extract_model_alias(app.route_prefix, 'sampler'))))
 
         app = builder(deploy_options=deploy_options, **args)
 
@@ -202,6 +212,9 @@ class ServerLauncher:
         """
         # Apply Ray Serve patches before initializing Ray
         apply_ray_serve_patches()
+        if self.config.training_config.models:
+            os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = (
+                self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster')
 
         # Initialize telemetry if configured
         telemetry = self.config.telemetry
@@ -241,6 +254,7 @@ class ServerLauncher:
                 logger.info(f'ServerState policy exported to worker env: {server_state_env}')
 
         model_alias_map = build_model_alias_map(self.config.applications)
+        model_alias_map.update({model.name: model.model_id for model in self.config.training_config.models})
         if model_alias_map:
             os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(model_alias_map, ensure_ascii=False)
         else:
@@ -250,12 +264,16 @@ class ServerLauncher:
         self._start_serve()
 
         applications = self.config.applications
-        if not applications:
+        if not applications and not self.config.training_config.models:
             logger.warning('No applications configured')
             return
 
         for app_spec in applications:
-            self._deploy_application(app_spec)
+            if app_spec.import_path != 'model':
+                self._deploy_application(app_spec)
+
+        if self.config.training_config.models:
+            self._deploy_training()
 
         host = self.config.http_options.host
         port = self.config.http_options.port
@@ -287,6 +305,10 @@ class ServerLauncher:
         telemetry-shutdown failure cannot mask the user-facing shutdown path.
         """
         from ray import serve
+        if getattr(self, '_training_controller', None) is not None:
+            import ray
+            ray.get(self._training_controller.shutdown.remote())
+            ray.kill(self._training_controller, no_restart=True)
         try:
             serve.shutdown()
             logger.info('Ray Serve shut down successfully')
@@ -297,6 +319,49 @@ class ServerLauncher:
         # after Serve is down. Errors are swallowed by the helper.
         from twinkle.server.telemetry import flush_telemetry_safely
         flush_telemetry_safely()
+
+    def _deploy_training(self) -> None:
+        import ray
+        from ray import serve
+
+        from twinkle.server.training.actor import TrainingControllerActor, controller_name
+        from twinkle.server.training.router import build_training_router
+
+        namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
+        env = build_propagated_env_vars()
+        for key in ('PYTHONPATH', 'TWINKLE_DEFAULT_SAVE_DIR', 'TMPDIR', 'OMP_NUM_THREADS'):
+            if key in os.environ:
+                env.setdefault(key, os.environ[key])
+        controller = TrainingControllerActor.options(
+            name=controller_name(namespace), namespace=namespace, runtime_env={
+                'env_vars': env
+            }).remote(self.config.training_config.model_dump(), namespace)
+        try:
+            ray.get(controller.initialize.remote())
+        except Exception:
+            try:
+                ray.get(controller.shutdown.remote())
+            except Exception:
+                logger.exception('Training controller cleanup failed during initialization rollback')
+            finally:
+                ray.kill(controller, no_restart=True)
+            raise
+        self._training_controller = controller
+        for model in self.config.training_config.models:
+            app = build_training_router(self.config.training_config, model, namespace,
+                                        self.config.http_options.model_dump(), {
+                                            'num_replicas': 1,
+                                            'ray_actor_options': {
+                                                'num_cpus': 0.1,
+                                                'runtime_env': {
+                                                    'env_vars': env
+                                                }
+                                            }
+                                        })
+            serve.run(
+                app,
+                name=f'training-router-{namespace}-{model.name}',
+                route_prefix=model.route_prefix or f'/api/v1/model/{model.name}')
 
 
 def launch_server(

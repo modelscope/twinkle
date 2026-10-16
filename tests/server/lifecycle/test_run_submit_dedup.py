@@ -75,7 +75,7 @@ async def test_release_kept_when_task_already_enqueued():
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
     assert mgmt.state.released == [], 'claim wrongly released for an already-enqueued task'
-    assert 'seq::sess-1::sess-1-ad::7' in mgmt.state.claimed
+    assert 'seq::sess-1::sess-1-ad::forward_backward::7' in mgmt.state.claimed
 
 
 @pytest.mark.asyncio
@@ -84,7 +84,7 @@ async def test_release_when_never_enqueued():
     mgmt = _FakeManagement(record_after_claim=None)
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
-    assert mgmt.state.released == ['seq::sess-1::sess-1-ad::7'], 'claim should be released when nothing enqueued'
+    assert mgmt.state.released == ['seq::sess-1::sess-1-ad::forward_backward::7'], 'claim should be released when nothing enqueued'
 
 
 @pytest.mark.asyncio
@@ -107,5 +107,5 @@ async def test_dedup_key_is_scoped_per_adapter():
                 backend_call=_call)
 
     claimed = set(mgmt.state.claimed)
-    assert claimed == {'seq::sess-1::sess-1-lora-A::1', 'seq::sess-1::sess-1-lora-B::1'}, (
+    assert claimed == {'seq::sess-1::sess-1-lora-A::forward_backward::1', 'seq::sess-1::sess-1-lora-B::forward_backward::1'}, (
         f'adapters collided on one dedup key: {claimed}')

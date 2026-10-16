@@ -1511,6 +1511,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         for param in self.model.parameters():
             param.grad = None
 
+        if kwargs.get('reset_training_state', False):
+            for optimizer_group in self.optimizer_group.values():
+                self.unregister_mm_forward_hook(optimizer_group)
+            self.optimizer_group = {_default_adapter_name: self._construct_default_optimizer_group()}
+            self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
+            self.active_group = _default_adapter_name
+            if self._model_wrapped:
+                self.register_mm_forward_hook(self.optimizer_group[_default_adapter_name])
+
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         strict = kwargs.pop('strict', False)

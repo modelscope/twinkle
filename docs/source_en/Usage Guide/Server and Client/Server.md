@@ -479,3 +479,9 @@ raises. During that window newly arriving tasks fail fast with a `server`/503 er
 Each persisted future stores its immutable `absolute_deadline` when it is created.
 Cleanup therefore reaches the same decision regardless of which deployment process
 holds the cleanup lease.
+
+## On-demand training and device reclamation
+
+Existing `applications` entries with `import_path: model` remain valid. Set `args.min_replicas: 0` for lazy startup and explicitly set `args.idle_timeout_s` for business inactivity. Legacy `adapter_config.adapter_timeout` remains a heartbeat timeout and `adapter_max_lifetime` retains its absolute lifetime. New `modes` default to 1800 seconds of business inactivity; heartbeats and polling do not renew that deadline; queued and running operations protect training state. Empty instances above the resident minimum are destroyed so other models can reuse their devices. Existing deployment min/max replicas become training instance minimums/limits.
+
+To offer both LoRA and full training for one model, configure `num_devices`, `device_mesh`, `min_replicas`, and `idle_timeout_s` separately under `args.modes.lora/full`. LoRA users share compatible instances; each full-training handle owns an instance. Sampling configuration stays the same. See the [specification](../../../design/on-demand-training.md) and `cookbook/client/server/on_demand_training.yaml`.

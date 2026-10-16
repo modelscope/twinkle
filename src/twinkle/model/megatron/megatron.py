@@ -1010,6 +1010,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         for _model in self.strategy.unwrap_model(self.model):
             for param in _model.parameters():
                 param.grad = None
+        if kwargs.get('reset_training_state', False):
+            self.optimizer_group = {_default_adapter_name: self._construct_default_optimizer_group()}
+            self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         if dist.is_initialized():
             dist.barrier()
 

@@ -17,6 +17,11 @@ from twinkle.server.task_errors import trim_traceback
 
 # Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
 _FAILURE_WIRE: dict[str, tuple[int, ErrorCategory]] = {
+    'capacity_unavailable': (409, ErrorCategory.User),
+    'training_expired': (404, ErrorCategory.User),
+    'startup_failed': (500, ErrorCategory.Server),
+    'startup_timeout': (504, ErrorCategory.Server),
+    'protocol_mismatch': (400, ErrorCategory.User),
     'invalid_request': (400, ErrorCategory.User),
     'request_rejected': (400, ErrorCategory.User),
     'resource_not_found': (404, ErrorCategory.User),

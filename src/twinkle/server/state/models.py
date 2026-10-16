@@ -35,6 +35,9 @@ class ModelRecord(BaseModel):
     lora_config: Any = None
     replica_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
+    controller_epoch: str | None = None
+    training_namespace: str | None = None
+    instance_id: str | None = None
 
 
 class SamplingSessionRecord(BaseModel):
@@ -61,6 +64,11 @@ class FutureFailureRecord(BaseModel):
 # gateways each map this same key set to their own wire vocabularies; keeping the set
 # in one place lets a consistency test catch a map that drifts out of coverage.
 FAILURE_REASON_CODES: frozenset[str] = frozenset({
+    'capacity_unavailable',
+    'training_expired',
+    'startup_failed',
+    'startup_timeout',
+    'protocol_mismatch',
     'invalid_request',
     'request_rejected',
     'resource_not_found',
