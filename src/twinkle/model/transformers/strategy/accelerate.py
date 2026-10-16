@@ -161,6 +161,29 @@ class AccelerateStrategy:
         fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
+    @staticmethod
+    def _reshard_unsharded_fsdp_params(model) -> None:
+        """Reshard FSDP2 param groups left unsharded before optimizer state-dict conversion.
+
+        Under accelerate-FSDP2 the root param group is sharded with
+        ``reshard_after_forward=None``, which PyTorch's heuristic resolves to False, and
+        so are groups created with ``reshard_after_forward=False`` (e.g. tied-weight tail
+        groups). After a ``no_grad`` evaluation there is no backward pass to trigger the
+        post-backward reshard, so params of modules not individually wrapped by
+        ``fully_shard`` (e.g. the visual tower of a VL model) remain materialized as full
+        ``nn.Parameter`` while the optimizer still holds the sharded ``DTensor``.
+        ``get/set_optimizer_state_dict`` maps optimizer params back to model params by
+        identity and would then raise ``KeyError: 0`` inside
+        ``torch.distributed.checkpoint.state_dict``. Calling ``FSDPModule.reshard``
+        restores the sharded DTensor params; it is a no-op for groups already sharded.
+        """
+        from torch.distributed.fsdp import FSDPModule
+
+        if isinstance(model, FSDPModule):
+            for module in model.modules():
+                if isinstance(module, FSDPModule):
+                    module.reshard()
+
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
 
@@ -169,6 +192,7 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
+            self._reshard_unsharded_fsdp_params(model)
             # PyTorch initializes Adam state through the native optimizer step.
             # AcceleratedOptimizer may skip that step when gradients are not synchronized.
             inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
@@ -195,6 +219,7 @@ class AccelerateStrategy:
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
+            self._reshard_unsharded_fsdp_params(model)
             inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
             optim_state = {}
             if self.accelerator.process_index == 0:
