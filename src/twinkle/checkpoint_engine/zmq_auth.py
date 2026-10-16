@@ -80,16 +80,14 @@ def recv_auth_pyobj(
         return pickle.loads(msg) if isinstance(msg, (bytes, bytearray)) else socket.recv_pyobj()
 
     if len(msg) < _HMAC_SIZE:
-        raise RuntimeError(
-            f'Rejecting short ZMQ message at {where}: {len(msg)} bytes '
-            f'(< HMAC size {_HMAC_SIZE}).')
+        raise RuntimeError(f'Rejecting short ZMQ message at {where}: {len(msg)} bytes '
+                           f'(< HMAC size {_HMAC_SIZE}).')
 
     received_hmac = msg[:_HMAC_SIZE]
     payload_bytes = msg[_HMAC_SIZE:]
     expected_hmac = hmac.new(auth_key.encode(), payload_bytes, hashlib.sha256).digest()
     if not hmac.compare_digest(received_hmac, expected_hmac):
-        raise RuntimeError(
-            f'HMAC verification failed for ZMQ message at {where}; '
-            'refusing to deserialize untrusted payload.')
+        raise RuntimeError(f'HMAC verification failed for ZMQ message at {where}; '
+                           'refusing to deserialize untrusted payload.')
 
     return pickle.loads(payload_bytes)
