@@ -344,4 +344,3 @@ class TransformersSampler(Sampler):
                 ))
 
         return generation.run_chunk(chunk, encoded, params, self.template, call_batch, strict=strict)
-

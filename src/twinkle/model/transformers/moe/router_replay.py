@@ -104,6 +104,7 @@ def set_router_replay_data(
     routed_experts: torch.Tensor,
     model: nn.Module,
     replay_mask: torch.Tensor = None,
+    sp_context=None,
 ) -> None:
     """Slice *routed_experts* into per-block
     ``target_indices`` and inject them into the registered MoE blocks of *model*.
@@ -126,27 +127,26 @@ def set_router_replay_data(
         raise ValueError(f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
                          f'got {tuple(routed_experts.shape)}')
 
-    # SP: slice full-sequence routed_experts (and the per-token replay_mask) to local SP rank tokens.
-    # Both travel in one pad_and_split_inputs call so the mask is split identically to the indices and
-    # stays token-aligned with them.
-    from ..strategy.sequence_parallel import sequence_parallel as sp
+    # SP: slice full-sequence routed_experts and replay mask with one declared
+    # collection so both token-aligned tensors use identical pad/split rules.
+    # Setup runs before the model's forward hook pushes its context.
+    # An unregistered model is non-SP, even if another SP model was prepared.
+    from ..strategy.sequence_parallel import _MODULE_TO_CTX
+    sp = sp_context if sp_context is not None else _MODULE_TO_CTX.get(model)
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
-        extra_split_values = [(routed_experts, 0, 1)]
+        from ..strategy.sequence_parallel.data_keys import DataKeySpec, SPKeyCollection, SPKeyValue
+
+        spec = DataKeySpec('routed_experts', split_dim=1, pad_value=0, stage='router_replay',
+                           pad_at='router_replay', split_at='router_replay')
+        keys = SPKeyCollection()
+        keys.add(SPKeyValue(spec, routed_experts))
         if replay_mask is not None:
-            extra_split_values.append((replay_mask, 0, 1))
-        _, _, _, _, _, _, extra_values = sp.pad_and_split_inputs(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            real_position_ids=sp.real_position_ids,
-            extra_split_values=extra_split_values)
-        routed_experts = extra_values[0]
-        if replay_mask is not None:
-            replay_mask = extra_values[1]
+            mask_spec = DataKeySpec('replay_mask', split_dim=1, pad_value=0, stage='router_replay',
+                                    pad_at='router_replay', split_at='router_replay')
+            keys.add(SPKeyValue(mask_spec, replay_mask))
+        sp.pad_and_split_inputs(keys, boundary='router_replay', real_position_ids=sp.real_position_ids)
+        routed_experts = keys.get_value('routed_experts')
 
     # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
     routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())
@@ -169,7 +169,7 @@ def set_router_replay_data(
             state.target_mask = local_mask
 
 
-def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | None:
+def get_router_replay_data(model: nn.Module, batch_size=1, sp_context=None) -> torch.Tensor | None:
     """Collect ``recorded_indices`` from all registered MoE blocks in *model*.
 
     . note::
@@ -199,7 +199,8 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | Non
     routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
 
     # SP: all-gather local routing data across SP ranks along seq_len dim.
-    from ..strategy.sequence_parallel import sequence_parallel as sp
+    from ..strategy.sequence_parallel import _MODULE_TO_CTX
+    sp = sp_context if sp_context is not None else _MODULE_TO_CTX.get(model)
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
         routed_experts = sp.gather(routed_experts, dim=1, position_ids=sp.real_position_ids)

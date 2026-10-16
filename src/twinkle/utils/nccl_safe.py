@@ -81,6 +81,10 @@ class SafeLossWrapper(Loss):
         self.enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
         self.require_values = getattr(loss_instance, 'require_values', False)
         self.reduction = getattr(loss_instance, 'reduction', 'mean')
+        # Preserve the loss's SP data contract through the NCCL-safe wrapper.
+        self.sp_gather_keys = getattr(loss_instance, 'sp_gather_keys', ())
+        self.sp_input_key_specs = getattr(loss_instance, 'sp_input_key_specs', ())
+        self.sp_output_key_specs = getattr(loss_instance, 'sp_output_key_specs', ())
         self._nccl_safe_wrapped = True
 
     def __call__(self, inputs, outputs, **kwargs):

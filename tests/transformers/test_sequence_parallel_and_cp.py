@@ -16,8 +16,7 @@ from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
 from twinkle.utils import DeviceMesh, Platform, ensure_hccl_socket_env, selective_log_softmax, torch_util
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy SP/CP test (mp.spawn, world_size up to 4); not viable on dual-V100 CI, run manually.')
+pytestmark = [pytest.mark.slow, pytest.mark.accel(2)]
 
 LOGITS_RTOL = 1e-2
 LOGITS_ATOL = 5e-3
@@ -50,6 +49,7 @@ def _make_padded_labels(input_ids: torch.Tensor, valid_lengths: list[int]) -> to
 def _make_case(case_name: str) -> dict:
     cases = {
         'sp_only': {
+            'num_hidden_layers': 2,
             'expected_mode': 'sp_only',
             'world_size': 2,
             'ulysses_size': 2,
@@ -58,6 +58,7 @@ def _make_case(case_name: str) -> dict:
             'seq_len': 769,
         },
         'sp_only_multi_sample': {
+            'num_hidden_layers': 2,
             'expected_mode': 'sp_only',
             'world_size': 2,
             'ulysses_size': 2,
@@ -67,6 +68,7 @@ def _make_case(case_name: str) -> dict:
             'batch_size': 3,
         },
         'sp_only_multi_sample_masked': {
+            'num_hidden_layers': 2,
             'expected_mode': 'sp_only',
             'world_size': 2,
             'ulysses_size': 2,
@@ -718,6 +720,162 @@ class TestDerivedRingPrecision:
             args=(world_size, port, 'cp_sp', backend, 'flash_attention_2'),
             nprocs=world_size,
             join=True)
+
+
+def _run_multi_model_worker(rank: int, world_size: int, port: int, backend_config: dict):
+    """Two SP-enabled models (policy/ref style) with interleaved forwards.
+
+    Same architecture, different weights and different sequence lengths. Each
+    model must use its own SP context: a shared/singleton context shows up here
+    as cross-model position_ids pollution (logits mismatch or shape errors).
+    """
+    device = _init_dist(rank, world_size, port, backend_config)
+    try:
+        device_type = backend_config['device_type']
+        case = _make_case('sp_only')
+        vocab_size = 256
+
+        _seed_backend(1234, device_type)
+        policy_base = _build_tiny_llama(case, device, device_type)
+        _seed_backend(5678, device_type)
+        ref_base = _build_tiny_llama(case, device, device_type)
+
+        policy_sp = _build_tiny_llama(case, device, device_type)
+        policy_sp.load_state_dict(policy_base.state_dict())
+        ref_sp = _build_tiny_llama(case, device, device_type)
+        ref_sp.load_state_dict(ref_base.state_dict())
+
+        seq_len_p = int(case['seq_len'])
+        seq_len_r = seq_len_p // 2
+        _seed_backend(42, device_type)
+        input_ids_p = torch.randint(low=0, high=vocab_size, size=(1, seq_len_p), device=device)
+        position_ids_p = torch.arange(seq_len_p, device=device).unsqueeze(0)
+        input_ids_r = torch.randint(low=0, high=vocab_size, size=(1, seq_len_r), device=device)
+        position_ids_r = torch.arange(seq_len_r, device=device).unsqueeze(0)
+        labels_p = _make_labels(input_ids_p)
+        labels_r = _make_labels(input_ids_r)
+
+        # Non-SP baselines (computed before SP strategies exist).
+        policy_base.zero_grad(set_to_none=True)
+        base_outputs_p = policy_base(
+            input_ids=input_ids_p, position_ids=position_ids_p, attention_mask=None, use_cache=False)
+        base_logits_p = base_outputs_p.logits.detach().float()
+        base_loss_sum_p, base_num_tokens_p = _compute_training_path_loss(base_outputs_p.logits, labels_p)
+        base_loss_sum_p.backward()
+        base_grads_p = _normalize_grad_dict(_collect_attention_param_grads(policy_base), base_num_tokens_p)
+
+        ref_base.zero_grad(set_to_none=True)
+        base_outputs_r = ref_base(
+            input_ids=input_ids_r, position_ids=position_ids_r, attention_mask=None, use_cache=False)
+        base_logits_r = base_outputs_r.logits.detach().float()
+        base_loss_sum_r, base_num_tokens_r = _compute_training_path_loss(base_outputs_r.logits, labels_r)
+        base_loss_sum_r.backward()
+        base_grads_r = _normalize_grad_dict(_collect_attention_param_grads(ref_base), base_num_tokens_r)
+
+        # Two independent SP strategies on the same device mesh.
+        device_mesh = DeviceMesh.from_sizes(
+            fsdp_size=world_size,
+            dp_size=1,
+            ulysses_size=2,
+            device_type=device_type,
+        )
+        policy_strategy = _make_strategy(policy_sp, device_mesh, 2)
+        ref_strategy = _make_strategy(ref_sp, device_mesh, 2)
+
+        if policy_strategy._ctx is ref_strategy._ctx:
+            raise AssertionError('multi_model: strategies must own distinct SP contexts.')
+
+        # Module registry must route each model's attention to its own context.
+        from twinkle.model.transformers.strategy.sequence_parallel import _MODULE_TO_CTX
+        policy_attn = next(m for m in policy_sp.modules() if m.__class__.__name__.endswith('Attention'))
+        ref_attn = next(m for m in ref_sp.modules() if m.__class__.__name__.endswith('Attention'))
+        if _MODULE_TO_CTX.get(policy_attn) is not policy_strategy._ctx:
+            raise AssertionError('multi_model: policy attention module not registered to policy ctx.')
+        if _MODULE_TO_CTX.get(ref_attn) is not ref_strategy._ctx:
+            raise AssertionError('multi_model: ref attention module not registered to ref ctx.')
+
+        local_labels_p = _prepare_label_inputs(policy_strategy, input_ids_p, position_ids_p)
+        local_labels_r = _prepare_label_inputs(ref_strategy, input_ids_r, position_ids_r)
+
+        # Interleaved forwards: policy -> ref -> policy.
+        policy_sp.zero_grad(set_to_none=True)
+        ref_sp.zero_grad(set_to_none=True)
+        sp_outputs_p1 = policy_sp(
+            input_ids=input_ids_p, position_ids=position_ids_p, attention_mask=None, use_cache=False)
+        sp_outputs_r = ref_sp(
+            input_ids=input_ids_r, position_ids=position_ids_r, attention_mask=None, use_cache=False)
+        sp_outputs_p2 = policy_sp(
+            input_ids=input_ids_p, position_ids=position_ids_p, attention_mask=None, use_cache=False)
+
+        # Context isolation: each ctx must still hold its own sequence metadata.
+        if policy_strategy._ctx.real_position_ids.shape[-1] != seq_len_p:
+            raise AssertionError('multi_model: policy ctx position_ids polluted by ref forward.')
+        if ref_strategy._ctx.real_position_ids.shape[-1] != seq_len_r:
+            raise AssertionError('multi_model: ref ctx position_ids polluted by policy forward.')
+
+        # Capture per-rank local logits (with grad) before postprocess_outputs
+        # replaces outputs['logits'] with the grad-less gathered tensor.
+        local_logits_p1 = sp_outputs_p1.logits
+        local_logits_r = sp_outputs_r.logits
+
+        sp_logits_p1 = policy_strategy.postprocess_outputs(sp_outputs_p1).logits.detach().float()
+        sp_logits_r = ref_strategy.postprocess_outputs(sp_outputs_r).logits.detach().float()
+        sp_logits_p2 = policy_strategy.postprocess_outputs(sp_outputs_p2).logits.detach().float()
+
+        _assert_logits_close('multi_model policy fwd1', rank, base_logits_p, sp_logits_p1, seq_len_p, None)
+        _assert_logits_close('multi_model ref fwd', rank, base_logits_r, sp_logits_r, seq_len_r, None)
+        _assert_logits_close('multi_model policy fwd2', rank, base_logits_p, sp_logits_p2, seq_len_p, None)
+
+        # Interleaved loss + backward (ref backward first, then policy):
+        # GatherLoss.backward must use the ctx captured at forward time.
+        sp_loss_sum_p, sp_num_tokens_p = _compute_training_path_loss(local_logits_p1, local_labels_p,
+                                                                     policy_strategy)
+        sp_loss_sum_r, sp_num_tokens_r = _compute_training_path_loss(local_logits_r, local_labels_r,
+                                                                     ref_strategy)
+        sp_loss_sum_r.backward()
+        sp_loss_sum_p.backward()
+        _average_model_grads_over_group(policy_sp, policy_strategy._ctx._data_rank_group)
+        _average_model_grads_over_group(ref_sp, ref_strategy._ctx._data_rank_group)
+        sp_grads_p = _normalize_grad_dict(_collect_attention_param_grads(policy_sp), sp_num_tokens_p)
+        sp_grads_r = _normalize_grad_dict(_collect_attention_param_grads(ref_sp), sp_num_tokens_r)
+
+        if sp_num_tokens_p != base_num_tokens_p or sp_num_tokens_r != base_num_tokens_r:
+            raise AssertionError(f'multi_model num_tokens mismatch on rank {rank}: '
+                                 f'policy sp={sp_num_tokens_p} base={base_num_tokens_p}, '
+                                 f'ref sp={sp_num_tokens_r} base={base_num_tokens_r}')
+        if abs(sp_loss_sum_p.item() / max(sp_num_tokens_p, 1) - base_loss_sum_p.item() / max(base_num_tokens_p,
+                                                                                             1)) > LOSS_ATOL:
+            raise AssertionError(f'multi_model policy loss mismatch on rank {rank}: '
+                                 f'sp={sp_loss_sum_p.item()} base={base_loss_sum_p.item()}')
+        if abs(sp_loss_sum_r.item() / max(sp_num_tokens_r, 1) - base_loss_sum_r.item() / max(base_num_tokens_r,
+                                                                                             1)) > LOSS_ATOL:
+            raise AssertionError(f'multi_model ref loss mismatch on rank {rank}: '
+                                 f'sp={sp_loss_sum_r.item()} base={base_loss_sum_r.item()}')
+        _assert_grad_dict_close('multi_model policy', rank, base_grads_p, sp_grads_p)
+        _assert_grad_dict_close('multi_model ref', rank, base_grads_r, sp_grads_r)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestMultiModelSequenceParallel:
+    """Multi-model (policy/ref style) SP context isolation tests."""
+
+    def _get_backend_or_skip(self, world_size: int = 2) -> dict:
+        backend = _get_runtime_backend()
+        if backend is None:
+            pytest.skip('CUDA or NPU is required for multi-model SP tests.')
+        if backend['device_count'] < world_size:
+            pytest.skip(f'Requires at least {world_size} {backend["label"]} devices.')
+        return backend
+
+    def test_two_models_interleaved_forward(self):
+        world_size = 2
+        backend = self._get_backend_or_skip(world_size)
+        if not is_flash_attn_available():
+            pytest.skip('flash_attention_2 is required for multi-model SP tests.')
+        port = _find_free_port()
+        mp.spawn(_run_multi_model_worker, args=(world_size, port, backend), nprocs=world_size, join=True)
 
 
 class TestDerivedRingMemoryProfile:

@@ -640,16 +640,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _ensure_sp_strategy(self) -> None:
         if not getattr(self, '_enable_sp', False):
             return
-        if self.sp_strategy is not None:
-            return
-        from .strategy.sequence_parallel import SequenceParallelStrategy
+        if self.sp_strategy is None:
+            from .strategy.sequence_parallel import SequenceParallelStrategy
 
-        self.sp_strategy = SequenceParallelStrategy(
-            self.device_mesh,
-            {},
-            model=self.model,
-            tokenizer_id=self.tokenizer_id,
-        )
+            self.sp_strategy = SequenceParallelStrategy(
+                self.device_mesh,
+                {},
+                model=self.model,
+                tokenizer_id=self.tokenizer_id,
+            )
+        for optimizer_group in self.optimizer_group.values():
+            self.sp_strategy.register_loss_key_specs(optimizer_group.loss_instance)
 
     def _get_default_group(self):
         """Get the only group, else return the default one"""
@@ -780,15 +781,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # backend's enum before the ``== RouterReplayAction.*`` comparisons and the per-block state below.
         router_replay_action = resolve_router_replay_action(router_replay_action)
         unwrapped = self.strategy.unwrap_model(self.model)
+        sp_context = getattr(self.sp_strategy, '_ctx', None)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped, replay_mask)
+            set_router_replay_data(routed_experts, unwrapped, replay_mask=replay_mask, sp_context=sp_context)
 
         def cleanup():
             recorded = None
             if router_replay_action == RouterReplayAction.RECORD:
-                recorded = get_router_replay_data(unwrapped, batch_size)
+                recorded = get_router_replay_data(unwrapped, batch_size, sp_context=sp_context)
             if not manual_cleanup:
                 clear_global_router_replay_action()
                 clear_global_indices()
@@ -867,6 +869,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
+        sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
         # Not a model argument; the loss reads it back off `inputs` further down.
         completion_mask = inputs.pop('completion_mask', None)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
@@ -898,6 +901,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         recorded_routing = rr_cleanup()
 
         inputs['labels'] = labels
+        inputs.update(sp_auxiliary_inputs)
         if loss_scale is not None:
             inputs['loss_scale'] = loss_scale
         if channel is not None:
@@ -931,8 +935,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+        inputs, outputs = processor.postprocess_tensor_sp(
+            inputs,
+            outputs,
+            sp_strategy=self.sp_strategy,
+            task=task,
+            sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
+        )
+        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task, sp_strategy=self.sp_strategy)
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
@@ -1004,6 +1014,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
+            sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
             # Not a model argument; the loss reads it back off `inputs` further down.
             completion_mask = inputs.pop('completion_mask', None)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
@@ -1038,6 +1049,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             recorded_routing = rr_cleanup()
 
             inputs['labels'] = labels
+            inputs.update(sp_auxiliary_inputs)
             if loss_scale is not None:
                 inputs['loss_scale'] = loss_scale
             if channel is not None:
@@ -1071,8 +1083,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
-            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+            inputs, outputs = processor.postprocess_tensor_sp(
+                inputs,
+                outputs,
+                sp_strategy=self.sp_strategy,
+                task=task,
+                sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
+            )
+            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task,
+                                                                sp_strategy=self.sp_strategy)
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
@@ -1674,6 +1693,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        if self.sp_strategy is not None:
+            self.sp_strategy.register_loss_key_specs(optimizer_config.loss_instance)
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
