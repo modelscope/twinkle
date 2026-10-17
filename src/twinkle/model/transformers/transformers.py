@@ -590,7 +590,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 raise ValueError('sampling replay does not support sequence or context parallelism')
         loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        inputs: Dict[str, Any] = processor(
+        inputs: Dict[str, Any] = processor.process_local(
             inputs,
             sp_strategy=self.sp_strategy,
             hf_config=self.hf_config,
@@ -715,7 +715,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
             loss_require_values = getattr(loss_instance, 'require_values', False)
-            inputs: Dict[str, Any] = processor(
+            inputs: Dict[str, Any] = processor.process_local(
                 inputs,
                 sp_strategy=self.sp_strategy,
                 hf_config=self.hf_config,
