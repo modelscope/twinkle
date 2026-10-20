@@ -101,10 +101,12 @@ class InputProcessor:
                     _input['position_ids'] = _input['position_ids'][1:]
             return inputs
 
-    def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
+    def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], input_key_specs=None,
+                       **kwargs) -> List[InputFeature]:
         from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
 
-        registered_keys = {spec.name for spec in getattr(kwargs.get('sp_strategy'), 'input_key_specs', BUILTIN_INPUT_KEYS)}
+        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
+        registered_keys = {spec.name for spec in specs}
 
         def to_tensor(_input):
             for key in list(_input.keys()):
@@ -664,7 +666,8 @@ class InputProcessor:
         inputs: Dict[str, Any],
         outputs: Optional[Dict[str, Any]] = None,
         task: str = 'causal_lm',
-        sp_strategy=None,
+        input_key_specs=None,
+        output_key_specs=None,
     ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
@@ -673,6 +676,9 @@ class InputProcessor:
         (``logps``, ``logits``) from ``[1, total_tokens, ...]`` to
         ``[num_sequences, max_seq_len, ...]``. Keys that are ``None`` are silently
         skipped.
+
+        Input/output key specs describe the tensor layout and padding values;
+        this restoration step does not require a parallel strategy.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op. Same for
@@ -694,9 +700,11 @@ class InputProcessor:
             BUILTIN_INPUT_KEYS, BUILTIN_OUTPUT_KEYS,
         )
 
-        input_keys = [spec for spec in getattr(sp_strategy, 'input_key_specs', BUILTIN_INPUT_KEYS)
+        input_specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
+        output_specs = BUILTIN_OUTPUT_KEYS if output_key_specs is None else output_key_specs
+        input_keys = [spec for spec in input_specs
                       if spec.stage == 'auxiliary' and spec.need_unpack and inputs.get(spec.name) is not None]
-        output_keys = [spec for spec in getattr(sp_strategy, 'output_key_specs', BUILTIN_OUTPUT_KEYS)
+        output_keys = [spec for spec in output_specs
                        if spec.need_unpack and outputs and outputs.get(spec.name) is not None]
         all_specs = input_keys + output_keys
         all_tensors = [inputs[spec.name] for spec in input_keys] + [outputs[spec.name] for spec in output_keys]
@@ -729,12 +737,11 @@ class InputProcessor:
         return [self.unpack_packed_sequences(inp, task=task)[0] for inp in inputs]
 
     @staticmethod
-    def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+    def to_transformers_dict(inputs: List[InputFeature], input_key_specs=None, **kwargs) -> List[InputFeature]:
         import torch
         from twinkle.model.transformers.strategy.sequence_parallel.data_keys import PROCESSOR_PASSTHROUGH_KEYS
 
-        sp_strategy = kwargs.get('sp_strategy')
-        registered_keys = [spec.name for spec in getattr(sp_strategy, 'input_key_specs', ())]
+        registered_keys = [spec.name for spec in input_key_specs] if input_key_specs is not None else []
         results = []
         for _input in inputs:
             output = {}
@@ -771,11 +778,11 @@ class InputProcessor:
         return results
 
     @staticmethod
-    def pop_sp_auxiliary_inputs(inputs, sp_strategy=None):
+    def pop_sp_auxiliary_inputs(inputs, *, input_key_specs=None):
         """Keep loss-only token fields out of Hugging Face model.forward."""
         from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
 
-        specs = getattr(sp_strategy, 'input_key_specs', BUILTIN_INPUT_KEYS)
+        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
         return {spec.name: inputs.pop(spec.name) for spec in specs
                 if spec.stage == 'auxiliary' and spec.name not in ('labels', 'loss_scale') and spec.name in inputs}
 
@@ -849,12 +856,13 @@ class InputProcessor:
     #: skipped for these fields when the batch is on the Qwen-audio contract.
     _QWEN_AUDIO_FIELDS = ('input_features', 'feature_attention_mask')
 
-    def _collate_macro_batch(self, inputs: List[InputFeature], sp_strategy=None) -> InputFeature:
+    def _collate_macro_batch(self, inputs: List[InputFeature], input_key_specs=None) -> InputFeature:
         import torch
         from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
 
         builtin_names = {spec.name for spec in BUILTIN_INPUT_KEYS}
-        key_specs = {spec.name: spec for spec in getattr(sp_strategy, 'input_key_specs', BUILTIN_INPUT_KEYS)
+        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
+        key_specs = {spec.name: spec for spec in specs
                      if spec.stage == 'auxiliary' or (spec.stage == 'forward' and spec.name not in builtin_names)}
         # Two mutually-exclusive audio contracts share the `input_features` field name and are told
         # apart by the mask field that rides alongside it:
@@ -972,12 +980,13 @@ class InputProcessor:
                    inputs: List[InputFeature],
                    micro_batch_size: Optional[int] = None,
                    variable_seq_lengths=False,
+                   input_key_specs=None,
                    **kwargs) -> List[InputFeature]:
         if len(inputs) == 1 and self.framework != 'megatron':
             return inputs
         if micro_batch_size is None:
             # normal collate
-            outputs = self._collate_macro_batch(inputs, sp_strategy=kwargs.get('sp_strategy'))
+            outputs = self._collate_macro_batch(inputs, input_key_specs=input_key_specs)
             for key in outputs:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
@@ -989,7 +998,7 @@ class InputProcessor:
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 _output = self._collate_macro_batch(inputs[i:i + micro_batch_size],
-                                                    sp_strategy=kwargs.get('sp_strategy'))
+                                                    input_key_specs=input_key_specs)
                 for key in _output:
                     if key in self.VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
@@ -997,7 +1006,7 @@ class InputProcessor:
             return outputs
         else:
             # each macro batch shares the same length
-            res = self._collate_macro_batch(inputs, sp_strategy=kwargs.get('sp_strategy'))
+            res = self._collate_macro_batch(inputs, input_key_specs=input_key_specs)
             keys = list(res.keys())
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):

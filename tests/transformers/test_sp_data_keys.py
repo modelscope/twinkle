@@ -169,12 +169,12 @@ def test_processor_preserves_registered_keys_before_sp_split(monkeypatch, rank):
               'position_ids': torch.arange(5).unsqueeze(0),
               'labels': torch.ones(1, 5, dtype=torch.long),
               'token_weights': values, 'unregistered': values}
-    result = processor([sample], sp_strategy=strategy)
+    result = processor([sample], sp_strategy=strategy, input_key_specs=strategy.input_key_specs)
     expected = torch.tensor([[0, 1, 2, 3, 4, -2]])[:, rank * 3:(rank + 1) * 3]
     torch.testing.assert_close(result['token_weights'], expected)
     assert 'unregistered' not in result
     other = _strategy(rank)
-    assert 'token_weights' not in processor.to_transformers_dict([sample], sp_strategy=other)[0]
+    assert 'token_weights' not in processor.to_transformers_dict([sample], input_key_specs=other.input_key_specs)[0]
 
 
 @pytest.mark.parametrize('rank', [0, 1])
@@ -202,10 +202,10 @@ def test_registered_multidimensional_key_collation_and_loss_boundary(monkeypatch
                         'position_ids': list(range(length)), 'labels': list(range(1, length + 1)),
                         'token_features': [ [[1] * length, [2] * length] ],
                         'completion_mask': [1] * length})
-    result = processor(samples, sp_strategy=strategy)
+    result = processor(samples, sp_strategy=strategy, input_key_specs=strategy.input_key_specs)
     expected = torch.tensor([[[1, 1, 1], [2, 2, 2]], [[1, 1, 1], [2, 2, 2]]])
     torch.testing.assert_close(result['token_features'], expected)
-    auxiliary = processor.pop_sp_auxiliary_inputs(result, strategy)
+    auxiliary = processor.pop_sp_auxiliary_inputs(result, input_key_specs=strategy.input_key_specs)
     assert set(auxiliary) == {'completion_mask', 'token_features'}
     assert 'token_features' not in result
 
@@ -228,7 +228,8 @@ def test_model_specific_forward_key_is_split_only_in_model_hook(monkeypatch):
     strategy._ctx._prepare_forward_hook(model)
     ids = torch.arange(5).unsqueeze(0)
     prepared = InputProcessor()([{'input_ids': ids, 'position_ids': ids,
-                                  'token_type_ids': ids}], sp_strategy=strategy)
+                                  'token_type_ids': ids}], sp_strategy=strategy,
+                                input_key_specs=strategy.input_key_specs)
     assert prepared['token_type_ids'].shape == (1, 5)
     torch.testing.assert_close(model(**prepared), torch.tensor([[3, 4, 0]]))
 
@@ -252,23 +253,51 @@ def test_declared_collection_uses_sequence_axis_and_collects_without_logps(monke
 
 def test_packing_unpacks_registered_keys_on_declared_axis():
     from twinkle.processor import InputProcessor
+    from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
 
-    strategy = _strategy()
-    strategy.register_input_key(DataKeySpec('token_features', pad_value=-2, need_gather=True))
+    input_specs = (*BUILTIN_INPUT_KEYS, DataKeySpec('token_features', pad_value=-2, need_gather=True))
+    output_specs = (DataKeySpec('scores', side='output', stage='output', need_split=False, pad_value=-3),)
     inputs = {'position_ids': torch.tensor([[0, 1, 2, 0, 1]]), 'labels': torch.tensor([[1, 2, 3, 4, 5]]),
               'completion_mask': torch.ones(1, 5), 'token_features': torch.tensor([[[1, 2, 3, 4, 5]]])}
-    unpacked, _ = InputProcessor().unpack_packed_sequences(inputs, sp_strategy=strategy)
+    outputs = {'scores': torch.tensor([[[10, 20, 30, 40, 50]]])}
+    unpacked, unpacked_outputs = InputProcessor().unpack_packed_sequences(
+        inputs, outputs, input_key_specs=input_specs, output_key_specs=output_specs)
     assert unpacked['token_features'].shape == (2, 1, 3)
     assert unpacked['token_features'].tolist() == [[[1, 2, 3]], [[4, 5, -2]]]
     assert unpacked['completion_mask'].tolist() == [[1, 1, 1], [1, 1, 0]]
+    assert unpacked_outputs['scores'].tolist() == [[[10, 20, 30]], [[40, 50, -3]]]
 
 
-def test_padding_free_collation_preserves_registered_nondefault_sequence_axis():
+@pytest.mark.parametrize('padding_free', [False, True])
+def test_processor_preserves_custom_keys_without_sp_strategy(monkeypatch, padding_free):
+    from twinkle import Platform
     from twinkle.processor import InputProcessor
+    from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
 
-    strategy = _strategy()
-    strategy.register_input_key(DataKeySpec('token_features', split_dim=-1, pad_value=-2))
-    processor = InputProcessor(padding_free=True)
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
+    specs = (*BUILTIN_INPUT_KEYS, DataKeySpec('token_features', pad_value=-2))
+    samples = [
+        {'input_ids': list(range(length)), 'position_ids': list(range(length)),
+         'token_features': [[[1] * length, [2] * length]]}
+        for length in (3, 5)
+    ]
+    processor = InputProcessor(padding_free=padding_free)
+    result = processor(samples, input_key_specs=specs)
+    expected = (torch.tensor([[[1] * 8, [2] * 8]]) if padding_free else
+                torch.tensor([[[1, 1, 1, -2, -2], [2, 2, 2, -2, -2]], [[1] * 5, [2] * 5]]))
+    torch.testing.assert_close(result['token_features'], expected)
+    auxiliary = processor.pop_sp_auxiliary_inputs(result, input_key_specs=specs)
+    torch.testing.assert_close(auxiliary['token_features'], expected)
+
+
+@pytest.mark.parametrize('padding_free', [False, True])
+@pytest.mark.parametrize('micro_batch_size,variable_seq_lengths', [(None, False), (2, False), (1, False), (1, True)])
+def test_collation_preserves_declared_sequence_axis(padding_free, micro_batch_size, variable_seq_lengths):
+    from twinkle.processor import InputProcessor
+    from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
+
+    specs = (*BUILTIN_INPUT_KEYS, DataKeySpec('token_features', split_dim=-1, pad_value=-2))
+    processor = InputProcessor(padding_free=padding_free)
     samples = [
         {'input_ids': torch.tensor([[1, 2, 3]]),
          'position_ids': torch.tensor([[0, 1, 2]]),
@@ -278,14 +307,20 @@ def test_padding_free_collation_preserves_registered_nondefault_sequence_axis():
          'token_features': torch.tensor([[[30, 31, 32, 33, 34], [40, 41, 42, 43, 44]]])},
     ]
 
-    result = processor._collate_macro_batch(samples, sp_strategy=strategy)
-
-    assert result['token_features'].shape == (1, 2, 8)
-    torch.testing.assert_close(
-        result['token_features'],
-        torch.tensor([[[10, 11, 12, 30, 31, 32, 33, 34],
-                       [20, 21, 22, 40, 41, 42, 43, 44]]]),
-    )
+    results = processor.collate_fn(samples, micro_batch_size=micro_batch_size,
+                                   variable_seq_lengths=variable_seq_lengths, input_key_specs=specs)
+    first = torch.tensor([[[10, 11, 12], [20, 21, 22]]])
+    first_padded = torch.tensor([[[10, 11, 12, -2, -2], [20, 21, 22, -2, -2]]])
+    second = torch.tensor([[[30, 31, 32, 33, 34], [40, 41, 42, 43, 44]]])
+    if micro_batch_size == 1:
+        expected = [first if padding_free or variable_seq_lengths else first_padded, second]
+    elif padding_free:
+        expected = [torch.cat((first, second), dim=-1)]
+    else:
+        expected = [torch.cat((first_padded, second), dim=0)]
+    assert len(results) == len(expected)
+    for result, value in zip(results, expected):
+        torch.testing.assert_close(result['token_features'], value)
 
 
 def test_processor_preserves_special_arguments_outside_data_key_registry():
@@ -299,7 +334,7 @@ def test_processor_preserves_special_arguments_outside_data_key_registry():
     sample = {'input_ids': torch.tensor([[1, 2]]),
               'cache_position': torch.tensor([0, 1]),
               'padding_free': True}
-    converted_with_sp = InputProcessor.to_transformers_dict([sample], sp_strategy=strategy)[0]
+    converted_with_sp = InputProcessor.to_transformers_dict([sample], input_key_specs=strategy.input_key_specs)[0]
     converted_without_sp = InputProcessor.to_transformers_dict([sample])[0]
     for converted in (converted_with_sp, converted_without_sp):
         torch.testing.assert_close(converted['cache_position'], sample['cache_position'])

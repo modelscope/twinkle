@@ -859,9 +859,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 raise ValueError('sampling replay does not support sequence or context parallelism')
         loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
+        input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
         inputs: Dict[str, Any] = processor(
             inputs,
             sp_strategy=self.sp_strategy,
+            input_key_specs=input_key_specs,
             model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
@@ -869,7 +871,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
-        sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
+        sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, input_key_specs=input_key_specs)
         # Not a model argument; the loss reads it back off `inputs` further down.
         completion_mask = inputs.pop('completion_mask', None)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
@@ -942,7 +944,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             task=task,
             sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
         )
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task, sp_strategy=self.sp_strategy)
+        inputs, outputs = processor.unpack_packed_sequences(
+            inputs, outputs, task=task, input_key_specs=input_key_specs,
+            output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
@@ -1004,9 +1008,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
             loss_require_values = getattr(loss_instance, 'require_values', False)
+            input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
+                input_key_specs=input_key_specs,
                 model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
@@ -1014,7 +1020,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
-            sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, sp_strategy=self.sp_strategy)
+            sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, input_key_specs=input_key_specs)
             # Not a model argument; the loss reads it back off `inputs` further down.
             completion_mask = inputs.pop('completion_mask', None)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
@@ -1090,8 +1096,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 task=task,
                 sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
             )
-            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task,
-                                                                sp_strategy=self.sp_strategy)
+            inputs, outputs = processor.unpack_packed_sequences(
+                inputs, outputs, task=task, input_key_specs=input_key_specs,
+                output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
