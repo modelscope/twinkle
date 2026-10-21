@@ -10,7 +10,7 @@ Two mutations applied to the model:
    ``[B, T, H]`` or ``[B, T_local, H]`` under SP).
 
 Last-token pooling (incl. padding-free, SP gather) is **deferred** to
-``InputProcessor.postprocess_tensor_sp(task='embedding', ...)`` so this patch
+``postprocess_task_outputs(task='embedding', ...)`` so this patch
 stays SP/CP/packed-agnostic and the dispatch sits in one place.
 
 Both mutations are reverted by ``unpatch``.
@@ -44,7 +44,7 @@ def get_lm_head_model(module, lm_heads=None):
 def _output_features_hook(module, args, kwargs, output):
     # Replaces the model's structured output entirely; downstream HF utilities
     # (generate, loss, past_key_values, ...) won't work until ``unpatch``.
-    # Pooling + L2-normalize is deferred to ``InputProcessor._postprocess_embedding``
+    # Pooling + L2-normalize is deferred to ``postprocess_task_outputs``
     # so the hook stays pooling-agnostic (last-token / mean / CLS all work uniformly).
     hidden_states = output.logits
     return {'features': hidden_states.contiguous()}

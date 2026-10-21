@@ -125,9 +125,6 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
         def __call__(self, inputs, **kwargs):
             return dict(inputs)
 
-        def postprocess_tensor_sp(self, inputs, outputs, **kwargs):
-            return inputs, outputs
-
         def unpack_packed_sequences(self, inputs, outputs=None, **kwargs):
             return inputs, outputs
 

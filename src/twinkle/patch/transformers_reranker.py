@@ -14,7 +14,7 @@ Two things differ from :class:`~twinkle.patch.transformers_emb.TransformersEmbed
    are introduced (unlike the ``num_labels=1`` sequence-classification head used by the plain
    ``reranker`` task, which trains a fresh ``score`` linear).
 2. Last-valid-token reduction ``[B, T, 1] -> [B, 1]`` is DEFERRED to
-   ``InputProcessor.postprocess_tensor_sp(task='generative_reranker', ...)`` -- symmetric with how
+   ``postprocess_task_outputs(task='generative_reranker', ...)`` -- symmetric with how
    embedding defers pooling -- so this patch stays SP/CP/packed-agnostic and the dispatch lives in
    one place.
 

@@ -151,7 +151,8 @@ def _ppo_value_worker(rank, port):
         local_labels = prepared.pop('labels')
         local_outputs = model(**{key: prepared[key] for key in ('input_ids', 'position_ids')})
         local_outputs['values'] = local_outputs.pop('logits')
-        loss_inputs, loss_outputs = InputProcessor().postprocess_tensor_sp(
+        from twinkle.model.transformers.task_outputs import postprocess_task_outputs
+        loss_inputs, loss_outputs = postprocess_task_outputs(
             {'labels': local_labels},
             local_outputs,
             sp_strategy=strategy,
@@ -287,3 +288,92 @@ def test_ppo_value_loss_through_transformers_sdpa_sp_training_pipeline():
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     mp.spawn(_ppo_training_pipeline_worker, args=(port,), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize('task', ['embedding', 'generative_reranker'])
+def test_model_task_pooling_without_parallel_strategy(task):
+    from twinkle.model.transformers.task_outputs import postprocess_task_outputs
+
+    features = torch.arange(28, dtype=torch.float32).reshape(2, 7, 2).requires_grad_()
+    # Left padding on row 0, right padding on row 1: use the rightmost valid index.
+    positions = torch.tensor([[-1, -1, 0, 1, 2, 3, 4], [0, 1, 2, -1, -1, -1, -1]])
+    key = {'embedding': 'features', 'generative_reranker': 'logits'}[task]
+    _, outputs = postprocess_task_outputs({'position_ids': positions}, {key: features}, task=task)
+    expected = features[torch.arange(2), torch.tensor([6, 2])]
+    if task == 'embedding':
+        expected = torch.nn.functional.normalize(expected, dim=-1)
+    actual = outputs['embeddings' if task == 'embedding' else 'logits']
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+    assert 'sequence_scores' not in outputs
+
+
+@pytest.mark.parametrize('task', ['seq_cls', 'reranker', 'embedding', 'generative_reranker'])
+def test_sequence_labels_remain_global_in_model_sp_preparation(task):
+    from twinkle.model.transformers.transformers import TransformersModel
+    from twinkle.processor import InputProcessor
+
+    model = SimpleNamespace(sp_strategy=_strategy())
+    labels = torch.tensor([[0], [1]])
+    positions = torch.arange(5).expand(2, -1)
+    inputs = {'input_ids': positions, 'position_ids': positions, 'labels': labels}
+    prepared = TransformersModel._prepare_sp_inputs(model, inputs, InputProcessor(), task=task)
+    assert prepared['labels'] is labels
+    assert 'padding_free' not in prepared
+
+
+def _sp_pooling_worker(rank, port):
+    os.environ['RANK'], os.environ['WORLD_SIZE'] = str(rank), '2'
+    torch.set_num_threads(1)
+    from torch.utils.checkpoint import DefaultDeviceType
+    DefaultDeviceType.set_device_type('cpu')
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank,
+                            world_size=2, timeout=timedelta(seconds=120))
+    try:
+        from twinkle.model.transformers.task_outputs import postprocess_task_outputs
+
+        # Pooling values and averaged parameter gradients match a full sequence,
+        # for both ordinary batches and packed samples, with non-divisible lengths.
+        for topology, packed in (('ulysses', False), ('ulysses', True), ('ring', True)):
+            positions = (torch.tensor([[0, 1, 2, 0, 1, 2, 3]]) if packed else
+                         torch.tensor([[0, 1, 2, -1, -1, -1, -1], [0, 1, 2, 3, 4, 5, 6]]))
+            values = torch.arange(positions.numel() * 2, dtype=torch.float32).reshape(*positions.shape, 2) + 1
+            for task in ('embedding', 'generative_reranker'):
+                key = {'embedding': 'features', 'generative_reranker': 'logits'}[task]
+                strategy = _strategy()
+                strategy._ctx._sp_rank = rank
+                strategy._ctx._sp_group = dist.group.WORLD
+                strategy._ctx.extra_kwargs['position_ids'] = positions
+                if topology == 'ring':
+                    strategy._ctx.sp_world_size = 1
+                    strategy._ctx.rp_world_size = 2
+                    strategy._ctx._sp_rank = 0
+                    strategy._ctx._rp_rank = rank
+                    strategy._ctx._sp_group = None
+                    strategy._ctx._rp_group = dist.group.WORLD
+                base_scale = torch.tensor([0.7, 1.2], requires_grad=True)
+                scale = base_scale.detach().clone().requires_grad_()
+                _, base_outputs = postprocess_task_outputs({'position_ids': positions}, {key: values * base_scale}, task=task)
+                padded_positions = strategy.pad(positions, padding_value=-1, position_ids=positions)
+                local = strategy.pad(values, padding_value=0, dim=1, position_ids=positions)
+                local = strategy.split(local, dim=1, position_ids=padded_positions)
+                _, outputs = postprocess_task_outputs({'position_ids': positions}, {key: local * scale},
+                                                     task=task, sp_strategy=strategy)
+                name = 'embeddings' if task == 'embedding' else 'logits'
+                torch.testing.assert_close(outputs[name], base_outputs[name])
+                outputs[name].square().sum().backward()
+                base_outputs[name].square().sum().backward()
+                dist.all_reduce(scale.grad)
+                torch.testing.assert_close(scale.grad / 2, base_scale.grad, atol=2e-5, rtol=2e-5)
+
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+def test_sp_pooling_and_gradients_match_full_sequence():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_sp_pooling_worker, args=(port,), nprocs=2, join=True)

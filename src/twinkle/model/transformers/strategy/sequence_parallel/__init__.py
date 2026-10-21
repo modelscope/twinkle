@@ -1025,6 +1025,11 @@ class SequenceParallelStrategy:
             return inputs
         return self._ctx.prepare_inputs(inputs)
 
+    def pool_last_valid_token(self, features, inputs):
+        from .pooling import pool_last_valid_token
+
+        return pool_last_valid_token(features, inputs, sp_strategy=self)
+
     def register_input_key(self, spec: DataKeySpec) -> None:
         """Declare a token-aligned input on this model only.
 
@@ -1131,7 +1136,7 @@ class SequenceParallelStrategy:
         mask = inputs.get('completion_mask')
         if mask is None or not torch.is_tensor(mask) or mask.dim() < 2:
             return
-        gathered = sequence_parallel.gather(mask, dim=1, position_ids=real_position_ids)
+        gathered = self._ctx.gather(mask, dim=1, position_ids=real_position_ids)
         inputs['completion_mask'] = self._trim_gathered_sequence_padding(gathered, real_position_ids)
 
     def gather_loss_tensors(

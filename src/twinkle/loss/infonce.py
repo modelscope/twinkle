@@ -52,7 +52,7 @@ def _resolve_distance_metric(metric) -> Callable[[torch.Tensor, torch.Tensor], t
 
 
 def _extract_sentences(outputs) -> torch.Tensor:
-    """Return [B, D] sentence embeddings from postprocess_tensor_sp output.
+    """Return [B, D] sentence embeddings from model task postprocessing output.
 
     Prefers the canonical ``embeddings`` key (post-pooling); falls back to
     ``logits`` (legacy hook-side pooling) and applies CLS pooling for 3-D.

@@ -45,9 +45,12 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
                            replayed_selective_log_softmax, selective_log_softmax, torch_util)
+
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
+
+from .task_outputs import postprocess_task_outputs
 
 logger = get_logger()
 
@@ -105,9 +108,9 @@ def _resolve_task_context(model, task, template=None):
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
-    ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    ``postprocess_task_outputs(task='embedding', ...)``.
     'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_tensor_sp`` too. The plain
+    last-valid-token reduction is deferred to ``postprocess_task_outputs`` too. The plain
     'reranker' task needs NO patch: it rides a real ``num_labels=1`` classification head
     built at model construction, which already returns ``[B, 1]``.
     """
@@ -816,6 +819,19 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             acc_strategy=self._acc_strategy,
         )
 
+    def _prepare_sp_inputs(self, inputs, processor, task='causal_lm'):
+        if self.sp_strategy is None:
+            return inputs
+        payload = dict(inputs)
+        payload['padding_free'] = bool(processor.padding_free or processor._any_packing([inputs]))
+        # Sentence-level labels describe whole sequences rather than tokens.
+        sentence_task = task in ('seq_cls', 'reranker', 'embedding', 'generative_reranker')
+        sequence_labels = payload.pop('labels', None) if sentence_task else None
+        payload = self.sp_strategy.preprocess_inputs(payload)
+        if sequence_labels is not None:
+            payload['labels'] = sequence_labels
+        return payload
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
@@ -862,12 +878,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
         inputs: Dict[str, Any] = processor(
             inputs,
-            sp_strategy=self.sp_strategy,
             input_key_specs=input_key_specs,
             model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
         )
+        inputs = self._prepare_sp_inputs(inputs, processor, task=task)
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
@@ -937,7 +953,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
-        inputs, outputs = processor.postprocess_tensor_sp(
+        inputs, outputs = postprocess_task_outputs(
             inputs,
             outputs,
             sp_strategy=self.sp_strategy,
@@ -1011,12 +1027,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
             inputs: Dict[str, Any] = processor(
                 inputs,
-                sp_strategy=self.sp_strategy,
                 input_key_specs=input_key_specs,
                 model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
             )
+            inputs = self._prepare_sp_inputs(inputs, processor, task=task)
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
@@ -1089,7 +1105,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
-            inputs, outputs = processor.postprocess_tensor_sp(
+            inputs, outputs = postprocess_task_outputs(
                 inputs,
                 outputs,
                 sp_strategy=self.sp_strategy,

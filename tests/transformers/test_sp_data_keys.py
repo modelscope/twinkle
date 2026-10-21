@@ -169,7 +169,8 @@ def test_processor_preserves_registered_keys_before_sp_split(monkeypatch, rank):
               'position_ids': torch.arange(5).unsqueeze(0),
               'labels': torch.ones(1, 5, dtype=torch.long),
               'token_weights': values, 'unregistered': values}
-    result = processor([sample], sp_strategy=strategy, input_key_specs=strategy.input_key_specs)
+    result = processor([sample], input_key_specs=strategy.input_key_specs)
+    result = strategy.preprocess_inputs(result)
     expected = torch.tensor([[0, 1, 2, 3, 4, -2]])[:, rank * 3:(rank + 1) * 3]
     torch.testing.assert_close(result['token_weights'], expected)
     assert 'unregistered' not in result
@@ -202,7 +203,8 @@ def test_registered_multidimensional_key_collation_and_loss_boundary(monkeypatch
                         'position_ids': list(range(length)), 'labels': list(range(1, length + 1)),
                         'token_features': [ [[1] * length, [2] * length] ],
                         'completion_mask': [1] * length})
-    result = processor(samples, sp_strategy=strategy, input_key_specs=strategy.input_key_specs)
+    result = processor(samples, input_key_specs=strategy.input_key_specs)
+    result = strategy.preprocess_inputs(result)
     expected = torch.tensor([[[1, 1, 1], [2, 2, 2]], [[1, 1, 1], [2, 2, 2]]])
     torch.testing.assert_close(result['token_features'], expected)
     auxiliary = processor.pop_sp_auxiliary_inputs(result, input_key_specs=strategy.input_key_specs)
@@ -228,8 +230,8 @@ def test_model_specific_forward_key_is_split_only_in_model_hook(monkeypatch):
     strategy._ctx._prepare_forward_hook(model)
     ids = torch.arange(5).unsqueeze(0)
     prepared = InputProcessor()([{'input_ids': ids, 'position_ids': ids,
-                                  'token_type_ids': ids}], sp_strategy=strategy,
-                                input_key_specs=strategy.input_key_specs)
+                                  'token_type_ids': ids}], input_key_specs=strategy.input_key_specs)
+    prepared = strategy.preprocess_inputs(prepared)
     assert prepared['token_type_ids'].shape == (1, 5)
     torch.testing.assert_close(model(**prepared), torch.tensor([[3, 4, 0]]))
 
