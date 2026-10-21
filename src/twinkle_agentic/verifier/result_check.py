@@ -16,8 +16,10 @@ they fall back to a :class:`~twinkle_agentic.envs.localenv.LocalEnv` over
 ``workspace``, which is only correct when the episode itself ran locally.
 """
 import json
+import math
 import os
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
@@ -45,10 +47,18 @@ _KINDS = (
     'file_json',
     'shell',
     'python',
+    'hidden_python',
     'answer_contains',
     'answer_equals',
+    'answer_one_of',
+    'answer_number',
     'answer_regex',
+    'sql_query',
+    'web_receipt',
+    'lean',
 )
+
+_NUMBER_RE = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
 
 
 @dataclass
@@ -77,12 +87,65 @@ class Check:
     weight: float = 1.0
     timeout: int = DEFAULT_TIMEOUT
     description: str = ''
+    abs_tol: float = 0.0
+    rel_tol: float = 0.0
+    unit: str = ''
+    query: str = ''
+    db_path: str = ''
+    expect_rows: Any = None
+    ordered: bool = False
+    columns: Any = None
+    # web_receipt: one entry per url the answer cites. Each must have been served
+    # by web_search (it appeared in a result list) or fetched by fetch_page.
+    min_published: str = ''
+    # lean: the .lean file the episode is expected to have written, and the
+    # declaration that must exist in it. `path` holds the file.
+    theorem: str = ''
+    lean_project: str = ''
 
     def __post_init__(self):
         if self.kind not in _KINDS:
             raise ValueError(f'unknown check kind {self.kind!r}; expected one of {_KINDS}')
         if self.weight <= 0:
             raise ValueError(f'check weight must be positive, got {self.weight}')
+        if self.kind == 'answer_one_of':
+            if (not isinstance(self.value, (list, tuple)) or not self.value
+                    or any(not isinstance(item, (str, int, float, bool)) for item in self.value)):
+                raise ValueError('answer_one_of value must be a non-empty list of scalar answers')
+        if self.kind == 'sql_query':
+            # A SQL check is only meaningful if the query is well-formed and the
+            # expectation is stated. Validated here rather than at run time so a
+            # malformed task fails at build, next to the author who can fix it.
+            if not isinstance(self.query, str) or not self.query.strip():
+                raise ValueError('sql_query requires a non-empty query')
+            if not isinstance(self.db_path, str) or not self.db_path.strip():
+                raise ValueError('sql_query requires a db_path')
+            if self.expect_rows is None:
+                raise ValueError('sql_query requires expect_rows (a list of rows)')
+            if not isinstance(self.expect_rows, (list, tuple)):
+                raise ValueError('sql_query expect_rows must be a list of rows')
+            for row in self.expect_rows:
+                if not isinstance(row, (list, tuple)):
+                    raise ValueError('sql_query expect_rows entries must be lists/rows')
+        if self.kind == 'lean':
+            # A lean check without a named declaration would pass on an empty
+            # file, so the name is required rather than defaulted.
+            if not isinstance(self.path, str) or not self.path.strip():
+                raise ValueError('lean requires path (the .lean file to grade)')
+            if not isinstance(self.theorem, str) or not self.theorem.strip():
+                raise ValueError('lean requires theorem (the declaration that must exist)')
+        if self.kind == 'answer_number':
+            if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
+                raise ValueError('answer_number value must be numeric')
+            if not math.isfinite(float(self.value)):
+                raise ValueError('answer_number value must be finite')
+            for name in ('abs_tol', 'rel_tol'):
+                tolerance = getattr(self, name)
+                if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                        or not math.isfinite(float(tolerance)) or tolerance < 0):
+                    raise ValueError(f'answer_number {name} must be finite and non-negative')
+            if not isinstance(self.unit, str):
+                raise ValueError('answer_number unit must be a string')
 
 
 @dataclass
@@ -129,6 +192,11 @@ class CheckContext:
     workspace: str = ''
     final_answer: str = ''
     env: Optional['Env'] = None
+    # What the search tools actually served this episode, in order, as recorded
+    # by the host that answered them. Empty for a task that used no web tools,
+    # which is why `web_receipt` fails rather than passes when it is asked for
+    # with nothing here: an absent log is not evidence of a retrieval.
+    receipts: Sequence[Dict[str, Any]] = ()
 
 
 def _local_env(workspace: str) -> 'Env':
@@ -242,10 +310,11 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
         ok = got == check.value if not isinstance(check.value, str) else _norm(got) == _norm(check.value)
         return CheckOutcome(check, ok, '' if ok else f'{check.path}:{check.key} is {got!r}, expected {check.value!r}')
 
-    if kind in ('shell', 'python'):
+    if kind in ('shell', 'python', 'hidden_python'):
         env = ctx.env or _local_env(ctx.workspace)
+        interpreter = 'shell' if kind == 'shell' else 'python'
         try:
-            code, out = env.run_script(check.code, kind, check.timeout)
+            code, out = env.run_script(check.code, interpreter, check.timeout)
         except Exception as e:  # noqa
             return CheckOutcome(check, False, f'{type(env).__name__} raised {type(e).__name__}: {e}')
         if code != check.expect_exit:
@@ -256,6 +325,43 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
             return CheckOutcome(check, False, f'output does not contain {_norm(check.value)!r}')
         return CheckOutcome(check, True)
 
+    if kind == 'sql_query':
+        try:
+            full = _resolve(ctx.workspace, check.db_path)
+        except ValueError as e:
+            return CheckOutcome(check, False, str(e))
+        if not os.path.isfile(full):
+            return CheckOutcome(check, False, f'{check.db_path} does not exist')
+        # Read-only, via URI, so a check can never mutate the artifact it grades.
+        # A task that passes by writing during verification is not a solved task.
+        try:
+            conn = sqlite3.connect(f'file:{full}?mode=ro', uri=True)
+        except sqlite3.Error as e:
+            return CheckOutcome(check, False, f'{check.db_path} is not a readable SQLite file: {e}')
+        try:
+            try:
+                got = conn.execute(check.query).fetchall()
+            except sqlite3.Error as e:
+                return CheckOutcome(check, False, f'query failed: {e}')
+        finally:
+            conn.close()
+        want = [tuple(row) for row in check.expect_rows]
+        got = [tuple(r) for r in got]
+        if not check.ordered:
+            # Set comparison by default: SQL without ORDER BY has no guaranteed row
+            # order, so requiring one would fail correct solutions on an accident of
+            # the planner. Compare sorted, but sort by the repr so mixed and NULL
+            # values do not raise on comparison.
+            got_cmp, want_cmp = sorted(map(repr, got)), sorted(map(repr, want))
+            ok = got_cmp == want_cmp
+        else:
+            ok = got == want
+        if ok:
+            return CheckOutcome(check, True)
+        return CheckOutcome(
+            check, False, f'query returned {len(got)} row(s) {got[:3]!r}..., expected {len(want)} '
+            f'row(s) {want[:3]!r}...' + ('' if check.ordered else ' (unordered)'))
+
     answer = ctx.final_answer or ''
     if kind == 'answer_contains':
         ok = _norm(check.value) in answer
@@ -265,8 +371,147 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
         return CheckOutcome(
             check, ok, '' if ok else f'final answer is {answer.strip()[:120]!r}, '
             f'expected {_norm(check.value)[:120]!r}')
+    if kind == 'answer_one_of':
+        choices = [_norm(value) for value in check.value]
+        ok = answer.strip() in choices
+        return CheckOutcome(check, ok, '' if ok else f'final answer is {answer.strip()[:120]!r}, '
+                            f'expected one of {choices!r}')
+    if kind == 'answer_number':
+        text = answer.strip()
+        if check.unit:
+            suffix = check.unit.strip()
+            if not suffix or not text.endswith(suffix):
+                return CheckOutcome(check, False, f'final answer does not use required unit {check.unit!r}')
+            text = text[:-len(suffix)].strip()
+        if not _NUMBER_RE.fullmatch(text):
+            return CheckOutcome(check, False, f'final answer is not one unambiguous finite number: '
+                                f'{answer.strip()[:120]!r}')
+        got = float(text)
+        if not math.isfinite(got):
+            return CheckOutcome(check, False, 'final answer number is not finite')
+        ok = math.isclose(got, float(check.value), rel_tol=float(check.rel_tol), abs_tol=float(check.abs_tol))
+        return CheckOutcome(
+            check, ok, '' if ok else f'final answer number is {got!r}, expected {check.value!r} '
+            f'(abs_tol={check.abs_tol}, rel_tol={check.rel_tol})')
+    if kind == 'web_receipt':
+        return _check_web_receipt(check, ctx)
+
+    if kind == 'lean':
+        return _check_lean(check, ctx)
+
     ok = re.search(check.pattern, answer, re.S) is not None
     return CheckOutcome(check, ok, '' if ok else f'final answer does not match /{check.pattern}/')
+
+
+def _check_lean(check: Check, ctx: CheckContext) -> CheckOutcome:
+    """Compile in the episode environment, reject sorry warnings and require a named declaration."""
+    if ctx.env is None:
+        # Compiling needs the sandbox: the toolchain lives there, not here. A
+        # check that silently ran locally would grade a different machine's PATH
+        # and report a failure that has nothing to do with the submission.
+        return CheckOutcome(check, False, 'lean checks require an environment to compile in')
+    project = check.lean_project or '.'
+    # `lean_env` is set by the image; the grader reads it the same way.
+    theorem_pattern = r'(theorem|lemma)[[:space:]]+' + re.escape(check.theorem) + r'([[:space:]:]|$)'
+    script = _LEAN_GRADER.format(
+        project=_shquote(project), path=_shquote(check.path), theorem_pattern=_shquote(theorem_pattern))
+    try:
+        code, out = ctx.env.run_script(script, 'shell', check.timeout)
+    except Exception as e:  # noqa: BLE001
+        return CheckOutcome(check, False, f'{type(e).__name__}: {e}')
+    if code == 2:
+        return CheckOutcome(check, False, f'could not grade: {out.strip()[:300]}')
+    if code != 0:
+        return CheckOutcome(check, False, out.strip()[:400] or f'exit {code}')
+    return CheckOutcome(check, True, '')
+
+
+# Runs inside the sandbox. Kept as a template rather than inline f-string so the
+# quoting of the three substituted values happens in one place.
+_LEAN_GRADER = """
+export PATH="${{LEAN_PREFIX:-/opt/lean}}/bin:$PATH"
+cd {project} 2>/dev/null || {{ echo "lean project not found"; exit 2; }}
+[ -f {path} ] || {{ echo "submission not found"; exit 2; }}
+out=$(lake env lean {path} 2>&1); status=$?
+# Checked before the exit code: sorry exits 0, so the exit code alone cannot
+# distinguish a proof from a placeholder.
+if printf '%s' "$out" | grep -qE 'declaration uses .sorry.|sorryAx'; then
+  echo "uses sorry or admit, which proves nothing"; echo "$out" | head -5; exit 1
+fi
+[ $status -eq 0 ] || {{ echo "$out" | head -20; exit 1; }}
+# A file can compile without ever stating the theorem; that is not a proof of it.
+grep -qE {theorem_pattern} {path} \
+  || {{ echo "compiles, but named declaration not found"; exit 1; }}
+echo "accepted"
+"""
+
+
+def _shquote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def _check_web_receipt(check: Check, ctx: CheckContext) -> CheckOutcome:
+    """Every cited url must appear in what the search tools actually served.
+
+    This is the check that makes a citation mean something. Without it, an answer
+    that names a plausible url is indistinguishable from one that read the page,
+    and a policy learns that inventing a source is free. The evidence is the
+    host's own log of the calls it answered -- not anything the policy wrote, so
+    it cannot be manufactured from inside the episode.
+
+    Three things are verified per cited url, and each fails for its own reason:
+
+      * the url was served at all -- `web_search` returned it or `fetch_page`
+        fetched it. A url the policy assembled from a site's naming scheme is not
+        a retrieval.
+      * if `min_published` is set, at least one receipt carrying that url also
+        carried a publication date on or after it. This is what stops an answer
+        built on a page the engine itself flagged as old.
+      * the cited set is non-empty. An answer with no citations cannot have come
+        from searching, so the check fails rather than passing vacuously.
+    """
+    cited = check.value
+    if isinstance(cited, str):
+        cited = [cited]
+    if not isinstance(cited, (list, tuple)) or not cited:
+        return CheckOutcome(check, False, 'web_receipt requires value = the cited url(s)')
+
+    # url -> newest publication date seen for it, '' when only ever fetched.
+    # Presence in this map is the retrieval evidence; the date is a separate
+    # question. Conflating them was a bug: a url that was fetched but never
+    # appeared in a dated result list vanished from the map entirely, and the
+    # failure then said "never retrieved" about a page the episode had in fact
+    # read -- an accusation that was both wrong and unhelpful to act on.
+    served: Dict[str, str] = {}
+    for receipt in ctx.receipts or ():
+        for hit in (receipt or {}).get('urls') or ():
+            url = (hit or {}).get('url') or ''
+            if not url:
+                continue
+            published = (hit or {}).get('published') or ''
+            if url not in served or published > served[url]:
+                served[url] = published
+
+    if not served:
+        return CheckOutcome(
+            check, False, f'the episode cites {len(cited)} url(s) but the search tools were '
+            f'never used successfully; a citation with no retrieval behind it '
+            f'is not evidence')
+
+    missing = [url for url in cited if url not in served]
+    if missing:
+        return CheckOutcome(
+            check, False, f'cited url(s) never came back from a search or fetch: {missing}. '
+            f'Served urls were: {sorted(served)[:5]}')
+
+    if check.min_published:
+        undated = [url for url in cited if not served.get(url) or served[url] < check.min_published]
+        if undated:
+            return CheckOutcome(
+                check, False, f'cited url(s) have no publication date on or after '
+                f'{check.min_published}: {[(u, served.get(u) or "undated") for u in undated]}')
+
+    return CheckOutcome(check, True, '')
 
 
 def run_checks(
