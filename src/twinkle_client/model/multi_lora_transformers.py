@@ -1,30 +1,32 @@
-from typing import Any, Dict, Optional
+from __future__ import annotations
+
+import itertools
+import logging
+import threading
+from collections.abc import Mapping
 from pathlib import Path
-import time
-from twinkle_client.http import http_get, http_post
-from twinkle_client.common.json_utils import json_safe
-from twinkle_client.types.component import DataRef
-from twinkle_client.types.model import (
-    CalculateLossResponse,
-    CalculateMetricResponse,
-    ClipGradNormResponse,
-    ForwardBackwardResponse,
-    ForwardResponse,
-    GetStateDictResponse,
-    GetTrainConfigsResponse,
-    SaveResponse,
-    TrainingProgressResponse,
-)
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from peft import LoraConfig
+
+from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types.component import DataRef
+from twinkle_client._request_builder import build_request
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
+
+logger = logging.getLogger('twinkle_client')
 
 
-def _data_ref_payload(inputs: DataRef | list[DataRef]) -> dict[str, Any]:
+def _data_refs(inputs: DataRef | list[DataRef]) -> list[dict[str, Any]]:
     """Encode one or more opaque references for a DataPlane model endpoint."""
     refs = [inputs] if isinstance(inputs, DataRef) else list(inputs)
     if not refs:
         raise ValueError('at least one DataRef is required')
     if not all(isinstance(item, DataRef) for item in refs):
         raise TypeError('data-plane model inputs must contain only DataRef values')
-    return {'input_refs': [item.model_dump() for item in refs]}
+    return [item.model_dump() for item in refs]
 
 
 class MultiLoraTransformersModel:
@@ -32,69 +34,187 @@ class MultiLoraTransformersModel:
 
     This client manages adapters and sends training/inference requests to the model server.
     The server-side session (managed by TwinkleClient) keeps the model alive.
+
+    Every method builds its endpoint's request model rather than a dict, so a
+    misspelled or wrongly-typed argument fails here -- in the caller's own stack trace,
+    with no request sent. Arguments that are not declared fields (loss inputs, plugin
+    constructor arguments) are routed into that model's passthrough region, so public
+    signatures stay ``**kwargs`` and callers are unchanged.
     """
 
-    def __init__(self, model_id: str, **kwargs):
-        """Initialize model client."""
-        from twinkle_client.http import get_base_url
-        self.server_url = get_base_url()
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        """Initialize a model wrapper bound to one immutable request identity."""
+        self._transport = capture_transport(transport)
         kwargs.pop('data_plane_url', None)
 
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
-        self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
+        self.server_url = f'{self._transport.context.base_url}/model/{model_id}/twinkle'
         self.adapter_name = None
-        response = http_post(
-            url=f'{self.server_url}/create',
-        )
-        response.raise_for_status()
+        # Per-client monotonic sequence for idempotent dedup of stateful training ops:
+        # the server dedups on (session_id, seq_id) so a retried grad/step call is
+        # applied at most once. Reserved once per call and reused on retry.
+        self._seq_counter = itertools.count(1)
+        self._seq_lock = threading.Lock()
+        # The server-side component is created lazily on first use rather than in
+        # __init__, so constructing the wrapper performs no network I/O.
+        self._created = False
+        self._create_lock = threading.Lock()
 
-    def add_adapter_to_model(self, adapter_name: str, config: Optional[Dict[str, Any]] = None, **kwargs) -> None:
+    # ------------------------------------------------------------------ #
+    # Request plumbing
+    # ------------------------------------------------------------------ #
+
+    def _ensure_created(self) -> None:
+        """Create the server-side model component once, on first use.
+
+        Deferred out of ``__init__`` so construction has no side effect: a failed
+        ``create`` surfaces from the first operation instead of leaving a
+        half-initialised object published. Idempotent and thread-safe.
+        """
+        if self._created:
+            return
+        with self._create_lock:
+            if self._created:
+                return
+            self._transport.post(f'{self.server_url}/create')
+            self._created = True
+
+    def _submit(self, endpoint: str, model_cls, response_cls, **values):
+        """Build, send, and resolve one twinkle-native request."""
+        self._ensure_created()
+        body = build_request(model_cls, **values)
+        response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
+        return self._await_task(response, response_cls)
+
+    def _await_task(self, response, model_cls):
+        """Resolve a Submit_Endpoint response through the Client_Future_Layer.
+
+        Blocks until the task is terminal and returns the deserialized ``model_cls``
+        result (or ``None``), raising ``TaskFailedError`` on a failed terminal state.
+        Keeps every public method's synchronous signature unchanged.
+        """
+        from twinkle_client._future import resolve_response
+        return resolve_response(response, model_cls, transport=self._transport)
+
+    def _next_seq_id(self) -> int:
+        """Reserve the next monotonic seq_id for a stateful op (dedup key with session)."""
+        with self._seq_lock:
+            return next(self._seq_counter)
+
+    # ------------------------------------------------------------------ #
+    # Adapter lifecycle
+    # ------------------------------------------------------------------ #
+
+    def add_adapter_to_model(
+        self,
+        adapter_name: str,
+        config: LoraConfig | Mapping[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
         """Add a new adapter to the model.
 
         Pass a peft ``LoraConfig`` (or its dict form) for LoRA training against a
         LoRA-mode deployment. Pass ``config=None`` for full-parameter training
         against a ``train_mode: full`` deployment.
         """
-        save_dir = kwargs.get('save_dir')
+        if isinstance(config, Mapping):
+            from peft import LoraConfig
+
+            config = LoraConfig(**config)
+        save_dir = kwargs.pop('save_dir', None)
         if save_dir:
-            kwargs['save_dir'] = Path(save_dir).expanduser().resolve().as_posix()
-        response = http_post(
-            url=f'{self.server_url}/add_adapter_to_model',
-            json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
-        )
-        response.raise_for_status()
+            save_dir = Path(save_dir).expanduser().resolve().as_posix()
+        self._submit(
+            'add_adapter_to_model',
+            model_types.AddAdapterRequest,
+            None,
+            adapter_name=adapter_name,
+            config=config,
+            save_dir=save_dir,
+            **kwargs)
         self.adapter_name = adapter_name
 
     def remove_adapter(self, adapter_name: str | None = None) -> None:
         """Release one client-owned adapter from the training component."""
         name = adapter_name or self.adapter_name
-        response = http_post(
-            url=f'{self.server_url}/remove_adapter',
-            json_data={'adapter_name': name},
-        )
-        response.raise_for_status()
+        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name)
         if name == self.adapter_name:
             self.adapter_name = None
 
-    def forward(self, inputs: Any, **kwargs) -> ForwardResponse:
-        """Execute forward pass on inline model inputs."""
-        response = http_post(
-            url=f'{self.server_url}/forward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
-        )
-        response.raise_for_status()
-        return ForwardResponse(**response.json())
+    # ------------------------------------------------------------------ #
+    # Inline forward family
+    # ------------------------------------------------------------------ #
 
-    def forward_only(self, inputs: Any, **kwargs) -> ForwardResponse:
+    def forward(self, inputs: Any, **kwargs) -> model_types.ForwardResponse:
+        """Execute forward pass on inline model inputs."""
+        return self._submit(
+            'forward',
+            model_types.ForwardRequest,
+            model_types.ForwardResponse,
+            inputs=inputs,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def forward_only(self, inputs: Any, **kwargs) -> model_types.ForwardResponse:
         """Execute forward pass without gradient computation on inline inputs."""
-        response = http_post(
-            url=f'{self.server_url}/forward_only',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
-        )
-        response.raise_for_status()
-        return ForwardResponse(**response.json())
+        return self._submit(
+            'forward_only',
+            model_types.ForwardOnlyRequest,
+            model_types.ForwardResponse,
+            inputs=inputs,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def forward_backward(self, inputs: Any, **kwargs) -> model_types.ForwardBackwardResponse:
+        """Execute combined forward and backward pass on inline inputs."""
+        return self._submit(
+            'forward_backward',
+            model_types.ForwardBackwardTaskRequest,
+            model_types.ForwardBackwardResponse,
+            inputs=inputs,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            seq_id=self._next_seq_id(),
+            **kwargs)
+
+    def calculate_loss(self, **kwargs) -> model_types.CalculateLossResponse:
+        """Calculate loss from model outputs."""
+        return self._submit(
+            'calculate_loss',
+            model_types.AdapterRequest,
+            model_types.CalculateLossResponse,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def get_train_configs(self, **kwargs) -> model_types.GetTrainConfigsResponse:
+        """Get training configs."""
+        return self._submit(
+            'get_train_configs',
+            model_types.AdapterRequest,
+            model_types.GetTrainConfigsResponse,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def backward(self, **kwargs) -> None:
+        """Execute backward pass."""
+        self._submit(
+            'backward',
+            model_types.AdapterRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            seq_id=self._next_seq_id(),
+            **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Data-plane forward family
+    # ------------------------------------------------------------------ #
 
     def forward_from_data_plane(
         self,
@@ -103,20 +223,17 @@ class MultiLoraTransformersModel:
         input_field: str | None = None,
         kwarg_fields: dict[str, str] | None = None,
         **kwargs,
-    ) -> ForwardResponse:
+    ) -> model_types.ForwardResponse:
         """Execute forward using rows referenced from the server DataPlane."""
-        response = http_post(
-            url=f'{self.server_url}/forward_from_data_plane',
-            json_data={
-                **_data_ref_payload(inputs),
-                'adapter_name': self.adapter_name,
-                'input_field': input_field,
-                'kwarg_fields': kwarg_fields or {},
-                **json_safe(kwargs),
-            },
-        )
-        response.raise_for_status()
-        return ForwardResponse(**response.json())
+        return self._submit(
+            'forward_from_data_plane',
+            model_types.DataPlaneForwardRequest,
+            model_types.ForwardResponse,
+            input_refs=_data_refs(inputs),
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            input_field=input_field,
+            kwarg_fields=kwarg_fields or {},
+            **kwargs)
 
     def forward_only_from_data_plane(
         self,
@@ -127,61 +244,22 @@ class MultiLoraTransformersModel:
         output_ref: DataRef | None = None,
         output_fields: dict[str, str] | None = None,
         **kwargs,
-    ) -> ForwardResponse | DataRef:
+    ) -> model_types.ForwardResponse | DataRef:
         """Execute forward-only using DataPlane rows and optionally append outputs."""
-        body = {
-            **_data_ref_payload(inputs),
-            'adapter_name': self.adapter_name,
-            'input_field': input_field,
-            'kwarg_fields': kwarg_fields or {},
-            'output_ref': output_ref.model_dump() if output_ref is not None else None,
-            'output_fields': output_fields or {},
-            **json_safe(kwargs),
-        }
-        response = http_post(
-            url=f'{self.server_url}/forward_only_from_data_plane',
-            json_data=body,
-        )
-        response.raise_for_status()
-        result = ForwardResponse(**response.json())
+        result = self._submit(
+            'forward_only_from_data_plane',
+            model_types.DataPlaneForwardOnlyRequest,
+            model_types.ForwardResponse,
+            input_refs=_data_refs(inputs),
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            input_field=input_field,
+            kwarg_fields=kwarg_fields or {},
+            output_ref=output_ref.model_dump() if output_ref is not None else None,
+            output_fields=output_fields or {},
+            **kwargs)
         if output_ref is not None:
             return DataRef(**result.result)
         return result
-
-    def calculate_loss(self, **kwargs) -> CalculateLossResponse:
-        """Calculate loss from model outputs."""
-        response = http_post(
-            url=f'{self.server_url}/calculate_loss',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return CalculateLossResponse(**response.json())
-
-    def get_train_configs(self, **kwargs) -> GetTrainConfigsResponse:
-        """Get training configs."""
-        response = http_post(
-            url=f'{self.server_url}/get_train_configs',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return GetTrainConfigsResponse(**response.json())
-
-    def backward(self, **kwargs) -> None:
-        """Execute backward pass."""
-        response = http_post(
-            url=f'{self.server_url}/backward',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-
-    def forward_backward(self, inputs: Any, **kwargs) -> ForwardBackwardResponse:
-        """Execute combined forward and backward pass on inline inputs."""
-        response = http_post(
-            url=f'{self.server_url}/forward_backward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
-        )
-        response.raise_for_status()
-        return ForwardBackwardResponse(**response.json())
 
     def forward_backward_from_data_plane(
         self,
@@ -190,208 +268,233 @@ class MultiLoraTransformersModel:
         input_field: str | None = None,
         kwarg_fields: dict[str, str] | None = None,
         **kwargs,
-    ) -> ForwardBackwardResponse:
+    ) -> model_types.ForwardBackwardResponse:
         """Execute forward/backward using rows referenced from the server DataPlane."""
-        response = http_post(
-            url=f'{self.server_url}/forward_backward_from_data_plane',
-            json_data={
-                **_data_ref_payload(inputs),
-                'adapter_name': self.adapter_name,
-                'input_field': input_field,
-                'kwarg_fields': kwarg_fields or {},
-                **json_safe(kwargs),
-            },
-        )
-        response.raise_for_status()
-        return ForwardBackwardResponse(**response.json())
+        return self._submit(
+            'forward_backward_from_data_plane',
+            model_types.DataPlaneForwardRequest,
+            model_types.ForwardBackwardResponse,
+            input_refs=_data_refs(inputs),
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            input_field=input_field,
+            kwarg_fields=kwarg_fields or {},
+            seq_id=self._next_seq_id(),
+            **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Optimizer / scheduler steps
+    # ------------------------------------------------------------------ #
 
     def step(self, **kwargs) -> None:
         """Execute optimizer step."""
-        response = http_post(
-            url=f'{self.server_url}/step',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'step',
+            model_types.StepRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            seq_id=self._next_seq_id(),
+            **kwargs)
 
     def zero_grad(self, **kwargs) -> None:
         """Zero out gradients."""
-        response = http_post(
-            url=f'{self.server_url}/zero_grad',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'zero_grad',
+            model_types.AdapterRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def lr_step(self, **kwargs) -> None:
         """Execute learning rate scheduler step."""
-        response = http_post(
-            url=f'{self.server_url}/lr_step',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'lr_step',
+            model_types.LrStepRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            seq_id=self._next_seq_id(),
+            **kwargs)
 
-    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs) -> ClipGradNormResponse:
+    def clip_grad_norm(self,
+                       max_grad_norm: float = 1.0,
+                       norm_type: int = 2,
+                       **kwargs) -> model_types.ClipGradNormResponse:
         """Clip gradient norm."""
-        response = http_post(
-            url=f'{self.server_url}/clip_grad_norm',
-            json_data={'max_grad_norm': max_grad_norm, 'norm_type': norm_type, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return ClipGradNormResponse(**response.json())
+        return self._submit(
+            'clip_grad_norm',
+            model_types.ClipGradNormRequest,
+            model_types.ClipGradNormResponse,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            max_grad_norm=max_grad_norm,
+            norm_type=norm_type,
+            **kwargs)
 
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs) -> None:
         """Clip gradient norm and execute optimizer step in one call."""
-        response = http_post(
-            url=f'{self.server_url}/clip_grad_and_step',
-            json_data={'max_grad_norm': max_grad_norm, 'norm_type': norm_type, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'clip_grad_and_step',
+            model_types.ClipGradAndStepRequest,
+            None,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            max_grad_norm=max_grad_norm,
+            norm_type=norm_type,
+            seq_id=self._next_seq_id(),
+            **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Plugin setters
+    # ------------------------------------------------------------------ #
 
     def set_loss(self, loss_cls: str, **kwargs) -> None:
         """Set the loss function."""
-        response = http_post(
-            url=f'{self.server_url}/set_loss',
-            json_data={'loss_cls': loss_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'set_loss',
+            model_types.SetLossRequest,
+            None,
+            loss_cls=loss_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def set_optimizer(self, optimizer_cls: str, **kwargs) -> None:
         """Set the optimizer."""
-        response = http_post(
-            url=f'{self.server_url}/set_optimizer',
-            json_data={'optimizer_cls': optimizer_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'set_optimizer',
+            model_types.SetOptimizerRequest,
+            None,
+            optimizer_cls=optimizer_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs) -> None:
         """Set the learning rate scheduler."""
-        response = http_post(
-            url=f'{self.server_url}/set_lr_scheduler',
-            json_data={'scheduler_cls': scheduler_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-
-    def save(self, name: str, **kwargs) -> SaveResponse:
-        """Save model checkpoint."""
-        response = http_post(
-            url=f'{self.server_url}/save',
-            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return SaveResponse(**response.json())
-
-    def load(self, name: str, **kwargs) -> None:
-        """Load model checkpoint."""
-        response = http_post(
-            url=f'{self.server_url}/load',
-            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-
-    def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> Dict[str, Any]:
-        response = http_post(
-            url=f'{self.server_url}/resume_from_checkpoint',
-            json_data={'name': name, 'adapter_name': self.adapter_name,
-                       'resume_only_model': resume_only_model, **kwargs}
-        )
-        response.raise_for_status()
-        return TrainingProgressResponse(**response.json()).result
-
-    def apply_patch(self, patch_cls: str, **kwargs) -> None:
-        """Apply a patch to the model."""
-        response = http_post(
-            url=f'{self.server_url}/apply_patch',
-            json_data={'patch_cls': patch_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-
-    def add_metric(self, metric_cls: str, is_training: Optional[bool] = None, **kwargs) -> None:
-        """Add a metric to the model."""
-        response = http_post(
-            url=f'{self.server_url}/add_metric',
-            json_data={'metric_cls': metric_cls, 'is_training': is_training, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'set_lr_scheduler',
+            model_types.SetLrSchedulerRequest,
+            None,
+            scheduler_cls=scheduler_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def set_template(self, template_cls: str, **kwargs) -> None:
-        """Set the template for data processing."""
-        response = http_post(
-            url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': self.model_id, **kwargs}
-        )
-        response.raise_for_status()
+        """Set the template for data processing.
+
+        ``model_id`` is not injected here: the backend always overrides it with its own
+        tokenizer id, so sending it made the request advertise a parameter that had no
+        effect. A caller that passes it explicitly still reaches the template
+        constructor through the passthrough region.
+        """
+        self._submit(
+            'set_template',
+            model_types.SetTemplateRequest,
+            None,
+            template_cls=template_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
     def set_processor(self, processor_cls: str, **kwargs) -> None:
         """Set the input processor."""
-        response = http_post(
-            url=f'{self.server_url}/set_processor',
-            json_data={'processor_cls': processor_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
+        self._submit(
+            'set_processor',
+            model_types.SetProcessorRequest,
+            None,
+            processor_cls=processor_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
-    def calculate_metric(self, is_training: bool = True, **kwargs) -> CalculateMetricResponse:
+    def add_metric(self, metric_cls: str, is_training: bool | None = None, **kwargs) -> None:
+        """Add a metric to the model."""
+        self._submit(
+            'add_metric',
+            model_types.AddMetricRequest,
+            None,
+            metric_cls=metric_cls,
+            is_training=is_training,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def apply_patch(self, patch_cls: str, **kwargs) -> None:
+        """Apply a patch to the model."""
+        self._submit(
+            'apply_patch',
+            model_types.ApplyPatchRequest,
+            None,
+            patch_cls=patch_cls,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def calculate_metric(self, is_training: bool = True, **kwargs) -> model_types.CalculateMetricResponse:
         """Calculate metrics from model outputs."""
-        response = http_post(
-            url=f'{self.server_url}/calculate_metric',
-            json_data={'is_training': is_training, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return CalculateMetricResponse(**response.json())
+        return self._submit(
+            'calculate_metric',
+            model_types.CalculateMetricRequest,
+            model_types.CalculateMetricResponse,
+            is_training=is_training,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
 
-    def get_state_dict(self, **kwargs) -> GetStateDictResponse:
-        """Get model state dictionary."""
-        response = http_post(
-            url=f'{self.server_url}/get_state_dict',
-            json_data={'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return GetStateDictResponse(**response.json())
+    # ------------------------------------------------------------------ #
+    # Checkpoint I/O
+    # ------------------------------------------------------------------ #
+
+    def save(self, name: str, **kwargs) -> model_types.SaveResponse:
+        """Save model checkpoint."""
+        return self._submit(
+            'save',
+            model_types.SaveRequest,
+            model_types.SaveResponse,
+            name=name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def load(self, name: str, **kwargs) -> None:
+        """Load model checkpoint."""
+        self._submit(
+            'load',
+            model_types.LoadRequest,
+            None,
+            name=name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            **kwargs)
+
+    def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> dict[str, Any]:
+        """Resume weights (and optionally optimizer state) from a checkpoint."""
+        progress = self._submit(
+            'resume_from_checkpoint',
+            model_types.ResumeFromCheckpointRequest,
+            model_types.TrainingProgressResponse,
+            name=name,
+            adapter_name=kwargs.pop('adapter_name', self.adapter_name),
+            resume_only_model=resume_only_model,
+            **kwargs)
+        return progress.result
 
     def upload_to_hub(
         self,
         checkpoint_dir: str,
         hub_model_id: str,
-        hub_token: Optional[str] = None,
+        hub_token: str | None = None,
         async_upload: bool = True,
         poll_interval: float = 5.0,
     ) -> None:
         """Upload model checkpoint to hub.
 
-        Submits the upload task to the server and polls for completion.
-        Blocks until the upload finishes or raises on failure.
+        Submits the upload task and blocks (via the Client_Future_Layer) until it
+        finishes, raising ``TaskFailedError`` on failure.
 
         Args:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
             async_upload: Deprecated, has no effect. The server always runs the
-                upload in the background and the client polls for completion.
-            poll_interval: Seconds between status poll requests (default: 5).
+                upload in the background and the client waits via the future layer.
+            poll_interval: Deprecated, has no effect. Pacing is now owned by the
+                server-side long-poll of the Retrieve_Endpoint.
         """
-        response = http_post(
-            url=f'{self.server_url}/upload_to_hub',
-            json_data={
-                'checkpoint_dir': checkpoint_dir,
-                'hub_model_id': hub_model_id,
-                'hub_token': hub_token,
-            }
-        )
-        response.raise_for_status()
-        request_id = response.json().get('request_id')
-        if not request_id:
-            return
-
-        print(f'[upload_to_hub] Upload started (task {request_id}), waiting for completion...')
-        while True:
-            status_resp = http_get(url=f'{self.server_url}/upload_status/{request_id}')
-            status_resp.raise_for_status()
-            data = status_resp.json()
-            status = data.get('status', 'unknown')
-            if status == 'completed':
-                print(f'[upload_to_hub] Upload completed successfully.')
-                return
-            elif status == 'failed':
-                error = data.get('error', 'Unknown error')
-                raise RuntimeError(f'[upload_to_hub] Upload failed: {error}')
-            else:
-                print(f'[upload_to_hub] Status: {status}...')
-                time.sleep(poll_interval)
+        logger.info('[upload_to_hub] submitting upload, waiting for completion...')
+        self._submit(
+            'upload_to_hub',
+            model_types.UploadToHubRequest,
+            None,
+            checkpoint_dir=checkpoint_dir,
+            hub_model_id=hub_model_id,
+            hub_token=hub_token)
+        logger.info('[upload_to_hub] upload completed successfully.')

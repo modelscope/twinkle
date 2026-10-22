@@ -85,9 +85,10 @@ class MuonClip(Optimizer):
         super().__init__(params, defaults)
         # Only pay for the attention wrappers if some group will actually clip. Reading the groups rather
         # than the argument, since `create_muon_param_groups` can turn it off per group.
-        if any(
-                group.get('qk_clip_enabled', qk_clip_enabled) and group.get('is_qk', False)
-                for group in self.param_groups):
+        self._qk_groups_present = any(
+            group.get('qk_clip_enabled', qk_clip_enabled) and group.get('is_qk', False)
+            for group in self.param_groups)
+        if self._qk_groups_present:
             MaxLogitsTracker.install()
 
     @staticmethod
@@ -124,7 +125,9 @@ class MuonClip(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        max_logits = self._resolve_max_logits(max_logits)
+        # No group can clip -> skip the max-logit collective entirely (the all-reduce in
+        # _resolve_max_logits runs even when nothing recorded, just to stay collective).
+        max_logits = self._resolve_max_logits(max_logits) if self._qk_groups_present else None
 
         for group in self.param_groups:
             lr = float(group['lr'])

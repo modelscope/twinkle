@@ -9,15 +9,15 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|tests/)
       - id: check-yaml
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|tests/)
       - id: end-of-file-fixer
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|tests/)
       - id: requirements-txt-fixer
         exclude: ^(client_tools/|src/twinkle_client/|tests/)
       - id: check-merge-conflict
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|tests/)
       - id: mixed-line-ending
         args: ["--fix=lf"]
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|tests/)

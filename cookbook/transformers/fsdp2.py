@@ -140,14 +140,13 @@ def train():
         # the fused-CE + FSDP2 collectives are rank-symmetric. liger_bench.py
         # avoids this with a per-step _synchronize(); one pre-loop drain is
         # sufficient (verified on 35B MoE, 4x Ascend, FSDP2).
+        import torch
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
             _dist.barrier()
         if Torch.is_npu_available():
-            import torch_npu
             torch.npu.synchronize()
         if Torch.is_gpu_available():
-            import torch
             torch.cuda.synchronize()
         logger.info('[fsdp2] fused-CE: pre-loop barrier+device-sync drain applied')
     for batch in dataloader:

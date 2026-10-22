@@ -34,8 +34,12 @@ class ResourceManager:
         import ray
         from ray.util.placement_group import PlacementGroup
         all_ranks = []
+        shared_groups = []
         last_rank = -1
         cpu_proc_count = 0
+        group_names = [group.name for group in groups]
+        if len(group_names) != len(set(group_names)):
+            raise ValueError(f'DeviceGroup names must be unique, got {group_names}.')
         device_types = {group.device_type.upper() for group in groups} - {'CPU'}
         assert len(device_types) <= 1
 
@@ -49,17 +53,36 @@ class ResourceManager:
         for group in groups:
             ranks = group.ranks
             if (group.device_type or '').upper() == 'CPU':
+                if group.shared:
+                    raise ValueError(f"CPU DeviceGroup '{group.name}' cannot be shared.")
                 assert isinstance(ranks, int), 'CPU group only supports integer ranks'
                 cpu_proc_count += ranks
                 continue
 
             if isinstance(ranks, int):
+                if group.shared:
+                    raise ValueError(
+                        f"Shared DeviceGroup '{group.name}' requires explicit physical ranks; got ranks={ranks}.")
                 ranks = list(range(last_rank + 1, last_rank + 1 + ranks))
-            all_ranks.extend(ranks)
+            ranks = list(ranks)
+            if not ranks:
+                raise ValueError(f"DeviceGroup '{group.name}' must contain at least one rank.")
             group.ranks = ranks
-            last_rank = ranks[-1]
+            if group.shared:
+                shared_groups.append(group)
+                continue
+            all_ranks.extend(ranks)
+            last_rank = max(last_rank, max(ranks))
 
-        assert len(set(all_ranks)) == len(all_ranks)  # no duplication
+        if len(set(all_ranks)) != len(all_ranks):
+            raise ValueError('Non-shared DeviceGroup ranks must not overlap.')
+        allocated_ranks = set(all_ranks)
+        for group in shared_groups:
+            missing = sorted(set(group.ranks) - allocated_ranks)
+            if missing:
+                raise ValueError(
+                    f"Shared DeviceGroup '{group.name}' references unallocated physical ranks {missing}; "
+                    'shared ranks must be a subset of non-shared DeviceGroup ranks.')
         if device_type != 'CPU':
             # Calculate required nodes based on actual node indices spanned by all_ranks
             if all_ranks:

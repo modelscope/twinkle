@@ -155,9 +155,9 @@ class TestDataCollator:
         assert 'attention_mask' in batch_right
 
 
-class TestDeviceMeshSampler:
+class TestShardedBatchSampler:
 
-    def test_device_mesh_sampler_basic(self):
+    def test_sharded_batch_sampler_basic(self):
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
@@ -169,7 +169,7 @@ class TestDeviceMeshSampler:
         assert len(batches) > 0
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
-    def test_device_mesh_sampler_with_encode(self):
+    def test_sharded_batch_sampler_with_encode(self):
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)

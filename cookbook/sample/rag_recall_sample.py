@@ -1,9 +1,9 @@
 """RAG recall test: compress a query via condenser → embed → search LanceDB.
 
-End-to-end validation that the thinking-trace RAG index built by
-``cookbook/exp/embedding/build_thinking_rag_index.py`` is retrievable.
+End-to-end retrieval validation against a prebuilt thinking-trace RAG index
+in LanceDB (select its location with ``--db-path``).
 
-Architecture (8 GPUs, same as build script):
+Architecture (8 GPUs):
   * GPU 0-3: vLLM condenser (TP=4)
   * GPU 4-7: TransformersModel embedding (DP=4)
 

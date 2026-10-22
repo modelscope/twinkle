@@ -11,15 +11,21 @@ from __future__ import annotations
 
 import functools
 import inspect
+import itertools
 import threading
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, Generator, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 __all__ = ['TimeRecorder', 'default_recorder', 'timed', 'span', 'enable_perf', 'disable_perf']
 
 _NS_PER_SEC = 1e9
+
+#: Source of ``_Span.sid``. Allocation happens at span construction, so a parent's
+#: sid is always SMALLER than its children's -- the ordering offline timeline
+#: analysis relies on when folding subtree self-times (see :mod:`.timeline`).
+_SPAN_IDS = itertools.count()
 
 
 class _Span:
@@ -30,13 +36,20 @@ class _Span:
     a parent POINTER rather than a shared stack list is what makes concurrent
     contexts safe: each ``span()`` enter creates a fresh object and rebinds the
     ContextVar to it, so two coroutines never mutate one another's chain.
+
+    ``sid`` (construction order, process-unique) and ``tid`` (owning thread id)
+    make a closed span a self-contained event: the id pair is what the offline
+    timeline rebuild keys its nesting edges and per-thread lanes on, since span
+    NAMES repeat while identities do not.
     """
 
-    __slots__ = ('name', 'parent', 'start_ns', 'child_ns')
+    __slots__ = ('name', 'parent', 'sid', 'tid', 'start_ns', 'child_ns')
 
-    def __init__(self, name: str, parent: Optional['_Span'], start_ns: int) -> None:
+    def __init__(self, name: str, parent: Optional['_Span'], start_ns: int, tid: int) -> None:
         self.name = name
         self.parent = parent
+        self.sid = next(_SPAN_IDS)
+        self.tid = tid
         self.start_ns = start_ns
         self.child_ns = 0
 
@@ -60,8 +73,24 @@ class TimeRecorder:
         self._current: ContextVar[Optional[_Span]] = ContextVar('twinkle_perf_span', default=None)
         self._first_start_ns: Optional[int] = None
         self._last_end_ns: Optional[int] = None
+        # Append-only event stream for offline timeline analysis (see timeline.py):
+        # one 8-tuple per CLOSED span, in close order. Shares the aggregate's window
+        # semantics -- cleared by reset(), snapshotted (not consumed) by trace_events().
+        self._events: List[Tuple[Optional[int], Optional[int], str, int, int, int, int, int]] = []
 
     # ------------------------------------------------------------------ control
+
+    def __reduce__(self):
+        """Pickle by reference to the process-wide recorder.
+
+        The recorder holds a threading.Lock, so any ``@timed`` wrapper that closes
+        over it is unpicklable. Ray serialises actor classes by value (the modified
+        class is dynamic), and a single ``@timed`` method then makes the whole
+        actor un-exportable ("cannot pickle '_thread.lock' object"). The recorder
+        is process-global state, so a worker must time into ITS OWN default
+        recorder rather than a stale copy.
+        """
+        return (_get_default_recorder, ())
 
     def enable(self) -> None:
         self._enabled = True
@@ -78,6 +107,7 @@ class TimeRecorder:
         with self._lock:
             self._stats.clear()
             self._edges.clear()
+            self._events.clear()
             self._first_start_ns = None
             self._last_end_ns = None
 
@@ -103,7 +133,7 @@ class TimeRecorder:
         partial duration); the exception is NOT suppressed.
         """
         parent = self._current.get()
-        current = _Span(name, parent, time.perf_counter_ns())
+        current = _Span(name, parent, time.perf_counter_ns(), threading.get_ident())
         token = self._current.set(current)
         try:
             yield
@@ -120,6 +150,7 @@ class TimeRecorder:
             current.parent.child_ns += total_ns
         self_ns = total_ns - current.child_ns
         parent_name = current.parent.name if current.parent is not None else None
+        parent_sid = current.parent.sid if current.parent is not None else None
         with self._lock:
             stat = self._stats.get(current.name)
             if stat is None:
@@ -134,6 +165,8 @@ class TimeRecorder:
                 self._edges[(parent_name, current.name)] = edge
             edge[0] += 1
             edge[1] += total_ns
+            self._events.append(
+                (current.sid, parent_sid, current.name, current.tid, current.start_ns, end_ns, self_ns, total_ns))
             if self._first_start_ns is None or current.start_ns < self._first_start_ns:
                 self._first_start_ns = current.start_ns
             if self._last_end_ns is None or end_ns > self._last_end_ns:
@@ -179,10 +212,37 @@ class TimeRecorder:
 
     # ------------------------------------------------------------------ output
 
+    def trace_events(self) -> List[Tuple[Optional[int], Optional[int], str, int, int, int, int, int]]:
+        """Snapshot the raw event stream: one tuple per CLOSED span, in close order.
+
+        Each event is ``(sid, parent_sid, name, tid, start_ns, end_ns, self_ns,
+        total_ns)`` -- identities and thread ids included, which is exactly what
+        the offline timeline transforms (:mod:`.timeline`) need to rebuild the
+        nesting tree, the per-thread lanes and the gaps between stations. Copy on
+        read (NOT consumed): aggregates keep accumulating afterwards, so this
+        pairs with ``reset()``'s window semantics exactly like ``summary()`` does.
+        """
+        with self._lock:
+            return list(self._events)
+
     def _wall_ns(self) -> int:
         if self._first_start_ns is None or self._last_end_ns is None:
             return 0
         return self._last_end_ns - self._first_start_ns
+
+    def bubble_s(self) -> float:
+        """Idle seconds in the recorded window: wall time not covered by any root span.
+
+        A root span (parent ``None``) is a top-level timed operation, so the union of the
+        root spans is the window's busy time and ``wall - busy`` is the gap spent waiting --
+        for data, for dispatch, for a peer rank. Clamped at 0 because concurrent roots can
+        overlap and over-count busy. Complements each span's ``self_s`` (idle *inside* a
+        span, between its children) with the idle *between* top-level spans.
+        """
+        with self._lock:
+            wall_ns = self._wall_ns()
+            root_busy_ns = sum(total for (parent, _name), (_count, total) in self._edges.items() if parent is None)
+        return max(0, wall_ns - root_busy_ns) / _NS_PER_SEC
 
     def summary(self) -> Dict[str, Any]:
         """Structured aggregate: per-span timings plus the nesting tree.
@@ -264,6 +324,11 @@ class TimeRecorder:
 #: Process-wide recorder bound by the module-level :func:`timed` / :func:`span`.
 #: Disabled by default so importing perf never changes existing behaviour.
 default_recorder = TimeRecorder(enabled=False)
+
+
+def _get_default_recorder() -> TimeRecorder:
+    """Unpickling entry point for :meth:`TimeRecorder.__reduce__`."""
+    return default_recorder
 
 #: Decorator bound to :data:`default_recorder`; ``@timed`` or ``@timed('name')``.
 timed = default_recorder.timed

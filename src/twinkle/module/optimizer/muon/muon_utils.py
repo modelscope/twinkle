@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import torch.nn as nn
 
 from twinkle.utils import get_logger
 
@@ -39,7 +41,7 @@ class MuonConfig:
     momentum: float = 0.95
     nesterov: bool = False
     newton_schulz_steps: int = 5
-    qk_clip_tau: float = 100.0
+    qk_clip_tau: float = 10000.0
     qk_clip_enabled: bool = True
     rms_scale_factor: float = 0.2
     adamw_betas: Tuple[float, float] = (0.9, 0.999)
@@ -69,24 +71,37 @@ class MuonConfig:
         }
 
 
-def create_muon_param_groups(param_groups: List[Dict[str, Any]], config: MuonConfig) -> List[Dict[str, Any]]:
+def create_muon_param_groups(param_groups: List[Dict[str, Any]],
+                              config: MuonConfig,
+                              model: Optional[nn.Module] = None) -> List[Dict[str, Any]]:
     """Split the given param groups by how :class:`MuonClip` should treat each parameter.
 
     Each incoming group can yield up to three: the Q/K weights (`apply_muon=True, is_qk=True`), the other
     matrices (`apply_muon=True`), and everything Muon does not apply to (`apply_muon=False`) -- vectors,
-    plus whatever `config.exclude_keys` matches. Splitting rather than rebuilding keeps each group's own
-    `lr` and `weight_decay`, which a caller may have set per group and which a flat regrouping would drop.
+    parameters inside an ``nn.Embedding``, plus whatever `config.exclude_keys` matches. Splitting rather
+    than rebuilding keeps each group's own `lr` and `weight_decay`, which a caller may have set per group
+    and which a flat regrouping would drop.
 
     Args:
         param_groups: The param groups built by the caller, each with `params` and `param_names`.
         config: The Muon config.
+        model: The model the parameters come from. When given, every parameter inside an
+            ``nn.Embedding`` is forced into the AdamW bucket by TYPE -- only some families name it
+            `embed_tokens` (internlm2 says `tok_embeddings`, chatglm `transformer.embedding`, ...),
+            so the static `exclude_keys` cannot cover them all.
     Returns:
         The new param groups, ready to be passed to :class:`MuonClip`.
     """
     defaults = config.group_defaults
+    embedding_param_ids = set()
+    if model is not None:
+        for module in model.modules():
+            if isinstance(module, nn.Embedding):
+                embedding_param_ids.update(id(p) for p in module.parameters())
     new_param_groups = []
     counts = {'qk': 0, 'muon': 0, 'rest': 0}
     qk_examples = []
+    embedding_examples = []
 
     for group in param_groups:
         names = group.get('param_names')
@@ -96,8 +111,11 @@ def create_muon_param_groups(param_groups: List[Dict[str, Any]], config: MuonCon
         buckets = {'qk': [], 'muon': [], 'rest': []}
         for index, name in enumerate(names):
             param = group['params'][index]
-            if param.ndim < 2 or any(key in name for key in config.exclude_keys):
+            if (param.ndim < 2 or id(param) in embedding_param_ids
+                    or any(key in name for key in config.exclude_keys)):
                 kind = 'rest'
+                if id(param) in embedding_param_ids and len(embedding_examples) < 3:
+                    embedding_examples.append(name)
             elif any(key in name.lower() for key in config.qk_keys):
                 kind = 'qk'
             else:
@@ -125,6 +143,8 @@ def create_muon_param_groups(param_groups: List[Dict[str, Any]], config: MuonCon
     else:
         logger.info(f"Enable Muon for {counts['muon'] + counts['qk']} weights "
                     f"({counts['qk']} of them Q/K), AdamW for {counts['rest']}.")
+        if embedding_examples:
+            logger.info(f'Embedding weights stay on AdamW by type, e.g. {embedding_examples}.')
     if config.qk_clip_enabled and counts['qk'] == 0:
         logger.warning(f'QK-Clip is enabled but no parameter matched qk_keys={list(config.qk_keys)}, '
                        'so nothing will ever be clipped.')

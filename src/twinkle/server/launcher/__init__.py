@@ -27,6 +27,6 @@ Usage:
 """
 from __future__ import annotations
 
-from .server_launcher import ServerLauncher, build_ray_runtime_env, launch_server
+from .server_launcher import ServerLauncher, build_ray_runtime_env, ensure_ray_cluster, launch_server
 
-__all__ = ['ServerLauncher', 'launch_server', 'build_ray_runtime_env']
+__all__ = ['ServerLauncher', 'launch_server', 'build_ray_runtime_env', 'ensure_ray_cluster']

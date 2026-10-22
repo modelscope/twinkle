@@ -118,10 +118,10 @@ def test_gdn_patch_routes_each_owner_and_preserves_non_sp(monkeypatch):
 
 
 def test_router_replay_uses_model_owner_outside_forward(monkeypatch):
-    from twinkle.model.transformers.moe import router_replay as rr
+    from twinkle.model.transformers.moe.router_replay import RouterReplay as rr
 
     class Context:
-        sp_world_size = 2
+        world_size = sp_world_size = 2
         real_position_ids = None
 
         def __init__(self, offset):

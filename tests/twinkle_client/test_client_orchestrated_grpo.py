@@ -5,12 +5,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from twinkle_client.types import DataRef
+from twinkle.protocol.types import DataRef
 
-
-MODULE_PATH = (
-    Path(__file__).parents[2] / 'cookbook' / 'client' / 'async_rl' / 'client_orchestrated_grpo.py'
-)
+MODULE_PATH = (Path(__file__).parents[2] / 'cookbook' / 'client' / 'async_rl' / 'client_orchestrated_grpo.py')
 
 
 def _load_module():
@@ -57,6 +54,7 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch, cap
     )
 
     class FakeModel:
+
         def __init__(self):
             self.saved = []
             self.steps = 0
@@ -78,6 +76,7 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch, cap
             return {'result': {'loss': 1.0 / self.steps, 'grad_norm': 0.5}}
 
     class FakeDataPlane:
+
         def __init__(self):
             self.released = []
 
@@ -95,9 +94,21 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch, cap
         model = FakeModel()
         data_plane = FakeDataPlane()
         batches = [
-            [{'name': 'p0-g0'}, {'name': 'p0-g1'}],
-            [{'name': 'p1-g0'}, {'name': 'p1-g1'}],
-            [{'name': 'p2-g0'}, {'name': 'p2-g1'}],
+            [{
+                'name': 'p0-g0'
+            }, {
+                'name': 'p0-g1'
+            }],
+            [{
+                'name': 'p1-g0'
+            }, {
+                'name': 'p1-g1'
+            }],
+            [{
+                'name': 'p2-g0'
+            }, {
+                'name': 'p2-g1'
+            }],
         ]
         await module.run_grpo(batches, model, object(), data_plane)
         return model, data_plane
@@ -152,6 +163,7 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
     monkeypatch.setattr(module, 'GRPOAdvantage', lambda: lambda rewards, **_kwargs: [1.0])
 
     class FakeModel:
+
         def __init__(self):
             self.saved = []
 
@@ -169,6 +181,7 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
             return {'result': {'loss': 1.0}}
 
     class FakeDataPlane:
+
         async def aget(self, ref, *, fields=None):
             assert fields == ['decoded']
             return [{'decoded': ref.ref_id}]
@@ -183,7 +196,13 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
         model = FakeModel()
         try:
             await module.run_grpo(
-                [[{'name': 'p0'}], [{'name': 'p1'}], [{'name': 'p2'}]],
+                [[{
+                    'name': 'p0'
+                }], [{
+                    'name': 'p1'
+                }], [{
+                    'name': 'p2'
+                }]],
                 model,
                 object(),
                 FakeDataPlane(),

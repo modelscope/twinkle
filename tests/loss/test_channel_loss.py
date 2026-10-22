@@ -145,6 +145,8 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
     model._model_wrapped = True
     model._router_replay_enabled = False
     model._enable_sp = False
+    model._gdn_padding_free_enabled = False
+    model.strategy = SimpleNamespace(unwrap_model=lambda model: model)
     model.sp_strategy = None
     model.hf_config = None
     status = SimpleNamespace(inputs=None, outputs=None, forward_kwargs=None, loss_value=0)
@@ -155,6 +157,7 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
         train_status=status,
         accumulate_metrics=lambda _: None,
     )
+    group.get_loss = lambda loss_key=None: group.loss_instance
     model.optimizer_group = {'': group}
 
     TransformersModel.forward.__wrapped__(model, inputs={

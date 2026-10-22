@@ -1,28 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""DeepSpeed training strategy for twinkle.
-
-A peer of ``AccelerateStrategy`` and ``NativeFSDPStrategy``. All DeepSpeed
-logic is self-contained here — the existing strategies are not modified.
-
-Design: construct ``DeepSpeedPlugin`` + ``Accelerator`` in ``__init__``.
-``wrap_model`` applies ZeRO-3 compatibility patches (from
-``twinkle.patch.deepspeed_patches``) around ``accelerator.prepare``.
-``get_full_state_dict`` / ``gather_parameters`` use DeepSpeed's
-``GatheredParameters`` for ZeRO-3 parameter gathering.
-"""
 import os
 from contextlib import nullcontext
 from datetime import timedelta
 from typing import Any, Dict, Literal, Mapping, Optional
 
+import torch.nn as nn
+
+from twinkle.model.state_dict_utils import collect_local_state, is_saveable_adapter_key
 from twinkle.patch import apply_context, apply_patch
 # Re-export for convenience
 from twinkle.patch.deepspeed_patches import DeepSpeedLeafModulesPatch  # noqa: F401
 from twinkle.patch.deepspeed_patches import (DeepSpeedHookReorderPatch, DeepSpeedModulesToSavePatch,
                                              DeepSpeedParamWrapperPatch)
+from .base import TransformerStrategyBase
 
 
-class DeepSpeedStrategy:
+class DeepSpeedStrategy(TransformerStrategyBase):
     """A training strategy backed by HuggingFace accelerate + DeepSpeed.
 
     Args:
@@ -78,10 +71,6 @@ class DeepSpeedStrategy:
 
     # -- state queries ------------------------------------------------------
 
-    @property
-    def is_deepspeed_enabled(self) -> bool:
-        return True
-
     def is_zero_stage(self, stage: int) -> bool:
         cfg = self._deepspeed_plugin.deepspeed_config
         if not isinstance(cfg, dict):
@@ -112,12 +101,6 @@ class DeepSpeedStrategy:
                 cfg = getattr(cfg, 'config', cfg)
             return deepspeed.zero.Init(config_dict_or_path=cfg)
         return nullcontext()
-
-    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
-        pass
-
-    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
-        return config_or_dir
 
     def wrap_model(self, model, *args):
         """Wrap model with DeepSpeed via ``accelerator.prepare``.
@@ -159,6 +142,8 @@ class DeepSpeedStrategy:
         model,
         optimizer,
         output_path: str,
+        *,
+        param_name_mapping=None,
     ) -> None:
         """Save optimizer state via DeepSpeed engine checkpoint.
 
@@ -167,6 +152,10 @@ class DeepSpeedStrategy:
         Both model and optimizer state are saved — the model portion is
         redundant with ``save()`` but is the standard DeepSpeed format.
         """
+        # Engine checkpoints round-trip optimizer state under DeepSpeed's internal
+        # parameter names, so a caller-side renaming map has no meaning here.
+        if param_name_mapping:
+            raise ValueError('DeepSpeed engine checkpoints do not support param_name_mapping.')
         engine = self.unwrap_model(model)
         save_dir = os.path.dirname(output_path)
         engine.save_checkpoint(save_dir)
@@ -176,28 +165,33 @@ class DeepSpeedStrategy:
         model,
         optimizer,
         input_path: str,
+        *,
+        param_name_mapping=None,
     ) -> None:
         """Load optimizer state from a DeepSpeed engine checkpoint."""
         from twinkle.utils import get_logger
 
         logger = get_logger()
+        if param_name_mapping:
+            raise ValueError('DeepSpeed engine checkpoints do not support param_name_mapping.')
         engine = self.unwrap_model(model)
         load_dir = os.path.dirname(input_path)
         try:
             engine.load_checkpoint(load_dir)
-        except Exception as e:
+        except (KeyError, FileNotFoundError, RuntimeError) as e:
             logger.warning(f'Failed to load deepspeed checkpoint: {e}')
 
     def get_full_state_dict(self, model) -> dict:
-        """Collect full state dict, gathering ZeRO-3 partitioned params."""
+        """Collect full state dict (with persistent buffers), gathering ZeRO-3 partitioned params."""
         unwrapped = self.unwrap_model(model)
+        state = collect_local_state(unwrapped, include_buffers=True)
         if self.is_zero_stage(3):
             from deepspeed.runtime.zero import GatheredParameters
 
-            params = list(unwrapped.parameters())
+            params = [t for t in state.values() if isinstance(t, nn.Parameter)]
             with GatheredParameters(params):
-                return {k: v.cpu() for k, v in unwrapped.named_parameters()}
-        return {k: v.cpu() for k, v in unwrapped.named_parameters()}
+                return {name: tensor.cpu() for name, tensor in state.items()}
+        return {name: tensor.cpu() for name, tensor in state.items()}
 
     def load_full_state_dict(self, model, state_dict) -> None:
         """Load a full state dict into the (possibly partitioned) model."""
@@ -212,24 +206,20 @@ class DeepSpeedStrategy:
             unwrapped.load_state_dict(state_dict, strict=False)
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
-        """Collect only LoRA adapter parameters, gathering under ZeRO-3."""
+        """Collect LoRA parameters, trained modules_to_save copies and their buffers, gathering under ZeRO-3."""
         unwrapped = self.unwrap_model(model)
         adapter_suffix = f'.{adapter_name}.'
-        state_dict = {}
+        state = collect_local_state(unwrapped, include_buffers=True)
+        selected = {n: t for n, t in state.items() if is_saveable_adapter_key(n) and adapter_suffix in n}
 
         if self.is_zero_stage(3):
             from deepspeed.runtime.zero import GatheredParameters
 
-            params = [p for n, p in unwrapped.named_parameters() if _is_lora_state_key(n) and adapter_suffix in n]
+            # ZeRO-3 partitions parameters only; buffers are plain tensors and pass through.
+            params = [t for t in selected.values() if isinstance(t, nn.Parameter)]
             with GatheredParameters(params):
-                for n, p in unwrapped.named_parameters():
-                    if _is_lora_state_key(n) and adapter_suffix in n:
-                        state_dict[n] = p.cpu()
-        else:
-            for n, p in unwrapped.named_parameters():
-                if _is_lora_state_key(n) and adapter_suffix in n:
-                    state_dict[n] = p.cpu()
-        return state_dict
+                return {n: t.cpu() for n, t in selected.items()}
+        return {n: t.cpu() for n, t in selected.items()}
 
     # -- DeepSpeed-specific -------------------------------------------------
 
@@ -247,7 +237,3 @@ class DeepSpeedStrategy:
 
             return GatheredParameters(params)
         return nullcontext()
-
-
-def _is_lora_state_key(name: str) -> bool:
-    return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name

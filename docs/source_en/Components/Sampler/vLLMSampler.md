@@ -5,34 +5,38 @@ vLLMSampler uses the vLLM engine for efficient inference, supporting high-throug
 ## Usage Example
 
 ```python
+import twinkle
 from twinkle.sampler import vLLMSampler
-from twinkle.data_format import SamplingParams
+from twinkle.data_format import SamplingParams, Trajectory
 from twinkle import DeviceMesh
+
+twinkle.initialize(mode='local', nproc_per_node=1)
+trajectories = [Trajectory(messages=[{'role': 'user', 'content': 'What is 2 + 3?'}])]
 
 # Create sampler
 sampler = vLLMSampler(
     model_id='ms://Qwen/Qwen3.5-4B',
-    device_mesh=DeviceMesh.from_sizes(dp_size=2, tp_size=2),
-    remote_group='sampler_group'
+    engine_args={'enable_lora': True, 'max_lora_rank': 16},
+    device_mesh=DeviceMesh.from_sizes(dp_size=1),
 )
 
-# Add LoRA
-sampler.add_adapter_to_model('my_lora', 'path/to/lora')
+# Encode chat messages using the model's template
+sampler.set_template('Qwen3_5Template')
 
 # Set sampling parameters
 params = SamplingParams(
     max_tokens=512,
     temperature=0.7,
     top_p=0.9,
-    top_k=50
+    top_k=50,
+    num_samples=4,
 )
 
 # Perform sampling
 responses = sampler.sample(
     trajectories,
     sampling_params=params,
-    adapter_name='my_lora',
-    num_samples=4  # Generate 4 samples per prompt
+    adapter_path='path/to/lora',  # Saved LoRA checkpoint (rank <= max_lora_rank)
 )
 ```
 

@@ -11,14 +11,14 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 from typing import Any
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
-from .openai_handlers import _register_openai_routes
+from .openai_handlers import _register_api_key_gate, _register_openai_routes
 from .proxy import ServiceProxy
-from .tinker_handlers import _register_tinker_routes
-from .twinkle_handlers import _register_twinkle_routes
+from .tinker_handlers import _register_gateway_tinker_routes
+from .twinkle_handlers import _register_gateway_twinkle_routes
 
 logger = get_logger()
 
@@ -48,6 +48,18 @@ class GatewayServer(LazyCleanupMixin):
         self.owned_by = kwargs.get('owned_by') or 'twinkle'
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
+        # Per-instance, not module-level: a process-global set never got cleared
+        # across replica rebuilds and made the OpenAI template tests non-isolatable.
+        self._template_initialized: set[str] = set()
+
+    @property
+    def supported_model_names(self) -> frozenset[str]:
+        """Base-model names this gateway accepts.
+
+        Public because ``openai_handlers._resolve_base_model`` reads it; it used to
+        reach into ``gateway._supported_model_names`` directly.
+        """
+        return self._supported_model_names
 
     @staticmethod
     def _normalize_server_state_args(server_config: Any) -> dict[str, Any]:
@@ -120,9 +132,11 @@ def build_gateway_app(deploy_options: dict[str, Any],
     # because it has no per-handler request hook, so the lazy-cleanup middleware
     # must cover every route (and stays innermost).
     def register_routes(app: FastAPI, get_self: Any) -> None:
-        _register_tinker_routes(app, get_self)
-        _register_twinkle_routes(app, get_self)
+        _register_gateway_tinker_routes(app, get_self)
+        _register_gateway_twinkle_routes(app, get_self)
         _register_openai_routes(app, get_self)
+        # Registered last so the api_key gate wraps everything installed before it.
+        _register_api_key_gate(app, get_self)
 
     async def _on_shutdown(servable: Any) -> None:
         await servable.proxy.close()

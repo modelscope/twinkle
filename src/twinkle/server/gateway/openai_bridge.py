@@ -58,6 +58,21 @@ def _require_model(body: dict[str, Any]) -> str:
     return model
 
 
+def _is_token_ids(value: Any) -> bool:
+    """True for a non-empty list of plain ints -- OpenAI's token-id prompt/input form."""
+    return (isinstance(value, list) and bool(value)
+            and all(isinstance(t, int) and not isinstance(t, bool) for t in value))
+
+
+def _text_trajectory(text: str) -> dict[str, Any]:
+    """One bare text as a single-user-turn Trajectory.
+
+    The gateway has no tokenizer, so text prompts run through the model's own chat template;
+    token-id prompts skip it entirely by arriving as a pre-encoded InputFeature.
+    """
+    return {'messages': [{'role': 'user', 'content': text}]}
+
+
 def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Translate an OpenAI chat completion request body to a SampleRequest dict.
 
@@ -202,21 +217,37 @@ def _map_stop_reason(stop_reason: str | None) -> str:
 def translate_completion_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Translate an OpenAI text-completion request body to a SampleRequest dict.
 
-    A completion prompt is wrapped as a single-user-turn ``Trajectory`` rather than pre-encoded token
-    ids: the gateway has no tokenizer, and running the prompt through the model's own chat template is
-    what a served chat model expects. ``logprobs`` here is OpenAI's completion-style bare int (not the
-    chat bool + ``top_logprobs`` pair), so it is mapped on its own after the shared extractor.
+    ``prompt`` takes any of OpenAI's four forms -- a string, a list of strings, a list of token
+    ids, or a list of such lists. Text prompts are wrapped as single-user-turn ``Trajectory``
+    entries (the gateway has no tokenizer, and running the prompt through the model's own chat
+    template is what a served chat model expects); token-id lists arrive as pre-encoded
+    ``InputFeature`` entries instead. ``logprobs`` here is OpenAI's completion-style bare int (not
+    the chat bool + ``top_logprobs`` pair), so it is mapped on its own after the shared extractor.
 
     Returns:
         ``(sample_request_dict, sticky_key)`` -- same contract as :func:`translate_chat_request`.
 
     Raises:
-        ValueError: If ``model`` or ``prompt`` is missing or invalid.
+        ValueError: If ``model`` or ``prompt`` is missing or invalid, or ``echo`` / ``suffix`` is
+            set (this gateway does not echo the prompt or generate mid-prompt, and silently
+            dropping either would return a response that is not what was asked for).
     """
     model = _require_model(body)
 
+    for unsupported in ('echo', 'suffix'):
+        if body.get(unsupported):
+            raise ValueError(unsupported)
+
     prompt = body.get('prompt')
-    if not isinstance(prompt, str) or not prompt:
+    if isinstance(prompt, str):
+        inputs: list[dict[str, Any]] = [_text_trajectory(prompt)]
+    elif isinstance(prompt, list) and prompt and all(isinstance(t, str) for t in prompt):
+        inputs = [_text_trajectory(t) for t in prompt]
+    elif _is_token_ids(prompt):
+        inputs = [{'input_ids': prompt}]
+    elif isinstance(prompt, list) and prompt and all(_is_token_ids(t) for t in prompt):
+        inputs = [{'input_ids': t} for t in prompt]
+    else:
         raise ValueError('prompt')
 
     sampling_params = _extract_sampling_params(body)
@@ -224,12 +255,7 @@ def translate_completion_request(body: dict[str, Any]) -> tuple[dict[str, Any], 
         sampling_params['logprobs'] = body['logprobs']
 
     sample_request = {
-        'inputs': {
-            'messages': [{
-                'role': 'user',
-                'content': prompt
-            }]
-        },
+        'inputs': inputs,
         'sampling_params': sampling_params or None,
         'adapter_name': model,
     }
@@ -287,6 +313,32 @@ def translate_completion_response(
     }
 
 
+def translate_completion_stream_chunk(
+    delta_text: str,
+    model: str,
+    finish_reason: str | None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Translate one sampler stream delta to an OpenAI ``text_completion.chunk``.
+
+    The streaming counterpart of :func:`translate_completion_response`. The sampler's NDJSON lines
+    carry ``{"delta", "finish_reason"}``; each becomes one chunk whose ``text`` is the delta.
+    """
+    if request_id is None:
+        request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
+    return {
+        'id': request_id,
+        'object': 'text_completion.chunk',
+        'created': int(time.time()),
+        'model': model,
+        'choices': [{
+            'index': 0,
+            'text': delta_text or '',
+            'finish_reason': finish_reason,
+        }],
+    }
+
+
 def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Translate an OpenAI embeddings request body to a ``/twinkle/encode`` request dict.
 
@@ -304,9 +356,13 @@ def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], s
 
     raw_input = body.get('input')
     if isinstance(raw_input, str):
-        texts = [raw_input]
+        inputs = [_text_trajectory(raw_input)]
     elif isinstance(raw_input, list) and raw_input and all(isinstance(t, str) for t in raw_input):
-        texts = raw_input
+        inputs = [_text_trajectory(t) for t in raw_input]
+    elif _is_token_ids(raw_input):
+        inputs = [{'input_ids': raw_input}]
+    elif isinstance(raw_input, list) and raw_input and all(_is_token_ids(t) for t in raw_input):
+        inputs = [{'input_ids': t} for t in raw_input]
     else:
         raise ValueError('input')
 
@@ -315,12 +371,7 @@ def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], s
         pooling_params['dimensions'] = body['dimensions']
 
     encode_request = {
-        'inputs': [{
-            'messages': [{
-                'role': 'user',
-                'content': text
-            }]
-        } for text in texts],
+        'inputs': inputs,
         'pooling_params': pooling_params,
         'adapter_name': model,
     }
@@ -338,6 +389,8 @@ def translate_embedding_response(encode_data: dict[str, Any], model: str) -> dic
             'index': index,
             'embedding': vector
         } for index, vector in enumerate(vectors)],
+        # usage is a zero placeholder: the pooling forward has no tokenizer to count tokens, and
+        # OpenAI makes the field mandatory. Clients that bill on token counts must count their side.
         'usage': {
             'prompt_tokens': 0,
             'total_tokens': 0
@@ -383,7 +436,12 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
         raise ValueError('model')
 
     sampling_params = _extract_sampling_params(request_config)
-    sampling_params['logprobs'] = request_config.get('logprobs') if request_config.get('logprobs') is not None else 0
+    # Rollout recomputes importance ratios against the served per-token logprobs, so they are
+    # forced on: at least the minimum count even when the request did not ask for them.
+    sampling_params['logprobs'] = max(int(sampling_params.get('logprobs') or 0), 1)
+    for name in ('top_k', 'prompt_logprobs'):
+        if request_config.get(name) is not None:
+            sampling_params[name] = request_config[name]
 
     sample_request = {
         'inputs': inputs,

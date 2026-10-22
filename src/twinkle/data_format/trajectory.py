@@ -62,6 +62,44 @@ def attach_user_data(trajectory: Trajectory, **values: Any) -> Trajectory:
     return out
 
 
+def ground_truth(trajectory: Trajectory, key: str = 'ground_truth') -> Any:
+    """A trajectory's gold label: the packed ``user_data`` entry first, the flat column second.
+
+    Both spellings carry the same label -- a twinkle pipeline packs ``user_data``, a swift scoring
+    row keeps dataset columns flat -- so a Reward reads one helper and works in either world.
+    """
+    value = user_data_get(trajectory.get('user_data'), key)
+    if value is None:
+        value = trajectory.get(key)
+    return value
+
+
+def msg_content_text(msg: Dict[str, Any]) -> str:
+    """Extract plain text from a message's content (str | list | dict)."""
+    c = msg.get('content')
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
+    if isinstance(c, dict) and c.get('type') == 'text':
+        return c.get('text', '')
+    return ''
+
+
+def last_assistant_text(trajectory: Trajectory) -> str:
+    """The newest assistant turn's text -- the completion a reward scores.
+
+    Multimodal messages carry content as a list of parts, so text goes through
+    :func:`msg_content_text` instead of being read as a plain string. The *last* assistant
+    turn: a conversation that went through tools has several, and the model's answer is
+    the turn it finished on.
+    """
+    for message in reversed(trajectory.get('messages') or []):
+        if isinstance(message, dict) and message.get('role') == 'assistant':
+            return msg_content_text(message)
+    return ''
+
+
 def user_data_get(items: Any, key: str, default: Any = None) -> Any:
     """Look up the first value matching ``key`` in packed user_data, decoded."""
     if isinstance(items, Mapping):

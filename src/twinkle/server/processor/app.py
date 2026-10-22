@@ -18,11 +18,11 @@ from fastapi import FastAPI
 from ray import serve
 from typing import Any
 
-import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle import DeviceGroup, get_logger
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.runtime import init_twinkle_runtime
+from twinkle.server.session_resource import ProcessorManagerMixin
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.utils.lifecycle import ProcessorManagerMixin
 from .twinkle_handlers import _register_processor_routes
 
 logger = get_logger()
@@ -36,7 +36,7 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
 
     Lifecycle is handled by ProcessorManagerMixin:
     - Processors are registered with a session ID on creation.
-    - A background thread expires processors whose session has timed out.
+    - A background task expires processors whose session has timed out.
     - Per-user processor limit is enforced at registration.
     - Sticky session routing ensures session requests hit the same replica.
     """
@@ -48,16 +48,13 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
                  nproc_per_node: int = 1,
                  processor_config: dict[str, Any] | None = None):
         self.device_group = DeviceGroup(**device_group)
-        twinkle.initialize(
-            mode='ray',
+        self.device_mesh = init_twinkle_runtime(
+            is_mock=False,
             nproc_per_node=nproc_per_node,
-            groups=[self.device_group],
-            lazy_collect=False,
-            ncpu_proc_per_node=ncpu_proc_per_node)
-        if 'mesh_dim_names' in device_mesh:
-            self.device_mesh = DeviceMesh(**device_mesh)
-        else:
-            self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
+            device_group=self.device_group,
+            device_mesh_dict=device_mesh,
+            ncpu_proc_per_node=ncpu_proc_per_node,
+        )
 
         # processor objects keyed by processor_id
         self.resource_dict: dict[str, Any] = {}
@@ -82,10 +79,17 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
         self._ensure_countdown_started()
         await self._ensure_state_cleanup_started()
 
-    def _on_processor_expired(self, processor_id: str) -> None:
-        """Called by the countdown thread when a processor's session expires."""
+    async def _on_processor_expired(self, processor_id: str) -> None:
+        """Remove the local processor and release its shared quota lease."""
+        info = self.get_resource_info(processor_id)
         self.resource_dict.pop(processor_id, None)
         self.unregister_resource(processor_id)
+        if info is not None:
+            await self.state.release_processor_quota(
+                info['token'],
+                processor_id,
+                lease_seconds=self._processor_quota_lease_seconds,
+            )
 
 
 def build_processor_app(ncpu_proc_per_node: int,

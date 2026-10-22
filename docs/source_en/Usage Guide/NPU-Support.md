@@ -209,19 +209,18 @@ export TWINKLE_NPU_GATED_RMSNorm_FP32=1
 
 ## Quick Start
 
-**Important Notice**: The following examples are from the `cookbook/` directory and have been verified in actual NPU environments. It is recommended to run scripts directly from the cookbook rather than copying and pasting code snippets.
+The repository provides Megatron NPU smoke examples in [`cookbook/megatron/ascend/`](https://github.com/modelscope/twinkle/tree/main/cookbook/megatron/ascend). Run the dense-model example from that directory:
 
-### SFT LoRA Fine-tuning
+```bash
+cd cookbook/megatron/ascend
+bash tp_npu.sh
+```
 
-The NPU document no longer provides this kind of SFT cookbook example; this capability should be described together with an actually available cookbook example or a future NPU script.
-
-### GRPO Reinforcement Learning Training
-
-The NPU document no longer provides this kind of GRPO cookbook example; this capability should be described together with an actually available cookbook example or a future NPU script.
+The script uses eight NPUs and runs a short LoRA training loop with TP/PP/DP parallelism. Dedicated GRPO and Tinker server configuration examples for NPU are not currently provided.
 
 ### More Examples
 
-Check the `cookbook/remote/tinker/ascend/` directory for remote training server-side configuration.
+For MoE training smoke examples, see `cookbook/megatron/ascend/tp_moe_npu.py` and `cookbook/megatron/ascend/tp_moe_cp_npu.py`.
 
 ## Parallelization Strategies
 
@@ -286,7 +285,6 @@ Feature support matrix based on actual code verification:
 | DP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
 | FSDP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
 | Ray Distributed | ✅ | ✅ | - | No corresponding cookbook example |
-| TorchSampler | ✅ | ✅ | - | No corresponding cookbook example |
 | vLLMSampler | ✅ | ✅ | - | No corresponding cookbook example |
 | Full Fine-tuning | ✅ | ✅ | - | Verified available |
 | QLoRA | ✅ | ❌ | - | Quantization operators not yet supported |
@@ -307,16 +305,11 @@ Feature support matrix based on actual code verification:
 
 ## Example Code
 
-Twinkle's verified NPU examples currently focus on the Megatron smoke path; the SFT and GRPO cookbook examples do not have corresponding files yet.
+Available NPU smoke examples:
 
-### Remote Training (Tinker Protocol)
-- **Server Configuration**: [cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
-  - Provides HTTP API interface
-  - Supports remote training and inference
-  - Suitable for production environment deployment
-
-**Running Examples**:
-No corresponding command examples are provided yet.
+- [Dense model: `tp_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_npu.py)
+- [MoE model: `tp_moe_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_moe_npu.py)
+- [MoE with context parallelism: `tp_moe_cp_npu.py`](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/ascend/tp_moe_cp_npu.py)
 
 ## Reference Resources
 

@@ -204,13 +204,20 @@ class Torch(Framework):
         return tensor
 
     @staticmethod
-    def synchronize():
+    def synchronize(device=None):
+        """Wait for all queued work on ``device``, defaulting to the LOCAL_RANK device.
+
+        Pass ``device`` explicitly in subprocesses (e.g. vLLM TP workers) that inherit the
+        parent's LOCAL_RANK but are bound to a different device.
+        """
         import torch
+        if device is None:
+            device = Platform.get_local_device()
         if Torch.is_gpu_available():
-            torch.cuda.synchronize(Platform.get_local_device())
+            torch.cuda.synchronize(device)
         elif Torch.is_npu_available():
             import torch_npu
-            torch.npu.synchronize(Platform.get_local_device())
+            torch.npu.synchronize(device)
 
     @staticmethod
     def contains_nan(*args, **kwargs) -> bool:

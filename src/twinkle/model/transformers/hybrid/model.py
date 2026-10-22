@@ -344,6 +344,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                 training_dir,
                 adapter_name=adapter_name,
                 consumed_train_samples=kwargs.get('consumed_train_samples', 0),
+                component_states=kwargs.get('component_states', {}),
             )
             self._write_hybrid_training_manifest(training_dir, adapter_name)
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -396,11 +397,16 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         if not resume_only_model:
             trainer_state = self._restore_training_state(training_dir, adapter_name=adapter_name)
             self._load_rng_state(os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
-        return {
+        result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
+        if resume_only_model:
+            result['component_states'] = {}
+        elif 'component_states' in trainer_state:
+            result['component_states'] = trainer_state['component_states']
+        return result
 
     # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
     # training-state dict immediately, so this override must stay non-lazy too (it either delegates to

@@ -39,8 +39,7 @@ class GRPOLoss(Loss):
         # plain surrogate above. They are the constructor-parameterised form of the controls the
         # legacy ``GRPOTrainer`` applied inline (and dev carried in ``_ConfiguredGRPOLoss`` /
         # ``_AdvancedGRPOLoss``): sequence-level IS, dual-clip, entropy filter/logging, truncated-IS
-        # rollout correction, off-policy sequence masking, FIPO future-KL weighting, SDAR distillation
-        # and CHORD's auxiliary SFT objective.
+        # rollout correction, off-policy sequence masking, FIPO future-KL weighting and SDAR distillation.
         importance_sampling_level: str = 'token',
         delta: Optional[float] = None,
         top_entropy_quantile: float = 1.0,
@@ -57,7 +56,6 @@ class GRPOLoss(Loss):
         fipo_safety_threshold: Optional[float] = 4.0,
         sdar_loss_coef: float = 0.0,
         sdar_gate_beta: float = 5.0,
-        enable_chord: bool = False,
         **kwargs,
     ):
         self.epsilon = epsilon
@@ -87,7 +85,6 @@ class GRPOLoss(Loss):
         self.fipo_safety_threshold = fipo_safety_threshold
         self.sdar_loss_coef = sdar_loss_coef
         self.sdar_gate_beta = sdar_gate_beta
-        self.enable_chord = enable_chord
         # ``_advanced`` selects the configured surrogate pipeline (see ``_configured_grpo``). It covers
         # exactly the controls the base ``_reduce_loss`` path cannot express: dual-clip, entropy
         # filter/logging, overlong filtering, truncated-IS rollout correction / off-policy diagnostics,
@@ -99,9 +96,8 @@ class GRPOLoss(Loss):
         self._advanced = (loss_type == 'fipo' or delta is not None or top_entropy_quantile < 1.0 or log_entropy
                           or overlong_filter or rollout_importance_sampling_mode is not None
                           or log_rollout_offpolicy_metrics or off_policy_sequence_mask_delta is not None)
-        # ``_distill_wrap`` marks the SDAR/CHORD auxiliary objectives, which slice the batch and read
-        # ``outputs['logits']``/``outputs['logps']`` around the policy loss.
-        self._distill_wrap = enable_chord or sdar_loss_coef > 0.0
+        # ``_distill_wrap`` marks the SDAR auxiliary objective, which reads the rollout logits/logps.
+        self._distill_wrap = sdar_loss_coef > 0.0
         # The configured pipeline recomputes the surrogate and aggregation itself and never calls
         # ``_reduce_loss``, so pairing it with a variant whose objective LIVES in an overridden
         # ``_reduce_loss`` (REAL / DRO / DPPO / GeoMean / ClipCov / KLCov) would silently downgrade that
@@ -116,7 +112,7 @@ class GRPOLoss(Loss):
                 'overlong_filter / rollout_importance_sampling_mode / log_rollout_offpolicy_metrics / '
                 'off_policy_sequence_mask_delta / fipo) to use this loss_type.')
         # Gate the expensive forward paths: entropy for the bonus OR the advanced entropy
-        # logging/filtering; logits for the SDAR/CHORD auxiliary terms.
+        # logging/filtering; logits for the SDAR auxiliary term.
         self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
         self.require_logits = self._distill_wrap
 
@@ -286,14 +282,16 @@ class GRPOLoss(Loss):
             elif n_sample == n_pos:
                 # Response-only form (e.g. old_logps from vLLM).
                 result[i, pos] = sample
-            elif n_sample >= seq_len:
-                # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
-                result[i, pos] = sample[:seq_len][mask[i]]
+            elif n_pos == 0 or (n_sample > 0 and pos[-1].item() < n_sample):
+                # Variable-length full-sequence form. The processor right-pads the
+                # batch, but per-sample RL fields from Tinker remain unpadded. They
+                # are valid when every selected mask position exists in this row.
+                result[i, pos] = sample[pos]
             else:
                 raise AssertionError(f'data/mask length mismatch at sample {i}: '
                                      f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                                     '(expected n_sample == n_pos for response-only form, '
-                                     'or n_sample >= seq_len for full-sequence form)')
+                                     '(expected n_sample == n_pos for response-only form, or all masked positions '
+                                     'to exist in the per-sample full-sequence form)')
 
         return result
 
@@ -484,9 +482,6 @@ class GRPOLoss(Loss):
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         rollout_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         truncated: Optional[List[bool]] = None,
-        chord_count: int = 0,
-        chord_mu: float = 0.0,
-        chord_phi: bool = False,
         teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         **kwargs,
     ):
@@ -495,63 +490,31 @@ class GRPOLoss(Loss):
         The extra keyword arguments are supplied by the RL training loop for every GRPO step (so the
         signature is stable whether or not a control is active): ``rollout_logps`` (the sampler's own
         log-probs, for truncated-IS correction and off-policy diagnostics), ``truncated`` (per-row
-        overlong flags), ``chord_count``/``chord_mu``/``chord_phi`` (CHORD's auxiliary-SFT rows appended
-        to the batch and their mixing weight), and ``teacher_logps`` (SDAR's privileged teacher). With
-        every control off this is exactly :meth:`_base_grpo`.
+        overlong flags), and ``teacher_logps`` (SDAR's privileged teacher). With every control off this
+        is exactly :meth:`_base_grpo`.
         """
-        chord_count = int(chord_count)
         if not (self._advanced or self._distill_wrap):
             return self._base_grpo(inputs, outputs, old_logps=old_logps, ref_logps=ref_logps,
                                    advantages=advantages, **kwargs)
 
-        rl_inputs, rl_outputs, rl_kwargs = inputs, outputs, kwargs
-        if chord_count:
-            # CHORD appends ``chord_count`` auxiliary-SFT rows to the batch; the policy loss sees only
-            # the leading rollout rows, the SFT term only the tail.
-            labels = inputs['labels']
-            rl_count = labels.shape[0] - chord_count
-            if rl_count < 1:
-                raise ValueError('advanced GRPO batches must contain at least one rollout sample.')
-            rl_inputs = dict(inputs)
-            rl_inputs['labels'] = labels[:rl_count]
-            rl_outputs = {name: self._slice_batch(value, rl_count) for name, value in outputs.items()}
-            rl_kwargs = {name: self._slice_batch(value, rl_count) for name, value in kwargs.items()}
-
         if self._advanced:
             result = self._configured_grpo(
-                rl_inputs, rl_outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
-                rollout_logps=rollout_logps, truncated=truncated, **rl_kwargs)
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
+                rollout_logps=rollout_logps, truncated=truncated, **kwargs)
         else:
             result = self._base_grpo(
-                rl_inputs, rl_outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
-                **rl_kwargs)
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
 
         loss = result['loss']
         channel_loss = result.get('channel_loss')
-        if self._distill_wrap or chord_count:
-            loss = loss * (1.0 - float(chord_mu))
-            loss = self._add_sdar(loss, rl_inputs, rl_outputs, teacher_logps)
-            loss = self._add_chord(loss, outputs, inputs['labels'], chord_count, chord_mu, chord_phi)
+        if self._distill_wrap:
+            loss = self._add_sdar(loss, inputs, outputs, teacher_logps)
             result = LossOutput(loss=loss, num_tokens=0)
         else:
             result = LossOutput(loss=loss, num_tokens=result['num_tokens'])
         if channel_loss is not None:
             result['channel_loss'] = channel_loss
         return result
-
-    @staticmethod
-    def _slice_batch(values, end: int):
-        """The leading ``end`` rows of a batch-parallel value, tolerating non-sliceable entries.
-
-        Per-row lists/tensors slice normally; a scalar broadcast across the batch (or a value with no
-        row axis) has no leading dimension to trim, so it is returned unchanged.
-        """
-        if values is None:
-            return None
-        try:
-            return values[:end]
-        except (TypeError, KeyError):
-            return values
 
     def _configured_grpo(
         self,
@@ -735,28 +698,6 @@ class GRPOLoss(Loss):
             teacher_logps, response_mask, student_logps.device, student_logps.dtype)
         sdar_loss, _ = compute_sdar_loss(student_logps, teacher, response_mask, self.sdar_gate_beta)
         return loss + self.sdar_loss_coef * sdar_loss
-
-    def _add_chord(self, loss, outputs, labels, chord_count, chord_mu, chord_phi):
-        """Add CHORD's auxiliary SFT cross-entropy over the trailing ``chord_count`` rows."""
-        if not chord_count:
-            return loss
-        import torch
-        import torch.nn.functional as F
-        rl_count = labels.shape[0] - chord_count
-        chord_logits = outputs['logits'][rl_count:]
-        chord_labels = labels[rl_count:]
-        token_loss = F.cross_entropy(
-            chord_logits.reshape(-1, chord_logits.shape[-1]),
-            chord_labels.reshape(-1),
-            ignore_index=self.ignore_index,
-            reduction='none')
-        valid = chord_labels.reshape(-1).ne(self.ignore_index)
-        if chord_phi:
-            # CHORD's phi-function reweights each token by p(1-p), peaking at medium confidence.
-            probability = torch.exp(-token_loss.detach())
-            token_loss = token_loss * probability * (1.0 - probability)
-        chord_loss = token_loss[valid].mean() if valid.any() else token_loss.sum() * 0.0
-        return loss + float(chord_mu) * chord_loss
 
 
 class PPOLoss(GRPOLoss):

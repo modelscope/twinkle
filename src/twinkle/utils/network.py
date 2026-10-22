@@ -12,7 +12,16 @@ def is_valid_ipv6_address(ip: str) -> bool:
         return False
 
 
-def find_node_ip() -> Optional[str]:
+def find_node_ip() -> str:
+    """Return a usable IPv4 address for this node.
+
+    Prefers a non-loopback, non-virtual interface, then falls back to a
+    virtual interface. When the host only exposes loopback addresses (for
+    example ``docker run --network none``), ``127.0.0.1`` is returned instead
+    of ``None``: callers use the result as ``MASTER_ADDR`` and a ``None``
+    there fails deep inside Ray's ``env_vars`` validation rather than raising
+    a useful error.
+    """
     import psutil
     main_ip, virtual_ip = None, None
     for name, addrs in sorted(psutil.net_if_addrs().items()):
@@ -25,7 +34,7 @@ def find_node_ip() -> Optional[str]:
                 else:
                     if main_ip is None:
                         main_ip = addr.address
-    return main_ip or virtual_ip
+    return main_ip or virtual_ip or '127.0.0.1'
 
 
 def find_free_port(address: str = '', start_port: Optional[int] = None, retry: int = 100) -> int:

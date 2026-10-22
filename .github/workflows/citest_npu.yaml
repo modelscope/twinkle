@@ -3,7 +3,7 @@ name: citest-npu
 on:
   push:
     branches:
-      - master
+      - main
       - "release/**"
     paths-ignore:
       - "setup.*"

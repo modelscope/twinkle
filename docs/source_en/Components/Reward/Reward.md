@@ -78,31 +78,8 @@ def my_reward(trajectories, ground_truths):
 rewards = my_reward(generated, ground_truths)
 ```
 
-## Usage Scenarios
+## Training Integration
 
-Typical workflow of reward functions in RLHF training:
+The sampler returns a list of `SampleResponse` objects. Read generated token IDs from `response.sequences`, decode them, and construct `Trajectory` objects before calling a reward function that accepts trajectories. Repeat each prompt's ground truth for its generated sequences so rewards and advantages stay in the same order.
 
-```python
-from twinkle.sampler import vLLMSampler
-from twinkle.reward import MathReward
-from twinkle.advantage import GRPOAdvantage
-
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = MathReward()
-advantage_fn = GRPOAdvantage()
-
-for batch in dataloader:
-    # 1. Sample and generate multiple candidate answers
-    response = sampler.sample(batch, num_samples=4)
-
-    # 2. Evaluate quality using reward function
-    rewards = reward_fn(response.trajectories, batch.ground_truths)
-
-    # 3. Calculate advantages
-    advantages = advantage_fn(rewards, num_generations=4)
-
-    # 4. Update policy using advantage values
-    ...
-```
-
-> The design of reward functions is crucial for RLHF effectiveness. A good reward function should accurately reflect the task objectives and provide clear learning signals.
+See the maintained [GRPO training example](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/short_math_grpo.py) for the complete workflow.

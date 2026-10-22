@@ -8,7 +8,7 @@ the Shared_App_Scaffold is extracted, so the extraction can be shown to be
 behavior-preserving. For each builder they assert, as fixed expectations:
 
 1. the **registered route set** — the complete set of route paths together with
-   their HTTP methods (compared against the committed contract baseline);
+   their HTTP methods (compared against the committed route inventory);
 2. the **externally observable middleware ordering/effect**, to the extent it is
    black-box observable — the ``verify_token`` auth middleware rejects a
    non-``/healthz`` request that is missing the sticky-session request-id header
@@ -32,9 +32,9 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.testclient import TestClient
 from pathlib import Path
 
-# ----- contract baseline (route-set oracle) -------------------------------- #
+# ----- committed route inventory (route-set oracle) ------------------------ #
 
-_BASELINE = json.loads((Path(__file__).parent / 'contract' / 'client_api_baseline.json').read_text())
+_BASELINE = json.loads((Path(__file__).parent / 'contract' / 'client_api_routes.json').read_text())
 
 _HTTP_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}
 
@@ -57,8 +57,7 @@ def _route_set(app: FastAPI) -> set[tuple[str, str]]:
 
 
 def _baseline_route_set(app_name: str) -> set[tuple[str, str]]:
-    paths = _BASELINE[app_name]['paths']
-    return {(path, method) for path, ops in paths.items() for method in ops}
+    return {(path, method) for method, path in (route.split(' ', 1) for route in _BASELINE[app_name])}
 
 
 # ----- builder capture ----------------------------------------------------- #

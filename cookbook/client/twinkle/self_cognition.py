@@ -6,26 +6,21 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-
-dotenv.load_dotenv('.env')
-
 import os
 from peft import LoraConfig
 
 from twinkle import get_logger
-from twinkle.dataset import DatasetMeta
 from twinkle import init_twinkle_client
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
+from twinkle.dataset import Dataset, DatasetMeta
 
+dotenv.load_dotenv('.env')
 logger = get_logger()
 
 base_model = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 base_url = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000')
 api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 save_dir = '/tmp/twinkle_sft_output'
-
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
@@ -74,7 +69,7 @@ def train():
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
-    model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+    model = client.model(f'ms://{base_model}')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(target_modules='all-linear')
@@ -160,7 +155,6 @@ def train():
     # model.upload_to_hub(
     #     checkpoint_dir=twinkle_path,
     #     hub_model_id=hub_model_id,
-    #     async_upload=False
     # )
     # logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 

@@ -115,15 +115,15 @@ def test_mock_dispatch_returns_mock_sampler() -> None:
 
 
 def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
-    from twinkle_agentic.async_rl import vllm_sampler_tq as module
+    from twinkle.server.sampler.backends import vllm_async as module
 
     captured = {}
 
     def construct(**kwargs):
         captured.update(kwargs)
-        return 'vllm-tq'
+        return 'vllm-async'
 
-    monkeypatch.setattr(module, 'VLLMSamplerTQ', construct)
+    monkeypatch.setattr(module, 'ServerVLLMSampler', construct)
 
     sampler = _construct_sampler_backend(
         'vllm_async',
@@ -131,8 +131,8 @@ def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
         None,
     )
 
-    assert sampler == 'vllm-tq'
-    assert captured == {'model_id': 'local-model', 'context_manager': None}
+    assert sampler == 'vllm-async'
+    assert captured == {'model_id': 'local-model'}
 
 
 def test_standard_vllm_is_independent_of_data_plane(monkeypatch) -> None:

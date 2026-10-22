@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-import twinkle_client.types as types
+import twinkle.protocol.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.server.sampler.twinkle_handlers import (
     _register_twinkle_sampler_routes,
@@ -62,41 +65,38 @@ def test_async_sampler_rejects_group_id_count_mismatch() -> None:
 class _SamplerManagement:
 
     def __init__(self):
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        self.sampling_guard = SamplerConcurrency()
         self.sampler = self
         self.data_plane = self
         self.enabled = True
         self.scheduled = []
         self.put_rows = None
+        self.task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
 
     async def _on_request_start(self, _request):
         return 'token'
 
-    async def schedule_task_and_wait(self, task, **kwargs):
-        self.scheduled.append(kwargs)
-        return await task()
+    async def submit_concurrent_and_peek(self, coro_factory, *, model_id=None, task_type=None):
+        self.scheduled.append({'model_id': model_id, 'task_type': task_type})
+        result = await coro_factory()
+        from twinkle.protocol.types.lifecycle import TaskEnvelope
+        return TaskEnvelope(request_id='req-test', status='completed', result=result)
 
-    def submit_generation(self, submission_id, inputs, params, **kwargs):
-        self.submission_id = submission_id
-        self.inputs = inputs
-        self.params = params
-        self.generation_kwargs = kwargs
+    async def call_backend(self, fn, /, *args, admit=True, **kwargs):
+        return fn(*args, **kwargs)
 
-    def get_generation_status(self, submission_id):
-        assert submission_id == self.submission_id
-        return {'status': 'completed'}
-
-    def collect_generation(self, submission_id):
-        assert submission_id == self.submission_id
-        return [SampleResponse(sequences=[SampledSequence(
+    def submit(self, trajectory, params, adapter_name='', adapter_path=None):
+        trajectory['request_id'] = 'req-rollout'
+        future = Future()
+        future.set_result([SampleResponse(sequences=[SampledSequence(
             stop_reason='stop',
             tokens=[7],
             logprobs=[[(7, -0.25)]],
             decoded='answer',
             new_input_feature={'input_ids': [1, 7], 'labels': [-100, 7]},
-        )])]
-
-    def cancel_generation(self, _submission_id):
-        raise AssertionError('completed generation must not be cancelled')
+        )])])
+        return future
 
     async def put(self, rows, *, kind, tags):
         self.put_rows = rows
@@ -124,14 +124,15 @@ async def test_sample_to_data_plane_returns_ref_after_short_admission() -> None:
         sampling_params={'max_tokens': 4},
     )
 
-    ref = await route.endpoint(request, body, management)
+    env = await route.endpoint(request, body, management)
 
+    ref = types.DataRef(**env.result)
     assert ref.ref_id == 'rollout-ref'
+    # The whole admit -> generate -> store runs as one background future now
+    # (vLLM owns generation concurrency), so there is a single scheduled task.
     assert management.scheduled == [{
         'model_id': 'session-adapter',
-        'token': 'token',
-        'input_tokens': 1,
-        'task_type': 'sample_admission',
+        'task_type': 'sample_to_data_plane',
     }]
     assert management.put_rows == [{
         'train_input': {'input_ids': [1, 7], 'labels': [-100, 7]},

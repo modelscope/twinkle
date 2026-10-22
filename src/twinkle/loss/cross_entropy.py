@@ -10,12 +10,16 @@ class CrossEntropyLoss(Loss):
                  ignore_index: int = -100,
                  reduction='mean',
                  dft: bool = False,
+                 probability_weight=None,
                  label_smoothing: float = 0.0,
                  **kwargs):
         super().__init__()
+        if probability_weight not in (None, 'p_one_minus_p'):
+            raise ValueError("probability_weight must be None or 'p_one_minus_p'")
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.dft = dft
+        self.probability_weight = probability_weight
         self.label_smoothing = label_smoothing
 
     def micro_batch_scale(self, inputs, indices):
@@ -32,6 +36,18 @@ class CrossEntropyLoss(Loss):
         if total_tokens == 0:
             return 0.0
         return sum(token_counts[index] for index in indices) / total_tokens
+
+    def batch_normalizer(self, inputs):
+        if self.reduction != 'sum':
+            return None
+        count = 0
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                count += int(labels.ne(self.ignore_index).sum().item())
+            else:
+                count += sum(int(token != self.ignore_index) for token in labels)
+        return count
 
     def __call__(self, inputs, outputs, **kwargs):
         _, per_token, mask = self.get_per_token_loss(inputs, outputs)
@@ -67,6 +83,9 @@ class CrossEntropyLoss(Loss):
         if self.dft:
             # DFT: weight each token's loss by its own probability p = exp(logp), i.e. -p*log(p).
             per_token = per_token * logps.exp()
+        if self.probability_weight == 'p_one_minus_p':
+            probability = logps.detach().exp()
+            per_token = per_token * probability * (1 - probability)
         loss_scale = inputs.get('loss_scale')
         if loss_scale is not None:
             import torch

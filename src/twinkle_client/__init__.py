@@ -1,8 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-from typing import Optional, TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .data_plane import DataPlaneClient
+    from .http import ClientContext, ClientTransport
     from .manager import TwinkleClient
 
 
@@ -21,7 +24,7 @@ def init_tinker_client(**kwargs) -> None:
 
     Example::
 
-        >>> from twinkle_client import init_tinker_client
+        >>> from twinkle import init_tinker_client
         >>> init_tinker_client()
         >>> from tinker import ServiceClient
         >>> client = ServiceClient(base_url='http://localhost:8000', api_key='your_token')
@@ -35,11 +38,11 @@ def init_tinker_client(**kwargs) -> None:
 
 
 def init_twinkle_client(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
     session_heartbeat_interval: int = 10,
     **kwargs,
-) -> 'TwinkleClient':
+) -> TwinkleClient:
     """
     Initialize a Twinkle client.
 
@@ -64,7 +67,7 @@ def init_twinkle_client(
         An initialised :class:`~twinkle_client.manager.TwinkleClient` instance.
     """
     from .manager import TwinkleClient
-    return TwinkleClient(
+    return TwinkleClient.connect(
         base_url=base_url,
         api_key=api_key,
         session_heartbeat_interval=session_heartbeat_interval,
@@ -72,6 +75,17 @@ def init_twinkle_client(
     )
 
 
-from .data_plane import DataPlaneClient
+def __getattr__(name: str) -> Any:
+    if name == 'DataPlaneClient':
+        from .data_plane import DataPlaneClient
+        value = DataPlaneClient
+    elif name in {'ClientContext', 'ClientTransport'}:
+        from .http import ClientContext, ClientTransport
+        value = {'ClientContext': ClientContext, 'ClientTransport': ClientTransport}[name]
+    else:
+        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    globals()[name] = value
+    return value
 
-__all__ = ['DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']
+
+__all__ = ['ClientContext', 'ClientTransport', 'DataPlaneClient', 'init_tinker_client', 'init_twinkle_client']

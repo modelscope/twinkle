@@ -6,7 +6,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from twinkle.data_format import Trajectory, user_data_get
+from twinkle.data_format import Trajectory, last_assistant_text, user_data_get
 from twinkle.reward.base import Reward
 from twinkle.reward.math_reward import MathReward
 
@@ -28,7 +28,7 @@ class BoxedMathAccuracyReward(Reward):
 
     @classmethod
     def _score(cls, trajectory: Trajectory) -> float:
-        completion = cls._last_assistant_content(trajectory)
+        completion = last_assistant_text(trajectory)
         if '\\boxed{' not in completion:
             return 0.0
         prediction = MathReward.extract_boxed_result(completion).strip()
@@ -38,13 +38,6 @@ class BoxedMathAccuracyReward(Reward):
         if cls._decimal_equal(prediction, ground_truth):
             return 1.0
         return float(MathReward.compare_consecutive(prediction, ground_truth))
-
-    @staticmethod
-    def _last_assistant_content(trajectory: Trajectory) -> str:
-        for message in reversed(trajectory.get('messages', [])):
-            if message.get('role') == 'assistant':
-                return str(message.get('content', ''))
-        return ''
 
     @staticmethod
     def _decimal_equal(first: str, second: str) -> bool:

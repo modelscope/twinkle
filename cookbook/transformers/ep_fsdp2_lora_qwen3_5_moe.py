@@ -135,12 +135,14 @@ def train():
 
     optimizer_group = model.optimizer_group[args.lora.adapter_name]
     if _use_fused_ce:
+        import torch
         import torch.distributed as _dist
         if _dist.is_available() and _dist.is_initialized():
             _dist.barrier()
         if Torch.is_npu_available():
-            import torch_npu
             torch.npu.synchronize()
+        if Torch.is_gpu_available():
+            torch.cuda.synchronize()
     for batch in dataloader:
         if callable(batch):
             batch = batch()

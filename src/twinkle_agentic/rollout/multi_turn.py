@@ -1,7 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
+import copy
 import re
-from typing import Any, Callable, Dict, List, Literal, Optional
+import threading
+import uuid
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Optional
+
+import json
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
@@ -10,36 +17,233 @@ from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
-from .ledger import MessageLedger, TurnLedger
+from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
+from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
 
 ResponseCallback = Callable[..., SampledSequence]
 
 
-def _default_response_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs,
-                               **kwargs) -> SampledSequence:
-    """Use the sampler when present, otherwise the API adapter."""
+@dataclass(frozen=True)
+class StreamDelta:
+    """One token delta of the current generation, for live display."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamToolCall:
+    """One turn's dispatched tool calls: the function names and what each returned."""
+
+    names: list[str] = field(default_factory=list)
+    observations: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """The finished episode: a message-level transcript trajectory (NOT trainable -- no token fields)."""
+
+    trajectory: Trajectory
+
+
+@dataclass
+class RolloutSample:
+    """One on-policy rollout trajectory, pre-collation (the RL training-sample layer).
+
+    ``encoded`` carries the full prompt+completion feature with the ledger's already-shifted
+    labels; ``rollout_logprobs`` are the sampling-policy old_logps, one per response token.
+    ``response_loss_mask`` mirrors ``response_token_ids``.
+    """
+
+    # Defaults let a consumer synthesise a sample-shaped row (a scored ground truth, a
+    # cache-loaded candidate) without faking engine state; the engine factory always fills them.
+    encoded: dict = field(default_factory=dict)
+    response_token_ids: list[int] = field(default_factory=list)
+    rollout_logprobs: list[float] = field(default_factory=list)
+    prompt_id: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+    decoded: str = ""
+    truncated: bool = False
+    response_loss_mask: list[int] = field(default_factory=list)
+    messages: list[dict] | None = None
+    rollout_infos: dict[str, Any] = field(default_factory=dict)
+    # The sampler's per-token sampling support set (twinkle SamplingMask); assembled into the
+    # top-level sampling_masks forward kwarg by the consumer, never into encoded.
+    sampling_mask: Any | None = None
+    # The policy version this trajectory was generated under (the admission pin); 0 when the
+    # producing path does not track versions.
+    policy_version: int = 0
+    # How many publishes the policy advanced between admission and collection; in_place only
+    # (adapter_snapshot pins one frozen path, so the span is always 0).
+    version_span: int = 0
+    # The ORIGINAL prompt messages, stamped on the streaming collect path for PRM scoring and
+    # the teacher privileged view; None on the blocking generate path.
+    prompt: list[dict] | None = None
+    # Per-sample outcome-reward row (one value per scorer), scored by the streaming layer before
+    # the sample enters the ready buffer; None until then.
+    orm_reward: list[float] | None = None
+    # Per-token process reward in the response-token frame, scored by the same seam; None when
+    # no PRM channel is wired.
+    prm_process: list[float] | None = None
+    # The kernel's group identity (the admission expansion key), stamped when the trajectory enters
+    # the ready buffer; positions are the training contract, this is provenance/debugging.
+    group_key: str | None = None
+    # A group-level baseline (e.g. ReMax's greedy reward), written by the group-completion hook;
+    # one value shared by every sibling of the group.
+    baseline: float | None = None
+
+    @property
+    def input_feature(self) -> dict:
+        """Back-compat alias: the training feature is ``encoded`` (was ``input_feature``)."""
+        return self.encoded
+
+    @property
+    def old_logps(self) -> list[float]:
+        """The sampling-policy logprobs, already flat (one per response token)."""
+        return list(self.rollout_logprobs)
+
+    @property
+    def rollout_logps(self) -> list[float]:
+        return list(self.rollout_logprobs)
+
+    @property
+    def prompt_index(self) -> str:
+        """Back-compat alias for the group id."""
+        return self.prompt_id
+
+
+@dataclass(eq=False)
+class SampleHandle:
+    """One in-flight trajectory admitted by :meth:`MultiTurnRollout.admit`.
+
+    Carries the submit-time facts collect/cancel need; identity is ``submission_id``
+    (two handles for one submission are the same trajectory).
+    """
+
+    submission_id: str
+    prompt_idx: Any
+    trajectory_idx: int
+    prompt_extras: dict[str, Any] | None = None
+    require_logprobs: bool = True
+    policy_version: int = 0
+    # The ORIGINAL prompt messages, stamped onto the collected sample (sample.prompt).
+    prompt: list[dict] | None = None
+    # Ref-only remote result (a LazyCollect the driver never resolves early); the local
+    # engine shape leaves it unset and runs the episode on a Future instead.
+    payload: Any = None
+    # The admission pin's adapter path. None marks the in_place strategy, whose collect
+    # stamps a version span; a pinned path (adapter_snapshot) spans nothing.
+    adapter_path: str | None = None
+
+    def __hash__(self) -> int:
+        return hash(self.submission_id)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SampleHandle) and self.submission_id == other.submission_id
+
+
+def _build_sampling_params(num_samples: int, sampling_params: dict | None, force_logprobs: bool) -> SamplingParams:
+    """Assemble the twinkle SamplingParams shared by every rollout entry point.
+
+    One contract (temperature default, forced old_logps, per-submission num_samples) so no
+    path can silently sample under different params than another; the engine drives one
+    trajectory per turn, hence num_samples is always 1 here.
+    """
+    sp = dict(sampling_params or {})
+    sp.setdefault("temperature", 1.0)
+    if force_logprobs:
+        # Contract 15: these logprobs ARE old_logps, so requesting them is forced, not defaulted.
+        sp["logprobs"] = max(int(sp.get("logprobs") or 0), 1)
+    sp["num_samples"] = num_samples
+    return SamplingParams(**sp)
+
+
+#: Prompt-row media columns threaded onto the Trajectory so the sampler encodes them.
+_MULTIMODAL_PROMPT_KEYS = ("images", "videos", "audios", "objects", "tools")
+
+#: Keys of the flat trajectory a training forward consumes: the encoded feature proper
+#: plus the MoE replay pair the sampler reported.
+_TRAIN_FEATURE_KEYS = ("input_ids", "labels", "completion_mask", "routed_experts", "replay_mask")
+
+
+def _vision_feature_keys() -> frozenset:
+    """The multimodal feature keys to lift from the engine's feature into ``encoded``."""
+    from twinkle.processor.base import InputProcessor
+
+    return frozenset(InputProcessor.VLM_CONCAT_FIELDS) | frozenset(("mm_token_type_ids", "second_per_grid_ts"))
+
+
+def trajectory_to_rollout_sample(traj: dict[str, Any], prompt_id: str, extra: dict[str, Any]) -> RolloutSample:
+    """Translate one ledger-merged Trajectory into a RolloutSample.
+
+    The token fields arrive ready-made from the ledger's ``merge`` (labels already
+    next-token shifted; ``response_token_ids`` / ``rollout_logprobs`` the flat training
+    view); message-only mode (a text-only backend) has no token fields, so only
+    ``messages`` / ``decoded`` / ``rollout_infos`` carry anything.
+    """
+    input_ids = list(traj.get("input_ids") or [])
+    labels = list(traj.get("labels") or [])
+    messages = copy.deepcopy(traj.get("messages"))
+    encoded: dict[str, Any] = {}
+    response_token_ids: list[int] = []
+    rollout_logprobs: list[float] = []
+    if input_ids and labels:
+        keys = set(_TRAIN_FEATURE_KEYS) | _vision_feature_keys()
+        encoded = {key: traj[key] for key in keys if key in traj}
+        response_token_ids = list(traj.get("response_token_ids") or [])
+        rollout_logprobs = list(traj.get("rollout_logprobs") or [])
+    rollout_infos = {
+        key: traj[key]
+        for key in ("turns", "stop_reason", "truncated", "stuck_stop", "tool_stop", "followups")
+        if key in traj
+    }
+    if traj.get("error") is not None:
+        rollout_infos["error"] = traj["error"]
+    return RolloutSample(
+        encoded=encoded,
+        response_token_ids=response_token_ids,
+        rollout_logprobs=rollout_logprobs,
+        response_loss_mask=[1] * len(response_token_ids),
+        prompt_id=prompt_id,
+        extra=extra,
+        decoded=last_assistant_text(messages),
+        truncated=bool(traj.get("truncated")),
+        messages=messages,
+        rollout_infos=rollout_infos,
+        sampling_mask=traj.get("sampling_mask"),
+    )
+
+
+#: Ray runs a decorated actor's methods one at a time unless max_concurrency is raised; each
+#: in-flight episode is a separate generate call. A PERFORMANCE ceiling only, never a second
+#: admission cap: the sole admission truth is the driver's backpressure (buffer over handles).
+_MAX_CONCURRENT_EPISODES = 1024
+
+
+def default_response_callback(
+    sampler, api, sampling_params, *, input_feature, adapter_kwargs, rollout_state=None, **kwargs
+) -> SampledSequence:
+    """Use the sampler when present, otherwise the API adapter. Public so a caller-side
+    ``response_callback`` can adjust ``sampling_params`` and delegate here."""
     if sampler is None:
         if api is None:
-            raise ValueError('response_callback was omitted, but no sampler or API was provided')
-        return api(input_feature, sampling_params, **adapter_kwargs)
-    responses = sampler.sample([input_feature], sampling_params=sampling_params, **adapter_kwargs)
+            raise ValueError("response_callback was omitted, but no sampler or API was provided")
+        return api(rollout_state or input_feature, sampling_params, **adapter_kwargs)
+    use_state = rollout_state is not None and getattr(type(sampler), "accepts_rollout_state", False)
+    sample_input = rollout_state if use_state else input_feature
+    responses = sampler.sample([sample_input], sampling_params=sampling_params, **adapter_kwargs)
     if not isinstance(responses, list):
-        raise TypeError(f'expected List[SampleResponse] from sampler.sample, got '
-                        f'{type(responses).__name__}')
+        raise TypeError(f"expected List[SampleResponse] from sampler.sample, got {type(responses).__name__}")
     if len(responses) != 1:
-        raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; '
-                           'expected exactly one.')
+        raise RuntimeError(f"sampler returned {len(responses)} responses for a single request; expected exactly one.")
     response = responses[0]
     if not isinstance(response, SampleResponse):
-        raise TypeError(f'expected SampleResponse from sampler.sample, got '
-                        f'{type(response).__name__}')
+        raise TypeError(f"expected SampleResponse from sampler.sample, got {type(response).__name__}")
     if len(response.sequences) != 1:
-        raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
+        raise RuntimeError(f"SampleResponse contains {len(response.sequences)} sequences; expected exactly one.")
     sequence = response.sequences[0]
     if not isinstance(sequence, SampledSequence):
-        raise TypeError(f'expected SampledSequence, got {type(sequence).__name__}')
+        raise TypeError(f"expected SampledSequence, got {type(sequence).__name__}")
     return sequence
 
 
@@ -56,72 +260,91 @@ def is_error_observation(observation: str) -> bool:
     anywhere in the text also matches a *successful* read of a file that happens
     to contain them, and this decides whether an episode is cut short.
     """
-    text = (observation or '').strip()
+    text = (observation or "").strip()
     if not text:
         return False
-    if text.startswith('Error:'):
+    if text.startswith("Error:"):
         return True
-    if text.startswith(('Tool runtime unreachable:', 'Tool runtime returned no result')):
+    if text.startswith(("Tool runtime unreachable:", "Tool runtime returned no result")):
         return True
     return bool(re.search(r'"success"\s*:\s*false', text))
 
 
-def _call_key(tool_call: Dict[str, Any]) -> str:
+def _call_key(tool_call: dict[str, Any]) -> str:
     """A stable identity for a tool call: its name plus its arguments verbatim.
 
     Byte-identical is the point. A model that changes one path and tries again is
     making progress; one that reissues the same call with the same arguments is
     not, whatever the tool answered.
     """
-    fn = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
-    name = fn.get('name') or tool_call.get('name') or tool_call.get('tool_name') or ''
-    args = fn.get('arguments', tool_call.get('arguments'))
+    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = fn.get("name") or tool_call.get("name") or tool_call.get("tool_name") or ""
+    args = fn.get("arguments", tool_call.get("arguments"))
     if not isinstance(args, str):
         try:
             args = json.dumps(args, sort_keys=True, ensure_ascii=False)
         except (TypeError, ValueError):
             args = repr(args)
-    return f'{name}\x00{args}'
+    return f"{name}\x00{args}"
+
+
+def _tool_call_names(tool_calls: list[dict[str, Any]]) -> list[str]:
+    """The function names of this turn's calls, in order, for display.
+
+    Reads the same three shapes :func:`_call_key` does (``function.name`` / ``name`` / ``tool_name``);
+    a call whose name cannot be read is dropped rather than shown as an empty string.
+    """
+    names: list[str] = []
+    for tool_call in tool_calls:
+        fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        name = fn.get("name") or tool_call.get("name") or tool_call.get("tool_name") or ""
+        if name:
+            names.append(name)
+    return names
 
 
 def _default_tool_messages(
-    tool_calls: List[Dict[str, Any]],
-    observations: List[str],
-) -> List[Dict[str, Any]]:
-    msgs: List[Dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]],
+    observations: list[str],
+) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = []
     for i, obs in enumerate(observations):
-        msg: Dict[str, Any] = {'role': 'tool', 'content': '' if obs is None else str(obs)}
+        msg: dict[str, Any] = {"role": "tool", "content": "" if obs is None else str(obs)}
         if i < len(tool_calls) and isinstance(tool_calls[i], dict):
             tc = tool_calls[i]
-            fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
-            tid = tc.get('id') or tc.get('tool_call_id')
-            name = fn.get('name') or tc.get('name') or tc.get('tool_name')
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            tid = tc.get("id") or tc.get("tool_call_id")
+            name = fn.get("name") or tc.get("name") or tc.get("tool_name")
             if tid:
-                msg['tool_call_id'] = tid
+                msg["tool_call_id"] = tid
             if name:
-                msg['name'] = name
+                msg["name"] = name
         msgs.append(msg)
     return msgs
 
 
-def _malformed_tool_message(errors: List[str]) -> Dict[str, Any]:
+def _malformed_tool_message(errors: list[str]) -> dict[str, Any]:
     """What goes back to the model when its tool-call markup did not parse.
 
     ``role='tool'`` because it is the outcome of the call the model just tried to
     make. There is no ``tool_call_id`` to pair it with -- the call never became a
     call -- which ``_default_tool_messages`` above already treats as optional.
     """
-    reason = '; '.join(e for e in errors if e) or 'the markup could not be parsed'
+    reason = "; ".join(e for e in errors if e) or "the markup could not be parsed"
     return {
-        'role':
-        'tool',
-        'content': ('Your tool call was not run: ' + reason + '. Send the call again. Inside '
-                    'a JSON string a backslash has to be written as \\\\ and a line break as '
-                    '\\n; a single quote needs no backslash at all.'),
+        "role": "tool",
+        "content": (
+            "Your tool call was not run: " + reason + ". Send the call again. Inside "
+            "a JSON string a backslash has to be written as \\\\ and a line break as "
+            "\\n; a single quote needs no backslash at all."
+        ),
     }
 
 
-@remote_class()
+# execute='first': a deployed rollout is ONE payload actor running every episode thread-side;
+# max_concurrency lifts Ray's one-method-at-a-time default so in-flight episodes overlap (a
+# PERFORMANCE ceiling only -- the admission truth stays with the driver's backpressure).
+@remote_class(execute="first", max_concurrency=_MAX_CONCURRENT_EPISODES)
 class MultiTurnRollout(Rollout):
     """Agentic multi-turn rollout with tool use, one episode per thread.
 
@@ -167,28 +390,31 @@ class MultiTurnRollout(Rollout):
     def __init__(
         self,
         sampler=None,
-        template: Optional[Template] = None,
-        tool_manager: Optional[ToolManager] = None,
+        template: Template | None = None,
+        tool_manager: ToolManager | None = None,
         harness=None,
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: SamplingParams | None = None,
         max_turns: int = 6,
-        max_trajectory_tokens: Optional[int] = None,
-        concurrency: Optional[int] = None,
-        tracer: Optional[TraceWriter] = None,
-        adapter_path: Optional[str] = None,
+        max_trajectory_tokens: int | None = None,
+        concurrency: int | None = None,
+        tracer: TraceWriter | None = None,
+        adapter_path: str | None = None,
         use_base_model: bool = False,
         stop_after_stuck_turns: int = 0,
         max_malformed_retries: int = 2,
-        followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
-        api: Optional[API] = None,
-        response_callback: Optional[ResponseCallback] = None,
-        api_appended_as: Literal['demonstration', 'context'] = 'demonstration',
-        api_kwargs: Optional[Dict[str, Any]] = None,
+        followup_fn: Callable[[Trajectory, int], Any] | None = None,
+        api: API | None = None,
+        response_callback: ResponseCallback | None = None,
+        api_appended_as: Literal["demonstration", "context"] = "demonstration",
+        api_kwargs: dict[str, Any] | None = None,
+        allow_partial_rollout: bool = False,
+        tools_factory: Callable[[Any], tuple[Any, list[Any], Any]] | None = None,
+        tools_config: Any = None,
     ):
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
             if api is not None:
-                raise ValueError('the positional backend and api= both specify an API')
+                raise ValueError("the positional backend and api= both specify an API")
             api, sampler = sampler, None
         # A local Template is what makes a trajectory trainable: it encodes the
         # opening turn, reads tool-call markup, and owns the tokenizer. Without one
@@ -198,46 +424,68 @@ class MultiTurnRollout(Rollout):
         # APISampler formats the call with it.
         message_only = template is None
         if message_only and api is not None:
-            raise ValueError('api=/APISampler requires a local Template to format the call; '
-                             'message-only mode (template=None) has none.')
+            raise ValueError(
+                "api=/APISampler requires a local Template to format the call; "
+                "message-only mode (template=None) has none."
+            )
         if response_callback is None and sampler is None and api is None:
-            raise ValueError('MultiTurnRollout requires a sampler or API when response_callback is omitted')
+            raise ValueError("MultiTurnRollout requires a sampler or API when response_callback is omitted")
         if sampler is not None:
-            sample = getattr(type(sampler), 'sample', None)
+            sample = getattr(type(sampler), "sample", None)
             if sample is None:
-                raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
+                raise TypeError(f"backend must be an API or sampler, got {type(sampler).__name__}")
             # A message-only backend is a local text sampler, not a slice_dp GPU
             # worker, so the one-request-per-call spreading this guards against does
             # not apply; only the token-level path needs the declaration.
-            if not message_only and not getattr(sample, '_enable_continous_work', False):
-                raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
-                                 'enable_continous_work=True: this rollout samples one trajectory per '
-                                 'call, and a slice_dp sampler raises when a worker gets nothing from '
-                                 'a batch of one.')
+            if not message_only and not getattr(sample, "_enable_continous_work", False):
+                raise ValueError(
+                    f"{type(sampler).__name__}.sample must be declared with "
+                    "enable_continous_work=True: this rollout samples one trajectory per "
+                    "call, and a slice_dp sampler raises when a worker gets nothing from "
+                    "a batch of one."
+                )
         if adapter_path and use_base_model:
-            raise ValueError('adapter_path and use_base_model=True ask for opposite '
-                             'weights; the sampler would drop the adapter silently.')
+            raise ValueError(
+                "adapter_path and use_base_model=True ask for opposite "
+                "weights; the sampler would drop the adapter silently."
+            )
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
-            raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
-                             f'{max_trajectory_tokens}')
+            raise ValueError(f"max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}")
         self._init_common(max_turns=max_turns, sampling_params=sampling_params, concurrency=concurrency, tracer=tracer)
         self.sampler = sampler
         self.template = template
+        self._template_backend = getattr(type(sampler), "template_backend", "vllm") if sampler is not None else "vllm"
         # No template -> account in messages, not tokens (see ``_new_ledger``).
         self._message_only = message_only
         if isinstance(api, APISampler):
             if api_kwargs:
-                raise ValueError('api_kwargs belongs on the APISampler when api= is already adapted')
+                raise ValueError("api_kwargs belongs on the APISampler when api= is already adapted")
             if api.template is not template:
-                raise ValueError('MultiTurnRollout and APISampler must share the same template instance')
+                raise ValueError("MultiTurnRollout and APISampler must share the same template instance")
             self.api = api
         elif api is not None:
             self.api = APISampler(api, template, appended_as=api_appended_as, api_kwargs=api_kwargs)
         else:
             if api_kwargs:
-                raise ValueError('api_kwargs requires an API backend')
+                raise ValueError("api_kwargs requires an API backend")
             self.api = None
-        self.response_callback = response_callback or _default_response_callback
+        self.response_callback = response_callback or default_response_callback
+        if tools_factory is not None and tool_manager is not None:
+            raise ValueError(
+                "tools_factory builds a per-episode sandbox manager; a shared "
+                "tool_manager cannot also be set. Pass one or the other."
+            )
+        # A sandbox env pool holds live locks/queues and cannot cross the Ray boundary, so it is
+        # built HERE (engine-side) via the injected factory, never handed in pre-built. A sandbox
+        # binds tools per episode (each trajectory leases its own env), so the shared tool_manager
+        # is dropped then and every episode passes its own leased manager.
+        self.env_pool, self.tool_plugins, self._tool_manager_for = (
+            (None, [], None) if tools_factory is None else tools_factory(tools_config)
+        )
+        self._per_episode_tools = self.env_pool is not None and bool(self.tool_plugins)
+        # Every RL entry (generate/admit) threads this into each per-turn sample call: it makes
+        # a turn resumable across an in-place weight republish instead of returning truncated.
+        self._allow_partial_rollout = allow_partial_rollout
         self.tool_manager = tool_manager
         # An optional AgentHarness (a pool exposing ``.lease()``, or a 1:1 list)
         # that shapes messages each turn. The ledger still owns every token id;
@@ -275,8 +523,7 @@ class MultiTurnRollout(Rollout):
         # script that could not run. Nothing an episode kept was written after
         # its stop point except those broken scripts.
         if stop_after_stuck_turns < 0:
-            raise ValueError(f'stop_after_stuck_turns must be >= 0, got '
-                             f'{stop_after_stuck_turns}')
+            raise ValueError(f"stop_after_stuck_turns must be >= 0, got {stop_after_stuck_turns}")
         self.stop_after_stuck_turns = stop_after_stuck_turns
         # How many replies in a row may carry tool-call markup that does not
         # parse before the episode ends anyway. Such a reply is not the model
@@ -289,8 +536,7 @@ class MultiTurnRollout(Rollout):
         # would otherwise spend all of ``max_turns`` failing to; 0 restores the
         # old behaviour of ending the episode on the first one.
         if max_malformed_retries < 0:
-            raise ValueError(f'max_malformed_retries must be >= 0, got '
-                             f'{max_malformed_retries}')
+            raise ValueError(f"max_malformed_retries must be >= 0, got {max_malformed_retries}")
         self.max_malformed_retries = max_malformed_retries
         # Called with (trajectory, how many follow-ups it has had already) at the
         # moment an episode would end: because the model stopped calling tools,
@@ -319,22 +565,334 @@ class MultiTurnRollout(Rollout):
         # which would rewrite the very state the text is about.
         self.followup_fn = followup_fn
         if self.template is not None:
-            assert self.template.truncation_strategy != 'split', (
+            assert self.template.truncation_strategy != "split", (
                 "MultiTurnRollout does not support truncation_strategy='split'; "
-                'use left/right/delete/raise on the template.')
+                "use left/right/delete/raise on the template."
+            )
 
     @remote_function()
-    def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
+    def __call__(self, trajectories: list[Trajectory], **kwargs) -> list[Trajectory]:
         """The base implementation; the decorator is what a deployed handle needs."""
         return super().__call__(trajectories, **kwargs)
 
-    def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
-        adapter_path = kwargs.get('adapter_path', self.adapter_path)
+    def stream(
+        self,
+        trajectory: Trajectory,
+        *,
+        sampling_params: SamplingParams | None = None,
+        tool_manager: ToolManager | None = None,
+        adapter_path: str | None = None,
+    ):
+        """Display-only streaming variant of ONE episode: yield token deltas live, then the transcript.
+
+        Runs the same tool loop as :meth:`_run_episode` but accounts at the MESSAGE level (a
+        :class:`MessageLedger`, template-aware so tool-call markup in the reply text still parses) and
+        streams each generation's text deltas as they arrive, so an interactive REPL can echo tokens
+        live. The result is a transcript, NOT a trainable trajectory: ``sample_stream`` yields text
+        only, so no token ids / labels / logprobs are banked. Training rollouts keep using the blocking
+        :meth:`__call__` path, which produces the trainable per-token account.
+
+        Single-trajectory and local: a generator does not cross the Ray boundary, so this needs an
+        in-process sampler with ``sample_stream`` (the TUI), not a deployed handle or an API backend.
+
+        Termination is deliberately simpler than ``_run_episode`` (no follow-up stages, no stuck-turn
+        or malformed-markup retries -- those are training-rollout concerns): the episode ends when the
+        model stops calling tools, when a generation hits its length cap, or at ``max_turns``.
+
+        Yields:
+            :class:`StreamDelta` for each token delta of each turn's generation;
+            :class:`StreamToolCall` after each turn that dispatched tools;
+            :class:`StreamDone` once at the end, carrying the transcript trajectory.
+        """
+        if self.sampler is None or not hasattr(self.sampler, "sample_stream"):
+            raise ValueError(
+                "MultiTurnRollout.stream requires a local sampler exposing sample_stream; "
+                "an API / response_callback backend has no token stream to show."
+            )
+        params = sampling_params if sampling_params is not None else self.sampling_params
+        if params is None:
+            params = SamplingParams()
+        # Fall back to the construction-time tool_manager, as __call__/_resolve_call does, so a caller
+        # that wired tools at build time need not re-pass them per stream.
+        tool_manager = tool_manager if tool_manager is not None else self.tool_manager
+        # Message-level accounting, but template-aware so a reply's tool-call markup still parses. The
+        # feature stays a {'messages','tools'} dict with no input_ids, so sample_stream re-encodes the
+        # whole trajectory each turn and the tool schema reaches the prompt tokens.
+        ledger = MessageLedger(label="stream", max_tokens=self.max_trajectory_tokens, template=self.template)
+        opening_tools = None
+        if "tools" not in trajectory and tool_manager is not None:
+            opening_tools = list(tool_manager.tool_infos() or [])
+        ledger.open(trajectory, tools=opening_tools)
+
+        stop_reason: str | None = None
+        truncated = False
+        turns = 0
+        while turns < self.max_turns:
+            turns += 1
+            pieces: list[str] = []
+            finish: str | None = None
+            for delta, finish_reason in self.sampler.sample_stream(
+                ledger.input_feature, params, adapter_path=adapter_path
+            ):
+                if delta:
+                    pieces.append(delta)
+                    yield StreamDelta(delta)
+                if finish_reason is not None:
+                    finish = finish_reason
+            text = "".join(pieces)
+            stop_reason = finish or STOP_NO_TOOL
+            ledger.record(SampledSequence(stop_reason=stop_reason, tokens=[], decoded=text))
+            if finish == "length":
+                # Cut off mid-reply: the tokens streamed are all there is, and no tool call it was
+                # still emitting gets dispatched (the turn never decided it was done).
+                truncated = True
+                break
+            tool_calls = ledger.parse_tool_call(text)
+            if not tool_calls:
+                break
+            if turns >= self.max_turns:
+                # Out of turns: the model asked for tools but there is no further generation to read
+                # their results, so do not dispatch (mirrors _run_episode) -- mark the episode truncated.
+                truncated = True
+                break
+            if tool_manager is None:
+                raise ValueError("the model emitted tool_calls but stream() was given no tool_manager")
+            observations = self._run_tools(tool_manager, tool_calls)
+            yield StreamToolCall(names=_tool_call_names(tool_calls), observations=observations)
+            ledger.observe(_default_tool_messages(tool_calls, observations))
+        out = ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated)
+        yield StreamDone(out)
+
+    # ---------------------------------------------------------- RL entries
+    #
+    # The batch and streaming faces over the same engine: ``generate`` is the blocking
+    # (locally) / lazy (over Ray) batch entry, and admit/poll/collect/cancel is the
+    # four-call protocol the streaming driver's engine seams default-bind to. Both
+    # translate each episode's ledger-merged trajectory into a RolloutSample.
+
+    @remote_function(dispatch="all", collect="none", lazy_collect=True)
+    def generate(
+        self,
+        prompts: list[list[dict]],
+        num_samples: int = 1,
+        sampling_params: dict | None = None,
+        prompt_extras: list[dict[str, Any]] | None = None,
+        force_logprobs: bool = True,
+        adapter_path: str | None = None,
+        allow_partial_rollout: bool | None = None,
+    ) -> list[RolloutSample]:
+        """Run one episode per (prompt, sample) pair and translate each output.
+
+        ``num_samples`` completions per prompt, grouped by prompt -- a GRPO group is one
+        prompt's slice of the returned list. ``lazy_collect=True`` makes a REMOTE call
+        return a LazyCollect handle immediately (what :meth:`admit` parks on its
+        payload); a local call still blocks.
+        """
+        if num_samples < 1:
+            raise ValueError("num_samples must be >= 1.")
+        if prompt_extras is not None and len(prompt_extras) != len(prompts):
+            raise ValueError("prompt_extras must contain exactly one mapping per prompt.")
+        extras = prompt_extras or [{} for _ in prompts]
+        trajectories, metadata = [], []
+        for prompt_index, prompt in enumerate(prompts):
+            for _ in range(num_samples):
+                extra = copy.deepcopy(extras[prompt_index])
+                trajectory: dict[str, Any] = {"messages": copy.deepcopy(prompt)}
+                # Thread the prompt row's media columns so a multimodal episode samples its media.
+                for key in _MULTIMODAL_PROMPT_KEYS:
+                    if extra.get(key):
+                        trajectory[key] = copy.deepcopy(extra[key])
+                trajectories.append(trajectory)
+                metadata.append((str(prompt_index), extra))
+        sp = self._rl_sampling_params(sampling_params, force_logprobs)
+        # adapter_path threads into every per-turn sampler.sample (a LoRA run must not sample
+        # from the base); allow_partial_rollout rides the same kwargs channel (False reads as
+        # omitted).
+        kwargs: dict[str, Any] = {
+            "sampling_params": sp,
+            "allow_partial_rollout": (
+                self._allow_partial_rollout if allow_partial_rollout is None else allow_partial_rollout
+            ),
+        }
+        if adapter_path:
+            kwargs["adapter_path"] = adapter_path
+        outputs = self(trajectories, **kwargs)
+        if len(outputs) != len(metadata):
+            raise RuntimeError(f"multi-turn rollout returned {len(outputs)} trajectories for {len(metadata)} inputs.")
+        return [
+            trajectory_to_rollout_sample(output, prompt_id, extra)
+            for output, (prompt_id, extra) in zip(outputs, metadata, strict=False)
+        ]
+
+    def _rl_sampling_params(self, sampling_params: Any, force_logprobs: bool) -> SamplingParams:
+        """The one SamplingParams every RL entry samples under (contract 15).
+
+        A per-call dict replaces the construction-time params wholesale; either way
+        old_logps are forced and num_samples is 1 -- the engine drives one trajectory
+        per call, so no path can silently sample under different params than another.
+        """
+        if isinstance(sampling_params, SamplingParams):
+            sp = sampling_params
+        elif sampling_params is None:
+            sp = self.sampling_params or SamplingParams()
+        else:
+            sp = _build_sampling_params(1, sampling_params, force_logprobs)
+        if force_logprobs and not sp.logprobs:
+            sp = replace(sp, logprobs=1)
+        if sp.num_samples != 1:
+            sp = replace(sp, num_samples=1)
+        return sp
+
+    def admit(
+        self,
+        prompt: list[dict],
+        trajectory_idx: int = 0,
+        *,
+        prompt_idx: Any = 0,
+        sampling_params: dict | None = None,
+        prompt_extras: dict[str, Any] | None = None,
+        adapter_path: str | None = None,
+        policy_version: int = 0,
+    ) -> SampleHandle:
+        """Admit ONE trajectory without blocking; poll/collect/cancel complete the protocol.
+
+        ``prompt_idx`` / ``trajectory_idx`` are carried for the collect-side group
+        stamping; ``policy_version`` is the admission pin, stamped onto the sample. A
+        REMOTE deployment parks the lazy generate on the handle's payload; a local one
+        runs the episode on a daemon-thread Future. This method also runs on a Ray
+        proxy whose ``__init__`` never executed, which is why every state it touches
+        is either on the handle or lazy.
+        """
+        handle = SampleHandle(
+            submission_id=uuid.uuid4().hex,
+            prompt_idx=prompt_idx,
+            trajectory_idx=trajectory_idx,
+            prompt_extras=dict(prompt_extras) if prompt_extras else None,
+            policy_version=policy_version,
+            prompt=list(prompt) if prompt is not None else None,
+            adapter_path=adapter_path,
+        )
+        if hasattr(self, "_actors"):
+            # The remote episode runs on the actor: the generate call itself returns a
+            # LazyCollect immediately, so admission never blocks the driver thread.
+            handle.payload = self.generate(
+                [prompt],
+                num_samples=1,
+                sampling_params=sampling_params,
+                prompt_extras=[prompt_extras] if prompt_extras else None,
+                force_logprobs=True,
+                adapter_path=adapter_path,
+            )
+            return handle
+        futures: dict[str, Future] = self.__dict__.setdefault("_episode_futures", {})
+        future: Future = Future()
+        futures[handle.submission_id] = future
+
+        def _work() -> None:
+            try:
+                future.set_result(
+                    self.generate(
+                        [prompt],
+                        num_samples=1,
+                        sampling_params=sampling_params,
+                        prompt_extras=[prompt_extras] if prompt_extras else None,
+                        force_logprobs=True,
+                        adapter_path=adapter_path,
+                    )
+                )
+            except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
+                future.set_exception(exc)
+
+        threading.Thread(target=_work, name=f"episode-{handle.submission_id[:8]}", daemon=True).start()
+        return handle
+
+    def poll(self, handles: list[SampleHandle]) -> list[SampleHandle]:
+        """Non-blocking as-completed query; a failed local episode raises here, fail-loudly."""
+        futures: dict[str, Future] = getattr(self, "_episode_futures", {})
+        completed: list[SampleHandle] = []
+        for handle in handles:
+            if handle.payload is not None:
+                # ready() is a ray.wait(timeout=0) status probe, never a fetch; a FAILED episode
+                # still reports ready and its exception surfaces at collect.
+                if handle.payload.ready():
+                    completed.append(handle)
+                continue
+            future = futures.get(handle.submission_id)
+            if future is None or not future.done():
+                continue
+            error = future.exception()
+            if error is not None:
+                raise RuntimeError(f"streaming episode {handle.submission_id} failed: {error}") from error
+            completed.append(handle)
+        return completed
+
+    def collect(self, handle: SampleHandle) -> RolloutSample:
+        """Collect ONE completed trajectory, stamped with its group id / pin version / prompt."""
+        if handle.payload is not None:
+            samples = handle.payload()
+        else:
+            future = getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
+            if future is None:
+                raise RuntimeError(
+                    f"collect called for an unknown or already-collected submission {handle.submission_id}."
+                )
+            samples = future.result()
+        if len(samples) != 1:
+            raise RuntimeError(
+                f"episode collect expected exactly 1 sample (submission {handle.submission_id}), got {len(samples)}."
+            )
+        sample = samples[0]
+        sample.prompt_id = str(handle.prompt_idx)
+        sample.policy_version = handle.policy_version
+        sample.prompt = handle.prompt
+        return sample
+
+    def cancel(self, handle: SampleHandle | None) -> None:
+        """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
+
+        A concurrent.futures.Future silently discards an unretrieved exception, so an
+        abandoned episode that later fails needs no drain here.
+        """
+        if handle is None:
+            return
+        if handle.payload is not None:
+            # The in-actor episode finishes on its own; its result is discarded with the ref.
+            return
+        getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
+
+    # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
+    # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    def abort_all_inflight(self) -> None:
+        """Abort every in-flight sampler generation so an in-place republish can resume them.
+
+        Distinct from cancel (which DROPS a submission): abort keeps it alive and
+        resumable on the fresh weights. Runs where the sampler handle is reachable --
+        on a Ray proxy the driver instance has no sampler attribute, so the decorated
+        dispatch is what carries the call to the worker that holds one.
+        """
+        abort = getattr(getattr(self, "sampler", None), "abort_all_inflight", None)
+        if not callable(abort):
+            raise RuntimeError(
+                "abort-on-publish needs a sampler with abort_all_inflight (the twinkle "
+                "partial-rollout capability): the core vLLM/SGLang samplers provide it."
+            )
+        return abort()
+
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    def close(self) -> None:
+        """Release the sandbox env pool; the sampler's lifecycle is not owned here."""
+        getattr(self, "_episode_futures", {}).clear()
+        if self.env_pool is not None:
+            self.env_pool.close()
+
+    def _resolve_call(self, kwargs: dict[str, Any], n: int) -> dict[str, Any]:
+        adapter_path = kwargs.get("adapter_path", self.adapter_path)
         # Left out entirely when unset, so a sampler without LoRA enabled sees the
         # same call it always did.
-        adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
-        if kwargs.get('use_base_model', self.use_base_model):
-            adapter_kwargs['use_base_model'] = True
+        adapter_kwargs = {"adapter_path": adapter_path} if adapter_path else {}
+        if kwargs.get("use_base_model", self.use_base_model):
+            adapter_kwargs["use_base_model"] = True
         # ``allow_partial_rollout`` makes each per-turn ``sample()`` resumable across an in-place weight
         # republish: a publish aborts the turn in flight and, with this set, it continues from its own
         # tokens on the fresh weights instead of returning truncated -- what lets a MULTI-TURN episode
@@ -342,33 +900,32 @@ class MultiTurnRollout(Rollout):
         # local-sampler capability, so it is threaded only when a sampler drives the turns; an API/teacher
         # backend has no in-place weight sync to resume across (and its callback would not take the kwarg).
         # Left out entirely when unset, so the default per-turn call is unchanged.
-        if self.sampler is not None and kwargs.get('allow_partial_rollout', False):
-            adapter_kwargs['allow_partial_rollout'] = True
-        sampling_params = kwargs.get('sampling_params', self.sampling_params)
+        if self.sampler is not None and kwargs.get("allow_partial_rollout", False):
+            adapter_kwargs["allow_partial_rollout"] = True
+        sampling_params = kwargs.get("sampling_params", self.sampling_params)
         if sampling_params.num_samples != 1:
-            raise ValueError(f'MultiTurnRollout supports num_samples=1 only, got '
-                             f'{sampling_params.num_samples}')
-        response_callback = kwargs.get('response_callback', self.response_callback)
+            raise ValueError(f"MultiTurnRollout supports num_samples=1 only, got {sampling_params.num_samples}")
+        response_callback = kwargs.get("response_callback", self.response_callback)
         if not callable(response_callback):
-            raise TypeError('response_callback must be callable')
+            raise TypeError("response_callback must be callable")
         return {
-            'sampling_params': sampling_params,
-            'adapter_kwargs': adapter_kwargs,
-            'response_callback': response_callback,
-            'tool_managers': self._broadcast(kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
-            'followup_fn': kwargs.get('followup_fn', self.followup_fn),
-            'harnesses': self._resolve_harness(kwargs.get('harness', self.harness), n),
+            "sampling_params": sampling_params,
+            "adapter_kwargs": adapter_kwargs,
+            "response_callback": response_callback,
+            "tool_managers": self._broadcast(kwargs.get("tool_manager", self.tool_manager), n, name="tool_manager"),
+            "followup_fn": kwargs.get("followup_fn", self.followup_fn),
+            "harnesses": self._resolve_harness(kwargs.get("harness", self.harness), n),
         }
 
-    def _resolve_harness(self, harness, n: int) -> List[Any]:
+    def _resolve_harness(self, harness, n: int) -> list[Any]:
         """One harness per episode. A pool is shared and leased per thread; a
         bare harness carries per-episode state and cannot be shared across
         parallel threads, so n>1 needs a pool or a 1:1 list."""
         if harness is None:
             return [None] * n
-        if hasattr(harness, 'lease'):
+        if hasattr(harness, "lease"):
             return [harness] * n
-        return self._broadcast(harness, n, name='harness', per_trajectory=True)
+        return self._broadcast(harness, n, name="harness", per_trajectory=True)
 
     def _new_ledger(self, index: int):
         """The episode account for one trajectory: token-level or message-level.
@@ -379,26 +936,42 @@ class MultiTurnRollout(Rollout):
         message list. The loop below is identical either way -- it talks only to
         the ledger, never to ``self.template`` directly.
         """
-        label = f'trajectory {index}'
+        label = f"trajectory {index}"
         if self._message_only:
             return MessageLedger(label=label, max_tokens=self.max_trajectory_tokens)
-        return TurnLedger(self.template, label=label, max_tokens=self.max_trajectory_tokens)
+        return TurnLedger(
+            self.template,
+            label=label,
+            max_tokens=self.max_trajectory_tokens,
+            backend=self._template_backend,
+        )
 
-    def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+    def _run_one(self, trajectory: Trajectory, index: int, ctx: dict[str, Any]) -> Trajectory:
+        if self._per_episode_tools:
+            # A sandbox env holds one workspace: the trajectory drives alone with its
+            # tools bound to the env it leased; the lease blocks when the pool empties
+            # (the sandbox's own concurrency bound) and is held for the whole episode.
+            with self.env_pool.lease() as env:
+                scoped = dict(ctx)
+                scoped["tool_managers"] = [self._tool_manager_for(env, self.tool_plugins)] * len(ctx["tool_managers"])
+                return self._run_with_harness(trajectory, index, scoped)
+        return self._run_with_harness(trajectory, index, ctx)
+
+    def _run_with_harness(self, trajectory: Trajectory, index: int, ctx: dict[str, Any]) -> Trajectory:
         # A harness from a pool is leased for the episode and returned after, so
         # its per-episode state (an agent's memory, say) never leaks into the
         # next one. Anything else is used as passed.
-        harness = ctx['harnesses'][index]
-        if harness is not None and hasattr(harness, 'lease'):
+        harness = ctx["harnesses"][index]
+        if harness is not None and hasattr(harness, "lease"):
             with harness.lease() as leased:
                 return self._run_episode(trajectory, index, ctx, leased)
         return self._run_episode(trajectory, index, ctx, harness)
 
-    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any], harness=None) -> Trajectory:
-        tool_manager: ToolManager = ctx['tool_managers'][index]
-        followup_fn = ctx['followup_fn']
-        adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
-        response_callback: ResponseCallback = ctx['response_callback']
+    def _run_episode(self, trajectory: Trajectory, index: int, ctx: dict[str, Any], harness=None) -> Trajectory:
+        tool_manager: ToolManager = ctx["tool_managers"][index]
+        followup_fn = ctx["followup_fn"]
+        adapter_kwargs: dict[str, Any] = ctx["adapter_kwargs"]
+        response_callback: ResponseCallback = ctx["response_callback"]
 
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
@@ -411,14 +984,14 @@ class MultiTurnRollout(Rollout):
         if harness is not None:
             trajectory = harness.before_generate(trajectory)
         opening_tools = None
-        if 'tools' not in trajectory and tool_manager is not None:
+        if "tools" not in trajectory and tool_manager is not None:
             opening_tools = list(tool_manager.tool_infos() or [])
         ledger.open(trajectory, tools=opening_tools)
 
-        stop_reason: Optional[str] = None
-        generation_error: Optional[str] = None
+        stop_reason: str | None = None
+        generation_error: str | None = None
         truncated = False
-        params = ctx['sampling_params']
+        params = ctx["sampling_params"]
         # Consecutive turns that made no progress, the calls already issued, and
         # whether being stuck is what ended the episode. All three stay at their
         # initial value when ``stop_after_stuck_turns`` is 0.
@@ -434,7 +1007,7 @@ class MultiTurnRollout(Rollout):
         # choice: 'max_turns' or 'stuck'. Reported separately from ``truncated``
         # because an episode can hit the turn limit and still go on to answer the
         # follow-up stages, in which case nothing was cut off.
-        tool_stop: Optional[str] = None
+        tool_stop: str | None = None
         # The loop counts generations, and each granted follow-up buys the one
         # extra generation it asked for. Paying for the follow-up stages out of
         # ``max_turns`` would mean an episode that spent its whole tool budget
@@ -454,15 +1027,16 @@ class MultiTurnRollout(Rollout):
             if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
             followup = followup_fn(
-                ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated), followups)
+                ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated), followups
+            )
             if followup is None:
                 return False
             text, next_params = self._unpack_followup(followup)
-            if not ledger.observe([{'role': 'user', 'content': text}]):
+            if not ledger.observe([{"role": "user", "content": text}]):
                 truncated = True
                 return False
             # Follow-up stages are answers, so an API must not see tool schemas.
-            ledger.input_feature['tools'] = []
+            ledger.clear_tools()
             followups += 1
             budget += 1
             if next_params is not None:
@@ -480,6 +1054,7 @@ class MultiTurnRollout(Rollout):
                     self.api,
                     params,
                     input_feature=ledger.input_feature,
+                    rollout_state=ledger.state,
                     adapter_kwargs=adapter_kwargs,
                     trajectory=trajectory,
                     trajectory_index=index,
@@ -492,49 +1067,26 @@ class MultiTurnRollout(Rollout):
                 truncated = True
                 break
             if not isinstance(seq, SampledSequence):
-                raise TypeError(f'response_callback must return SampledSequence, got '
-                                f'{type(seq).__name__}')
+                raise TypeError(f"response_callback must return SampledSequence, got {type(seq).__name__}")
 
             ledger.record(seq)
-            pif = ledger.input_feature
             stop_reason = seq.stop_reason
 
-            msgs = pif.get('messages') or []
+            msgs = ledger.messages
             last_msg = msgs[-1] if msgs else None
-            tool_calls = (last_msg.get('tool_calls') if isinstance(last_msg, dict) else None)
+            tool_calls = last_msg.get("tool_calls") if isinstance(last_msg, dict) else None
             if not tool_calls:
-                tool_calls = ledger.parse_tool_call(seq.decoded or '')
-            # After a follow-up, a parsed call is not a call: the tools were
-            # withdrawn for these stages on purpose (see ``followup_fn``), and
-            # dispatching python that the model wrote as *an answer* would edit
-            # the state the answer is about.
+                tool_calls = ledger.parse_tool_call(seq.decoded or "")
             if followups:
                 tool_calls = None
-                # The parse also *rewrote* the message: when a reply parses as
-                # a call, the template stores it with the call text removed, so
-                # a caller reading the message gets less than the model wrote.
-                # For these stages the reply is the deliverable, and one of the
-                # tool-call formats is XML-shaped, so a check script asserting
-                # the content of an .xml file matches it: 5 of ex12's 72 check
-                # scripts came back with the XML cut out of them -- three then
-                # ran with `content == ''` where the model had written the file's
-                # real text, and two no longer held a code block at all.
-                if msgs and isinstance(last_msg, dict):
-                    # Decoded without the special tokens, the way the template
-                    # writes a message: ``seq.decoded`` keeps the closing
-                    # ``<|im_end|>``, and putting that in the content put it in
-                    # the problem statements ex13 handed to solvers -- 7 of 7 of
-                    # them ended in a literal '<|im_end|>'. The ledger decodes
-                    # through the template's tokenizer, falling back to
-                    # ``seq.decoded`` when there is none (message-only mode).
-                    last_msg['content'] = ledger.decode_tokens(seq)
-                    last_msg.pop('tool_calls', None)
+                if isinstance(last_msg, dict):
+                    message = dict(last_msg)
+                    message["content"] = ledger.decode_tokens(seq)
+                    message.pop("tool_calls", None)
+                    ledger.replace_last_message(message)
 
-            # Let the harness normalize the assistant turn's message metadata
-            # (tool-call ids, content shape) without touching the tokens the
-            # ledger just banked.
             if harness is not None:
-                self._harness_after_generate(harness, pif, seq.decoded or '', tool_calls)
+                self._harness_after_generate(harness, ledger, seq.decoded or "", tool_calls)
 
             # 3. Termination conditions
             # A reply cut off at ``max_tokens`` is truncated in exactly the sense
@@ -544,7 +1096,7 @@ class MultiTurnRollout(Rollout):
             # the task for the token budget. Tool calls the cut reply happens to
             # contain are still not dispatched -- the turn never got to decide it
             # was done emitting them.
-            if seq.stop_reason == 'length':
+            if seq.stop_reason == "length":
                 truncated = True
                 break
 
@@ -560,7 +1112,7 @@ class MultiTurnRollout(Rollout):
                 # the call again. Not after a follow-up: tools are withdrawn
                 # there on purpose (see ``followup_fn``), so a reply that looks
                 # like a call is meant to be read as text.
-                parse_errors = ([] if followups else ledger.tool_call_errors(seq.decoded or ''))
+                parse_errors = [] if followups else ledger.tool_call_errors(seq.decoded or "")
                 if parse_errors and malformed_turns < self.max_malformed_retries:
                     malformed_turns += 1
                     if not ledger.observe([_malformed_tool_message(parse_errors)]):
@@ -577,7 +1129,7 @@ class MultiTurnRollout(Rollout):
             if ledger.turns >= self.max_turns:
                 # Out of tool turns, not out of episode: the stages that read the
                 # end state can still run on what was built.
-                tool_stop = 'max_turns'
+                tool_stop = "max_turns"
                 if grant_followup():
                     continue
                 truncated = True
@@ -588,7 +1140,7 @@ class MultiTurnRollout(Rollout):
             # 4. This turn's calls, appended as an append-only bridge of tool
             #    messages the model did not write.
             if tool_manager is None:
-                raise ValueError('the model emitted tool_calls but this trajectory has no ToolManager')
+                raise ValueError("the model emitted tool_calls but this trajectory has no ToolManager")
             observations = self._run_tools(tool_manager, tool_calls)
             if self.stop_after_stuck_turns:
                 keys = [_call_key(tc) for tc in tool_calls]
@@ -601,20 +1153,17 @@ class MultiTurnRollout(Rollout):
                     stuck_turns = 0
 
             if harness is not None:
-                tool_messages = self._harness_tool_messages(harness, ledger.input_feature, observations, tool_calls)
+                tool_messages = self._harness_tool_messages(harness, ledger, observations, tool_calls)
             else:
                 tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
             if overflowed:
-                # Trajectory exceeded max_length.
                 truncated = True
-            else:
-                pif = ledger.input_feature
             # Checked after the messages are appended, so the turns that ended
             # the episode are in the trajectory the caller reads.
             if self.stop_after_stuck_turns and stuck_turns >= self.stop_after_stuck_turns:
                 stuck_stop = True
-                tool_stop = 'stuck'
+                tool_stop = "stuck"
                 # Same as the turn limit: the tool phase is over, the state it
                 # left is not, so the stages still get their turn.
                 if not overflowed and grant_followup():
@@ -641,42 +1190,31 @@ class MultiTurnRollout(Rollout):
             followups=followups,
         )
         if generation_error is not None:
-            out['error'] = generation_error
+            out["error"] = generation_error
         return out
 
     # ------------------------------------------------------------------ private
 
     @staticmethod
-    def _harness_after_generate(harness, pif: Dict[str, Any], decoded: str, tool_calls) -> None:
-        """Swap the harness-shaped assistant message onto the banked turn.
-
-        The ledger owns the ids; only the human-readable last message is
-        replaced. The harness is handed the turns *before* this reply and
-        appends its own normalized assistant, whose shaped form we take back.
-        """
-        msgs = list(pif.get('messages') or [])
-        if not msgs:
+    def _harness_after_generate(harness, ledger, decoded: str, tool_calls) -> None:
+        messages = ledger.messages
+        if not messages:
             return
-        prior = msgs[:-1]
-        shaped = harness.after_generate({'messages': list(prior), 'tools': pif.get('tools')}, decoded, tool_calls)
-        shaped_msgs = (shaped or {}).get('messages') or []
-        if len(shaped_msgs) > len(prior):
-            pif['messages'][-1] = shaped_msgs[len(prior)]
+        prior = messages[:-1]
+        shaped = harness.after_generate({"messages": prior, "tools": ledger.tools}, decoded, tool_calls)
+        shaped_messages = (shaped or {}).get("messages") or []
+        if len(shaped_messages) > len(prior):
+            ledger.replace_last_message(shaped_messages[len(prior)])
 
     @staticmethod
-    def _harness_tool_messages(harness, pif: Dict[str, Any], observations, tool_calls):
-        """This turn's tool messages, framed by the harness (append-only tail).
-
-        Falls back to the default framing when the harness appended nothing.
-        """
-        prior = list(pif.get('messages') or [])
-        shaped = harness.after_tools({'messages': list(prior), 'tools': pif.get('tools')}, observations, tool_calls)
-        shaped_msgs = (shaped or {}).get('messages') or []
-        tail = shaped_msgs[len(prior):]
-        return tail or _default_tool_messages(tool_calls, observations)
+    def _harness_tool_messages(harness, ledger, observations, tool_calls):
+        prior = ledger.messages
+        shaped = harness.after_tools({"messages": prior, "tools": ledger.tools}, observations, tool_calls)
+        shaped_messages = (shaped or {}).get("messages") or []
+        return shaped_messages[len(prior) :] or _default_tool_messages(tool_calls, observations)
 
     @staticmethod
-    def _run_tools(tool_manager: ToolManager, tool_calls: List[Dict[str, Any]]) -> List[str]:
+    def _run_tools(tool_manager: ToolManager, tool_calls: list[dict[str, Any]]) -> list[str]:
         """Run one turn's calls, through ``call_many`` when the manager has it.
 
         A turn's calls go together because they share one Env round trip
@@ -687,11 +1225,11 @@ class MultiTurnRollout(Rollout):
         A manager that answers with fewer results than calls leaves the rest
         empty rather than shifting them onto the wrong call.
         """
-        if hasattr(tool_manager, 'call_many'):
+        if hasattr(tool_manager, "call_many"):
             contents = tool_manager.call_many(tool_calls)
         else:
             contents = [tool_manager(tc) for tc in tool_calls]
-        obs = [''] * len(tool_calls)
-        for i, content in enumerate(contents[:len(tool_calls)]):
-            obs[i] = '' if content is None else str(content)
+        obs = [""] * len(tool_calls)
+        for i, content in enumerate(contents[: len(tool_calls)]):
+            obs[i] = "" if content is None else str(content)
         return obs

@@ -12,32 +12,39 @@ Consistent with ``test_sampler_over_existing_model.py``: these cases pin the sea
 the base class turns a template's output into an ``InputFeature``, which keys it keeps,
 and where it refuses -- not generation itself.
 """
+
 import pytest
 import torch
 
+from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
+from twinkle.template.contract import MediaBundle, PromptEncoding, RolloutState
 
 
 class _ConcreteSampler(Sampler):
     """Minimal concrete Sampler; the base-class seam never calls these two."""
 
-    def sample(self, inputs, sampling_params=None, adapter_name='', *, num_samples=1):
-        raise AssertionError('sample must not be called by the base-class seam under test')
+    def sample(self, inputs, sampling_params=None, adapter_name="", *, num_samples=1):
+        raise AssertionError("sample must not be called by the base-class seam under test")
 
     def apply_patch(self, patch_cls, **kwargs):
-        raise AssertionError('apply_patch must not be called by the base-class seam under test')
+        raise AssertionError("apply_patch must not be called by the base-class seam under test")
 
 
 class _FakeTemplate:
     """Mirrors the ``Template.encode`` / ``Template.decode`` contract that base.py relies on."""
 
-    def __init__(self, encoded=None, decoded='decoded-text'):
-        self._encoded = ({
-            'input_ids': torch.tensor([1, 2, 3]),  # a tensor exercises the .tolist() branch
-            'labels': torch.tensor([-100, -100, 3]),  # must be dropped from the InputFeature
-            'attention_mask': [1, 1, 1],  # extra key -> must be copied through
-            'images': ['pic'],  # extra key -> must be copied through
-        } if encoded is None else encoded)
+    def __init__(self, encoded=None, decoded="decoded-text"):
+        self._encoded = (
+            {
+                "input_ids": torch.tensor([1, 2, 3]),  # a tensor exercises the .tolist() branch
+                "labels": torch.tensor([-100, -100, 3]),  # must be dropped from the InputFeature
+                "attention_mask": [1, 1, 1],  # extra key -> must be copied through
+                "images": ["pic"],  # extra key -> must be copied through
+            }
+            if encoded is None
+            else encoded
+        )
         self._decoded = decoded
         self.encode_calls = []
         self.decode_calls = []
@@ -51,37 +58,60 @@ class _FakeTemplate:
         return self._decoded
 
 
-# ---------------------------------------------------------------------------
-# Input classification: _not_encoded / _is_trajectory / _normalize_inputs
-# ---------------------------------------------------------------------------
+def test_generation_uses_rollout_state_engine_ids():
+
+    class Template:
+        def encode_prompt(self, trajectory, *, backend, add_generation_prompt):
+            state = RolloutState(
+                feature={"input_ids": [1, 2]},
+                engine_input_ids=(8, 9),
+                messages=tuple(trajectory["messages"]),
+                tools=(),
+                reasoning_started=False,
+                media=MediaBundle(),
+            )
+            return PromptEncoding(state)
+
+    encoded, states, failures = generation.encode_all(
+        Template(), [{"messages": [{"role": "user", "content": "q"}]}], logprobs_only=False, strict=True
+    )
+    assert failures == {}
+    assert generation.prompt_ids(encoded[0], states[0]) == [8, 9]
+
+
+def test_generation_rejects_feature_only_multimodal_input():
+    with pytest.raises(NotImplementedError, match="Trajectory or RolloutState"):
+        generation.encode_all(
+            None, [{"input_ids": [1], "pixel_values": torch.ones(1)}], logprobs_only=False, strict=True
+        )
+
 
 class TestInputClassification:
-
     def test_not_encoded_true_for_trajectory(self):
-        assert Sampler._not_encoded({'messages': [{'role': 'user', 'content': 'hi'}]}) is True
+        assert Sampler._not_encoded({"messages": [{"role": "user", "content": "hi"}]}) is True
 
     def test_not_encoded_false_when_input_ids_present(self):
-        assert Sampler._not_encoded({'input_ids': [1, 2, 3]}) is False
+        assert Sampler._not_encoded({"input_ids": [1, 2, 3]}) is False
 
     def test_not_encoded_false_when_input_embedding_present(self):
-        assert Sampler._not_encoded({'input_embedding': torch.zeros(2)}) is False
+        assert Sampler._not_encoded({"input_embedding": torch.zeros(2)}) is False
 
     def test_not_encoded_rejects_non_dict(self):
-        with pytest.raises(AssertionError, match='Expected dict'):
-            Sampler._not_encoded(['not', 'a', 'dict'])
+        with pytest.raises(AssertionError, match="Expected dict"):
+            Sampler._not_encoded(["not", "a", "dict"])
 
     def test_is_trajectory_single_trajectory_dict(self):
         sampler = _ConcreteSampler()
-        assert sampler._is_trajectory({'messages': []}) is True
+        assert sampler._is_trajectory({"messages": []}) is True
 
     def test_is_trajectory_single_encoded_dict(self):
         sampler = _ConcreteSampler()
-        assert sampler._is_trajectory({'input_ids': [1]}) is False
+        assert sampler._is_trajectory({"input_ids": [1]}) is False
 
     def test_is_trajectory_list_inspects_first_element(self):
         sampler = _ConcreteSampler()
-        assert sampler._is_trajectory([{'messages': []}, {'messages': []}]) is True
-        assert sampler._is_trajectory([{'input_ids': [1]}]) is False
+        assert sampler._is_trajectory([{"messages": []}, {"messages": []}]) is True
+        assert sampler._is_trajectory([{"input_ids": [1]}]) is False
 
     def test_is_trajectory_empty_list_is_false(self):
         sampler = _ConcreteSampler()
@@ -89,17 +119,17 @@ class TestInputClassification:
 
     def test_is_trajectory_non_dict_is_false(self):
         sampler = _ConcreteSampler()
-        assert sampler._is_trajectory('a raw string') is False
+        assert sampler._is_trajectory("a raw string") is False
         assert sampler._is_trajectory(42) is False
 
     def test_normalize_inputs_wraps_single_dict(self):
         sampler = _ConcreteSampler()
-        single = {'input_ids': [1]}
+        single = {"input_ids": [1]}
         assert sampler._normalize_inputs(single) == [single]
 
     def test_normalize_inputs_passes_through_iterable(self):
         sampler = _ConcreteSampler()
-        batch = [{'input_ids': [1]}, {'input_ids': [2]}]
+        batch = [{"input_ids": [1]}, {"input_ids": [2]}]
         assert sampler._normalize_inputs(batch) == batch
         # A tuple is normalized to a list.
         assert sampler._normalize_inputs(tuple(batch)) == batch
@@ -109,33 +139,33 @@ class TestInputClassification:
 # encode_trajectory
 # ---------------------------------------------------------------------------
 
-class TestEncodeTrajectory:
 
+class TestEncodeTrajectory:
     def test_raises_without_template(self):
         sampler = _ConcreteSampler()
         assert sampler.template is None
-        with pytest.raises(ValueError, match='Template not set'):
-            sampler.encode_trajectory({'messages': []})
+        with pytest.raises(ValueError, match="Template not set"):
+            sampler.encode_trajectory({"messages": []})
 
     def test_builds_input_feature_and_filters_keys(self):
         sampler = _ConcreteSampler()
         template = _FakeTemplate()
         sampler.template = template
-        result = sampler.encode_trajectory({'messages': []})
+        result = sampler.encode_trajectory({"messages": []})
         # input_ids came back as a tensor and must be converted to a plain list.
-        assert result['input_ids'] == [1, 2, 3]
-        assert isinstance(result['input_ids'], list)
+        assert result["input_ids"] == [1, 2, 3]
+        assert isinstance(result["input_ids"], list)
         # 'labels' is deliberately not carried into the sampler InputFeature.
-        assert 'labels' not in result
+        assert "labels" not in result
         # Extra multimodal / mask keys are copied through untouched.
-        assert result['attention_mask'] == [1, 1, 1]
-        assert result['images'] == ['pic']
+        assert result["attention_mask"] == [1, 1, 1]
+        assert result["images"] == ["pic"]
 
     def test_add_generation_prompt_is_forwarded(self):
         sampler = _ConcreteSampler()
         template = _FakeTemplate()
         sampler.template = template
-        trajectory = {'messages': []}
+        trajectory = {"messages": []}
         sampler.encode_trajectory(trajectory, add_generation_prompt=False)
         assert template.encode_calls == [(trajectory, False)]
         sampler.encode_trajectory(trajectory)  # default True
@@ -143,34 +173,34 @@ class TestEncodeTrajectory:
 
     def test_raises_when_encode_returns_no_input_ids(self):
         sampler = _ConcreteSampler()
-        sampler.template = _FakeTemplate(encoded={'attention_mask': [1, 1]})
+        sampler.template = _FakeTemplate(encoded={"attention_mask": [1, 1]})
         with pytest.raises(ValueError, match="must return 'input_ids'"):
-            sampler.encode_trajectory({'messages': []})
+            sampler.encode_trajectory({"messages": []})
 
     def test_list_input_ids_are_kept_as_is(self):
         sampler = _ConcreteSampler()
-        sampler.template = _FakeTemplate(encoded={'input_ids': [7, 8], 'extra': 'x'})
-        result = sampler.encode_trajectory({'messages': []})
-        assert result['input_ids'] == [7, 8]
-        assert result['extra'] == 'x'
+        sampler.template = _FakeTemplate(encoded={"input_ids": [7, 8], "extra": "x"})
+        result = sampler.encode_trajectory({"messages": []})
+        assert result["input_ids"] == [7, 8]
+        assert result["extra"] == "x"
 
 
 # ---------------------------------------------------------------------------
 # decode_response
 # ---------------------------------------------------------------------------
 
-class TestDecodeResponse:
 
+class TestDecodeResponse:
     def test_raises_without_template(self):
         sampler = _ConcreteSampler()
-        with pytest.raises(ValueError, match='Template not set'):
+        with pytest.raises(ValueError, match="Template not set"):
             sampler.decode_response([1, 2, 3])
 
     def test_delegates_to_template(self):
         sampler = _ConcreteSampler()
-        template = _FakeTemplate(decoded='hello world')
+        template = _FakeTemplate(decoded="hello world")
         sampler.template = template
-        assert sampler.decode_response([1, 2, 3]) == 'hello world'
+        assert sampler.decode_response([1, 2, 3]) == "hello world"
         assert template.decode_calls == [[1, 2, 3]]
 
 
@@ -178,11 +208,11 @@ class TestDecodeResponse:
 # default encode (pooling) refuses loudly
 # ---------------------------------------------------------------------------
 
-class TestDefaultEncode:
 
+class TestDefaultEncode:
     def test_encode_not_implemented_by_default(self):
         # A backend without a pooling head must fail loudly rather than return hidden
         # states that merely look like embeddings.
         sampler = _ConcreteSampler()
-        with pytest.raises(NotImplementedError, match='does not support pooling'):
-            sampler.encode({'input_ids': [1, 2, 3]})
+        with pytest.raises(NotImplementedError, match="does not support pooling"):
+            sampler.encode({"input_ids": [1, 2, 3]})

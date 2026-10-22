@@ -14,7 +14,7 @@ for data in dataloader:
 As you can see, dataloader contains the `__iter__` method, returning an iterator. Under different training conditions such as DDP, TP, Ulysses, etc., since each rank extracts different data, samplers generally have multiple implementations and are relatively complex.
 
 In Twinkle, we adopted a very simple and direct approach by passing `DeviceMesh` to the DataLoader. Since DeviceMesh contains the cluster structure, DeviceMesh can provide the data shards needed by all ranks.
-Therefore, we additionally developed `DeviceMeshSampler` and `DeviceMeshFetcher`, which are used for sampling work of ordinary datasets and streaming datasets respectively.
+Therefore, we additionally developed `ShardedBatchSampler` and `StreamShardDataset`, which are used for sampling work of ordinary datasets and streaming datasets respectively.
 Additionally, due to the existence of LazyDataset, when the dataset actually extracts data, it may contain invalid data or throw exceptions, so we provide `RetrySampler` for skipping and retrying.
 
 Using DataLoader is very simple:

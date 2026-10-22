@@ -7,6 +7,7 @@ from tqdm import tqdm
 from typing import List, TypeVar
 
 from twinkle.infra import remote_class, remote_function
+from twinkle.perf import timed
 from .base import Dataset, DatasetMeta
 
 _T = TypeVar('_T')
@@ -34,6 +35,7 @@ class PackingDataset(Dataset):
         self._packed_called = False
 
     @remote_function()
+    @timed
     def pack_dataset(self):
         """Call to start packing dataset"""
         assert 'input_ids' in self.dataset[0], 'Tokenize dataset first to do packing.'

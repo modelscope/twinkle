@@ -57,9 +57,6 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
-          runtime_env:
-            env_vars:
-              TWINKLE_FAIL_FAST: "0"
 
   # 2. Training model. gemma-4-12B-it is a 12B multimodal MoE checkpoint, so
   #    shard it with FSDP across the 4 GPUs of the `model` device group. The
@@ -102,7 +99,6 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "1"
-              TWINKLE_FAIL_FAST: "0"
 
   # 3. Processor service - tokenizes/encodes datasets on CPU workers.
   - name: processor
@@ -125,6 +121,4 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
-          runtime_env:
-            env_vars:
-              TWINKLE_FAIL_FAST: "0"
+        

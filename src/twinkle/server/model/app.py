@@ -7,32 +7,34 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
 from typing import Any
 
-from twinkle import DeviceGroup
-from twinkle.server.common.router import StickyLoraRequestRouter
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
+from twinkle import DeviceGroup, remote_class
+from twinkle.model.base import TrainableModel
+from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.model.routing import StickyLoraRequestRouter
+from twinkle.server.runtime import init_twinkle_runtime
+from twinkle.server.session_resource import AdapterManagerMixin
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
-from twinkle.server.utils.backend_dispatch import BackendSelector
-from twinkle.server.utils.lifecycle import AdapterManagerMixin
-from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-from .tinker_handlers import _register_tinker_routes
-from .twinkle_handlers import _register_twinkle_routes
+from twinkle.utils.unsafe import trust_remote_code
+from .tinker_handlers import _register_model_tinker_routes
+from .twinkle_handlers import _register_model_twinkle_routes
 
 logger = get_logger()
 
-# ``FullModeBusyError`` lives in ``twinkle.server.exceptions``; re-exported here
-# for backwards compatibility with callers importing it from this module.
-__all__ = ['FullModeBusyError', 'ModelManagement', 'build_model_app']
+__all__ = ['ModelManagement', 'build_model_app']
 
 # Ctor kwargs consumed by the MultiLora wrappers' signatures but unknown to the
 # plain (full-parameter) model classes, where **kwargs flows into HF
@@ -47,8 +49,30 @@ def _make_mock_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMockModel(**kw)
 
 
+def _make_model_class(base: type) -> type:
+    """Compose a model class with twinkle's tinker/twinkle compat mixin.
+
+    This is the composition ``TwinkleCompatTransformersModel`` bakes in at import time, done at runtime
+    for a class that arrives as an import spec. The result is decorated with ``remote_class`` for the
+    same reason the built-in compat classes are: the outermost decorator layer is what names the class
+    the workers hold, so a subclass that only inherits the (already wrapped) base ``__init__`` would
+    spawn workers of the base class and lose every compat method.
+
+    Args:
+        base: The model class named by ``ModelArgs.model_cls``.
+    """
+    from .backends.transformers_model import _TransformersTinkerCompatMixin
+
+    return remote_class()(type(f'TwinkleCompat{base.__name__}', (_TransformersTinkerCompatMixin, base), {}))
+
+
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
+    # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
+    # constructor -- it would either be rejected by the remote-class layer in safe mode
+    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only
+    # allows it for a LoRA-mode transformers deployment.
+    model_cls_spec = kw.pop('model_cls', None)
     if train_mode == 'full':
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
@@ -59,6 +83,8 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
 
     if train_mode == 'hybrid':
         return TwinkleCompatSpectralHybridTransformersModel(**kw)
+    if model_cls_spec is not None:
+        return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
     return TwinkleCompatTransformersModel(**kw)
 
 
@@ -73,6 +99,19 @@ def _make_megatron_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMegatronModel(**kw)
 
 
+def _require_trusted_imports(spec: str) -> None:
+    """Gate a ``module:attr`` import spec behind the trust-remote-code switch.
+
+    The specs are plain data crossing the Ray boundary, which is exactly what lets them slip past
+    the remote-class layer's ``check_unsafe`` (that check sees only the constructor kwargs, not the
+    import the replica performs later). Importing arbitrary code on request of a deployment config
+    must stay behind the same switch the rest of remote-code execution honors, or safe mode
+    (``TWINKLE_TRUST_REMOTE_CODE=0``) would promise more than it delivers.
+    """
+    if not trust_remote_code():
+        raise ValueError(f'import spec {spec!r} requires TWINKLE_TRUST_REMOTE_CODE != 0')
+
+
 def _resolve_model_loader(spec: str, model_id: str) -> Any:
     """Resolve a ``module:callable`` loader-factory spec and build the loader for ``model_id``.
 
@@ -81,12 +120,37 @@ def _resolve_model_loader(spec: str, model_id: str) -> Any:
     its own ``swift.dev.model.loader:build_model_loader``, which owns family resolution and returns a
     ``ModelLoaderProtocol`` object, or ``None`` to keep the generic AutoConfig/AutoModel path.
     """
+    _require_trusted_imports(spec)
     module_name, _, attr = spec.partition(':')
     if not attr:
         raise ValueError(
             f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
     factory = getattr(importlib.import_module(module_name), attr)
-    return factory(model_id)
+    loader = factory(model_id)
+    # Fail here, not at first use inside the model constructor: a misspelled factory that returns
+    # something else would otherwise surface as an opaque AttributeError deep in the backend.
+    if loader is not None and not callable(getattr(loader, 'build_config', None)):
+        raise TypeError(f'model_loader factory {spec!r} returned {loader!r}, which is neither None nor a '
+                        'ModelLoaderProtocol (missing callable build_config)')
+    return loader
+
+
+def _resolve_model_cls(spec: str) -> type:
+    """Resolve a ``module:attr`` import spec into the model class it names.
+
+    The sibling of ``_resolve_model_loader``: the class arrives as plain data (it crosses the Ray
+    boundary), so it is imported generically here -- twinkle never imports a concrete model registry.
+    swift points this at its own class, e.g.
+    ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
+    """
+    _require_trusted_imports(spec)
+    module_name, _, attr = spec.partition(':')
+    if not attr:
+        raise ValueError(f'model_cls must be a "module:attr" import spec naming a model class, got {spec!r}')
+    obj = getattr(importlib.import_module(module_name), attr)
+    if not (isinstance(obj, type) and issubclass(obj, TrainableModel)):
+        raise TypeError(f'model_cls must name a TrainableModel subclass, got {spec!r} -> {obj!r}')
+    return obj
 
 
 # Single validate-then-dispatch selector for the model backend.
@@ -159,9 +223,18 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
+        self._model_unhealthy = False
+        self._health_probe_task: asyncio.Task | None = None
 
-        # Initialize mixins
-        self._init_task_queue(queue_config, deployment_name='Model')
+        actors = getattr(self.model, '_actors', None)
+        self._init_task_queue(
+            queue_config,
+            deployment_name='Model',
+            enable_admission_gate=True,
+            on_backend_timeout=self._probe_after_timeout,
+            collect_width=len(actors) if actors else 1,
+        )
+        self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
         self._init_adapter_manager(**(adapter_config or {}))
         await self._register_replica_on_startup()
         # Note: countdown task is started lazily in _ensure_sticky()
@@ -180,6 +253,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """Register this replica's capacity before Ray Serve marks it ready."""
         if not self._replica_registered:
             await self.state.register_replica(self.replica_id, self.max_loras)
+            await self.state.touch_replica_last_seen(self.replica_id)
             self._replica_registered = True
 
     @serve.multiplexed(max_num_models_per_replica=5)
@@ -194,9 +268,11 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
-        token = get_token_from_request(request)
-        return token
+        if self._model_unhealthy:
+            raise HTTPException(status_code=503, detail='Model actors are unavailable')
+        return get_token_from_request(request)
 
     async def shutdown(self) -> None:
         """Explicit async cleanup — called via FastAPI shutdown event."""
@@ -204,32 +280,49 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             await self.state.unregister_replica(self.replica_id)
         except Exception:
             pass
+        await self.shutdown_task_queue()
         await self.data_plane.close()
 
-    def check_model_health(self) -> dict:
-        """Probe model actors liveness via a lightweight ping.
-
-        Returns a dict with 'healthy' (bool) and 'detail' (str).
-        If the model actors are dead (e.g. OOM/SIGSEGV), the ping call
-        will raise RayActorError, signalling the watchdog to restart.
-        """
+    async def _run_model_health_probe(self) -> dict:
         try:
-            result = self.model.ping()
+            result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
+                self._model_unhealthy = False
                 return {'healthy': True, 'detail': 'model actors alive'}
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
         except Exception as e:
+            self._model_unhealthy = True
             return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
+
+    async def check_model_health(self) -> dict:
+        """Run one coalesced actor probe outside the event loop."""
+        current = getattr(self, '_health_probe_task', None)
+        if current is None or current.done():
+            self._health_probe_task = asyncio.create_task(self._run_model_health_probe())
+        return await asyncio.shield(self._health_probe_task)
+
+    def mark_unhealthy(self) -> None:
+        """Flag the deployment unhealthy; /healthz returns 503 until a probe recovers it."""
+        self._model_unhealthy = True
+
+    async def _probe_after_timeout(self) -> None:
+        """Fired by ComputeWorker on a backend timeout: probe and log liveness."""
+        result = await self.check_model_health()
+        logger.warning('[Model] post-timeout liveness probe: %s', result)
 
     async def _cleanup_adapter(self, adapter_name: str) -> None:
         if self.get_resource_info(adapter_name):
-            self.clear_resource_state(adapter_name)
             if self.train_mode == 'full':
                 # No PEFT adapter to remove; restore clean base weights so the
                 # next tenant does not inherit this tenant's trained weights.
-                self.model.reload_initial_weights()
+                # Takes the Admission_Gate: this path is driven by the background
+                # countdown and never enters Task_Queue, so the gate is what keeps
+                # it from colliding with an in-flight training call.
+                await self.call_backend(self.model.reload_initial_weights)
             else:
-                self.model.remove_adapter(adapter_name)
+                await self.call_backend(self.model.remove_adapter, adapter_name)
+            self.clear_resource_state(adapter_name)
             self.unregister_resource(adapter_name)
             await self.state.unload_model(adapter_name)
 
@@ -260,9 +353,9 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """
         if not self.is_full_mode:
             return
-        for rid, info in self._resource_records.items():
-            if rid != adapter_name and not info.get('expiring'):
-                raise FullModeBusyError(rid)
+        holder = self.find_active_resource(exclude=adapter_name)
+        if holder is not None:
+            raise FullModeBusyError(holder)
 
     async def _on_adapter_expired(self, adapter_name: str) -> None:
         self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
@@ -308,8 +401,8 @@ def build_model_app(model_id: str,
     # teardown via ``on_shutdown`` and its sticky-LoRA router via
     # ``request_router_config``.
     def register_routes(app: FastAPI, get_self: Any) -> None:
-        _register_tinker_routes(app, get_self)
-        _register_twinkle_routes(app, get_self)
+        _register_model_tinker_routes(app, get_self)
+        _register_model_twinkle_routes(app, get_self)
 
     async def _on_shutdown(servable: Any) -> None:
         await servable.shutdown()

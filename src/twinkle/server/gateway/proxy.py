@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import httpx
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from typing import Any
 
+from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
-from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from . import routes
 
 logger = get_logger()
 
@@ -38,8 +41,16 @@ class ServiceProxy:
     ):
         self.http_options = http_options or {}
         self.route_prefix = route_prefix
-        # Disable proxy env vars to avoid external routing
-        self.client = httpx.AsyncClient(timeout=None, trust_env=False)
+        # Disable proxy env vars to avoid external routing. Verification is off iff TLS is on:
+        # every outbound target is this deployment's own listener (localhost), whose certificate is
+        # whatever ssl_certfile configured -- typically self-signed and in no CA store, so default
+        # verification would fail every internal call with CERTIFICATE_VERIFY_FAILED. This is a
+        # self-connection, not a trust decision about a remote peer.
+        self.client = httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+            verify=not self.http_options.get('ssl_certfile'),
+        )
 
     async def close(self) -> None:
         """Close the underlying httpx.AsyncClient to release connections."""
@@ -56,15 +67,18 @@ class ServiceProxy:
         Returns:
             Complete target URL for the internal service
         """
-        prefix = self.route_prefix.rstrip('/') if self.route_prefix else ''
         host = self.http_options.get('host', 'localhost')
         port = self.http_options.get('port', 8000)
 
         if host == '0.0.0.0':
             host = 'localhost'
 
-        base_url = f'http://{host}:{port}'
-        return f'{base_url}{prefix}/{service_type}/{base_model}/{endpoint}'
+        # The listener these URLs target serves HTTPS when the deployment set an ssl_certfile
+        # (HttpOptions forwards the pair to Ray Serve verbatim), so the outbound scheme has to
+        # follow it -- a fixed ``http://`` would send plaintext to a TLS port and fail every proxy.
+        scheme = 'https' if self.http_options.get('ssl_certfile') else 'http'
+        base_url = f'{scheme}://{host}:{port}'
+        return f'{base_url}{routes.target_url(self.route_prefix, service_type, base_model, endpoint)}'
 
     def _prepare_headers(self, request_headers) -> dict[str, str]:
         """Prepare headers for proxying by removing problematic headers."""
@@ -144,7 +158,19 @@ class ServiceProxy:
             )
         except Exception as e:
             logger.error('Proxy error: %s', str(e), exc_info=True)
-            return Response(content=f'Proxy Error: {str(e)}', status_code=502)
+            # The gateway could not reach the upstream deployment. Return the
+            # unified ``ErrorPayload`` (502/Server) instead of a plain-text body
+            # so every gateway failure has the same wire shape. Upstream error
+            # responses are passed through unchanged above, preserving their own
+            # ErrorPayload body.
+            request_id = request.headers.get(H_REQUEST_ID) or request.headers.get(H_REQUEST_ID_LEGACY) or ''
+            payload = ErrorPayload(
+                error=f'Proxy Error: {str(e)}',
+                category=ErrorCategory.Server,
+                error_code=502,
+                request_id=request_id,
+            )
+            return JSONResponse(status_code=502, content=payload.model_dump(mode='json', exclude_none=True))
 
     async def proxy_request_stream(
         self,
@@ -203,7 +229,7 @@ class ServiceProxy:
             endpoint: The tinker endpoint name (e.g., 'create_model', 'forward')
             base_model: The base model name for routing
         """
-        return await self.proxy_request(request, f'tinker/{endpoint}', base_model, 'model')
+        return await self.proxy_request(request, routes.tinker_endpoint(endpoint), base_model, 'model')
 
     async def proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
         """Proxy request to sampler's tinker endpoint (/tinker/<endpoint>).
@@ -213,4 +239,4 @@ class ServiceProxy:
             endpoint: The tinker endpoint name (e.g., 'asample')
             base_model: The base model name for routing
         """
-        return await self.proxy_request(request, f'tinker/{endpoint}', base_model, 'sampler')
+        return await self.proxy_request(request, routes.tinker_endpoint(endpoint), base_model, 'sampler')

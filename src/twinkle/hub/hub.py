@@ -513,6 +513,7 @@ class MSHub(HubOperation):
             revision=revision,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            token=token,
             **kwargs)
 
     @staticmethod

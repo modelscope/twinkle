@@ -104,6 +104,10 @@ class CheckpointEngine(ABC):
         """
         raise NotImplementedError
 
+    def close(self):
+        """Release persistent communication state when this engine will not be reused."""
+        self.finalize()
+
     @abstractmethod
     async def send_weights(self, weights: Generator[tuple[str, 'torch.Tensor'], None, None]):
         """Send model weights to rollout workers.

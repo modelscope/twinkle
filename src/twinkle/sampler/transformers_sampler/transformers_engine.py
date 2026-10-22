@@ -1,26 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""A :class:`~twinkle.sampler.BaseSamplerEngine` backed by plain transformers ``generate()``.
-
-Why this exists alongside vLLM and sglang: those two are the throughput backends, but they cannot
-load every architecture (custom / brand-new / ``trust_remote_code`` models often land in transformers
-first), they cost a separate weight copy in the KV-cache format, and they are heavyweight optional
-dependencies. This engine trades throughput for reach -- it runs anything ``AutoModelForCausalLM``
-loads, with no extra install.
-
-Three things differ from the vLLM engine and callers do feel them:
-
-- **no continuous batching.** transformers generates one padded batch at a time, so a batch runs at
-  the pace of its longest sequence and concurrent ``sample()`` calls serialize behind
-  :attr:`_generate_lock`. Batching is therefore done up front (see :meth:`batch_sample`) rather than
-  by the engine scheduler.
-- **left padding is mandatory.** Decoder-only generation appends to the end of the sequence, so pads
-  must sit on the left or the model continues from padding. The tokenizer's own ``padding_side`` is
-  overridden per call rather than mutated globally, because the same tokenizer object may be shared
-  with a training path that needs right padding.
-- **logprobs come from ``scores``, not from a KV-cache side channel.** ``output_scores=True`` returns
-  raw logits per step; they are log-softmaxed here. Prompt logprobs need a separate forward pass
-  (:meth:`_prompt_logprobs`) because ``generate()`` never scores the prompt.
-"""
 from __future__ import annotations
 
 import asyncio

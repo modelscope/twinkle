@@ -12,10 +12,23 @@ other deployments) fail at load time instead of being silently dropped.
 from __future__ import annotations
 
 import math
+import os
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Any, Literal
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from twinkle.server.task_queue.config import TaskQueueConfig
+
+# Env var keys the launcher sets from the gateway ``server_config`` so that any
+# Ray worker (model / sampler / processor), not just the gateway, applies the
+# configured ServerState policy instead of ``get_server_state``'s hardcoded
+# defaults. Only the four *policy* fields are propagated; ``actor_name`` is a
+# per-process cache key, not a cross-worker policy, so it is excluded.
+SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
+    'TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT',
+    'TWINKLE_SERVER_STATE_CLEANUP_INTERVAL',
+    'TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT',
+    'TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL',
+)
 
 # ---------- shared helpers ------------------------------------------------- #
 
@@ -42,6 +55,12 @@ class HttpOptions(BaseModel):
     port: int = 8000
     ssl_keyfile: str | None = None
     ssl_certfile: str | None = None
+
+    @model_validator(mode='after')
+    def _ssl_pair_set_together(self) -> 'HttpOptions':
+        if (self.ssl_keyfile is None) != (self.ssl_certfile is None):
+            raise ValueError('ssl_keyfile and ssl_certfile must be set together to serve HTTPS')
+        return self
 
 
 # ---------- per-deployment args schemas ------------------------------------ #
@@ -86,6 +105,13 @@ class ModelArgs(_ArgsBase):
     hybrid: SpectralHybridArgs | None = None
     data_plane_url: str | None = None
     model_loader: str | None = None
+    #: ``module:attr`` import spec naming the model class to serve, e.g.
+    #: ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
+    #: twinkle resolves it inside the replica and wraps the class in its own tinker/twinkle compat
+    #: layer, so a family whose runtime object is not a plain AutoModel (a sentence-transformers
+    #: pipeline, say) can be served by the same deployment. Only meaningful for a LoRA-mode
+    #: transformers deployment; every other combination is rejected below instead of being ignored.
+    model_cls: str | None = None
 
     @model_validator(mode='after')
     def _validate_spectral_backend(self):
@@ -96,6 +122,10 @@ class ModelArgs(_ArgsBase):
                 raise ValueError('hybrid is only supported by the transformers backend')
             if self.train_mode == 'full':
                 raise ValueError('hybrid is not supported with train_mode="full"')
+        if self.model_cls is not None:
+            if self.backend != 'transformers' or self.train_mode != 'lora' or self.hybrid is not None:
+                raise ValueError('model_cls is only supported by a transformers backend in train_mode="lora" '
+                                 'without hybrid')
         return self
 
 
@@ -139,15 +169,57 @@ class ServerStateArgs(_ArgsBase):
     metrics_update_interval: float | None = None
     actor_name: str | None = None
 
+    def to_env_vars(self) -> dict[str, str]:
+        """Serialize the policy fields to env vars for Ray-worker propagation.
+
+        Mirrors :meth:`PersistenceConfig.to_env_vars`. Only the four policy
+        fields are emitted (``actor_name`` is a per-process cache key, not a
+        policy); unset (``None``) fields are skipped so the worker falls back to
+        ``ServerState``'s own defaults.
+        """
+        env: dict[str, str] = {}
+        if self.expiration_timeout is not None:
+            env['TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT'] = str(self.expiration_timeout)
+        if self.cleanup_interval is not None:
+            env['TWINKLE_SERVER_STATE_CLEANUP_INTERVAL'] = str(self.cleanup_interval)
+        if self.per_token_model_limit is not None:
+            env['TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT'] = str(self.per_token_model_limit)
+        if self.metrics_update_interval is not None:
+            env['TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL'] = str(self.metrics_update_interval)
+        return env
+
+    @classmethod
+    def from_env(cls) -> ServerStateArgs | None:
+        """Reconstruct policy fields from launcher-set env vars.
+
+        Returns ``None`` when no ``TWINKLE_SERVER_STATE_*`` key is set, so a
+        caller can distinguish "no env-configured policy" from "explicitly
+        configured to a default value". Only policy fields are populated;
+        ``actor_name`` stays ``None``.
+        """
+        exp = os.environ.get('TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT')
+        clean = os.environ.get('TWINKLE_SERVER_STATE_CLEANUP_INTERVAL')
+        limit = os.environ.get('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT')
+        interval = os.environ.get('TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL')
+        if exp is None and clean is None and limit is None and interval is None:
+            return None
+        return cls(
+            expiration_timeout=float(exp) if exp is not None else None,
+            cleanup_interval=float(clean) if clean is not None else None,
+            per_token_model_limit=int(limit) if limit is not None else None,
+            metrics_update_interval=float(interval) if interval is not None else None,
+        )
+
 
 class ServerArgs(_ArgsBase):
     """Args for the gateway ``server`` deployment.
 
     ``api_key``, when set, makes the gateway require ``Authorization: Bearer
-    <key>`` on the OpenAI-compatible generation endpoints (chat/completions,
-    completions, embeddings, infer); the health/models endpoints stay open so
-    load balancers can probe them. ``owned_by`` is the ``owned_by`` field the
-    ``/models`` listing reports for every served model.
+    <key>`` on every route (the OpenAI-compatible generation endpoints, the
+    tinker training endpoints and the /twinkle task surface alike); only the
+    liveness probes (/health, /ping, /twinkle/healthz*) and /models stay open
+    so load balancers can do their job. ``owned_by`` is the ``owned_by``
+    field the ``/models`` listing reports for every served model.
     """
 
     server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
@@ -159,12 +231,17 @@ class ServerArgs(_ArgsBase):
 
 
 class ProcessorArgs(_ArgsBase):
-    """Args for the ``processor`` deployment."""
+    """Args for the ``processor`` deployment.
+
+    A processor deployment has no task queue, so there is deliberately no
+    ``queue_config`` field here: with ``extra='forbid'`` a YAML that sets
+    ``processor.args.queue_config`` now fails validation with the offending path
+    instead of being silently ignored.
+    """
 
     ncpu_proc_per_node: int | None = None
     device_group: dict[str, Any] | None = None
     device_mesh: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
 class DataPlaneArgs(_ArgsBase):

@@ -182,6 +182,9 @@ class _NoopTrainStrategy:
     def capture_pre_ep_state_if_needed(self, model, *, enable_ep):
         return None
 
+    def unwrap_model(self, model):
+        return model
+
     def wrap_model(self, model, *args):
         return (model, *args) if args else model
 

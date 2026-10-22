@@ -11,7 +11,7 @@ advantage_fn = GRPOAdvantage()
 
 # 假设有 2 个 prompt,每个生成 4 个样本
 rewards = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # 8 个奖励值
-advantages = advantage_fn(rewards, num_generations=4, scale='group')
+advantages = advantage_fn(rewards, num_generations=4, scale='none')
 
 # advantages 会是每组减去组内均值:
 # 第一组: [0.0-0.5, 1.0-0.5, 0.0-0.5, 1.0-0.5] = [-0.5, 0.5, -0.5, 0.5]
@@ -30,38 +30,8 @@ GRPO 将样本分组(每组对应一个 prompt 的多个生成),然后在组内:
 - 在组内进行相对比较,更符合人类偏好的相对性
 - 避免奖励尺度的影响
 
-## 完整训练示例
+## 训练集成
 
-在 GRPO 训练中使用优势函数:
+通过 `SamplingParams(num_samples=N, logprobs=1)` 设置采样数量，从每个响应的 `sequences` 读取生成结果。训练还需要对齐的 labels 和旧策略 logprobs，仅传 advantages 不足以完成正确的训练。
 
-```python
-from twinkle.advantage import GRPOAdvantage
-from twinkle.model import TransformersModel
-from twinkle.sampler import vLLMSampler
-
-# Create components
-actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = ...
-advantage_fn = GRPOAdvantage()
-
-# Training loop
-for batch in dataloader:
-    # Sample generation
-    sample_response = sampler.sample(batch, num_samples=4)
-    input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
-    ...
-    rewards = reward_fn(...)
-
-    # Calculate advantages
-    advantages = advantage_fn(rewards, num_generations=4)
-
-    # 4. Policy optimization
-    loss = actor.forward_backward(
-        inputs=input_data,
-        advantages=advantages
-    )
-    actor.clip_grad_and_step()
-```
-
-> GRPO 方法简单高效,适合大多数 RLHF 训练场景。
+完整的采样、奖励计算和优化器循环见 [GRPO 训练示例](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/short_math_grpo.py)。使用 RLOO 时，将优势函数替换为 `RLOOAdvantage`，并为每个 prompt 至少生成两个样本。

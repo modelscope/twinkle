@@ -48,6 +48,17 @@ def ensure_hccl_socket_env(master_port: int, environ: Optional[dict] = None) -> 
         env.setdefault(key, value)
 
 
+def hccl_socket_env(master_port: int, environ: Optional[dict] = None) -> dict:
+    """Return the HCCL socket env this process will use for a group rendezvoused on ``master_port``.
+
+    Read-only counterpart of :func:`ensure_hccl_socket_env`: explicit or previously set values win
+    over the defaults derived from ``master_port``. Processes joining one HCCL group must agree on
+    these values, so a master can publish this dict and peers apply it before joining.
+    """
+    env = os.environ if environ is None else environ
+    return {key: env.get(key, value) for key, value in _derive_hccl_socket_env_defaults(master_port).items()}
+
+
 def _resolve_ascend_physical_device_id(device_id: int) -> int:
     """Map local NPU device index to physical device id via visible devices."""
     visible = os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '').strip()
@@ -121,6 +132,9 @@ class NPU(Platform):
                     check=True,
                 )
             except subprocess.CalledProcessError:
+                # Last resort: dual-chip Ascend boards (e.g. Atlas 300I Duo) expose two chip-level
+                # ids per physical card, and `npu-smi info -t board` is indexed by the physical card,
+                # so the board index is half the visible (chip-level) device id.
                 result = subprocess.run(
                     ['npu-smi', 'info', '-t', 'board', '-i', str(device_id // 2)],
                     capture_output=True,

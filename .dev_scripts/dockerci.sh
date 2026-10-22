@@ -9,7 +9,7 @@ IMAGE_VERSION=ci_image
 MODELSCOPE_HOME_CACHE=~/.cache
 CI_TEST=True
 MODELSCOPE_SDK_DEBUG=True
-CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest tests'
+CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest -vv -o faulthandler_timeout=60 tests'
 MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'
@@ -28,7 +28,8 @@ do
   flock -n "$lock_fd" || { echo "WARN: gpu $gpu is in use!" >&2; idx=$((idx+1)); continue; }
   echo "get gpu lock $gpu"
 
-  CONTAINER_NAME="twinkle-ci-$idx"
+  # Distinguish concurrent runs and reruns from containers left on the runner.
+  CONTAINER_NAME="twinkle-ci-${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-1}-$idx"
   let is_get_file_lock=true
 
   # pull image if there are update

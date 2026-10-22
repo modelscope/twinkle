@@ -103,7 +103,8 @@ class _StateActor:
                 results.append(value)
         return results
 
-    async def close(self) -> None:
+    async def flush_all(self) -> None:
+        """Destructively clear shared state for tests and explicit admin flows."""
         self._store.clear()
 
     async def health_check(self) -> bool:
@@ -123,8 +124,8 @@ class RayActorBackend(StateBackend):
     def __init__(self, key_prefix: str = '') -> None:
         if not ray.is_initialized():
             raise RuntimeError('RayActorBackend requires an initialized Ray runtime — call '
-                               'ray.init() first, switch persistence to "file"/"redis", or '
-                               'rely on the deployment launcher to start Ray.')
+                               'ray.init() first, switch persistence to "redis", or rely on '
+                               'the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)
         try:
             self._actor = ray.get_actor(name)
@@ -169,13 +170,13 @@ class RayActorBackend(StateBackend):
         return await self._actor.mget.remote(keys)
 
     async def close(self) -> None:
-        await self._actor.close.remote()
+        """Release this process's actor handle without clearing shared state."""
+        self._actor = None
 
     async def health_check(self) -> bool:
         try:
-            return await self._actor.health_check.remote()
-        except ray.exceptions.RayActorError:
-            # The actor crashed (OOM, node died). Don't silently re-create
-            # it — that would lose all in-memory state. Let readiness probes
-            # see False and the deployment owner decide to restart.
+            return bool(await self._actor.health_check.remote())
+        except Exception:
+            # The actor crashed (OOM, node died) or this local handle was closed.
+            # Do not silently recreate it because that could hide state loss.
             return False

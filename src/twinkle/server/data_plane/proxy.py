@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 from typing import Any
 
-from twinkle_client.http.headers import build_routing_headers
-from twinkle_client.types.component import DataRef
+from twinkle.protocol.headers import build_routing_headers
+from twinkle.protocol.types.component import DataRef
 
 
 class DataPlaneProxy:

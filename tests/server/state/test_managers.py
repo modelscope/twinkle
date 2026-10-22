@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from unittest import mock
 
+from twinkle.server.exceptions import ResourceQuotaExceededError
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.future_manager import FutureManager
@@ -14,6 +15,7 @@ from twinkle.server.state.model_manager import ModelManager
 from twinkle.server.state.models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
 from twinkle.server.state.sampling_manager import SamplingSessionManager
 from twinkle.server.state.session_manager import SessionManager
+from .fake_backend import FakeBackend
 
 # ============================================================
 # SessionManager Tests
@@ -97,7 +99,7 @@ class TestSessionManager:
         await manager.add('new_sess', new_record)
 
         cutoff = now - 500
-        removed_count = await manager.cleanup_expired(cutoff)
+        _, removed_count = await manager.collect_and_remove_expired(cutoff)
         assert removed_count == 1
         assert await manager.get('old_sess') is None
         assert await manager.get('new_sess') is not None
@@ -110,7 +112,7 @@ class TestSessionManager:
         await manager.add('old_sess', record)
 
         cutoff = time.time() - 100
-        removed_count = await manager.cleanup_expired(cutoff)
+        _, removed_count = await manager.collect_and_remove_expired(cutoff)
         assert removed_count == 1
 
 
@@ -148,11 +150,11 @@ class TestModelManager:
 
     @pytest.mark.asyncio
     async def test_token_limit_enforced(self, manager):
-        """Adding more models than per_token_model_limit should raise RuntimeError."""
+        """Adding more models than the per-token quota raises a user quota error."""
         for i in range(3):
             await manager.add(f'm{i}', ModelRecord(token='tok1'))
 
-        with pytest.raises(RuntimeError, match='Model limit exceeded'):
+        with pytest.raises(ResourceQuotaExceededError, match='Model quota exceeded'):
             await manager.add('m3', ModelRecord(token='tok1'))
 
     @pytest.mark.asyncio
@@ -171,6 +173,12 @@ class TestModelManager:
         assert info['max_loras'] == 5
         assert info['used_loras'] == 0
         assert info['free_loras'] == 5
+
+    @pytest.mark.asyncio
+    async def test_liveness_only_replica_is_alive(self, manager):
+        await manager.touch_replica_last_seen('sampler-replica')
+        alive = await manager.get_alive_replica_ids(liveness_threshold=60)
+        assert 'sampler-replica' in alive
 
     @pytest.mark.asyncio
     async def test_capacity_info_after_add(self, manager):
@@ -196,9 +204,10 @@ class TestModelManager:
         avail = await manager.get_available_replica_ids(['r1', 'r2'])
         assert avail == ['r1', 'r2']
 
-        # Per-token count enforces the limit using the persisted records.
-        count = await manager._count_models_for_token('tok1')
-        assert count == 2
+        # The public add path enforces the per-token quota from persisted counts.
+        await manager.add('m3', ModelRecord(token='tok1'))
+        with pytest.raises(ResourceQuotaExceededError, match='Model quota exceeded'):
+            await manager.add('m4', ModelRecord(token='tok1'))
 
     @pytest.mark.asyncio
     async def test_cascade_cleanup_by_session(self, manager):
@@ -253,7 +262,7 @@ class TestModelLimitRace:
             try:
                 await state.register_model({'base_model': 'b'}, token='tok', model_id=f'm{i}')
                 results.append(True)
-            except RuntimeError:
+            except ResourceQuotaExceededError:
                 results.append(False)
 
         await asyncio.gather(*(try_add(i) for i in range(n)))
@@ -270,7 +279,7 @@ class TestModelLimitRace:
         state = ServerState(backend=backend, per_token_model_limit=1)
 
         await state.register_model({'base_model': 'b'}, token='tok', model_id='m1')
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ResourceQuotaExceededError):
             await state.register_model({'base_model': 'b'}, token='tok', model_id='m2')
 
         assert await state.unload_model('m1') is True
@@ -289,8 +298,55 @@ class TestModelLimitRace:
         await state._model_mgr.rebuild_indexes()
 
         await state.register_model({'base_model': 'b'}, token='tok', model_id='m3')
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ResourceQuotaExceededError):
             await state.register_model({'base_model': 'b'}, token='tok', model_id='m4')
+
+
+# ============================================================
+# Cluster-wide Processor Quota Tests
+# ============================================================
+
+
+class TestProcessorQuota:
+
+    @pytest.mark.asyncio
+    async def test_two_server_states_share_one_token_limit(self):
+        backend = FakeBackend()
+        states = [ServerState(backend=backend), ServerState(backend=backend)]
+
+        async def reserve(i: int) -> bool:
+            try:
+                await states[i % 2].reserve_processor_quota(
+                    'token', f'p{i}', f's{i}', limit=3, lease_seconds=30.0)
+                return True
+            except ResourceQuotaExceededError:
+                return False
+
+        accepted = await asyncio.gather(*(reserve(i) for i in range(12)))
+        assert sum(accepted) == 3
+
+    @pytest.mark.asyncio
+    async def test_reservation_is_idempotent_and_release_frees_slot(self):
+        state = ServerState(backend=FakeBackend())
+        await state.reserve_processor_quota('token', 'p1', 's1', limit=1, lease_seconds=30.0)
+        await state.reserve_processor_quota('token', 'p1', 's1', limit=1, lease_seconds=30.0)
+        with pytest.raises(ResourceQuotaExceededError) as exc:
+            await state.reserve_processor_quota('token', 'p2', 's2', limit=1, lease_seconds=30.0)
+        assert exc.value.error_code == 429
+        assert exc.value.category.value == 'user'
+
+        await state.release_processor_quota('token', 'p1')
+        await state.release_processor_quota('token', 'p1')
+        await state.reserve_processor_quota('token', 'p2', 's2', limit=1, lease_seconds=30.0)
+
+    @pytest.mark.asyncio
+    async def test_expired_worker_lease_is_reclaimed(self):
+        state = ServerState(backend=FakeBackend())
+        with mock.patch('twinkle.server.state.server_state.time.time', return_value=100.0):
+            await state.reserve_processor_quota('token', 'dead', 's1', limit=1, lease_seconds=10.0)
+        with mock.patch('twinkle.server.state.server_state.time.time', return_value=111.0):
+            assert await state.renew_processor_quota('token', 'dead', lease_seconds=10.0) is False
+            await state.reserve_processor_quota('token', 'replacement', 's2', limit=1, lease_seconds=10.0)
 
 
 # ============================================================
@@ -328,7 +384,7 @@ class TestSamplingSessionManager:
         await manager.add('samp_new', record2)
 
         cutoff = time.time() - 100
-        removed = await manager.cleanup_expired(cutoff)
+        removed = await manager.cleanup_expired(cutoff, [])
         assert removed == 1
         assert await manager.get('samp_old') is None
         assert await manager.get('samp_new') is not None

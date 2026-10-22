@@ -10,6 +10,7 @@ import math
 import re
 from typing import Any, Dict, List
 
+from twinkle.data_format import last_assistant_text
 from twinkle.reward.base import Reward
 from twinkle.utils import get_logger
 
@@ -17,17 +18,8 @@ logger = get_logger()
 
 
 def _get_completion(trajectory: Dict[str, Any]) -> str:
-    """Extract assistant completion from trajectory."""
-    messages = trajectory.get('messages', [])
-    for msg in reversed(messages):
-        if msg.get('role') == 'assistant':
-            content = msg.get('content', '')
-            if isinstance(content, list):
-                return ''.join(
-                    block.get('text', '') for block in content
-                    if isinstance(block, dict) and block.get('type') == 'text')
-            return content
-    return ''
+    """Extract assistant completion from trajectory (shared helper)."""
+    return last_assistant_text(trajectory)
 
 
 def _extract_boxed_answers(text: str) -> List[str]:

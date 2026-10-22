@@ -22,6 +22,8 @@ promised they match the type.
 import json
 from typing import Any, Dict, List, Optional
 
+from twinkle.data_format import last_assistant_text, msg_content_text
+
 __all__ = [
     'assistant_text',
     'is_agent_row',
@@ -30,18 +32,6 @@ __all__ = [
     'msg_has_payload',
     'normalize_tool_calls',
 ]
-
-
-def msg_content_text(msg: Dict[str, Any]) -> str:
-    """Extract plain text from a message's content (str | list | dict)."""
-    c = msg.get('content')
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
-    if isinstance(c, dict) and c.get('type') == 'text':
-        return c.get('text', '')
-    return ''
 
 
 def msg_has_media(msg: Dict[str, Any]) -> bool:
@@ -114,14 +104,7 @@ def is_agent_row(messages) -> bool:
 def assistant_text(trajectory: Dict[str, Any]) -> str:
     """The last assistant message's text, or '' if the model produced none.
 
-    Explorers differ in what else they attach -- token ids, logprobs, tool
-    turns -- but every one of them leaves the reply as an assistant message,
-    so this is the one field a parser can rely on.
-
-    The *last* one: a conversation that went through tools has several, and the
-    model's answer is the turn it finished on.
+    Thin alias of :func:`twinkle.data_format.last_assistant_text` -- the one
+    implementation both twinkle rewards and agentic consumers share.
     """
-    for message in reversed(trajectory.get('messages') or []):
-        if isinstance(message, dict) and message.get('role') == 'assistant':
-            return msg_content_text(message)
-    return ''
+    return last_assistant_text(trajectory)

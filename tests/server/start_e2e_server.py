@@ -1,4 +1,6 @@
-"""One-click: restart Ray cluster + launch Twinkle server + wait until ready.
+"""Manual PPU E2E helper; it is not a pytest test or CI entry point.
+
+One-click: restart Ray cluster + launch Twinkle server + wait until ready.
 
 Usage:
     python start_e2e_server.py                         # default config (transformers LoRA)
@@ -22,8 +24,8 @@ import time
 import requests
 
 # ── Paths ──
-RAY = "/mnt/nas2/anaconda3/envs/tinker_myl/bin/ray"
-PYTHON = "/mnt/nas2/anaconda3/envs/tinker_myl/bin/python"
+RAY = "/mnt/nas2/anaconda3/envs/twinkle_ppu_vllm/bin/ray"
+PYTHON = "/mnt/nas2/anaconda3/envs/twinkle_ppu_vllm/bin/python"
 WORKDIR = "/mnt/nas2/yunlin.myl/twinkle"
 DEFAULT_CONFIG = "tests/server/config/server_config_4b_e2e.yaml"
 RAY_TEMP_DIR = "/mnt/nas2/yunlin.myl/ray_logs"
@@ -136,14 +138,14 @@ def restart_ray():
     run(f"{RAY} stop --force", check=False)
     time.sleep(2)
 
-    # Head node: GPU 0,1,2,3 (4 GPUs for model PP=2 x DP=2)
+    # Head node: 4 GPUs for model PP=2 x DP=2 (skip busy card 2).
     run(f"{RAY} start --head --port=6379 --num-gpus=4 "
         f"--disable-usage-stats --temp-dir={RAY_TEMP_DIR}",
-        env={"CUDA_VISIBLE_DEVICES": "0,1,2,3"})
+        env={"CUDA_VISIBLE_DEVICES": "0,1,3,4"})
 
-    # Worker: GPU 4 (1 GPU for sampler)
+    # Worker: 1 GPU for sampler.
     run(f"{RAY} start --address=127.0.0.1:6379 --num-gpus=1",
-        env={"CUDA_VISIBLE_DEVICES": "4"})
+        env={"CUDA_VISIBLE_DEVICES": "5"})
 
     # CPU-only worker (processor + server)
     run(f"{RAY} start --address=127.0.0.1:6379 --num-gpus=0",

@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import List, Union
+from typing import Any, List, Union
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, ground_truth, last_assistant_text
 from twinkle.reward.base import Reward
 
 
 class MathReward(Reward):
+    """Boxed-answer math accuracy: the gold comes from the trajectory's ``user_data``."""
 
     def __init__(self, ground_truth_key: str = 'solution'):
         self.ground_truth_key = ground_truth_key
@@ -70,36 +71,24 @@ class MathReward(Reward):
             value = False
         return value
 
-    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
+    def __call__(self, trajectories: List[Trajectory], **kwargs: Any) -> List[float]:
         rewards = []
-
-        def _last_content(traj):
-            # Trajectories can be dicts after serialization in distributed runs.
-            if isinstance(traj, dict):
-                return traj['messages'][-1]['content']
-            return traj.messages[-1].content
-
-        def _ground_truth_content(traj):
-            if isinstance(traj, dict):
-                user_data = traj.get('user_data')
-                if isinstance(user_data, list):
-                    for item in user_data:
-                        if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == self.ground_truth_key:
-                            return item[1]
-            return _last_content(traj)
-
-        predictions = [_last_content(trajectory) for trajectory in trajectories]
-        ground_truths = [_ground_truth_content(trajectory) for trajectory in ground_truths]
-        for prediction, ground_truth in zip(predictions, ground_truths):
+        for trajectory in trajectories:
+            prediction = last_assistant_text(trajectory)
+            # The gold lives in the trajectory's user_data (or flat column); an absent key falls
+            # back to scoring the completion against itself (compare degenerates, never raises).
+            # The test is `is None`: a gold of 0 is a real label, not a missing one.
+            gold = ground_truth(trajectory, self.ground_truth_key)
+            if gold is None:
+                gold = prediction
             if '# Answer' in prediction:
                 prediction = prediction.split('# Answer')[1]
-            if '# Answer' in ground_truth:
-                ground_truth = ground_truth.split('# Answer')[1]
+            if isinstance(gold, str) and '# Answer' in gold:
+                gold = gold.split('# Answer')[1]
             prediction = prediction.strip()
-            ground_truth = ground_truth.strip()
+            gold = str(gold).strip()
             prediction = MathReward.extract_boxed_result(prediction)
-            ground_truth = MathReward.extract_boxed_result(ground_truth)
-            reward = MathReward.compare_consecutive(prediction, ground_truth)
-            reward = 1.0 if reward else 0.0
-            rewards.append(float(reward))
+            gold = MathReward.extract_boxed_result(gold)
+            reward = MathReward.compare_consecutive(prediction, gold)
+            rewards.append(float(1.0 if reward else 0.0))
         return rewards

@@ -50,6 +50,9 @@ class SeqClsLoss(Loss):
 
         if self.problem_type == 'regression':
             loss_fct = nn.MSELoss()
+            # MSE demands matching dtypes (a bf16 head vs float32 targets raises); HF's
+            # *ForSequenceClassification casts the same way, and multi_label below already does.
+            labels = labels.to(logits.dtype)
             # num_labels==1: squeeze the trailing class axis so [B,1] vs [B] broadcast cleanly, matching
             # legacy (transformers_seq_cls_forward / seq_cls_loss_func).
             if self.num_labels == 1:

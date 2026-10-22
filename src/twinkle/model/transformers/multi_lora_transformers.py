@@ -43,7 +43,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
             model_loader: Optional[ModelLoaderProtocol] = None,
+            acc_strategy: str = 'token',
+            model_arch: Optional[Dict[str, Any]] = None,
             **kwargs):
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant TransformersModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
@@ -54,6 +61,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
+        # ``_acc_strategy`` and ``model_arch`` are read by inherited ``TransformersModel`` code -- the
+        # former by ``_construct_default_optimizer_group`` (reached from ``_register_adapter``, i.e. every
+        # ``add_adapter_to_model``) and the latter by the Muon/GaLore param-group builder and the
+        # multimodal ``'all-linear'`` expansion. This fork overrides ``__init__`` wholesale instead of
+        # forwarding kwargs to ``super().__init__()``, so it has to set both itself; ``model_arch`` gets the
+        # same role normalization the base applies.
+        self._acc_strategy = acc_strategy
+        self.model_arch = dict(model_arch or {})
+        for _role in ('language_model', 'vision_tower', 'aligner'):
+            _value = self.model_arch.get(_role)
+            self.model_arch[_role] = [_value] if isinstance(_value, str) else list(_value or [])
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         self.lora_config = lora_config
@@ -92,7 +110,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        # pop: tokenizer_id is not a from_pretrained argument, so it must not leak into the model
+        # construction kwargs above.
+        self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
         self._model_wrapped = False
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
@@ -133,9 +153,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         pass
 
-    def _lazy_wrap_model(self):
-        return super()._lazy_wrap_model()
-
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
             raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')
@@ -149,7 +166,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
         if getattr(self, '_enable_expert_parallel', False):
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=True)
-            # self._maybe_apply_expert_parallel()   # 各rank广播之前不能对moe层进行分片, 没有实际权重时不能分片
+            # Do not shard the MoE layers here: sharding must wait until the rank0 weight broadcast
+            # during wrap_model -- ranks without materialized weights cannot be sharded yet.
         self.multi_adapter.patch_target_parameters(self.model, target_parameters)
 
     @contextmanager
@@ -209,9 +227,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self._adapter_context(kwargs.get('adapter_name')):
             return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
-
-    def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
-        return super()._create_param_group(adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
 
     @remote_function()
     def step(self, **kwargs):
@@ -327,8 +342,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     # must block until it lands, or the run's final save is torn down with the actor before writing.
     @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
-        self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        adapter_name = kwargs.get('adapter_name')
+        self._check_adapter_valid(adapter_name)
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
             dist.barrier()
@@ -338,7 +354,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
                 if os.path.exists(name):

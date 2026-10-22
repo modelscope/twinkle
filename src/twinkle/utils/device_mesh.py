@@ -631,6 +631,7 @@ class DeviceGroup:
     device_type: str
     gpus_per_worker: int = 1
     visible_devices: Optional[Union[List[str], List[int], str, int]] = None
+    shared: bool = False
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
 

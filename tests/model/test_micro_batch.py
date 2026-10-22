@@ -6,9 +6,9 @@ import pytest
 from twinkle.loss import CrossEntropyLoss, GRPOLoss
 from twinkle.loss.base import Loss
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
+from twinkle.model.optimizer_group import BaseOptimizerGroup
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.utils.nccl_safe import safe_loss
 
 
 @pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
@@ -72,17 +72,6 @@ def test_sample_mean_and_token_sum_micro_batch_scales():
     assert CrossEntropyLoss(reduction='sum').micro_batch_scale(inputs, [0]) == 1.0
 
 
-def test_safe_loss_preserves_wrapped_micro_batch_scale():
-    inputs = [
-        {'labels': [1, -100]},
-        {'labels': [2, 3]},
-        {'labels': [4, -100]},
-        {'labels': [5, 6]},
-    ]
-
-    assert safe_loss(GRPOLoss()).micro_batch_scale(inputs, [0, 2]) == .5
-
-
 def test_loss_without_micro_batch_semantics_fails_when_split():
     with pytest.raises(NotImplementedError, match='does not support micro-batching'):
         Loss().micro_batch_scale([{}, {}], [0])
@@ -90,8 +79,15 @@ def test_loss_without_micro_batch_semantics_fails_when_split():
 
 def test_transformers_forward_backward_keeps_original_default_path():
     class ModelHarness:
+        _forward_backward_single = TransformersModel._forward_backward_single
+        _not_encoded = staticmethod(lambda inputs: False)
+
+        def _get_default_group(self):
+            return 'adapter'
+
         def __init__(self):
             self.calls = []
+            self.optimizer_group = {'adapter': BaseOptimizerGroup(loss_instance=CrossEntropyLoss())}
 
         def forward(self, *, inputs, **_kwargs):
             self.calls.append(('forward', inputs))
@@ -115,8 +111,9 @@ def test_transformers_forward_backward_keeps_original_default_path():
 
 
 def test_transformers_forward_backward_executes_real_micro_batches():
-    class OptimizerConfig:
+    class OptimizerConfig(BaseOptimizerGroup):
         def __init__(self):
+            super().__init__()
             self.processor = InputProcessor(padding_free=False)
             self.template = None
             self.train_status = SimpleNamespace(loss_value=None, num_tokens=0.0)
@@ -129,6 +126,7 @@ def test_transformers_forward_backward_executes_real_micro_batches():
             pass
 
     class ModelHarness:
+        _forward_backward_single = TransformersModel._forward_backward_single
         _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
         _forward_backward_micro_batch = TransformersModel._forward_backward_micro_batch
         _forward_backward_micro_batches = TransformersModel._forward_backward_micro_batches
@@ -176,6 +174,7 @@ def test_transformers_forward_backward_executes_real_micro_batches():
         sync_gradients=True,
     )
 
+    assert outputs['loss'] == 2.0
     assert model.forward_batches == [[0, 1], [2, 3]]
     assert model.backward_calls == [(False, 1.0), (True, 1.0)]
     assert model.optimizer_group['adapter'].train_status.num_tokens == 1.0
@@ -259,3 +258,280 @@ def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch):
             MicroBatchConfig(micro_batch_size=1),
             OptimizerConfig(),
         )
+
+
+@pytest.mark.parametrize('algorithm', [None, 'ffd', 'kk'])
+def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm):
+    import torch
+
+    class ModelHarness:
+        _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
+
+        def __init__(self):
+            self.optimizer_group = {'adapter': SimpleNamespace(
+                processor=InputProcessor(padding_free=False), _dp_group=None,
+                _ensure_dp_group=lambda: None,
+            )}
+            self.calls = []
+
+        def _get_default_group(self):
+            return 'adapter'
+
+        @staticmethod
+        def _not_encoded(_inputs):
+            return False
+
+        _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
+        _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+
+        def _forward_only_single(self, *, inputs, sampling_masks, **kwargs):
+            ids = [item['sample_id'] for item in inputs]
+            self.calls.append(ids)
+            assert sampling_masks.tolist() == ids
+            assert kwargs['disable_lora'] is True
+            assert kwargs['task'] == 'embedding'
+            width = max(len(item['input_ids']) for item in inputs)
+            return {'logps': torch.tensor(ids)[:, None].expand(-1, width),
+                    'logits': None, 'routed_experts': torch.tensor(ids)[:, None, None, None]}
+
+    inputs = [{'input_ids': [1] * length, 'sample_id': index}
+              for index, length in enumerate([2, 5, 1, 4, 3])]
+    model = ModelHarness()
+    options = {'micro_batch_size': 2}
+    if algorithm is not None:
+        options.update(dynamic_batching=True, max_tokens_per_micro_batch=10, packing_algorithm=algorithm)
+    outputs = TransformersModel.forward_only.__wrapped__(
+        model, inputs=inputs, sampling_masks=torch.arange(5), disable_lora=True, task='embedding', **options)
+    assert len(model.calls) >= 3
+    assert outputs['logps'].shape == (5, 5)
+    assert outputs['logps'][:, 0].tolist() == list(range(5))
+    assert outputs['routed_experts'][:, 0, 0, 0].tolist() == list(range(5))
+    assert outputs['logits'] is None
+
+
+def test_forward_only_without_micro_batches_prepares_inputs_once():
+    class ModelHarness:
+        optimizer_group = {'adapter': object()}
+
+        def _get_default_group(self):
+            return 'adapter'
+
+        def _prepare_forward_only_inputs(self, inputs, optimizer_config):
+            assert optimizer_config is self.optimizer_group['adapter']
+            self.prepare_calls += 1
+            return [inputs]
+
+        def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
+            assert optimizer_config is self.optimizer_group['adapter']
+            return inputs, kwargs
+
+    model = ModelHarness()
+    model.prepare_calls = 0
+    inputs = {'input_ids': [1]}
+    result = TransformersModel.forward_only.__wrapped__(model, inputs=inputs, disable_lora=True)
+    assert result == ([inputs], {'disable_lora': True})
+    assert model.prepare_calls == 1
+
+
+def test_merge_micro_batch_outputs_handles_nested_results():
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    result = merge_micro_batch_outputs([
+        {'hidden_states': (torch.tensor([[2., 2.], [0., 0.]]),)},
+        {'hidden_states': (torch.tensor([[1., 1.]]),)},
+    ], [[2, 0], [1]])
+    assert result['hidden_states'][0][:, 0].tolist() == [0., 1., 2.]
+
+
+@pytest.mark.parametrize('padding_free', [False, True])
+@pytest.mark.parametrize('algorithm', [None, 'ffd', 'kk'])
+def test_forward_only_tiny_model_matches_unsplit_outputs(padding_free, algorithm):
+    import torch
+    from unittest.mock import patch
+    from tests.model.test_value_model import _tiny_model_dir
+
+    model_dir = _tiny_model_dir()
+    if padding_free:
+        # GPT2 has no packed attention backend. Remove attention layers so this
+        # test isolates packing/unpacking without cross-document attention leakage.
+        from transformers import GPT2Config, GPT2LMHeadModel
+        config = GPT2Config.from_pretrained(model_dir)
+        config.n_layer = 0
+        GPT2LMHeadModel(config).save_pretrained(model_dir)
+    model = TransformersModel(model_id=model_dir, mixed_precision='no')
+    model.set_loss(CrossEntropyLoss())
+    model.set_processor(InputProcessor(padding_free=padding_free))
+    model._lazy_wrap_model()
+    device = str(next(model.model.parameters()).device)
+    inputs = [{'input_ids': [1, 2, 3, 4], 'labels': [-100, 2, 3, 4]},
+              {'input_ids': [1, 2], 'labels': [-100, 2]},
+              {'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]}]
+    if padding_free:
+        for sample in inputs:
+            sample['position_ids'] = list(range(len(sample['input_ids'])))
+    options = {'micro_batch_size': 2}
+    if algorithm:
+        options.update(dynamic_batching=True, max_tokens_per_micro_batch=8, packing_algorithm=algorithm)
+    with patch('twinkle.processor.base.Platform.get_local_device', return_value=device):
+        expected = model.forward_only(inputs=inputs, return_logits=True)
+        actual = model.forward_only(inputs=inputs, return_logits=True, **options)
+    for index, sample in enumerate(inputs):
+        length = len(sample['input_ids'])
+        torch.testing.assert_close(actual['logps'][index, :length], expected['logps'][index, :length])
+        torch.testing.assert_close(actual['logits'][index, :length], expected['logits'][index, :length])
+    assert not actual['logps'].requires_grad
+
+
+def test_forward_only_micro_batches_match_value_model():
+    import torch
+    from unittest.mock import patch
+    from tests.model.test_value_model import _tiny_model_dir
+    from twinkle.loss import PPOValueLoss
+    from twinkle.model import TransformersValueModel
+
+    model = TransformersValueModel(model_id=_tiny_model_dir(), mixed_precision='no')
+    model.set_loss(PPOValueLoss())
+    model._lazy_wrap_model()
+    device = str(next(model.model.parameters()).device)
+    inputs = [{'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]},
+              {'input_ids': [1, 2], 'labels': [-100, 2]},
+              {'input_ids': [1, 2, 3, 4], 'labels': [-100, 2, 3, 4]}]
+    with patch('twinkle.processor.base.Platform.get_local_device', return_value=device):
+        expected = model.forward_only(inputs=inputs)
+        actual = model.forward_only(inputs=inputs, micro_batch_size=1)
+    for index, sample in enumerate(inputs):
+        length = len(sample['input_ids'])
+        torch.testing.assert_close(actual['values'][index, :length], expected['values'][index, :length])
+    assert actual.get('logps') is None
+    assert not actual['values'].requires_grad
+
+
+@pytest.mark.parametrize('reduction, expected', [('mean', 3.5), ('sum', 6.0)])
+def test_forward_only_accumulates_aux_loss_using_training_micro_batch_scale(reduction, expected):
+    import torch
+
+    loss = CrossEntropyLoss(reduction=reduction)
+
+    class ModelHarness:
+        optimizer_group = {'adapter': SimpleNamespace(get_loss=lambda key: loss)}
+
+        def _get_default_group(self):
+            return 'adapter'
+
+        def _not_encoded(self, inputs):
+            return False
+
+        def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+            return [[0], [1]]
+
+        _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
+        _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+
+        def _forward_only_single(self, *, inputs, **kwargs):
+            value = float(inputs[0]['input_ids'][0])
+            return {'aux_loss': torch.tensor(value), 'logps': torch.tensor([[value]])}
+
+    inputs = [{'input_ids': [2], 'labels': [1]},
+              {'input_ids': [4, 4, 4], 'labels': [1, 1, 1]}]
+    outputs = TransformersModel.forward_only.__wrapped__(ModelHarness(), inputs=inputs, micro_batch_size=1)
+    assert outputs['aux_loss'].item() == expected
+    assert outputs['logps'][:, 0].tolist() == [2., 4.]
+
+
+@pytest.mark.parametrize('plan', [[[0], [0]], [[0], [2]], [[0], []]])
+def test_merge_rejects_invalid_sample_plan(plan):
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    with pytest.raises(ValueError, match='plan'):
+        merge_micro_batch_outputs([{'logps': torch.ones(1, 2)}] * 2, plan)
+
+
+@pytest.mark.parametrize('field, task, first_shape, second_shape', [
+    ('logits', 'causal_lm', (1, 2, 4), (1, 3, 5)),
+    ('logits', 'seq_cls', (1, 2), (1, 3)),
+    ('embeddings', 'embedding', (1, 2), (1, 3)),
+    ('routed_experts', 'causal_lm', (1, 2, 3, 2), (1, 4, 3, 1)),
+])
+def test_merge_rejects_non_sequence_dimension_changes(field, task, first_shape, second_shape):
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    with pytest.raises(ValueError, match=f'outputs.{field}: non-sequence dimension'):
+        merge_micro_batch_outputs([{field: torch.zeros(first_shape)}, {field: torch.zeros(second_shape)}],
+                                  [[0], [1]], task=task)
+
+
+def test_merge_pooled_outputs_and_unknown_nested_outputs():
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    result = merge_micro_batch_outputs([
+        {'embeddings': torch.tensor([[2., 3.]]), 'extra': {'scores': torch.tensor([[20.]])}},
+        {'embeddings': torch.tensor([[0., 1.]]), 'extra': {'scores': torch.tensor([[0., 1.]])}},
+    ], [[1], [0]], task='embedding')
+    assert result['embeddings'].tolist() == [[0., 1.], [2., 3.]]
+    assert result['extra']['scores'].tolist() == [[0., 1.], [20., 0.]]
+
+
+def test_merge_fallback_validates_tuple_structure_and_pads_tensors():
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    outputs = [{'extra_layers': (torch.ones(1, 2, 2, 2),)},
+               {'extra_layers': (torch.ones(1, 2, 3, 3) * 2,)}]
+    result = merge_micro_batch_outputs(outputs, [[1], [0]])
+    assert result['extra_layers'][0].shape == (2, 2, 3, 3)
+    assert result['extra_layers'][0][0, 0, 0, 0] == 2
+    outputs[1]['extra_layers'] = ()
+    with pytest.raises(ValueError, match='outputs.extra_layers: tuple lengths'):
+        merge_micro_batch_outputs(outputs, [[1], [0]])
+
+
+def test_merge_aux_loss_requires_explicit_training_scales():
+    import torch
+    from twinkle.model.micro_batch import merge_micro_batch_outputs
+
+    outputs = [{'aux_loss': torch.tensor(2.), 'logps': torch.tensor([[20.]])},
+               {'aux_loss': torch.tensor(4.), 'logps': torch.tensor([[10.]])}]
+    with pytest.raises(ValueError, match='outputs.aux_loss: one training scale'):
+        merge_micro_batch_outputs(outputs, [[1], [0]])
+    result = merge_micro_batch_outputs(outputs, [[1], [0]], micro_batch_scales=[.25, .75])
+    assert result['aux_loss'].item() == 3.5
+    assert result['logps'][:, 0].tolist() == [10., 20.]
+
+
+@pytest.mark.parametrize('micro_batch_size', [None, 1])
+def test_forward_only_encodes_trajectories_once(micro_batch_size):
+    import torch
+    from unittest.mock import Mock
+
+    encoded = [{'input_ids': [1, 2]}, {'input_ids': [3]}]
+    template = SimpleNamespace(batch_encode=Mock(return_value=encoded))
+    optimizer_config = SimpleNamespace(template=template)
+
+    class ModelHarness:
+        optimizer_group = {'adapter': optimizer_config}
+        _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
+        _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+
+        def _get_default_group(self):
+            return 'adapter'
+
+        def _not_encoded(self, inputs):
+            return 'input_ids' not in inputs
+
+        def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+            return [[0], [1]]
+
+        def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
+            assert optimizer_config.template is template
+            assert all('input_ids' in item for item in inputs)
+            return {'embeddings': torch.tensor([[item['input_ids'][0]] for item in inputs])}
+
+    inputs = [{'messages': []}, {'messages': []}]
+    options = {} if micro_batch_size is None else {'micro_batch_size': micro_batch_size}
+    result = TransformersModel.forward_only.__wrapped__(ModelHarness(), inputs=inputs, **options)
+    template.batch_encode.assert_called_once_with(inputs)
+    assert result['embeddings'].tolist() == [[1], [3]]

@@ -1,30 +1,25 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Alignment tests between twinkle samplers and swift inference engines.
+"""Compare Twinkle vLLMSampler with Swift VllmEngine.
 
-This script tests that twinkle's TorchSampler and vLLMSampler produce identical
-results to swift's TransformersEngine and VllmEngine respectively.
+Usage:
+    python align_swift.py                 # local LLM comparison
+    python align_swift.py --multimodal    # also compare multimodal inference
+    python align_swift.py --ray           # Ray placement benchmark (6 GPUs)
 
-Test cases:
-1. LLM + TorchSampler vs TransformersEngine
-2. LLM + vLLMSampler vs VllmEngine
-3. LLM + vLLMSampler with Ray (model 4 GPUs, sampler 2 GPUs, weight sync) - speed impact
-4. MLLM + TorchSampler vs TransformersEngine
-5. MLLM + vLLMSampler vs VllmEngine
-
-Run Ray test alone: python align_swift.py --ray
-  (requires 6 GPUs: 4 for model, 2 for sampler)
+The Ray benchmark uses 4 GPUs for a model and 2 for samplers; it measures
+sampling with a separate model group, without training or weight sync.
 """
 
+import argparse
 import gc
-import os
+import sys
 import torch
-from swift.infer_engine import RequestConfig, TransformersEngine, VllmEngine
+from swift.infer_engine import RequestConfig, VllmEngine
 from swift.utils import seed_everything
 
 # Do not init twinkle at import so --ray can init with Ray; other tests init local in main.
 import twinkle
 from twinkle.data_format import SamplingParams, Trajectory
-from twinkle.sampler.torch_sampler import TorchSampler
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from twinkle.template import Qwen3_5Template, Template
 
@@ -91,47 +86,10 @@ GSM8K_MESSAGES4 = [{
     'in how many different rooms could Hans be checked in?'
 }]
 
-# Optional: restrict GPUs for local tests (e.g. '6,7'). Ray test uses 6 GPUs by default.
-if 'CUDA_VISIBLE_DEVICES' not in os.environ or not os.environ['CUDA_VISIBLE_DEVICES']:
-    pass  # use default
-else:
-    pass  # already set
-
 
 def clean_cache():
     gc.collect()
     torch.cuda.empty_cache()
-
-
-def test_llm_torch_sampler():
-
-    seed_everything(42)
-    swift_engine = TransformersEngine(LLM_MODEL_ID)
-    request_config = RequestConfig(max_tokens=128, temperature=0, repetition_penalty=1)
-    swift_resp = swift_engine.infer([{'messages': LLM_MESSAGES}], request_config=request_config)
-    swift_response = swift_resp[0].choices[0].message.content
-    del swift_engine
-    clean_cache()
-
-    # Twinkle inference
-    seed_everything(42)
-    sampler = TorchSampler(LLM_MODEL_ID)
-    sampler.set_template(Template, model_id=LLM_MODEL_ID)
-
-    trajectory = Trajectory(messages=LLM_MESSAGES)
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-    resp = sampler.sample([trajectory], sampling_params=sampling_params)
-    tokens = resp[0].sequences[0].tokens
-    twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
-    del sampler
-    clean_cache()
-
-    match = swift_response == twinkle_response
-    if not match:
-        print(f'Swift: {swift_response}')
-        print(f'Twinkle: {twinkle_response}')
-
-    return match
 
 
 def test_llm_vllm_sampler():
@@ -148,7 +106,7 @@ def test_llm_vllm_sampler():
     clean_cache()
 
     seed_everything(42)
-    sampler = vLLMSampler(LLM_MODEL_ID, gpu_memory_utilization=0.5)
+    sampler = vLLMSampler(LLM_MODEL_ID, engine_args={'gpu_memory_utilization': 0.5})
     sampler.set_template(Template, model_id=LLM_MODEL_ID)
 
     trajectory = Trajectory(messages=LLM_MESSAGES)
@@ -170,10 +128,10 @@ def test_llm_vllm_sampler():
 
 
 def test_llm_vllm_sampler_ray():
-    """Twinkle sampler with Ray + model group (4 GPUs) + sampler group (2 GPUs) + weight sync.
+    """Twinkle sampler with Ray + model group (4 GPUs) + sampler group (2 GPUs).
 
     Isolates RL-like setup (no training/dataset): same 16 requests as local test,
-    to measure impact of Ray, multi-process sampler, and checkpoint sync on sample speed.
+    to measure the impact of Ray and multi-process sampling on sample speed.
     Run alone: python align_swift.py --ray  (requires 6 GPUs).
     """
     import time
@@ -229,14 +187,8 @@ def test_llm_vllm_sampler_ray():
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=LLM_MODEL_ID)
-    sampler.add_adapter_to_sampler(ADAPTER_NAME, lora_config)
 
-    # One weight sync (simulate RL step) then reset prefix cache
-    t_sync0 = time.perf_counter()
-    # ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
     sampler.reset_prefix_cache()
-    sync_sec = time.perf_counter() - t_sync0
-    logger.info('Weight sync + reset_prefix_cache: %.2f s', sync_sec)
 
     trajectory = Trajectory(messages=LLM_MESSAGES)
     sampling_params = SamplingParams(max_tokens=2048, temperature=0, repetition_penalty=1)
@@ -246,41 +198,11 @@ def test_llm_vllm_sampler_ray():
     sampler.sample(trajectories, sampling_params=sampling_params, adapter_name=ADAPTER_NAME)
     t1 = time.perf_counter()
 
-    print(f'Twinkle Ray (model={MODEL_GPUS}, sampler={SAMPLER_GPUS}, ckpt_sync) inference time: {t1 - t0:.2f} s')
-    print(f'  (weight_sync+reset_prefix_cache: {sync_sec:.2f} s)')
+    print(f'Twinkle Ray (model={MODEL_GPUS}, sampler={SAMPLER_GPUS}) inference time: {t1 - t0:.2f} s')
 
     # No Swift baseline in same process; compare with local test run separately
     logger.info('Run test_llm_vllm_sampler (local) for baseline comparison.')
     return True
-
-
-def test_mllm_torch_sampler():
-    seed_everything(42)
-    swift_engine = TransformersEngine(MLLM_MODEL_ID)
-    request_config = RequestConfig(max_tokens=128, temperature=0)
-    swift_resp = swift_engine.infer([{'messages': MLLM_MESSAGES, 'images': MLLM_IMAGES}], request_config=request_config)
-    swift_response = swift_resp[0].choices[0].message.content
-    del swift_engine
-    clean_cache()
-
-    seed_everything(42)
-    from transformers import Qwen3VLForConditionalGeneration
-    sampler = TorchSampler(MLLM_MODEL_ID, model_cls=Qwen3VLForConditionalGeneration)
-    sampler.set_template(Qwen3_5Template, model_id=MLLM_MODEL_ID)
-
-    trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-    resp = sampler.sample([trajectory], sampling_params=sampling_params)
-    tokens = resp[0].sequences[0].tokens
-    twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
-    del sampler
-    clean_cache()
-
-    match = swift_response == twinkle_response
-    if not match:
-        print(f'Swift: {swift_response[:300]}')
-        print(f'Twinkle: {twinkle_response[:300]}')
-    return match
 
 
 def test_mllm_vllm_sampler():
@@ -293,7 +215,8 @@ def test_mllm_vllm_sampler():
     clean_cache()
 
     seed_everything(42)
-    sampler = vLLMSampler(MLLM_MODEL_ID, gpu_memory_utilization=VLLM_GPU_MEM, max_model_len=VLLM_MAX_MODEL_LEN)
+    sampler = vLLMSampler(
+        MLLM_MODEL_ID, engine_args={'gpu_memory_utilization': VLLM_GPU_MEM, 'max_model_len': VLLM_MAX_MODEL_LEN})
     sampler.set_template(Qwen3_5Template, model_id=MLLM_MODEL_ID)
 
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
@@ -312,27 +235,21 @@ def test_mllm_vllm_sampler():
 
 
 def main():
-    # Ray test only: 6 GPUs (4 model + 2 sampler), no prior twinkle init
-    print('Running Twinkle vLLM sampler with Ray (model=4, sampler=2, weight sync)...')
-    passed = test_llm_vllm_sampler_ray()
-    print('LLM vLLMSampler (Ray):', 'PASS' if passed else 'FAIL')
+    parser = argparse.ArgumentParser(description='Twinkle/Swift vLLM comparisons')
+    parser.add_argument('--ray', action='store_true', help='Run only the Ray placement benchmark (6 GPUs)')
+    parser.add_argument('--multimodal', action='store_true', help='Include the multimodal comparison')
+    args = parser.parse_args()
+    if args.ray:
+        return 0 if test_llm_vllm_sampler_ray() else 1
 
     twinkle.initialize(mode='local', nproc_per_node=1)
-
-    results = {}
-    # results['LLM TorchSampler'] = test_llm_torch_sampler()
-    results['LLM vLLMSampler'] = test_llm_vllm_sampler()
-    # results['MLLM TorchSampler'] = test_mllm_torch_sampler()
-    # results['MLLM vLLMSampler'] = test_mllm_vllm_sampler()
-
+    results = {'LLM vLLMSampler': test_llm_vllm_sampler()}
+    if args.multimodal:
+        results['MLLM vLLMSampler'] = test_mllm_vllm_sampler()
     for test_name, passed in results.items():
-        status = 'PASS' if passed else 'FAIL'
-        print(f'{test_name}: {status}')
-
-    all_passed = all(results.values())
-    print(f'\nAll tests passed: {all_passed}')
-    return all_passed
+        print(f"{test_name}: {'PASS' if passed else 'FAIL'}")
+    return 0 if all(results.values()) else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

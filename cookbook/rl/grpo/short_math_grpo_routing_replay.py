@@ -26,7 +26,6 @@ from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
 from twinkle.preprocessor.llm import GSM8KProcessor
-from twinkle.model.transformers.moe.router_replay import RouterReplayAction
 
 logger = get_logger()
 args = CLI.from_args()
@@ -279,7 +278,8 @@ def main():
             mb_inputs = all_input_data[mb_start:mb_end]
             recompute_output = model.forward_only(
                     inputs=copy.deepcopy(mb_inputs),
-                    router_replay_action={'R2': RouterReplayAction.RECORD,'R3': RouterReplayAction.REPLAY_FORWARD}.get(ROUTER_REPLAY_MODE),
+                    # The model layer self-judges: R2 RECORDs on this capture pass, R3 REPLAYs.
+                    router_replay_mode=ROUTER_REPLAY_MODE,
                     micro_batch_size=MICRO_BATCH_SIZE,
                 )
             old_logps = recompute_output.get('logps')
@@ -305,7 +305,7 @@ def main():
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
                 micro_batch_size=MICRO_BATCH_SIZE,
-                router_replay_action=RouterReplayAction.REPLAY_FORWARD
+                router_replay_mode=ROUTER_REPLAY_MODE
             )
             model.clip_grad_and_step()
             optim_step += 1

@@ -18,20 +18,20 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
 
     # ----- Cleanup -----
 
-    async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str] | None = None, **kwargs) -> int:
+    async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str]) -> int:
         """Remove sampling sessions that are older than cutoff_time, or whose
         owning session has already been expired.
 
         Args:
             cutoff_time: Unix timestamp threshold.
-            expired_session_ids: Optional list of session IDs that have just
-                been expired; any sampling session belonging to one of these
+            expired_session_ids: Session IDs that have just been expired; any
+                sampling session belonging to one of these
                 sessions will also be removed regardless of its own age.
 
         Returns:
             Number of sampling sessions removed.
         """
-        session_set = set(expired_session_ids or [])
+        session_set = set(expired_session_ids)
         all_records = await self.get_all()
         expired_ids = []
 

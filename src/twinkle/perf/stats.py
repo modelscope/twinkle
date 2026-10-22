@@ -2,10 +2,11 @@
 """Tensor statistics helpers for the module profiler.
 
 These are plain functions over ``torch.Tensor`` (and the nested containers a
-forward may return) so both the built-in :class:`ActivationStatsProfiler` and
-user subclasses can reuse them. Every reduction ends in ``.item()``, which forces
-a device sync -- that is intentional and affordable because the profiler only
-collects on gated steps, never on every forward.
+forward may return) so both the built-in :func:`activation_stats` /
+:func:`param_stats` collectors and user collectors can reuse them. Every
+reduction ends in ``.item()``, which forces a device sync -- that is
+intentional and affordable because the profiler only collects on gated steps,
+never on every forward.
 """
 
 from __future__ import annotations

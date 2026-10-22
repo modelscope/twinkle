@@ -25,3 +25,7 @@ class Loss:
             return 1.0
         raise NotImplementedError(
             f'{self.__class__.__name__} does not support micro-batching, including dynamic batching')
+
+    def batch_normalizer(self, inputs: list[InputFeature]):
+        """Return this batch's additive reduction denominator, or ``None`` for mean-reduced losses."""
+        return None

@@ -93,11 +93,21 @@ class GptqQuantizer(CalibrationQuantizer):
                 return n, m
         return None, None
 
+    def _should_not_quantize(self, name: str) -> bool:
+        """True when ``name`` matches a ``modules_to_not_convert`` entry.
+
+        Substring match, mirroring how the AWQ path consumes the same list; optimum's GPTQQuantizer
+        has no such parameter of its own, so entries like 'mlp.shared_expert_gate' must be filtered
+        out of the names handed to it here.
+        """
+        return any(module in name for module in (self.modules_to_not_convert or ()))
+
     def get_modules_in_block_to_quantize(self, model, block_name: str) -> Optional[List[List[str]]]:
         """Group a block's linears for MoE models.
 
         Only meaningful for MoE: the router ('mlp.gate') must stay in full precision, and the expert
-        linears sharing a suffix are quantized as one group. Dense models return None, letting
+        linears sharing a suffix are quantized as one group. ``modules_to_not_convert`` entries drop
+        further linears (shared expert gates and the like). Dense models return None, letting
         optimum use its own default grouping.
         """
         if not self.is_moe_model:
@@ -119,7 +129,7 @@ class GptqQuantizer(CalibrationQuantizer):
                 suffix = name.rsplit('.', 1)[-1]
                 experts[suffix].append(name)
                 experts_idx = len(res)
-            elif 'mlp.gate' not in name:
+            elif 'mlp.gate' not in name and not self._should_not_quantize(name):
                 res.append([name])
         if experts_idx is not None:
             res[experts_idx:experts_idx] = experts.values()
@@ -254,6 +264,27 @@ class GptqQuantizer(CalibrationQuantizer):
             raise RuntimeError('call quantize() before save(): the GPTQQuantizer holds the packing metadata.')
         self.gptq_quantizer.save(
             model, output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+        self._strip_placeholder_dataset(output_dir)
+
+    def _strip_placeholder_dataset(self, output_dir: str) -> None:
+        """Remove the placeholder dataset name from the saved quantize_config.json.
+
+        ``_build_optimum_quantizer`` must pass a non-empty dataset name (optimum validates it even
+        though ``_patch_calib_dataset`` replaces the loader); leaving it in the file would point
+        loaders at a dataset that does not exist. ``quantize`` already strips it from config.json,
+        this covers the separate quantize_config.json optimum writes.
+        """
+        import json
+        import os
+
+        path = os.path.join(output_dir, 'quantize_config.json')
+        if not os.path.exists(path):
+            return
+        with open(path, encoding='utf-8') as f:
+            config = json.load(f)
+        if config.pop('dataset', None) is not None:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
 
 
 class GptqV2Quantizer(GptqQuantizer):
@@ -264,3 +295,23 @@ class GptqV2Quantizer(GptqQuantizer):
     def __init__(self, *args, **kwargs):
         kwargs['v2'] = True
         super().__init__(*args, **kwargs)
+
+    def save(self, model, output_dir: str, *, safe_serialization: bool = True, max_shard_size='5GB') -> None:
+        """Save the packed weights in the gptq_v2 layout, skipping optimum's back-conversion.
+
+        optimum's ``GPTQQuantizer.save`` unconditionally converts gptq_v2 packing back to the v1
+        layout when ``sym`` is enabled (its default), which would undo the format the caller chose.
+        The weights are written by ``save_pretrained`` directly and the packing metadata by
+        serializing the quantizer's own dict (minus the placeholder dataset name).
+        """
+        import json
+        import os
+
+        if self.gptq_quantizer is None:
+            raise RuntimeError('call quantize() before save(): the GPTQQuantizer holds the packing metadata.')
+        os.makedirs(output_dir, exist_ok=True)
+        model.save_pretrained(output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+        config = self.gptq_quantizer.to_dict()
+        config.pop('dataset', None)
+        with open(os.path.join(output_dir, 'quantize_config.json'), 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)

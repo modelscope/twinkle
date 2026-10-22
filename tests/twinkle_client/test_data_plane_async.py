@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 import threading
 
-import pytest
-
 from twinkle_client.data_plane import DataPlaneClient
-from twinkle_client.types import DataRef, DataRowsResponse
+from twinkle.protocol.types import DataRef, DataRowsResponse
 
 
 def test_async_convenience_methods_delegate_to_sync_operations(monkeypatch) -> None:
@@ -46,9 +45,13 @@ def test_async_convenience_methods_delegate_to_sync_operations(monkeypatch) -> N
     asyncio.run(run())
 
     assert [call[:-1] for call in calls] == [
-        ('put', [{'value': 1}], 'rollout'),
+        ('put', [{
+            'value': 1
+        }], 'rollout'),
         ('get', original_ref, ['value']),
-        ('append', original_ref, [{'value': 2}]),
+        ('append', original_ref, [{
+            'value': 2
+        }]),
         ('release', appended_ref),
     ]
     assert all(call[-1] != caller_thread for call in calls)
@@ -96,7 +99,11 @@ def test_async_tagged_methods_and_batch_read_delegate_to_sync_operations(monkeyp
     asyncio.run(run())
 
     assert calls == [
-        ('put', [{'value': 1}], 'data', tags),
+        ('put', [{
+            'value': 1
+        }], 'data', tags),
         ('get_batch', ref, None),
-        ('append', ref, [{'reward': 1.0}], tags),
+        ('append', ref, [{
+            'reward': 1.0
+        }], tags),
     ]

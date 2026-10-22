@@ -7,7 +7,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from twinkle.data_format import Trajectory, user_data_get
+from twinkle.data_format import Trajectory, last_assistant_text, user_data_get
 from twinkle.reward.base import Reward
 from twinkle.reward.math_reward import MathReward
 
@@ -31,7 +31,7 @@ class DAPOMathAccuracyReward(Reward):
 
     @classmethod
     def _score(cls, trajectory: Trajectory) -> float:
-        completion = cls._last_assistant_content(trajectory)
+        completion = last_assistant_text(trajectory)
         prediction = cls.extract_answer(completion)
         ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', '')).strip()
         if not prediction or not ground_truth:
@@ -51,13 +51,6 @@ class DAPOMathAccuracyReward(Reward):
         if len(answer) >= 2 and answer.startswith('$') and answer.endswith('$'):
             answer = answer[1:-1].strip()
         return answer
-
-    @staticmethod
-    def _last_assistant_content(trajectory: Trajectory) -> str:
-        for message in reversed(trajectory.get('messages', [])):
-            if message.get('role') == 'assistant':
-                return str(message.get('content', ''))
-        return ''
 
     @staticmethod
     def _decimal_equal(first: str, second: str) -> bool:
@@ -128,7 +121,7 @@ class DAPOMathReward(Reward):
         }
 
     def _accuracy(self, trajectory: Trajectory) -> float:
-        completion = DAPOMathAccuracyReward._last_assistant_content(trajectory)
+        completion = last_assistant_text(trajectory)
         scored_completion = completion[-self.score_tail_chars:]
         prediction = DAPOMathAccuracyReward.extract_answer(scored_completion)
         ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', '')).strip()

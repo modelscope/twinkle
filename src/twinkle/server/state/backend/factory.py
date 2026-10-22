@@ -26,17 +26,10 @@ def create_backend(config: PersistenceConfig | None = None) -> StateBackend:
 
     match config.mode:
         case 'memory':
-            # Deferred import: RayActorBackend pulls in ``ray``, which is an
-            # optional dependency. Importing it lazily means callers that
-            # never select memory mode (e.g. file/redis users) do not need
-            # ray installed just to load this factory.
+            # Deferred import keeps the module-level import graph light; the Twinkle
+            # server always runs on Ray Serve, so ``ray`` is available here.
             from .memory_backend import RayActorBackend
             return RayActorBackend(key_prefix=config.key_prefix)
-        case 'file':
-            if not config.file_path:
-                raise ValueError('file_path is required for file persistence mode')
-            from .file_backend import FileBackend
-            return FileBackend(config.file_path)
         case 'redis':
             if not config.redis_url:
                 raise ValueError('redis_url is required for redis persistence mode')

@@ -3,10 +3,112 @@ import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
+from twinkle.utils.loader import run_worker_setup_hook
 from .. import _torch_setup
 from .resource_manager import ResourceManager
 
 T = TypeVar('T')
+
+
+class LazyCollect:
+    """A remote call's pending result, addressed through the Future protocol.
+
+    Holds the per-worker refs of one dispatched call and collects them on demand. ``result`` (and
+    the callable form) materialise the collected value; ``done``/``ready`` probe completion without
+    fetching any payload, so a driver can time control-plane side effects (release a pin, flip a
+    window) to the true end of a call while the payload keeps flowing as a reference to a
+    downstream actor. A FAILED task also reports ready (``ray.wait`` surfaces completion, not
+    success); the exception is raised at the real collect.
+    """
+
+    _is_lazy_collect = True
+
+    def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
+        self._futures = futures
+        self._method = method
+        self._collect_func = collect_func
+        self.device_mesh = device_mesh
+        self._result = None  # Cache collected results
+        self._timeout = timeout
+
+    def _get_result(self):
+        """Internal method to lazily collect and cache results"""
+        import ray
+        if self._result is None:
+            result = []
+            for future in self._futures:
+                if isinstance(future, ray.ObjectRef):
+                    result.append(ray.get(future, timeout=self._timeout))
+                else:
+                    result.append(future)
+            self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
+        return self._result
+
+    def __call__(self):
+        """Lazily collect results, support repeated calls (with caching)"""
+        return self._get_result()
+
+    def result(self, timeout=None):
+        """Materialise the collected value; an explicit timeout overrides the declared one."""
+        if timeout is not None:
+            self._timeout = timeout
+        return self._get_result()
+
+    def exception(self, timeout=None):
+        """The raised exception if the call failed, else ``None`` (Future protocol)."""
+        try:
+            self.result(timeout)
+            return None
+        except StopIteration:
+            raise
+        except Exception as exc:  # noqa
+            return exc
+
+    def done(self) -> bool:
+        """Whether every referenced task has finished (Future protocol alias of :meth:`ready`)."""
+        return self.ready()
+
+    def ready(self) -> bool:
+        """Whether every referenced task has finished, WITHOUT fetching any payload.
+
+        A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
+        adapter pin) to the true completion of a lazily-collected call, while the payload keeps
+        flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
+        never materialises the result, so ``_result`` stays untouched and no data returns to the
+        caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
+        exception is raised later, at the real :meth:`__call__` collect.
+        """
+        import ray
+        refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+        if not refs:
+            return True
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+        return len(ready) == len(refs)
+
+    def __iter__(self):
+        """Support iteration: automatically collect results then iterate"""
+        return iter(self._get_result())
+
+    def __len__(self):
+        """Support len() function"""
+        return len(self._get_result())
+
+    def __getitem__(self, key):
+        """Index into the collected value (a dict key or a list index/slice); materialises it.
+
+        Together with :meth:`get` / :meth:`__contains__` this lets the SAME subscript syntax read a
+        lazy remote return and a local plain dict/list -- a caller writes ``out['logps']`` and works
+        in both deployment forms without a shape branch.
+        """
+        return self._get_result()[key]
+
+    def get(self, key, default=None):
+        """Dict-style ``get`` over the collected value; materialises it (missing key -> ``default``)."""
+        return self._get_result().get(key, default)
+
+    def __contains__(self, key):
+        """Membership over the collected value; materialises it."""
+        return key in self._get_result()
 
 
 class RayHelper:
@@ -97,7 +199,10 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            resources = RayHelper._get_ray_custom_resources(device_groups)
+            # Connecting to an existing cluster (e.g. RAY_ADDRESS set for multi-node): custom
+            # resources are declared at ``ray start`` time, and Ray rejects ``resources`` on connect.
+            connecting = bool(os.environ.get('RAY_ADDRESS'))
+            resources = None if connecting else RayHelper._get_ray_custom_resources(device_groups)
             ray.init(ignore_reinit_error=True, resources=resources or None)
 
         if RayHelper.resource_manager is None:
@@ -138,19 +243,32 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
-        """Execute method and return results."""
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                         on_submit: Optional[Callable] = None, timeout=None):
+        """Execute method and return results.
+
+        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
+        the **total** wall-clock time to collect the whole list -- different from
+        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
+        The two paths are each bounded on their own; the total-time semantics here
+        are strictly tighter.
+        """
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit), timeout=timeout)
 
     @staticmethod
-    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                          on_submit: Optional[Callable] = None):
         """Execute method and return futures."""
         output = []
         for worker_and_args in workers_and_args:
             worker, args, kwargs = worker_and_args
             remote_call = getattr(worker, method_name)
-            output.append(remote_call.remote(*args, **kwargs))
+            result = remote_call.remote(*args, **kwargs)
+            output.append(result)
+            # Register one by one so already-sent refs are never lost if a later RPC send fails.
+            if on_submit is not None:
+                on_submit(worker, result)
         return output
 
     @staticmethod
@@ -193,44 +311,7 @@ class RayHelper:
                                 futures,
                                 device_mesh,
                                 timeout=None):
-        """Return a callable to collect results in the workers."""
-
-        class LazyCollect:
-
-            def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
-                self._futures = futures
-                self._method = method
-                self._collect_func = collect_func
-                self._is_lazy_collect = True
-                self.device_mesh = device_mesh
-                self._result = None  # Cache collected results
-                self._timeout = timeout
-
-            def _get_result(self):
-                """Internal method to lazily collect and cache results"""
-                import ray
-                if self._result is None:
-                    result = []
-                    for future in self._futures:
-                        if isinstance(future, ray.ObjectRef):
-                            result.append(ray.get(future, timeout=self._timeout))
-                        else:
-                            result.append(future)
-                    self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
-                return self._result
-
-            def __call__(self):
-                """Lazily collect results, support repeated calls (with caching)"""
-                return self._get_result()
-
-            def __iter__(self):
-                """Support iteration: automatically collect results then iterate"""
-                return iter(self._get_result())
-
-            def __len__(self):
-                """Support len() function"""
-                return len(self._get_result())
-
+        """Return the Future-protocol handle over one dispatched call's refs."""
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod
@@ -269,6 +350,7 @@ class RayHelper:
                        instance_id,
                        extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                        max_concurrency: Optional[int] = None,
+                       worker_slots: Optional[List[int]] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -285,6 +367,14 @@ class RayHelper:
         if isinstance(ranks, int):
             ranks = list(range(ranks))
         assert len(placement_groups) == len(ranks)
+        if worker_slots is not None:
+            slots = tuple(worker_slots)
+            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(slots):
+                raise ValueError(f'worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.')
+            if not slots:
+                return []
+            placement_groups = [placement_groups[slot] for slot in slots]
+            ranks = [ranks[slot] for slot in slots]
         key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
         if execute == 'peer':
             # Create the peer worker
@@ -344,7 +434,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':
@@ -374,7 +468,12 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         else:
             world_size = len(ranks)
@@ -401,7 +500,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':
@@ -415,6 +518,11 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         return workers

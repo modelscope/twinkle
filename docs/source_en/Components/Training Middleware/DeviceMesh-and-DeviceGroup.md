@@ -87,4 +87,4 @@ Data distribution judgment is performed by the `get_slice` method of DeviceMesh:
 batch[device_mesh.get_slice(len(batch))]
 ```
 
-get_slice calculates which dp group the current worker belongs to based on the current rank and obtains the corresponding data. This process occurs in the DeviceMeshSampler of DataLoader, and also in the dispatch and collect of remote_class.
+get_slice calculates which dp group the current worker belongs to based on the current rank and obtains the corresponding data. This process occurs in the ShardedBatchSampler of DataLoader, and also in the dispatch and collect of remote_class.

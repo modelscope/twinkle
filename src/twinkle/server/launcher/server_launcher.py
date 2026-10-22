@@ -18,9 +18,9 @@ from typing import Any
 
 from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
+from twinkle.patch.ray_serve import apply_ray_serve_patches, get_runtime_env_for_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
-from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 from .builder_registry import get_builders, resolve_builder
 from .env_propagation import build_propagated_env_vars
 
@@ -43,6 +43,31 @@ def build_ray_runtime_env() -> dict[str, Any]:
         merged_env_vars.update(propagated_env_vars)
         runtime_env['env_vars'] = merged_env_vars
     return runtime_env
+
+
+def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
+    """Bring up (or attach to) the Ray runtime a Serve deployment needs.
+
+    The deploy-side entry for Ray bring-up: with no cluster running this starts a local head seeded
+    with :func:`build_ray_runtime_env` (the patches Ray Serve's proxy actors need); ``address='auto'``
+    attaches to an existing cluster instead. Idempotent -- an already-initialized runtime is left
+    untouched. Both the launcher itself and a caller that starts the head before handing off to
+    :func:`launch_server` (e.g. swift's deploy recipe) go through here, so worker seeding stays
+    single-sourced.
+    """
+    import ray
+
+    if ray.is_initialized():
+        return
+    init_kwargs: dict[str, Any] = {
+        'namespace': namespace,
+        'runtime_env': build_ray_runtime_env(),
+        'ignore_reinit_error': True,
+    }
+    if address:
+        init_kwargs['address'] = address
+    ray.init(**init_kwargs)
+    logger.info(f'ray runtime ready (namespace={namespace}, address={address or "local head"})')
 
 
 class ServerLauncher:
@@ -96,26 +121,11 @@ class ServerLauncher:
         return resolve_builder(import_path, self._get_builders())
 
     def _init_ray(self) -> None:
-        """Initialize Ray if not already initialized."""
+        """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
         if self._ray_initialized:
             return
-
-        import ray
-
         namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
-
-        if not ray.is_initialized():
-            # Use runtime_env to apply patches in worker processes
-            # This is required because Ray Serve's ProxyActor runs in separate processes
-            runtime_env = build_ray_runtime_env()
-            # Connect to existing cluster if available, otherwise start local instance
-            ray.init(
-                address='auto',
-                namespace=namespace,
-                runtime_env=runtime_env,
-            )
-            logger.info(f'Ray initialized with namespace={namespace}')
-
+        ensure_ray_cluster(namespace=namespace, address='auto')
         self._ray_initialized = True
 
     def _start_serve(self) -> None:
@@ -235,6 +245,23 @@ class ServerLauncher:
             os.environ[k] = v
         logger.info(f'Persistence backend configured: mode={persistence.mode}')
 
+        # Export the gateway ``server`` application's ServerState policy (quota /
+        # expiry / cleanup / metrics interval) to env vars for the same reason:
+        # so every worker's first ``get_server_state()`` applies the configured
+        # values instead of the hardcoded defaults. Without this the model worker
+        # that enforces ``per_token_model_limit`` runs on the default (30),
+        # silently ignoring the YAML value.
+        server_specs = [a for a in self.config.applications if a.import_path == 'server']
+        if len(server_specs) > 1:
+            logger.warning(f'{len(server_specs)} "server" applications declared; using the first '
+                           'for ServerState policy env propagation.')
+        if server_specs:
+            server_state_env = server_specs[0].args.server_config.to_env_vars()
+            for k, v in server_state_env.items():
+                os.environ[k] = v
+            if server_state_env:
+                logger.info(f'ServerState policy exported to worker env: {server_state_env}')
+
         model_alias_map = build_model_alias_map(self.config.applications)
         if model_alias_map:
             os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(model_alias_map, ensure_ascii=False)
@@ -294,6 +321,24 @@ class ServerLauncher:
         flush_telemetry_safely()
 
 
+def _warn_public_unauthenticated(config: ServerConfig) -> None:
+    """Loudly flag a 0.0.0.0 listener with no gateway ``api_key`` anywhere.
+
+    Every inference route would be reachable without credentials from any host that
+    can route to this machine -- the advisory class where an open deployment becomes
+    free compute plus an internal-network pivot. Keeping the check here (the single
+    launch choke point) covers YAML and programmatic configs alike.
+    """
+    if config.http_options.host != '0.0.0.0':
+        return
+    if any(app.import_path == 'server' and getattr(app.args, 'api_key', None)
+           for app in config.applications):
+        return
+    logger.warning('server binds 0.0.0.0:%s with no api_key configured on any gateway application: '
+                   'every route is reachable unauthenticated by any network peer. Set ServerArgs.api_key '
+                   '(--api_key) or bind a non-public host.', config.http_options.port)
+
+
 def launch_server(
     config: ServerConfig | None = None,
     config_path: str | Path | None = None,
@@ -323,6 +368,8 @@ def launch_server(
         # ``FileNotFoundError`` / ``ConfigParseError`` / ``pydantic.ValidationError``
         # propagate so the caller can surface a precise message.
         config = ServerConfig.from_yaml(config_path)
+
+    _warn_public_unauthenticated(config)
 
     launcher = ServerLauncher(
         config=config,

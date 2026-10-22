@@ -7,7 +7,9 @@ Each class only builds the matching ``transformers`` quantization_config. See
 from typing import List, Optional, Union
 
 from twinkle.quantizer.base import ConfigQuantizer
-from twinkle.utils import requires
+from twinkle.utils import get_logger, requires
+
+logger = get_logger()
 
 
 class BnbQuantizer(ConfigQuantizer):
@@ -94,6 +96,13 @@ class HqqQuantizer(ConfigQuantizer):
     def get_quantization_config(self):
         from transformers import HqqConfig
 
+        if self.skip_modules:
+            # transformers 5.x matches skip_modules against per-layer linear tags (relative names
+            # like 'self_attn.q_proj'), not module paths: an entry naming a whole tower ('visual')
+            # matches nothing and those layers stay quantized.
+            logger.warning(
+                "hqq skip_modules are matched against per-layer linear tags; entries naming whole "
+                "submodules (e.g. 'visual') will not match and their linears stay quantized.")
         kwargs = {}
         if self.skip_modules is not None:
             kwargs['skip_modules'] = self.skip_modules

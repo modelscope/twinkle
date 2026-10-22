@@ -7,7 +7,7 @@ class SkipSampler(Sampler):
 
     It counts indices, not samples successfully read. Those used to differ, back when the sampler read
     each sample to check it and skipped the unreadable ones -- which is why skipping had to read too.
-    :class:`RetryDataset` now answers every index with a sample, so the counts are the same and
+    :class:`MapRetryDataset` now answers every index with a sample, so the counts are the same and
     resuming costs nothing.
 
     Args:

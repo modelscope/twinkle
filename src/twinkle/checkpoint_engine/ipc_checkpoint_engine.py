@@ -26,7 +26,7 @@ NCCL engine rather than larger:
 ZMQ carries only handles and per-tensor metadata -- a few hundred bytes per bucket.
 """
 import os
-import pickle
+import re
 import torch
 import zmq
 from typing import Any, AsyncGenerator, Generator
@@ -34,6 +34,7 @@ from typing import Any, AsyncGenerator, Generator
 from twinkle import Platform, get_logger
 from twinkle.utils.framework import Torch
 from .base import CheckpointEngine
+from .zmq_auth import recv_auth_pyobj, send_auth_pyobj
 
 logger = get_logger()
 
@@ -47,15 +48,27 @@ _CHANNEL_SIZE = 2
 # Every tensor starts at a multiple of this. ``Tensor.view(dtype)`` requires the storage offset to be
 # a multiple of the target element size, and 16 covers every dtype Torch has.
 _ALIGNMENT = 16
+# Both socket directions give up after this, so a topology mismatch (a peer that never binds) surfaces
+# as a RuntimeError from the auth helpers instead of an unbounded hang.
+_ZMQ_TIMEOUT_MS = 300_000
 
 
 class IPCCheckpointEngine(CheckpointEngine):
     """Hand weights to a sampler on the same device by mapping memory instead of copying it."""
 
-    def __init__(self, bucket_size: int = 512 << 20, **kwargs) -> None:
+    backend_name = 'ipc'
+
+    def __init__(self, bucket_size: int | None = None, channel: str = 'default', auth_key: str = '',
+                 **kwargs) -> None:
         # Smaller default than the NCCL engine's 3 GB: a bigger bucket buys nothing when the transfer
         # is a mapping, and under colocation this buffer competes with the sampler for the same GPU.
-        self.bucket_size = bucket_size
+        # An explicit ``bucket_size`` (an overridden ``_bucket_size`` on the mixin) wins over it.
+        self.bucket_size = bucket_size if bucket_size is not None else 512 << 20
+        # Names the transport channel this engine serves, so two colocate managers over the same GPU
+        # pair derive different sockets instead of unlinking each other's.
+        self.channel = channel
+        # Empty disables HMAC on the control frames; the manager always sets one for its channels.
+        self.auth_key = auth_key
 
         # Set by the manager before prepare(); unused here, the endpoint is not negotiated.
         self.is_master = False
@@ -75,14 +88,17 @@ class IPCCheckpointEngine(CheckpointEngine):
 
     # ── rendezvous ───────────────────────────────────────────────────────
 
-    @staticmethod
-    def endpoint() -> str:
+    def endpoint(self) -> str:
         """The socket both peers derive independently from the device they share.
 
-        The platform helper obtains the physical device UUID for the current local device.
+        The platform helper obtains the physical device UUID for the current local device. The
+        channel is part of the path, so two colocate managers over the same GPU pair (a sampler
+        channel plus a model-to-model channel, say) each get their own socket instead of the
+        second bind unlinking the first one.
         """
         uuid = str(Platform.get_vllm_device_uuid(Torch.get_current_device()))
-        return f'ipc:///tmp/twinkle-colocate-{uuid}.sock'
+        safe_channel = re.sub(r'[^A-Za-z0-9_.-]', '_', self.channel)
+        return f'ipc:///tmp/twinkle-colocate-{safe_channel}-{uuid}.sock'
 
     def prepare(self) -> dict[str, Any]:
         """Nothing to negotiate; the endpoint is derived, not exchanged."""
@@ -94,6 +110,8 @@ class IPCCheckpointEngine(CheckpointEngine):
         trainer_world_size: int,
         rollout_world_size: int,
         metadata: list[dict],
+        *,
+        sender_ranks=None,
     ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
         """Decide which trainer ranks have a sampler to talk to, and pair them up.
 
@@ -113,18 +131,22 @@ class IPCCheckpointEngine(CheckpointEngine):
         ``tp``. Nothing here has to match them up explicitly: the endpoint is derived from the GPU, so
         the pairing falls out of both peers being on it.
         """
-        if rollout_world_size <= 0 or trainer_world_size % rollout_world_size:
-            raise ValueError(
-                f'Colocated weight sync expects each sampler process to cover a whole number of trainer '
-                f'ranks\' GPUs, got trainer={trainer_world_size} and rollout={rollout_world_size}. Unless '
-                f'the two roles are placed on the same devices, this needs the NCCL engine instead.')
-        # How many trainer ranks share one sampler process: 1 without tensor parallelism, tp with it.
-        ranks_per_sampler = trainer_world_size // rollout_world_size
+        if sender_ranks is None:
+            if rollout_world_size <= 0 or trainer_world_size % rollout_world_size:
+                raise ValueError(
+                    f'Colocated weight sync expects each sampler process to cover a whole number of trainer '
+                    f'ranks\' GPUs, got trainer={trainer_world_size} and rollout={rollout_world_size}. Unless '
+                    f'the two roles are placed on the same devices, this needs the NCCL engine instead.')
+            ranks_per_sampler = trainer_world_size // rollout_world_size
+            sender_ranks = tuple(range(0, trainer_world_size, ranks_per_sampler))
+        else:
+            sender_ranks = tuple(sender_ranks)
+            if any(type(rank) is not int or not 0 <= rank < trainer_world_size for rank in sender_ranks):
+                raise ValueError('IPC sender_ranks must identify physical ranks within the trainer world.')
+            if len(sender_ranks) != rollout_world_size or len(set(sender_ranks)) != len(sender_ranks):
+                raise ValueError('Each IPC receiver must have exactly one unique trainer sender rank.')
         trainer_kwargs = {
-            'rank': [
-                _SENDER_RANK if rank % ranks_per_sampler == 0 else _IDLE_RANK
-                for rank in range(trainer_world_size)
-            ],
+            'rank': [_SENDER_RANK if rank in sender_ranks else _IDLE_RANK for rank in range(trainer_world_size)],
             'world_size': [_CHANNEL_SIZE] * trainer_world_size,
             'master_metadata': [None] * trainer_world_size,
         }
@@ -145,6 +167,11 @@ class IPCCheckpointEngine(CheckpointEngine):
         endpoint = self.endpoint()
         self._context = zmq.Context()
         self.socket = self._context.socket(zmq.PAIR)
+        # Without a bound timeout, a topology mismatch -- a receiver whose endpoint points at a GPU
+        # nobody binds -- blocks forever on the first frame; with one, the auth helpers turn the
+        # timeout into a RuntimeError that names where it waited.
+        self.socket.setsockopt(zmq.RCVTIMEO, _ZMQ_TIMEOUT_MS)
+        self.socket.setsockopt(zmq.SNDTIMEO, _ZMQ_TIMEOUT_MS)
         if rank == _SENDER_RANK:
             # A socket file left by a crashed run would make bind fail; the sender owns the path.
             path = endpoint.removeprefix('ipc://')
@@ -254,9 +281,20 @@ class IPCCheckpointEngine(CheckpointEngine):
         """Publish the filled part of the buffer and wait until the receiver is done with it."""
         # The copies above are non_blocking; without this the receiver could map bytes not yet written.
         Torch.synchronize()
-        self.socket.send(pickle.dumps({'handle': self._handle, 'bucket_meta': bucket_meta, 'is_last': is_last}))
+        send_auth_pyobj(
+            self.socket,
+            {'handle': self._handle, 'bucket_meta': bucket_meta, 'is_last': is_last},
+            self.auth_key,
+            where='IPC checkpoint sender publishing a bucket',
+            timeout_s=_ZMQ_TIMEOUT_MS / 1000,
+        )
         # The receiver copies out of this buffer, so it must say so before we overwrite it.
-        self.socket.recv()
+        recv_auth_pyobj(
+            self.socket,
+            self.auth_key,
+            where='IPC checkpoint sender waiting for the bucket acknowledgement',
+            timeout_s=_ZMQ_TIMEOUT_MS / 1000,
+        )
 
     # ── receiver ─────────────────────────────────────────────────────────
 
@@ -264,7 +302,12 @@ class IPCCheckpointEngine(CheckpointEngine):
         """Yield views onto the sender's buffer. Callers that keep a tensor must clone it."""
         assert self.rank is not None and self.rank != _SENDER_RANK, 'The sender rank does not receive.'
         while True:
-            message = pickle.loads(self.socket.recv())
+            message = recv_auth_pyobj(
+                self.socket,
+                self.auth_key,
+                where='IPC checkpoint receiver waiting for a bucket',
+                timeout_s=_ZMQ_TIMEOUT_MS / 1000,
+            )
             bucket_meta = message['bucket_meta']
             # The closing message can be empty -- there is no buffer to map behind it, and for a model
             # with nothing to send it is the only message there is.
@@ -276,7 +319,13 @@ class IPCCheckpointEngine(CheckpointEngine):
             # Consumers copy with non_blocking=True, so the acknowledgement has to wait for the copies
             # and not merely for the loop above.
             Torch.synchronize()
-            self.socket.send(b'ack')
+            send_auth_pyobj(
+                self.socket,
+                'ack',
+                self.auth_key,
+                where='IPC checkpoint receiver acknowledging a bucket',
+                timeout_s=_ZMQ_TIMEOUT_MS / 1000,
+            )
             if message['is_last']:
                 break
 

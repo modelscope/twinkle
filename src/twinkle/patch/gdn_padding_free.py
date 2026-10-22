@@ -1,7 +1,5 @@
 import torch
-import transformers
-from importlib import import_module
-from packaging.version import Version
+from inspect import unwrap
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
 
@@ -9,38 +7,22 @@ from twinkle.patch import Patch
 from twinkle.utils.utils import call_with_supported_kwargs
 
 
-def _is_qwen35_model(hf_config) -> bool:
-    return 'qwen3_5' in getattr(hf_config, 'model_type', '')
-
-
-def _iter_qwen35_class_pairs():
-    class_specs = (
-        (
-            'transformers.models.qwen3_5.modeling_qwen3_5',
-            'Qwen3_5DecoderLayer',
-            'Qwen3_5GatedDeltaNet',
-        ),
-        (
-            'transformers.models.qwen3_5_moe.modeling_qwen3_5_moe',
-            'Qwen3_5MoeDecoderLayer',
-            'Qwen3_5MoeGatedDeltaNet',
-        ),
-    )
-    for module_name, decoder_class_name, gdn_class_name in class_specs:
-        try:
-            modeling_module = import_module(module_name)
-            yield getattr(modeling_module, decoder_class_name), getattr(modeling_module, gdn_class_name)
-        except Exception:
-            continue
-
-
-def _find_qwen35_class_pairs(module: Optional[torch.nn.Module], hf_config, enable_sp: bool):
-    if module is None or enable_sp or not _is_qwen35_model(hf_config):
+def _find_gdn_class_pairs(module: Optional[torch.nn.Module], enable_sp: bool):
+    if module is None or enable_sp:
         return ()
+    supported_names = {'Qwen3_5GatedDeltaNet', 'Qwen3_5MoeGatedDeltaNet'}
     class_pairs = []
-    for decoder_layer_cls, gated_delta_net_cls in _iter_qwen35_class_pairs():
-        if any(isinstance(submodule, gated_delta_net_cls) for submodule in module.modules()):
-            class_pairs.append((decoder_layer_cls, gated_delta_net_cls))
+    for layer in module.modules():
+        gdn = getattr(layer, 'linear_attn', None)
+        if not isinstance(gdn, torch.nn.Module):
+            continue
+        if type(gdn).__name__ not in supported_names:
+            continue
+        # Match concrete class names without inheriting support through the MRO.
+        # No Transformers internal import path is needed.
+        pair = (type(layer), type(gdn))
+        if pair not in class_pairs:
+            class_pairs.append(pair)
     return tuple(class_pairs)
 
 
@@ -56,15 +38,10 @@ def _get_flash_linear_attention_kernels():
     return causal_conv1d, chunk_gated_delta_rule
 
 
-def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
-    return Version(transformers.__version__) < Version('5.9.0')
-
-
 def _patch_gdn_kernels_for_cu_seqlens(
     mod: torch.nn.Module,
     *,
     cu_seqlens: torch.Tensor,
-    patch_chunk_rule: bool,
     origin_forward,
     forward_args,
     forward_kwargs,
@@ -75,18 +52,20 @@ def _patch_gdn_kernels_for_cu_seqlens(
     else:
         causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
 
-    # The Qwen3.5 modeling code references ``causal_conv1d_fn`` (and, for transformers
-    # < 5.9.0, ``chunk_gated_delta_rule``) as *module-level* globals inside the layer
-    # forward, not as instance attributes.  Patch them in the forward's global
-    # namespace so the swapped-in, ``cu_seqlens``-aware kernels are picked up, then
-    # restore afterwards.
-    modeling_globals = origin_forward.__globals__
-    old_conv_fn = modeling_globals.get('causal_conv1d_fn')
-    old_chunk_rule = modeling_globals.get('chunk_gated_delta_rule') if patch_chunk_rule else None
+    # Older Transformers stores callables on the instance; newer versions call
+    # modeling globals. Prefer instance attributes, including a None conv fallback.
+    modeling_globals = unwrap(origin_forward).__globals__
+    conv_namespace = mod.__dict__ if 'causal_conv1d_fn' in mod.__dict__ else modeling_globals
+    chunk_namespace = mod.__dict__ if 'chunk_gated_delta_rule' in mod.__dict__ else modeling_globals
+    chunk_name = 'chunk_gated_delta_rule' if chunk_namespace is mod.__dict__ else 'torch_chunk_gated_delta_rule'
+    old_conv_fn = conv_namespace['causal_conv1d_fn']
+    old_chunk_rule = chunk_namespace[chunk_name]
 
     if is_npu:
 
-        def causal_conv1d_wrapper(hidden_states, weight, bias=None, activation=None, **kwargs):
+        def causal_conv1d_wrapper(hidden_states=None, weight=None, bias=None, activation=None, **kwargs):
+            if hidden_states is None:
+                hidden_states = kwargs.pop('x')
             kwargs.pop('seq_idx', None)
             kwargs.pop('backend', None)
             return npu_causal_conv1d_fn(
@@ -98,7 +77,9 @@ def _patch_gdn_kernels_for_cu_seqlens(
             )
     else:
 
-        def causal_conv1d_wrapper(hidden_states, weight, bias=None, activation=None, **kwargs):
+        def causal_conv1d_wrapper(hidden_states=None, weight=None, bias=None, activation=None, **kwargs):
+            if hidden_states is None:
+                hidden_states = kwargs.pop('x')
             kwargs.pop('seq_idx', None)
             kwargs.pop('backend', None)
             output = causal_conv1d(
@@ -107,6 +88,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
                 bias=bias,
                 activation=activation,
                 cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=hidden_states.device),
+                backend='triton',
             )
             if isinstance(output, tuple):
                 output = output[0]
@@ -123,31 +105,33 @@ def _patch_gdn_kernels_for_cu_seqlens(
             kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
             return chunk_gated_delta_rule(query, key, value, **kwargs)
 
-    modeling_globals['causal_conv1d_fn'] = causal_conv1d_wrapper
-    if patch_chunk_rule and old_chunk_rule is not None:
-        modeling_globals['chunk_gated_delta_rule'] = chunk_gated_delta_rule_wrapper
+    conv_namespace['causal_conv1d_fn'] = causal_conv1d_wrapper
+    chunk_namespace[chunk_name] = chunk_gated_delta_rule_wrapper
     try:
         return call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
-        modeling_globals['causal_conv1d_fn'] = old_conv_fn
-        if patch_chunk_rule and old_chunk_rule is not None:
-            modeling_globals['chunk_gated_delta_rule'] = old_chunk_rule
+        conv_namespace['causal_conv1d_fn'] = old_conv_fn
+        chunk_namespace[chunk_name] = old_chunk_rule
 
 
 class GatedDeltaNetPaddingFreePatch(Patch):
 
+    @staticmethod
+    def is_applicable(module: torch.nn.Module, *, enable_sp: bool = False) -> bool:
+        """Detect supported GatedDeltaNet layers by type, rather than model names."""
+        return bool(_find_gdn_class_pairs(module, enable_sp))
+
     def __call__(self, module, *args, **kwargs):
         del args
-        qwen35_class_pairs = _find_qwen35_class_pairs(
+        gdn_class_pairs = _find_gdn_class_pairs(
             module,
-            kwargs.get('hf_config'),
             bool(kwargs.get('enable_sp', False)),
         )
-        if not qwen35_class_pairs:
+        if not gdn_class_pairs:
             return
         module._twinkle_gdn_padding_free_patched = True
 
-        for decoder_layer_cls, gated_delta_net_cls in qwen35_class_pairs:
+        for decoder_layer_cls, gated_delta_net_cls in gdn_class_pairs:
             if getattr(gated_delta_net_cls, '_twinkle_sp_linear_patched', False):
                 continue
 
@@ -165,7 +149,8 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                     _origin_decoder_forward=origin_decoder_forward,
                     **extra_kwargs,
                 ):
-                    if getattr(layer, 'layer_type', None) != 'linear_attention':
+                    if (getattr(layer, 'layer_type', None) != 'linear_attention'
+                            or extra_kwargs.get('cu_seq_lens_q') is None):
                         return call_with_supported_kwargs(
                             _origin_decoder_forward,
                             layer,
@@ -207,7 +192,6 @@ class GatedDeltaNetPaddingFreePatch(Patch):
 
             if not getattr(gated_delta_net_cls, '_twinkle_padding_free_gdn_patched', False):
                 origin_forward = gated_delta_net_cls.forward
-                patch_chunk_rule = _needs_chunk_gated_delta_rule_cu_seqlens_patch()
 
                 def forward(
                     mod,
@@ -217,7 +201,6 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                     attention_mask: Optional[torch.Tensor] = None,
                     cu_seq_lens_q: Optional[torch.Tensor] = None,
                     _origin_forward=origin_forward,
-                    _patch_chunk_rule=patch_chunk_rule,
                     **extra_kwargs,
                 ):
                     if cu_seq_lens_q is None:
@@ -233,7 +216,6 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                     return _patch_gdn_kernels_for_cu_seqlens(
                         mod,
                         cu_seqlens=cu_seq_lens_q,
-                        patch_chunk_rule=_patch_chunk_rule,
                         origin_forward=_origin_forward,
                         forward_args=(hidden_states, ),
                         forward_kwargs={

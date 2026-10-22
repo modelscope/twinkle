@@ -49,6 +49,9 @@ _MOE_LEAF_MAP: Dict[str, Tuple[str, str]] = {
     'glm_moe_dsa': ('transformers.models.glm_moe_dsa.modeling_glm_moe_dsa', 'GlmMoeDsaMoE'),
 }
 
+# Shared idempotency marker: each patch class checks it on its own patched attribute.
+_MARKER = '_twinkle_deepspeed_patch'
+
 
 class DeepSpeedLeafModulesPatch(Patch):
     """Mark MoE blocks as ZeRO-3 leaf modules.
@@ -121,6 +124,10 @@ class DeepSpeedParamWrapperPatch(Patch):
         except ImportError:
             return module
 
+        # Idempotent: a second apply must not stack a wrapper on the wrapper.
+        if getattr(ParamWrapper.get_param, _MARKER, False):
+            return module
+
         self._origin = ParamWrapper.get_param
         origin = self._origin
 
@@ -138,6 +145,7 @@ class DeepSpeedParamWrapperPatch(Patch):
                     return fake.expand(ds_shape)
             return param
 
+        setattr(_get_param_patched, _MARKER, True)
         ParamWrapper.get_param = _get_param_patched
         return module
 
@@ -198,7 +206,10 @@ class DeepSpeedHookReorderPatch(Patch):
     def __call__(self, module: 'nn.Module', *args, **kwargs):
         import deepspeed
 
-        self._model = module
+        # Idempotent: a second apply must not stack a wrapper on the wrapper.
+        if getattr(deepspeed.initialize, _MARKER, False):
+            return module
+
         self._origin_init = deepspeed.initialize
 
         model = module
@@ -212,6 +223,7 @@ class DeepSpeedHookReorderPatch(Patch):
                 model._forward_pre_hooks.move_to_end(hook_id)
             return res
 
+        setattr(_initialize, _MARKER, True)
         deepspeed.initialize = _initialize
         return module
 

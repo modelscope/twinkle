@@ -1,6 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Any, List, Optional
 
+from twinkle.utils import get_logger
+
+logger = get_logger()
+
 
 class Quantizer:
     """Post-training quantization of an already-loaded model.
@@ -24,7 +28,10 @@ class Quantizer:
 
     def __init__(self, quant_bits: Optional[int] = None, **kwargs):
         self.quant_bits = quant_bits
-        self.kwargs = kwargs
+        if kwargs:
+            # Subclass __init__ signatures are the supported surface; what survives their named
+            # parameters is a typo or an unsupported knob and would otherwise vanish silently.
+            logger.warning('%s ignores unrecognized options: %s', type(self).__name__, sorted(kwargs))
 
     def quantize(self, model):
         """Quantize ``model`` and return it.

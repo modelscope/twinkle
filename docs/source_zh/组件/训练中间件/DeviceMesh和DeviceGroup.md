@@ -87,7 +87,7 @@ dataloader 取出数据 -> 按照 dp_size=4 分发给 sampler -> 按照 dp_size=
 batch[device_mesh.get_slice(len(batch))]
 ```
 
-get_slice 会根据当前 rank，计算出当前 worker 属于哪个 dp 组，并获取对应的数据。该过程发生在 DataLoader 的 DeviceMeshSampler 中，同样发生在 remote_class 的 dispatch 和 collect 中。
+get_slice 会根据当前 rank，计算出当前 worker 属于哪个 dp 组，并获取对应的数据。该过程发生在 DataLoader 的 ShardedBatchSampler 中，同样发生在 remote_class 的 dispatch 和 collect 中。
 # DeviceMesh/DeviceGroup
 
 这两个类用于表达硬件资源分配和网络拓扑，Twinkle 的数据分发和收集也依赖它们。
@@ -159,4 +159,4 @@ dataloader 取出数据 -> 按照 dp_size=4 分发给 sampler -> 按照 dp_size=
 batch[device_mesh.get_slice(len(batch))]
 ```
 
-get_slice 会根据当前 rank，计算出当前 worker 属于哪个 dp 组，并获取对应的数据。该过程发生在 DataLoader 的 DeviceMeshSampler 中，同样发生在 remote_class 的 dispatch 和 collect 中。
+get_slice 会根据当前 rank，计算出当前 worker 属于哪个 dp 组，并获取对应的数据。该过程发生在 DataLoader 的 ShardedBatchSampler 中，同样发生在 remote_class 的 dispatch 和 collect 中。

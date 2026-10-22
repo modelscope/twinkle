@@ -8,7 +8,7 @@ from .strategy.sequence_parallel.pooling import pool_last_valid_token
 
 def postprocess_task_outputs(inputs, outputs, *, task='causal_lm', sp_strategy=None, sp_gather_keys=()):
     """Reduce task features before loss; processors only restore batch layouts."""
-    if task in ('embedding', 'generative_reranker'):
+    if task in ('embedding', 'generative_reranker', 'seq_cls', 'reranker'):
         features = outputs.get('features') if task == 'embedding' else outputs.get('logits')
         if features is None:
             raise ValueError(f'Missing per-token features for task={task!r}')

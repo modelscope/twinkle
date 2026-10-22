@@ -7,10 +7,9 @@ Usage:
     python test_sampler_e2e.py
 
     # Run specific test
-    python test_sampler_e2e.py --test vllm_trajectory
-    python test_sampler_e2e.py --test torch_trajectory
-    python test_sampler_e2e.py --test vllm_input_feature
-    python test_sampler_e2e.py --test torch_input_feature
+    python test_sampler_e2e.py --test vllm_engine
+    python test_sampler_e2e.py --test vllm_batch
+    python test_sampler_e2e.py --test params_conversion
 
 Environment:
     TWINKLE_MODEL_ID: Model to use (default: Qwen/Qwen2.5-0.5B)

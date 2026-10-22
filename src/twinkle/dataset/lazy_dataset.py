@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import twinkle
 from twinkle import remote_class, remote_function
+from twinkle.perf import timed
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.utils import construct_class, processing_lock
 from .base import Dataset, DatasetMeta
@@ -37,10 +38,6 @@ class LazyDataset(Dataset):
         self._lazy_map_ops: Dict[str, List[Tuple[Callable, Dict]]] = {}
         # Global lazy map ops (applied after mix): [(func, kwargs), ...]
         self._global_map_ops: List[Tuple[Callable, Dict]] = []
-
-        # Mix state. `_mixed` is the base class's flag and is reused verbatim -- a second field for
-        # the same concept would have to be kept in sync with it by hand, and inherited methods that
-        # read `_mixed` would silently see the wrong value.
         self._mixed = False
         self._mix_interleave = True
         self._length_cache: Optional[int] = None
@@ -64,6 +61,7 @@ class LazyDataset(Dataset):
         return list(self.datasets.keys())
 
     @remote_function()
+    @timed
     def map(self,
             preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
             dataset_meta: DatasetMeta = None,
@@ -88,6 +86,7 @@ class LazyDataset(Dataset):
             self._lazy_map_ops.setdefault(key, []).append((func, kwargs))
 
     @remote_function()
+    @timed
     def filter(self,
                filter_func: Union[Callable, str, Type[DataFilter], DataFilter],
                dataset_meta: DatasetMeta = None,
@@ -130,6 +129,7 @@ class LazyDataset(Dataset):
             self._invalidate_length_cache()
 
     @remote_function()
+    @timed
     def encode(self, add_generation_prompt: bool = False, **kwargs):
         """Record encode operation for lazy execution."""
         assert self.template is not None

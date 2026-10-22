@@ -23,20 +23,22 @@ And not needed, in the one case where it would otherwise be: passing ``model=<Tr
 instead of ``model_id`` makes this a facade over a model that already exists, generating inside its
 workers. Nothing is loaded and nothing is synced, because there is only ever one set of weights.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import asyncio
 import atexit
 import threading
 from copy import copy
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Optional, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
+from twinkle.perf import timed
 from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
+from twinkle.template.contract import RolloutState
 
 logger = get_logger()
 
@@ -45,13 +47,15 @@ logger = get_logger()
 class TransformersSampler(Sampler):
     """Sample with ``AutoModelForCausalLM.generate()``."""
 
-    def __init__(self,
-                 model_id: str = None,
-                 engine_args: Dict[str, Any] = None,
-                 device_mesh: DeviceMesh = None,
-                 *,
-                 model: Any = None,
-                 **kwargs):
+    def __init__(
+        self,
+        model_id: str = None,
+        engine_args: dict[str, Any] = None,
+        device_mesh: DeviceMesh = None,
+        *,
+        model: Any = None,
+        **kwargs,
+    ):
         """
         Args:
             model_id: HuggingFace model id or local path. Mutually exclusive with ``model``.
@@ -73,25 +77,28 @@ class TransformersSampler(Sampler):
             **kwargs: Accepted and ignored, for signature parity with the other samplers.
         """
         super().__init__()
-        requires('transformers')
+        requires("transformers")
 
         if (model_id is None) == (model is None):
-            raise ValueError('Pass either model_id, to load a model to sample from, or model, to sample '
-                             'from one that already exists -- not both and not neither.')
+            raise ValueError(
+                "Pass either model_id, to load a model to sample from, or model, to sample "
+                "from one that already exists -- not both and not neither."
+            )
         self.model = model
         self.model_id = model_id
         self.device_mesh = device_mesh
         engine_kwargs = dict(engine_args or {})
         # How many prompts go into one padded generate(). Larger is faster until the padding waste
         # from mixed prompt lengths outweighs it, and until activations stop fitting.
-        self.max_batch_size = engine_kwargs.pop('max_batch_size', 8)
+        self.max_batch_size = engine_kwargs.pop("max_batch_size", 8)
 
         # Mirror the other samplers: a private loop on a background thread, so the public methods stay
         # synchronous and blocking even when the caller already runs inside an event loop (Ray workers
         # run uvloop, which forbids asyncio.run).
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(
-            target=self._run_event_loop, daemon=True, name='TransformersSampler-EventLoop')
+            target=self._run_event_loop, daemon=True, name="TransformersSampler-EventLoop"
+        )
         self._async_thread.start()
 
         if model is not None:
@@ -99,6 +106,7 @@ class TransformersSampler(Sampler):
             self.engine = None
         else:
             from .transformers_engine import TransformersEngine
+
             self.engine: TransformersEngine = TransformersEngine(model_id, **engine_kwargs)
 
         self._shutdown_called = False
@@ -114,6 +122,7 @@ class TransformersSampler(Sampler):
     def _iter_in_loop(self, async_gen):
         """Drain an async generator running on the background loop into a plain iterator."""
         import queue as stdlib_queue
+
         q: stdlib_queue.Queue = stdlib_queue.Queue()
         sentinel = object()
 
@@ -135,10 +144,10 @@ class TransformersSampler(Sampler):
                 raise item
             yield item
 
-    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
+    def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def set_template(self, template_cls, **kwargs):
         """Set the template that turns messages into token ids.
 
@@ -152,19 +161,20 @@ class TransformersSampler(Sampler):
 
     # ------------------------------------------------------------------ sampling
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch="slice_dp", collect="flatten", lazy_collect=False)
+    @timed
     def sample(
         self,
-        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
-        adapter_name: str = '',
-        adapter_path: Optional[str] = None,
+        inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
+        sampling_params: SamplingParams | dict[str, Any] | None = None,
+        adapter_name: str = "",
+        adapter_path: str | None = None,
         *,
         return_encoded: bool = False,
         use_base_model: bool = False,
-        adapter_paths: Optional[List[Optional[str]]] = None,
+        adapter_paths: list[str | None] | None = None,
         strict: bool = True,
-    ) -> List[SampleResponse]:
+    ) -> list[SampleResponse]:
         """Sample completions for ``inputs``.
 
         Args:
@@ -204,29 +214,35 @@ class TransformersSampler(Sampler):
                 return_encoded=return_encoded,
                 use_base_model=use_base_model,
                 adapter_paths=adapter_paths,
-                strict=strict)
+                strict=strict,
+            )
         params = self._coerce_params(sampling_params)
-        inputs_list = self._normalize_inputs(inputs)
+        inputs_list = [inputs] if isinstance(inputs, RolloutState) else self._normalize_inputs(inputs)
         if not inputs_list:
             return []
         if adapter_paths is not None:
             if adapter_path is not None:
-                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
-                                 '(one per input), not both.')
+                raise ValueError(
+                    "Pass either adapter_path (one adapter for the whole call) or adapter_paths "
+                    "(one per input), not both."
+                )
             if len(adapter_paths) != len(inputs_list):
-                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
-                                 'slicing keeps them aligned.')
+                raise ValueError(
+                    f"adapter_paths has {len(adapter_paths)} entries but there are "
+                    f"{len(inputs_list)} inputs; they must correspond one-to-one so that DP "
+                    "slicing keeps them aligned."
+                )
 
         logprobs_only = params.max_tokens == 0
         if logprobs_only:
             params = copy(params)
             params.max_tokens = 1
 
-        encoded, failures = generation.encode_all(self.template, inputs_list, logprobs_only=logprobs_only,
-                                                  strict=strict)
+        encoded, states, failures = generation.encode_all(
+            self.template, inputs_list, logprobs_only=logprobs_only, strict=strict
+        )
 
-        results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
+        results: list[SampleResponse | None] = [None] * len(inputs_list)
         for index, response in failures.items():
             results[index] = response
 
@@ -235,33 +251,44 @@ class TransformersSampler(Sampler):
         for path, indices in generation.group_by_adapter(pending, adapter_paths, adapter_path).items():
             adapter_uri = self._resolve_adapter(path, adapter_name, use_base_model)
             for chunk in generation.chunks(indices, self.max_batch_size):
-                for index, response in zip(chunk, self._run_chunk(chunk, encoded, params, adapter_uri, strict)):
+                for index, response in zip(
+                    chunk, self._run_chunk(chunk, encoded, states, params, adapter_uri, strict), strict=False
+                ):  # noqa: E501
                     results[index] = response
 
         if not logprobs_only:
-            generation.attach_features(self.template, results, encoded)
-        return [
-            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
-        ]
+            generation.attach_features(self.template, results, encoded, states)
+        return [r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)]
 
     def sample_stream(
         self,
-        inputs: Union[InputFeature, Trajectory, Dict[str, Any]],
-        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
-        adapter_name: str = '',
-        adapter_path: Optional[str] = None,
+        inputs: InputFeature | Trajectory | dict[str, Any],
+        sampling_params: SamplingParams | dict[str, Any] | None = None,
+        adapter_name: str = "",
+        adapter_path: str | None = None,
     ):
         """Yield ``(delta_text, finish_reason)`` tuples for a single input."""
         if self.model is not None:
             yield from self.model.generate_stream(
-                inputs, sampling_params=sampling_params, adapter_name=adapter_name, adapter_path=adapter_path)
+                inputs, sampling_params=sampling_params, adapter_name=adapter_name, adapter_path=adapter_path
+            )
             return
         params = self._coerce_params(sampling_params)
-        feat = inputs if not self._not_encoded(inputs) else self.encode_trajectory(inputs, adapter_name)
+        state = inputs if isinstance(inputs, RolloutState) else None
+        if state is not None:
+            feat = state.feature
+        elif self._not_encoded(inputs):
+            if self.template is None:
+                raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+            state = self.template.encode_prompt(inputs, backend="transformers").state
+            feat = state.feature
+        else:
+            feat = inputs
         adapter_uri = self._resolve_adapter(adapter_path, adapter_name, use_base_model=False)
-        prompt = self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids']
+        prompt = generation.prompt_ids(feat, state)
         yield from self._iter_in_loop(
-            self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri))
+            self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri)
+        )
 
     # ------------------------------------------------------------------ engine passthrough
 
@@ -272,45 +299,49 @@ class TransformersSampler(Sampler):
         putting a sampler to sleep to free the device would believe it had.
         """
         if self.engine is None:
-            raise RuntimeError('This sampler generates through the model it was given, which owns those '
-                               'weights and that memory; there is no engine here to control. Call the '
-                               'corresponding method on the model instead.')
+            raise RuntimeError(
+                "This sampler generates through the model it was given, which owns those "
+                "weights and that memory; there is no engine here to control. Call the "
+                "corresponding method on the model instead."
+            )
         return self.engine
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def get_state_keys(self):
         return self._run_in_loop(self._own_engine().get_state_keys())
 
-    @remote_function(dispatch='all', collect='first')
+    @remote_function(dispatch="all", collect="first")
+    @timed
     def sleep(self, level: int = 1) -> None:
         self._run_in_loop(self._own_engine().sleep(level=level))
 
-    @remote_function(dispatch='all', collect='first')
-    def wake_up(self, tags: List[str] = None) -> None:
+    @remote_function(dispatch="all", collect="first")
+    @timed
+    def wake_up(self, tags: list[str] = None) -> None:
         self._run_in_loop(self._own_engine().wake_up(tags=tags))
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def add_adapter_to_sampler(self, adapter_name: str, config: Any) -> None:
-        raise NotImplementedError('TransformersSampler loads adapters from disk; pass adapter_path to sample().')
+        raise NotImplementedError("TransformersSampler loads adapters from disk; pass adapter_path to sample().")
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def shutdown(self):
         """Release the model and stop the background loop. Idempotent; also runs via ``atexit``."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
         try:
-            if getattr(self, 'engine', None) is not None:
+            if getattr(self, "engine", None) is not None:
                 self._run_in_loop(self.engine.shutdown())
         except Exception as e:
-            logger.warning(f'TransformersSampler engine shutdown error: {e}')
+            logger.warning(f"TransformersSampler engine shutdown error: {e}")
         try:
             if self._async_loop.is_running():
                 self._async_loop.call_soon_threadsafe(self._async_loop.stop)
             if self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
         except Exception as e:
-            logger.warning(f'TransformersSampler event loop shutdown error: {e}')
+            logger.warning(f"TransformersSampler event loop shutdown error: {e}")
 
     # ------------------------------------------------------------------ internals
 
@@ -322,14 +353,21 @@ class TransformersSampler(Sampler):
             return SamplingParams.from_dict(sampling_params)
         return sampling_params
 
-    def _resolve_adapter(self, adapter_path: Optional[str], adapter_name: str, use_base_model: bool) -> Optional[str]:
+    def _resolve_adapter(self, adapter_path: str | None, adapter_name: str, use_base_model: bool) -> str | None:
         if use_base_model or adapter_path is None:
             return None
         local_path = HubOperation.download_model(model_id_or_path=adapter_path)
         return self.engine.load_lora(local_path, adapter_name or None)
 
-    def _run_chunk(self, chunk: List[int], encoded: Dict[int, Dict[str, Any]], params: SamplingParams,
-                   adapter_uri: Optional[str], strict: bool) -> List[SampleResponse]:
+    def _run_chunk(
+        self,
+        chunk: list[int],
+        encoded: dict[int, dict[str, Any]],
+        states,
+        params: SamplingParams,
+        adapter_uri: str | None,
+        strict: bool,
+    ) -> list[SampleResponse]:
         """Generate for one padded batch, falling back to one-at-a-time to isolate a bad input."""
 
         def call_batch(prompts, extra):
@@ -341,6 +379,7 @@ class TransformersSampler(Sampler):
                     logprobs=params.logprobs is not None,
                     adapter_uri=adapter_uri,
                     extra_model_inputs=extra or None,
-                ))
+                )
+            )
 
-        return generation.run_chunk(chunk, encoded, params, self.template, call_batch, strict=strict)
+        return generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)

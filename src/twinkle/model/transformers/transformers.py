@@ -1,16 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import asyncio
 import contextlib
 import json
 import numpy as np
 import os
 import random
 import re
-import threading
+import time
 import torch
 import torch.distributed as dist
 import transformers
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
 from peft.utils import load_peft_weights
@@ -28,21 +27,28 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
+from twinkle.checkpoint_engine.delta.trainer.backends import FSDP2DeltaBackend
+from twinkle.checkpoint_engine.delta.trainer.mixin import DeltaTrainerMixin
+from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lora_key, normalize_param_name,
+                                                   print_weight_example)
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
-from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
+from twinkle.model.state_dict_utils import normalize_adapter_keys
+from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
                                       create_muon_param_groups, resolve_tower_prefixes)
 from twinkle.patch import Patch, apply_context, apply_patch
+from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
                            replayed_selective_log_softmax, selective_log_softmax, torch_util)
 
@@ -110,12 +116,16 @@ def _resolve_task_context(model, task, template=None):
     downstream pooling can run inside
     ``postprocess_task_outputs(task='embedding', ...)``.
     'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_task_outputs`` too. The plain
-    'reranker' task needs NO patch: it rides a real ``num_labels=1`` classification head
-    built at model construction, which already returns ``[B, 1]``.
+    last-valid-token reduction is deferred to ``postprocess_task_outputs`` too.
+    'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
+    ``postprocess_task_outputs`` can do packed-aware last-token reduction (same as embedding).
     """
-    if task in (None, 'causal_lm', 'reranker', 'seq_cls'):
+    if task in (None, 'causal_lm'):
         return contextlib.nullcontext()
+    if task in ('seq_cls', 'reranker'):
+        # Surface per-token scores for model-side packed/SP-aware pooling.
+        from twinkle.patch.transformers_value import TransformersValuePatch
+        return apply_context(model, TransformersValuePatch(squeeze_single=False))
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
@@ -223,21 +233,27 @@ class OptimizerGroup(BaseOptimizerGroup):
         else:
             return []
 
-    def accumulate_metrics(self, is_training):
+    def accumulate_metrics(self, is_training, include_default: bool = True, metric_step: Optional[int] = None):
         self._ensure_dp_group()
         status = self.train_status if is_training else self.eval_status
+        if metric_step is None:
+            metric_step = self.cur_step - 1
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
             forward_kwargs = copy(status.forward_kwargs)
             forward_kwargs.pop('gradient_accumulation_steps', None)
+            loss_key = forward_kwargs.pop('_metric_loss_key', None)
             for metric in status.metrics:
+                metric_loss_key = getattr(metric, '_twinkle_loss_key', None)
+                if metric_loss_key != loss_key or (metric_loss_key is None and not include_default):
+                    continue
                 metric.accumulate(
                     status.inputs,
                     status.outputs,
                     lr=self._get_lr(),
-                    step=self.cur_step - 1,
+                    step=metric_step,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     grad_norm=self._last_grad_norm,
-                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
+                    loss_reduction=status.loss_reduction or getattr(self.get_loss(loss_key), 'reduction', 'mean'),
                     **forward_kwargs)
 
 
@@ -289,7 +305,8 @@ def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
 
 @remote_class()
-class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
+class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, DeltaTrainerMixin,
+                       FSDP2DeltaBackend):
     """The transformers model wrapper.
 
     Args:
@@ -368,7 +385,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if model_id is not None:
             model_id = HubOperation.download_model(model_id, revision=kwargs.get('revision'))
         self.model_id = model_id
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        # pop: tokenizer_id is not a from_pretrained argument, so it must not leak into the model
+        # construction kwargs below.
+        self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None and model_id is not None:
@@ -378,6 +397,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
         else:
             from transformers import AutoConfig
+            # Fallback path (no ModelLoader): this config load may execute the checkpoint's own
+            # Python. State it loudly -- the same advisory class as a hardcoded trust_remote_code.
+            logger.warning_once('loading %s with trust_remote_code=True: the checkpoint\'s own Python code '
+                                'will execute inside this process. Only use checkpoints you trust.', model_id)
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         if model_cls is None and hasattr(self.hf_config, 'architectures'):
             model_cls = self.hf_config.architectures[0]
@@ -456,17 +479,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
 
+    # Optional training features (NEFTune noise, Liger kernels) applied to the constructed model;
+    # same-named methods stay so subclasses can override them.
+
     def _activate_neftune(self, neftune_noise_alpha: float) -> None:
         """Add NEFTune uniform noise to the embedding output during training only.
 
         Mirrors ``transformers.integrations.neftune.neftune_post_forward_hook``: scale is
-        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op when the module is in eval mode, so
-        validation and generation see clean embeddings. Registered on the input-embedding module object,
-        which a later LoRA/DDP wrap preserves (they wrap Linear layers / the top model, not this module).
+        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op in eval mode, so
+        validation and generation see clean embeddings. Registered on the input-embedding
+        module object, which a later LoRA/DDP wrap preserves.
         """
         embeddings = self.model.get_input_embeddings()
         if embeddings is None:
-            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; skipping NEFTune.')
+            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; '
+                           'skipping NEFTune.')
             return
 
         def neftune_post_forward_hook(module, input, output):
@@ -481,11 +508,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
         """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
 
-        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of Liger's
-        default set; None keeps the default. ``kernelize`` mutates the module in place (class / forward
-        replacement), which is why it belongs at the end of construction, before the optimizer is built.
-        The fused-linear-CE op is deliberately not a target here -- it skips the lm_head GEMM rather than
-        swapping a layer, so it is a loss-path selection, not a kernelize op.
+        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of
+        Liger's default set; None keeps the default. ``kernelize`` mutates the module in place
+        (class / forward replacement), which is why it belongs at the end of construction,
+        before the optimizer is built.
         """
         from twinkle.kernel import kernelize
         kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
@@ -494,10 +520,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
         """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
 
-        Returning None rather than a copy of the default matters: ``kernelize`` logs family-skips at DEBUG
-        on the default path but raises them to WARNING for any explicit mapping. 'fused_linear_cross_entropy'
-        is not a kernelize op, so it matches no DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss
-        side consumes it instead).
+        Returning None rather than a copy of the default matters: ``kernelize`` logs
+        family-skips at DEBUG on the default path but raises them to WARNING for any explicit
+        mapping. 'fused_linear_cross_entropy' is not a kernelize op, so it matches no
+        DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss side consumes it instead).
         """
         if not liger_kernel_config:
             return None
@@ -653,7 +679,19 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 tokenizer_id=self.tokenizer_id,
             )
         for optimizer_group in self.optimizer_group.values():
-            self.sp_strategy.register_loss_key_specs(optimizer_group.loss_instance)
+            for loss_instance in (optimizer_group.loss_instance, *optimizer_group.loss_registry.values()):
+                self.sp_strategy.register_loss_key_specs(loss_instance)
+
+    def _ensure_gdn_padding_free_patch(self) -> None:
+        """Install the non-SP GatedDeltaNet patch before wrapping the model."""
+        self._gdn_padding_free_enabled = False
+        if getattr(self, '_enable_sp', False):
+            return
+        if not getattr(self.model, '_twinkle_gdn_padding_free_patched', False):
+            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+            apply_patch(self.model, GatedDeltaNetPaddingFreePatch, hf_config=self.hf_config, enable_sp=False)
+        self._gdn_padding_free_enabled = bool(getattr(self.model, '_twinkle_gdn_padding_free_patched', False))
 
     def _get_default_group(self):
         """Get the only group, else return the default one"""
@@ -666,27 +704,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # into the exception string and that dump swallows the real traceback.
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
-    @staticmethod
-    def _not_encoded(inputs):
-        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
-        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
-        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
-        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
-        while isinstance(inputs, (list, tuple)):
-            if not inputs:
-                return False
-            inputs = inputs[0]
-        assert isinstance(inputs, dict)
-        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
-        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
-        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
-        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
-        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
-        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
-        return not any(
-            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
-            for k in inputs)
-
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
@@ -695,14 +712,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
+            self._ensure_gdn_padding_free_patch()
 
-            if len(optimizer_groups) == 1:
-                optimizer_group = optimizer_groups[0]
-                optimizer = optimizer_group.optimizer
-                assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                optimizer_group.optimizer = optimizer
-                self.register_mm_forward_hook(optimizer_group)
+            if optimizer_groups:
+                result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
+                self.model = result[0]
+                for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
+                    optimizer_group.optimizer = optimizer
+                    self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
                 result = self.strategy.wrap_model(self.model)
@@ -716,7 +733,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         model = self.strategy.unwrap_model(self.model)
         template = optimizer_group.template
         assert template is not None
-        optimizer_group._handler = model.register_forward_pre_hook(template.pre_forward_hook, with_kwargs=True)
+
+        def forward_hook(model, args, kwargs):
+            selected_group = getattr(self, '_forward_optimizer_group', None)
+            if selected_group is None:
+                selected_group = self.optimizer_group.get(self._get_default_group())
+            if selected_group is optimizer_group:
+                return template.pre_forward_hook(model, args, kwargs)
+
+        optimizer_group._handler = model.register_forward_pre_hook(forward_hook, with_kwargs=True)
+
+    @contextlib.contextmanager
+    def _mm_forward_context(self, optimizer_group: OptimizerGroup):
+        previous = getattr(self, '_forward_optimizer_group', None)
+        self._forward_optimizer_group = optimizer_group
+        try:
+            yield
+        finally:
+            self._forward_optimizer_group = previous
 
     def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         if optimizer_group._handler is not None:
@@ -753,53 +787,31 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if not self._router_replay_enabled or self._router_replay_applied:
             return
         model = self.strategy.unwrap_model(self.model)
-        from .moe.router_replay import apply_router_replay_patch
-        apply_router_replay_patch(model)
+        from .moe.router_replay import RouterReplay
+        RouterReplay.apply_router_replay_patch(model)
         self._router_replay_applied = True
 
-    def _router_replay_setup(self,
-                             router_replay_action,
-                             routed_experts=None,
-                             batch_size=1,
-                             manual_cleanup=False,
-                             replay_mask=None):
-        """Set up routing replay before a model forward.
+    def _router_replay(self, action, *, routed_experts=None, batch_size=1, manual_cleanup=False,
+                       replay_mask=None):
+        """Set up routing replay before a model forward; returns the per-call :class:`RouterReplay`.
 
-        Returns ``cleanup_fn``.
-        Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
+        A disabled/absent action yields the null object (all methods no-op); call ``finish()``
+        after the forward to gather recorded indices (RECORD) and clear global state.
         """
-        if not getattr(self, '_router_replay_enabled', False):
-            return lambda: None
-
+        from .moe.router_replay import RouterReplay
+        if not getattr(self, '_router_replay_enabled', False) or action is None:
+            return RouterReplay(action=None)
         self._maybe_apply_router_replay()
-
-        if router_replay_action is None:
-            return lambda: None
-
-        from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
-                                        get_router_replay_data, resolve_router_replay_action,
-                                        set_global_router_replay_action, set_router_replay_data)
-        # Callers (swift/dev) pass a backend-neutral string token (basic principle 1: the two backends are
-        # driven identically, and Megatron's RouterReplayAction is a different class), so resolve it to this
-        # backend's enum before the ``== RouterReplayAction.*`` comparisons and the per-block state below.
-        router_replay_action = resolve_router_replay_action(router_replay_action)
-        unwrapped = self.strategy.unwrap_model(self.model)
-        sp_context = getattr(self.sp_strategy, '_ctx', None)
-        set_global_router_replay_action(router_replay_action)
-        if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped, replay_mask=replay_mask, sp_context=sp_context)
-
-        def cleanup():
-            recorded = None
-            if router_replay_action == RouterReplayAction.RECORD:
-                recorded = get_router_replay_data(unwrapped, batch_size, sp_context=sp_context)
-            if not manual_cleanup:
-                clear_global_router_replay_action()
-                clear_global_indices()
-            return recorded
-
-        return cleanup
+        return RouterReplay(
+            action=action,
+            sp_context=getattr(self.sp_strategy, '_ctx', None),
+            routed_experts=routed_experts,
+            batch_size=batch_size,
+            manual_cleanup=manual_cleanup,
+            replay_mask=replay_mask,
+            model=lambda: self.strategy.unwrap_model(self.model),
+            apply_patch=None,  # already applied by _maybe_apply_router_replay above
+        )
 
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():
@@ -832,6 +844,79 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             payload['labels'] = sequence_labels
         return payload
 
+    def _restore_loss_inputs(self, inputs, labels, loss_scale=None, channel=None, completion_mask=None):
+        """Put the loss-related tensors popped before the model call back onto ``inputs``."""
+        inputs['labels'] = labels
+        if loss_scale is not None:
+            inputs['loss_scale'] = loss_scale
+        if channel is not None:
+            inputs['channel'] = channel
+        if completion_mask is not None:
+            inputs['completion_mask'] = completion_mask
+
+    def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
+                                     loss_instance, replay=None):
+        """Shared forward/forward_only tail: derive logps/entropy/values, then reclaim logits memory.
+
+        ``replay`` is the ``(loss_mask, masked_labels, metadata)`` tuple from ``_prepare_sampling_replay``
+        when sampling replay is enabled.
+        """
+        loss_require_logits = getattr(loss_instance, 'require_logits', False)
+        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
+        loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+            if replay is not None:
+                loss_mask, masked_labels, replay_metadata = replay
+                outputs['logps'] = replayed_selective_log_softmax(
+                    logits=outputs['logits'],
+                    labels=masked_labels,
+                    loss_mask=loss_mask,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    metadata=replay_metadata,
+                )
+            else:
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.masked_fill(~loss_mask, 0)
+                logits = outputs['logits']
+                logits.div_(temperature)
+                if loss_require_entropy:
+                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                        logits, masked_labels, return_entropy=True)
+                else:
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                del logits
+        if getattr(loss_instance, 'require_values', False):
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
+        outputs['past_key_values'] = None
+        if not (return_logits or loss_require_logits):
+            outputs['logits'] = None
+
+    def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
+                                  forward_kwargs, loss_instance, return_logits, recorded_routing):
+        """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
+        inputs, outputs = postprocess_task_outputs(
+            inputs, outputs, sp_strategy=self.sp_strategy, task=task,
+            sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()))
+        inputs, outputs = processor.unpack_packed_sequences(
+            inputs, outputs, task=task,
+            input_key_specs=getattr(self.sp_strategy, 'input_key_specs', None),
+            output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        status.inputs = inputs
+        status.outputs = outputs
+        status.forward_kwargs = forward_kwargs
+        if is_training:
+            status.loss_reduction = getattr(loss_instance, 'reduction', 'mean')
+        status.loss_value = outputs.get('aux_loss', 0)
+        return_outputs = copy(outputs)
+        if not return_logits:
+            return_outputs['logits'] = None
+        if recorded_routing is not None:
+            return_outputs['routed_experts'] = recorded_routing
+        return return_outputs
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
@@ -848,6 +933,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
+        loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -862,10 +948,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
-        loss_instance = optimizer_config.loss_instance
-        loss_require_logits = getattr(loss_instance, 'require_logits', False)
-        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
-        loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        loss_instance = optimizer_config.get_loss(loss_key)
         enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
         if enable_sampling_replay:
             if sampling_masks is None:
@@ -873,7 +956,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
             if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                 raise ValueError('sampling replay does not support sequence or context parallelism')
-        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
         inputs: Dict[str, Any] = processor(
@@ -882,6 +964,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
+            gdn_padding_free_enabled=self._gdn_padding_free_enabled,
         )
         inputs = self._prepare_sp_inputs(inputs, processor, task=task)
         labels: torch.Tensor = inputs.pop('labels', None)
@@ -902,83 +985,61 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             )
         optimizer_config.accumulate_metrics(True)
 
-        # Routing replay: respects router_replay_action regardless of caller
-        router_replay_action = kwargs.pop('router_replay_action', None)
+        # Routing replay: the driver passes the MODE scalar; the model layer owns the mode->action mapping
+        # (resolve_router_replay_mode -- the training forward always REPLAYS, so a missing routed_experts
+        # still fails loudly in RouterReplay.__init__).
+        router_replay_mode = kwargs.pop('router_replay_mode', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         routed_experts = inputs.pop('routed_experts', None)
         replay_mask = inputs.pop('replay_mask', None)
         batch_size = labels.shape[0] if labels is not None else (
             inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-        rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                               router_replay_manual_cleanup, replay_mask)
+        from .moe.router_replay import RouterReplay
+        rr = self._router_replay(
+            RouterReplay.resolve_router_replay_mode(router_replay_mode), routed_experts=routed_experts,
+            batch_size=batch_size, manual_cleanup=router_replay_manual_cleanup, replay_mask=replay_mask)
 
-        with _resolve_task_context(self.model, task, template=optimizer_config.template), \
-                _resolve_mm_graph_context(self.model, optimizer_config.template):
+        # Per-forward task patches probe module attributes (score/classifier heads,
+        # get_image_features) that DDP-wrapped models do not forward -- resolve them on the
+        # unwrapped module. Hooks registered there still fire: the wrapper's forward calls
+        # the inner module's __call__.
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
+                _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             outputs = self.model(**inputs)
 
-        recorded_routing = rr_cleanup()
+        recorded_routing = rr.finish()
 
-        inputs['labels'] = labels
+        self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
         inputs.update(sp_auxiliary_inputs)
-        if loss_scale is not None:
-            inputs['loss_scale'] = loss_scale
-        if channel is not None:
-            inputs['channel'] = channel
-        if completion_mask is not None:
-            inputs['completion_mask'] = completion_mask
-        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
-            loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
-            masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
-            logits = outputs['logits']
-            if enable_sampling_replay:
-                outputs['logps'] = replayed_selective_log_softmax(
-                    logits=logits,
-                    labels=masked_labels,
-                    loss_mask=loss_mask,
-                    sampling_masks=sampling_masks,
-                    temperature=temperature,
-                    metadata=replay_metadata,
-                )
-            elif loss_require_entropy:
-                logits.div_(temperature)
-                outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                    logits, masked_labels, return_entropy=True)
-            else:
-                logits.div_(temperature)
-                outputs['logps'] = selective_log_softmax(logits, masked_labels)
-            del logits
-        if loss_require_values:
-            values = outputs['logits']
-            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
-        outputs['past_key_values'] = None
-        if not (return_logits or loss_require_logits):
-            outputs['logits'] = None
-        inputs, outputs = postprocess_task_outputs(
+        self._postprocess_forward_outputs(
+            outputs,
+            labels=labels,
+            task=task,
+            temperature=temperature,
+            sampling_masks=sampling_masks,
+            return_logits=return_logits,
+            loss_instance=loss_instance,
+            replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+        )
+        return self._finalize_forward_outputs(
             inputs,
             outputs,
-            sp_strategy=self.sp_strategy,
+            processor=processor,
             task=task,
-            sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
+            optimizer_config=optimizer_config,
+            is_training=True,
+            forward_kwargs={**kwargs, '_metric_loss_key': loss_key},
+            loss_instance=loss_instance,
+            return_logits=return_logits,
+            recorded_routing=recorded_routing,
         )
-        inputs, outputs = processor.unpack_packed_sequences(
-            inputs, outputs, task=task, input_key_specs=input_key_specs,
-            output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
-        optimizer_config.train_status.inputs = inputs
-        optimizer_config.train_status.outputs = outputs
-        optimizer_config.train_status.forward_kwargs = kwargs
-        optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
-        return_outputs = copy(outputs)
-        if not return_logits:
-            return_outputs['logits'] = None
-        if recorded_routing is not None:
-            return_outputs['routed_experts'] = recorded_routing
-        return return_outputs
 
-    # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
-    # receive the materialized dict. The lazy default returns an un-collected callable instead, which a
-    # driver reading ``out['logps']``/``out['logits']`` (reference/teacher/reward/critic scoring) would
-    # silently mis-read as "no such key". Mirrors calculate_metric, the other return-value method.
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, lazy_collect=False)
+    # lazy_collect follows the global default (True): a caller that reads the output itself calls
+    # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
+    # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -987,35 +1048,128 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 disable_lora: If True, disable LoRA and use base model for inference.
+                micro_batch_size: Maximum samples per local micro-batch (fixed-count slicing).
+                dynamic_batching: Pack samples under max_tokens_per_micro_batch.
+                max_tokens_per_micro_batch: Token budget required for dynamic batching.
+                packing_algorithm: Dynamic packing strategy, 'ffd' (default) or 'kk'.
         Returns:
             The output of the model forward.
         """
+        config = MicroBatchConfig.from_kwargs(kwargs)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
+        if config is None:
+            return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
+        return self._forward_only_micro_batches(
+            inputs=inputs, config=config, optimizer_config=optimizer_config, **kwargs)
+
+    def _prepare_forward_only_inputs(self, inputs, optimizer_config):
+        """Normalize and encode the local batch once, before optional micro-batching."""
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if not inputs:
+            raise ValueError('inputs empty, check your DataLoader outputs')
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
+        if not inputs:
+            raise ValueError('encoded inputs empty, check your template outputs')
+        return inputs
+
+    def _forward_only_micro_batches(self, *, inputs, config, optimizer_config, **kwargs):
+        """Execute a local micro-batch plan and restore the complete return value.
+
+        Each micro-batch runs the full single-batch path (logps postprocessing included), so the
+        raw logits never span batches; ``merge_micro_batch_outputs`` then reassembles the
+        sample-ordered whole-batch return, reducing the per-batch ``aux_loss`` with the loss's
+        own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
+        ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
+        """
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        batches = []
+        for indices in plan:
+            micro_kwargs = {key: select_batch(value, indices, len(inputs)) for key, value in kwargs.items()}
+            outputs = self._forward_only_single(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                **micro_kwargs,
+            )
+            batches.append(dict(outputs))
+        micro_batch_scales = None
+        if any(output.get('aux_loss') is not None for output in batches):
+            loss_instance = optimizer_config.get_loss(kwargs.get('loss_key'))
+            micro_batch_scales = [loss_instance.micro_batch_scale(inputs, indices) for indices in plan]
+        return merge_micro_batch_outputs(
+            batches, plan, task=kwargs.get('task', 'causal_lm'), micro_batch_scales=micro_batch_scales)
+
+    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        """Plan the local micro-batches; under data parallelism every rank agrees on the count.
+
+        The token-cost packing is the same kernel ``forward_backward`` uses. Model DP ranks hold
+        different sequence lengths, so uncoordinated plans would disagree on the micro-batch
+        count; the all-gather loop below raises the minimum count until every rank returns the
+        same number, and fails loudly when no common count exists.
+        """
+        processor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
+        optimizer_config._ensure_dp_group()
+        dp_group = optimizer_config._dp_group
+        min_micro_batches = 1
+        while True:
+            try:
+                plan = plan_micro_batches(
+                    inputs, config, padding_free=processor.padding_free,
+                    min_micro_batches=min_micro_batches)
+                planning_error = None
+            except Exception as exc:
+                if dp_group is None:
+                    raise
+                plan = None
+                planning_error = f'{type(exc).__name__}: {exc}'
+            if dp_group is None:
+                return plan
+            local_state = {
+                'micro_batch_count': len(plan) if plan is not None else None,
+                'input_count': len(inputs),
+                'error': planning_error,
+            }
+            states = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(states, local_state, group=dp_group)
+            errors = [
+                f'rank {rank}: {state["error"]}'
+                for rank, state in enumerate(states) if state['error'] is not None]
+            if errors:
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: '
+                                   + '; '.join(errors))
+            counts = [state['micro_batch_count'] for state in states]
+            if all(count == len(plan) for count in counts):
+                return plan
+            min_micro_batches = max(counts)
+            if any(min_micro_batches > state['input_count'] for state in states):
+                raise ValueError('model DP ranks cannot execute the same number of non-empty '
+                                 'micro-batches; make the input batch divisible by the model '
+                                 'data-parallel size')
+
+    def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
+        """Run one evaluation micro-batch (or, without micro-batching, the whole batch)."""
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
-        optimizer_config = self.optimizer_group[adapter_name]
+        loss_key = kwargs.pop('loss_key', None)
+        # Accepted for backend parity with Megatron's empty-loss probe entry (``compute_loss=False``). This
+        # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
+        # to skip here; popped so it does not linger in eval_status.forward_kwargs.
+        kwargs.pop('compute_loss', None)
         self._lazy_wrap_model()
-        if not inputs:
-            raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.eval()
-        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
-                                                                        and self._not_encoded(inputs[0])):
-            # Trajectory or List[Trajectory]
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            if isinstance(inputs, dict):
-                inputs = [inputs]
-            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-            loss_instance = optimizer_config.loss_instance
-            loss_require_logits = getattr(loss_instance, 'require_logits', False)
-            loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
-            loss_require_logps = getattr(loss_instance, 'require_logps', True)
+            loss_instance = optimizer_config.get_loss(loss_key)
             enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
             if enable_sampling_replay:
                 if sampling_masks is None:
@@ -1031,6 +1185,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
+                gdn_padding_free_enabled=self._gdn_padding_free_enabled,
             )
             inputs = self._prepare_sp_inputs(inputs, processor, task=task)
             labels = inputs.pop('labels', None)
@@ -1052,79 +1207,53 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
-            # Routing replay: handle any action generically
-            router_replay_action = kwargs.pop('router_replay_action', None)
+            # Routing replay: the driver passes the MODE scalar; allow_record makes an R2 capture pass
+            # (a forward_only whose inputs carry no routing yet) RECORD here.
+            router_replay_mode = kwargs.pop('router_replay_mode', None)
             router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
             routed_experts = inputs.pop('routed_experts', None)
             replay_mask = inputs.pop('replay_mask', None)
             batch_size = labels.shape[0] if labels is not None else (
                 inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-            rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                                   router_replay_manual_cleanup, replay_mask)
+            from .moe.router_replay import RouterReplay
+            rr = self._router_replay(
+                RouterReplay.resolve_router_replay_mode(router_replay_mode, allow_record=True),
+                routed_experts=routed_experts, batch_size=batch_size,
+                manual_cleanup=router_replay_manual_cleanup, replay_mask=replay_mask)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-            with _resolve_task_context(self.model, task, template=optimizer_config.template), lora_ctx:
+            # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
+            with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
                 outputs = self.model(**inputs)
 
-            recorded_routing = rr_cleanup()
+            recorded_routing = rr.finish()
 
-            inputs['labels'] = labels
+            self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
             inputs.update(sp_auxiliary_inputs)
-            if loss_scale is not None:
-                inputs['loss_scale'] = loss_scale
-            if channel is not None:
-                inputs['channel'] = channel
-            if completion_mask is not None:
-                inputs['completion_mask'] = completion_mask
-            if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
-                loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
-                masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
-                logits = outputs['logits']
-                if enable_sampling_replay:
-                    outputs['logps'] = replayed_selective_log_softmax(
-                        logits=logits,
-                        labels=masked_labels,
-                        loss_mask=loss_mask,
-                        sampling_masks=sampling_masks,
-                        temperature=temperature,
-                        metadata=replay_metadata,
-                    )
-                elif loss_require_entropy:
-                    logits.div_(temperature)
-                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                        logits, masked_labels, return_entropy=True)
-                else:
-                    logits.div_(temperature)
-                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
-                del logits
-            if loss_require_values:
-                values = outputs['logits']
-                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
-            outputs['past_key_values'] = None
-            if not (return_logits or loss_require_logits):
-                outputs['logits'] = None
-            inputs, outputs = postprocess_task_outputs(
+            self._postprocess_forward_outputs(
+                outputs,
+                labels=labels,
+                task=task,
+                temperature=temperature,
+                sampling_masks=sampling_masks,
+                return_logits=return_logits,
+                loss_instance=loss_instance,
+                replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+            )
+            return self._finalize_forward_outputs(
                 inputs,
                 outputs,
-                sp_strategy=self.sp_strategy,
+                processor=processor,
                 task=task,
-                sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()),
+                optimizer_config=optimizer_config,
+                is_training=False,
+                forward_kwargs={**kwargs, '_metric_loss_key': loss_key},
+                loss_instance=loss_instance,
+                return_logits=return_logits,
+                recorded_routing=recorded_routing,
             )
-            inputs, outputs = processor.unpack_packed_sequences(
-                inputs, outputs, task=task, input_key_specs=input_key_specs,
-                output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
-            optimizer_config.eval_status.inputs = inputs
-            optimizer_config.eval_status.outputs = outputs
-            optimizer_config.eval_status.forward_kwargs = kwargs
-            optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-            return_outputs = copy(outputs)
-            if not return_logits:
-                return_outputs['logits'] = None
-            if recorded_routing is not None:
-                return_outputs['routed_experts'] = recorded_routing
-            return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
     def generate(
@@ -1268,104 +1397,83 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             'TransformersSampler(model_id=...) whose sample_stream runs on a single engine.')
 
     @remote_function(collect='mean')
-    def calculate_loss(self, **kwargs):
-        """Calculate loss
-
-        Args:
-            **kwargs:
-                adapter_name: Lora adapter name.
-                Any parameters needed for the specific loss type.
-        Returns:
-            A scalar loss value.
-        """
+    @timed
+    def calculate_loss(self,
+                       loss_key: Optional[str] = None,
+                       loss_weight: float = 1.0,
+                       global_normalizer: Optional[torch.Tensor] = None,
+                       **kwargs):
+        """Calculate one selected loss, optionally pre-normalized for a multi-RPC transaction."""
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        loss_instance: Loss = optimizer_config.loss_instance
+        loss_instance: Loss = optimizer_config.get_loss(loss_key)
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        if self.model.training:
-            status = optimizer_config.train_status
-        else:
-            status = optimizer_config.eval_status
+        status = optimizer_config.train_status if self.model.training else optimizer_config.eval_status
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
-        loss_value = result['loss']
+        main_loss = result['loss']
         raw_counts = result['num_tokens']
         counts = raw_counts
-        if not counts:
-            counts = torch.tensor(1, device=loss_value.device)
-        # Later will gather this value, so it becomes:
-        # 1. SUM loss: gather_sum(local_num_tokens / dp_world_size) = global_num_tokens / dp_world_size
-        # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps / dp_world_size )
-        #   = gradient_accumulation_steps
-        # Then, grad will divided by this value:
-        # 1. SUM loss: gather_mean(local_sum_grad) / (global_num_tokens / dp_world_size)
-        #              = (global_sum_grad / dp_world_size) / (global_num_tokens / dp_world_size)
-        #              = global_sum_grad/global_num_tokens
-        # 2. PER TOKEN MEAN loss: gather_mean(per_token_grad * gradient_accumulation_steps)
-        #                               / gradient_accumulation_steps
-        #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
-        #                               / gradient_accumulation_steps
-        #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
+        if global_normalizer is not None:
+            dp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
+            normalizer = torch.as_tensor(global_normalizer, device=main_loss.device, dtype=torch.float32)
+            objective_scale = float(loss_weight) * dp_world_size / normalizer.clamp(min=1)
+            counts = None
+        else:
+            objective_scale = float(loss_weight)
+            if not counts:
+                counts = torch.tensor(1, device=main_loss.device)
+
         raw_dp_fsdp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
-        counts = counts / raw_dp_fsdp_world_size
-        optimizer_config = self.optimizer_group[adapter_name]
-        status.num_tokens += counts.item()
-        status.loss_value += loss_value
+        if counts is not None:
+            counts = counts / raw_dp_fsdp_world_size
+            status.num_tokens += counts.item()
+        status.loss_value = (status.loss_value + main_loss) * objective_scale
         outputs['loss'] = status.loss_value
         outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
+        status.loss_reduction = 'mean' if global_normalizer is not None else getattr(loss_instance, 'reduction', 'mean')
         if result.get('channel_loss') is not None:
             outputs['channel_loss'] = result['channel_loss']
         return status.loss_value.item()
 
     @remote_function()
-    def backward(self, **kwargs):
-        """Backward propagation.
-
-        Args:
-            **kwargs:
-                adapter_name: Lora adapter name.
-                gradient_accumulation_steps: Number of gradient accumulation steps.
-        """
+    def backward(self,
+                 increment_step: bool = True,
+                 sync_gradients: Optional[bool] = None,
+                 **kwargs):
+        """Backward propagation with explicit step and synchronization controls."""
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
         scaler = optimizer_config.scaler
         if scaler is None and self.mixed_precision == 'fp16':
-            # Auto set a grad scaler
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
-        increment_step = kwargs.pop('_increment_step', True)
         if increment_step:
             optimizer_config.cur_step += 1
-        sync_gradients = kwargs.pop('sync_gradients', None)
-        should_sync = (
-            optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
-            if sync_gradients is None else bool(sync_gradients))
-
-        import contextlib
+        should_sync = (optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
+                       if sync_gradients is None else bool(sync_gradients))
         no_sync_ctx = contextlib.nullcontext()
         if not should_sync and hasattr(self.model, 'no_sync'):
             no_sync_ctx = self.model.no_sync()
 
-        router_replay_action = kwargs.pop('router_replay_action', None)
-        rr_cleanup = None
-        if router_replay_action is not None:
-            from .moe.router_replay import RouterReplayAction
-            rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
+        router_replay_mode = kwargs.pop('router_replay_mode', None)
+        rr = None
+        if router_replay_mode is not None:
+            from .moe.router_replay import RouterReplay, RouterReplayAction
+            rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
             if scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
-
-        if rr_cleanup is not None:
-            rr_cleanup()
-
+        if rr is not None:
+            rr.finish()
         optimizer_config.train_status.loss_value = None
 
     def _build_micro_batch_plan(self, inputs, config, optimizer_config):
@@ -1413,11 +1521,28 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
                                  'make the input batch divisible by the model data-parallel size')
 
+    def _global_loss_normalizer(self, inputs, loss_instance, optimizer_config):
+        local_normalizer = loss_instance.batch_normalizer(inputs)
+        if local_normalizer is None:
+            local_normalizer = 1.0
+        global_normalizer = torch.as_tensor(
+            local_normalizer,
+            device=Platform.get_local_device(),
+            dtype=torch.float32,
+        )
+        optimizer_config._ensure_dp_group()
+        if optimizer_config._dp_group is not None:
+            dist.all_reduce(global_normalizer, op=dist.ReduceOp.SUM, group=optimizer_config._dp_group)
+        return global_normalizer
+
     def _forward_backward_micro_batch(
         self,
         *,
         inputs,
         optimizer_config,
+        loss_key,
+        loss_weight,
+        global_normalizer,
         loss_scale,
         sync_gradients,
         increment_step,
@@ -1425,18 +1550,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     ):
         outputs = self.forward(
             inputs=inputs,
+            loss_key=loss_key,
             router_replay_manual_cleanup=True,
             **kwargs,
         )
         previous_normalizer = optimizer_config.train_status.num_tokens
-        loss = self.calculate_loss(**kwargs)
+        loss = self.calculate_loss(
+            loss_key=loss_key,
+            loss_weight=loss_weight,
+            global_normalizer=global_normalizer,
+            **kwargs,
+        )
         normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
-        optimizer_config.train_status.loss_value = (optimizer_config.train_status.loss_value * loss_scale)
-        optimizer_config.train_status.num_tokens = (previous_normalizer + normalizer_delta * loss_scale)
+        optimizer_config.train_status.loss_value = optimizer_config.train_status.loss_value * loss_scale
+        optimizer_config.train_status.num_tokens = previous_normalizer + normalizer_delta * loss_scale
         outputs['loss'] = loss * loss_scale
         self.backward(
+            increment_step=increment_step,
             sync_gradients=sync_gradients,
-            _increment_step=increment_step,
             **kwargs,
         )
         return outputs
@@ -1446,74 +1577,136 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         *,
         inputs,
         config,
+        optimizer_config,
+        loss_key,
+        loss_weight,
+        global_normalizer,
         sync_gradients,
-        loss_scale,
+        increment_step,
         **kwargs,
     ):
-        adapter_name = kwargs.get('adapter_name')
-        if adapter_name is None:
-            adapter_name = self._get_default_group()
+        local_batch_size = len(inputs)
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        loss_instance = optimizer_config.get_loss(loss_key)
+        total_loss = 0.0
+        outputs = {}
+        for micro_batch_index, indices in enumerate(plan):
+            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_loss_scale = loss_instance.micro_batch_scale(inputs, indices)
+            is_last_micro_batch = micro_batch_index == len(plan) - 1
+            outputs = self._forward_backward_micro_batch(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                loss_key=loss_key,
+                loss_weight=loss_weight,
+                global_normalizer=global_normalizer,
+                loss_scale=micro_loss_scale,
+                sync_gradients=sync_gradients if is_last_micro_batch else False,
+                increment_step=increment_step and is_last_micro_batch,
+                **micro_kwargs,
+            )
+            total_loss += float(outputs.get('loss', 0.0))
+        outputs['loss'] = total_loss
+        return outputs
+
+    def _forward_backward_single(
+        self,
+        *,
+        inputs,
+        loss_key,
+        loss_weight,
+        normalize_globally,
+        sync_gradients,
+        increment_step,
+        **kwargs,
+    ):
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(inputs, dict):
             inputs = [inputs]
+        if not inputs:
+            raise ValueError('inputs empty, check your DataLoader outputs')
         if self._not_encoded(inputs[0]):
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
             inputs = optimizer_config.template.batch_encode(inputs)
 
-        local_batch_size = len(inputs)
-        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
-        outputs = {}
-        loss_instance = optimizer_config.loss_instance
-        for micro_batch_index, indices in enumerate(plan):
-            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
-            micro_loss_scale = loss_scale * loss_instance.micro_batch_scale(inputs, indices)
-            is_last_micro_batch = micro_batch_index == len(plan) - 1
-            outputs = self._forward_backward_micro_batch(
-                inputs=[inputs[index] for index in indices],
-                optimizer_config=optimizer_config,
-                loss_scale=micro_loss_scale,
-                sync_gradients=sync_gradients if is_last_micro_batch else False,
-                increment_step=is_last_micro_batch,
-                **micro_kwargs,
-            )
-        return outputs
-
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         **kwargs):
-        """Do forward, calculate loss, and backward.
-
-        Args:
-            inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
-            **kwargs:
-                adapter_name: Lora adapter name.
-                gradient_accumulation_steps: Number of gradient accumulation steps.
-                micro_batch_size: Maximum samples processed per rank in one forward/backward.
-                dynamic_batching: Pack sequences by token cost instead of fixed sample slices.
-                max_tokens_per_micro_batch: Per-rank token limit used by dynamic batching.
-                packing_algorithm: Dynamic packing algorithm.
-                sync_gradients: Override gradient synchronization on the final micro-batch.
-                loss_scale: Weight applied to this input batch's loss.
-                Any parameters needed for the specific loss type.
-        Returns:
-            The output of the model forward.
-        """
+        loss_instance = optimizer_config.get_loss(loss_key)
+        global_normalizer = (
+            self._global_loss_normalizer(inputs, loss_instance, optimizer_config) if normalize_globally else None)
         micro_batch_config = MicroBatchConfig.from_kwargs(kwargs)
         if micro_batch_config is not None:
             return self._forward_backward_micro_batches(
                 inputs=inputs,
                 config=micro_batch_config,
-                sync_gradients=kwargs.pop('sync_gradients', None),
-                loss_scale=float(kwargs.pop('loss_scale', 1.0)),
+                optimizer_config=optimizer_config,
+                loss_key=loss_key,
+                loss_weight=loss_weight,
+                global_normalizer=global_normalizer,
+                sync_gradients=sync_gradients,
+                increment_step=increment_step,
                 **kwargs,
             )
 
-        outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
-        loss = self.calculate_loss(**kwargs)
-        outputs['loss'] = loss
-        self.backward(**kwargs)
-        return outputs
+        # loss_scale=1.0 makes the num_tokens/loss_value rescaling in the micro-batch body an identity,
+        # so it is exactly the old inline forward -> calculate_loss -> backward chain.
+        return self._forward_backward_micro_batch(
+            inputs=inputs,
+            optimizer_config=optimizer_config,
+            loss_key=loss_key,
+            loss_weight=loss_weight,
+            global_normalizer=global_normalizer,
+            loss_scale=1.0,
+            sync_gradients=sync_gradients,
+            increment_step=increment_step,
+            **kwargs,
+        )
+
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @timed
+    def forward_backward(
+        self,
+        *,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        loss_key: Optional[str] = None,
+        loss_weight: float = 1.0,
+        finalize_gradients: bool = True,
+        **kwargs,
+    ):
+        """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        completing_pending = optimizer_config.prepare_backward_transaction(finalize_gradients, loss_weight)
+        transactional = not finalize_gradients or completing_pending
+        requested_sync = kwargs.pop('sync_gradients', None)
+        outputs = self._forward_backward_single(
+            inputs=inputs,
+            loss_key=loss_key,
+            loss_weight=loss_weight,
+            normalize_globally=transactional,
+            sync_gradients=requested_sync if finalize_gradients else False,
+            increment_step=finalize_gradients,
+            **kwargs,
+        )
+        if not transactional:
+            return outputs
+
+        metric_step = optimizer_config.cur_step - 1 if finalize_gradients else optimizer_config.cur_step
+        optimizer_config.accumulate_metrics(True, include_default=False, metric_step=metric_step)
+        status = optimizer_config.train_status
+        status.inputs = None
+        status.outputs = None
+        total_loss = optimizer_config.record_transaction_loss(outputs.get('loss', 0.0), finalize_gradients)
+        if not finalize_gradients:
+            return outputs
+
+        dp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
+        status.num_tokens += 1.0 / dp_world_size
+        status.inputs = {}
+        status.outputs = ModelOutput(loss=total_loss)
+        status.forward_kwargs = {}
+        status.loss_reduction = 'mean'
+        return ModelOutput(loss=total_loss)
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
@@ -1529,6 +1722,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('clip gradients')
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
             return
 
@@ -1565,6 +1759,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             return grad_norm
 
     @remote_function(dispatch='all')
+    @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
@@ -1629,6 +1824,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('step the optimizer')
         grad_accum_steps = kwargs.pop('gradient_accumulation_steps', None)
         if not optimizer_config.do_grad_sync(grad_accum_steps):
             return
@@ -1677,6 +1873,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('zero gradients')
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
         optimizer = optimizer_config.optimizer
@@ -1694,6 +1891,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('step the learning-rate scheduler')
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
         if optimizer_config.scaler_has_nan:
@@ -1714,10 +1912,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the loss instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
+        optimizer_config.set_loss(loss_instance, loss_key=loss_key)
         if self.sp_strategy is not None:
-            self.sp_strategy.register_loss_key_specs(optimizer_config.loss_instance)
+            self.sp_strategy.register_loss_key_specs(loss_instance)
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
@@ -1770,6 +1970,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 param_groups_spec,
                 model=self.strategy.unwrap_model(self.model),
                 tower_prefixes=resolve_tower_prefixes(self.model_arch))
+        if galore_config is not None and muon_config is not None:
+            raise ValueError('galore_config and muon_config are mutually exclusive: the Muon grouping '
+                             'would stamp GaLore keys (rank, proj_type, ...) onto every sub-group.')
         if galore_config is not None:
             if isinstance(galore_config, dict):
                 galore_config = GaLoreConfig(**galore_config)
@@ -1777,7 +1980,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if muon_config is not None:
             if isinstance(muon_config, dict):
                 muon_config = MuonConfig(**muon_config)
-            params = create_muon_param_groups(params, muon_config)
+            # Families whose output head is not called 'lm_head' (internlm2 'output', chatglm
+            # 'transformer.output_layer', ...) would otherwise take the Muon update; the embedding
+            # side needs no key because create_muon_param_groups excludes it by type.
+            lm_head = self.model_arch.get('lm_head')
+            if lm_head and lm_head not in muon_config.exclude_keys:
+                muon_config.exclude_keys = list(muon_config.exclude_keys) + [lm_head]
+            params = create_muon_param_groups(
+                params, muon_config, model=self.strategy.unwrap_model(self.model))
         if hasattr(self.strategy, 'adjust_optimizer_kwargs'):
             kwargs = self.strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs)
         optimizer_config.optimizer = construct_class(
@@ -1835,6 +2045,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def __del__(self):
         HubOperation.wait_for()
+        # Chain to TrainableModel.__del__: an unjoined in-flight async write at teardown
+        # would silently lose the checkpoint.
+        super().__del__()
 
     # lazy_collect=False: save is a persistence side-effect the caller acts on immediately (it rotates
     # old checkpoints, writes args.json INTO the dir, and returns a path `swift infer` reloads), so the
@@ -1844,6 +2057,60 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     # is sync=True for the same reason; keeping the transformers backend non-lazy preserves that backend
     # equivalence.
     @remote_function(collect='first', lazy_collect=False)
+    @timed
+    def save_initial_adapter(self, initial_dir: str, adapter_name: Optional[str] = None) -> bool:
+        """Save the adapter's *initial* (pre-training) weights as a plain-LoRA checkpoint.
+
+        An init strategy that rewrites the base weight at injection (peft: pissa / olora / corda ...)
+        leaves the trained adapter only mergeable into the residual base the run produced; this
+        snapshot, taken before any training step, is what the post-training conversion folds against
+        (see ``save_converted_adapter``). False when there is nothing worth snapshotting.
+        """
+        model = self.strategy.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            return False
+        adapter_name = adapter_name or self._get_default_group()
+        config = model.peft_config.get(adapter_name)
+        if not isinstance(config.init_lora_weights, str):
+            return False
+        init_lora_weights = config.init_lora_weights
+        config.init_lora_weights = True
+        try:
+            os.makedirs(initial_dir, exist_ok=True)
+            model.save_pretrained(initial_dir)
+        finally:
+            config.init_lora_weights = init_lora_weights
+        return True
+
+    @remote_function(collect='first', lazy_collect=False)
+    @timed
+    def save_converted_adapter(self, converted_dir: str, initial_model_dir: str,
+                               adapter_name: Optional[str] = None) -> None:
+        """Save a *converted* copy of the adapter: its delta re-expressed against the ORIGINAL base.
+
+        peft's ``path_initial_model_for_weight_conversion`` folds the init factor back out using the
+        initial snapshot, producing a plain LoRA that merges into any copy of the original base --
+        the raw adapter of a base-modifying init instead only fits the residual base it trained on.
+        """
+        model = self.strategy.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            raise TypeError('save_converted_adapter requires a peft-wrapped model.')
+        adapter_name = adapter_name or self._get_default_group()
+        saved_config = copy(model.peft_config[adapter_name])
+        # The conversion loads the initial snapshot through peft's inject_adapter, which freezes the
+        # active adapter as a side effect; save + restore the requires_grad flags around it.
+        requires_grad_state = {name: p.requires_grad for name, p in model.named_parameters()}
+        os.makedirs(os.path.dirname(converted_dir), exist_ok=True)
+        model.save_pretrained(
+            converted_dir, path_initial_model_for_weight_conversion=os.path.abspath(initial_model_dir))
+        # peft replaces the adapter's config entry during conversion; restore the live one.
+        model.peft_config[adapter_name] = saved_config
+        for name, p in model.named_parameters():
+            if name in requires_grad_state:
+                p.requires_grad = requires_grad_state[name]
+
+    @remote_function(collect='first', lazy_collect=False)
+    @timed
     def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 
@@ -1857,11 +2124,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 safe_serialization: Save weights with safetensors instead of torch serialization.
                 max_shard_size: Maximum size of each full-model weight shard.
                 save_total_limit: Maximum number of completed checkpoint directories to retain.
+                async_save: Offload the staged weight/tokenizer/trainer-state file I/O to a background
+                    writer (the state itself is always gathered synchronously).
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         safe_serialization = kwargs.pop('safe_serialization', True)
         max_shard_size = kwargs.pop('max_shard_size', '5GB')
         save_total_limit = kwargs.pop('save_total_limit', None)
+        async_save = kwargs.pop('async_save', False)
         optimizer_config = self.optimizer_group[adapter_name]
         if name is None:
             name = f'checkpoint-step-{optimizer_config.cur_step}'
@@ -1881,49 +2151,66 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         else:
             processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
 
-        if isinstance(model, PeftModel):
-            if max_shard_size != '5GB':
-                raise NotImplementedError(
-                    'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
-                    'full-model checkpoint.')
-            if Platform.is_master():
-                model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
-                if safe_serialization:
-                    save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-                else:
-                    torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-        else:
-            model.save_pretrained(
-                checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
-
-        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-
+        # The optimizer/scheduler/scaler/rng state goes through the strategy's save protocol (deepspeed's
+        # engine.save_checkpoint / FSDP2's get_optimizer_state_dict perform collectives), so it stays on
+        # the synchronous path; async only offloads the staged weight/tokenizer/trainer-state file I/O.
+        self._deferred_trainer_state_writes = []
         if kwargs.get('save_optimizer', False):
             self._save_training_state(
                 checkpoint_dir,
                 adapter_name=adapter_name,
                 consumed_train_samples=kwargs.get('consumed_train_samples', 0),
+                component_states=kwargs.get('component_states', {}),
+                defer_trainer_state=async_save,
             )
 
-        copy_checkpoint_args(output_dir, checkpoint_dir)
-        rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+        def _write_weights() -> None:
+            """Pure file I/O over the staged CPU payloads; no collectives, no device tensors."""
+            if isinstance(model, PeftModel):
+                if max_shard_size != '5GB':
+                    raise NotImplementedError(
+                        'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
+                        'full-model checkpoint.')
+                if Platform.is_master():
+                    model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
+                    contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                    if safe_serialization:
+                        save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                    else:
+                        torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
+            else:
+                model.save_pretrained(
+                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(),
+                    **save_kwargs)
+
+        if async_save:
+            # trainer_state.json doubles as the completion marker a resume reads; the deferred writes run
+            # last so a crash mid-write leaves a directory the resume path cannot mistake for complete.
+            deferred = list(self._deferred_trainer_state_writes)
+
+            def _write_tail() -> None:
+                _write_weights()
+                self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+                copy_checkpoint_args(output_dir, checkpoint_dir)
+                for write in deferred:
+                    write()
+                rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+
+            self.submit_async_write(_write_tail)
+        else:
+            _write_weights()
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            copy_checkpoint_args(output_dir, checkpoint_dir)
+            rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         return checkpoint_dir
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         """Return PEFT-normalized adapter state dict for saving."""
-        # Avoid collecting the full base model for large FSDP/EP jobs.
+        # The strategy collector already gathers modules_to_save copies together with
+        # their persistent buffers (state_dict_utils.collect_local_state), so only the
+        # PEFT wrapper key segments remain to be stripped here.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
-        adapter_suffix = f'.{adapter_name}.'
-        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
-        processed_state_dict = {}
-        for key, value in adapter_state.items():
-            if modules_to_save_infix in key:
-                normalized = key.replace(modules_to_save_infix, '.')
-            else:
-                normalized = key.replace(adapter_suffix, '.')
-            processed_state_dict[normalized] = value
-        return processed_state_dict
+        return normalize_adapter_keys(adapter_state, adapter_name)
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
         """Map runtime optimizer parameter names to checkpoint names."""
@@ -1950,6 +2237,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _save_training_state(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        defer_trainer_state = kwargs.pop('defer_trainer_state', False)
+        # The optimizer/scheduler files are written before _write_weights() gets a chance to
+        # create the checkpoint dir via save_pretrained; torch.save then raises
+        # "Parent directory ... does not exist". This lives HERE (not at the top of save()) so it
+        # also covers the hybrid model's save path, which calls _save_training_state directly.
+        os.makedirs(output_dir, exist_ok=True)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
 
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1962,9 +2255,19 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             'cur_step': optimizer_config.cur_step,
             'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
             'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+            'component_states': kwargs.get('component_states', {}),
         }
-        with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
-            json.dump(trainer_state, f)
+
+        def _write_trainer_state() -> None:
+            with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
+                json.dump(trainer_state, f)
+
+        # Under async_save the trainer_state.json is the resume completion marker: defer it to the
+        # background write so a crash mid-write cannot leave a directory that looks complete.
+        if defer_trainer_state:
+            self._deferred_trainer_state_writes.append(_write_trainer_state)
+        else:
+            _write_trainer_state()
 
         if optimizer_config.scaler is not None:
             torch.save(
@@ -1988,6 +2291,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 self._default_tokenizer.save_pretrained(output_dir)
 
     @remote_function()
+    @timed
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         """Load model state and optionally optimizer state from a checkpoint.
 
@@ -2072,7 +2376,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
-    def _ensure_lora_dtype(self, model):
+    @staticmethod
+    def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
         is_npu_device = Platform.device_prefix() == 'npu'
@@ -2101,9 +2406,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.scaler_has_nan = scaler_state.get('scaler_has_nan', False)
 
     def _get_training_rng_state(self):
+        # numpy's state tuple carries int64 scalars and an ndarray, which torch's
+        # weights_only unpickler refuses; storing the key as a plain list keeps the
+        # whole file loadable with weights_only=True (np.random.set_state accepts it).
+        numpy_name, numpy_key, numpy_pos, numpy_has_gauss, numpy_cached = np.random.get_state()
         state = {
             'python_rng_state': random.getstate(),
-            'numpy_rng_state': np.random.get_state(),
+            'numpy_rng_state': (numpy_name, numpy_key.tolist(), int(numpy_pos), int(numpy_has_gauss),
+                                float(numpy_cached)),
             'torch_rng_state': torch.get_rng_state(),
         }
 
@@ -2118,7 +2428,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         return state
 
     def _load_rng_state(self, rng_path):
-        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        try:
+            rng_state = torch.load(rng_path, map_location='cpu', weights_only=True)
+        except Exception:
+            # Pre-hardening checkpoints stored numpy scalars/arrays, which the safe
+            # unpickler refuses. RNG state only affects run-to-run reproducibility, so
+            # the recovery is to drop it rather than fall back to unrestricted pickle.
+            raise ValueError(
+                f'{rng_path} is not loadable in weights-only mode (likely a pre-hardening checkpoint '
+                'carrying numpy rng objects). Delete the file and resume: only exact RNG replay is '
+                'lost, training correctness is unaffected.') from None
         random.setstate(rng_state['python_rng_state'])
         np.random.set_state(rng_state['numpy_rng_state'])
         torch.set_rng_state(rng_state['torch_rng_state'])
@@ -2155,15 +2474,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     # raises "'function' object is not subscriptable". Mirrors forward_only/calculate_metric, the other
     # methods whose return value the driver reads. sync=True orders the workers but does not materialize
     # the result; the megatron/hybrid/multi_lora variants are non-lazy for the same backend equivalence.
-    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
+    @timed
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
-        has_adapter = (
-            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
-        if has_adapter:
-            self.load(checkpoint_dir, adapter_name=adapter_name)
+        self.load(checkpoint_dir, adapter_name=adapter_name)
 
         if resume_only_model:
             optimizer_config = self.optimizer_group[adapter_name]
@@ -2171,14 +2487,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 'cur_step': 0,
                 'consumed_train_samples': 0,
                 'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                'component_states': {},
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
-        return {
+        result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
+        if 'component_states' in trainer_state:
+            result['component_states'] = trainer_state['component_states']
+        return result
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
@@ -2207,9 +2527,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         return config.to_dict() if hasattr(config, 'to_dict') else dict(config)
 
     @remote_function(collect='first', lazy_collect=False)
+    @timed
     def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('calculate metrics')
         return optimizer_config.calculate_metrics(is_training)
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
@@ -2239,7 +2561,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 # post check: unwrapped_model must be already a peft model before wrapping ddp
                 assert isinstance(unwrapped_model, PeftModel)
-            config = _adapted_model.peft_config
+            # ``peft_config`` is a {adapter_name: PeftConfig} mapping; keep only this adapter's entry so
+            # ``OptimizerGroup.adapter_config`` is always a single PeftConfig.
+            peft_configs = _adapted_model.peft_config
+            config = peft_configs.get(adapter_name, None) or next(iter(peft_configs.values()))
         else:
             config = config_or_dir
             self._expand_multimodal_lora_target(
@@ -2358,9 +2683,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        kwargs['model_id'] = self.tokenizer_id
-        template = construct_class(template_cls, Template, twinkle.template, **kwargs)
-        optimizer_config.template = template
+        if 'template_spec' not in kwargs:
+            kwargs['model_id'] = self.tokenizer_id
+        optimizer_config.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
@@ -2405,13 +2730,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the metric_cls instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
         if is_training is None or is_training is True:
-            optimizer_config.train_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
+            metric._twinkle_loss_key = loss_key
+            optimizer_config.train_status.metrics.append(metric)
         if not is_training:
-            optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
+            metric._twinkle_loss_key = loss_key
+            optimizer_config.eval_status.metrics.append(metric)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         # PEFT default uses param.numel(). For DTensors that returns the logical
@@ -2463,8 +2793,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         expr = ''
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        # adapter_config is always a single PeftConfig (see _patch_adapter); to_dict covers both
+        # the from-scratch and the from-checkpoint load paths.
         if optimizer_config.adapter_config is not None:
-            config = optimizer_config.adapter_config.__dict__
+            config = optimizer_config.adapter_config
+            config = config.to_dict() if hasattr(config, 'to_dict') else dict(config)
         else:
             config = {}
         config = {key: str(value) for key, value in config.items() if value is not None}
@@ -2507,40 +2840,45 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
-        # Get state dict from unwrapped model
+        # Get state dict from unwrapped model. Key shaping (PEFT segment stripping,
+        # vLLM base_layer renaming) lives in twinkle.checkpoint_engine.weight_keys.
         model = self.strategy.unwrap_model(self.model)
 
-        def _normalize(name: str, keep_base_layer: bool) -> str:
-            name = name.replace('base_model.model.', '')
-            if not keep_base_layer:
-                name = name.replace('.base_layer', '')
-            return name
+        def _checkpoint_tensor(tensor):
+            # Stage a (possibly CPU-offloaded) DTensor onto the device before the full_tensor all-gather.
+            from torch.distributed.tensor import DTensor
+            if isinstance(tensor, DTensor):
+                tensor = tensor.to(Torch.get_device(None), non_blocking=True)
+            return Torch.to_local_tensor(tensor)
 
-        def _add_base_layer_suffix(name):
-            # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
-            # only their ``.base_layer.*`` param, even when PEFT does not target
-            # them on the training side (e.g. linear-attn ``conv1d`` /
-            # ``in_proj_qkvz``).  Rename to match whenever the sampler exposes
-            # the ``.base_layer.`` variant.
-            base_layer_name = None
-            if name.endswith('.weight'):
-                base_layer_name = f'{name[:-7]}.base_layer.weight'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            elif name.endswith('.bias'):
-                base_layer_name = f'{name[:-5]}.base_layer.bias'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            if 'experts' in name and base_layer_name is not None:
-                return base_layer_name
-            return name
+        def _tied_duplicate_names() -> set:
+            """Names the HF state_dict repeats because they share one tensor, which must not be sent.
 
-        def _print_weight_example(names):
-            for name in names[:3]:
-                logger.info(f'Sync weight: {name}')
+            With ``tie_word_embeddings`` the LM head and the input embedding are the SAME tensor, so
+            the state_dict lists it twice (``lm_head.weight`` and ``*.embed_tokens.weight``). vLLM
+            loads only the name its module traversal reaches first and records the other as a skipped
+            alias, then asserts the canonical one did load
+            (``AutoWeightsLoader._check_skipped_aliases``). Sending both makes that check fail, and
+            the duplicate is redundant anyway because one write covers both.
 
-        def _is_lora_key(name: str) -> bool:
-            return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+            Keyed off the config rather than runtime storage identity: the sharing can be broken
+            apart mid-run (an optimizer step or an FSDP all-gather may materialise the head as its
+            own tensor), which would make a storage probe stop matching after the first sync. The
+            flag can sit on a nested ``text_config`` for multimodal shells, so check both.
+            """
+            config = getattr(self, 'hf_config', None)
+            if config is None:
+                return set()
+            tied = getattr(config, 'tie_word_embeddings', None)
+            if tied is None:
+                tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
+            if not tied:
+                return set()
+            # Drop the head, keep the embedding: vLLM's traversal reaches the nested embedding first,
+            # making it the canonical name that ``_check_skipped_aliases`` wants to see loaded.
+            return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
+
+        _tied_duplicates = _tied_duplicate_names()
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
@@ -2552,13 +2890,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():
-                        if _is_lora_key(name):
+                        if is_lora_key(name) or name in _tied_duplicates:
                             continue
-                        tensor = Torch.to_local_tensor(tensor)
-                        name = _normalize(name, keep_base_layer=False)
+                        tensor = _checkpoint_tensor(tensor)
+                        name = normalize_param_name(name, keep_base_layer=False)
                         names.append(name)
                         yield name, tensor
-                    _print_weight_example(names)
+                    print_weight_example(names)
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -2570,75 +2908,54 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 def weight_generator():
                     names = []
                     for name, tensor in lora_state_dict.items():
-                        tensor = Torch.to_local_tensor(tensor)
-                        name = _normalize(name, keep_base_layer=True)
+                        tensor = _checkpoint_tensor(tensor)
+                        name = normalize_param_name(name, keep_base_layer=True)
                         names.append(name)
                         yield name, tensor
-                    _print_weight_example(names)
+                    print_weight_example(names)
 
         else:
             # First full base-model sync.  When the sampler runs with
             # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
             # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
             # (detected via ``model_keys``); otherwise send canonical names.
+            from twinkle.checkpoint_engine.delta.trainer.backends.fsdp import convert_weight_keys
+
             add_base_layer = not merge_and_sync
-            state_dict = model.state_dict()
+            state_dict = convert_weight_keys(model.state_dict(), model)
 
             def weight_generator():
                 names = []
                 for name, tensor in state_dict.items():
-                    if _is_lora_key(name):
+                    if is_lora_key(name) or name in _tied_duplicates:
                         continue
-                    tensor = Torch.to_local_tensor(tensor)
-                    name = _normalize(name, keep_base_layer=False)
+                    tensor = _checkpoint_tensor(tensor)
+                    name = normalize_param_name(name, keep_base_layer=False)
                     if add_base_layer:
-                        name = _add_base_layer_suffix(name)
+                        name = add_base_layer_suffix(name, model_keys)
                     names.append(name)
                     yield name, tensor
-                _print_weight_example(names)
+                print_weight_example(names)
 
         return weight_generator()
 
-    @remote_function(dispatch='all', lazy_collect=True)
-    def send_weights(
-        self,
-        adapter_name: str = None,
-        base_sync_done: bool = False,
-        merge_and_sync: bool = False,
-        model_keys: List[str] = None,
-        **kwargs,
-    ):
-        engine = self._get_or_create_checkpoint_engine()
-        weight_generator = self._get_weight_generator(
-            adapter_name=adapter_name,
-            base_sync_done=base_sync_done,
-            merge_and_sync=merge_and_sync,
-            model_keys=model_keys,
-            **kwargs,
-        )
+    # ── Paired EMA support (policy→reference via checkpoint-engine) ─────────
+    # send_weights / prepare_ema_sender / receive_weights_ema are inherited from
+    # CheckpointEngineMixin (transport protocol); the weight-source hooks below feed them.
 
-        # Run async send_weights in a dedicated event loop thread.
-        # We cannot use the Ray worker's event loop because it may already
-        # be occupied, and send_weights uses run_in_executor internally.
-        async def _send():
-            await engine.send_weights(weight_generator)
+    def _get_local_weight_generator(self):
+        """Yield (name, local_tensor) for this rank's shard — no cross-rank gathering.
 
-        result_container = {'error': None}
+        Used by paired EMA: the receiver holds the SAME shard layout (identical
+        parallel_spec), so names and shapes match one-to-one without HF conversion.
+        """
+        from twinkle.utils.framework import Torch
+        model = self.strategy.unwrap_model(self.model)
+        for name, tensor in model.state_dict().items():
+            yield name, Torch.to_local_tensor(tensor)
 
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_send())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-
-        if result_container['error'] is not None:
-            raise result_container['error']
+    def _get_local_state_dict(self):
+        """Return {name: param} for this rank's local shard (used by EMA receiver and naive sync)."""
+        from twinkle.utils.framework import Torch
+        model = self.strategy.unwrap_model(self.model)
+        return {name: Torch.to_local_tensor(tensor) for name, tensor in model.state_dict().items()}

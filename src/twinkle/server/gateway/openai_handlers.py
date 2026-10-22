@@ -9,6 +9,7 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
 from collections.abc import Callable
@@ -16,7 +17,9 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from twinkle.server.lifecycle.envelope import envelope_from_record
+from twinkle.server.lifecycle.poll_config import long_poll_window
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -25,10 +28,13 @@ import httpx
 
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
+from . import routes
 from .openai_bridge import (make_error, translate_chat_request, translate_completion_request,
-                            translate_completion_response, translate_embedding_request, translate_embedding_response,
+                            translate_completion_response, translate_completion_stream_chunk,
+                            translate_embedding_request, translate_embedding_response,
                             translate_infer_request, translate_infer_response, translate_response,
                             translate_stream_chunk)
+from .use_cases import poll_future
 
 logger = get_logger()
 
@@ -46,9 +52,6 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         Translates OpenAI request to SampleRequest, injects sticky routing
         headers using the model field, and proxies to the sampler.
         """
-        denied = _deny_without_key(request, self.api_key)
-        if denied is not None:
-            return denied
         body = await request.json()
 
         # Validate and translate
@@ -73,49 +76,22 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         if base_model is None:
             return _model_not_found(model)
         sticky_headers = _build_sticky_headers(_sticky_key(request, model), request)
-        body_bytes = json.dumps(sample_request).encode()
         await _ensure_template(self, base_model, sticky_headers, request)
         request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
+        first_chunk = {'is_first': True}
 
-        async def _sse_generator():
-            is_first = True
-            try:
-                async for line in self.proxy.proxy_request_stream(
-                        request,
-                        endpoint='twinkle/sample_stream',
-                        base_model=base_model,
-                        service_type='sampler',
-                        body_override=body_bytes,
-                        extra_headers=sticky_headers,
-                ):
-                    chunk_data = json.loads(line)
-                    openai_chunk = translate_stream_chunk(
-                        delta_text=chunk_data.get('delta', ''),
-                        model=model,
-                        finish_reason=chunk_data.get('finish_reason'),
-                        request_id=request_id,
-                        is_first=is_first,
-                    )
-                    is_first = False
-                    yield f'data: {json.dumps(openai_chunk)}\n\n'
+        def _chat_chunk(delta_text: str, finish_reason: str | None) -> dict[str, Any]:
+            is_first = first_chunk['is_first']
+            first_chunk['is_first'] = False
+            return translate_stream_chunk(
+                delta_text=delta_text,
+                model=model,
+                finish_reason=finish_reason,
+                request_id=request_id,
+                is_first=is_first,
+            )
 
-                yield 'data: [DONE]\n\n'
-            except httpx.HTTPStatusError as e:
-                error_body = e.response.content.decode()[:500]
-                error_chunk = make_error(
-                    message=f'Streaming error: {error_body}',
-                    error_type='server_error',
-                )
-                yield f'data: {json.dumps(error_chunk)}\n\n'
-                yield 'data: [DONE]\n\n'
-        return StreamingResponse(
-            _sse_generator(),
-            media_type='text/event-stream',
-            headers={
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no'
-            },
-        )
+        return _streaming_response(self, request, sample_request, base_model, sticky_headers, _chat_chunk)
 
     @app.post('/completions')
     async def completions(
@@ -124,17 +100,29 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     ):
         """OpenAI-compatible text completion endpoint.
 
-        The prompt is wrapped as a single-user-turn trajectory (see
-        :func:`translate_completion_request`) and served by the same sampler path as chat.
+        The prompt is wrapped as single-user-turn trajectories (see
+        :func:`translate_completion_request`) and served by the same sampler path as chat,
+        streaming and non-streaming alike.
         """
-        denied = _deny_without_key(request, self.api_key)
-        if denied is not None:
-            return denied
         body = await request.json()
         try:
             sample_request, model = translate_completion_request(body)
         except ValueError as e:
             return _bad_request(e)
+
+        if body.get('stream', False):
+            base_model = await _resolve_base_model(self, model)
+            if base_model is None:
+                return _model_not_found(model)
+            sticky_headers = _build_sticky_headers(_sticky_key(request, model), request)
+            await _ensure_template(self, base_model, sticky_headers, request)
+            request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
+            return _streaming_response(
+                self, request, sample_request, base_model, sticky_headers,
+                lambda delta, finish: translate_completion_stream_chunk(
+                    delta_text=delta, model=model, finish_reason=finish, request_id=request_id),
+            )
+
         request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
         return await _proxy_sample(
             self,
@@ -155,9 +143,6 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         Proxies to the sampler's ``/twinkle/encode`` pooling forward. Only a sampler built with a
         pooling head can serve it; a generation-only sampler returns an error, which is surfaced as-is.
         """
-        denied = _deny_without_key(request, self.api_key)
-        if denied is not None:
-            return denied
         body = await request.json()
         try:
             encode_request, model = translate_embedding_request(body)
@@ -184,9 +169,6 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         logprobs and each sequence's ``new_input_feature`` -- the token-in-token-out surface a trainer
         recomputes ratios against, without re-tokenizing the served text.
         """
-        denied = _deny_without_key(request, self.api_key)
-        if denied is not None:
-            return denied
         body = await request.json()
         try:
             sample_request, model = translate_infer_request(body)
@@ -244,12 +226,12 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
         pass
 
     # Check if it's directly a supported base model
-    if model in gateway._supported_model_names:
+    if model in gateway.supported_model_names:
         return model
 
     # Fallback: if there's exactly one supported model, use it
-    if len(gateway._supported_model_names) == 1:
-        return next(iter(gateway._supported_model_names))
+    if len(gateway.supported_model_names) == 1:
+        return next(iter(gateway.supported_model_names))
 
     return None
 
@@ -270,10 +252,9 @@ def _sticky_key(request: Request, model: str) -> str:
 
 def _bad_request(exc: ValueError) -> JSONResponse:
     """A 400 for a translator's ``ValueError``; the exception text names the offending field."""
-    param = str(exc) if str(exc) in ('model', 'messages', 'prompt', 'input', 'infer_requests') else None
     return JSONResponse(
         status_code=400,
-        content=make_error(message=f'Missing or invalid field: {exc}', param=param),
+        content=make_error(message=f'Missing or invalid field: {exc}', param=str(exc) or None),
     )
 
 
@@ -293,11 +274,14 @@ def _deny_without_key(request: Request, api_key: str | None) -> JSONResponse | N
 
     When the gateway was deployed without an ``api_key`` the port is unauthenticated and this is a
     no-op -- the operator opted out, matching a plain OpenAI server started without ``--api-key``.
+    The comparison is constant-time: a Bearer check on a public port is measurable by anyone who
+    can reach it.
     """
     if api_key is None:
         return None
     header = request.headers.get('authorization') or ''
-    if not header.startswith('Bearer ') or header[len('Bearer '):] != api_key:
+    supplied = header[len('Bearer '):] if header.startswith('Bearer ') else ''
+    if not supplied or not secrets.compare_digest(supplied.encode(), api_key.encode()):
         return JSONResponse(
             status_code=401,
             content=make_error(
@@ -309,6 +293,30 @@ def _deny_without_key(request: Request, api_key: str | None) -> JSONResponse | N
     return None
 
 
+async def _await_terminal_envelope(gateway: GatewayServer, request_id: str) -> dict[str, Any]:
+    """Long-poll one queued task's future record to a terminal state (or the window's end).
+
+    Uses the same future store, the same ``poll_future`` use case, and the same Long_Poll_Window
+    that the twinkle-native ``/twinkle/retrieve_future`` endpoint reads, so the OpenAI surface and
+    the native surface wait identically.
+    """
+    outcome = await poll_future(gateway.state, request_id)
+    if outcome.record is None:
+        return {'request_id': request_id, 'status': 'pending'}
+    return envelope_from_record(request_id, outcome.record).model_dump()
+
+
+def _task_failed(envelope: dict[str, Any]) -> JSONResponse:
+    """Map a failed/cancelled TaskEnvelope's ErrorPayload to an OpenAI-shaped error response."""
+    error = envelope.get('error') or {}
+    message = error.get('message') or envelope.get('status') or 'task failed'
+    error_code = error.get('error_code')
+    return JSONResponse(
+        status_code=error_code if isinstance(error_code, int) else 500,
+        content=make_error(message=f'Task failed: {message}', error_type='server_error'),
+    )
+
+
 async def _proxy_sample(
     gateway: GatewayServer,
     request: Request,
@@ -318,12 +326,19 @@ async def _proxy_sample(
     endpoint: str,
     translate: Callable[[dict[str, Any], str], Any],
 ) -> JSONResponse:
-    """Resolve routing, ensure the sampler template, proxy one non-streaming call, translate the result.
+    """Resolve routing, ensure the sampler template, drive one queued task to a terminal state,
+    translate the result.
 
     The shared body of every non-streaming OpenAI endpoint (chat/completions/infer/embeddings): they
     differ only in ``endpoint`` and in how the sampler's dict is turned back into an OpenAI shape, which
     the caller passes as ``translate(data, model)``. Keeping the resolve → sticky → template → proxy →
-    error sequence in one place means a fix to routing applies to all of them at once.
+    wait → error sequence in one place means a fix to routing applies to all of them at once.
+
+    The sampler replies with a TaskEnvelope, and the payload of a completed task rides in
+    ``result`` -- never at the top level. A task that does not settle inside the sampler's inline
+    fast path is long-polled here until it does (see ``_await_terminal_envelope``), so a generation
+    of realistic length still completes within one HTTP call instead of coming back as a pending
+    envelope that would translate into an empty-but-200 response.
     """
     base_model = await _resolve_base_model(gateway, model)
     if base_model is None:
@@ -350,7 +365,24 @@ async def _proxy_sample(
             ),
         )
 
-    result = translate(json.loads(response.body), model)
+    envelope = json.loads(response.body)
+    if envelope.get('status') != 'completed':
+        envelope = await _await_terminal_envelope(gateway, envelope.get('request_id', ''))
+        if envelope.get('status') == 'failed' or envelope.get('status') == 'cancelled':
+            return _task_failed(envelope)
+        if envelope.get('status') != 'completed':
+            return JSONResponse(
+                status_code=504,
+                content=make_error(
+                    message=(f'Task {envelope.get("request_id")} is still running after the '
+                             f'{long_poll_window():.0f}s long-poll window; poll /twinkle/retrieve_future '
+                             'with its request_id'),
+                    error_type='server_error',
+                    code='task_timeout',
+                ),
+            )
+
+    result = translate(envelope.get('result'), model)
     resp_headers = {}
     replica_id = response.headers.get('x-twinkle-replica-id')
     if replica_id:
@@ -358,8 +390,76 @@ async def _proxy_sample(
     return JSONResponse(content=result, headers=resp_headers)
 
 
-# Per-process cache; each Ray Serve worker holds its own instance.
-_template_initialized: set[str] = set()
+def _streaming_response(
+    gateway: GatewayServer,
+    request: Request,
+    sample_request: dict[str, Any],
+    base_model: str,
+    sticky_headers: dict[str, str],
+    chunk_translator: Callable[[str, str | None], dict[str, Any]],
+) -> StreamingResponse:
+    """Proxy to the sampler's streaming endpoint and translate its NDJSON lines to OpenAI SSE.
+
+    Shared by the chat and completions streaming paths: both read ``{"delta", "finish_reason"}``
+    lines from ``/twinkle/sample_stream`` and differ only in the chunk shape, which
+    ``chunk_translator(delta_text, finish_reason)`` produces (it owns whatever per-stream state,
+    like the chat first-chunk role marker, it needs).
+    """
+
+    async def _sse_generator():
+        try:
+            async for line in gateway.proxy.proxy_request_stream(
+                    request,
+                    endpoint='twinkle/sample_stream',
+                    base_model=base_model,
+                    service_type='sampler',
+                    body_override=json.dumps(sample_request).encode(),
+                    extra_headers=sticky_headers,
+            ):
+                chunk_data = json.loads(line)
+                openai_chunk = chunk_translator(chunk_data.get('delta', ''), chunk_data.get('finish_reason'))
+                yield f'data: {json.dumps(openai_chunk)}\n\n'
+
+            yield 'data: [DONE]\n\n'
+        except httpx.HTTPStatusError as e:
+            error_body = e.response.content.decode()[:500]
+            error_chunk = make_error(
+                message=f'Streaming error: {error_body}',
+                error_type='server_error',
+            )
+            yield f'data: {json.dumps(error_chunk)}\n\n'
+            yield 'data: [DONE]\n\n'
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        },
+    )
+
+
+def _register_api_key_gate(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
+    """Register the app-level Bearer gate for ``api_key``.
+
+    The gate covers every route, not just the OpenAI endpoints: the tinker training endpoints and
+    the ``/twinkle/*`` task surface are strictly more sensitive than generation, and protecting chat
+    while leaving weight-mutating calls anonymous would be security theater. Liveness probes and
+    the model listing stay open so load balancers can do their job. Registered after the routes
+    (and therefore wrapping the cleanup middleware ``build_deployment_app`` installs) so a rejected
+    request short-circuits before any handler runs.
+    """
+    open_paths = frozenset({'/health', '/ping', '/models', '/twinkle/healthz', '/twinkle/healthz/deep'})
+
+    @app.middleware('http')
+    async def require_api_key(request: Request, call_next):
+        gateway = self_fn()
+        if gateway.api_key is not None and request.url.path not in open_paths:
+            denied = _deny_without_key(request, gateway.api_key)
+            if denied is not None:
+                return denied
+        return await call_next(request)
 
 
 async def _ensure_template(
@@ -370,10 +470,10 @@ async def _ensure_template(
 ) -> None:
     """Ensure the sampler has a chat template set for encoding Trajectory inputs.
 
-    Called once per base_model (cached in-process). On failure, logs a warning
-    but doesn't block — the sampler will return its own error if needed.
+    Called once per base_model (cached on the ``GatewayServer`` instance). On failure,
+    logs a warning but doesn't block -- the sampler will return its own error if needed.
     """
-    if base_model in _template_initialized:
+    if base_model in gateway._template_initialized:
         return
 
     template_cls = get_template_for_model(base_model)
@@ -386,14 +486,14 @@ async def _ensure_template(
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint='twinkle/set_template',
+            endpoint=routes.TWINKLE_SET_TEMPLATE,
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,
             extra_headers=sticky_headers,
         )
         if resp.status_code == 200:
-            _template_initialized.add(base_model)
+            gateway._template_initialized.add(base_model)
         else:
             logger.warning('set_template failed: %s', resp.body.decode()[:200])
     except Exception as e:

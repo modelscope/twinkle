@@ -87,12 +87,13 @@ class RougeBleu(TextMetric):
         if not pairs:
             return {}
         scores: Dict[str, List[float]] = {key: [] for key in self.keys}
+        rouge = Rouge()  # once per calculate: its constructor loads stopwords/word lists
         for prediction, reference in pairs:
             hypothesis = [word.strip(' ') for word in jieba.cut(prediction) if word.strip(' ')]
             target = [word.strip(' ') for word in jieba.cut(reference) if word.strip(' ')]
             if not hypothesis or not target:
                 continue
-            for key, value in Rouge().get_scores(' '.join(hypothesis), ' '.join(target))[0].items():
+            for key, value in rouge.get_scores(' '.join(hypothesis), ' '.join(target))[0].items():
                 scores[key].append(value['f'])
             scores['bleu-4'].append(
                 sentence_bleu([target], hypothesis, smoothing_function=SmoothingFunction().method3))

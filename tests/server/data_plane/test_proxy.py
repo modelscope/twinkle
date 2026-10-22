@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 
 from twinkle.server.data_plane.proxy import DataPlaneProxy
-from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
-from twinkle_client.types import DataRef
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
+from twinkle.protocol.types import DataRef
 
 
 class _Response:

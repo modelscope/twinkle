@@ -25,6 +25,7 @@ import json
 import os
 import posixpath
 import shlex
+import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -205,6 +206,9 @@ class AgentEnv(Env):
         self._custom_tools: List[ToolInfo] = []
         self._custom_handlers: Dict[str, Callable[['AgentEnv', Dict[str, Any]], str]] = {}
         self._sandbox = None
+        self._execution_lock = threading.RLock()
+        self._active_commands = 0
+        self._uncertain_execution = None
 
     # ------------------------------------------------------------------
     # Tool registration
@@ -418,7 +422,17 @@ class AgentEnv(Env):
         tools.extend(self._custom_tools)
         return tools
 
+    def ensure_idle(self) -> None:
+        with self._execution_lock:
+            if self._active_commands:
+                raise RuntimeError('AgentEnv 命令仍在执行。')
+            if self._uncertain_execution is not None:
+                raise RuntimeError('AgentEnv 服务端执行是否已结束尚未确认；workspace 必须隔离。') from self._uncertain_execution
+
     def close(self) -> None:
+        with self._execution_lock:
+            if self._active_commands:
+                raise RuntimeError('AgentEnv 仍有未结束的命令，不能关闭或复用。')
         self._kill_sandbox()
 
     # ------------------------------------------------------------------
@@ -490,9 +504,14 @@ class AgentEnv(Env):
         check reads the status, and :meth:`healthy` reads it to decide whether
         this sandbox still exists.
         """
+        self.ensure_idle()
+        with self._execution_lock:
+            self._active_commands += 1
         try:
             result = self._sandbox.commands.run(command, cwd=cwd, timeout=timeout)
-            return int(result.exit_code or 0), self._merge(result.stdout, result.stderr)
+            if result.exit_code is None:
+                raise RuntimeError('AgentEnv 未返回最终命令退出码。')
+            return int(result.exit_code), self._merge(result.stdout, result.stderr)
         except Exception as e:  # noqa
             # The SDK raises on a non-zero exit, carrying the streams on the
             # exception; that is the script's own failure and belongs to the
@@ -503,10 +522,15 @@ class AgentEnv(Env):
                 # silently reported the exception's own repr as its output, which
                 # reads like something the script printed.
                 return int(exit_code), self._merge(getattr(e, 'stdout', ''), getattr(e, 'stderr', ''))
+            with self._execution_lock:
+                self._uncertain_execution = e
             if 'timeout' in type(e).__name__.lower():
-                # No traceback to explain itself with, so the output has to.
-                return TIMEOUT_EXIT_CODE, f'execution timed out after {timeout}s (possible infinite loop)'
+                # 等待超时不能证明服务端已停止；ensure_idle 将阻止租约复用。
+                return TIMEOUT_EXIT_CODE, f'execution timed out after {timeout}s (cleanup unconfirmed)'
             return 1, f'{type(e).__name__}: {e}'
+        finally:
+            with self._execution_lock:
+                self._active_commands -= 1
 
     @staticmethod
     def _merge(stdout: Optional[str], stderr: Optional[str]) -> str:
@@ -521,10 +545,9 @@ class AgentEnv(Env):
     def _kill_sandbox(self) -> None:
         if self._sandbox is None:
             return
-        sandbox_id = self.sandbox_id
-        try:
-            self._sandbox.kill()
-        except Exception as e:  # noqa # best-effort: AgentENV auto-evicts on timeout anyway
-            logger.warning(f'AgentEnv failed to kill sandbox {sandbox_id}: {e}')
-        finally:
-            self._sandbox = None
+        result = self._sandbox.kill()
+        if result is not True:
+            raise RuntimeError(f'AgentEnv 未确认 sandbox {self.sandbox_id} 已终止；保留原句柄。')
+        self._sandbox = None
+        with self._execution_lock:
+            self._uncertain_execution = None

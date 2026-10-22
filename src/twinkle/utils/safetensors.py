@@ -134,6 +134,30 @@ class SafetensorLazyLoader:
             res[k] = LazyTensor(loader=partial(self._load_tensor, key=k))
         return res
 
+    def keys(self):
+        """The checkpoint's tensor keys -- the keyspace a streaming transform iterates over."""
+        return list(self._weight_map.keys())
+
+    def partition_keyspace(self, world_size: int):
+        """Split the keyspace into ``world_size`` disjoint key lists for data-parallel streaming.
+
+        Keys are grouped by module path (the key minus its trailing ``.weight``/``.bias``/... segment)
+        and whole groups are dealt round-robin, so every tensor of one module lands on the same worker:
+        a per-module transform (a LoRA merge folds a module's weight and bias together) then never needs
+        a tensor held by another worker. The parts are pairwise disjoint and their union is the full
+        keyspace; ``world_size <= 1`` returns the whole keyspace as a single part.
+        """
+        if world_size <= 1:
+            return [self.keys()]
+        groups = {}
+        for key in self._weight_map:
+            module_path = key.rsplit('.', 1)[0] if '.' in key else key
+            groups.setdefault(module_path, []).append(key)
+        partitions = [[] for _ in range(world_size)]
+        for index, module_keys in enumerate(groups.values()):
+            partitions[index % world_size].extend(module_keys)
+        return partitions
+
     def _load_tensor(self, key):
         filename = self._weight_map[key]
         file_handle = self._open_file(filename)
@@ -157,6 +181,9 @@ class StreamingSafetensorSaver:
         max_shard_size: str = '5GB',
         save_rank: Literal['master', 'last'] = 'last',
         is_peft_format: bool = False,
+        *,
+        rank: int = None,
+        world_size: int = 1,
     ) -> None:
         self.save_dir = save_dir
         if isinstance(max_shard_size, str):
@@ -177,12 +204,24 @@ class StreamingSafetensorSaver:
         self.total_size = 0
         self.shard_index = 1
         self.weight_map = {}
-        self.is_save_rank = is_last_rank() if save_rank == 'last' else is_master()
+        # Multi-writer mode: an explicit (rank, world_size) makes every rank write its OWN shards under
+        # rank-tagged names, and finalize() returns a manifest for the driver to assemble into one global
+        # index (see assemble_sharded_index). It is decoupled from the env-based is_master/is_last_rank,
+        # which every Ray worker would read as True (no torchrun env), so it cannot pick a single writer.
+        self.rank = rank
+        self.world_size = world_size
+        self.multi_writer = rank is not None and world_size > 1 and not is_peft_format
+        if self.multi_writer:
+            self.is_save_rank = True
+        else:
+            self.is_save_rank = is_last_rank() if save_rank == 'last' else is_master()
         self.is_peft_format = is_peft_format
         if self.is_save_rank:
             os.makedirs(save_dir, exist_ok=True)
         self._previous_model_files = set()
-        if self.is_save_rank and not self.is_peft_format:
+        # Stale-file cleanup is a whole-directory concern; in multi-writer mode the driver does it once
+        # in assemble_sharded_index (a per-rank glob would also catch the other ranks' in-flight shards).
+        if self.is_save_rank and not self.is_peft_format and not self.multi_writer:
             self._previous_model_files = set(Path(save_dir).glob('model*.safetensors'))
             index_path = Path(save_dir) / 'model.safetensors.index.json'
             if index_path.exists():
@@ -208,6 +247,10 @@ class StreamingSafetensorSaver:
         if shard_filename is None:
             if self.is_peft_format:
                 shard_filename = 'adapter_model.safetensors'
+            elif self.multi_writer:
+                # Rank-tagged so concurrent Ray workers writing one save_dir never collide; `@@@@@` is
+                # this rank's local shard total, unknown until finalize().
+                shard_filename = f'model-{self.rank:05d}-{self.shard_index:05d}-of-@@@@@.safetensors'
             else:
                 shard_filename = f'model-{self.shard_index:05d}-of-?????.safetensors'
         shard_path = os.path.join(self.save_dir, shard_filename)
@@ -227,6 +270,8 @@ class StreamingSafetensorSaver:
             self._save_current_shard()
         if self.is_peft_format:
             return
+        if self.multi_writer:
+            return self._finalize_multi_writer()
         total_shards = self.shard_index - 1
         # rename `?????`
         for i in range(1, total_shards + 1):
@@ -245,7 +290,7 @@ class StreamingSafetensorSaver:
                 new_filename = filename.replace('?????', f'{total_shards:05d}')
                 updated_weight_map[key] = new_filename
 
-            self._save_index(updated_weight_map)
+            self._write_index(self.save_dir, updated_weight_map, self.total_size)
 
         if total_shards == 1:
             current_files = {Path(self.save_dir) / 'model.safetensors'}
@@ -258,9 +303,72 @@ class StreamingSafetensorSaver:
         for stale_path in self._previous_model_files - current_files:
             stale_path.unlink(missing_ok=True)
 
-    def _save_index(self, weight_map):
-        index = {'metadata': {'total_size': self.total_size}, 'weight_map': weight_map}
+    def _finalize_multi_writer(self):
+        """Rename this rank's shards to their local totals and return a manifest for the driver.
 
-        index_path = os.path.join(self.save_dir, 'model.safetensors.index.json')
+        Each rank only sees its own shards, so it cannot write the index (the global shard count and the
+        key->file map span every rank). The driver collects all manifests and calls
+        :meth:`assemble_sharded_index` to renumber them into one globally-contiguous layout. The returned
+        ``files`` are ordered by local shard index, and ``weight_map`` maps each key to its file in
+        ``files`` (both use the rank-tagged local name, the input the driver renumbers from).
+        """
+        local_total = self.shard_index - 1
+        files = []
+        for i in range(1, local_total + 1):
+            temp_name = f'model-{self.rank:05d}-{i:05d}-of-@@@@@.safetensors'
+            final_name = f'model-{self.rank:05d}-{i:05d}-of-{local_total:05d}.safetensors'
+            old_path = os.path.join(self.save_dir, temp_name)
+            new_path = os.path.join(self.save_dir, final_name)
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+            files.append(final_name)
+        weight_map = {key: name.replace('@@@@@', f'{local_total:05d}') for key, name in self.weight_map.items()}
+        return {'rank': self.rank, 'files': files, 'weight_map': weight_map, 'total_size': self.total_size}
+
+    @staticmethod
+    def assemble_sharded_index(save_dir, manifests):
+        """Renumber every rank's shards into one global HF layout and write the single index.
+
+        ``manifests`` is the list returned by each rank's :meth:`_finalize_multi_writer`. Files are
+        concatenated in rank order, so the ``g``-th file across all ranks becomes global shard ``g``,
+        renamed to ``model-{g:05d}-of-{global_total:05d}.safetensors``; the merged weight_map is rewritten
+        to those new names. Stale ``model*.safetensors`` from a previous run are removed here -- the
+        whole-directory cleanup each rank deliberately skipped (a per-rank glob would also catch the other
+        ranks' in-flight shards).
+        """
+        manifests = sorted(manifests, key=lambda manifest: manifest['rank'])
+        ordered = [name for manifest in manifests for name in manifest['files']]
+        global_total = len(ordered)
+        total_size = sum(manifest['total_size'] for manifest in manifests)
+
+        if global_total == 1:
+            rename_map = {ordered[0]: 'model.safetensors'}
+        else:
+            rename_map = {name: f'model-{g:05d}-of-{global_total:05d}.safetensors' for g, name in enumerate(ordered, 1)}
+        for old_name, new_name in rename_map.items():
+            old_path = os.path.join(save_dir, old_name)
+            new_path = os.path.join(save_dir, new_name)
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+
+        if global_total > 1:
+            weight_map = {}
+            for manifest in manifests:
+                for key, old_name in manifest['weight_map'].items():
+                    weight_map[key] = rename_map[old_name]
+            StreamingSafetensorSaver._write_index(save_dir, weight_map, total_size)
+            current_files = set(rename_map.values()) | {'model.safetensors.index.json'}
+        else:
+            current_files = set(rename_map.values())
+            # A previous multi-shard run may leave an index that no longer matches this single file.
+            (Path(save_dir) / 'model.safetensors.index.json').unlink(missing_ok=True)
+        for stale_path in Path(save_dir).glob('model*.safetensors'):
+            if stale_path.name not in current_files:
+                stale_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _write_index(save_dir, weight_map, total_size):
+        index = {'metadata': {'total_size': total_size}, 'weight_map': weight_map}
+        index_path = os.path.join(save_dir, 'model.safetensors.index.json')
         with open(index_path, 'w') as f:
             json.dump(index, f, indent=2)

@@ -24,9 +24,10 @@ import json
 import pytest
 import re
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
+from twinkle.template.base import Template
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 from twinkle_agentic.rollout.trace import TraceWriter
 from twinkle_agentic.tools.base import Tool
@@ -101,9 +102,16 @@ class FakeTokenizer:
 
 
 class FakeTemplate:
-    """Minimal Template that mirrors the parts MultiTurnRollout touches."""
+    """Minimal Template that mirrors the parts MultiTurnRollout touches; the delta is twinkle's own."""
     model_id = 'qwen-fake'
     truncation_strategy = 'right'
+    enable_thinking = False
+    render_delta = Template.render_delta
+    decode_tool_calls = staticmethod(Template.decode_tool_calls)
+
+    @staticmethod
+    def _engine_input_ids(input_ids):
+        return list(input_ids)
 
     def __init__(self, tokenizer: FakeTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -117,6 +125,9 @@ class FakeTemplate:
         pif['input_ids'] = input_ids
         pif['labels'] = [-100] * len(input_ids)  # inference mode
         return self._invoke_post_pipeline([pif])[0]
+
+    def finalize_appended_features(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._invoke_post_pipeline(inputs)
 
     def _invoke_post_pipeline(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
@@ -434,120 +445,6 @@ def _user_traj(text: str = 'hi') -> dict[str, Any]:
 
 def _tool_call_text(name: str, arguments: dict[str, Any]) -> str:
     return '<tool_call>' + json.dumps({'name': name, 'arguments': arguments}) + '</tool_call>'
-
-
-class FakeTurnController:
-    """Minimal external scheduler adapter used to exercise Twinkle's shared loop."""
-
-    def __init__(self):
-        self.started = []
-        self.closed = []
-
-    @staticmethod
-    def create_state(trajectory):
-        return {'id': trajectory['id'], 'finish_after': trajectory['finish_after']}
-
-    @staticmethod
-    def sampler_input(state):
-        return {'id': state['id']}
-
-    def start(self, states):
-        self.started = list(states)
-
-    @staticmethod
-    def on_turn(states, sequences, current_turn, forced_stops):
-        updates = []
-        for state, sequence, forced_stop in zip(states, sequences, forced_stops, strict=True):
-            tokens = list(sequence.tokens)
-            updates.append({
-                'done': forced_stop or current_turn >= state['finish_after'],
-                'response_token_ids': tokens,
-                'response_loss_mask': [1] * len(tokens),
-                'rollout_logprobs': [values[0][1] for values in sequence.logprobs],
-                'rollout_infos': {'last_turn': current_turn},
-            })
-        return updates
-
-    @staticmethod
-    def finalize(state, response_token_ids, response_loss_mask):
-        flat_tokens = [token for turn in response_token_ids for token in turn]
-        flat_masks = [mask for turn in response_loss_mask for mask in turn]
-        return {
-            'encoded': {
-                'input_ids': flat_tokens,
-                'labels': [token if mask else -100 for token, mask in zip(flat_tokens, flat_masks, strict=True)],
-            },
-            'controller_id': state['id'],
-        }
-
-    def close(self, states):
-        self.closed = list(states)
-
-
-class FakeControlledSampler:
-
-    def __init__(self, fail_on_call=None):
-        self.calls = []
-        self.fail_on_call = fail_on_call
-
-    def sample(self, inputs, sampling_params=None):
-        call = len(self.calls) + 1
-        self.calls.append((list(inputs), sampling_params))
-        if call == self.fail_on_call:
-            raise RuntimeError('controlled sampler failure')
-        token_count = min(2, sampling_params.max_tokens) if sampling_params.max_tokens is not None else 2
-        responses = []
-        for index, _ in enumerate(inputs):
-            tokens = [call * 100 + index * 10 + offset for offset in range(token_count)]
-            logprobs = [[(token, -float(call))] for token in tokens]
-            responses.append(SampleResponse(sequences=[SampledSequence('stop', tokens, logprobs=logprobs)]))
-        return responses
-
-
-# =============================================================================
-# Tests: controller-driven state machine
-# =============================================================================
-def test_turn_controller_uses_shared_batched_loop_and_preserves_order():
-    sampler = FakeControlledSampler()
-    controller = FakeTurnController()
-    rollout = MultiTurnRollout(
-        sampler=sampler, template=object(), turn_controller=controller, max_turns=3)
-
-    outputs = rollout([{'id': 'first', 'finish_after': 1}, {'id': 'second', 'finish_after': 2}])
-
-    assert [[item['id'] for item in inputs] for inputs, _ in sampler.calls] == [['first', 'second'], ['second']]
-    assert [output['controller_id'] for output in outputs] == ['first', 'second']
-    assert [output['turns'] for output in outputs] == [1, 2]
-    assert outputs[0]['rollout_infos'] == {'last_turn': 1, 'num_turns': 1}
-    assert outputs[1]['rollout_infos'] == {'last_turn': 2, 'num_turns': 2}
-    assert all(len(output['logprobs']) == _count_trainable(output['encoded']['labels']) for output in outputs)
-    assert controller.started == controller.closed
-
-
-def test_turn_controller_total_budget_and_failure_cleanup():
-    controller = FakeTurnController()
-    sampler = FakeControlledSampler()
-    rollout = MultiTurnRollout(
-        sampler=sampler,
-        template=object(),
-        turn_controller=controller,
-        max_turns=None,
-        completion_length_limit_scope='total')
-    output = rollout(
-        [{'id': 'budget', 'finish_after': 3}], sampling_params=SamplingParams(max_tokens=3, logprobs=1))[0]
-    assert [params.max_tokens for _, params in sampler.calls] == [3, 1]
-    assert output['truncated'] is True
-    assert output['turns'] == 2
-
-    failing_controller = FakeTurnController()
-    failing_rollout = MultiTurnRollout(
-        sampler=FakeControlledSampler(fail_on_call=2),
-        template=object(),
-        turn_controller=failing_controller,
-        max_turns=3)
-    with pytest.raises(RuntimeError, match='controlled sampler failure'):
-        failing_rollout([{'id': 'failure', 'finish_after': 3}])
-    assert [state['id'] for state in failing_controller.closed] == ['failure']
 
 
 # =============================================================================
@@ -913,9 +810,9 @@ def test_extra_trajectory_fields_pass_through(make_rollout, sampler):
 # =============================================================================
 # Tests: constructor validation
 # =============================================================================
-def test_rejects_none_template(sampler, tool_manager):
-    with pytest.raises(ValueError, match='Template'):
-        MultiTurnRollout(sampler=sampler, template=None, tool_manager=tool_manager)
+def test_none_template_is_accepted_for_message_only_rollout(sampler, tool_manager):
+    rollout = MultiTurnRollout(sampler=sampler, template=None, tool_manager=tool_manager)
+    assert rollout.template is None
 
 
 def test_none_tool_manager_accepted_at_construction(sampler, template):
@@ -1412,7 +1309,7 @@ def test_appending_a_user_turn_keeps_the_history_ids_and_adds_only_the_new_block
     messages = [{'role': 'user', 'content': 'do work'},
                 {'role': 'assistant', 'content': '<think>reasoning</think>Done.'}]
     pif = template.encode({'messages': messages})
-    pif['labels'] = [7] * len(pif['input_ids'])  # stand-in for "these were sampled"
+    pif['labels'] = [7] * (len(pif['input_ids']) - 1) + [-100]  # sampled labels in output order
     before_ids = list(pif['input_ids'])
 
     out = extend_with_bridge(pif, [{'role': 'user', 'content': 'write the checks'}], template)

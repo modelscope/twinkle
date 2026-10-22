@@ -14,7 +14,7 @@ for data in dataloader:
 可以看出 dataloader 包含 `__iter__` 方法，返回一个迭代器出来。在 DDP、TP、Ulysses 等不同训练条件下，由于每个 rank 取出的数据不同，因此一般 sampler 有多种实现，较为复杂。
 
 在 Twinkle 中，我们采取了一个非常简单直接的方案，将 `DeviceMesh` 传递给 DataLoader，由于 DeviceMesh 中包含了集群结构，因此 DeviceMesh 可以给出所有 rank 需要的数据分片。
-因此我们额外开发了 `DeviceMeshSampler` 和 `DeviceMeshFetcher`，分别用于普通数据集和流式数据集两类的取样工作。
+因此我们额外开发了 `ShardedBatchSampler` 和 `StreamShardDataset`，分别用于普通数据集和流式数据集两类的取样工作。
 另外，由于 LazyDataset 的存在，导致数据集实际取出数据时可能包含了无效数据或者抛出异常，因此提供了 `RetrySampler` 来进行跳过和重试。
 
 DataLoader 的使用非常简单：

@@ -71,17 +71,11 @@ def _register_module_tree(model: torch.nn.Module, ctx) -> None:
 
 def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_position_or_past_key_values, *args,
                              **kwargs):
-    if has_signature_parameter(fn, 'cache_position'):
-        return call_with_supported_kwargs(
-            fn,
-            config,
-            input_embeds,
-            attention_mask,
-            cache_position_or_past_key_values,
-            *args,
-            **kwargs,
-        )
-    if cache_position_or_past_key_values is None and 'past_key_values' in kwargs:
+    # Newer transformers replaces cache_position with q_length/q_offset kwargs; on the no-cache prefill
+    # path the positional cache_position we supply is not accepted and must be dropped.
+    drop_positional = (not has_signature_parameter(fn, 'cache_position') and cache_position_or_past_key_values is None
+                       and 'past_key_values' in kwargs)
+    if drop_positional:
         return call_with_supported_kwargs(fn, config, input_embeds, attention_mask, *args, **kwargs)
     return call_with_supported_kwargs(
         fn,
@@ -1192,14 +1186,16 @@ class SequenceParallelStrategy:
 
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         from twinkle.utils.platforms import Platform
-        from ..optimizer_state import remap_optimizer_state_names
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
         if Platform.is_master():
             optim_state = optimizer.state_dict()
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
-        from ..optimizer_state import remap_optimizer_state_names
-        optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
+        # weights_only=True: optimizer state is tensors + plain containers (verified), so a
+        # hostile checkpoint's pickle payload never reaches an unrestricted unpickler.
+        optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
         remap_optimizer_state_names(optim_state, param_name_mapping or {})
         optimizer.load_state_dict(optim_state)

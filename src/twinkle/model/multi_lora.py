@@ -1,6 +1,6 @@
 import re
 import torch
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -152,6 +152,19 @@ class MultiLora:
     def patch_target_parameters(self, module, target_parameters):
         self.target_parameter_manager.patch(module, target_parameters)
 
+    @staticmethod
+    def _autocast_adapter_dtype(peft_model, adapter_name: str) -> None:
+        """Apply PEFT's own adapter dtype autocast to one preallocated slot.
+
+        ``PeftModel.__init__`` runs ``_cast_adapter_dtype`` (fp16/bf16 -> fp32) for the
+        slot created at construction time, but ``PeftModel.add_adapter`` does not. Calling
+        it explicitly keeps every preallocated slot on the same dtype PEFT would produce,
+        instead of forcing fp32 ourselves. It is a no-op for an fp32 base.
+        """
+        base = getattr(peft_model, 'base_model', None)
+        if base is not None and hasattr(base, '_cast_adapter_dtype'):
+            base._cast_adapter_dtype(adapter_name=adapter_name, autocast_adapter_dtype=True)
+
     @contextmanager
     def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
         self.activate_adapter(tenant_adapter_name)
@@ -196,12 +209,14 @@ class MultiLora:
                 _before(_module)
         else:
             _before(self.module)
-        yield adapter_name
-        if isinstance(self.module, list):
-            for _module in self.module:
-                _after(_module)
-        else:
-            _after(self.module)
+        try:
+            yield adapter_name
+        finally:
+            if isinstance(self.module, list):
+                for _module in self.module:
+                    _after(_module)
+            else:
+                _after(self.module)
         # self.deactivate_adapter()
 
     def check_length(
@@ -398,8 +413,6 @@ class MultiLora:
             def _megatron_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
                 from megatron.core.extensions.transformer_engine import (TEGroupedLinear,
                                                                          TELayerNormColumnParallelLinear, TELinear)
-                from megatron.core.tensor_parallel import (gather_from_sequence_parallel_region,
-                                                           scatter_to_sequence_parallel_region)
                 from megatron.core.transformer.moe.router import TopKRouter
 
                 previous_dtype = x.dtype
@@ -425,9 +438,6 @@ class MultiLora:
                     raise ValueError(f'Unsupported base layer type: {type(self.base_layer)}')
 
                 if not isinstance(self.base_layer, TopKRouter) and not self.disable_adapters and not self.merged:
-                    if self.sequence_parallel and self.base_layer.parallel_mode == 'column':
-                        x = gather_from_sequence_parallel_region(x)
-
                     for active_adapter in self.active_adapters:
                         if active_adapter not in self.lora_A.keys():
                             continue
@@ -443,55 +453,30 @@ class MultiLora:
                         scaling = _lora.tenant_config.lora_alpha / (
                             _lora.tenant_config.r**0.5 if _lora.tenant_config.use_rslora else _lora.tenant_config.r)
 
-                        def _lora_A(x, *args, **kwargs):
-                            if isinstance(lora_A, TEGroupedLinear):
-
-                                def _get_weight_tensors(self):
-                                    tensors = self._get_weight_tensors_origin()
-                                    return [t[:_lora.tenant_config.r, :].contiguous() for t in tensors]
-
-                                lora_A._get_weight_tensors_origin = lora_A._get_weight_tensors
-                                lora_A._get_weight_tensors = MethodType(_get_weight_tensors, lora_A)
-                                output = lora_A(x, *args, **kwargs)
-                                lora_A._get_weight_tensors = lora_A._get_weight_tensors_origin
-                                delattr(lora_A, '_get_weight_tensors_origin')
-                                return output
-                            else:
-                                return torch.nn.functional.linear(
-                                    x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
-
-                        def _lora_B(x, *args, **kwargs):
-                            if isinstance(lora_B, TEGroupedLinear):
-
-                                def _get_weight_tensors(self):
-                                    tensors = self._get_weight_tensors_origin()
-                                    return [t[:, :_lora.tenant_config.r].contiguous() for t in tensors]
-
-                                lora_B._get_weight_tensors_origin = lora_B._get_weight_tensors
-                                lora_B._get_weight_tensors = MethodType(_get_weight_tensors, lora_B)
-                                output = lora_B(x, *args, **kwargs)
-                                lora_B._get_weight_tensors = lora_B._get_weight_tensors_origin
-                                delattr(lora_B, '_get_weight_tensors_origin')
-                                return output
-                            else:
-                                return torch.nn.functional.linear(
-                                    x, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
-
                         dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
                         x = x.to(dtype)
 
-                        lora_result = _lora_A(dropout(x), *args, **kwargs)
-                        if isinstance(lora_result, tuple):
-                            lora_result = lora_result[0]
-
-                        lora_result = _lora_B(lora_result, *args, **kwargs)
-                        if isinstance(lora_result, tuple):
-                            lora_result = lora_result[0]
-
+                        fp8_context = nullcontext()
+                        if getattr(self.config, 'fp8_param', False):
+                            import transformer_engine.pytorch as te
+                            fp8_context = te.fp8_autocast(enabled=False)
+                        with fp8_context:
+                            # Keep the backend layer's TP/SP communication and parameter
+                            # identities. Mask inactive ranks between A and B instead of
+                            # replacing parallel layers with local linear operations.
+                            lora_result = (
+                                lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(
+                                    dropout(x)))
+                            if isinstance(lora_result, tuple):
+                                lora_result = lora_result[0]
+                            lora_result = torch.nn.functional.pad(lora_result[..., :_lora.tenant_config.r],
+                                                                  (0, _self.max_r - _lora.tenant_config.r))
+                            lora_result = (
+                                lora_B(lora_result, *args, **kwargs)
+                                if isinstance(lora_B, TEGroupedLinear) else lora_B(lora_result))
+                            if isinstance(lora_result, tuple):
+                                lora_result = lora_result[0]
                         lora_result = lora_result * scaling
-
-                        if self.sequence_parallel and self.base_layer.parallel_mode == 'row':
-                            lora_result = scatter_to_sequence_parallel_region(lora_result)
 
                         result = result + lora_result
 
@@ -530,6 +515,7 @@ class MultiLora:
             def _patch_peft(_module):
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     _peft_model: PeftModel = get_peft_model(
                         _module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
@@ -546,6 +532,7 @@ class MultiLora:
                 _config = deepcopy(config)
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     # TODO first wrap needs parse target_modules, need to fix later
                     if _config.target_modules:

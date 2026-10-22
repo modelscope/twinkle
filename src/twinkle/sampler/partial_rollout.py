@@ -1,28 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Engine-agnostic partial rollout (interrupt/resume) for the core samplers.
-
-Deep-buffer async RL republishes the policy weights while generations are still in flight. With in-place
-weight sync the sampler holds a single live weight copy, so an in-flight generation would otherwise decode
-its second half under half-updated weights -- its logprobs then match no consistent policy version and
-importance-sampling correction cannot repair them. Partial rollout fixes this: on republish the driver
-aborts every in-flight request (:meth:`PartialRolloutMixin.abort_all_inflight`), each aborted generation
-comes back with ``stop_reason='abort'`` plus the tokens it produced so far, and the resume loop below
-continues it from ``new_input_feature`` on the fresh weights, merging the segments at the end.
-
-The abort/resume *data contract* is already engine-agnostic -- ``SampledSequence`` carries ``stop_reason``
-and ``new_input_feature``, and both the vLLM and SGLang engines map an aborted request to
-``stop_reason='abort'`` -- so this mixin holds the one shared resume/merge loop plus the in-flight request
-registry, and each backend supplies only two engine hooks: ``_sample_single`` (already present) and an
-``async def abort_request(request_id)`` on its engine wrapper. It lives here in the core ``twinkle.sampler``
-package so the plain :class:`~twinkle.sampler.vllm_sampler.vLLMSampler` /
-:class:`~twinkle.sampler.sglang_sampler.SGLangSampler` and the higher-level ``twinkle_agentic``
-TransferQueue samplers share one implementation, so a resume-logic fix never has to be mirrored across
-backends or layers.
-
-Contract for a concrete subclass: be decorated with ``@remote_class()``, own a running background event
-loop at ``self._async_loop``, initialise ``self._inflight_request_ids`` to a set, expose ``self.engine``
-with an ``async def abort_request(request_id)``, and implement ``async def _sample_single(...)``.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +8,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from twinkle import get_logger, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.perf import timed
 
 logger = get_logger()
 
@@ -94,6 +71,36 @@ class PartialRolloutMixin:
         """Abort one in-flight engine request; it then finishes with ``stop_reason='abort'`` + partials."""
         await self.engine.abort_request(request_id)
 
+    async def _sample_engine_request(self, request_id: str, coroutine) -> SampleResponse:
+        """On caller cancellation abort explicitly, and unregister the request only after the real engine call ends."""
+        try:
+            await self._wait_generation_gate()
+            task = asyncio.create_task(coroutine)
+        except BaseException:
+            coroutine.close()
+            raise
+        self._register_inflight(request_id)
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            async def cleanup():
+                try:
+                    await self._abort_request(request_id)
+                except BaseException as error:
+                    logger.warning('Failed to abort engine request %s; waiting for it to end naturally: %s', request_id, error)
+                await asyncio.gather(task, return_exceptions=True)
+
+            cleanup_task = asyncio.create_task(cleanup())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cleanup_task.result()
+            raise
+        finally:
+            self._unregister_inflight(request_id)
+
     async def _abort_all_inflight(self) -> int:
         """Abort every in-flight request on this worker; returns how many abort calls were issued.
 
@@ -112,6 +119,7 @@ class PartialRolloutMixin:
         return aborted
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @timed
     def abort_all_inflight(self) -> dict[str, int]:
         """Abort every in-flight generation on this DP worker (called on an in-place weight republish).
 
@@ -122,6 +130,69 @@ class PartialRolloutMixin:
         """
         future = asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop)
         return {'aborted': future.result()}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def _generation_count(self):
+        """Idle probe input: in-flight engine requests plus active partial-rollout loops on this worker.
+
+        Read by ``WorkerPool.workers_idle`` (driver side) to decide whether an actor can retire; the
+        broadcast is exempted from the cw barrier via the control list there.
+        """
+        return (len(getattr(self, '_inflight_request_ids', ()))
+                + getattr(self, '_active_partial_rollouts', 0))
+
+    def _ensure_pause_state(self) -> None:
+        if getattr(self, '_generation_resume_gate', None) is None:
+            self._generation_resume_gate = asyncio.Event()
+            self._generation_resume_gate.set()
+            self._generation_paused = False
+            self._active_partial_rollouts = 0
+            self._rollouts_waiting_at_gate = 0
+
+    async def _wait_generation_gate(self) -> None:
+        self._ensure_pause_state()
+        if self._generation_resume_gate.is_set():
+            return
+        self._rollouts_waiting_at_gate += 1
+        try:
+            await self._generation_resume_gate.wait()
+        finally:
+            self._rollouts_waiting_at_gate -= 1
+
+    async def _pause_generation(self) -> int:
+        self._ensure_pause_state()
+        if self._generation_paused:
+            while (getattr(self, '_inflight_request_ids', None)
+                   or self._rollouts_waiting_at_gate < self._active_partial_rollouts):
+                await asyncio.sleep(0.001)
+            return 0
+        self._generation_paused = True
+        self._generation_resume_gate.clear()
+        aborted = await self._abort_all_inflight()
+        # Every unfinished rollout must leave engine decode and stop at the closed resume gate. Requests that
+        # finish naturally decrement _active_partial_rollouts instead and therefore do not delay the barrier.
+        while (getattr(self, '_inflight_request_ids', None)
+               or self._rollouts_waiting_at_gate < self._active_partial_rollouts):
+            await asyncio.sleep(0.001)
+        return aborted
+
+    async def _resume_generation(self) -> None:
+        self._ensure_pause_state()
+        self._generation_paused = False
+        self._generation_resume_gate.set()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @timed
+    def pause_generation(self) -> dict[str, int]:
+        """Stop decode at a resumable barrier before a shared sampler releases its GPUs."""
+        future = asyncio.run_coroutine_threadsafe(self._pause_generation(), self._async_loop)
+        return {'aborted': future.result()}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    def resume_generation(self) -> None:
+        """Release requests paused by :meth:`pause_generation`; idempotent."""
+        future = asyncio.run_coroutine_threadsafe(self._resume_generation(), self._async_loop)
+        future.result()
 
     # ------------------------------------------------------------------
     # Resume / merge kernel
@@ -152,6 +223,7 @@ class PartialRolloutMixin:
                     logprobs=logprobs,
                     decoded=self.template.decode(tokens),
                     new_input_feature=final_sequence.new_input_feature,
+                    new_state=final_sequence.new_state,
                     routed_experts=final_sequence.routed_experts,
                 )
             ],
@@ -162,7 +234,8 @@ class PartialRolloutMixin:
         original_input: dict[str, Any],
         sampling_params: SamplingParams,
         *,
-        run_attempt: Callable[[Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        run_attempt: Callable[[Any, Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        original_state: Any = None,
         allow_partial_rollout: bool = False,
         max_retries: int = 0,
         retry_delay_s: float = 0.0,
@@ -179,55 +252,69 @@ class PartialRolloutMixin:
         stop ends the loop, merging any accumulated segments first.
         """
         current_input = original_input
+        current_state = original_state
         partial_responses: list[SampleResponse] = []
         partial_states: list[Any] = []
         generated_tokens = 0
         last_error: Optional[Exception] = None
         was_aborted = False
         resumed_partial_output = False
-
-        for attempt in range(max_retries + 1):
-            attempt_params = copy(sampling_params)
-            if allow_partial_rollout and attempt_params.max_tokens is not None:
-                attempt_params.max_tokens -= generated_tokens
-            try:
-                response, attempt_state = await run_attempt(current_input, attempt_params, attempt)
-                sequence = response.sequences[0]
-            except Exception as exc:
-                last_error = exc
-            else:
-                if sequence.stop_reason not in {'abort', 'error'}:
-                    if not allow_partial_rollout or not partial_responses:
-                        return PartialRolloutOutcome(response, (attempt_state, ), attempt + 1, was_aborted,
-                                                     resumed_partial_output)
-                    partial_responses.append(response)
-                    partial_states.append(attempt_state)
-                    return PartialRolloutOutcome(
-                        self._merge_partial_responses(partial_responses), tuple(partial_states), attempt + 1,
-                        was_aborted, resumed_partial_output)
-
-                last_error = RuntimeError(f'generation stopped with {sequence.stop_reason}')
-                was_aborted = was_aborted or sequence.stop_reason == 'abort'
-                if allow_partial_rollout and sequence.tokens:
-                    resumed_partial_output = True
-                    partial_responses.append(response)
-                    partial_states.append(attempt_state)
-                    generated_tokens += len(sequence.tokens)
-                    current_input = sequence.new_input_feature
-                    if sampling_params.max_tokens is not None and generated_tokens >= sampling_params.max_tokens:
+        attempts = 0
+        retries_used = 0
+        self._ensure_pause_state()
+        self._active_partial_rollouts += 1
+        try:
+            while retries_used <= max_retries:
+                await self._wait_generation_gate()
+                attempt_params = copy(sampling_params)
+                if allow_partial_rollout and attempt_params.max_tokens is not None:
+                    attempt_params.max_tokens -= generated_tokens
+                attempt = attempts
+                attempts += 1
+                handover_abort = False
+                try:
+                    response, attempt_state = await run_attempt(current_input, current_state, attempt_params, attempt)
+                    sequence = response.sequences[0]
+                except Exception as exc:
+                    last_error = exc
+                else:
+                    if sequence.stop_reason not in {'abort', 'error'}:
+                        if not allow_partial_rollout or not partial_responses:
+                            return PartialRolloutOutcome(response, (attempt_state, ), attempts, was_aborted,
+                                                         resumed_partial_output)
+                        partial_responses.append(response)
+                        partial_states.append(attempt_state)
                         return PartialRolloutOutcome(
-                            self._merge_partial_responses(partial_responses, stop_reason='length'),
-                            tuple(partial_states),
-                            attempt + 1,
-                            was_aborted,
-                            resumed_partial_output,
-                        )
-                elif not allow_partial_rollout:
-                    current_input = original_input
+                            self._merge_partial_responses(partial_responses), tuple(partial_states), attempts,
+                            was_aborted, resumed_partial_output)
 
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delay_s)
+                    last_error = RuntimeError(f'generation stopped with {sequence.stop_reason}')
+                    was_aborted = was_aborted or sequence.stop_reason == 'abort'
+                    handover_abort = sequence.stop_reason == 'abort' and self._generation_paused
+                    if allow_partial_rollout and sequence.tokens:
+                        resumed_partial_output = True
+                        partial_responses.append(response)
+                        partial_states.append(attempt_state)
+                        generated_tokens += len(sequence.tokens)
+                        current_input = sequence.new_input_feature
+                        current_state = sequence.new_state or current_state
+                        if sampling_params.max_tokens is not None and generated_tokens >= sampling_params.max_tokens:
+                            return PartialRolloutOutcome(
+                                self._merge_partial_responses(partial_responses, stop_reason='length'),
+                                tuple(partial_states), attempts, was_aborted, resumed_partial_output)
+                    elif not allow_partial_rollout:
+                        current_input = original_input
+                        current_state = original_state
 
-        error_detail = f'{type(last_error).__name__}: {last_error}'
-        error = RuntimeError(f'generation failed after {max_retries + 1} attempts; last error: {error_detail}')
-        raise error from last_error
+                # Resource handover is not a generation failure and does not consume the ordinary retry budget.
+                if handover_abort:
+                    continue
+                retries_used += 1
+                if retries_used <= max_retries:
+                    await asyncio.sleep(retry_delay_s)
+
+            error_detail = f'{type(last_error).__name__}: {last_error}'
+            error = RuntimeError(f'generation failed after {attempts} attempts; last error: {error_detail}')
+            raise error from last_error
+        finally:
+            self._active_partial_rollouts -= 1

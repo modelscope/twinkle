@@ -78,31 +78,8 @@ def my_reward(trajectories, ground_truths):
 rewards = my_reward(generated, ground_truths)
 ```
 
-## 使用场景
+## 训练集成
 
-奖励函数在 RLHF 训练的典型使用流程:
+采样器返回 `SampleResponse` 列表。先从 `response.sequences` 读取生成 token、解码并构造 `Trajectory`，再调用接受 trajectory 的奖励函数。每个 prompt 的标准答案需要按生成数量重复，保证奖励和优势值的顺序一致。
 
-```python
-from twinkle.sampler import vLLMSampler
-from twinkle.reward import MathReward
-from twinkle.advantage import GRPOAdvantage
-
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = MathReward()
-advantage_fn = GRPOAdvantage()
-
-for batch in dataloader:
-    # 1. 采样生成多个候选答案
-    response = sampler.sample(batch, num_samples=4)
-
-    # 2. 使用奖励函数评估质量
-    rewards = reward_fn(response.trajectories, batch.ground_truths)
-
-    # 3. 计算优势值
-    advantages = advantage_fn(rewards, num_generations=4)
-
-    # 4. 用优势值进行策略梯度更新
-    ...
-```
-
-> 奖励函数的设计对 RLHF 效果至关重要。好的奖励函数应该准确反映任务目标,并提供明确的学习信号。
+完整流程见 [GRPO 训练示例](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/short_math_grpo.py)。

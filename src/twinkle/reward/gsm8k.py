@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, List
 
-from twinkle.data_format import user_data_get
+from twinkle.data_format import ground_truth, last_assistant_text, user_data_get
 from twinkle.reward.base import Reward
 
 
@@ -51,13 +51,8 @@ class GSM8KAccuracyReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
             # Get model completion (last assistant message)
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
 
             # Get ground truth from user_data
             user_data = trajectory.get('user_data') or []
@@ -84,9 +79,11 @@ class GSM8KAccuracyReward(Reward):
 class MathVerifyAccuracyReward(Reward):
     """Use the same math-verify parsing and equivalence check as AReaL."""
 
-    def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True):
+    def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True,
+                 ground_truth_key: str = 'ground_truth'):
         self.precision = precision
         self.try_extract_without_anchor = try_extract_without_anchor
+        self.ground_truth_key = ground_truth_key
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         from math_verify.grader import verify
@@ -99,17 +96,14 @@ class MathVerifyAccuracyReward(Reward):
 
         rewards = []
         for trajectory in trajectories:
-            completion = ''
-            for message in reversed(trajectory.get('messages', [])):
-                if message.get('role') == 'assistant':
-                    completion = str(message.get('content', ''))
-                    break
-            ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', ''))
+            completion = last_assistant_text(trajectory)
+            gold = ground_truth(trajectory, self.ground_truth_key)
+            gold = '' if gold is None else str(gold)
             try:
                 # Disable signal-based timeouts because rollout rewards run on
                 # the sampler's background event-loop thread.
                 gold = parse(
-                    ground_truth,
+                    gold,
                     extraction_config=extraction_config,
                     parsing_timeout=None,
                 )
@@ -152,11 +146,7 @@ class GSM8KBrevityReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            completion = ''
-            for message in reversed(trajectory.get('messages', [])):
-                if message.get('role') == 'assistant':
-                    completion = message.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
             has_answer = _has_boxed(completion) or bool(re.search(r'####\s*[\-\d,\.]+', completion))
             if not has_answer:
                 rewards.append(0.0)
@@ -210,12 +200,7 @@ class GSM8KFormatReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
             has_answer = bool(_has_boxed(completion) or re.search(r'####\s*[\-\d,\.]+', completion))
             rewards.append(1.0 if has_answer else 0.0)
         return rewards

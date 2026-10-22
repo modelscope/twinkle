@@ -5,6 +5,7 @@ import os
 from typing import Type, TypeVar, Union
 
 from twinkle.infra import remote_class, remote_function
+from twinkle.perf import timed
 from twinkle.template import Template
 from .base import DatasetMeta
 from .iterable_dataset import IterableDataset
@@ -53,6 +54,7 @@ class IterablePackingDataset(IterableDataset):
                                                               'truncation_strategy==`split`')
 
     @remote_function()
+    @timed
     def pack_dataset(self):
         """Call to start packing dataset"""
         self._packed_called = True

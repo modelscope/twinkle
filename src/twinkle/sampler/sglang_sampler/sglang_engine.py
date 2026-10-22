@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""SGLang inference engine, the sglang counterpart of `vllm_engine.VLLMEngine`."""
 import inspect
 import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -547,12 +546,12 @@ class SGLangEngine(BaseSamplerEngine):
             return
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
-        tags = tags or self._offloaded_tags
+        requested = self._offloaded_tags if tags is None else tags
+        tags = [tag for tag in requested if tag in self._offloaded_tags]
         if not tags:
-            logger.warning('wake_up() called without a preceding sleep(); skipping.')
             return
         await self._manager.resume_memory_occupation(ResumeMemoryOccupationReqInput(tags=tags), None)
-        self._offloaded_tags = []
+        self._offloaded_tags = [tag for tag in self._offloaded_tags if tag not in tags]
 
     async def reset_prefix_cache(self) -> None:
         await self._manager.flush_cache()

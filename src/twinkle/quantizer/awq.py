@@ -29,6 +29,8 @@ class AwqQuantizer(CalibrationQuantizer):
                  lm_head_key: str = 'lm_head',
                  **kwargs):
         requires('autoawq')
+        if quant_bits not in (4, 8):
+            raise ValueError(f'awq does not support quant_bits: {quant_bits}, only 4 or 8.')
         super().__init__(
             quant_bits=quant_bits,
             group_size=group_size,

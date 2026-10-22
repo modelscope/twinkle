@@ -141,7 +141,7 @@ allocation 生成后，去掉 `--generate-allocation-only` 并补充数据集、
 Qwen3.5-9B 示例配置位于：
 
 ```text
-cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 ```
 
 关键配置如下：
@@ -174,10 +174,10 @@ Hybrid 服务需要在 FSDP/DDP 包装前创建 FFT slot，因此不支持 `memo
 
 ```bash
 twinkle-server check-config \
-  -c cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+  -c cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 
 twinkle-server launch \
-  -c cookbook/client/server/transformer/server_config_hybrid_qwen3_5_9b.yaml
+  -c cookbook/client/server/transformer/server_config_hybrid_lora.yaml
 ```
 
 ### 3.3 使用 client 启动 Hybrid LoRA 训练

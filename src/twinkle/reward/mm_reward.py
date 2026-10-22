@@ -2,6 +2,7 @@
 import re
 from typing import Any, Dict, List
 
+from twinkle.data_format import last_assistant_text
 from twinkle.reward.base import Reward
 
 
@@ -23,16 +24,7 @@ class MultiModalAccuracyReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    content = msg.get('content', '')
-                    if isinstance(content, str):
-                        completion = content
-                    elif isinstance(content, list):
-                        completion = ' '.join(part.get('text', '') for part in content if part.get('type') == 'text')
-                    break
+            completion = last_assistant_text(trajectory)
 
             user_data = trajectory.get('user_data', [])
             gt = ''

@@ -4,6 +4,8 @@ from typing import List, Optional, Sequence
 import torch
 from torch.utils.data import Sampler
 
+from .random_state import derive_seed
+
 
 class EpochSampler(Sampler):
     """The order one epoch reads a map-style dataset in, as a function of ``(data_seed, epoch)``.
@@ -21,7 +23,7 @@ class EpochSampler(Sampler):
     ``lengths`` and ``shuffle``: the grouping runs on a shuffled order, which is what keeps the batches
     from being identical every epoch despite being length-correlated.
 
-    Data-parallel sharding is deliberately not here. :class:`DeviceMeshSampler` slices each batch
+    Data-parallel sharding is deliberately not here. :class:`ShardedBatchSampler` slices each batch
     across ranks, so this yields the whole global order and every rank derives the same one.
 
     Args:
@@ -68,9 +70,9 @@ class EpochSampler(Sampler):
         if not self.shuffle:
             return iter(range(self.dataset_length))
         generator = torch.Generator()
-        generator.manual_seed(self.base_seed + self.epoch)
+        generator.manual_seed(derive_seed(self.base_seed, self.epoch))
         if self.group_by_length:
-            from transformers.trainer_pt_utils import get_length_grouped_indices
+            from twinkle.utils.torch_utils import get_length_grouped_indices
             return iter(get_length_grouped_indices(self.lengths, self.batch_size, generator=generator))
         return iter(torch.randperm(self.dataset_length, generator=generator).tolist())
 

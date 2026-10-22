@@ -289,9 +289,9 @@ def apply_param_groups_spec(groups: List[dict],
     validate_param_groups_spec(spec)
     _check_tower_roles(spec, tower_prefixes)
     resolve_module_type = _transformers_module_type_resolver(model)
-    # Every group _create_param_group builds carries the same optimizer lr, so the first is the base
-    # the no-op check compares a rule's absolute lr against.
-    base_lr = groups[0].get('lr') if groups else None
+    # Each group's own lr is the base its rules' absolute lr is compared against; the last one
+    # survives to _warn_unmatched (all groups carry the same optimizer lr in practice).
+    base_lr: Optional[float] = None
     matched = [0] * len(spec)
     new_groups: List[dict] = []
     for group in groups:

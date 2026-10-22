@@ -15,6 +15,8 @@ _T = TypeVar('_T')
 
 
 def load_mm_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
+    from .safe_media import checked_media_path, safe_http_get
+
     res = path
     if isinstance(path, str):
         path = path.strip()
@@ -23,14 +25,15 @@ def load_mm_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
             with requests.Session() as session:
                 session.mount('http://', HTTPAdapter(max_retries=retries))
                 session.mount('https://', HTTPAdapter(max_retries=retries))
-                response = session.get(path, timeout=10)
-                response.raise_for_status()
+                # safe_http_get keeps this session (retries and all) but follows redirects
+                # itself, re-validating each hop's target address against the public ranges.
+                response = safe_http_get(path, timeout=10, session=session)
                 content = response.content
                 res = BytesIO(content)
         else:
             data = path
             if os.path.exists(path):
-                with open(path, 'rb') as f:
+                with open(checked_media_path(path), 'rb') as f:
                     res = BytesIO(f.read())
             else:
                 if data.startswith('data:'):

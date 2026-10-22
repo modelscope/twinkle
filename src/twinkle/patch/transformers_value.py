@@ -1,19 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Patch a HF sequence-classification model to expose PER-TOKEN scores (PPO's value critic).
+"""Patch a HF sequence-classification model to expose PER-TOKEN scores (skip internal pooling).
 
-PPO's value function needs an estimate ``V(s_t)`` at every response token. It rides the SAME
-``num_labels=1`` sequence-classification head as ``task='seq_cls'`` (a trainable ``score`` linear over
-the last hidden state), but ``*ForSequenceClassification`` pools that head to the last valid token and
-returns one scalar ``[B, 1]``. This patch captures the head's per-token output ``score(hidden)`` BEFORE
-the pooling and returns it in place of the pooled logits, so ``outputs['logits']`` is ``[B, T]`` (one
-value per token). No new parameters are introduced -- the value head IS the seq_cls ``score``.
+HF's ``*ForSequenceClassification`` pools hidden states to the last valid token and returns
+``[B, num_labels]``.  This patch captures the score head's per-token output BEFORE pooling and
+surfaces it as ``outputs['logits']`` with shape ``[B, T, num_labels]``, letting the downstream
+processor (``postprocess_tensor_sp``) do packed-aware pooling via ``_pool_last_valid_token``.
 
-Symmetric with the Megatron backend, where the seq_cls head already emits a per-token ``[b, s, 1]`` and
-``task='value'`` simply skips the last-token pick in ``forward_step``. Like the embedding / generative
-reranker patches, both mutations are reverted by ``unpatch``.
+Two consumers:
+- ``task='value'`` (PPO critic): needs per-token V(s_t), ``squeeze_single=True`` drops the trailing
+  dim so logits is ``[B, T]``.
+- ``task='seq_cls'``/``'reranker'`` under padding_free: needs ``[B, T, num_labels]`` (3D) so the
+  processor's einsum-based pooling works; ``squeeze_single=False``.
 
-Scope: the DDP / AccelerateStrategy path; it does not cover sequence-parallel / packed layouts, so the
-PPO recipe runs the critic without those.
+Symmetric with the Megatron backend, where the seq_cls head already emits per-token ``[b, s, 1]``
+and ``task='value'`` simply skips the last-token pick in ``forward_step``.
 """
 from types import MethodType
 from typing import TYPE_CHECKING
@@ -28,7 +28,15 @@ _SCORE_NAMES = ('score', 'classifier')
 
 
 class TransformersValuePatch(Patch):
-    """Return the seq_cls head's per-token scores ``[B, T]`` as logits (skip pooling). Reversible."""
+    """Return the seq_cls head's per-token scores as logits (skip HF's internal pooling). Reversible.
+
+    Args:
+        squeeze_single: If True (default, PPO value), squeeze ``[B, T, 1]`` to ``[B, T]``.
+            If False (seq_cls/reranker), keep 3D so ``_pool_last_valid_token`` einsum works.
+    """
+
+    def __init__(self, squeeze_single: bool = True):
+        self._squeeze_single = squeeze_single
 
     def __call__(self, module, *args, **kwargs):
         score = self._find_score(module)
@@ -53,9 +61,9 @@ class TransformersValuePatch(Patch):
         per_token = self._captured.get('per_token')
         if per_token is None:
             return output
-        # num_labels=1 (the PPO critic) -> [B, T]; keep the head width for any other num_labels.
-        values = per_token[..., 0] if (per_token.dim() == 3 and per_token.shape[-1] == 1) else per_token
-        return {'logits': values}
+        if self._squeeze_single and per_token.dim() == 3 and per_token.shape[-1] == 1:
+            per_token = per_token[..., 0]
+        return {'logits': per_token}
 
     @staticmethod
     def _find_score(module):
@@ -65,8 +73,8 @@ class TransformersValuePatch(Patch):
             head = getattr(base, name, None)
             if head is not None:
                 return head
-        raise AssertionError("task='value' requires a seq_cls score/classifier head (build the critic with "
-                             "task_type='seq_cls', num_labels=1); none was found on the model.")
+        raise AssertionError('seq_cls score/classifier head not found on the model; '
+                             "build with task_type='seq_cls' or task_type='reranker'.")
 
     def unpatch(self, module, *args, **kwargs):
         hook = getattr(self, '_hook', None)

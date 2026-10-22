@@ -20,7 +20,7 @@ def test_endpoint_uses_platform_uuid_without_touching_cuda(monkeypatch):
         staticmethod(lambda device_id=0, platform=None: f'uuid-{device_id}'),
     )
 
-    assert IPCCheckpointEngine.endpoint() == 'ipc:///tmp/twinkle-colocate-uuid-0.sock'
+    assert IPCCheckpointEngine(channel='default').endpoint() == 'ipc:///tmp/twinkle-colocate-default-uuid-0.sock'
 
 
 def test_map_uses_reducer_callable_and_receiver_device(monkeypatch):

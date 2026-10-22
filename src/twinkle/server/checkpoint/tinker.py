@@ -8,7 +8,9 @@ from datetime import datetime
 from tinker import types as tinker_types
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.checkpoint import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
+from twinkle.server.checkpoint.checkpoint_manager import BaseCheckpointManager
+from twinkle.server.checkpoint.paths import TRAIN_RUN_INFO_FILENAME
+from twinkle.server.checkpoint.training_run_manager import BaseTrainingRunManager
 
 
 class TinkerTrainingRunManager(BaseTrainingRunManager):
@@ -73,10 +75,6 @@ class TinkerCheckpointManager(BaseCheckpointManager):
     def path_prefix(self) -> str:
         return 'twinkle://'
 
-    @property
-    def path_field_name(self) -> str:
-        return 'tinker_path'
-
     def _create_checkpoint(self,
                            checkpoint_id,
                            checkpoint_type,
@@ -130,6 +128,3 @@ class TinkerCheckpointManager(BaseCheckpointManager):
 
     def _create_weights_info(self, run_info: dict[str, Any]) -> tinker_types.WeightsInfoResponse:
         return tinker_types.WeightsInfoResponse(**run_info)
-
-    def parse_tinker_path(self, tinker_path: str) -> tinker_types.ParsedCheckpointTinkerPath | None:
-        return self.parse_path(tinker_path)
