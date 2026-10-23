@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import twinkle
+from twinkle import Platform
 from twinkle.processor import InputProcessor
 
 twinkle.initialize(mode='local')
@@ -91,6 +92,48 @@ class TestMicroBatchMode:
         assert len(out) == 2
         for b in out:
             assert b['input_ids'].shape[0] == 2
+
+
+class TestMegatronCausalMask:
+    """The dense 4D mask must not be built when the backend derives its own."""
+
+    def _collate(self, monkeypatch, device_prefix, attention_mask_type):
+        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: device_prefix))
+        proc = InputProcessor(padding_free=False, framework='megatron')
+        proc._create_4d_attention_mask = lambda _: pytest.fail('dense 4D mask allocated')
+        return proc.collate_fn(
+            _make_text_batch(4, seq_len=8),
+            micro_batch_size=2,
+            variable_seq_lengths=False,
+            attention_mask_type=attention_mask_type,
+        )
+
+    def test_causal_npu_omits_dense_mask(self, monkeypatch):
+        outputs = self._collate(monkeypatch, 'npu', 'causal')
+        assert len(outputs) == 2
+        assert all(output['attention_mask'] is None for output in outputs)
+
+    def test_non_causal_still_builds_dense_mask(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: 'npu'))
+        proc = InputProcessor(padding_free=False, framework='megatron')
+        outputs = proc.collate_fn(
+            _make_text_batch(4, seq_len=8),
+            micro_batch_size=2,
+            variable_seq_lengths=False,
+            attention_mask_type=None,
+        )
+        assert all(output['attention_mask'].dim() == 4 for output in outputs)
+
+    def test_other_backends_still_build_dense_mask(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: 'cuda'))
+        proc = InputProcessor(padding_free=False, framework='megatron')
+        outputs = proc.collate_fn(
+            _make_text_batch(4, seq_len=8),
+            micro_batch_size=2,
+            variable_seq_lengths=False,
+            attention_mask_type='causal',
+        )
+        assert all(output['attention_mask'].dim() == 4 for output in outputs)
 
 
 class TestMultimodalMode:
