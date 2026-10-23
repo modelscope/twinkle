@@ -550,10 +550,14 @@ class CISPOLoss(GRPOLoss):
         advantages: 'torch.Tensor',
         per_token_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
-        """Clamped ratio * advantage * log_prob."""
+        """Clamped ratio * advantage * log_prob.
+
+        The IS weight is truncated from above at ``1 + epsilon_high`` (MiniMax-M1), the same
+        bound ``CISPOMetric`` reports as clipped; ``epsilon_high`` defaults to ``epsilon``.
+        """
         import torch
 
-        clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
+        clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon_high).detach()
         return -clamped_ratios * advantages * per_token_logps
 
     def _aggregate_loss(
