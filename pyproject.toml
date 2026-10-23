@@ -59,7 +59,8 @@ test = [
   "hypothesis>=6.0",
   "pytest",
   "pytest-asyncio",
-  "grimp>=3.0"
+  "grimp>=3.0",
+  "scikit-learn"
 ]
 docs = [
   "sphinx>=5.3.0,<6.0.0",
