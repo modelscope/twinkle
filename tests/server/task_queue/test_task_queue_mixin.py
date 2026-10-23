@@ -1,10 +1,11 @@
+from tests.server.task_queue.helpers import _DummyState, _AllowingRateLimiter, _DummyQueue
 import asyncio
 import pytest
 import pytest_asyncio
 
-from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.task_queue.types import UserTaskError
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
 
 
@@ -46,54 +47,6 @@ def test_exception_summary_falls_back_to_the_ray_error_itself():
     summary = _exception_summary(err)
     assert summary.startswith('RayTaskError')
     assert 'Model.step' in summary
-
-
-class _DummyState:
-
-    def __init__(self):
-        self.records = []
-        self._latest = {}
-
-    async def store_future_status(self, *args, **kwargs):
-        self.records.append((args, kwargs))
-        request_id, status = args[0], args[1]
-        self._latest[request_id] = {
-            'status': status,
-            'result': kwargs.get('result'),
-            'failure': (kwargs['failure'].model_dump() if kwargs.get('failure') is not None else None),
-            'queue_state': kwargs.get('queue_state'),
-            'queue_state_reason': kwargs.get('queue_state_reason'),
-        }
-
-    async def get_future(self, request_id):
-        return self._latest.get(request_id)
-
-
-class _AllowingRateLimiter:
-
-    async def check_and_record(self, token, input_tokens):
-        return True, None
-
-
-class _DummyQueue(TaskQueueMixin):
-
-    def __init__(self):
-        self.state = _DummyState()
-        # A generous Inline_Fast_Path window keeps "task settles inside submit"
-        # deterministic for the trivial in-process coroutines used here.
-        self._task_queue_config = TaskQueueConfig(inline_fast_path_timeout=5.0)
-        self._rate_limiter = _AllowingRateLimiter()
-        self._task_metrics = None
-        self._deployment_name = 'test'
-
-    def enable_compute_worker(self):
-        self._compute_worker = ComputeWorker(
-            state=self.state,
-            config=self._task_queue_config,
-            task_metrics=None,
-            deployment_name=self._deployment_name,
-        )
-        self._event_loop = None
 
 
 @pytest.mark.asyncio
@@ -140,7 +93,7 @@ async def test_worker_stop_exits_when_wait_for_swallows_cancellation(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_worker_can_restart_after_stopping_while_idle():
+async def test_idle_worker_stop_is_terminal_for_its_replica():
     queue = _DummyQueue()
     queue.enable_compute_worker()
     worker = queue._compute_worker
@@ -152,9 +105,11 @@ async def test_worker_can_restart_after_stopping_while_idle():
         await worker.ensure_started()
         await asyncio.sleep(0)  # Let the idle worker wait for new work.
         await asyncio.wait_for(worker.stop(), timeout=1)
-        env = await queue.submit_and_peek(work, model_id='model1', token='token1')
-        assert env.status == 'completed'
-        assert env.result == {'ok': True}
+        from twinkle.server.exceptions import ResourceExhaustedError
+        with pytest.raises(ResourceExhaustedError):
+            await queue.submit_and_peek(work, model_id='model1', token='token1')
+        assert not queue.state.records
+        assert not worker._started
     finally:
         await worker.stop()
 
@@ -221,6 +176,7 @@ async def test_preflight_accepts_batch_with_per_dp_multiple():
 @pytest.mark.asyncio
 async def test_background_task_tracks_status():
     queue = _DummyQueue()
+    queue.enable_compute_worker()
 
     async def work():
         return {'ok': True}
@@ -229,9 +185,13 @@ async def test_background_task_tracks_status():
         work,
         model_id='model1',
     )
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if not queue._compute_worker._detached_tasks:
+            break
+        await asyncio.sleep(0.001)
+    await queue._compute_worker.stop()
 
-    assert [args[1] for args, _ in queue.state.records] == ['running', 'completed']
+    assert [args[1] for args, _ in queue.state.records] == ['pending', 'running', 'completed']
     assert queue.state.records[0][1]['absolute_deadline'] > 0
     assert queue.state.records[-1][1]['result'] == {'ok': True}
 
@@ -319,7 +279,7 @@ async def test_user_task_error_is_stored_as_user_failure():
     queue.enable_compute_worker()
 
     async def work():
-        raise UserTaskError('invalid request')
+        raise RequestRejectedError('invalid request')
 
     try:
         await queue.schedule_task(work, model_id='model1', token='token1')
@@ -455,7 +415,7 @@ async def test_concurrent_task_keeps_queue_failure_mapping(make_concurrent_queue
     queue = make_concurrent_queue()
 
     async def work():
-        raise UserTaskError('invalid request')
+        raise RequestRejectedError('invalid request')
 
     await queue.schedule_concurrent_task(work, token='token1')
     for _ in range(100):
@@ -615,6 +575,108 @@ async def test_cancel_during_running_status_write_leaves_failed_future(make_conc
 
 
 @pytest.mark.asyncio
+async def test_background_capacity_and_shutdown_are_supervised(make_concurrent_queue):
+    from twinkle.server.exceptions import ResourceExhaustedError
+    queue = make_concurrent_queue(TaskQueueConfig(concurrent_task_limit=1))
+    entered, exited = asyncio.Event(), asyncio.Event()
+
+    async def work():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            exited.set()
+
+    ref = await queue.schedule_background_task(work)
+    await asyncio.wait_for(entered.wait(), 1)
+    with pytest.raises(ResourceExhaustedError):
+        await queue.schedule_background_task(work)
+    assert len(queue.state._latest) == 1
+    await queue._compute_worker.stop()
+    assert exited.is_set()
+    assert queue.state._latest[ref['request_id']]['status'] == 'failed'
+    assert queue._compute_worker._detached_reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_stopped_replica_rejects_serial_submission_without_a_future():
+    from twinkle.server.exceptions import ResourceExhaustedError
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    await queue._compute_worker.stop()
+    with pytest.raises(ResourceExhaustedError):
+        await queue.schedule_task(lambda: asyncio.sleep(0))
+    assert not queue.state.records
+    assert not queue._compute_worker._started
+
+
+@pytest.mark.asyncio
+async def test_stop_during_pending_write_cannot_restart_the_serial_worker():
+    from twinkle.server.exceptions import ResourceExhaustedError
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    original = queue.state.store_future_status
+
+    async def write_then_stop(*args, **kwargs):
+        await original(*args, **kwargs)
+        if args[1] == 'pending':
+            await queue._compute_worker.stop()
+
+    queue.state.store_future_status = write_then_stop
+    with pytest.raises(ResourceExhaustedError):
+        await queue.schedule_task(lambda: asyncio.sleep(0), request_id='late-serial')
+    assert queue.state._latest['late-serial']['status'] == 'failed'
+    assert not queue._compute_worker._started
+    assert queue._compute_worker.total_queued() == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_serial_tasks_that_never_started():
+    queue = _DummyQueue()
+    queue.enable_compute_worker()
+    executed = []
+
+    async def work():
+        executed.append(True)
+
+    ref = await queue.schedule_task(work)
+    await queue._compute_worker.stop()
+    assert not executed
+    assert queue.state._latest[ref['request_id']]['status'] == 'failed'
+    assert queue._compute_worker.total_queued() == 0
+    assert not queue._compute_worker.has_task(ref['request_id'])
+
+
+@pytest.mark.asyncio
+async def test_unknown_start_ack_never_executes_backend(make_concurrent_queue, monkeypatch):
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.state.server_state import ServerState
+    queue = make_concurrent_queue()
+    backend = FakeBackend()
+    queue.state = queue._compute_worker._state = ServerState(backend=backend)
+    original = backend.update_atomic
+    executed = []
+
+    async def lost_ack(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if kwargs.get('return_changed'):
+            raise ConnectionError('start acknowledgement lost')
+        return result
+
+    async def work():
+        executed.append(True)
+
+    monkeypatch.setattr(backend, 'update_atomic', lost_ack)
+    ref = await queue.schedule_concurrent_task(work)
+    for _ in range(100):
+        if not queue._compute_worker._detached_tasks:
+            break
+        await asyncio.sleep(0.001)
+    assert not executed
+    assert (await queue.state.get_future(ref['request_id']))['status'] == 'failed'
+
+
+@pytest.mark.asyncio
 async def test_cancel_winning_running_write_race_skips_execution(make_concurrent_queue):
     queue = make_concurrent_queue()
     executed = False
@@ -643,3 +705,53 @@ async def test_cancel_winning_running_write_race_skips_execution(make_concurrent
     assert queue.state._latest[ref['request_id']]['status'] == 'cancelled'
     assert queue._compute_worker._detached_reserved == 0
     assert not queue._compute_worker._detached_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['schedule_task', 'schedule_concurrent_task', 'schedule_background_task'])
+async def test_admission_persists_future_and_owner_together(method):
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.state import ServerState
+    queue = TaskQueueMixin()
+    queue.state = ServerState(backend=FakeBackend())
+    queue.replica_id = 'ownership-test'
+    queue._init_task_queue()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def operation():
+        entered.set()
+        await finish.wait()
+        return 42
+
+    try:
+        ref = await getattr(queue, method)(operation, token='owner')
+        record = await queue.state.get_future(ref['request_id'])
+        assert record['owner_token'] == 'owner'
+        assert not await queue.state._backend.keys('future_owner::*')
+        await asyncio.wait_for(entered.wait(), 1)
+        from twinkle.server.exceptions import ResourceNotFoundError
+        with pytest.raises(ResourceNotFoundError):
+            await queue.state.assert_future_owner(ref['request_id'], 'other')
+    finally:
+        finish.set()
+        await queue.shutdown_task_queue()
+
+
+@pytest.mark.asyncio
+async def test_backend_cancellation_is_an_explicit_server_failure(make_concurrent_queue):
+    from twinkle.server.lifecycle.envelope import envelope_from_record
+    from twinkle.server.task_queue.types import ExecutionScope
+    queue = make_concurrent_queue()
+    scope = ExecutionScope()
+
+    async def work():
+        raise asyncio.CancelledError()
+
+    ref = await queue.schedule_concurrent_task(work, token='token1', execution_scope=scope)
+    await scope.wait()
+    record = await queue.state.get_future(ref['request_id'])
+    assert record['status'] == 'failed'
+    assert record['failure']['reason_code'] == 'backend_cancelled'
+    envelope = envelope_from_record(ref['request_id'], record)
+    assert envelope.error.error_code == 503
+    assert envelope.error.category == 'server'

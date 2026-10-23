@@ -7,86 +7,20 @@ so these pure ``FutureManager`` semantics run against the dict-backed fake below
 """
 from __future__ import annotations
 
+import asyncio
 import time
-from collections.abc import Callable
-from fnmatch import fnmatch
-from typing import Any
 from unittest import mock
 
 import pytest
 
-from twinkle.server.state.backend.base import StateBackend
+from tests.server.state.fake_backend import FakeBackend
 from twinkle.server.state.future_manager import FutureManager
 from twinkle.server.state.models import FutureFailureRecord
 
 
-class _FakeBackend(StateBackend):
-    """Dict-backed StateBackend. Single event loop, so ``update_atomic`` is atomic
-    simply by not awaiting between read and write -- the real backends' guarantee."""
-
-    def __init__(self) -> None:
-        self._store: dict[str, tuple[Any, float | None]] = {}
-
-    def _is_expired(self, key: str) -> bool:
-        entry = self._store.get(key)
-        if entry is None:
-            return True
-        _, expire_at = entry
-        if expire_at is not None and time.time() >= expire_at:
-            del self._store[key]
-            return True
-        return False
-
-    async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        self._store[key] = (value, (time.time() + ttl) if ttl is not None else None)
-
-    async def get(self, key: str) -> Any | None:
-        return None if self._is_expired(key) else self._store[key][0]
-
-    async def mget(self, keys: list[str]) -> list[Any | None]:
-        return [await self.get(key) for key in keys]
-
-    async def delete(self, key: str) -> None:
-        self._store.pop(key, None)
-
-    async def exists(self, key: str) -> bool:
-        return not self._is_expired(key)
-
-    async def keys(self, pattern: str) -> list[str]:
-        return [k for k in list(self._store) if not self._is_expired(k) and fnmatch(k, pattern)]
-
-    async def count(self, pattern: str) -> int:
-        return len(await self.keys(pattern))
-
-    async def set_nx(self, key: str, value: Any, ttl: int | None = None) -> bool:
-        if not self._is_expired(key):
-            return False
-        await self.set(key, value, ttl)
-        return True
-
-    async def update_atomic(
-        self,
-        key: str,
-        transform: Callable[[Any | None], Any | None],
-        ttl: int | None = None,
-    ) -> Any | None:
-        current = await self.get(key)
-        updated = transform(current)
-        if updated is None:
-            return current
-        await self.set(key, updated, ttl)
-        return updated
-
-    async def close(self) -> None:
-        pass
-
-    async def health_check(self) -> bool:
-        return True
-
-
 @pytest.fixture
 def manager():
-    return FutureManager(_FakeBackend(), expiration_timeout=300.0)
+    return FutureManager(FakeBackend(), expiration_timeout=300.0)
 
 
 async def _store(manager, request_id, status, *, replica_id=None, absolute_deadline=None):
@@ -203,7 +137,7 @@ async def test_stored_timestamps_align_with_wall_clock_regardless_of_host_tz(man
 @pytest.mark.asyncio
 async def test_claim_seq_dedups_then_release_readmits():
     from twinkle.server.state.server_state import ServerState
-    state = ServerState(backend=_FakeBackend())
+    state = ServerState(backend=FakeBackend())
     # First claim of a (session, seq_id) is unseen -> None, caller proceeds to enqueue.
     assert await state.claim_seq('seq::s1::1', 'reqA', ttl=60) is None
     # A duplicate claim returns the original request_id -> caller returns its envelope.
@@ -218,7 +152,7 @@ async def test_claim_seq_dedups_then_release_readmits():
 @pytest.mark.asyncio
 async def test_cancel_drops_pending_but_never_running():
     from twinkle.server.state.server_state import ServerState
-    state = ServerState(backend=_FakeBackend())
+    state = ServerState(backend=FakeBackend())
     # pending -> cancel drops it to a terminal domain failure.
     await state.store_future_status('rp', 'pending', 'm1')
     assert await state.cancel_future('rp') == {'cancelled': True, 'state': 'cancelled'}
@@ -247,3 +181,68 @@ def test_cancelled_record_maps_to_error_envelope():
     env = envelope_from_record('rc', rec)
     assert env.status == 'cancelled'
     assert env.error is not None and env.error.error_code == 499
+
+
+@pytest.mark.asyncio
+async def test_late_queued_and_repeated_running_cannot_regress_or_renew(manager):
+    await _store(manager, 'race', 'pending')
+    assert await manager.try_start('race')
+    before = (await manager.get('race')).model_dump()
+    await _store(manager, 'race', 'queued')
+    await _store(manager, 'race', 'running')
+    assert (await manager.get('race')).model_dump() == before
+    assert await manager.cancel_if_pending('race') == 'running'
+    assert not await manager.try_start('race')
+    assert not await manager.try_start('missing')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_first', [False, True])
+async def test_start_and_cancel_have_one_atomic_winner(manager, cancel_first):
+    await _store(manager, 'race', 'queued')
+    operations = [manager.try_start('race'), manager.cancel_if_pending('race')]
+    if cancel_first:
+        operations.reverse()
+    results = await asyncio.gather(*operations)
+    started = results[1] if cancel_first else results[0]
+    status = (await manager.get('race')).status
+    assert started == (status == 'running')
+    assert status in ('running', 'cancelled')
+    assert not await manager.try_start('race')
+
+
+@pytest.mark.asyncio
+async def test_concurrent_starters_only_one_obtains_execution(manager):
+    await _store(manager, 'race', 'pending')
+    assert sum(await asyncio.gather(*(manager.try_start('race') for _ in range(20)))) == 1
+
+
+@pytest.mark.asyncio
+async def test_future_owner_outlives_admission_retention_until_result_cleanup(monkeypatch):
+    from twinkle.server.exceptions import ResourceNotFoundError
+    from twinkle.server.state import ServerState
+    state = ServerState(backend=FakeBackend(), expiration_timeout=10)
+    await state.store_future_status('owned', 'pending', 'training_test', owner_token='owner')
+    await state.store_future_status('owned', 'completed', 'training_test', result={'value': 42})
+    now = time.time()
+    monkeypatch.setattr(time, 'time', lambda: now + 11)
+    assert await state.get_future('owned') is not None
+    await state.assert_future_owner('owned', 'owner')
+    with pytest.raises(ResourceNotFoundError):
+        await state.assert_future_owner('owned', 'other')
+    await state._future_mgr.cleanup_expired(now + 11)
+    assert await state.get_future('owned') is None
+    assert not await state._backend.keys('future*')
+
+
+@pytest.mark.asyncio
+async def test_future_owner_is_immutable_and_not_part_of_wire_envelope():
+    from twinkle.server.state import ServerState
+    from twinkle.server.lifecycle.envelope import envelope_from_record
+    state = ServerState(backend=FakeBackend())
+    await state.store_future_status('owned', 'pending', None, owner_token='secret-owner')
+    await state.store_future_status('owned', 'completed', None, result=42, owner_token='replacement')
+    record = await state.get_future('owned')
+    assert record['owner_token'] == 'secret-owner'
+    assert 'owner_token' not in envelope_from_record('owned', record).model_dump()
+    assert 'secret-owner' not in envelope_from_record('owned', record).model_dump_json()

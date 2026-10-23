@@ -13,10 +13,10 @@ from typing import Any
 
 import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.lifecycle.proxy import ServiceProxy
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
 from .openai_handlers import _register_openai_routes
-from .proxy import ServiceProxy
 from .tinker_handlers import _register_gateway_tinker_routes
 from .twinkle_handlers import _register_gateway_twinkle_routes
 
@@ -41,6 +41,8 @@ class GatewayServer(LazyCleanupMixin):
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models)
+        self.training_models = self._normalize_models(kwargs.get('training_models', supported_models))
+        self._training_model_names = frozenset(m.model_name for m in self.training_models)
         self._supported_model_names = frozenset(m.model_name for m in self.supported_models)
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
@@ -89,11 +91,11 @@ class GatewayServer(LazyCleanupMixin):
         return normalized
 
     def _validate_base_model(self, base_model: str) -> None:
-        if base_model not in self._supported_model_names:
+        if base_model not in self._training_model_names:
             raise HTTPException(
                 status_code=400,
                 detail=f"Base model '{base_model}' is not supported. "
-                f"Supported models: {', '.join(sorted(self._supported_model_names))}")
+                f"Supported models: {', '.join(sorted(self._training_model_names))}")
 
     async def _get_base_model(self, model_id: str) -> str:
         metadata = await self.state.get_model_metadata(model_id)

@@ -64,15 +64,15 @@ class BaseOptimizerGroup:
         """Accumulate metrics for train/eval status. Override in subclass if needed."""
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            metric_kwargs = {
+                **status.forward_kwargs,
+                'lr': self._get_lr(),
+                'step': self.cur_step - 1,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                'grad_norm': self._last_grad_norm,
+            }
             for metric in status.metrics:
-                metric.accumulate(
-                    status.inputs,
-                    status.outputs,
-                    lr=self._get_lr(),
-                    step=self.cur_step - 1,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm,
-                    **status.forward_kwargs)
+                metric.accumulate(status.inputs, status.outputs, **metric_kwargs)
 
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""

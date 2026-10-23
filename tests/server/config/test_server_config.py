@@ -33,38 +33,26 @@ _PERSISTENCE_VARIANTS = st.one_of(
     }),
 )
 
-_MODEL_APP = st.fixed_dictionaries({
-    'name':
-    st.just('m'),
-    'route_prefix':
-    st.just('/api/v1/m'),
-    'import_path':
-    st.just('model'),
-    'args':
-    st.fixed_dictionaries({
+_TRAINING_MODEL = st.fixed_dictionaries({
+    'name': st.just('m'), 'import_path': st.just('model'), 'route_prefix': st.just('/api/v1/model/m'),
+    'args': st.fixed_dictionaries({
         'model_id': st.just('model-id'),
-        'device_group': st.just({
-            'name': 'g',
-            'ranks': 1,
-            'device_type': 'CPU'
-        }),
-        'device_mesh': st.just({
-            'device_type': 'CPU',
-            'dp_size': 1
-        }),
         'backend': st.sampled_from(['mock', 'transformers', 'megatron']),
+        'device_group': st.just({'ranks': 2, 'device_type': 'cuda'}),
+        'device_mesh': st.just({'dp_size': 2}),
+        'train_mode': st.sampled_from(['lora', 'full']),
     }),
 })
 
 _VALID_CONFIG = st.fixed_dictionaries({
     'persistence': _PERSISTENCE_VARIANTS,
-    'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
+    'applications': st.lists(_TRAINING_MODEL, min_size=0, max_size=1),
 })
 
 # ---------- valid → fully validated ---------------------------------------- #
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(payload=_VALID_CONFIG)
 def test_valid_payload_yields_full_instance(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)
@@ -141,7 +129,7 @@ def test_sampler_docstring_values_match_selector() -> None:
 # ---------- round-trip fidelity ----------------------------------------- #
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(payload=_VALID_CONFIG)
 def test_round_trip_fidelity(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)

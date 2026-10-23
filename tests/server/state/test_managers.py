@@ -534,3 +534,20 @@ class TestCascadeCleanup:
         session_alive = await state.get_session_last_heartbeat('s-race') is not None
         model_alive = await state.get_model_metadata('m-race') is not None
         assert session_alive == model_alive
+
+
+@pytest.mark.parametrize('environment_limit', [None, '7'])
+def test_state_initializes_without_or_with_a_partial_environment_policy(monkeypatch, environment_limit):
+    """A missing optional policy must resolve to defaults before field access."""
+    import uuid
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.config.application_spec import SERVER_STATE_ENV_KEYS
+    from twinkle.server.state.server_state import get_server_state
+
+    for key in SERVER_STATE_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    if environment_limit is not None:
+        monkeypatch.setenv('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT', environment_limit)
+    state = get_server_state(cache_key='policy-' + uuid.uuid4().hex, backend=FakeBackend())
+    assert state.expiration_timeout == 86400
+    assert state.cleanup_interval == 3600

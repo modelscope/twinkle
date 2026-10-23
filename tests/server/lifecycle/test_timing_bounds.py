@@ -21,7 +21,7 @@ ray = pytest.importorskip('ray')
 
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval  # noqa: E402
 from twinkle.server.state import ServerState                              # noqa: E402
-from twinkle.server.task_queue.config import TaskQueueConfig        # noqa: E402
+from twinkle.server.config.task_queue import TaskQueueConfig        # noqa: E402
 from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 
 _WINDOW = 0.05

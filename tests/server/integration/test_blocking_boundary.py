@@ -21,7 +21,7 @@ ray = pytest.importorskip('ray')
 
 from twinkle.server.task_queue.backend_gate import BackendGate  # noqa: E402
 from twinkle.server.task_queue.mixin import TaskQueueMixin  # noqa: E402
-from twinkle.server.task_queue.types import BackendBusyError  # noqa: E402
+from twinkle.server.exceptions import BackendBusyError  # noqa: E402
 
 
 class _Harness(TaskQueueMixin):

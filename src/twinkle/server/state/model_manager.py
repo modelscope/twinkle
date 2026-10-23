@@ -93,7 +93,8 @@ class ModelManager(BaseManager[ModelRecord]):
 
     async def get_capacity_info(self) -> dict[str, int]:
         """Return global LoRA capacity across all registered replicas."""
-        replicas = await self._replicas.get_all()
+        capacities = await self._replicas.get_all()
+        replicas = {identity: capacity for identity, capacity in capacities.items() if capacity > 0}
         loaded_per_replica = await self._loaded_per_replica()
         total_max = sum(replicas.values())
         total_used = sum(loaded_per_replica.get(rid, 0) for rid in replicas)
@@ -115,6 +116,22 @@ class ModelManager(BaseManager[ModelRecord]):
         for model_id in loaded:
             await self.remove(model_id)
         await self._replicas.unregister(replica_id)
+
+    async def unregister_replica_capacity(self, replica_id: str) -> None:
+        """Remove capacity and heartbeat only; model records are retired by the owning lifecycle controller."""
+        await self._replicas.unregister(replica_id)
+
+    async def save_record(self, model_id: str, record: ModelRecord) -> None:
+        # Update without re-applying quota; cannot reuse add().
+        await self._backend.set(self._make_key(model_id), record.model_dump())
+
+    async def get_training_records(self, namespace: str):
+        from .training_records import TrainingRecord
+        keys = await self._backend.keys('model::*')
+        return [
+            TrainingRecord.model_validate(value) for value in await self._backend.mget(keys) if isinstance(value, dict)
+            and value.get('controller_epoch') and value.get('training_namespace') == namespace
+        ]
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:
         """Refresh a replica's liveness timestamp."""
@@ -220,6 +237,9 @@ class ModelManager(BaseManager[ModelRecord]):
         all_records = await self.get_all()
         expired_ids: list[str] = []
         for model_id, record in all_records.items():
+            if record.controller_epoch is not None:
+                # Managed training has one lifecycle writer: TrainingController.
+                continue
             if record.session_id and record.session_id in session_set:
                 expired_ids.append(model_id)
                 continue

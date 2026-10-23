@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Protocol
 from twinkle import get_logger
 from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
-from twinkle.server.task_queue.types import UserTaskError
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
 from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
@@ -370,7 +370,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """
         explicit_name = self.get_ckpt_name(name) if name else None
         if explicit_name == 'latest':
-            raise UserTaskError('Checkpoint name "latest" is reserved for unnamed sampler saves.')
+            raise RequestRejectedError('Checkpoint name "latest" is reserved for unnamed sampler saves.')
         version_id = uuid.uuid4().hex
         checkpoint_name = explicit_name or 'latest'
         uri_name = explicit_name or f'live_{version_id}'

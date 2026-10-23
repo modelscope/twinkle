@@ -17,9 +17,8 @@ if TYPE_CHECKING:
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.lifecycle.envelope import error_payload_from_failure
 from twinkle.server.middleware.auth import get_token_from_request
-from twinkle.server.state.models import FutureFailureRecord
-from twinkle.server.task_errors import trim_traceback
 from twinkle.utils.logger import get_logger
 from .use_cases import delete_checkpoint
 from .use_cases import get_training_run as get_training_run_use_case
@@ -27,42 +26,10 @@ from .use_cases import get_weights_info, list_checkpoints, list_training_runs, p
 
 logger = get_logger()
 
-# Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
-_TINKER_FAILURE_WIRE: dict[str, tuple[int, str]] = {
-    'invalid_request': (400, 'user'),
-    'request_rejected': (400, 'user'),
-    'resource_not_found': (404, 'user'),
-    'full_mode_busy': (409, 'user'),
-    'input_tokens_exceeded': (422, 'user'),
-    'batch_size_invalid': (422, 'user'),
-    'rate_limit_exceeded': (429, 'user'),
-    'resource_quota_exceeded': (429, 'user'),
-    'cancelled': (499, 'user'),
-    'endpoint_unavailable': (501, 'server'),
-    'state_contention': (503, 'server'),
-    'backend_gate_unavailable': (503, 'server'),
-    'orphaned_replica': (503, 'server'),
-    'execution_timeout': (504, 'server'),
-    'deadline_exceeded': (500, 'server'),
-    'internal_error': (500, 'server'),
-}
-
 
 def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any]:
-    """Map domain failure state to the existing Tinker-compatible error body."""
-    failure = FutureFailureRecord.model_validate(stored)
-    error_code, category = _TINKER_FAILURE_WIRE.get(failure.reason_code, (500, 'server'))
-    payload: dict[str, Any] = {
-        'error': failure.message[:1024],
-        'category': category,
-        'error_code': error_code,
-        'request_id': request_id,
-    }
-    if failure.details is not None:
-        payload['details'] = failure.details
-    if failure.diagnostic and category == 'server':
-        payload['traceback'] = trim_traceback(failure.diagnostic)
-    return payload
+    """Serialize the shared failure presentation with Tinker's field names."""
+    return error_payload_from_failure(stored, request_id=request_id).model_dump(mode='json', exclude_none=True)
 
 
 def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -83,7 +50,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
         # Convert twinkle.protocol.types.SupportedModel to tinker.types.SupportedModel
-        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
+        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.training_models]
         return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 
     @app.post('/telemetry')
@@ -121,6 +88,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
                               self: GatewayServer = Depends(self_fn)) -> Any:
         """Retrieve the result of an async task with long polling."""
         request_id = body.request_id
+        await self.state.assert_future_owner(request_id, get_token_from_request(request))
         outcome = await poll_future(self.state, request_id)
         record = outcome.record
         if outcome.timed_out:

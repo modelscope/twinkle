@@ -64,7 +64,7 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             return
 
         with super()._adapter_context(adapter_name) as slot_name:
-            self._restore_preallocated_lora_grad()
+            self.multi_adapter.enable_slot_gradients()
             self.fft_slots.activate_fft_slot(adapter_name)
             yield slot_name
 
@@ -72,14 +72,14 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
     def _disabled_adapter_context(self, adapter_name: str):
         try:
             with super()._adapter_context(adapter_name, disable_lora=True) as slot_name:
-                self._restore_preallocated_lora_grad()
+                self.multi_adapter.enable_slot_gradients()
                 self.fft_slots.deactivate_fft_slots()
                 try:
                     yield slot_name
                 finally:
                     self.fft_slots.activate_fft_slot(adapter_name)
         finally:
-            self._restore_preallocated_lora_grad()
+            self.multi_adapter.enable_slot_gradients()
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):

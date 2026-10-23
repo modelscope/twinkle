@@ -6,10 +6,13 @@ import random
 from collections.abc import Callable
 from typing import Any
 
+from twinkle.server.telemetry.metrics import get_state_backend_metrics
 from .base import ConcurrencyError, StateBackend
 
 try:
     import redis.asyncio as aioredis
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
     from redis.exceptions import WatchError
 
     _REDIS_AVAILABLE = True
@@ -38,6 +41,7 @@ class RedisBackend(StateBackend):
             raise ImportError('redis package required. Install with: pip install redis')
         self._client = aioredis.from_url(redis_url, decode_responses=True)
         self._prefix = key_prefix
+        self._metrics = get_state_backend_metrics()
 
     def _make_key(self, key: str) -> str:
         """Add namespace prefix to key."""
@@ -56,10 +60,27 @@ class RedisBackend(StateBackend):
         else:
             await self._client.set(real_key, data)
 
+    async def _retry_read(self, operation, *args):
+        """Retry only read commands after a stale pooled connection is discarded.
+
+        Writes/EXEC are deliberately excluded: a lost acknowledgement does not
+        prove that a mutation failed, so replay could apply it twice.
+        """
+        for attempt in range(3):
+            try:
+                result = await operation(*args)
+                self._metrics.redis_health.set(1)
+                return result
+            except (RedisConnectionError, RedisTimeoutError):
+                self._metrics.redis_health.set(0)
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.05 * (attempt + 1))
+
     async def get(self, key: str) -> Any | None:
         """Retrieve value, return None if not found or expired."""
         real_key = self._make_key(key)
-        raw = await self._client.get(real_key)
+        raw = await self._retry_read(self._client.get, real_key)
         if raw is None:
             return None
         return json.loads(raw)
@@ -72,7 +93,7 @@ class RedisBackend(StateBackend):
     async def exists(self, key: str) -> bool:
         """Check if key exists and is not expired."""
         real_key = self._make_key(key)
-        return bool(await self._client.exists(real_key))
+        return bool(await self._retry_read(self._client.exists, real_key))
 
     async def keys(self, pattern: str) -> list[str]:
         """Return all key names matching the pattern using SCAN.
@@ -106,6 +127,8 @@ class RedisBackend(StateBackend):
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
         """WATCH/GET/MULTI/SET/EXEC with bounded retries + jittered backoff on WatchError.
 
@@ -116,8 +139,10 @@ class RedisBackend(StateBackend):
         / heartbeat) or reraise (lease renewal).
         """
         real_key = self._make_key(key)
+        connection_failures = 0
         for attempt in range(_UPDATE_ATOMIC_MAX_RETRIES):
             async with self._client.pipeline() as pipe:
+                executing = False
                 try:
                     await pipe.watch(real_key)
                     raw = await pipe.get(real_key)
@@ -125,21 +150,40 @@ class RedisBackend(StateBackend):
                     new_value = transform(current)
                     if new_value is None:
                         await pipe.unwatch()
-                        return current
+                        self._metrics.update_atomic_retries.observe(attempt)
+                        return False if return_changed else current
                     pipe.multi()
                     if ttl is not None:
                         pipe.set(real_key, json.dumps(new_value), ex=ttl)
                     else:
                         pipe.set(real_key, json.dumps(new_value))
+                    executing = True
                     await pipe.execute()
-                    return new_value
-                except WatchError:
+                    self._metrics.update_atomic_retries.observe(attempt)
+                    return True if return_changed else new_value
+                except WatchError as exc:
+                    # redis-py also wraps a lost watched connection as WatchError.
+                    # Once EXEC was sent, its outcome may be unknown, not aborted.
+                    transport_failure = isinstance(exc.__context__,
+                                                   (RedisConnectionError, RedisTimeoutError)) or (str(exc).startswith(
+                                                       ('A ConnectionError occurred', 'A TimeoutError occurred')))
+                    if executing and transport_failure:
+                        raise RedisConnectionError('Atomic update outcome could not be confirmed') from exc
+                    self._metrics.update_atomic_conflicts.inc()
                     backoff = min(
                         _UPDATE_ATOMIC_BASE_BACKOFF_SECONDS * (2**attempt),
                         _UPDATE_ATOMIC_MAX_BACKOFF_SECONDS,
                     )
                     await asyncio.sleep(backoff * random.random())
                     continue
+                except (RedisConnectionError, RedisTimeoutError):
+                    self._metrics.redis_health.set(0)
+                    connection_failures += 1
+                    if executing or connection_failures >= 3:
+                        raise
+                    # Before EXEC there was no mutation, so reconnecting is safe.
+                    await asyncio.sleep(0.05 * connection_failures)
+        self._metrics.update_atomic_retries.observe(_UPDATE_ATOMIC_MAX_RETRIES)
         raise ConcurrencyError(f'update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}')
 
     async def mget(self, keys: list[str]) -> list[Any | None]:
@@ -147,7 +191,7 @@ class RedisBackend(StateBackend):
         if not keys:
             return []
         real_keys = [self._make_key(k) for k in keys]
-        raw_values = await self._client.mget(real_keys)
+        raw_values = await self._retry_read(self._client.mget, real_keys)
         return [json.loads(v) if v is not None else None for v in raw_values]
 
     async def close(self) -> None:
@@ -157,6 +201,8 @@ class RedisBackend(StateBackend):
     async def health_check(self) -> bool:
         """Check if Redis is healthy and available."""
         try:
-            return bool(await self._client.ping())
+            healthy = bool(await self._retry_read(self._client.ping))
         except Exception:
-            return False
+            healthy = False
+        self._metrics.redis_health.set(1 if healthy else 0)
+        return healthy

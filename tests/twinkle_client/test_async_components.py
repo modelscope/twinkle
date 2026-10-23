@@ -41,6 +41,10 @@ def _recorder(calls, result_factory):
     def post(url, headers=None, data=None, timeout=None, **kwargs):
         body = json.loads(data) if data else kwargs.get('json') or {}
         calls.append((url, body))
+        if '/model/' in url and url.endswith('/create'):
+            return _Response({'training_handles': True})
+        if url.endswith('/add_adapter_to_model'):
+            return _Response(_completed({'training_id': 'training-test', 'adapter_name': body['adapter_name']}))
         return _Response(result_factory(url))
 
     return post
@@ -65,7 +69,7 @@ def test_model_forward_backward_sends_multiple_data_refs(monkeypatch) -> None:
                      }}))
 
     model = module.MultiLoraTransformersModel('ms://base')
-    model.adapter_name = 'adapter'
+    model.add_adapter_to_model('adapter', None)
     refs = [
         DataRef(ref_id='data-1', size=2, fields=['train_input']),
         DataRef(ref_id='data-2', size=2, fields=['train_input']),
@@ -91,7 +95,7 @@ def test_model_inline_forward_methods_keep_the_original_endpoints(monkeypatch) -
     _patch_transport(monkeypatch, calls, lambda url: {} if url.endswith('/create') else _completed({'result': {}}))
 
     model = module.MultiLoraTransformersModel('ms://base')
-    model.adapter_name = 'adapter'
+    model.add_adapter_to_model('adapter', None)
     inputs = [{'input_ids': [1, 2]}]
     model.forward(inputs, return_logits=True)
     model.forward_only(inputs, disable_lora=True)
@@ -140,7 +144,7 @@ def test_undeclared_forward_arguments_are_routed_to_loss_kwargs(monkeypatch) -> 
     _patch_transport(monkeypatch, calls, lambda url: {} if url.endswith('/create') else _completed({'result': {}}))
 
     model = module.MultiLoraTransformersModel('ms://base')
-    model.adapter_name = 'adapter'
+    model.add_adapter_to_model('adapter', None)
     model.forward_backward([{'input_ids': [1, 2]}], advantages=[0.5], old_logps=[[-1.0, -2.0]])
 
     _, body = calls[-1]
@@ -158,7 +162,7 @@ def test_model_data_plane_forward_uses_a_separate_api(monkeypatch) -> None:
                      }}))
 
     model = module.MultiLoraTransformersModel('ms://base')
-    model.adapter_name = 'adapter'
+    model.add_adapter_to_model('adapter', None)
     ref = DataRef(ref_id='data-1', size=2, fields=['train_input'])
     model.forward_from_data_plane(ref, input_field='train_input')
 
@@ -180,7 +184,7 @@ def test_model_data_plane_forward_only_can_append_selected_outputs(monkeypatch) 
                      if url.endswith('/create') else _completed({'result': updated_ref.model_dump()}))
 
     model = module.MultiLoraTransformersModel('ms://base')
-    model.adapter_name = 'adapter'
+    model.add_adapter_to_model('adapter', None)
     result = model.forward_only_from_data_plane(
         ref,
         output_ref=ref,
@@ -223,3 +227,169 @@ def test_sampler_async_data_plane_path_returns_reference_without_materializing(m
     assert url.endswith('/sampler/base/twinkle/sample_to_data_plane')
     assert body['num_samples'] == 4
     assert body['group_ids'] == ['group-1']
+
+
+def test_old_remove_completion_does_not_clear_new_same_name_binding():
+    import threading
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    entered, resume = threading.Event(), threading.Event()
+    class Transport(ClientTransport):
+        def __init__(self):
+            super().__init__(ClientContext(base_url='http://server', api_key='owner'))
+            self.created = 0
+            self.operations = []
+        def post(self, url, json_data):
+            return _Response({'training_handles': True})
+        def post_model(self, url, body):
+            self.operations.append((url.rsplit('/', 1)[-1], body.model_dump()))
+            if url.endswith('/add_adapter_to_model'):
+                self.created += 1
+                return _Response(_completed({'training_id': f'training-{self.created}', 'adapter_name': 'same'}))
+            if url.endswith('/remove_adapter'):
+                if not entered.is_set():
+                    entered.set()
+                    assert resume.wait(3)
+            return _Response(_completed(None))
+    transport = Transport()
+    model = MultiLoraTransformersModel('small', transport=transport)
+    model.add_adapter_to_model('same', None)
+    errors = []
+    def remove():
+        try:
+            model.remove_adapter()
+        except Exception as exc:
+            errors.append(exc)
+    releasing = threading.Thread(target=remove)
+    releasing.start()
+    try:
+        assert entered.wait(3)
+        model.remove_adapter('same')
+        model.add_adapter_to_model('same', None)
+    finally:
+        resume.set()
+        releasing.join(3)
+    assert not releasing.is_alive() and not errors
+    model.zero_grad()
+    assert transport.operations[-1][1]['training_id'] == 'training-2'
+    removal = next(body for endpoint, body in transport.operations if endpoint == 'remove_adapter')
+    assert removal['training_id'] == 'training-1'
+
+
+def test_duplicate_adapter_is_rejected_before_rpc_and_release_allows_recreate(monkeypatch):
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    first = MultiLoraTransformersModel('base')
+    first.add_adapter_to_model('same', None)
+    count = len(calls)
+    with pytest.raises(RuntimeError, match='already'):
+        first.add_adapter_to_model('same', None)
+    assert len(calls) == count
+    second = MultiLoraTransformersModel('base')
+    second.add_adapter_to_model('same', None)
+    first.remove_adapter('same')
+    first.add_adapter_to_model('same', None)
+
+
+def test_concurrent_duplicate_and_failed_creation_leave_reusable_name(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    original = model._submit
+    entered, resume = threading.Event(), threading.Event()
+
+    def fail(*args, **kwargs):
+        entered.set()
+        assert resume.wait(3)
+        raise RuntimeError('create failed')
+
+    monkeypatch.setattr(model, '_submit', fail)
+    with ThreadPoolExecutor(1) as executor:
+        future = executor.submit(model.add_adapter_to_model, 'same', None)
+        try:
+            assert entered.wait(3)
+            with pytest.raises(RuntimeError, match='already being created'):
+                model.add_adapter_to_model('same', None)
+        finally:
+            resume.set()
+        with pytest.raises(RuntimeError, match='create failed'):
+            future.result()
+    monkeypatch.setattr(model, '_submit', original)
+    model.add_adapter_to_model('same', None)
+    assert model._training_ids['same'] == 'training-test'
+
+
+def test_unknown_training_rejected_before_handshake(monkeypatch):
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed({}))
+    model = MultiLoraTransformersModel('base')
+    with pytest.raises(RuntimeError, match='add_adapter_to_model'):
+        model.step()
+    assert not calls
+
+
+def test_expired_handle_can_be_removed_and_recreated_on_same_object(monkeypatch):
+    import pytest
+    from twinkle_client.exceptions import TwinkleHTTPError
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    model.add_adapter_to_model('same', None)
+    submit = model._submit
+
+    def expired(*args, **kwargs):
+        raise TwinkleHTTPError('Training handle expired', status_code=404, error_code=404)
+
+    monkeypatch.setattr(model, '_submit', expired)
+    with pytest.raises(TwinkleHTTPError) as error:
+        model.remove_adapter('same')
+    assert error.value.status_code == 404
+    monkeypatch.setattr(model, '_submit', submit)
+    model.add_adapter_to_model('same', None)
+    model.zero_grad()
+    assert calls[-1][1]['training_id'] == model._training_ids['same']
+
+
+def test_failed_release_keeps_handle_when_outcome_is_unknown(monkeypatch):
+    import pytest
+    from twinkle_client.exceptions import TwinkleHTTPError
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    model.add_adapter_to_model('same', None)
+    identity = model._training_ids['same']
+    for error in (TwinkleHTTPError('Unavailable', status_code=503), TimeoutError('ACK unknown')):
+        def failed(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(model, '_submit', failed)
+        with pytest.raises(type(error)):
+            model.remove_adapter('same')
+        assert model._training_ids['same'] == identity
+        assert model.adapter_name == 'same'
+
+
+def test_sequence_and_handle_selection_are_object_local(monkeypatch):
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed({}))
+    first, second = MultiLoraTransformersModel('base'), MultiLoraTransformersModel('base')
+    for model in (first, second):
+        model._created = True
+        model.adapter_name = 'default'
+    first._training_ids = {'default': 'first-default', 'other': 'first-other'}
+    second._training_ids = {'default': 'second-default'}
+    first.step()
+    first.step(adapter_name='other')
+    second.step()
+    assert [(body['adapter_name'], body['training_id'], body['seq_id']) for _, body in calls] == [
+        ('default', 'first-default', 1), ('other', 'first-other', 2), ('default', 'second-default', 1)]

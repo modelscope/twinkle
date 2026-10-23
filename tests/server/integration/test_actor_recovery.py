@@ -40,7 +40,7 @@ class _HealthHarness:
 
 
 @pytest.mark.asyncio
-async def test_timeout_probe_marks_unhealthy_then_recovers():
+async def test_timeout_probe_keeps_runtime_unhealthy_even_if_actor_recovers():
     model = _MockModel()
     h = _HealthHarness(model)
 
@@ -54,11 +54,12 @@ async def test_timeout_probe_marks_unhealthy_then_recovers():
     await h._probe_after_timeout()
     assert h._model_unhealthy is True  # /healthz would return 503
 
-    # Actor recovers; one successful probe clears the bit (no restart needed).
+    # Actor liveness cannot prove that timed-out training stopped mutating state.
+    # The controller must replace this runtime before accepting more work.
     model.alive = True
     result = await h.check_model_health()
-    assert result['healthy'] is True
-    assert h._model_unhealthy is False
+    assert result['healthy'] is False
+    assert h._model_unhealthy is True
 
 
 @pytest.mark.asyncio
@@ -76,11 +77,11 @@ async def test_health_route_returns_503_when_probe_fails():
 
 
 @pytest.mark.asyncio
-async def test_mark_unhealthy_is_cleared_by_successful_probe():
+async def test_mark_unhealthy_is_not_cleared_by_successful_probe():
     h = _HealthHarness(_MockModel())
     h.mark_unhealthy()
     assert h._model_unhealthy is True
 
     result = await h.check_model_health()
-    assert result['healthy'] is True
-    assert h._model_unhealthy is False
+    assert result['healthy'] is False
+    assert h._model_unhealthy is True

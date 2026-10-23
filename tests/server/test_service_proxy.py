@@ -1,19 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Directed tests for ``gateway/proxy.py``.
-
-Covers the route-URL construction now sourced from ``gateway.routes``, the
-``H_MULTIPLEX`` header compatibility in ``_prepare_headers``, and the 502 ``ErrorPayload``
-fallback when the upstream is unreachable.
-"""
+"""ServiceProxy URL construction, headers, bounded waits, and upstream error mapping."""
 from __future__ import annotations
 
+import asyncio
 import json
+
+import httpx
 
 import pytest
 from starlette.requests import Request
 from unittest.mock import AsyncMock
 
-from twinkle.server.gateway.proxy import ServiceProxy
+from twinkle.server.lifecycle.proxy import ServiceProxy
 from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
 
 
@@ -49,6 +47,37 @@ def test_prepare_headers_sets_multiplex_from_request_id():
     assert headers.get(H_MULTIPLEX_LEGACY) == 'req-1'
     # ``host`` / ``content-length`` are stripped before forwarding.
     assert 'host' not in {k.lower() for k in headers}
+
+
+@pytest.mark.asyncio
+async def test_proxy_waits_are_bounded_and_timeout_keeps_existing_wire():
+    closed = asyncio.Event()
+
+    async def stall(reader, writer):
+        try:
+            await reader.read(4096)
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            closed.set()
+
+    server = await asyncio.start_server(stall, '127.0.0.1', 0)
+    port = server.sockets[0].getsockname()[1]
+    proxy = ServiceProxy(http_options={'host': '127.0.0.1', 'port': port})
+    assert all(value is not None and value > 0 for value in proxy.client.timeout.as_dict().values())
+    proxy.client.timeout = httpx.Timeout(0.05)
+    request = _make_request(headers=[(H_REQUEST_ID.encode(), b'req-timeout')])
+    try:
+        reply = await asyncio.wait_for(proxy.proxy_request(request, 'tinker/forward', 'small', 'model',
+                                                                  body_override=b'{}'), 1)
+        assert reply.status_code == 502
+        assert json.loads(reply.body)['request_id'] == 'req-timeout'
+    finally:
+        await proxy.close()
+        server.close()
+        await server.wait_closed()
+        await asyncio.wait_for(closed.wait(), 1)
 
 
 @pytest.mark.asyncio

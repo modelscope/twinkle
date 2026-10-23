@@ -6,13 +6,12 @@ Ray Serve cluster (server + model + sampler + processor) with Qwen3.5-4B.
 
 Backend selection via env var TWINKLE_TEST_BACKEND:
   - "transformers" (default): all 6 phases run strictly
-  - "megatron": Phase C/D skipped (known multi-LoRA strict-load bug),
-    Phase E/F best-effort (GPU OOM possible)
+  - "megatron": all 6 phases run strictly (requires a working optimizer-resume backend)
 
 Phase A — initial training (STEPS_PHASE_A steps)
 Phase B — keep training STEPS_PHASE_B more steps, save again
 Phase C — RELOAD VERIFY: load() ckpt_a, forward_only on fixed batch,
-  assert loss matches Phase A end
+  assert token log probabilities match Phase A end
 Phase D — RESUME VERIFY: resume_from_checkpoint(ckpt_b), train more
 Phase E + F — vLLM LoRA-effect greedy probe
 
@@ -58,13 +57,13 @@ BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'transformers').lower()
 assert BACKEND in ('transformers', 'megatron'), f'Invalid TWINKLE_TEST_BACKEND={BACKEND!r}'
 
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
-BASE_URL = 'http://localhost:9000'
+BASE_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
 API_KEY = 'EMPTY_API_KEY'
-SAVE_DIR = '/mnt/nas2/yunlin.myl/twinkle/output/twinkle_e2e_full_cycle'
+SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', 'output/twinkle_e2e_full_cycle')
 STEPS_PHASE_A = 60
 STEPS_PHASE_B = 4
 STEPS_PHASE_D = 4
-RELOAD_LOSS_TOLERANCE = 0.05  # |reloaded - original| / original
+RELOAD_LOGPROB_ATOL = 2e-3  # Same absolute tolerance as controller-restart acceptance.
 RESUME_LOSS_BAND = 3.0  # resumed step's loss must be within this factor of Phase-B's last
 SAMPLE_MAX_TOKENS = 32
 
@@ -125,21 +124,13 @@ def _train_n_steps(model, dataloader, n: int, *, label: str, start_step: int = 0
     return losses
 
 
-def _record_fixed_batch_loss(model, batch, *, label: str) -> float:
-    """Run forward_only on a fixed batch and report the loss for reload comparison.
-
-    Uses ``forward_only`` + ``calculate_metric(is_training=False)`` to retrieve
-    loss. This is compatible with both Transformers and Megatron backends
-    (Megatron does not support standalone ``calculate_loss``).
-    """
-    model.forward_only(inputs=batch)
-    metric = model.calculate_metric(is_training=False)
-    try:
-        val = float(metric.result.get('loss')) if hasattr(metric.result, 'get') else float(metric.result['loss'])
-    except (TypeError, KeyError):
-        val = float(metric.result)
-    logger.info(f'[{label}] fixed-batch loss = {val:.4f}')
-    return val
+def _record_fixed_batch_logps(model, batch, *, label: str):
+    """Read actual forward outputs; forward_only need not populate loss metrics."""
+    from tests.server.integration.on_demand_training.acceptance_support import checked_logps
+    values = checked_logps(model.forward_only(inputs=batch).result['logps'])
+    logger.info('[%s] fixed-batch logps: count=%d min=%.6f max=%.6f',
+                label, values.size, values.min(), values.max())
+    return values
 
 
 # Probe prompts for vLLM LoRA-effect verification. Mixing different prompt
@@ -217,7 +208,7 @@ def main() -> int:
 
     # Capture a fixed batch we'll re-use after reload to assert state survived.
     fixed_batch = next(iter(_build_dataset_loader()))
-    loss_a_fixed = _record_fixed_batch_loss(model_a, fixed_batch, label='A-fixed')
+    logps_a_fixed = _record_fixed_batch_logps(model_a, fixed_batch, label='A-fixed')
 
     ckpt_a_resp = model_a.save(
         name='e2e-phase-a',
@@ -249,11 +240,11 @@ def main() -> int:
     logger.info('Phase C: reload-verify (load ckpt_a, fixed batch)')
     logger.info('=' * 60)
     model_a.load(ckpt_a)
-    loss_c_fixed = _record_fixed_batch_loss(model_a, fixed_batch, label='C-fixed')
-    delta = abs(loss_c_fixed - loss_a_fixed) / max(abs(loss_a_fixed), 1e-6)
-    logger.info(f'Phase C reload delta: |{loss_c_fixed:.4f} - {loss_a_fixed:.4f}| / {loss_a_fixed:.4f} = {delta:.4f}')
-    assert delta <= RELOAD_LOSS_TOLERANCE, (
-        f'Phase C FAILED: reload delta {delta:.4f} > tolerance {RELOAD_LOSS_TOLERANCE}')
+    import numpy as np
+    logps_c_fixed = _record_fixed_batch_logps(model_a, fixed_batch, label='C-fixed')
+    np.testing.assert_allclose(logps_c_fixed, logps_a_fixed, rtol=0, atol=RELOAD_LOGPROB_ATOL)
+    delta = float(np.max(np.abs(logps_c_fixed - logps_a_fixed)))
+    logger.info('Phase C reload max logprob error: %.6f', delta)
 
     # ---------------------------------------------------------------------
     # Phase D — RESUME VERIFY
@@ -307,8 +298,7 @@ def main() -> int:
     logger.info('=' * 60)
     logger.info('  Phase A losses (%d steps): first=%.3f last=%.3f', len(losses_a), losses_a[0][1], losses_a[-1][1])
     logger.info('  Phase B losses (%d steps): %s', len(losses_b), [f'{l:.3f}' for _, l in losses_b])
-    logger.info('  Phase C reload: |%.4f - %.4f| / %.4f = %.4f (tol %.2f)', loss_c_fixed, loss_a_fixed,
-                loss_a_fixed, delta, RELOAD_LOSS_TOLERANCE)
+    logger.info('  Phase C reload max logprob error: %.6f (atol %.4f)', delta, RELOAD_LOGPROB_ATOL)
     logger.info('  Phase D resume losses (%d steps): %s', len(losses_d), [f'{l:.3f}' for _, l in losses_d])
     logger.info('  Phase F LoRA-effect probes (%d/%d diverged):', n_diverged, len(PROBE_PROMPTS))
     for prompt, _, _, div in probe_results:

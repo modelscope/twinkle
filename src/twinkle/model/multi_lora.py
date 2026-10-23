@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
 from twinkle.utils import get_logger
-from .multi_lora_target_parameters import TargetParameterLoraManager
+from .multi_lora_target_parameters import TargetParameterLoraManager, TargetParameterLoraWrapper
 
 logger = get_logger()
 
@@ -123,6 +123,54 @@ class MultiLora:
                 _module.set_adapter('lora_0')
         else:
             self.module.set_adapter('lora_0')
+
+    def _named_slot_parameters(self, module):
+        """Identify owned adapter parameters through their actual layer containers."""
+        slots = {tenant.adapter_name for tenant in self.loras}
+        for layer_name, layer in module.named_modules():
+            if isinstance(layer, LoraLayer):
+                containers = layer.adapter_layer_names
+            elif isinstance(layer, TargetParameterLoraWrapper):
+                containers = ('lora_A', 'lora_B')
+            else:
+                continue
+            for container_name in containers:
+                container = getattr(layer, container_name)
+                for slot in slots & container.keys():
+                    value = container[slot]
+                    prefix = '.'.join(part for part in (layer_name, container_name, slot) if part)
+                    if isinstance(value, torch.nn.Parameter):
+                        yield prefix, value
+                    else:
+                        for name, parameter in value.named_parameters():
+                            yield prefix + '.' + name, parameter
+
+    def enable_slot_gradients(self):
+        """Keep owned adapter slots visible to reducers without unfreezing the base."""
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        for module in modules:
+            for _, parameter in self._named_slot_parameters(module):
+                parameter.requires_grad_(True)
+
+    @contextmanager
+    def trainable_slots(self):
+        """Expose all slots while wrapping DDP/FSDP, then restore the active mask.
+
+        Reducers discover parameters once during wrapping. The mask is restored
+        by adapter path because FSDP can replace the Parameter objects themselves.
+        """
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        masks = [{
+            name: parameter.requires_grad
+            for name, parameter in self._named_slot_parameters(module)
+        } for module in modules]
+        try:
+            self.enable_slot_gradients()
+            yield
+        finally:
+            for module, mask in zip(modules, masks):
+                for name, parameter in self._named_slot_parameters(module):
+                    parameter.requires_grad_(mask[name])
 
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
@@ -559,18 +607,12 @@ class MultiLora:
         # PEFT's add_adapter calls set_adapter(active_adapters) which only keeps the
         # first adapter's requires_grad=True.  We need ALL LoRA params to be trainable
         # so that MegatronDDP registers them all in its gradient buffers (main_grad).
-        def _enable_all_lora_grad(_module):
-            for name, param in _module.named_parameters():
-                if 'lora_' in name and not param.requires_grad:
-                    param.requires_grad_(True)
-
-        if isinstance(module, list):
-            for _m in module:
-                _enable_all_lora_grad(_m)
-        else:
-            _enable_all_lora_grad(module)
-
         self.module = module
+        modules = module if isinstance(module, list) else [module]
+        for chunk in modules:
+            for _, parameter in self._named_slot_parameters(chunk):
+                parameter.requires_grad_(True)
+
         if not isinstance(module, list):
             self.lora_layer_names = [name for name, layer in module.named_modules() if isinstance(layer, Linear)]
         return module

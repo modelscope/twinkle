@@ -67,13 +67,15 @@ class FakeBackend(StateBackend):
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
         current = await self.get(key)
         updated = transform(current)
         if updated is None:
-            return current
+            return False if return_changed else current
         await self.set(key, updated, ttl)
-        return updated
+        return True if return_changed else updated
 
     async def flush_all(self) -> None:
         self._store.clear()

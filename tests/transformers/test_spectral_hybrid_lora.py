@@ -871,11 +871,15 @@ def test_disable_lora_restores_slots_after_operation_fails():
     assert all(parameter.requires_grad for name, parameter in model.named_parameters() if 'lora_' in name)
 
 
-def test_multi_tenant_hybrid_isolation_and_non_destructive_merge():
+@pytest.mark.parametrize('fft_disabled', [False, True])
+def test_multi_tenant_hybrid_isolation_and_non_destructive_merge(fft_disabled):
     base, model, manager, spectral = _make_multi_tenant_hybrid()
     inputs = torch.randn(2, 8)
     with manager.adapter('regular'):
         regular_before = model(inputs).detach().clone()
+    if fft_disabled:
+        # A normal LoRA selection can disable auxiliary FFT wrappers in PEFT.
+        spectral._get_fft_wrapper('layers.0.self_attn.q_proj').enable_adapters(False)
 
     hybrid = manager.find_lora_by_tenant('hybrid')
     modules = dict(model.named_modules())

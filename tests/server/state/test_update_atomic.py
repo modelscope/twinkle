@@ -129,6 +129,43 @@ async def test_key_prefix_is_hidden_from_logical_keys(backend_pair) -> None:
     assert await first.keys('session::*') == ['session::one']
 
 
+@pytest.mark.asyncio
+async def test_atomic_update_reports_this_call_not_the_existing_value(backend_pair):
+    first, second = backend_pair
+    assert await first.update_atomic('claim', functools.partial(_replace_with, value=True),
+                                     return_changed=True) is True
+    assert await second.update_atomic('claim', _no_op, return_changed=True) is False
+    assert await second.get('claim') is True
+    assert await second.update_atomic('missing', _no_op, return_changed=True) is False
+
+
+@pytest.mark.asyncio
+async def test_future_execution_is_claimed_once_across_backend_handles(backend_pair):
+    from twinkle.server.state.future_manager import FutureManager
+    first, second = [FutureManager(backend, 300) for backend in backend_pair]
+    await first.store_status('start', 'pending', 'm')
+    starts = await asyncio.gather(*(manager.try_start('start') for manager in [first, second] * 8))
+    assert sum(starts) == 1
+    await second.store_status('start', 'queued', 'm')
+    assert await first.cancel_if_pending('start') == 'running'
+    assert (await first.get('start')).status == 'running'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_first', [False, True])
+async def test_future_start_cancel_race_across_backend_handles(backend_pair, cancel_first):
+    from twinkle.server.state.future_manager import FutureManager
+    first, second = [FutureManager(backend, 300) for backend in backend_pair]
+    await first.store_status('start', 'queued', 'm')
+    calls = [first.try_start('start'), second.cancel_if_pending('start')]
+    if cancel_first:
+        calls.reverse()
+    results = await asyncio.gather(*calls)
+    started = results[1] if cancel_first else results[0]
+    assert started == ((await first.get('start')).status == 'running')
+    assert not await second.try_start('start')
+
+
 # ---------- Memory backend ----------------------------------------------- #
 
 
@@ -258,3 +295,19 @@ async def test_redis_retry_exhaustion_maps_to_http_503(redis_backend) -> None:
         'error_code': 503,
         'request_id': 'req-contention',
     }
+
+
+@pytest.mark.asyncio
+async def test_future_owner_is_shared_with_result_and_removed_with_it(backend_pair):
+    from twinkle.server.exceptions import ResourceNotFoundError
+    from twinkle.server.state import ServerState
+    first, second = (ServerState(backend=backend) for backend in backend_pair)
+    await first.store_future_status('owned', 'pending', None, owner_token='owner')
+    await second.store_future_status('owned', 'completed', None, result=42)
+    await first.assert_future_owner('owned', 'owner')
+    with pytest.raises(ResourceNotFoundError):
+        await second.assert_future_owner('owned', 'other')
+    assert (await second.get_future('owned'))['owner_token'] == 'owner'
+    await first._future_mgr.cleanup_expired(float('inf'))
+    assert await second.get_future('owned') is None
+    assert not await backend_pair[0].keys('future*')

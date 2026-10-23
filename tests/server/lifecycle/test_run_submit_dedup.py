@@ -23,24 +23,25 @@ class _FakeState:
         self.claim_ttls = []
         self.released = []
 
-    async def claim_seq(self, dedup_key, request_id, ttl):
-        # Unseen -> claim it and let the caller proceed (returns None).
-        self.claimed[dedup_key] = request_id
-        self.claim_ttls.append(ttl)
-        return None
+    async def claim_training_seq(self, training_id, stream, seq_id, request_id, retention):
+        key = (training_id, stream, seq_id)
+        prior = self.claimed.get(key)
+        self.claimed[key] = prior or request_id
+        self.claim_ttls.append(retention)
+        return prior
 
     async def get_future(self, request_id):
         # Simulates whether a PENDING/QUEUED record was written (task enqueued).
         return self._record_after_claim
 
-    async def release_seq(self, dedup_key):
-        self.released.append(dedup_key)
+    async def release_training_seq(self, training_id, stream, seq_id, request_id):
+        self.released.append((training_id, stream, seq_id))
 
 
 class _FakeManagement:
     def __init__(self, record_after_claim):
         self.state = _FakeState(record_after_claim)
-        self.task_queue_config = SimpleNamespace(queue_timeout=300.0, effective_execution_timeout=1800.0)
+        self.sequence_retention_s = 3600
         # A real deployment declares its backend; preflight reads it from here.
         self.backend = 'transformers'
         self.data_world_size = 1
@@ -63,7 +64,7 @@ def _body(adapter_name: str = 'ad', seq_id: int = 7) -> ForwardBackwardTaskReque
     ``run_submit`` now reads field roles off the body to build the backend kwargs and to
     run preflight, so a ``SimpleNamespace`` would exercise a shape production never sees.
     """
-    return ForwardBackwardTaskRequest(inputs=[{'input_ids': [1, 2]}], adapter_name=adapter_name, seq_id=seq_id)
+    return ForwardBackwardTaskRequest(inputs=[{'input_ids': [1, 2]}], adapter_name=adapter_name, seq_id=seq_id, training_id='training-' + adapter_name)
 
 
 async def _call(self, body, adapter_name, token):  # pragma: no cover - never invoked
@@ -77,7 +78,7 @@ async def test_release_kept_when_task_already_enqueued():
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
     assert mgmt.state.released == [], 'claim wrongly released for an already-enqueued task'
-    assert 'seq::sess-1::sess-1-ad::7' in mgmt.state.claimed
+    assert ('training-ad', 'native::sess-1::forward_backward', 7) in mgmt.state.claimed
 
 
 @pytest.mark.asyncio
@@ -86,19 +87,16 @@ async def test_release_when_never_enqueued():
     mgmt = _FakeManagement(record_after_claim=None)
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
-    assert mgmt.state.released == ['seq::sess-1::sess-1-ad::7'], 'claim should be released when nothing enqueued'
+    assert mgmt.state.released == [('training-ad', 'native::sess-1::forward_backward', 7)], 'claim should be released when nothing enqueued'
 
 
 @pytest.mark.asyncio
-async def test_dedup_ttl_covers_queue_and_execution():
+async def test_dedup_uses_training_sequence_retention():
     """The claim must outlive queue wait plus execution, not just execution."""
     mgmt = _FakeManagement(record_after_claim={'status': 'queued'})
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
-    config = mgmt.task_queue_config
-    assert mgmt.state.claim_ttls == [int(config.queue_timeout + config.effective_execution_timeout) + 60]
-    # An execution-only window is exactly what let a queued first copy expire.
-    assert mgmt.state.claim_ttls[0] > int(config.effective_execution_timeout) + 60
+    assert mgmt.state.claim_ttls == [mgmt.sequence_retention_s]
 
 
 @pytest.mark.asyncio
@@ -121,5 +119,5 @@ async def test_dedup_key_is_scoped_per_adapter():
                 backend_call=_call)
 
     claimed = set(mgmt.state.claimed)
-    assert claimed == {'seq::sess-1::sess-1-lora-A::1', 'seq::sess-1::sess-1-lora-B::1'}, (
+    assert claimed == {('training-lora-A', 'native::sess-1::forward_backward', 1), ('training-lora-B', 'native::sess-1::forward_backward', 1)}, (
         f'adapters collided on one dedup key: {claimed}')

@@ -21,6 +21,7 @@ def test_checkpoint_activates_target_tenant_before_optimizer_state_initializatio
     wrapper = object.__new__(MultiLoraTransformersModel)
     wrapper.__dict__['model'] = model
     wrapper.multi_adapter = manager
+    wrapper._model_wrapped = True
     wrapper.strategy = SimpleNamespace(unwrap_model=lambda value: value)
     with manager.adapter('first'):
         params = [param for name, param in model.named_parameters() if '.lora_0.' in name]

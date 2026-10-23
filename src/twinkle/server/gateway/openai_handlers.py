@@ -28,11 +28,14 @@ import twinkle.protocol.types as types
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from . import routes
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
 from .use_cases import poll_future
 
 logger = get_logger()
+
+TWINKLE_SAMPLE = 'twinkle/sample'
+TWINKLE_SAMPLE_STREAM = 'twinkle/sample_stream'
+TWINKLE_SET_TEMPLATE = 'twinkle/set_template'
 
 _OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
 _DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
@@ -145,7 +148,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             # Non-streaming: proxy to /twinkle/sample, translate response
             response = await self.proxy.proxy_request(
                 request,
-                endpoint=routes.TWINKLE_SAMPLE,
+                endpoint=TWINKLE_SAMPLE,
                 base_model=base_model,
                 service_type='sampler',
                 body_override=body_bytes,
@@ -214,7 +217,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 try:
                     async for line in self.proxy.proxy_request_stream(
                             request,
-                            endpoint=routes.TWINKLE_SAMPLE_STREAM,
+                            endpoint=TWINKLE_SAMPLE_STREAM,
                             base_model=base_model,
                             service_type='sampler',
                             body_override=body_bytes,
@@ -330,7 +333,7 @@ async def _ensure_template(
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint=routes.TWINKLE_SET_TEMPLATE,
+            endpoint=TWINKLE_SET_TEMPLATE,
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,

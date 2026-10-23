@@ -1,11 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""``ServerLauncher`` and the ``launch_server`` entry point.
-
-The real launcher module. It lives here (rather than in the package
-``__init__.py``) so the package's ``__init__`` stays a thin aggregator; the
-public dotted paths ``twinkle.server.launcher.ServerLauncher`` /
-``launch_server`` are preserved by the ``__init__`` re-export.
-"""
+"""Initialize server configuration, deploy applications, and own their shutdown."""
 from __future__ import annotations
 
 import json
@@ -13,290 +7,254 @@ import os
 import signal
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from twinkle import get_logger
-from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
+from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map, extract_model_alias
 from twinkle.patch.ray_serve import apply_ray_serve_patches, get_runtime_env_for_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
+from twinkle.server.config.resources import build_propagated_env_vars, build_worker_env_vars
 from .builder_registry import get_builders, resolve_builder
-from .env_propagation import build_propagated_env_vars
 
 logger = get_logger()
 
 
 class ServerLauncher:
-    """
-    Unified server launcher.
+    """Own startup and cleanup; business scheduling stays in the controllers."""
 
-    This class handles Ray/Serve initialization and application deployment.
-
-    Attributes:
-        config: The server configuration dictionary
-        ray_namespace: The Ray namespace for the cluster
-    """
-
-    def __init__(
-        self,
-        config: ServerConfig,
-        ray_namespace: str | None = None,
-    ):
-        """
-        Initialize the server launcher.
-
-        Args:
-            config: A validated :class:`ServerConfig` instance. Raw dicts are
-                rejected — operators must build ``ServerConfig`` via
-                ``ServerConfig.from_yaml`` or its constructor so cross-field
-                validation runs before the launcher consumes anything.
-            ray_namespace: Ray namespace (default: 'twinkle_cluster')
-        """
+    def __init__(self, config: ServerConfig, ray_namespace: str | None = None):
         if not isinstance(config, ServerConfig):
             raise TypeError('ServerLauncher requires a typed ServerConfig instance; '
                             f'got {type(config).__name__}. Build one with '
                             'ServerConfig.from_yaml(path) or ServerConfig(...).')
-        self.config: ServerConfig = config
-        self.ray_namespace = ray_namespace
+        self.config = config
+        self.ray_namespace = ray_namespace or config.ray_namespace or 'twinkle_cluster'
         self._builders: dict[str, Callable] = {}
         self._ray_initialized = False
         self._serve_started = False
+        self._training_controller = None
+        self._sampler_controllers = []
 
     def _get_builders(self) -> dict[str, Callable]:
-        """Get (and cache) the builder functions for all app types."""
         if not self._builders:
             self._builders = get_builders()
         return self._builders
 
     def _resolve_builder(self, import_path: str) -> Callable:
-        """Resolve an import_path to a builder function.
-
-        Raises:
-            ValueError: If the import_path cannot be resolved.
-        """
         return resolve_builder(import_path, self._get_builders())
 
+    def _configure_environment(self) -> None:
+        if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
+            os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
+        os.environ.update(self.config.persistence.to_env_vars())
+        gateways = [app for app in self.config.applications if app.import_path == 'server']
+        if gateways:
+            os.environ.update(gateways[0].args.server_config.to_env_vars())
+        aliases = build_model_alias_map(self.config.applications)
+        if aliases:
+            os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(aliases, ensure_ascii=False)
+        else:
+            os.environ.pop(MODEL_ID_ALIASES_ENV, None)
+        self._configure_telemetry()
+
+    def _configure_telemetry(self) -> None:
+        telemetry = self.config.telemetry
+        os.environ['TWINKLE_TELEMETRY_ENABLED'] = str(int(telemetry.enabled))
+        if not telemetry.enabled:
+            return
+        from twinkle.server.telemetry import init_telemetry
+        init_telemetry(telemetry)
+        os.environ.update({
+            'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
+            'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
+            'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
+            'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
+        })
+
     def _init_ray(self) -> None:
-        """Initialize Ray if not already initialized."""
         if self._ray_initialized:
             return
-
         import ray
-
-        namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
-
         if not ray.is_initialized():
-            # Use runtime_env to apply patches in worker processes
-            # This is required because Ray Serve's ProxyActor runs in separate processes
             runtime_env = get_runtime_env_for_patches()
-            # Propagate telemetry + persistence env vars to all Ray workers
-            propagated_env_vars = build_propagated_env_vars()
-            if propagated_env_vars:
-                merged_env_vars = dict(runtime_env.get('env_vars') or {})
-                merged_env_vars.update(propagated_env_vars)
-                runtime_env['env_vars'] = merged_env_vars
-            # Connect to existing cluster if available, otherwise start local instance
-            ray.init(
-                address='auto',
-                namespace=namespace,
-                runtime_env=runtime_env,
-            )
-            logger.info(f'Ray initialized with namespace={namespace}')
-
+            runtime_env['env_vars'] = {**runtime_env.get('env_vars', {}), **build_propagated_env_vars()}
+            ray.init(address='auto', namespace=self.ray_namespace, runtime_env=runtime_env)
         self._ray_initialized = True
 
     def _start_serve(self) -> None:
-        """Start Ray Serve with http_options from config."""
         if self._serve_started:
             return
-
         from ray import serve
-
-        try:
-            from ray.serve.context import _get_global_client
-            _get_global_client()
-            # Serve is running, shut it down before re-starting
-            serve.shutdown()
-        except Exception:
-            # Serve not running — nothing to shut down
-            pass
-
-        http_options = self.config.http_options.model_dump()
-        serve_kwargs: dict[str, Any] = {'http_options': http_options}
-        # ``proxy_location`` controls where the Ray Serve HTTP proxy runs
-        # (``EveryNode`` / ``HeadOnly`` / ``Disabled``). The example configs
-        # set this field, so honour it here instead of silently ignoring.
+        options = {'http_options': self.config.http_options.model_dump()}
         if self.config.proxy_location:
-            serve_kwargs['proxy_location'] = self.config.proxy_location
-        serve.start(**serve_kwargs)
-        logger.info(f'Ray Serve started with http_options={http_options}, '
-                    f'proxy_location={self.config.proxy_location!r}')
-
+            options['proxy_location'] = self.config.proxy_location
+        serve.start(**options)
         self._serve_started = True
 
-    def _deploy_application(self, app_spec: ApplicationSpec) -> None:
-        """Deploy a single application.
+    def _deployment_options(self, options: dict, env: dict | None = None) -> dict:
+        options = deepcopy(options)
+        options.pop('name', None)
+        actor = options.setdefault('ray_actor_options', {})
+        runtime_env = actor.setdefault('runtime_env', {})
+        runtime_env['env_vars'] = {**build_worker_env_vars(), **runtime_env.get('env_vars', {}), **(env or {})}
+        return options
 
-        Args:
-            app_spec: Validated :class:`ApplicationSpec` from the typed config.
-        """
+    def _gateway_arguments(self) -> dict[str, Any]:
+        args = {'http_options': self.config.http_options.model_dump()}
+        models = self.config.training_config.models
+        if models:
+            args['training_models'] = [model.name for model in models]
+            args['supported_models'] = list(
+                dict.fromkeys(
+                    alias for app in self.config.applications
+                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler'))))
+        return args
+
+    def _deploy_sampler(self, app: ApplicationSpec) -> None:
+        import ray
         from ray import serve
 
-        name = app_spec.name
-        route_prefix = app_spec.route_prefix
-        import_path = app_spec.import_path
-        # Shallow-dump the typed args to a kwargs dict WITHOUT recursing into
-        # nested models: ``dict(model)`` yields top-level (field, value) pairs
-        # with nested models left as instances, so ``queue_config`` stays a
-        # typed ``TaskQueueConfig`` and is not re-serialized to a dict only to be
-        # revived via ``from_dict`` inside the builder (the prior triple
-        # validation). ``None`` values are dropped to match ``exclude_none``.
-        args = {k: v for k, v in dict(app_spec.args).items() if v is not None}
-        deployments = list(app_spec.deployments or [])
+        from twinkle.server.sampler.pool.actor import create_sampler_controller
+        from twinkle.server.sampler.pool.router import build_sampler_router
+        controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
+                                                                 self.config.resources.model_dump(),
+                                                                 build_worker_env_vars())
+        self._sampler_controllers.append(controller)
+        ray.get(controller.initialize.remote())
+        serve.run(
+            build_sampler_router(self.ray_namespace, pool_id, options), name=app.name, route_prefix=app.route_prefix)
 
-        logger.info(f'Starting {name} at {route_prefix}...')
+    def _deploy_application(self, app_spec: ApplicationSpec) -> None:
+        """Model declarations go to the training controller; other apps deploy here."""
+        if app_spec.import_path == 'model':
+            return
+        if app_spec.import_path == 'sampler':
+            self._deploy_sampler(app_spec)
+            return
+        from ray import serve
+        args = {key: value for key, value in dict(app_spec.args).items() if value is not None}
+        if app_spec.import_path == 'server':
+            defaults = self._gateway_arguments()
+            for key, value in defaults.items():
+                args.setdefault(key, value)
+        deployment = app_spec.deployments[0] if app_spec.deployments else {}
+        options = self._deployment_options(deployment)
+        builder = self._resolve_builder(app_spec.import_path)
+        serve.run(builder(deploy_options=options, **args), name=app_spec.name, route_prefix=app_spec.route_prefix)
 
-        builder = self._resolve_builder(import_path)
+    def _training_router_options(self, model) -> dict:
+        options = self._deployment_options(model.deploy_options, model.env_vars)
+        if 'autoscaling_config' not in options:
+            options.setdefault('num_replicas', 1)
+        options['ray_actor_options'].setdefault('num_cpus', 0.1)
+        return options
 
-        deploy_options = {}
-        if deployments:
-            if len(deployments) > 1:
-                logger.warning(f'Application "{name}" has {len(deployments)} deployments configured, '
-                               f'but only the first deployment will be used.')
-            deploy_config = deployments[0]
-            if isinstance(deploy_config, dict):
-                deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
+    def _deploy_training(self) -> None:
+        import ray
+        from ray import serve
 
-        # Inject telemetry + persistence env vars into the deployment's
-        # runtime_env so that Ray Serve replicas (worker processes) can
-        # initialize telemetry and resolve the configured persistence backend
-        # regardless of deployment startup order.
-        # User-specified env_vars take precedence over our defaults.
-        propagated_env_vars = build_propagated_env_vars()
-        if propagated_env_vars:
-            ray_actor_options = dict(deploy_options.get('ray_actor_options') or {})
-            runtime_env = dict(ray_actor_options.get('runtime_env') or {})
-            env_vars = dict(runtime_env.get('env_vars') or {})
-            for k, v in propagated_env_vars.items():
-                env_vars.setdefault(k, v)
-            runtime_env['env_vars'] = env_vars
-            ray_actor_options['runtime_env'] = runtime_env
-            deploy_options['ray_actor_options'] = ray_actor_options
+        from twinkle.server.model.pool.actor import TrainingControllerActor, controller_name
+        from twinkle.server.model.pool.router import build_training_router
+        config = self.config.training_config
+        controller = TrainingControllerActor.options(
+            name=controller_name(self.ray_namespace),
+            namespace=self.ray_namespace,
+            runtime_env={
+                'env_vars': build_worker_env_vars()
+            }).remote(config.model_dump(), self.ray_namespace)
+        self._training_controller = controller
+        try:
+            ray.get(controller.initialize.remote())
+            for model in config.models:
+                app = build_training_router(config, model, self.ray_namespace, self.config.http_options.model_dump(),
+                                            self._training_router_options(model))
+                serve.run(
+                    app,
+                    name=f'training-router-{self.ray_namespace}-{model.name}',
+                    route_prefix=model.route_prefix or f'/api/v1/model/{model.name}')
+        except Exception:
+            self._run_cleanup([('training controller rollback', self._stop_training_controller)], raise_errors=False)
+            raise
 
-        # Pass http_options to server apps for internal proxy routing
-        if import_path == 'server':
-            args.setdefault('http_options', self.config.http_options.model_dump())
+    def _stop_controller(self, controller) -> None:
+        import ray
 
-        app = builder(deploy_options=deploy_options, **args)
+        # Keep an unconfirmed owner available for cleanup retry; a timeout alone
+        # does not certify its workers or devices were released.
+        ray.get(controller.shutdown.remote(), timeout=self.config.resources.shutdown_timeout_s)
+        ray.kill(controller, no_restart=True)
 
-        serve.run(app, name=name, route_prefix=route_prefix)
-        logger.info(f'Deployed {name} at {route_prefix}')
+    def _stop_training_controller(self) -> None:
+        if self._training_controller is not None:
+            self._stop_controller(self._training_controller)
+            self._training_controller = None
+
+    def _stop_sampler_controller(self, controller) -> None:
+        self._stop_controller(controller)
+        self._sampler_controllers.remove(controller)
+
+    @staticmethod
+    def _run_cleanup(actions: list[tuple[str, Callable]], *, raise_errors: bool) -> None:
+        """Attempt every independent cleanup; rollback preserves the startup error."""
+        failures = []
+        for name, action in actions:
+            try:
+                action()
+            except Exception as exc:
+                failures.append((name, exc))
+                logger.exception('%s failed', name)
+        if failures and raise_errors:
+            names = ', '.join(name for name, _ in failures)
+            raise RuntimeError(f'Server cleanup is incomplete: {names}') from failures[0][1]
+
+    def _shutdown(self, *, raise_errors: bool = True) -> None:
+        from functools import partial
+        from ray import serve
+
+        from twinkle.server.telemetry import flush_telemetry_safely
+        actions = [('training controller shutdown', self._stop_training_controller)]
+        actions.extend(('sampler controller shutdown', partial(self._stop_sampler_controller, controller))
+                       for controller in tuple(self._sampler_controllers))
+        if self._serve_started:
+            actions.append(('Ray Serve shutdown', serve.shutdown))
+        actions.append(('telemetry flush', flush_telemetry_safely))
+        self._run_cleanup(actions, raise_errors=raise_errors)
+        self._serve_started = False
+
+    @staticmethod
+    def _wait_for_shutdown() -> None:
+        stopped = threading.Event()
+
+        def signal_shutdown(signum, frame):
+            logger.info('Received %s', signal.Signals(signum).name)
+            stopped.set()
+
+        signal.signal(signal.SIGINT, signal_shutdown)
+        signal.signal(signal.SIGTERM, signal_shutdown)
+        stopped.wait()
 
     def launch(self) -> None:
-        """Launch the server with all configured applications.
-
-        Blocks the calling thread to keep the server running. Installs signal
-        handlers for SIGINT/SIGTERM so that ``serve.shutdown()`` is called on
-        termination instead of leaving orphaned deployments.
-        """
-        # Apply Ray Serve patches before initializing Ray
-        apply_ray_serve_patches()
-
-        # Initialize telemetry if configured
-        telemetry = self.config.telemetry
-        if telemetry.enabled:
-            from twinkle.server.telemetry import init_telemetry
-            init_telemetry(telemetry)
-            # Export config to env vars for Ray worker processes
-            os.environ['TWINKLE_TELEMETRY_ENABLED'] = '1'
-            os.environ['TWINKLE_TELEMETRY_DEBUG'] = '1' if telemetry.debug else '0'
-            os.environ['TWINKLE_TELEMETRY_SERVICE'] = telemetry.service_name
-            os.environ['TWINKLE_TELEMETRY_ENDPOINT'] = telemetry.otlp_endpoint
-            os.environ['TWINKLE_TELEMETRY_INTERVAL'] = str(telemetry.export_interval_ms)
-
-        # Export top-level persistence to env vars so any worker
-        # (not just Gateway) can build the same backend on first call to
-        # get_server_state().
-        persistence = self.config.persistence
-        for k, v in persistence.to_env_vars().items():
-            os.environ[k] = v
-        logger.info(f'Persistence backend configured: mode={persistence.mode}')
-
-        # Export the gateway ``server`` application's ServerState policy (quota /
-        # expiry / cleanup / metrics interval) to env vars for the same reason:
-        # so every worker's first ``get_server_state()`` applies the configured
-        # values instead of the hardcoded defaults. Without this the model worker
-        # that enforces ``per_token_model_limit`` runs on the default (30),
-        # silently ignoring the YAML value.
-        server_specs = [a for a in self.config.applications if a.import_path == 'server']
-        if len(server_specs) > 1:
-            logger.warning(f'{len(server_specs)} "server" applications declared; using the first '
-                           'for ServerState policy env propagation.')
-        if server_specs:
-            server_state_env = server_specs[0].args.server_config.to_env_vars()
-            for k, v in server_state_env.items():
-                os.environ[k] = v
-            if server_state_env:
-                logger.info(f'ServerState policy exported to worker env: {server_state_env}')
-
-        model_alias_map = build_model_alias_map(self.config.applications)
-        if model_alias_map:
-            os.environ[MODEL_ID_ALIASES_ENV] = json.dumps(model_alias_map, ensure_ascii=False)
-        else:
-            os.environ.pop(MODEL_ID_ALIASES_ENV, None)
-
-        self._init_ray()
-        self._start_serve()
-
-        applications = self.config.applications
-        if not applications:
+        if not self.config.applications:
             logger.warning('No applications configured')
             return
-
-        for app_spec in applications:
-            self._deploy_application(app_spec)
-
-        host = self.config.http_options.host
-        port = self.config.http_options.port
-
-        logger.info('All applications started!')
-        for app_spec in applications:
-            logger.info('  Endpoint: http://%s:%s%s', host, port, app_spec.route_prefix)
-
-        # Graceful shutdown via signal handling
-        shutdown_event = threading.Event()
-
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
-            logger.info(f'Received {sig_name}, shutting down gracefully...')
-            shutdown_event.set()
-
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-
-        # Block until a termination signal is received
-        shutdown_event.wait()
-
-        self._shutdown()
-
-    def _shutdown(self) -> None:
-        """Tear down Serve and flush telemetry on graceful termination.
-
-        Telemetry flush runs AFTER ``serve.shutdown()`` and is wrapped so a
-        telemetry-shutdown failure cannot mask the user-facing shutdown path.
-        """
-        from ray import serve
+        apply_ray_serve_patches()
+        self._configure_environment()
+        self._init_ray()
         try:
-            serve.shutdown()
-            logger.info('Ray Serve shut down successfully')
+            self._start_serve()
+            for app in self.config.applications:
+                self._deploy_application(app)
+            if self.config.training_config.models:
+                self._deploy_training()
+            logger.info('All applications started')
+            self._wait_for_shutdown()
         except Exception:
-            logger.warning('Error during Ray Serve shutdown', exc_info=True)
-
-        # Flush buffered OTLP batches (traces / metrics / logs) on the driver
-        # after Serve is down. Errors are swallowed by the helper.
-        from twinkle.server.telemetry import flush_telemetry_safely
-        flush_telemetry_safely()
+            self._shutdown(raise_errors=False)
+            raise
+        self._shutdown()
 
 
 def launch_server(

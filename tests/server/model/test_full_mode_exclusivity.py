@@ -5,120 +5,100 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from fastapi import FastAPI
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from starlette.requests import Request
 
-import twinkle.protocol.types as types
-from twinkle.server.exceptions import FullModeBusyError
-from twinkle.server.model import twinkle_handlers
-from twinkle.server.model.app import ModelManagement
-from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
-from twinkle.server.session_resource.base import SessionResourceMixin
+from tests.server.state.fake_backend import FakeBackend
+from tests.server.training.helpers import request, setup
+from twinkle.server.config.training import TrainingConfig
+from twinkle.server.model.pool.router import TrainingRouter
 
 
-class _ResourceStub:
-    """The resource-registry slice of ModelManagement, without Ray Serve."""
-
-    is_full_mode = True
-    _resource_type = 'Model'
-    find_active_resource = SessionResourceMixin.find_active_resource
-    register_resource = SessionResourceMixin.register_resource
-    unregister_resource = SessionResourceMixin.unregister_resource
-    set_resource_state = SessionResourceMixin.set_resource_state
-    _validate_registration = SessionResourceMixin._validate_registration
-    _create_resource_record = SessionResourceMixin._create_resource_record
-    assert_full_mode_available = ModelManagement.assert_full_mode_available
-    claim_full_mode_resource = ModelManagement.claim_full_mode_resource
-
-    def __init__(self):
-        self._resource_records = {}
+async def _setup_full_instance():
+    """Full-mode slots belong to the controller, not the retired model create route."""
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    raw = controller.config.model_dump()
+    raw['models'][1]['config']['max_replicas'] = 1
+    controller.config = TrainingConfig.model_validate(raw)
+    runtime.start_gate.clear()
+    return controller, state, runtime
 
 
 @pytest.mark.asyncio
 async def test_concurrent_full_mode_claims_have_exactly_one_winner():
-    stub = _ResourceStub()
-
-    async def claim(name):
-        # The old check-then-register split had this await between the two steps.
-        await asyncio.sleep(0)
-        stub.claim_full_mode_resource(name, 'token', 'session')
-
-    results = await asyncio.gather(claim('tenant-a'), claim('tenant-b'), return_exceptions=True)
-    assert sum(isinstance(result, FullModeBusyError) for result in results) == 1
-    assert len(stub._resource_records) == 1
-
-
-def test_same_tenant_may_reclaim_its_own_resource():
-    stub = _ResourceStub()
-    stub.claim_full_mode_resource('tenant-a', 'token', 'session')
-    stub.claim_full_mode_resource('tenant-a', 'token', 'session')
-
-    with pytest.raises(FullModeBusyError):
-        stub.claim_full_mode_resource('tenant-b', 'token', 'session')
-
-
-class _AsyncState:
-
-    def __init__(self):
-        self.registered = []
-        self.unloaded = []
-
-    async def register_model(self, config, *, token, model_id, replica_id, session_id):
-        # The exact window the old check-then-register split raced through.
-        await asyncio.sleep(0)
-        self.registered.append(model_id)
-
-    async def unload_model(self, model_id):
-        self.unloaded.append(model_id)
-
-
-class _RunManager:
-
-    def save(self, adapter_name, run_config):
-        return None
-
-
-class _FullModeManagement(_ResourceStub):
-    """The handler-level slice of ModelManagement needed by add_adapter_to_model."""
-
-    base_model = 'base-model'
-    replica_id = 'replica'
-
-    def __init__(self):
-        super().__init__()
-        self.state = _AsyncState()
-
-    async def _on_request_start(self, request):
-        return 'token'
-
-    async def submit_and_peek(self, factory, **kwargs):
-        from twinkle.protocol.types.lifecycle import TaskEnvelope
-        return TaskEnvelope(request_id='req', status='completed', result=await factory())
-
-
-def _request():
-    request = Request({'type': 'http', 'headers': []})
-    request.state.session_id = 'session'
-    request.state.request_id = 'req'
-    return request
+    controller, state, runtime = await _setup_full_instance()
+    try:
+        refs = await asyncio.gather(*(controller.create(request(name, mode='full'))
+                                      for name in ('tenant-a', 'tenant-b')))
+        assert len(controller.instances) == 1
+        assert len(next(iter(controller.instances.values())).training_ids) == 1
+        runtime.start_gate.set()
+        await controller.wait_for_jobs()
+        records = [await state.get_future(ref['request_id']) for ref in refs]
+        assert sum(record['status'] == 'completed' for record in records) == 1
+        assert sum(record['status'] == 'failed' and record['failure']['reason_code'] == 'capacity_unavailable'
+                   for record in records) == 1
+        assert await state._backend.get('token_count::owner') == 1
+    finally:
+        runtime.start_gate.set()
+        await controller.wait_for_jobs()
+        await controller.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_handler_creates_have_exactly_one_winner(monkeypatch):
-    """Two real handler calls, interleaved inside register_model, must not both win."""
-    management = _FullModeManagement()
-    monkeypatch.setattr(twinkle_handlers, 'create_training_run_manager', lambda *args, **kwargs: _RunManager())
-    app = FastAPI()
-    _register_model_twinkle_routes(app, lambda: management)
-    endpoint = next(route.endpoint for route in app.routes
-                    if getattr(route, 'path', None) == '/twinkle/add_adapter_to_model')
+async def test_same_tenant_may_reclaim_its_own_resource():
+    controller, _, runtime = await _setup_full_instance()
+    try:
+        refs = await asyncio.gather(*(controller.create(request('same', mode='full')) for _ in range(2)))
+        assert refs[0] == refs[1]
+        assert len(controller.instances) == 1
+        assert len(next(iter(controller.instances.values())).training_ids) == 1
+    finally:
+        runtime.start_gate.set()
+        await controller.wait_for_jobs()
+        await controller.shutdown()
 
-    results = await asyncio.gather(
-        *(endpoint(_request(), types.AddAdapterRequest(adapter_name=name), management)
-          for name in ('adapter-a', 'adapter-b')),
-        return_exceptions=True)
 
-    assert sum(isinstance(result, FullModeBusyError) for result in results) == 1
-    assert len(management._resource_records) == 1
-    # The loser released the model record it wrote before the claim failed.
-    assert len(management.state.unloaded) == 1
+def _request(body):
+    async def receive():
+        return {'type': 'http.request', 'body': json.dumps(body).encode(), 'more_body': False}
+    incoming = Request({'type': 'http', 'method': 'POST', 'path': '/twinkle/add_adapter_to_model', 'headers': []}, receive)
+    incoming.state.session_id = 'session'
+    incoming.state.token = 'owner'
+    incoming.state.request_id = 'req'
+    return incoming
+
+
+@pytest.mark.asyncio
+async def test_concurrent_handler_creates_have_exactly_one_winner():
+    """Drive the current catalog handler into real controller reservations."""
+    controller, state, runtime = await _setup_full_instance()
+    router = TrainingRouter.__new__(TrainingRouter)
+    router.state = state
+    router.config = controller.config
+    router.model = SimpleNamespace(name='small-full')
+    router.controller = SimpleNamespace(create=SimpleNamespace(remote=AsyncMock(side_effect=controller.create)))
+
+    async def create_remote(payload):
+        from twinkle.server.state.training_records import CreateTraining
+        return await controller.create(CreateTraining.model_validate(payload))
+    router.controller.create.remote.side_effect = create_remote
+    try:
+        refs = await asyncio.gather(*(router.native_request(_request({
+            'client_create_id': name, 'adapter_name': name,
+        }), 'add_adapter_to_model') for name in ('adapter-a', 'adapter-b')))
+        assert len(controller.instances) == 1
+        assert len(next(iter(controller.instances.values())).training_ids) == 1
+        runtime.start_gate.set()
+        await controller.wait_for_jobs()
+        records = [await state.get_future(ref.request_id) for ref in refs]
+        assert sum(record['status'] == 'completed' for record in records) == 1
+        assert sum(record['status'] == 'failed' and record['failure']['reason_code'] == 'capacity_unavailable'
+                   for record in records) == 1
+        assert await state._backend.get('token_count::owner') == 1
+    finally:
+        runtime.start_gate.set()
+        await controller.wait_for_jobs()
+        await controller.shutdown()

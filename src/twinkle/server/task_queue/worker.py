@@ -16,18 +16,20 @@ from dataclasses import replace
 from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
-from twinkle.protocol.types.errors import ErrorCategory
-from twinkle.server.exceptions import (BatchSizeError, EndpointUnavailableError, FullModeBusyError,
+from twinkle.protocol.types.errors import ErrorCategory, QueueState
+from twinkle.protocol.types.lifecycle import TaskStatus
+from twinkle.server.config.task_queue import TaskQueueConfig
+from twinkle.server.exceptions import (BackendBusyError, BatchSizeError, EndpointUnavailableError, FullModeBusyError,
                                        InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
                                        ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
                                        StateBackendError, TrainModeMismatchError, TwinkleServerError)
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from .config import TaskQueueConfig
-from .types import BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
+from .types import QueuedTask
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -107,6 +109,8 @@ class ComputeWorker:
         self._on_backend_timeout = on_backend_timeout
 
         self.task_queues: dict[str, asyncio.Queue] = {}
+        self._request_ids: set[str] = set()
+        self._task_outcomes: dict[str, dict[str, Any]] = {}
         self.queue_order: Deque[str] = deque()
         self.new_task_event: asyncio.Event = asyncio.Event()
 
@@ -119,14 +123,19 @@ class ComputeWorker:
         self._detached_tasks: dict[asyncio.Task, QueuedTask] = {}
         self._detached_reserved = 0
 
+    def ensure_accepting(self) -> None:
+        if self._stopping:
+            raise ResourceExhaustedError('The replica is shutting down.')
+
     async def ensure_started(self) -> None:
-        """Ensure the background worker coroutine is running."""
+        """Ensure the background worker coroutine is running; never reopen a stopped replica."""
+        self.ensure_accepting()
         if self._started and self._worker_task is not None and not self._worker_task.done():
             return
         async with self._start_lock:
+            self.ensure_accepting()
             if self._started and self._worker_task is not None and not self._worker_task.done():
                 return
-            self._stopping = False
             self._worker_task = asyncio.create_task(self._worker_loop())
             self._started = True
 
@@ -150,10 +159,11 @@ class ComputeWorker:
                     'Sampler task stopped during replica shutdown.',
                     QueueState.ACTIVE.value,
                     reason_code='orphaned_replica')
+        for queue_key in list(self.task_queues):
+            await self.fail_queue_tasks(queue_key, 'Replica stopped before the task could execute.')
         self._worker_task = None
         self._started = False
-        self.task_queues.clear()
-        self.queue_order.clear()
+        self._request_ids.clear()
 
     def ensure_queue_registered(self, queue_key: str) -> None:
         """Register a new per-key queue if it does not yet exist."""
@@ -170,6 +180,40 @@ class ComputeWorker:
         indexing the worker's internal ``task_queues`` container directly.
         """
         return self.task_queues[queue_key]
+
+    def track_task(self, request_id: str) -> None:
+        self._request_ids.add(request_id)
+
+    def has_task(self, request_id: str) -> bool:
+        """True while a task is queued or executing, including a terminal-future race."""
+        return request_id in self._request_ids
+
+    def get_task_outcome(self, request_id: str) -> dict[str, Any] | None:
+        """Read bounded local execution facts, never infer them from a future status."""
+        cutoff = time.time() - self._config.absolute_future_ttl(1)
+        for identity, outcome in list(self._task_outcomes.items()):
+            if outcome['finished_at'] <= cutoff:
+                self._task_outcomes.pop(identity)
+        outcome = self._task_outcomes.get(request_id)
+        return dict(outcome) if outcome is not None else None
+
+    async def finish_task(self,
+                          task: QueuedTask,
+                          executed: bool,
+                          unsafe: bool = False,
+                          finished_at: float | None = None) -> None:
+        if task.on_finished is not None:
+            self.get_task_outcome(task.request_id)
+            self._task_outcomes[task.request_id] = {
+                'state': 'unsafe' if unsafe else 'finished',
+                'executed': executed,
+                'finished_at': time.time() if finished_at is None else finished_at,
+            }
+        self._request_ids.discard(task.request_id)
+        if task.on_finished is not None:
+            acknowledged = await task.on_finished(executed, unsafe)
+            if acknowledged is True:
+                self._task_outcomes.pop(task.request_id, None)
 
     def total_queued(self) -> int:
         """Total number of pending tasks across all per-key queues."""
@@ -268,6 +312,7 @@ class ComputeWorker:
         for task in drained:
             await self._store_task_failed(task, reason, QueueState.UNKNOWN.value, queue_state_reason=reason)
             q.task_done()
+            await self.finish_task(task, False)
 
         self.task_queues.pop(queue_key, None)
         try:
@@ -294,6 +339,7 @@ class ComputeWorker:
         await self._store_task_failed(task, error, QueueState.PAUSED_CAPACITY.value, queue_state_reason=error)
         self._record_tasks_total(task.task_type or 'unknown', 'timeout')
         q.task_done()
+        await self.finish_task(task, False)
 
     async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
         """Execute a dequeued task, then release its queue slot."""
@@ -314,7 +360,8 @@ class ComputeWorker:
                 task.model_id,
                 queue_state=QueueState.ACTIVE.value,
                 replica_id=replica_id,
-                absolute_deadline=absolute_deadline)
+                absolute_deadline=absolute_deadline,
+                owner_token=task.token)
             wrote_status = True
             self.run_detached(task, queue_key)
         except BaseException:
@@ -329,7 +376,8 @@ class ComputeWorker:
 
     def reserve_detached(self) -> None:
         """Reserve before the future write, so capacity rejection leaves no record."""
-        if self._stopping or self._detached_reserved >= self._config.concurrent_task_limit:
+        self.ensure_accepting()
+        if self._detached_reserved >= self._config.concurrent_task_limit:
             raise ResourceExhaustedError('Concurrent compute capacity is unavailable on this replica.')
         self._detached_reserved += 1
 
@@ -375,10 +423,17 @@ class ComputeWorker:
 
         running = asyncio.create_task(run())
         self._detached_tasks[running] = task
+        scope = task.execution_scope
+        if scope is not None:
+            scope.track(running, task.request_id)
 
         def done(completed: asyncio.Task) -> None:
             self._detached_tasks.pop(completed, None)
             self.release_detached()
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None:
+                    logger.error('Detached task failed', exc_info=(type(error), error, error.__traceback__))
 
         running.add_done_callback(done)
 
@@ -391,6 +446,8 @@ class ComputeWorker:
         exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
+        executed = False
+        finished_at = None
         # One span per queued task execution, tagged `<deployment>.<task_type>`
         # (e.g. `model.forward`, `sampler.sample`).
         queue_attrs = {
@@ -403,28 +460,20 @@ class ComputeWorker:
         handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
         handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
         try:
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.RUNNING.value,
-                task.model_id,
-                queue_state=QueueState.ACTIVE.value,
-            )
-            # A client cancel (or orphan cleanup) can win the race against the
-            # running write; the terminal record is kept, so do not start work
-            # nobody will collect. Once running is stored, cancel_if_pending can
-            # no longer succeed, so this read closes the window.
-            if await self._is_record_terminal(task.request_id):
+            if not await self._state.try_start_future(task.request_id):
                 task_status = 'cancelled'
-                logger.info(f'[ComputeWorker] Task {task.request_id} became terminal before start; skipping.')
+                logger.info(f'[ComputeWorker] Task {task.request_id} was not acquired; skipping.')
                 return
             with traced_operation('task_queue.execute', attrs=queue_attrs):
                 logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
                              f'type={task_type}, queue_key={queue_key}')
                 with traced_operation(handler_span_name, attrs=handler_attrs):
+                    executed = True
                     coro = task.coro_factory()
                     # effective_execution_timeout is always positive (0 -> finite fallback),
                     # so wait_for is always in effect.
                     result = await asyncio.wait_for(coro, timeout=self._config.effective_execution_timeout)
+                    finished_at = time.time()
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             await self._state.store_future_status(
@@ -460,16 +509,6 @@ class ComputeWorker:
                     await self._on_backend_timeout()
                 except Exception:
                     logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
-        except UserTaskError as exc:
-            task_status = 'failed'
-            exec_time = time.monotonic() - exec_start
-            await self._store_task_failed(
-                task,
-                f'{type(exc).__name__}: {exc}',
-                QueueState.UNKNOWN.value,
-                reason_code='request_rejected',
-                attribution='user',
-            )
         except BackendBusyError as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start
@@ -514,6 +553,7 @@ class ComputeWorker:
                 traceback_text=traceback.format_exc(),
             )
         finally:
+            await self.finish_task(task, executed, executed and task_status in ('timeout', 'cancelled'), finished_at)
             self._record_execution_time(task_type, exec_time)
             self._record_tasks_total(task_type, task_status)
 
@@ -546,13 +586,6 @@ class ComputeWorker:
                 await self._fail_timed_out_task(task, queue_wait, q)
                 continue  # try the next queue
 
-            # A record already in a Terminal_State (e.g. written 'failed' by the
-            # state-hygiene orphan handling) must not be executed again.
-            if await self._is_record_terminal(task.request_id):
-                logger.info(f'[ComputeWorker] Task {task.request_id} already terminal on dequeue; skipping.')
-                q.task_done()
-                continue
-
             # Execute the task (serial: stops after the first execution)
             await self._execute_task(task, queue_key, q)
             return True
@@ -561,11 +594,8 @@ class ComputeWorker:
 
     async def _is_record_terminal(self, request_id: str) -> bool:
         """True if the future record already holds a Terminal_State."""
-        try:
-            record = await self._state.get_future(request_id)
-        except Exception:
-            return False
-        if not record:
+        record = await self._state.get_future(request_id)
+        if record is None:
             return False
         return record.get('status') in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value)
 

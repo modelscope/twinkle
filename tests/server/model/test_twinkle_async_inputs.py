@@ -101,7 +101,7 @@ async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -
         kwarg_fields={
             'old_logps': 'sampled_logprobs',
             'advantages': 'advantage',
-        },
+        }, training_id='training-a',
     )
 
     await route.endpoint(request, body, management)
@@ -109,7 +109,7 @@ async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -
     assert management.scheduled[-1]['batch_size'] == 8
     assert management.scheduled[-1]['data_world_size'] == 2
     inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
-    assert adapter_name == 'session-adapter'
+    assert adapter_name == 'training-a'
     assert [row['input_ids'] for row in inputs] == [[index] for index in range(8)]
     assert forwarded_kwargs['old_logps'] == [[-0.1]] * 4 + [[-0.2]] * 4
     assert forwarded_kwargs['advantages'] == [1.0] * 4 + [-1.0] * 4
@@ -139,13 +139,13 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
     body = types.DataPlaneForwardRequest(
         adapter_name='adapter',
         input_refs=[types.DataRef(ref_id='dpo', size=2, num_tokens=6)],
-        kwarg_fields={'ref_outputs.logps': 'ref_logps'},
+        kwarg_fields={'ref_outputs.logps': 'ref_logps'}, training_id='training-a',
     )
 
     await route.endpoint(request, body, management)
 
     inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
-    assert adapter_name == 'session-adapter'
+    assert adapter_name == 'training-a'
     assert [row['input_ids'] for row in inputs] == [[1, 2, 3], [1, 4, 5]]
     assert forwarded_kwargs['ref_outputs']['logps'] == [
         [-0.1, -0.2, -0.3],
@@ -177,7 +177,7 @@ async def test_save_forwards_backend_options_and_returns_public_path(
 
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TwinkleTrainingRunManager('token')
-    runs._write_info('session-adapter', {'base_model': 'test-model', 'is_lora': True})
+    runs._write_info('training-a', {'base_model': 'test-model', 'is_lora': True})
     manager = TwinkleCheckpointManager('token', runs)
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     service = Management()
@@ -189,14 +189,14 @@ async def test_save_forwards_backend_options_and_returns_public_path(
     request.state.session_id = 'session'
 
     body = types.SaveRequest(adapter_name='adapter', name='step/one', is_sampler=is_sampler,
-                             save_optimizer=save_optimizer, consumed_train_samples=7)
+                             save_optimizer=save_optimizer, consumed_train_samples=7, training_id='training-a')
     response = await endpoint(request, body, service)
     weights_type = 'sampler_weights' if is_sampler else 'weights'
-    directory = manager.get_ckpt_dir('session-adapter', f'{weights_type}/step_one')
-    assert response.result == {'twinkle_path': f'twinkle://session-adapter/{weights_type}/step_one',
+    directory = manager.get_ckpt_dir('training-a', f'{weights_type}/step_one')
+    assert response.result == {'twinkle_path': f'twinkle://training-a/{weights_type}/step_one',
                                'checkpoint_dir': str(directory)}
     assert (directory / 'weights').read_text() == '1'
-    assert service.model_calls == [('step_one', {'adapter_name': '' if full_mode else 'session-adapter',
+    assert service.model_calls == [('step_one', {'adapter_name': '' if full_mode else 'training-a',
                                                 'save_optimizer': save_optimizer, 'consumed_train_samples': 7})]
 
 
@@ -211,9 +211,9 @@ async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tm
 
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TwinkleTrainingRunManager('token')
-    runs._write_info('session-adapter', {'base_model': 'test-model'})
+    runs._write_info('training-a', {'base_model': 'test-model'})
     manager = TwinkleCheckpointManager('token', runs)
-    before = runs._read_info('session-adapter')
+    before = runs._read_info('training-a')
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     service = Management()
     app = FastAPI()
@@ -221,12 +221,12 @@ async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tm
     endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/twinkle/save')
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
-    body = types.SaveRequest(adapter_name='adapter', name='failed')
+    body = types.SaveRequest(adapter_name='adapter', name='failed', training_id='training-a')
 
     with pytest.raises(RuntimeError, match='backend save failed'):
         await endpoint(request, body, service)
-    assert manager.list_checkpoints('session-adapter').checkpoints == []
-    assert runs._read_info('session-adapter') == before
+    assert manager.list_checkpoints('training-a').checkpoints == []
+    assert runs._read_info('training-a') == before
 
 
 @pytest.mark.asyncio
@@ -253,9 +253,9 @@ async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, t
     request.state.session_id = 'session'
 
     if operation == 'load':
-        body = types.LoadRequest(adapter_name='adapter', name=path, load_optimizer=True, strict=False)
+        body = types.LoadRequest(adapter_name='adapter', name=path, load_optimizer=True, strict=False, training_id='training-a')
     elif operation == 'resume_from_checkpoint':
-        body = types.ResumeFromCheckpointRequest(adapter_name='adapter', name=path, resume_only_model=True)
+        body = types.ResumeFromCheckpointRequest(adapter_name='adapter', name=path, resume_only_model=True, training_id='training-a')
         service.model.resume_from_checkpoint.return_value = {'step': 7}
     else:
         body = types.UploadToHubRequest(checkpoint_dir=path, hub_model_id='org/output', hub_token='hub-token')
@@ -264,10 +264,10 @@ async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, t
     if operation == 'load':
         service.model.load.assert_called_once_with(
             name='step' if local else path, output_dir=manager.get_save_dir('run') if local else None,
-            load_optimizer=True, adapter_name='session-adapter', token='token', strict=False)
+            load_optimizer=True, adapter_name='training-a', token='token', strict=False)
     elif operation == 'resume_from_checkpoint':
         service.model.resume_from_checkpoint.assert_called_once_with(
-            directory, resume_only_model=True, adapter_name='session-adapter')
+            directory, resume_only_model=True, adapter_name='training-a')
         assert response.result == {'result': {'step': 7}}
     else:
         service.model.upload_to_hub.assert_called_once_with(
@@ -300,7 +300,7 @@ async def test_forward_backward_preflights_loss_inputs_before_backend() -> None:
             'labels': [-100, 5],
         } for index in range(3)],
         adapter_name='adapter',
-        loss_kwargs={'old_logps': [[-0.1], [-0.2], [-0.3]]},
+        loss_kwargs={'old_logps': [[-0.1], [-0.2], [-0.3]]}, training_id='training-a',
     )
 
     await route.endpoint(request, body, management)
@@ -309,11 +309,11 @@ async def test_forward_backward_preflights_loss_inputs_before_backend() -> None:
     preflight_inputs, preflight_adapter, preflight_kwargs = management.preflight_calls[0]
     # Slice-free: a per-rank slice would carry at most one of the three samples.
     assert len(preflight_inputs) == 3
-    assert preflight_adapter == 'session-adapter'
+    assert preflight_adapter == 'training-a'
     assert preflight_kwargs['old_logps'] == [[-0.1], [-0.2], [-0.3]]
     assert management.model_calls[0][0] == 'preflight'
     assert management.model_calls[-1][0] != 'preflight'
-    assert management.model_calls[-1][1] == 'session-adapter'
+    assert management.model_calls[-1][1] == 'training-a'
 
 
 @pytest.mark.asyncio
@@ -330,11 +330,11 @@ async def test_forward_backward_skips_preflight_without_rl_inputs() -> None:
             'input_ids': [1, 2],
             'labels': [-100, 5],
         }],
-        adapter_name='adapter',
+        adapter_name='adapter', training_id='training-a',
     )
 
     await route.endpoint(request, body, management)
 
     assert management.preflight_calls == []
     assert len(management.model_calls) == 1
-    assert management.model_calls[0][1] == 'session-adapter'
+    assert management.model_calls[0][1] == 'training-a'

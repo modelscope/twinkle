@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-import traceback
 import uuid
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
+from twinkle.protocol.types.errors import QueueState
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, TaskStatus
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
@@ -22,9 +23,8 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
-from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import ExecutionScope, QueuedTask
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
@@ -48,9 +48,8 @@ class TaskQueueMixin:
        concurrent requests itself, such as vLLM sampling.
 
     3. Background task (schedule_background_task):
-       asyncio.create_task, runs concurrently with compute queue. Use for I/O
-       or an engine that provides its own safe concurrency and batching.
-       Status is still tracked; clients can poll the same status endpoints.
+       Reuses the supervised concurrent path for pure I/O. Status, capacity
+       and shutdown are owned by the same worker as concurrent compute.
 
     Requirements
     ------------
@@ -128,6 +127,7 @@ class TaskQueueMixin:
 
         self._backend_gate = BackendGate(enable_admission_gate=enable_admission_gate)
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._queue_tasks: set[asyncio.Task] = set()
 
     @property
     def task_queue_config(self) -> TaskQueueConfig:
@@ -138,6 +138,10 @@ class TaskQueueMixin:
         Host_Protocol could not declare it without declaring a private name.
         """
         return self._task_queue_config
+
+    @property
+    def sequence_retention_s(self) -> float:
+        return self.state.expiration_timeout + self._future_absolute_ttl
 
     async def call_backend(self, fn: Callable[..., Any], /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
         """Run one backend call outside the event loop.
@@ -227,9 +231,33 @@ class TaskQueueMixin:
             batch_size_multiple=batch_size_multiple,
         )
 
+        task = QueuedTask(
+            request_id=request_id,
+            coro_factory=coro_factory,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            task_type=task_type,
+            created_at=time.monotonic())
+        await self._prepare_queued_task(task)
+
         if self._event_loop is None:
             self._event_loop = asyncio.get_running_loop()
 
+        try:
+            await self._enqueue_prepared_task(task)
+        except BaseException:
+            if task.on_finished is not None and await self.state.get_future(request_id) is None:
+                await self._compute_worker.finish_task(task, False)
+            raise
+        return {'request_id': request_id, 'model_id': model_id}
+
+    async def _prepare_queued_task(self, task: QueuedTask) -> None:
+        """Optional owner admission, after preflight and before any future write."""
+
+    async def _enqueue_prepared_task(self, task: QueuedTask) -> None:
+        request_id, model_id = task.request_id, task.model_id
+        self._compute_worker.ensure_accepting()
         await self.state.store_future_status(
             request_id,
             TaskStatus.PENDING.value,
@@ -237,36 +265,43 @@ class TaskQueueMixin:
             queue_state=QueueState.ACTIVE.value,
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline(),
+            owner_token=task.token,
         )
 
-        queue_key = self._queue_key(model_id=model_id, token=token)
+        try:
+            await self._compute_worker.ensure_started()
+        except BaseException:
+            try:
+                await self.state.store_future_status(
+                    request_id,
+                    TaskStatus.FAILED.value,
+                    model_id,
+                    failure=FutureFailureRecord(
+                        reason_code='orphaned_replica',
+                        attribution='server',
+                        message='Replica stopped before the task could be enqueued.'))
+            finally:
+                await self._compute_worker.finish_task(task, False)
+            raise
+        queue_key = self._queue_key(model_id=model_id, token=task.token)
         self._compute_worker.ensure_queue_registered(queue_key)
-        await self._compute_worker.ensure_started()
-
         q = self._compute_worker.get_queue(queue_key)
-        await q.put(
-            QueuedTask(
-                request_id=request_id,
-                coro_factory=coro_factory,
-                model_id=model_id,
-                token=token,
-                input_tokens=input_tokens,
-                task_type=task_type,
-                created_at=time.monotonic(),
-            ))
-        await self.state.store_future_status(
-            request_id,
-            TaskStatus.QUEUED.value,
-            model_id,
-            queue_state=QueueState.ACTIVE.value,
-        )
-        logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
-                    f'model_id={model_id}, queue_key={queue_key}, '
-                    f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
-
-        self._compute_worker.notify_new_task()
-
-        return {'request_id': request_id, 'model_id': model_id}
+        self._compute_worker.track_task(request_id)
+        await q.put(task)
+        try:
+            await self.state.store_future_status(
+                request_id,
+                TaskStatus.QUEUED.value,
+                model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
+            logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
+                        f'model_id={model_id}, queue_key={queue_key}, '
+                        f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
+        finally:
+            # Once q.put succeeds the sleeping worker must always be woken, even
+            # if an acknowledgement or status write fails afterwards.
+            self._compute_worker.notify_new_task()
 
     async def schedule_task(
         self,
@@ -318,6 +353,7 @@ class TaskQueueMixin:
         input_tokens: int = 0,
         task_type: str | None = None,
         request_id: str | None = None,
+        execution_scope: ExecutionScope | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
 
@@ -342,7 +378,8 @@ class TaskQueueMixin:
                 token=token,
                 input_tokens=input_tokens,
                 task_type=task_type,
-                created_at=time.monotonic()),
+                created_at=time.monotonic(),
+                execution_scope=execution_scope),
             self._queue_key(model_id=model_id, token=token),
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline())
@@ -419,68 +456,14 @@ class TaskQueueMixin:
         coro_factory: Callable[[], Coroutine],
         model_id: str | None = None,
         task_type: str | None = None,
+        token: str | None = None,
     ) -> dict[str, Any]:
-        """Schedule a fire-and-forget task outside the serial queue.
+        """Run pure I/O outside serial compute, with the same supervised lifecycle.
 
-        The task is launched immediately as an asyncio task. This is suitable
-        for pure I/O and for an inference engine such as vLLM that performs its
-        own safe request concurrency and continuous batching. Stateful Model
-        operations must continue to use :meth:`schedule_task`.
-
-        Status is tracked via state.store_future_status so clients can poll
-        progress through the same status endpoints as schedule_task().
-
-        Args:
-            coro_factory: Zero-argument callable that creates the coroutine.
-            model_id: Optional model id for result association.
-            task_type: Label for logging.
-
-        Returns:
-            {'request_id': str, 'model_id': str | None}
+        Capacity, timeout, cancellation and shutdown are owned by ComputeWorker;
+        background jobs must not create a second unsupervised execution path.
         """
-        request_id = f'req_{uuid.uuid4().hex}'
-        logger.info(f'[TaskQueue] Scheduling background task {request_id}, '
-                    f'type={task_type or "unknown"}, model_id={model_id}')
-
-        await self.state.store_future_status(
-            request_id,
-            TaskStatus.RUNNING.value,
-            model_id,
-            queue_state=QueueState.ACTIVE.value,
-            replica_id=getattr(self, 'replica_id', None),
-            absolute_deadline=self._future_deadline(),
-        )
-
-        async def _run() -> None:
-            try:
-                result = await coro_factory()
-                await self.state.store_future_status(
-                    request_id,
-                    TaskStatus.COMPLETED.value,
-                    model_id,
-                    result=result,
-                    queue_state=QueueState.ACTIVE.value,
-                )
-                logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
-            except Exception as exc:
-                failure = FutureFailureRecord(
-                    reason_code='internal_error',
-                    message=f'{type(exc).__name__}: {exc}'[:1024],
-                    attribution='server',
-                    diagnostic=traceback.format_exc(),
-                )
-                await self.state.store_future_status(
-                    request_id,
-                    TaskStatus.FAILED.value,
-                    model_id,
-                    failure=failure,
-                    queue_state=QueueState.ACTIVE.value,
-                )
-                logger.error(f'[TaskQueue] Background task {request_id} FAILED, type={task_type or "unknown"}:\n'
-                             f'{traceback.format_exc(limit=3)}')
-
-        asyncio.create_task(_run())
-        return {'request_id': request_id, 'model_id': model_id}
+        return await self.schedule_concurrent_task(coro_factory, model_id=model_id, task_type=task_type, token=token)
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
         await self._compute_worker.fail_queue_tasks(queue_key, reason)
@@ -493,13 +476,23 @@ class TaskQueueMixin:
             return
 
         def _schedule() -> None:
-            asyncio.create_task(self._fail_queue_tasks_async(queue_key, reason))
+            task = asyncio.create_task(self._fail_queue_tasks_async(queue_key, reason))
+            self._queue_tasks.add(task)
+            task.add_done_callback(self._queue_task_done)
 
         self._event_loop.call_soon_threadsafe(_schedule)
+
+    def _queue_task_done(self, task: asyncio.Task) -> None:
+        self._queue_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error('Queue maintenance failed', exc_info=(type(error), error, error.__traceback__))
 
     async def shutdown_task_queue(self) -> None:
         """Gracefully shut down the compute queue and release resources."""
         await self._rate_limiter.stop_cleanup_task()
         await self._compute_worker.stop()
+        await asyncio.gather(*self._queue_tasks, return_exceptions=True)
         self._backend_gate.shutdown()
         logger.debug('[TaskQueue] Task queue shutdown complete')

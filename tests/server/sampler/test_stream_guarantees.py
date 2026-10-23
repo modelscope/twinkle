@@ -89,6 +89,8 @@ async def test_stream_timeout_returns_error_payload_and_closes_queue():
 class _GenerationService:
 
     def __init__(self) -> None:
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        self.sampling_guard = SamplerConcurrency()
         self.cancelled = False
         self.sampler = SimpleNamespace(
             get_generation_status=lambda _submission_id: {'status': 'running'},
@@ -111,3 +113,6 @@ async def test_generation_poll_has_total_timeout_and_cancels():
         await asyncio.wait_for(_await_generation(service, 'submission'), timeout=0.05)
 
     assert service.cancelled is True
+    from twinkle.server.exceptions import BackendBusyError
+    with pytest.raises(BackendBusyError, match='restarting'):
+        service.sampling_guard.check_available()

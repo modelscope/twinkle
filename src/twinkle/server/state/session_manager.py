@@ -67,6 +67,13 @@ class SessionManager(BaseManager[SessionRecord]):
             return None
         return record.last_heartbeat
 
+    async def get_last_heartbeats(self, session_ids: list[str]) -> dict[str, float | None]:
+        records = await self._backend.mget([self._make_key(identity) for identity in session_ids])
+        return {
+            identity: SessionRecord.model_validate(record).last_heartbeat if record is not None else None
+            for identity, record in zip(session_ids, records, strict=True)
+        }
+
     # ----- Cleanup -----
 
     def _is_expired(self, record: SessionRecord, cutoff_time: float) -> bool:

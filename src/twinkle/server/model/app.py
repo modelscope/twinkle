@@ -8,23 +8,20 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 from __future__ import annotations
 
 import asyncio
-from fastapi import FastAPI, HTTPException, Request
-from ray import serve
-from ray.serve.config import RequestRouterConfig
+from fastapi import FastAPI, Request
 from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.config.backend_dispatch import BackendSelector
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
-from twinkle.server.exceptions import FullModeBusyError
-from twinkle.server.middleware.auth import get_token_from_request
-from twinkle.server.model.routing import StickyLoraRequestRouter
+from twinkle.server.config.task_queue import TaskQueueConfig
+from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.runtime import init_twinkle_runtime
-from twinkle.server.session_resource import AdapterManagerMixin
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
+from twinkle.server.state.training_records import TrainingRuntimeContext
+from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger
+from .runtime import TrainingRuntime
 from .tinker_handlers import _register_model_tinker_routes
 from .twinkle_handlers import _register_model_twinkle_routes
 
@@ -82,14 +79,14 @@ MODEL_SELECTOR = BackendSelector(
 )
 
 
-class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
+class ModelManagement(TrainingRuntime, TaskQueueMixin):
     """Unified model management service.
 
     Handles:
     - Base model and multiple LoRA adapters (multi-user)
     - Tinker training operations via /tinker/* endpoints (async/polling)
     - Twinkle training operations via /twinkle/* endpoints (synchronous)
-    - Adapter lifecycle via AdapterManagerMixin
+    - Worker-local gradient state is keyed by the controller-issued training handle.
     - Per-user rate limiting via TaskQueueMixin
     """
 
@@ -99,19 +96,21 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
                        device_group: dict[str, Any],
                        device_mesh: dict[str, Any],
                        backend: str,
-                       adapter_config: dict[str, Any] | None = None,
                        queue_config: TaskQueueConfig | None = None,
                        data_plane_url: str | None = None,
                        **kwargs):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
+        self.training_context = TrainingRuntimeContext.model_validate(kwargs.pop('training_context'))
+        await self.initialize_training_runtime(self.training_context, kwargs.pop('placement_group'),
+                                               kwargs.pop('allocation_devices'))
         self.device_mesh = init_twinkle_runtime(
             is_mock=(backend == 'mock'),
             nproc_per_node=nproc_per_node,
             device_group=self.device_group,
             device_mesh_dict=device_mesh,
         )
-        self.replica_id = serve.get_replica_context().replica_id.unique_id
+        self.replica_id = self.training_context.instance_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
         # ``train_mode`` selects LoRA multi-tenant (default) or exclusive
@@ -130,6 +129,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         if self.device_mesh is not None:
             ctor_kwargs['device_mesh'] = self.device_mesh
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
+        await self.wait_for_training_workers()
 
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
@@ -147,9 +147,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             collect_width=len(actors) if actors else 1,
         )
         self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
-        self._init_adapter_manager(**(adapter_config or {}))
+        self._training_states = {}
         await self._register_replica_on_startup()
-        # Note: countdown task is started lazily in _ensure_sticky()
 
     @property
     def data_world_size(self) -> int:
@@ -164,34 +163,15 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     async def _register_replica_on_startup(self) -> None:
         """Register this replica's capacity before Ray Serve marks it ready."""
         if not self._replica_registered:
-            await self.state.register_replica(self.replica_id, self.max_loras)
+            await self.state.register_replica(self.replica_id, 0 if self.is_full_mode else self.max_loras)
             await self.state.touch_replica_last_seen(self.replica_id)
             self._replica_registered = True
 
-    @serve.multiplexed(max_num_models_per_replica=5)
-    async def _sticky_entry(self, sticky_key: str):
-        return sticky_key
-
-    async def _ensure_sticky(self):
-        sticky_key = serve.get_multiplexed_model_id()
-        await self._sticky_entry(sticky_key)
-        # Lazy-start countdown task on first request (requires running event loop)
-        self._ensure_countdown_started()
-
     async def _on_request_start(self, request: Request) -> str:
-        await self._ensure_sticky()
-        await self.state.touch_replica_last_seen(self.replica_id)
-        await self._ensure_state_cleanup_started()
-        if self._model_unhealthy:
-            raise HTTPException(status_code=503, detail='Model actors are unavailable')
-        return get_token_from_request(request)
+        return await self.training_request_start(request)
 
     async def shutdown(self) -> None:
         """Explicit async cleanup — called via FastAPI shutdown event."""
-        try:
-            await self.state.unregister_replica(self.replica_id)
-        except Exception:
-            pass
         await self.shutdown_task_queue()
         await self.data_plane.close()
 
@@ -199,8 +179,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         try:
             result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
-                self._model_unhealthy = False
-                return {'healthy': True, 'detail': 'model actors alive'}
+                return {'healthy': not self._model_unhealthy, 'detail': 'model actors alive'}
             self._model_unhealthy = True
             return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
         except Exception as e:
@@ -215,28 +194,11 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         return await asyncio.shield(self._health_probe_task)
 
     def mark_unhealthy(self) -> None:
-        """Flag the deployment unhealthy; /healthz returns 503 until a probe recovers it."""
+        """Flag this training runtime unhealthy until the controller replaces it."""
         self._model_unhealthy = True
 
     async def _probe_after_timeout(self) -> None:
-        """Fired by ComputeWorker on a backend timeout: probe and log liveness."""
-        result = await self.check_model_health()
-        logger.warning('[Model] post-timeout liveness probe: %s', result)
-
-    async def _cleanup_adapter(self, adapter_name: str) -> None:
-        if self.get_resource_info(adapter_name):
-            if self.train_mode == 'full':
-                # No PEFT adapter to remove; restore clean base weights so the
-                # next tenant does not inherit this tenant's trained weights.
-                # Takes the Admission_Gate: this path is driven by the background
-                # countdown and never enters Task_Queue, so the gate is what keeps
-                # it from colliding with an in-flight training call.
-                await self.call_backend(self.model.reload_initial_weights)
-            else:
-                await self.call_backend(self.model.remove_adapter, adapter_name)
-            self.clear_resource_state(adapter_name)
-            self.unregister_resource(adapter_name)
-            await self.state.unload_model(adapter_name)
+        self._model_unhealthy = True
 
     @property
     def is_full_mode(self) -> bool:
@@ -253,36 +215,6 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             return ''
         return adapter_name
 
-    def assert_full_mode_available(self, adapter_name: str | None = None) -> None:
-        """In full mode, ensure no other tenant currently holds this deployment.
-
-        Call before registering any state so a rejected request leaves nothing
-        behind. ``adapter_name`` (when given) is excluded from the check so a
-        tenant re-issuing against its own resource is not blocked.
-
-        Raises:
-            FullModeBusyError: another (non-expiring) tenant already holds it.
-        """
-        if not self.is_full_mode:
-            return
-        holder = self.find_active_resource(exclude=adapter_name)
-        if holder is not None:
-            raise FullModeBusyError(holder)
-
-    def claim_full_mode_resource(self, adapter_name: str, token: str, session_id: str) -> None:
-        """Atomically take the exclusive full-mode resource for one tenant.
-
-        The check and the registration are synchronous neighbours: no coroutine
-        can interleave between them, so two concurrent creates cannot both pass
-        the availability check before either is recorded.
-        """
-        self.assert_full_mode_available(adapter_name)
-        self.register_resource(adapter_name, token, session_id)
-
-    async def _on_adapter_expired(self, adapter_name: str) -> None:
-        self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
-        await self._cleanup_adapter(adapter_name)
-
 
 def build_model_app(model_id: str,
                     nproc_per_node: int,
@@ -290,7 +222,6 @@ def build_model_app(model_id: str,
                     device_mesh: dict[str, Any],
                     deploy_options: dict[str, Any],
                     backend: str,
-                    adapter_config: dict[str, Any] | None = None,
                     queue_config: TaskQueueConfig | None = None,
                     data_plane_url: str | None = None,
                     **kwargs):
@@ -307,7 +238,6 @@ def build_model_app(model_id: str,
         backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``.
             Validated up front; bad values raise :class:`ConfigError` before
             any side effect.
-        adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration (rate limiting, etc.)
         **kwargs: Additional model initialization arguments
 
@@ -320,8 +250,7 @@ def build_model_app(model_id: str,
 
     # Build the FastAPI app + middleware stack + routes via the shared scaffold,
     # then bind the Ray Serve deployment. The Model passes its ``shutdown()``
-    # teardown via ``on_shutdown`` and its sticky-LoRA router via
-    # ``request_router_config``.
+    # teardown via ``on_shutdown``; the training controller owns handle routing.
     def register_routes(app: FastAPI, get_self: Any) -> None:
         _register_model_tinker_routes(app, get_self)
         _register_model_twinkle_routes(app, get_self)
@@ -336,9 +265,7 @@ def build_model_app(model_id: str,
         ModelManagement,
         deploy_options,
         deployment_name='ModelManagement',
-        request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config,
-                   data_plane_url),
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, queue_config, data_plane_url),
         bind_kwargs=kwargs,
     )
 

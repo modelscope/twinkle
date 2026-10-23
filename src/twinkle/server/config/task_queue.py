@@ -1,12 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Task queue configuration.
-
-Provides TaskQueueConfig (Pydantic) for controlling rate limits, timeouts,
-and queue behavior. Constraints are validated at construction time so an
-invalid YAML/dict value is rejected before the deployment reaches a ready
-state.
-"""
+"""Task queue configuration."""
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -55,20 +48,13 @@ class TaskQueueConfig(BaseModel):
 
     @property
     def effective_execution_timeout(self) -> float:
-        """The single source of the execution time bound.
-
-        ``0`` is not rejected (that would fail existing deployments); it is read
-        as "no configured limit" and replaced by a finite fallback so the bound
-        is always positive. This value feeds both ``_ray_get_timeout`` and the
-        ComputeWorker's ``asyncio.wait_for`` -- there is no second, independently
-        configurable timeout.
-        """
+        """Return the single execution time bound used by all queue paths."""
         if self.execution_timeout > 0:
             return self.execution_timeout
         return _ZERO_EXECUTION_TIMEOUT_FALLBACK
 
     def absolute_future_ttl(self, collect_width: int) -> float:
-        """Conservative lifetime for a non-terminal future record."""
+        """Return a conservative lifetime for a non-terminal future record."""
         ray_timeout = max(self.effective_execution_timeout, _MAX_DECLARED_BACKEND_TIMEOUT)
         resource_bound = max(1, collect_width) * ray_timeout
         return _ABSOLUTE_TTL_MULTIPLIER * (self.queue_timeout + resource_bound)
