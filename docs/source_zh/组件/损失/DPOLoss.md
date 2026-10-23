@@ -10,7 +10,7 @@
 from twinkle.loss import DPOLoss
 
 loss_fn = DPOLoss(
-    loss_type='sigmoid',  # 'sigmoid', 'hinge', 'ipo', 'kto'
+    loss_type='sigmoid',  # 'sigmoid', 'hinge', 'ipo', 'kto_pair'
     beta=0.1,
     sft_weight=0.0,       # 可选的 SFT 正则化权重
     reference_free=False,
@@ -20,7 +20,7 @@ model.set_loss(loss_fn)
 ```
 
 **参数:**
-- `loss_type`: DPO 变体 — `sigmoid`（默认）, `hinge`, `ipo`, 或 `kto`
+- `loss_type`: DPO 变体 — `sigmoid`（默认）, `hinge`, `ipo`, 或 `kto_pair`
 - `beta`: 控制偏好强度的温度参数
 - `sft_weight`: chosen 响应上额外 SFT 损失的权重
 - `reference_free`: 为 `True` 时跳过参考模型的对数概率
