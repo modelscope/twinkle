@@ -62,6 +62,7 @@ it.
 """
 from __future__ import annotations
 
+import torch
 import torch.nn.functional as F
 from typing import Optional
 
@@ -142,6 +143,10 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         self._fused_broken = False
         self._warned = False
 
+    def micro_batch_scale(self, inputs, indices):
+        from .cross_entropy import CrossEntropyLoss
+        return CrossEntropyLoss.micro_batch_scale(self, inputs, indices)
+
     def _materialise_ce(self, inputs, outputs, lm_head, hidden, **kwargs):
         """Materialise logits from the stashed lm_head weight (NOT its forward,
         which is identity under the patch) and run standard cross-entropy."""
@@ -153,6 +158,8 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         if bias is not None and hasattr(bias, 'full_tensor'):
             bias = bias.full_tensor()
         logits = F.linear(hidden.reshape(-1, hidden.shape[-1]), weight, bias=bias)
+        if self.softcap is not None:
+            logits = self.softcap * torch.tanh(logits / self.softcap)
         out = dict(outputs)
         out['logits'] = logits.view(*hidden.shape[:-1], -1)
         return CrossEntropyLoss(ignore_index=self.ignore_index, reduction=self.reduction)(inputs, out, **kwargs)
@@ -192,6 +199,10 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
                         'on some shapes, CUDA Triton compile failure).', e)
                 self._fused_broken = True
                 return self._materialise_ce(inputs, outputs, lm_head, hidden, **kwargs)
+            if self.reduction == 'mean':
+                # Already a per-token mean: num_tokens=0 tells calculate_loss not to divide again
+                # (same contract as CrossEntropyLoss).
+                return LossOutput(loss=loss, num_tokens=0)
             num_tokens = (labels != self.ignore_index).to(loss.device).sum().clamp(min=1)
             return LossOutput(loss=loss, num_tokens=num_tokens)
 
