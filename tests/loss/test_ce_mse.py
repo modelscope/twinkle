@@ -136,6 +136,25 @@ class TestChunkedCrossEntropyLoss:
         result = chunked({'labels': labels}, {'logits': logits})
         assert result['loss'].item() >= 0
 
+    @pytest.mark.parametrize('reduction,dft', [('mean', False), ('sum', False), ('mean', True)])
+    def test_chunked_backward_keeps_logits(self, reduction, dft):
+        """Backward matches standard CE and leaves the logits (read by train metrics) intact."""
+        torch.manual_seed(0)
+        labels = torch.tensor([[1, -100, 4, 2, 0, -100, 3]])
+        leaf = torch.randn(1, 7, 6, requires_grad=True)
+
+        def run(loss_fn):
+            leaf.grad = None
+            logits = leaf * 1.0  # non-leaf model output, as returned by lm_head
+            loss_fn({'labels': labels}, {'logits': logits})['loss'].backward()
+            return logits.detach(), leaf.grad.clone()
+
+        ref_logits, ref_grad = run(CrossEntropyLoss(reduction=reduction, dft=dft))
+        logits, grad = run(ChunkedCrossEntropyLoss(chunk_size=3, reduction=reduction, dft=dft))
+
+        torch.testing.assert_close(grad, ref_grad)
+        torch.testing.assert_close(logits, ref_logits)
+
     def test_chunked_invalid_chunk_size(self):
         with pytest.raises(AssertionError):
             ChunkedCrossEntropyLoss(chunk_size=0)

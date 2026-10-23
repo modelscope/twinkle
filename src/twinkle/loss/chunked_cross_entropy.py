@@ -74,8 +74,10 @@ def _get_chunked_ce_func():
                 scale = grad_output
 
             n = logits.shape[0]
-            # Write gradients in-place into logits to avoid allocating a
-            # second [N, V] tensor (halves peak backward memory).
+            # Gradients go to a fresh buffer: ``logits`` is the model output the caller
+            # keeps (train metrics such as Accuracy read it after backward), so it must not
+            # be overwritten. Only one chunk's fp32 log_softmax is ever live.
+            grad_logits = torch.empty_like(logits)
             for start in range(0, n, chunk_size):
                 end = min(start + chunk_size, n)
                 logits_chunk = logits[start:end].detach().requires_grad_(True)
@@ -90,10 +92,10 @@ def _get_chunked_ce_func():
                     loss_chunk = (per_token * mask).sum()
 
                 grad_chunk = torch.autograd.grad(loss_chunk, logits_chunk, retain_graph=False)[0]
-                logits.data[start:end] = grad_chunk * scale
+                grad_logits[start:end] = grad_chunk * scale
 
             # logits, labels, chunk_size, ignore_index, reduction, dft
-            return logits, None, None, None, None, None
+            return grad_logits, None, None, None, None, None
 
     _CHUNKED_CE_FUNC = _ChunkedCrossEntropyFunc
     return _CHUNKED_CE_FUNC
