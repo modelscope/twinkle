@@ -24,6 +24,14 @@ from torch import nn
 import twinkle.loss.liger_fused_linear_grpo as lflg
 from twinkle.loss import GRPOLoss, LigerFusedLinearGRPOLoss, torch_loss_mapping
 
+try:
+    import liger_kernel  # noqa: F401
+    _HAS_LIGER = True
+except ImportError:
+    _HAS_LIGER = False
+
+requires_liger = pytest.mark.skipif(not _HAS_LIGER, reason='liger_kernel not installed')
+
 
 def _make_grpo_batch(bs=2, seq=6, hidden=16, vocab=32, seed=0):
     """A synthetic fused-GRPO step: hidden states (logits under the patch), labels, advantages."""
@@ -66,6 +74,7 @@ def test_subclasses_grpo_loss():
 # ── Fused path: the Liger kernel runs and matches the torch objective ─────────
 
 
+@requires_liger
 class TestFusedPath:
 
     def test_fused_runs_and_matches_materialised_grpo(self):

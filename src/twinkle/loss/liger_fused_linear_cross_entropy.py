@@ -145,14 +145,21 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         self.reduction = reduction
         self.label_smoothing = label_smoothing
         self.softcap = softcap
-        self._liger = _get_liger_module()(
-            ignore_index=ignore_index,
-            reduction=reduction,
-            label_smoothing=label_smoothing,
-            softcap=softcap,
-        )
+        # Built on the first fused call, not here: a missing liger_kernel must degrade to the
+        # materialised-CE fallback (see the class docstring) instead of failing at set_loss() time.
+        self._liger = None
         self._fused_broken = False
         self._warned = False
+
+    def _ensure_liger(self):
+        if self._liger is None:
+            self._liger = _get_liger_module()(
+                ignore_index=self.ignore_index,
+                reduction=self.reduction,
+                label_smoothing=self.label_smoothing,
+                softcap=self.softcap,
+            )
+        return self._liger
 
     def _materialise_ce(self, inputs, outputs, lm_head, hidden, **kwargs):
         """Materialise logits from the stashed lm_head weight (NOT its forward,
@@ -194,7 +201,7 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
                 weight = weight.full_tensor()
             hidden_flat = _align_hidden_dtype(hidden_flat, weight)
             try:
-                loss = self._liger(weight, hidden_flat, labels_flat)
+                loss = self._ensure_liger()(weight, hidden_flat, labels_flat)
             except Exception as e:  # defensive, device-agnostic
                 if not self._warned:
                     self._warned = True
