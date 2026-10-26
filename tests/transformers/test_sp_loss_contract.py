@@ -98,7 +98,7 @@ def test_declared_but_unregistered_or_missing_output_fails_loudly():
 
 def test_ppo_value_loss_declares_per_token_value_collection():
     assert PPOValueLoss.sp_gather_keys == ('values',)
-    assert PPOValueLoss.sp_output_key_specs[0].name == 'values'
+    assert PPOValueLoss.output_key_specs[0].name == 'values'
 
 
 class _ToyValueModel(torch.nn.Module):

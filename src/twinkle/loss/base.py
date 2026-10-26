@@ -8,11 +8,14 @@ class Loss:
     require_entropy = False
     require_logps = True
     # Sequence-aligned outputs this loss needs in full-sequence layout.
-    # Keys must have an output DataKeySpec registered by SP or a model adapter.
+    # Keys must be declared in the model/loss output schema.
     sp_gather_keys = ()
     # A loss may declare additional sequence-aligned input/output contracts.
     # Keep the core loss API independent of the Transformers backend by
     # importing DataKeySpec only in concrete loss implementations.
+    input_key_specs = ()
+    output_key_specs = ()
+    # Compatibility for existing loss plugins. New declarations use the common names.
     sp_input_key_specs = ()
     sp_output_key_specs = ()
     require_values = False

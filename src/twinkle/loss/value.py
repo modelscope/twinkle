@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 from twinkle.loss.grpo import GRPOLoss
-from twinkle.model.transformers.strategy.sequence_parallel.data_keys import DataKeySpec
+from twinkle.data_fields import DataKeySpec
 
 if TYPE_CHECKING:
     import torch
@@ -23,7 +23,7 @@ class PPOValueLoss(Loss):
     require_values = True
     # PPO regresses per-token values; gather the value sequence before loss.
     sp_gather_keys = ('values',)
-    sp_output_key_specs = (DataKeySpec('values', split_dim=1, side='output', stage='output',
+    output_key_specs = (DataKeySpec('values', split_dim=1, side='output', stage='output',
                                        need_split=False, autograd=True, need_unpack=True),)
 
     def __init__(self, cliprange_value: float = 0.2, vf_coef: float = 1.0, ignore_index: int = -100, **kwargs):

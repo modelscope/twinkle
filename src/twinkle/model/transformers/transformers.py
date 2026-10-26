@@ -56,6 +56,8 @@ from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
+from twinkle.data_fields import partition_model_inputs, resolve_key_specs
+
 from .task_outputs import postprocess_task_outputs
 
 logger = get_logger()
@@ -844,15 +846,22 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             payload['labels'] = sequence_labels
         return payload
 
-    def _restore_loss_inputs(self, inputs, labels, loss_scale=None, channel=None, completion_mask=None):
-        """Put the loss-related tensors popped before the model call back onto ``inputs``."""
-        inputs['labels'] = labels
-        if loss_scale is not None:
-            inputs['loss_scale'] = loss_scale
-        if channel is not None:
-            inputs['channel'] = channel
-        if completion_mask is not None:
-            inputs['completion_mask'] = completion_mask
+    def _get_field_specs(self, loss_instance):
+        """Resolve model/loss fields even when sequence parallelism is disabled."""
+        from twinkle.utils.transformers_utils import get_llm_model
+        from .strategy.sequence_parallel.adapters import adapters_for_model
+
+        model = self.strategy.unwrap_model(self.model)
+        text_model = get_llm_model(model)
+        models = (model,) if text_model is model else (model, text_model)
+        adapters = tuple(adapter for candidate in models for adapter in adapters_for_model(candidate))
+        # Direct registration is a legacy declaration interface. Merge only
+        # those explicit declarations, not SP's derived execution registry.
+        direct_fields = self.sp_strategy.field_declarations if self.sp_strategy is not None else None
+        specs = resolve_key_specs(*models, *adapters, loss_instance, direct_fields)
+        if self.sp_strategy is not None:
+            self.sp_strategy.register_key_specs(*specs)
+        return specs
 
     def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
                                      loss_instance, replay=None):
@@ -894,15 +903,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             outputs['logits'] = None
 
     def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
-                                  forward_kwargs, loss_instance, return_logits, recorded_routing):
+                                  forward_kwargs, loss_instance, return_logits, recorded_routing,
+                                  input_key_specs, output_key_specs):
         """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
         inputs, outputs = postprocess_task_outputs(
             inputs, outputs, sp_strategy=self.sp_strategy, task=task,
             sp_gather_keys=getattr(loss_instance, 'sp_gather_keys', ()))
         inputs, outputs = processor.unpack_packed_sequences(
             inputs, outputs, task=task,
-            input_key_specs=getattr(self.sp_strategy, 'input_key_specs', None),
-            output_key_specs=getattr(self.sp_strategy, 'output_key_specs', None))
+            input_key_specs=input_key_specs,
+            output_key_specs=output_key_specs)
         status = optimizer_config.train_status if is_training else optimizer_config.eval_status
         status.inputs = inputs
         status.outputs = outputs
@@ -957,7 +967,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                 raise ValueError('sampling replay does not support sequence or context parallelism')
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
+        input_key_specs, output_key_specs = self._get_field_specs(loss_instance)
         inputs: Dict[str, Any] = processor(
             inputs,
             input_key_specs=input_key_specs,
@@ -967,12 +977,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             gdn_padding_free_enabled=self._gdn_padding_free_enabled,
         )
         inputs = self._prepare_sp_inputs(inputs, processor, task=task)
-        labels: torch.Tensor = inputs.pop('labels', None)
-        loss_scale = inputs.pop('loss_scale', None)
-        channel = inputs.pop('channel', None)
-        sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, input_key_specs=input_key_specs)
-        # Not a model argument; the loss reads it back off `inputs` further down.
-        completion_mask = inputs.pop('completion_mask', None)
+        inputs, loss_inputs = partition_model_inputs(inputs, input_key_specs)
+        labels = loss_inputs.get('labels')
         replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
             replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
@@ -1010,8 +1016,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         recorded_routing = rr.finish()
 
-        self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
-        inputs.update(sp_auxiliary_inputs)
+        inputs.update(loss_inputs)
         self._postprocess_forward_outputs(
             outputs,
             labels=labels,
@@ -1033,6 +1038,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             loss_instance=loss_instance,
             return_logits=return_logits,
             recorded_routing=recorded_routing,
+            input_key_specs=input_key_specs, output_key_specs=output_key_specs,
         )
 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
@@ -1178,7 +1184,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
             loss_require_values = getattr(loss_instance, 'require_values', False)
-            input_key_specs = getattr(self.sp_strategy, 'input_key_specs', None)
+            input_key_specs, output_key_specs = self._get_field_specs(loss_instance)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 input_key_specs=input_key_specs,
@@ -1188,12 +1194,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 gdn_padding_free_enabled=self._gdn_padding_free_enabled,
             )
             inputs = self._prepare_sp_inputs(inputs, processor, task=task)
-            labels = inputs.pop('labels', None)
-            loss_scale = inputs.pop('loss_scale', None)
-            channel = inputs.pop('channel', None)
-            sp_auxiliary_inputs = processor.pop_sp_auxiliary_inputs(inputs, input_key_specs=input_key_specs)
-            # Not a model argument; the loss reads it back off `inputs` further down.
-            completion_mask = inputs.pop('completion_mask', None)
+            inputs, loss_inputs = partition_model_inputs(inputs, input_key_specs)
+            labels = loss_inputs.get('labels')
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
                 packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
@@ -1230,8 +1232,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
             recorded_routing = rr.finish()
 
-            self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
-            inputs.update(sp_auxiliary_inputs)
+            inputs.update(loss_inputs)
             self._postprocess_forward_outputs(
                 outputs,
                 labels=labels,
@@ -1253,6 +1254,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 loss_instance=loss_instance,
                 return_logits=return_logits,
                 recorded_routing=recorded_routing,
+                input_key_specs=input_key_specs, output_key_specs=output_key_specs,
             )
 
     @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)

@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from twinkle.model.transformers.strategy.sequence_parallel import DataKeySpec, SequenceParallelStrategy
+from twinkle.data_fields import partition_model_inputs, resolve_key_specs
 from twinkle.model.transformers.strategy.sequence_parallel.data_keys import SPKeyCollection, SPKeyValue
 
 
@@ -162,7 +163,7 @@ def test_processor_preserves_registered_keys_before_sp_split(monkeypatch, rank):
 
     monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
     strategy = _strategy(rank)
-    strategy.register_input_key(DataKeySpec('token_weights', pad_value=-2))
+    strategy.register_input_key(DataKeySpec('token_weights', pad_value=-2, need_split=True))
     processor = InputProcessor()
     values = torch.arange(5).unsqueeze(0)
     sample = {'input_ids': torch.ones(1, 5, dtype=torch.long),
@@ -207,8 +208,8 @@ def test_registered_multidimensional_key_collation_and_loss_boundary(monkeypatch
     result = strategy.preprocess_inputs(result)
     expected = torch.tensor([[[1, 1, 1], [2, 2, 2]], [[1, 1, 1], [2, 2, 2]]])
     torch.testing.assert_close(result['token_features'], expected)
-    auxiliary = processor.pop_sp_auxiliary_inputs(result, input_key_specs=strategy.input_key_specs)
-    assert set(auxiliary) == {'completion_mask', 'token_features'}
+    result, auxiliary = partition_model_inputs(result, strategy.input_key_specs)
+    assert set(auxiliary) == {'labels', 'completion_mask', 'token_features'}
     assert 'token_features' not in result
 
 
@@ -288,7 +289,7 @@ def test_processor_preserves_custom_keys_without_sp_strategy(monkeypatch, paddin
     expected = (torch.tensor([[[1] * 8, [2] * 8]]) if padding_free else
                 torch.tensor([[[1, 1, 1, -2, -2], [2, 2, 2, -2, -2]], [[1] * 5, [2] * 5]]))
     torch.testing.assert_close(result['token_features'], expected)
-    auxiliary = processor.pop_sp_auxiliary_inputs(result, input_key_specs=specs)
+    result, auxiliary = partition_model_inputs(result, specs)
     torch.testing.assert_close(auxiliary['token_features'], expected)
 
 
@@ -341,3 +342,177 @@ def test_processor_preserves_special_arguments_outside_data_key_registry():
     for converted in (converted_with_sp, converted_without_sp):
         torch.testing.assert_close(converted['cache_position'], sample['cache_position'])
         assert converted['padding_free'] is True
+
+
+@pytest.mark.parametrize('padding_free', [False, True])
+def test_common_loss_fields_collate_and_unpack_without_sp(monkeypatch, padding_free):
+    from types import SimpleNamespace
+    from twinkle import Platform
+    from twinkle.processor import InputProcessor
+
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
+    loss = SimpleNamespace(input_key_specs=(DataKeySpec('token_targets', split_dim=2, pad_value=-9),))
+    input_specs, output_specs = resolve_key_specs(loss)
+    spec = next(spec for spec in input_specs if spec.name == 'token_targets')
+    assert not spec.need_pad and not spec.need_split and not spec.need_gather
+    samples = [dict(input_ids=list(range(length)), position_ids=list(range(length)),
+                    labels=list(range(length)), token_targets=[[[1] * length, [2] * length]])
+               for length in (3, 5)]
+    processor = InputProcessor(padding_free=padding_free)
+    batch = processor(samples, input_key_specs=input_specs)
+    model_inputs, loss_inputs = partition_model_inputs(batch, input_specs)
+    assert 'token_targets' not in model_inputs and 'labels' not in model_inputs
+    assert loss_inputs['token_targets'].shape == ((1, 2, 8) if padding_free else (2, 2, 5))
+    restored, _ = processor.unpack_packed_sequences(
+        batch, task='causal_lm', input_key_specs=input_specs, output_key_specs=output_specs)
+    torch.testing.assert_close(restored['token_targets'], torch.tensor([
+        [[1, 1, 1, -9, -9], [2, 2, 2, -9, -9]], [[1] * 5, [2] * 5]]))
+
+
+@pytest.mark.parametrize('ring_size', [1, 2])
+def test_global_loss_fields_are_never_gathered(monkeypatch, ring_size):
+    strategy = _strategy()
+    strategy._ctx.rp_world_size = ring_size
+    strategy._ctx.sp_world_size = 2 // ring_size
+    strategy._ctx.extra_kwargs['position_ids'] = torch.tensor([[0, 1, 2, 0, 1]])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Global loss fields must not enter SP collectives')
+
+    monkeypatch.setattr(strategy._ctx, 'gather', forbidden)
+    mask = torch.tensor([[0, 1, 1, 0, 1]])
+    scale = torch.tensor([[0., 1., 1., 0., 1.]])
+    inputs, _ = strategy.gather_loss_tensors({'completion_mask': mask, 'loss_scale': scale}, {})
+    assert inputs['completion_mask'] is mask and inputs['loss_scale'] is scale
+
+
+def test_model_input_destination_is_independent_of_split_stage():
+    spec = DataKeySpec('token_context', stage='auxiliary', model_input=True)
+    model_inputs, loss_inputs = partition_model_inputs({'token_context': 1, 'channel': ['a']}, (spec,))
+    assert model_inputs == {'token_context': 1}
+    assert loss_inputs == {'channel': ['a']}
+
+
+
+def test_explicit_parallel_boundaries_opt_in_without_changing_loss_field_defaults():
+    global_field = DataKeySpec('targets')
+    assert not global_field.need_pad and not global_field.need_split
+    local_field = DataKeySpec('local_targets', split_at='prepare', pad_at='prepare')
+    assert local_field.need_split and local_field.need_pad
+    padded_field = DataKeySpec('padded_targets', pad_at='prepare')
+    assert padded_field.need_pad and not padded_field.need_split
+
+
+@pytest.mark.parametrize('rank', [0, 1])
+@pytest.mark.parametrize('stage', ['forward', 'auxiliary'])
+def test_prepare_then_forward_honors_separate_pad_and_split_boundaries(rank, stage):
+    from types import SimpleNamespace
+
+    strategy = _strategy(rank)
+    strategy._ctx.tokenizer = SimpleNamespace(pad_token_id=0)
+    spec = DataKeySpec('token_type_ids', split_dim=1, pad_value=-7, stage=stage,
+                       model_input=True, pad_at='prepare', split_at='forward')
+    strategy.register_input_key(spec)
+
+    class Model(torch.nn.Module):
+        def forward(self, token_type_ids, **kwargs):
+            return token_type_ids
+
+    model = Model()
+    strategy._ctx._prepare_forward_hook(model)
+    positions = torch.arange(5).unsqueeze(0)
+    prepared = strategy.preprocess_inputs(dict(input_ids=positions.clone(), position_ids=positions,
+                                               token_type_ids=positions.clone()))
+    torch.testing.assert_close(prepared['token_type_ids'], torch.tensor([[0, 1, 2, 3, 4, -7]]))
+    expected = torch.tensor([[0, 1, 2]]) if rank == 0 else torch.tensor([[3, 4, -7]])
+    torch.testing.assert_close(model(**prepared), expected)
+
+
+def test_direct_registration_survives_model_schema_resolution_and_processor(monkeypatch):
+    from types import SimpleNamespace
+    from twinkle import Platform
+    from twinkle.model.transformers.transformers import TransformersModel
+    from twinkle.processor import InputProcessor
+
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
+    strategy = _strategy()
+    spec = DataKeySpec('token_weights', pad_value=-2)
+    strategy.register_input_key(spec)
+    output_spec = DataKeySpec('token_scores', side='output', stage='output', need_gather=True)
+    strategy.register_output_key(output_spec)
+    model = torch.nn.Linear(2, 2)
+    wrapper = SimpleNamespace(model=model, strategy=SimpleNamespace(unwrap_model=lambda value: value),
+                              sp_strategy=strategy)
+    input_specs, output_specs = TransformersModel._get_field_specs(wrapper, None)
+    assert spec in input_specs and output_spec in output_specs
+    processor = InputProcessor()
+    result = processor([dict(input_ids=[1, 2, 3], token_weights=[0.1, 0.2, 0.3])],
+                       input_key_specs=input_specs)
+    torch.testing.assert_close(result['token_weights'], torch.tensor([[0.1, 0.2, 0.3]]))
+    _, loss_inputs = partition_model_inputs(result, input_specs)
+    assert 'token_weights' in loss_inputs
+    # Consuming provider schemas must not turn them into direct registrations.
+    strategy.register_key_specs((DataKeySpec('provider_targets'),), ())
+    assert strategy.field_declarations.input_key_specs == (spec,)
+
+
+@pytest.mark.parametrize('label_type', ['tensor', 'numpy', 'python'])
+@pytest.mark.parametrize('framework', ['transformers', 'megatron'])
+def test_scalar_classification_labels_collate_with_common_schema(monkeypatch, label_type, framework):
+    import numpy as np
+    from twinkle import Platform
+    from twinkle.processor import InputProcessor
+
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
+    convert = {'tensor': torch.tensor, 'numpy': np.array, 'python': int}[label_type]
+    batch = [dict(input_ids=[1, 2, 3], position_ids=[0, 1, 2], labels=convert(label)) for label in (1, 0)]
+    result = InputProcessor(framework=framework)(batch)
+    if framework == 'megatron':
+        result = result[0]
+    torch.testing.assert_close(result['labels'], torch.tensor([[1], [0]]))
+    assert result['input_ids'].shape == (2, 3)
+
+
+@pytest.mark.parametrize('with_labels', [False, True])
+def test_packed_custom_loss_restoration_does_not_require_token_labels(with_labels):
+    from types import SimpleNamespace
+    from twinkle.processor import InputProcessor
+
+    loss = SimpleNamespace(
+        input_key_specs=(DataKeySpec('token_targets', pad_value=-9),),
+        output_key_specs=(DataKeySpec('token_scores', side='output', stage='output'),))
+    input_specs, output_specs = resolve_key_specs(loss)
+    inputs = dict(position_ids=torch.tensor([[0, 1, 2, 0, 1]]), token_targets=torch.zeros(1, 5))
+    if with_labels:
+        inputs['labels'] = torch.full((1, 5), -100)
+    outputs = {'token_scores': torch.tensor([[1., 1., 1., 3., 3.]])}
+    restored, outputs = InputProcessor(padding_free=True).unpack_packed_sequences(
+        inputs, outputs, input_key_specs=input_specs, output_key_specs=output_specs)
+    targets, scores = restored['token_targets'], outputs['token_scores']
+    torch.testing.assert_close(targets, torch.tensor([[0., 0., 0.], [0., 0., -9.]]))
+    valid = targets != -9
+    balanced_loss = (((scores - targets).square() * valid).sum(-1) / valid.sum(-1)).mean()
+    torch.testing.assert_close(balanced_loss, torch.tensor(5.))
+    assert ('labels' in restored) == with_labels
+
+
+def test_packed_output_logits_restore_without_labels():
+    from twinkle.processor import InputProcessor
+
+    logits = torch.arange(10).reshape(1, 5, 2)
+    _, outputs = InputProcessor(padding_free=True).unpack_packed_sequences(
+        {'position_ids': torch.tensor([[0, 1, 2, 0, 1]])}, {'logits': logits})
+    torch.testing.assert_close(outputs['logits'], torch.tensor([[[0, 1], [2, 3], [4, 5]],
+                                                             [[6, 7], [8, 9], [0, 0]]]))
+
+
+@pytest.mark.parametrize('operation', ['pad', 'split'])
+def test_loss_only_fields_reject_unreachable_forward_operations(operation):
+    from dataclasses import replace
+
+    spec = (DataKeySpec('token_targets', pad_at='forward', need_split=False) if operation == 'pad' else
+            DataKeySpec('token_targets', pad_at='prepare', split_at='forward'))
+    with pytest.raises(ValueError, match='Loss-only input.*forward boundary'):
+        _strategy().register_input_key(spec)
+    # Model arguments can reach the forward hook, regardless of their stage name.
+    _strategy().register_input_key(replace(spec, model_input=True))

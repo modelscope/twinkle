@@ -22,8 +22,8 @@ class TokenRegressionLoss(Loss):
     """Example plugin loss with custom sequence input and output keys."""
 
     require_logps = False
-    sp_input_key_specs = (DataKeySpec('token_targets', split_dim=1, pad_value=0, need_gather=True, owner='loss'),)
-    sp_output_key_specs = (DataKeySpec('token_scores', split_dim=1, side='output', stage='output',
+    input_key_specs = (DataKeySpec('token_targets', split_dim=1, pad_value=0, owner='loss'),)
+    output_key_specs = (DataKeySpec('token_scores', split_dim=1, side='output', stage='output',
                                        need_split=False, need_gather=True, autograd=True, owner='loss'),)
 
     def __call__(self, inputs, outputs, **kwargs):
@@ -107,7 +107,7 @@ def test_custom_token_regression_loss_matches_full_sequence_loss_and_gradient():
     mp.spawn(_worker, args=(port,), nprocs=2, join=True)
 
 
-def _e2e_worker(rank, port):
+def _e2e_worker(rank, port, sp_size):
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = '2'
     torch.set_num_threads(1)
@@ -124,7 +124,7 @@ def _e2e_worker(rank, port):
         torch.manual_seed(1234)
         baseline = LlamaForCausalLM(config).train()
 
-        mesh = DeviceMesh.from_sizes(dp_size=2, ulysses_size=2, device_type='cpu')
+        mesh = DeviceMesh.from_sizes(dp_size=2, ulysses_size=sp_size, device_type='cpu')
         model_module = importlib.import_module('twinkle.model.transformers.transformers')
         original_template = model_module.Template
         model_module.Template = lambda *_args, **_kwargs: SimpleNamespace(is_mm=False)
@@ -140,7 +140,7 @@ def _e2e_worker(rank, port):
         training_model.strategy = _NoopTrainStrategy()
         # This local CPU harness supplies worker mesh state explicitly.
         training_model.device_mesh = mesh
-        training_model._enable_sp = True
+        training_model._enable_sp = sp_size > 1
         model_forward = training_model.model.forward
 
         def forward_with_token_scores(*args, **kwargs):
@@ -152,17 +152,18 @@ def _e2e_worker(rank, port):
         training_model.model.load_state_dict(baseline.state_dict())
         training_model.model.gradient_checkpointing_disable()
         training_model.model.train()
-        strategy = SequenceParallelStrategy(mesh, model=training_model.model)
-        strategy._get_tokenizer = lambda: SimpleNamespace(pad_token_id=0)
+        strategy = SequenceParallelStrategy(mesh, model=training_model.model) if sp_size > 1 else None
+        if strategy is not None:
+            strategy._get_tokenizer = lambda: SimpleNamespace(pad_token_id=0)
         training_model.sp_strategy = strategy
 
         optimizer_group = training_model.optimizer_group[training_model._get_default_group()]
         loss_fn = TokenRegressionLoss()
-        optimizer_group.loss_instance = loss_fn  # OptimizerGroup applies the NCCL-safe wrapper.
-        assert training_model._enable_sp
-        assert optimizer_group.loss_instance.sp_input_key_specs
+        optimizer_group.loss_instance = loss_fn
+        assert optimizer_group.loss_instance.input_key_specs
         training_model._ensure_sp_strategy()
-        assert 'token_targets' in {spec.name for spec in strategy.input_key_specs}
+        if strategy is not None:
+            assert 'token_targets' in {spec.name for spec in strategy.input_key_specs}
 
         ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7], [2, 3, 4, 5, 6, 7, 8]])
         positions = torch.arange(ids.shape[1]).expand_as(ids)
@@ -205,8 +206,9 @@ def _e2e_worker(rank, port):
 
 
 @pytest.mark.slow
-def test_custom_loss_through_transformers_training_pipeline_and_optimizer_step():
+@pytest.mark.parametrize('sp_size', [1, 2])
+def test_custom_loss_through_transformers_training_pipeline_and_optimizer_step(sp_size):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    mp.spawn(_e2e_worker, args=(port,), nprocs=2, join=True)
+    mp.spawn(_e2e_worker, args=(port, sp_size), nprocs=2, join=True)

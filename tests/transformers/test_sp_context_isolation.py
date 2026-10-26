@@ -139,3 +139,61 @@ def test_router_replay_uses_model_owner_outside_forward(monkeypatch):
     assert rr.get_router_replay_data(models[0]).eq(10).all()
     assert rr.get_router_replay_data(models[1]).eq(20).all()
     assert rr.get_router_replay_data(models[2]).eq(0).all()
+
+
+@pytest.mark.parametrize('rank', [0, 1])
+def test_router_replay_shards_mask_with_routing_indices(monkeypatch, rank):
+    from twinkle.model.transformers.moe.router_replay import RouterReplay
+
+    model = torch.nn.Linear(1, 1)
+    ctx = sp.SequenceParallel()
+    ctx.world_size = ctx.sp_world_size = 2
+    ctx.rp_world_size = 1
+    ctx._sp_rank = rank
+    ctx.extra_kwargs['position_ids'] = torch.arange(5).unsqueeze(0)
+    monkeypatch.setattr(RouterReplay, '_find_moe_blocks_with_names', lambda _: [('block', model)])
+    state = SimpleNamespace(target_indices=None, target_mask=None)
+    monkeypatch.setattr(RouterReplay, '_registry', {'block': state})
+    mask = torch.tensor([[True, False, True, False, True]])
+    routing = torch.arange(5).reshape(1, 5, 1, 1)
+    from twinkle import Platform
+    monkeypatch.setattr(Platform, 'get_local_device', lambda: torch.device('cpu'))
+    RouterReplay.set_router_replay_data(routing, model, mask, sp_context=ctx)
+    expected_indices = torch.tensor([0, 1, 2, 3, 4, 0]).chunk(2)[rank]
+    expected_mask = torch.tensor([True, False, True, False, True, False]).chunk(2)[rank]
+    torch.testing.assert_close(state.target_indices[:, 0], expected_indices)
+    torch.testing.assert_close(state.target_mask, expected_mask)
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_prepare_causal_mask_method_does_not_retain_weak_registry_owner(monkeypatch, nested):
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.config = SimpleNamespace(num_attention_heads=2, _attn_implementation='sdpa')
+
+        def _update_causal_mask(self, mask, *args):
+            return mask + self.weight
+
+    model = Backbone()
+    if nested:
+        wrapper = torch.nn.Module()
+        wrapper.language_model = model
+        wrapper.config = model.config
+        model = wrapper
+        del wrapper
+    refs = [weakref.ref(module) for module in model.modules()]
+    ctx = sp.SequenceParallel()
+    monkeypatch.setattr(sp, 'get_llm_model', lambda value: value)
+    monkeypatch.setattr(sp.SequenceParallel, '_global_inited', True)
+    monkeypatch.setattr(sp.SequenceParallel, '_init_device_mesh', lambda *args: None)
+    monkeypatch.setattr(sp, 'sequence_parallel', sp.SequenceParallel())
+    ctx.prepare(2, model, SimpleNamespace(pad_token_id=0))
+    torch.testing.assert_close(ctx.causal_mask_func(torch.zeros(1)), torch.ones(1))
+    # Remove the compatibility mirror so only the weak registry owns the context.
+    sp.sequence_parallel.__dict__.clear()
+    del model
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert ctx.causal_mask_func is None

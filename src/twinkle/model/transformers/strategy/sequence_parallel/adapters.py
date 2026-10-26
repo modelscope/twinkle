@@ -92,7 +92,7 @@ class MoEAuxSPAdapter(ModelSPAdapter):
             router_logits = getattr(output, 'router_logits', None)
             if router_logits is None:
                 return output
-            attention_mask = kwargs['attention_mask']
+            attention_mask = kwargs.get('attention_mask')
             batch_size = 1 if attention_mask is None else attention_mask.shape[0]
             assert router_logits[0].shape[0] % batch_size == 0
             local_seq_len = router_logits[0].shape[0] // batch_size

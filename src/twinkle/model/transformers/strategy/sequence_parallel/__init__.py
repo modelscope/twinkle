@@ -5,9 +5,10 @@ import torch
 import torch.distributed as dist
 from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
+from types import SimpleNamespace
 from transformers import PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakMethod
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh, get_logger
@@ -445,6 +446,17 @@ class SequenceParallel:
         logger.info_once(f'[SequenceParallel] attention wrappers registered: {list(FLASH_ATTENTION_IMPLS)} -> '
                          'local_flash_attn, sdpa -> local_sdpa_attn (SP-aware)')
 
+    @property
+    def causal_mask_func(self):
+        func = self._causal_mask_func
+        return func() if isinstance(func, WeakMethod) else func
+
+    @causal_mask_func.setter
+    def causal_mask_func(self, func):
+        # The global weak-key registry owns this context. A bound method must
+        # not keep the owning model (and therefore its weak key) alive.
+        self._causal_mask_func = WeakMethod(func) if getattr(func, '__self__', None) is not None else func
+
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
 
         def pre_forward_split_hook(_self, args, kwargs):
@@ -458,7 +470,8 @@ class SequenceParallel:
                 position_ids = kwargs['position_ids']
                 real_position_ids = self._extract_real_position_ids(position_ids)
                 cache_position = kwargs.get('cache_position', None)
-                specs = tuple(spec for spec in self.input_key_registry if spec.stage == 'forward')
+                specs = tuple(spec for spec in self.input_key_registry
+                              if spec.pad_at == 'forward' or spec.split_at == 'forward')
                 common_names = ('input_ids', 'inputs_embeds', 'position_ids', 'attention_mask')
                 keys = SPKeyCollection.from_mapping(kwargs, specs, common_names=common_names)
                 self.pad_and_split_inputs(keys, boundary='forward', real_position_ids=real_position_ids,
@@ -831,10 +844,11 @@ class SequenceParallel:
             else:
                 attention_mask = attn_item.value
             local_cache_position = torch.arange(0, padded_model_inputs.shape[1], device=padded_model_inputs.device)
-            if (cache_position is None and self.causal_mask_func is not None
+            causal_mask_func = self.causal_mask_func
+            if (cache_position is None and causal_mask_func is not None
                     and not is_flash_attention_implementation(self.attn_implementation)):
-                attention_mask = self.causal_mask_func(attention_mask, padded_model_inputs.to(self.model_dtype),
-                                                       local_cache_position, None, None)
+                attention_mask = causal_mask_func(attention_mask, padded_model_inputs.to(self.model_dtype),
+                                                  local_cache_position, None, None)
                 attn_item.value = attention_mask
 
         # Split after padding so every field uses the same padded sequence frame.
@@ -891,7 +905,8 @@ class SequenceParallel:
         self.extra_kwargs['padding_free'] = padding_free
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
-        specs = tuple(spec for spec in self.input_key_registry if spec.stage == 'auxiliary')
+        specs = tuple(spec for spec in self.input_key_registry
+                      if spec.pad_at == 'prepare' or spec.split_at == 'prepare')
         keys = SPKeyCollection.from_mapping(inputs, specs, common_names=('labels', 'completion_mask', 'loss_scale'))
         self.pad_and_split_inputs(keys, boundary='prepare', real_position_ids=real_position_ids)
         for item in keys.values():
@@ -935,6 +950,9 @@ class SequenceParallelStrategy:
         # Per-model SP context. The module-level ``sequence_parallel`` singleton
         # is only kept as a compat mirror of the most recently prepared context.
         self._ctx = SequenceParallel()
+        # Compatibility declarations registered directly through the public API.
+        # Keep these separate from rules consumed from model/loss providers.
+        self.field_declarations = SimpleNamespace(input_key_specs=(), output_key_specs=())
 
     def _get_tokenizer(self) -> Optional[PreTrainedTokenizer]:
         if self._tokenizer is not None:
@@ -1027,39 +1045,43 @@ class SequenceParallelStrategy:
     def register_input_key(self, spec: DataKeySpec) -> None:
         """Declare a token-aligned input on this model only.
 
-        Auxiliary inputs are kept out of the model; stage=forward inputs are
-        sliced in its pre-hook. need_gather selects the loss-side collection.
+        pad_at/split_at select execution boundaries; need_gather selects
+        loss-side collection. The model wrapper owns input routing and merges
+        these explicit declarations into the processor schema.
         """
         self._ctx.input_key_registry.register(spec)
+        if spec not in self.field_declarations.input_key_specs:
+            self.field_declarations.input_key_specs += (spec,)
 
     @property
     def input_key_specs(self) -> Tuple[DataKeySpec, ...]:
-        """Read-only snapshot used by processors to preserve registered keys."""
+        """Read-only snapshot of this context's execution rules."""
         return tuple(self._ctx.input_key_registry)
 
     def register_output_key(self, spec: DataKeySpec) -> None:
         """Register a model-produced sequence output to collect before loss."""
         self._ctx.output_key_registry.register(spec)
+        if spec not in self.field_declarations.output_key_specs:
+            self.field_declarations.output_key_specs += (spec,)
 
     @property
     def output_key_specs(self) -> Tuple[DataKeySpec, ...]:
         return tuple(self._ctx.output_key_registry)
 
+    def register_key_specs(self, input_key_specs, output_key_specs):
+        """Consume model-resolved field definitions for SP execution."""
+        for spec in input_key_specs:
+            if spec.name not in self._ctx.input_key_registry._FORWARD_KEYS:
+                self._ctx.input_key_registry.register(spec)
+        for spec in output_key_specs:
+            self._ctx.output_key_registry.register(spec)
+
     def register_loss_key_specs(self, loss) -> None:
-        """Register sequence input/output contracts declared by a loss."""
-        for attr, register, expected_side in (
-                ('sp_input_key_specs', self.register_input_key, 'input'),
-                ('sp_output_key_specs', self.register_output_key, 'output')):
-            specs = getattr(loss, attr, ()) or ()
-            if isinstance(specs, DataKeySpec):
-                specs = (specs,)
-            for spec in specs:
-                if not isinstance(spec, DataKeySpec):
-                    raise TypeError(f'{type(loss).__name__}.{attr} must contain DataKeySpec values')
-                if spec.side != expected_side:
-                    raise ValueError(f'{type(loss).__name__}.{attr} contains {spec.side!r} key {spec.name!r}; '
-                                     f'expected {expected_side!r}')
-                register(spec)
+        """Compatibility entry point; field ownership remains with the provider."""
+        from twinkle.data_fields import declared_key_specs
+
+        self.register_key_specs(tuple(declared_key_specs(loss, 'input')),
+                                tuple(declared_key_specs(loss, 'output')))
 
     @property
     def model_sp_adapters(self) -> Tuple[ModelSPAdapter, ...]:
@@ -1120,19 +1142,6 @@ class SequenceParallelStrategy:
             gathered = self._ctx.gather(value, dim=dim, position_ids=real_position_ids)
         return self._trim_gathered_sequence_padding(gathered, real_position_ids, dim=dim)
 
-    def _gather_completion_mask(self, inputs: Dict[str, Any], real_position_ids) -> None:
-        """Gather ``completion_mask`` in place, mirroring the labels gather.
-
-        Deliberately not routed through :class:`GatherLoss`: the mask carries no
-        gradient, and reusing that autograd Function would attach a second backward
-        path to whichever tensor were passed alongside it, double-scaling its grad.
-        """
-        mask = inputs.get('completion_mask')
-        if mask is None or not torch.is_tensor(mask) or mask.dim() < 2:
-            return
-        gathered = self._ctx.gather(mask, dim=1, position_ids=real_position_ids)
-        inputs['completion_mask'] = self._trim_gathered_sequence_padding(gathered, real_position_ids)
-
     def gather_loss_tensors(
         self,
         inputs: Dict[str, Any],
@@ -1162,7 +1171,7 @@ class SequenceParallelStrategy:
         unknown_keys = required_keys - output_specs.keys()
         if unknown_keys:
             raise KeyError(f'Loss requested SP gather for unregistered output key(s) {sorted(unknown_keys)}. '
-                           'Register a sequence-aligned DataKeySpec with SequenceParallelStrategy.register_output_key().')
+                           'Declare a sequence-aligned DataKeySpec in the model or loss output_key_specs.')
         missing_keys = {key for key in required_keys if outputs.get(key) is None}
         if missing_keys:
             raise KeyError(f'Loss declared SP gather key(s) {sorted(missing_keys)}, but the model output is missing them.')
@@ -1171,7 +1180,6 @@ class SequenceParallelStrategy:
             if value is not None and (spec.need_gather or spec.name in required_keys
                                       or (spec.name == 'logits' and fused_hidden)):
                 outputs[spec.name] = self._gather_key(value, spec, real_position_ids)
-        self._gather_completion_mask(inputs, real_position_ids)
         return inputs, outputs
 
     def wrap_model(self, model, optimizer=None):

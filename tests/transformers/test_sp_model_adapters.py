@@ -71,7 +71,8 @@ def test_builtin_adapters_install_model_specific_patches(monkeypatch, adapter, p
     assert calls[0][2] is ctx
 
 
-def test_moe_adapter_registers_router_logits_gather_hook(monkeypatch):
+@pytest.mark.parametrize('mask_kind', ['omitted', 'none', 'explicit'])
+def test_moe_adapter_registers_router_logits_gather_hook(monkeypatch, mask_kind):
     hooks = []
 
     class MoEConfig:
@@ -94,6 +95,7 @@ def test_moe_adapter_registers_router_logits_gather_hook(monkeypatch):
     assert adapter.matches(model)
     adapter.configure(ctx, model)
     assert hooks and hooks[0][1]
-    output = hooks[0][0](model, (), {'attention_mask': torch.ones(1, 3)}, Output())
+    kwargs = {} if mask_kind == 'omitted' else {'attention_mask': None if mask_kind == 'none' else torch.ones(1, 3)}
+    output = hooks[0][0](model, (), kwargs, Output())
     assert len(output['router_logits']) == 1
     assert output['router_logits'][0].shape == (3, 3)

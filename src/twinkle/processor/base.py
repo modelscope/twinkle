@@ -105,7 +105,7 @@ class InputProcessor:
 
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], input_key_specs=None,
                        **kwargs) -> List[InputFeature]:
-        from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
+        from twinkle.data_fields import BUILTIN_INPUT_KEYS
 
         specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
         registered_keys = {spec.name for spec in specs}
@@ -147,6 +147,8 @@ class InputProcessor:
                         value = torch.cat(value, dim=0)
                 if isinstance(value, torch.Tensor):
                     value = value.to(Platform.get_local_device())
+                    if key == 'labels' and value.dim() == 0:
+                        value = value.reshape(1)
                     if value.dim() == 1:
                         value = value.unsqueeze(0)
                 _input[key] = value
@@ -518,17 +520,16 @@ class InputProcessor:
         """
         if task in ("embedding", "generative_reranker", "seq_cls", "reranker"):
             return inputs, outputs
-        labels = inputs.get("labels")
         position_ids = inputs.get("position_ids")
 
-        if labels is None or position_ids is None:
+        if position_ids is None:
             return inputs, outputs
         if not self._is_packed_position_ids(position_ids):
             return inputs, outputs
 
         from copy import copy
 
-        from twinkle.model.transformers.strategy.sequence_parallel.data_keys import (
+        from twinkle.data_fields import (
             BUILTIN_INPUT_KEYS, BUILTIN_OUTPUT_KEYS,
         )
 
@@ -571,7 +572,7 @@ class InputProcessor:
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], input_key_specs=None, **kwargs) -> List[InputFeature]:
         import torch
-        from twinkle.model.transformers.strategy.sequence_parallel.data_keys import PROCESSOR_PASSTHROUGH_KEYS
+        from twinkle.data_fields import PROCESSOR_PASSTHROUGH_KEYS
 
         registered_keys = [spec.name for spec in input_key_specs] if input_key_specs is not None else []
         results = []
@@ -609,28 +610,19 @@ class InputProcessor:
             results.append(InputFeature(**output))
         return results
 
-    @staticmethod
-    def pop_sp_auxiliary_inputs(inputs, *, input_key_specs=None):
-        """Keep loss-only token fields out of Hugging Face model.forward."""
-        from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
-
-        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
-        return {spec.name: inputs.pop(spec.name) for spec in specs
-                if spec.stage == 'auxiliary' and spec.name not in ('labels', 'loss_scale') and spec.name in inputs}
-
     def _collate_sequence_key(self, values, spec, padding_free):
         samples = []
         seq_dim = None
         for value in values:
             if not torch.is_tensor(value):
-                raise TypeError(f'Registered SP input {spec.name!r} must be a tensor before collation')
+                raise TypeError(f'Registered sequence input {spec.name!r} must be a tensor before collation')
             if value.dim() == 1:
                 value = value.unsqueeze(0)
             dim = spec.sequence_dim(value.dim())
             if dim == 0 or value.shape[0] != 1:
-                raise ValueError(f'SP input {spec.name!r} requires one sample with a leading batch dimension')
+                raise ValueError(f'Sequence input {spec.name!r} requires one sample with a leading batch dimension')
             if seq_dim is not None and seq_dim != dim - 1:
-                raise ValueError(f'Inconsistent sequence axis for SP input {spec.name!r}')
+                raise ValueError(f'Inconsistent sequence axis for input {spec.name!r}')
             seq_dim = dim - 1
             samples.append(value.squeeze(0))
         if padding_free:
@@ -691,7 +683,7 @@ class InputProcessor:
 
     def _collate_macro_batch(self, inputs: List[InputFeature], input_key_specs=None) -> InputFeature:
         import torch
-        from twinkle.model.transformers.strategy.sequence_parallel.data_keys import BUILTIN_INPUT_KEYS
+        from twinkle.data_fields import BUILTIN_INPUT_KEYS
 
         builtin_names = {spec.name for spec in BUILTIN_INPUT_KEYS}
         specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
