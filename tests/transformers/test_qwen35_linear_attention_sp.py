@@ -12,7 +12,7 @@ from transformers.utils.import_utils import is_flash_linear_attention_available
 from types import MethodType, SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
-from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.model.transformers.strategy.sequence_parallel.linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
 from twinkle.utils import DeviceMesh, selective_log_softmax
 
@@ -367,7 +367,7 @@ def _run_prefill_alignment_worker(rank: int,
         if sp_num_tokens != baseline_num_tokens:
             raise AssertionError(
                 f'prefill num_tokens mismatch on rank {rank}: baseline={baseline_num_tokens} sp={sp_num_tokens}')
-        sp_qkv_grad = _average_qkv_grad_over_group(sp_model, sequence_parallel._data_rank_group) / max(sp_num_tokens, 1)
+        sp_qkv_grad = _average_qkv_grad_over_group(sp_model, strategy._ctx._data_rank_group) / max(sp_num_tokens, 1)
         if not torch.allclose(sp_qkv_grad, baseline_qkv_grad, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (sp_qkv_grad - baseline_qkv_grad).abs().max().item()
             raise AssertionError(f'qkv grad mismatch on rank {rank}: max_diff={max_diff}')

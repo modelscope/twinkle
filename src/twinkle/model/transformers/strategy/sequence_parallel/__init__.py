@@ -582,12 +582,6 @@ class SequenceParallel:
         # towers) fall through to the origin attention.
         text_model = llm_model.language_model if hasattr(llm_model, 'language_model') else llm_model
         _register_module_tree(text_model, self)
-        if self is not sequence_parallel:
-            # Compat: keep the legacy module-level singleton reflecting the most
-            # recently prepared context (extra_kwargs is shared by reference, so
-            # legacy readers observe live per-forward state). New code should
-            # use explicit contexts instead.
-            sequence_parallel.__dict__.update(self.__dict__)
 
     def _mask_qkv(self, query, key, value, mask):
         mask = mask.unsqueeze(2).unsqueeze(3)
@@ -914,9 +908,6 @@ class SequenceParallel:
         return inputs
 
 
-sequence_parallel = SequenceParallel()
-
-
 @dataclass(frozen=True)
 class SequenceParallelConfig:
     enabled: bool = True
@@ -947,8 +938,7 @@ class SequenceParallelStrategy:
         self._tokenizer_id = tokenizer_id
         self._tokenizer = None
         self._initialized = False
-        # Per-model SP context. The module-level ``sequence_parallel`` singleton
-        # is only kept as a compat mirror of the most recently prepared context.
+        # Each model owns its SP context.
         self._ctx = SequenceParallel()
         # Compatibility declarations registered directly through the public API.
         # Keep these separate from rules consumed from model/loss providers.

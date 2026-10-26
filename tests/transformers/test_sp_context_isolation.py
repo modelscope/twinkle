@@ -188,11 +188,8 @@ def test_prepare_causal_mask_method_does_not_retain_weak_registry_owner(monkeypa
     monkeypatch.setattr(sp, 'get_llm_model', lambda value: value)
     monkeypatch.setattr(sp.SequenceParallel, '_global_inited', True)
     monkeypatch.setattr(sp.SequenceParallel, '_init_device_mesh', lambda *args: None)
-    monkeypatch.setattr(sp, 'sequence_parallel', sp.SequenceParallel())
     ctx.prepare(2, model, SimpleNamespace(pad_token_id=0))
     torch.testing.assert_close(ctx.causal_mask_func(torch.zeros(1)), torch.ones(1))
-    # Remove the compatibility mirror so only the weak registry owns the context.
-    sp.sequence_parallel.__dict__.clear()
     del model
     gc.collect()
     assert all(ref() is None for ref in refs)

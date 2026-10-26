@@ -13,7 +13,7 @@ from transformers.modeling_flash_attention_utils import is_flash_attn_available
 from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
-from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.utils import DeviceMesh, Platform, ensure_hccl_socket_env, selective_log_softmax, torch_util
 
 pytestmark = [pytest.mark.slow, pytest.mark.accel(2)]
@@ -542,7 +542,7 @@ def _run_precision_worker(rank: int,
         sp_loss_sum, sp_num_tokens = _compute_training_path_loss(local_logits, local_labels, strategy)
         sp_loss_sum.backward()
         global_loss = sp_loss_sum / max(sp_num_tokens, 1)
-        _average_model_grads_over_group(sp_model, sequence_parallel._data_rank_group)
+        _average_model_grads_over_group(sp_model, strategy._ctx._data_rank_group)
         sp_attention_grads = _normalize_grad_dict(_collect_attention_param_grads(sp_model), sp_num_tokens)
 
         if sp_num_tokens != base_num_tokens:
