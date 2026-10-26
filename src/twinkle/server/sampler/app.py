@@ -44,7 +44,7 @@ def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
     """Construct the vLLM backend with non-blocking generation admission."""
     from .backends.vllm_async import ServerVLLMSampler
 
-    return ServerVLLMSampler(**kw, context_manager=None)
+    return ServerVLLMSampler(**kw)
 
 
 def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
@@ -55,9 +55,9 @@ def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
 
 def _make_sglang_async_sampler(kw: dict[str, Any]) -> Any:
     """Construct the sglang backend with non-blocking generation admission (for the data plane)."""
-    from twinkle_agentic.async_rl.sglang_sampler_tq import SGLangSamplerTQ
+    from .backends.sglang_async import ServerSGLangSampler
 
-    return SGLangSamplerTQ(**kw)
+    return ServerSGLangSampler(**kw)
 
 
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
@@ -142,21 +142,6 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             sampler_kwargs.update(kwargs)
         self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
 
-        # Pin the chat template at construction when the deployment configured one, so the replica
-        # serves Trajectory inputs from its first request without waiting for the gateway's lazy
-        # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
-        # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
-        self._template_pinned = False
-        if template and hasattr(self.sampler, 'set_template'):
-            template_kwargs = dict(template)
-            template_cls = template_kwargs.pop('template_cls', None)
-            if template_cls is None:
-                raise ValueError(
-                    "template must carry a 'template_cls' key naming the template class; got keys: "
-                    f'{sorted(template_kwargs) or "none"}')
-            await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
-            self._template_pinned = True
-
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
@@ -171,13 +156,29 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         # backend result so a timed-out request cannot release live weights.
         self.sampler._ray_get_timeout = None
         self.sampling_guard = SamplerConcurrency()
+
+        # Pin the chat template at construction when the deployment configured one, so the replica
+        # serves Trajectory inputs from its first request without waiting for the gateway's lazy
+        # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
+        # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
+        # Runs after _init_task_queue: call_backend needs the BackendGate it installs.
+        self._template_pinned = False
+        if template and hasattr(self.sampler, 'set_template'):
+            template_kwargs = dict(template)
+            template_cls = template_kwargs.pop('template_cls', None)
+            if template_cls is None:
+                raise ValueError(
+                    "template must carry a 'template_cls' key naming the template class; got keys: "
+                    f'{sorted(template_kwargs) or "none"}')
+            await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
+            self._template_pinned = True
         if sampler_type != 'mock' and not self._template_pinned:
             await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
 
     async def shutdown(self) -> None:
         self.sampling_guard.close()
         try:
-            cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+            cancel_all = getattr(self.sampler, 'abort_all_inflight', None)
             if callable(cancel_all):
                 await self.call_backend(cancel_all, admit=False)
         finally:
@@ -230,8 +231,8 @@ def build_sampler_app(model_id: str,
         deploy_options: Ray Serve deployment options
         sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``sglang`` |
             ``sglang_async`` | ``torch``. Validated up front; bad values raise :class:`ConfigError`
-            before any side effect. The ``*_async`` variants add the non-blocking ``submit_generation``
-            that ``sample_to_data_plane`` requires; the plain ``vllm`` / ``sglang`` variants serve
+            before any side effect. The ``*_async`` variants add the non-blocking submission interface
+            (submit/pause/stop) that ``sample_to_data_plane`` requires; the plain ``vllm`` / ``sglang`` variants serve
             Trajectory / InputFeature sampling but cannot back the data plane.
         engine_args: Additional engine arguments for the sampler
         queue_config: Validated :class:`TaskQueueConfig` (rps_limit, tps_limit, etc.)

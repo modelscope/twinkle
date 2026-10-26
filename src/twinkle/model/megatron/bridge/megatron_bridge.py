@@ -1,38 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""MegatronBridgeBackend: build a Megatron model through NVIDIA megatron-bridge (AutoBridge).
-
-Supports full-parameter and LoRA text causal LM. LoRA goes through twinkle's HF ``get_peft_model``
-(same as the mcore backend); multimodal is not supported yet.
-
-``AutoBridge`` has no ``config.bridge`` and different method names/signatures than what twinkle's
-Model expects (``load_hf_weights`` / ``save_hf_weights`` / ``export_hf_weights``, no
-``peft_format`` / ``adapter_name`` / ``target_device`` / ``only_master_rank`` kwargs). To keep
-twinkle's Model load/save/export working unchanged, ``build_model_config`` attaches a
-``_MCoreCompatBridgeShim`` as ``provider.bridge``; the shim exposes the mcore-compatible surface
-and forwards to ``AutoBridge``.
-
-``AutoBridge.to_megatron_provider(load_weights=False)`` returns a ``GPTModelProvider`` (subclass of
-megatron-core ``TransformerConfig``) that already carries the fields the strategy reads off
-``self.config``, so the provider itself is used as the config-like object.
-
-AutoBridge import path: ``megatron.bridge.models.conversion.auto_bridge.AutoBridge`` (the top-level
-``megatron.bridge`` does not re-export it).
-"""
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 
 class _MCoreCompatBridgeShim:
-    """mcore-compatible facade over a megatron-bridge ``AutoBridge``.
-
-    Exposes ``load_weights`` / ``save_weights`` / ``export_weights`` with the signatures twinkle's
-    Model calls, forwarding to ``AutoBridge.load_hf_weights`` / ``save_hf_weights`` /
-    ``export_hf_weights``. For a non-default ``adapter_name`` (``peft_format=True``), save/export go
-    through peft's ``get_peft_model_state_dict(adapter_name=...)`` to write only that adapter's LoRA
-    delta (AutoBridge has no per-adapter export). A ``converter`` hook and ``only_master_rank=True``
-    are not supported and fail-fast.
-    """
+    """mcore-compatible facade over a megatron-bridge ``AutoBridge``: load/save/export with
+    twinkle's signatures. Per-adapter saves write only that adapter's LoRA delta; ``converter``
+    hooks and ``only_master_rank=True`` are unsupported and fail-fast."""
 
     def __init__(self, auto_bridge: Any, hf_config: Any):
         self._bridge = auto_bridge
@@ -40,12 +15,8 @@ class _MCoreCompatBridgeShim:
 
     @staticmethod
     def _peft_state_dict(mg_models, adapter_name: str):
-        """Return exactly ``adapter_name``'s LoRA weights from the PeftModel, in HF PEFT layout.
-
-        ``get_peft_model_state_dict`` returns only that adapter's ``lora_*`` params with the adapter
-        name stripped from the keys, which is the ``adapter_model.safetensors`` content
-        ``peft.PeftModel.from_pretrained`` expects.
-        """
+        """Exactly ``adapter_name``'s LoRA weights in HF PEFT layout (adapter name stripped), the
+        content ``adapter_model.safetensors`` expects."""
         from peft import PeftModel
         from peft.utils.save_and_load import get_peft_model_state_dict
 
@@ -60,13 +31,8 @@ class _MCoreCompatBridgeShim:
 
     @staticmethod
     def _reject_sharded_peft() -> None:
-        """Fail-fast on per-adapter save/export under TP or PP > 1.
-
-        ``get_peft_model_state_dict`` returns each rank's local LoRA params. Under DP the LoRA
-        weights are replicated, so rank 0's copy is complete; under TP/PP they are sharded and this
-        shim does not all-gather them, so rank 0 would write an incomplete adapter. Only DP is
-        supported here.
-        """
+        """Fail-fast on per-adapter save/export under TP or PP > 1: LoRA weights are sharded there
+        and this shim does not all-gather them, so rank 0 would write an incomplete adapter."""
         try:
             from megatron.core import parallel_state as mpu
         except Exception:
@@ -86,8 +52,8 @@ class _MCoreCompatBridgeShim:
                      peft_format: bool = False,
                      adapter_name: str = 'default',
                      converter=None):
-        """Forwards to ``AutoBridge.load_hf_weights``. Adapter reload is handled by twinkle's
-        PeftModel, so this base-weight path never runs with ``peft_format=True``."""
+        """Forward to ``AutoBridge.load_hf_weights``; adapter reload is handled by twinkle's
+        PeftModel, so ``peft_format=True`` never applies here."""
         if converter is not None:
             raise NotImplementedError('load_weights does not support a converter hook.')
         if peft_format:
@@ -101,9 +67,8 @@ class _MCoreCompatBridgeShim:
                      adapter_name: str = 'default',
                      converter=None,
                      max_shard_size: str = '5GB'):
-        """peft_format=False: forward to ``AutoBridge.save_hf_weights`` (full HF weights).
-        peft_format=True: write only ``adapter_name``'s LoRA delta as ``adapter_model.safetensors``
-        (twinkle writes the matching ``adapter_config.json`` / hf_config / tokenizer separately)."""
+        """peft_format=False: ``AutoBridge.save_hf_weights`` (full HF weights); True: write only
+        ``adapter_name``'s LoRA delta as ``adapter_model.safetensors``."""
         if converter is not None:
             raise NotImplementedError('save_weights does not support a converter hook.')
         if max_shard_size != '5GB':
@@ -137,9 +102,8 @@ class _MCoreCompatBridgeShim:
                        tqdm_desc: str = 'Exporting: ',
                        disable_tqdm: bool = True,
                        _is_saving: bool = False):
-        """Yields ``(hf_name, tensor)``. peft_format=False: full HF weights via
-        ``AutoBridge.export_hf_weights``. peft_format=True: only ``adapter_name``'s LoRA delta.
-        ``only_master_rank=True`` is unsupported (AutoBridge gathers full tensors to all ranks)."""
+        """Yield ``(hf_name, tensor)``: full weights via ``AutoBridge.export_hf_weights``, or only
+        ``adapter_name``'s LoRA delta when peft_format. ``only_master_rank=True`` is unsupported."""
         if converter is not None:
             raise NotImplementedError('export_weights does not support a converter hook.')
         if peft_format:
@@ -167,15 +131,9 @@ class MegatronBridgeBackend:
         return False
 
     def build_model_config(self, hf_config: Any, parallel_kwargs: Dict[str, Any], strategy: Any, **kwargs) -> Any:
-        """HF config -> a finalized GPTModelProvider with a shim attached as ``.bridge``.
-
-        Override values (parallel sizes, dtype, sequence_parallel, variable_seq_lengths, and the
-        backward/MoE defaults calculate_per_token_loss / moe_token_dispatcher_type) are taken from
-        the same strategy the mcore backend reads, so both backends build the same-shaped model.
-        """
+        """HF config -> a finalized GPTModelProvider with a shim attached as ``.bridge``."""
         from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 
-        # hf_config carries the local snapshot path (twinkle resolves it before calling).
         model_path = getattr(hf_config, 'name_or_path', None) or getattr(hf_config, '_name_or_path', None)
         if not model_path:
             raise ValueError('MegatronBridgeBackend needs hf_config.name_or_path (a local model dir).')
@@ -194,27 +152,16 @@ class MegatronBridgeBackend:
         overrides: Dict[str, Any] = dict(parallel_kwargs)
         overrides['sequence_parallel'] = strategy.sequence_parallel
         overrides['variable_seq_lengths'] = strategy.variable_seq_lengths
-        # attention_backend is NOT set here. It used to be pinned to AttnBackend.flash on this path
-        # only, while the mcore-bridge path left it at mcore's AttnBackend.auto -- so the same
-        # Config ran a different attention kernel depending on bridge_backend. It is now resolved
-        # once by the caller (from ModelConfig.attn_impl, defaulting to flash like legacy) and
-        # arrives through kwargs below, which both backends share.
-        # Fold through config kwargs the provider declares. Unsupported defaults may use the provider's
-        # own version-specific defaults; explicitly requested fields were checked above and never disappear.
+        # attention_backend is resolved by the caller and arrives through kwargs; both backends
+        # share it, so the same Config never picks a different kernel per bridge_backend.
         for k, v in kwargs.items():
             if hasattr(provider, k):
                 overrides[k] = v
 
-        # Match the mcore backend's backward/MoE defaults. calculate_per_token_loss defaults to
-        # False in core (mcore forces True for per-token-mean grad normalization);
-        # moe_token_dispatcher_type follows the same variable_seq_lengths gate (MoE only).
+        # Match the mcore backend's backward/MoE defaults (calculate_per_token_loss, dispatcher
+        # type gated on variable_seq_lengths) and fusion-flag alignment; see mcore.py for rationale.
         overrides.setdefault('calculate_per_token_loss', True)
         overrides.setdefault('moe_token_dispatcher_type', 'alltoall' if strategy.variable_seq_lengths else 'allgather')
-        # Same fusion-flag alignment as the mcore backend (see mcore.py for the rationale): legacy
-        # Megatron-SWIFT defaults these True, mcore's TransformerConfig defaults them False, and
-        # bias_activation_fusion in particular changes SwiGLU arithmetic in low precision. Only fold in
-        # flags the provider actually declares; gradient_accumulation_fusion is left out for the
-        # APEX-availability reason documented in mcore.py.
         for _fusion_flag in ('bias_activation_fusion', 'masked_softmax_fusion', 'bias_dropout_fusion'):
             if hasattr(provider, _fusion_flag):
                 overrides.setdefault(_fusion_flag, True)
@@ -224,9 +171,8 @@ class MegatronBridgeBackend:
         return provider
 
     def create_model(self, config: Any, model_dir: str, *, load_weights: bool, move_to_gpu) -> List[Any]:
-        """provide_distributed_model(wrap_with_ddp=False) -> bare models, move_to_gpu, then
-        (if load_weights) AutoBridge.load_hf_weights. The strategy's wrap_model does the DDP
-        wrap later. MPU is already initialized by the strategy, so it is reused here."""
+        """provide_distributed_model(wrap_with_ddp=False) -> bare models, move to GPU, then
+        load HF weights; the strategy's wrap_model does the DDP wrap later."""
         import torch.distributed as dist
 
         provider = config

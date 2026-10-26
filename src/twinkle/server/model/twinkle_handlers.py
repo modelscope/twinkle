@@ -588,11 +588,13 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                     self.set_resource_state(adapter_name, 'grad_ready', False)
                 else:
                     await self.call_backend(self.model.add_adapter_to_model, adapter_name, config, **extra_kwargs)
+                # Inside the same guard: a failed run-metadata save must roll the registration
+                # back too, or the adapter is served while list/get report no such run.
+                training_run_manager.save(adapter_name, run_config)
             except Exception:
                 self.unregister_resource(adapter_name)
                 await self.state.unload_model(adapter_name)
                 raise
-            training_run_manager.save(adapter_name, run_config)
             return {'status': 'ok', 'adapter_name': adapter_name}
 
         return await self.submit_and_peek(_task, model_id=adapter_name, token=token, task_type='add_adapter_to_model')
@@ -610,14 +612,21 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         token = await self._on_request_start(request)
 
         async def _task():
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             if body.checkpoint_dir.startswith('twinkle://'):
-                checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
                 if not parsed:
                     raise ValueError(f'Invalid twinkle path format: {body.checkpoint_dir}')
                 checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.checkpoint_dir)
             else:
-                checkpoint_dir = body.checkpoint_dir
+                # A raw local path is still confined to this token's directory: without the check an
+                # authenticated user could upload any readable directory (another tenant's weights).
+                from pathlib import Path
+
+                from twinkle.server.checkpoint.paths import ensure_inside
+
+                checkpoint_dir = str(ensure_inside(
+                    checkpoint_manager.training_run_manager.get_base_dir(), Path(body.checkpoint_dir)))
             await self.call_backend(
                 self.model.upload_to_hub,
                 checkpoint_dir=checkpoint_dir,

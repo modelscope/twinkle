@@ -20,12 +20,8 @@ class RingComm:
         self.world_size = dist.get_world_size(self._process_group)
         self._reqs = None
 
-        self.send_rank = (self.rank + 1) % self.world_size
-        self.recv_rank = (self.rank - 1) % self.world_size
-
-        if process_group is not None:
-            self.send_rank = dist.get_global_rank(self._process_group, self.send_rank)
-            self.recv_rank = dist.get_global_rank(self._process_group, self.recv_rank)
+        self.send_rank = dist.get_global_rank(self._process_group, (self.rank + 1) % self.world_size)
+        self.recv_rank = dist.get_global_rank(self._process_group, (self.rank - 1) % self.world_size)
 
     def send_recv(self, to_send: torch.Tensor, recv_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         if recv_tensor is None:
@@ -240,7 +236,7 @@ def _fa2_varlen_forward(fwd_op, q, k, v, causal, cu_seqlens_q, cu_seqlens_kv, ma
         'softmax_scale': softmax_scale,
         'causal': causal,
         'alibi_slopes': alibi_slopes,
-        'return_softmax': True and dropout_p > 0,
+        'return_softmax': dropout_p > 0,
     })
     if 'window_size' in params:
         params.update({'window_size': window_size})
@@ -249,8 +245,8 @@ def _fa2_varlen_forward(fwd_op, q, k, v, causal, cu_seqlens_q, cu_seqlens_kv, ma
             'window_size_left': window_size[0],
             'window_size_right': window_size[1],
         })
-    assert k.shape[-0] == cu_seqlens_kv[-1]
-    assert q.shape[-0] == cu_seqlens_q[-1]
+    assert k.shape[0] == cu_seqlens_kv[-1]
+    assert q.shape[0] == cu_seqlens_q[-1]
     assert max_seqlen_q == (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     assert max_seqlen_kv == (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).max().item()
     outputs = fwd_op(**params)

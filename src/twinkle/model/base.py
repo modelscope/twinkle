@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
 from twinkle import Platform, remote_function, torch_util
@@ -10,7 +11,6 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
-from twinkle.model.async_save import AsyncSaveMixin
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -141,9 +141,80 @@ class ModelLoaderProtocol(Protocol):
         ...
 
 
-class TrainableModel(AsyncSaveMixin, ABC):
+class TrainableModel(ABC):
+    """The backend-agnostic training surface.
+
+    The abstract methods below are grouped by lifecycle stage -- read this class
+    as the table of contents for a model's life:
+
+    - forward / forward_only / forward_backward / calculate_loss / backward:  compute
+    - step / zero_grad / lr_step / clip_grad_norm / clip_grad_and_step:  optimization
+    - save / load / get_state_dict / resume_from_checkpoint:  persistence
+    - set_template / set_processor / add_adapter_to_model / apply_patch / set_loss
+      / set_optimizer / set_lr_scheduler / add_metric:  assembly
+    - offload_to_cpu / reload_to_gpu / empty_cache / upload_to_hub:  resource lifecycle
+
+    Weight streaming into a sampler/reference (send_weights and friends) lives on
+    CheckpointEngineMixin, not here: it is transport protocol, not model surface.
+    """
 
     _checkpoint_engine = None
+    _async_write_executor: Optional[ThreadPoolExecutor] = None
+    _async_write_future: Optional[Future] = None
+
+    # -- async checkpoint persistence (staging/write separation) --------------------
+    #
+    # A save splits into a staging half (collecting state off the training device: gathers, D2H copies,
+    # optimizer/rng/scheduler state_dicts -- everything that touches the model or a process group) and a
+    # write half (serializing staged CPU payloads to disk -- pure file I/O, safe off-thread). Callers
+    # stage synchronously, then hand the write closure to :meth:`submit_async_write`; the checkpoint
+    # bytes are frozen at stage time, so training steps taken while the write is in flight never leak
+    # into the saved artifact.
+    #
+    # One write in flight per instance: a new submission first joins the previous write, so a slow disk
+    # can at most delay the next save, never pile up snapshots. Exceptions raised by the background
+    # write are re-raised to the next join (or :meth:`wait_async_saves`), never swallowed.
+
+    def _stage(self) -> None:
+        """Hook for subclasses needing extra synchronous staging work before a write is submitted."""
+
+    def submit_async_write(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` (pure file I/O over already-staged CPU payloads) on the background writer."""
+        executor = self._async_save_executor()
+        self._join_async_save()
+        self._async_write_future = executor.submit(fn)
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def wait_async_saves(self) -> None:
+        """Join and re-raise any failure from the in-flight background write."""
+        self._join_async_save()
+
+    def _async_save_executor(self) -> ThreadPoolExecutor:
+        # Lazily created so instances that never save asynchronously pay nothing.
+        if self._async_write_executor is None:
+            self._async_write_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='async-save')
+        return self._async_write_executor
+
+    def _join_async_save(self) -> None:
+        future = self._async_write_future
+        if future is not None:
+            self._async_write_future = None
+            future.result()
+
+    def shutdown_async_saves(self) -> None:
+        """Join any in-flight write and retire the writer thread (idempotent)."""
+        self._join_async_save()
+        executor = self._async_write_executor
+        if executor is not None:
+            self._async_write_executor = None
+            executor.shutdown(wait=True)
+
+    def __del__(self):
+        # Best-effort: an unjoined in-flight write at teardown loses the checkpoint silently otherwise.
+        executor = getattr(self, '_async_write_executor', None)
+        if executor is not None:
+            self.shutdown_async_saves()
 
     @abstractmethod
     def forward(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
@@ -249,6 +320,32 @@ class TrainableModel(AsyncSaveMixin, ABC):
     @abstractmethod
     def get_train_configs(self, **kwargs) -> str:
         ...
+
+    @staticmethod
+    def _not_encoded(inputs):
+        """True when ``inputs`` has not been run through the input processor yet.
+
+        A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a
+        list of encoded rows per item and the processor flattens it only later
+        (prepare_inputs), after this probe has run.  Descend to the first leaf
+        dict so the probe reads a packed batch's encoding state instead of
+        asserting on the intermediate list; for a flat dict / list[dict] the
+        loop is a no-op.
+        """
+        while isinstance(inputs, (list, tuple)):
+            if not inputs:
+                return False
+            inputs = inputs[0]
+        assert isinstance(inputs, dict)
+        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
+        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
+        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
+        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
+        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
+        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
+        return not any(
+            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
+            for k in inputs)
 
     def upload_to_hub(self,
                       checkpoint_dir: str,

@@ -50,7 +50,7 @@ class TestMultimodalDataset:
             pytest.skip(f'Failed to load Qwen3_5Template (may need network): {e}')
 
         assert dataset.template is not None
-        assert hasattr(dataset.template, 'is_mm')
+        assert dataset.template.is_multimodal
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_multimodal_dataset_encode_with_lazy(self):

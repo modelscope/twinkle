@@ -199,6 +199,7 @@ def main():
         template=rollout_template,
         sampling_params=sampling_params,
         max_turns=MAX_TURNS,
+        sticky_session=True,  # Keep each episode's tool loop on the same sampler worker.
     )
 
     advantage_fn = GRPOAdvantage()

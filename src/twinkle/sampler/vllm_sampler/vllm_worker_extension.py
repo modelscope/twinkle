@@ -18,12 +18,16 @@ import platform
 import re
 import signal
 import torch
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
+from twinkle.patch.vllm_weight_loader import streaming_weight_sync
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
+
+if TYPE_CHECKING:
+    from twinkle.checkpoint_engine.delta.config import DeltaWorkerCapabilities, DeltaWorkerMetadata
 
 logger = get_logger()
 
@@ -36,6 +40,17 @@ def set_death_signal():
     libc.prctl(1, signal.SIGKILL)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _cuda_visible_device(device: torch.device) -> str:
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible_devices is None:
+        return str(device_index)
+    selectors = [value.strip() for value in visible_devices.split(',')]
+    if not 0 <= device_index < len(selectors) or not selectors[device_index] or selectors[device_index] == '-1':
+        raise ValueError(f'Cannot map CUDA device {device_index} to CUDA_VISIBLE_DEVICES={visible_devices!r}')
+    return selectors[device_index]
 
 
 # Constants for the RL training LoRA adapter identity.
@@ -103,8 +118,77 @@ class TwinkleWorkerExtension:
         from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
         set_death_signal()
         VLLMLoraWeights()(None)
+        config = getattr(kwargs.get('vllm_config'), 'weight_transfer_config', None)
+        if getattr(config, 'backend', None) == 'twinkle_delta_ipc':
+            from .delta.transfer_engine import register_twinkle_delta_weight_transfer_engine
+            register_twinkle_delta_weight_transfer_engine()
+        elif getattr(config, 'backend', None) == 'twinkle_delta_hccl':
+            from .delta.transfer_engine import register_twinkle_delta_hccl_weight_transfer_engine
+            register_twinkle_delta_hccl_weight_transfer_engine()
 
         return super().__new__(cls)
+
+    def validate_delta_worker(self) -> 'DeltaWorkerCapabilities':
+        from .delta.transfer_engine import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
+        engine = getattr(self, 'weight_transfer_engine', None)
+        if not isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
+            raise RuntimeError("Delta sync requires engine_args['weight_transfer_config'] when constructing the "
+                               "sampler: {'backend': 'twinkle_delta_ipc'} on CUDA or "
+                               "{'backend': 'twinkle_delta_hccl'} on Ascend NPU")
+        engine._validate_configuration()
+        if is_moe_model(engine.model_config.hf_config):
+            raise ValueError('Twinkle FSDP delta export does not yet implement backend-specific MoE HF conversion')
+        return {'tp': self.model_runner.parallel_config.tensor_parallel_size, 'device': engine.device.type}
+
+    def delta_ipc_endpoint(self):
+        if not hasattr(self, '_delta_ipc_endpoint'):
+            import uuid
+            self._delta_ipc_endpoint = f'ipc:///tmp/twinkle-delta-{uuid.uuid4().hex}.sock'
+        return self._delta_ipc_endpoint
+
+    def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
+        from twinkle.infra import node_ip
+        return {
+            'node_ip': node_ip(),
+            'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
+            'cuda_visible_device': _cuda_visible_device(self.device),
+            'zmq_handle': self.delta_ipc_endpoint(),
+        }
+
+    def _delta_update_info_for_this_worker(self, update_info: List[Dict]) -> Dict:
+        """Pick this worker's entry from a per-worker ``update_info`` list.
+
+        Same indexing as vLLM's GPU ``Worker.update_weights``: ``data_parallel_index * world_size + rank``
+        (a list indexed by global worker rank across data-parallel replicas). vllm-ascend's
+        ``NPUWorker.update_weights`` only accepts a dict, so the entry is selected here instead of relying
+        on the worker class to do it.
+        """
+        parallel_config = getattr(getattr(self, 'vllm_config', None), 'parallel_config', None)
+        dp_index = int(getattr(parallel_config, 'data_parallel_index', 0) or 0)
+        world_size = int(getattr(parallel_config, 'world_size', 1) or 1)
+        index = dp_index * world_size + int(getattr(self, 'rank', 0) or 0)
+        if index >= len(update_info):
+            raise ValueError(f'delta update_info has {len(update_info)} entries but this worker needs entry {index}')
+        return update_info[index]
+
+    def update_twinkle_delta_weights(self, update_info: Optional[List[Dict]] = None):
+        """Run one delta weight-update session.
+
+        ``None``: CUDA IPC path, this worker's local zmq endpoint is used. A list of per-worker dicts
+        (HCCL path, e.g. ``[{'group_rank': 1}, {'group_rank': 2}]``): this worker's own entry is passed to
+        ``update_weights`` as a plain dict, so it works on both the GPU and the vllm-ascend worker.
+        """
+        if update_info is None:
+            self.update_weights({'zmq_handle': self.delta_ipc_endpoint()})
+        else:
+            self.update_weights(self._delta_update_info_for_this_worker(update_info))
+
+    def shutdown_delta_weight_transfer(self) -> None:
+        """Release the delta engine's transport channel (HCCL SUB + communicator); no-op for other engines."""
+        from .delta.transfer_engine import TwinkleDeltaIPCWeightTransferEngine
+        engine = getattr(self, 'weight_transfer_engine', None)
+        if isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
+            engine.shutdown()
 
     def monkey_patch_model(self):
         from twinkle.patch.vllm_moe_loader import VLLMMoEWeights
@@ -114,6 +198,7 @@ class TwinkleWorkerExtension:
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
 
+    @streaming_weight_sync()
     def update_weights_from_ipc(
         self,
         peft_config: Optional[Dict] = None,
@@ -326,15 +411,18 @@ class TwinkleWorkerExtension:
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
-            Torch.synchronize()
+            # Wait for this worker's own clones out of the shared buffer. Pass the device
+            # explicitly: TP workers inherit the actor's LOCAL_RANK, so the default would
+            # point at the wrong card.
+            Torch.synchronize(self.device)
+
+            # Every rank must finish reading before the driver acks: the ack lets the
+            # sender overwrite the buffer with the next bucket.
+            if tp_size > 1:
+                dist.barrier(group=cpu_group)
 
             if is_driver:
                 socket.send(b'')
-
-            # Ensure all ranks finish reading the buffer before the driver
-            # proceeds to the next bucket (which overwrites the buffer).
-            if tp_size > 1:
-                dist.barrier(group=cpu_group)
 
             if lora_mode:
                 lora_bucket_accum.extend(weights)
@@ -523,6 +611,7 @@ class TwinkleWorkerExtension:
         drafter_model.load_weights(weights)
 
     def get_state_keys(self):
+        """Return internal parameter names; each loader adapts its own input names."""
         keys = list(self.model_runner.model.state_dict().keys())
         drafter_model = self._drafter_model()
         if drafter_model is not None:

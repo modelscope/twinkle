@@ -82,10 +82,6 @@ def _merge_config(config: dict[str, Any] | None) -> ExpertParallelConfig:
     return cfg
 
 
-def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
-    return [block for _, block in find_moe_blocks_with_names(model)]
-
-
 def find_moe_blocks_with_names(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     blocks = []
     for name, module in model.named_modules():
@@ -235,8 +231,8 @@ def patch_forward(
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
         # Pass block-level routing replay state.
-        from .router_replay import get_replay_state
-        replay_state = get_replay_state(block_name)
+        from .router_replay import RouterReplay
+        replay_state = RouterReplay.get_replay_state(block_name)
 
         router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
@@ -531,7 +527,7 @@ def _run_router(
         router_logits = gate_out
 
     # Lazy import to avoid circular dependency with router_replay.py
-    from .router_replay import RouterReplayAction
+    from .router_replay import RouterReplay, RouterReplayAction
 
     # --- REPLAY (forward / backward): use injected selected_experts ---
     if (replay_state is not None and replay_state.action != RouterReplayAction.RECORD

@@ -37,7 +37,6 @@ class IterablePackingDataset(IterableDataset):
         if dataset_meta is not None:
             kwargs['streaming'] = True
         super().__init__(dataset_meta, **kwargs)
-        self._out_queue = mp.Queue()
         self.packed_idx = []
         self.packed_length = []
         self.packing_interval = packing_interval
@@ -66,8 +65,14 @@ class IterablePackingDataset(IterableDataset):
     def _processor(self):
         while True:
             i, data = self._in_queue.get()
-            encoded_data = self.template.encode(data)
-            data.update(encoded_data)
+            try:
+                encoded_data = self.template.encode(data)
+                data.update(encoded_data)
+            except BaseException as exc:
+                # Propagate instead of letting the daemon die with the error swallowed: the parent
+                # blocks on _out_queue.get() forever and the whole run hangs with no error output.
+                self._out_queue.put((i, exc))
+                return
             self._out_queue.put((i, data))
 
     def _put_data_in_queue(self, iterator) -> int:
@@ -83,6 +88,8 @@ class IterablePackingDataset(IterableDataset):
         res = [None] * num_samples
         for _ in range(num_samples):
             i, data = self._out_queue.get()
+            if isinstance(data, BaseException):
+                raise RuntimeError('A packing worker failed to encode a sample') from data
             if not data:
                 continue
             res[i] = (data, len(data['input_ids']))

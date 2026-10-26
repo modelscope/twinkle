@@ -10,14 +10,17 @@ Outputs are deterministic — keyed by ``(model_id, adapter_name, seed,
 prompt_index, sample_index)`` — so repeated calls with the same parameters
 produce identical token sequences and logprobs.
 """
+
 from __future__ import annotations
+import time
+from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
-import time
-from typing import Any, Iterable
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.template.utils import construct_template
 from twinkle.utils.logger import get_logger
 from twinkle.utils.seed import stable_seed
 
@@ -55,7 +58,7 @@ class MockSampler:
         *,
         seed: int = 0,
         vocab_size: int = 32,
-        stop_reason: str = 'length',
+        stop_reason: str = "length",
         tool_call_text: str | None = None,
         tool_call_turns: Iterable[int] | None = None,
         **kwargs: Any,
@@ -77,7 +80,7 @@ class MockSampler:
         # backend signature drift then shows up as a visible DEBUG warning in
         # the mock e2e instead of being discarded without trace.
         if kwargs:
-            logger.debug('MockSampler ignoring unknown ctor kwargs: %s', sorted(kwargs))
+            logger.debug("MockSampler ignoring unknown ctor kwargs: %s", sorted(kwargs))
         # Match the Sampler base attributes so duck-typed callers don't surprise.
         self.engine = None
         self.template = None
@@ -94,7 +97,7 @@ class MockSampler:
         self,
         inputs: Any,
         sampling_params: SamplingParams | None = None,
-        adapter_name: str = '',
+        adapter_name: str = "",
         *,
         num_samples: int = 1,
         **kwargs: Any,
@@ -106,8 +109,9 @@ class MockSampler:
         # TypeError.
         max_tokens = self._resolve_max_tokens(sampling_params)
         if max_tokens is None or max_tokens < 1:
-            raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r} '
-                             '(set sampling_params.max_tokens to a positive integer)')
+            raise ValueError(
+                f"max_tokens must be >= 1, got {max_tokens!r} (set sampling_params.max_tokens to a positive integer)"
+            )
 
         # Resolve per-call multi-turn knobs (explicit sample() kwargs override
         # ctor defaults) and advance the round counter that ``tool_call_turns``
@@ -132,7 +136,7 @@ class MockSampler:
                 # ``List[List[Tuple[int, float]]]`` (top-k per position) — the
                 # mock returns top-1 with the chosen token. The tinker handler
                 # flattens this to a single chosen-token logprob.
-                logprobs = [[(tok, float(lp))] for tok, lp in zip(tokens, logprobs_per_token)]
+                logprobs = [[(tok, float(lp))] for tok, lp in zip(tokens, logprobs_per_token, strict=False)]
                 sequences.append(
                     SampledSequence(
                         stop_reason=stop_reason,
@@ -140,7 +144,8 @@ class MockSampler:
                         logprobs=logprobs,
                         decoded=decoded,
                         new_input_feature=self._build_new_input_feature(pif, tokens),
-                    ))
+                    )
+                )
             responses.append(SampleResponse(sequences=sequences))
         return responses
 
@@ -149,13 +154,13 @@ class MockSampler:
         self,
         inputs: Any,
         sampling_params: SamplingParams | None = None,
-        adapter_name: str = '',
+        adapter_name: str = "",
         adapter_path: str | None = None,
     ):
         """Yield (delta_text, finish_reason) tuples one token at a time."""
         max_tokens = self._resolve_max_tokens(sampling_params)
         if max_tokens is None or max_tokens < 1:
-            raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r}')
+            raise ValueError(f"max_tokens must be >= 1, got {max_tokens!r}")
 
         seed = stable_seed(self.model_id, adapter_name, 0, 0)
         rng = np.random.default_rng(seed)
@@ -164,11 +169,12 @@ class MockSampler:
         for i, tok in enumerate(tokens):
             is_last = i == len(tokens) - 1
             time.sleep(0.05)
-            yield str(tok), ('length' if is_last else None)
+            yield str(tok), ("length" if is_last else None)
 
-    def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name="", adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
         from .streaming import stream_to_queue
+
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     @remote_function()
@@ -182,7 +188,7 @@ class MockSampler:
 
     @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
-        self.template = template_cls
+        self.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
     def reset_prefix_cache(self) -> None:
@@ -212,7 +218,7 @@ class MockSampler:
     def _resolve_max_tokens(params: SamplingParams | None) -> int | None:
         if params is None:
             return None
-        return getattr(params, 'max_tokens', None)
+        return getattr(params, "max_tokens", None)
 
     @staticmethod
     def _normalize_turns(turns: Iterable[int] | None, tool_call_text: str | None) -> frozenset[int]:
@@ -226,13 +232,13 @@ class MockSampler:
         return frozenset(int(t) for t in turns)
 
     def _resolve_stop_reason(self, kwargs: dict[str, Any]) -> str:
-        if 'stop_reason' in kwargs and kwargs['stop_reason'] is not None:
-            return str(kwargs['stop_reason'])
+        if "stop_reason" in kwargs and kwargs["stop_reason"] is not None:
+            return str(kwargs["stop_reason"])
         return self._stop_reason
 
     def _resolve_tool_call_text(self, kwargs: dict[str, Any]) -> str | None:
-        if 'tool_call_text' in kwargs:
-            return kwargs['tool_call_text']
+        if "tool_call_text" in kwargs:
+            return kwargs["tool_call_text"]
         return self._tool_call_text
 
     def _resolve_tool_call_turns(
@@ -240,8 +246,8 @@ class MockSampler:
         kwargs: dict[str, Any],
         tool_call_text: str | None,
     ) -> frozenset[int]:
-        if 'tool_call_turns' in kwargs and kwargs['tool_call_turns'] is not None:
-            return self._normalize_turns(kwargs['tool_call_turns'], tool_call_text)
+        if "tool_call_turns" in kwargs and kwargs["tool_call_turns"] is not None:
+            return self._normalize_turns(kwargs["tool_call_turns"], tool_call_text)
         if tool_call_text is not None and not self._tool_call_turns:
             return frozenset({1})
         return self._tool_call_turns
@@ -255,7 +261,7 @@ class MockSampler:
         this round's sampled tokens, ``labels`` marks the sampled tokens as
         trainable (their own ids) while prior/context positions stay ``-100``,
         and ``completion_mask`` marks them as the policy's own output.
-        This mirrors the shape a real sampler's ``concat_input_feature`` yields,
+        This mirrors the shape a real sampler's ``append_completion`` yields,
         which the multi-turn rollout relies on (it reads
         ``new_input_feature.input_ids`` and counts trainable ``labels``).
 
@@ -263,22 +269,22 @@ class MockSampler:
         deterministic list concatenation performed entirely on the CPU.
         """
         feat: dict[str, Any] = dict(pif) if isinstance(pif, dict) else {}
-        prev_ids = list(feat.get('input_ids') or [])
-        prev_labels = feat.get('labels')
+        prev_ids = list(feat.get("input_ids") or [])
+        prev_labels = feat.get("labels")
         if prev_labels is not None and len(prev_labels) == len(prev_ids):
             labels = list(prev_labels)
         else:
             # No (or misaligned) prior labels: treat the entire prior context as
             # non-trainable so only this round's sampled tokens count.
             labels = [-100] * len(prev_ids)
-        prev_mask = feat.get('completion_mask')
+        prev_mask = feat.get("completion_mask")
         if prev_mask is not None and len(prev_mask) == len(prev_ids):
             completion_mask = list(prev_mask)
         else:
             completion_mask = [0 if label == -100 else 1 for label in labels]
 
-        feat['input_ids'] = prev_ids + list(tokens)
-        feat['labels'] = labels + list(tokens)
-        feat['completion_mask'] = completion_mask + [1] * len(tokens)
-        feat['length'] = len(feat['input_ids'])
+        feat["input_ids"] = prev_ids + list(tokens)
+        feat["labels"] = labels + list(tokens)
+        feat["completion_mask"] = completion_mask + [1] * len(tokens)
+        feat["length"] = len(feat["input_ids"])
         return feat

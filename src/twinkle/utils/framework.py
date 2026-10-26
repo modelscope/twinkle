@@ -49,7 +49,9 @@ class Framework(ABC):
                 # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
                 # DP group instead. When CP is enabled we must pick the DP+CP
                 # variant, otherwise the rank span for metric aggregation is wrong.
-                if importlib.util.find_spec('megatron.core') is not None:
+                # find_spec for a submodule imports its parent, which is optional.
+                if (importlib.util.find_spec('megatron') is not None
+                        and importlib.util.find_spec('megatron.core') is not None):
                     from megatron.core import parallel_state as mpu
                     if mpu.model_parallel_is_initialized():
                         process_group = mpu.get_data_parallel_group_gloo(
@@ -204,13 +206,20 @@ class Torch(Framework):
         return tensor
 
     @staticmethod
-    def synchronize():
+    def synchronize(device=None):
+        """Wait for all queued work on ``device``, defaulting to the LOCAL_RANK device.
+
+        Pass ``device`` explicitly in subprocesses (e.g. vLLM TP workers) that inherit the
+        parent's LOCAL_RANK but are bound to a different device.
+        """
         import torch
+        if device is None:
+            device = Platform.get_local_device()
         if Torch.is_gpu_available():
-            torch.cuda.synchronize(Platform.get_local_device())
+            torch.cuda.synchronize(device)
         elif Torch.is_npu_available():
             import torch_npu
-            torch.npu.synchronize(Platform.get_local_device())
+            torch.npu.synchronize(device)
 
     @staticmethod
     def contains_nan(*args, **kwargs) -> bool:

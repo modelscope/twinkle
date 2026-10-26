@@ -136,6 +136,10 @@ class ToolManager:
             return str(tool(name, args))
         except Exception as e:  # noqa
             return f'Error: tool {name!r} raised {type(e).__name__}: {e}'
+        finally:
+            env = getattr(tool, '_env', None)
+            if env is not None:
+                env.ensure_idle()
 
     def call_many(
         self,
@@ -196,6 +200,8 @@ class ToolManager:
                 for i, _name, _args in batched:
                     out[i] = failure
                 return ['' if x is None else x for x in out]
+            finally:
+                env.ensure_idle()
             if len(results) != len(batched):
                 # Same reasoning: a short result list means the calls did not all
                 # run, and pairing them up by position would report one call's
@@ -218,6 +224,15 @@ class ToolManager:
             for fut in as_completed(futs):
                 out[futs[fut]] = fut.result()
         return ['' if x is None else x for x in out]
+
+    def ensure_idle(self):
+        """所有实际工具线程退出后，还须确认它们使用的远程环境已结束执行。"""
+        seen = set()
+        for tool in self._tools.values():
+            env = getattr(tool, '_env', None)
+            if env is not None and id(env) not in seen:
+                seen.add(id(env))
+                env.ensure_idle()
 
     def _shared_env(self):
         """Return the Env shared by every registered EnvTool, else None."""

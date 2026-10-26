@@ -7,6 +7,10 @@ carrying three test lists.
 """
 import pytest
 
+#: Tests of the archived pipelineTQ surface: they import modules that moved into
+#: async_rl/legacy/ and would break collection for the whole suite. Skip them at collection.
+collect_ignore_glob = ['twinkle_agentic/legacy/*']
+
 
 class Accelerators:
     """The box's accelerators, whichever backend it has."""

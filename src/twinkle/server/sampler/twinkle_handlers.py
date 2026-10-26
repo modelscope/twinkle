@@ -148,11 +148,6 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
     return sample_models
 
 
-def _submission_states(value) -> list[dict]:
-    """Normalize Twinkle's single-worker unwrapping to a list of states."""
-    return value if isinstance(value, list) else [value]
-
-
 async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, single_get_timeout: float = 60.0):
     loop = asyncio.get_running_loop()
     start = loop.time()
@@ -187,47 +182,48 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
             pass
 
 
-async def _await_generation(service: SamplerManagement, submission_id: str):
-    """Poll one admitted generation through the backend boundary."""
-    collected = False
+async def _await_futures(service: SamplerManagement, futures: List[Any], request_ids: List[str]):
+    """Collect submit futures off the event loop (``result()`` blocks); a failure stops the rest.
 
-    async def poll():
-        nonlocal collected
-        poll_interval = 0.01
-        while True:
-            try:
-                states = _submission_states(await service.call_backend(service.sampler.get_generation_status,
-                                                                       submission_id))
-            except Exception as error:
-                from ray.exceptions import TaskCancelledError
-                if not isinstance(error, TaskCancelledError):
-                    raise
-                await asyncio.sleep(poll_interval)
-                poll_interval = min(poll_interval * 1.5, 0.25)
-                continue
-            failed = next(
-                (state for state in states if state.get('status') not in ('running', 'completed')),
-                None,
-            )
-            if failed is not None:
-                error = failed.get('error') or failed.get('status', 'unknown failure')
-                raise RuntimeError(f'generation {submission_id} failed: {error}')
-            if states and all(state.get('status') == 'completed' for state in states):
-                responses = await service.call_backend(service.sampler.collect_generation, submission_id)
-                collected = True
-                return responses
-            await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.5, 0.25)
-
+    Each future is the sampler's submit return (a LazyCollect handle): probing and collecting are
+    LOCAL operations on the handle -- no per-status RPC round trip. When one request fails, the
+    still-running siblings are ended via the sampler's stop (abort + settle) so no engine work is
+    leaked; on success every future is already complete and the stop calls are skipped entirely.
+    """
+    loop = asyncio.get_running_loop()
     try:
-        return await poll()
-    finally:
-        if not collected:
-
+        results = await asyncio.gather(
+            *[loop.run_in_executor(None, future.result) for future in futures])
+        return [response for result in results for response in result]
+    except BaseException:
+        for request_id in request_ids:
             try:
-                await service.call_backend(service.sampler.cancel_generation, submission_id)
+                await service.call_backend(service.sampler.stop, {'request_id': request_id})
             except Exception:
-                logger.warning('Failed to clear generation %s', submission_id, exc_info=True)
+                logger.warning('Failed to stop generation %s', request_id, exc_info=True)
+        raise
+
+
+def _submit_group(service: SamplerManagement, inputs: List[Any], params: Any, *,
+                  adapter_name: str, adapter_path: Optional[str]) -> Tuple[List[Any], List[str], List[str]]:
+    """Submit one generation per input; returns (futures, request_ids, trajectories).
+
+    Synchronous on purpose: the caller wraps it in ``call_backend`` (the backend gate's executor),
+    which is also what hands each LazyCollect back across the event-loop boundary. Each trajectory
+    gets its request_id stamped by ``submit`` itself, so the ids returned here are the ones a later
+    stop/cancel addresses.
+    """
+    futures: List[Any] = []
+    request_ids: List[str] = []
+    trajectories: List[Dict[str, Any]] = []
+    for entry in inputs:
+        trajectory = dict(entry)
+        future = service.sampler.submit(trajectory, params, adapter_name=adapter_name,
+                                        adapter_path=adapter_path)
+        futures.append(future)
+        request_ids.append(trajectory['request_id'])
+        trajectories.append(trajectory)
+    return futures, request_ids, trajectories
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -300,7 +296,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         token = await self._on_request_start(request)
         if not self.data_plane.enabled:
             raise EndpointUnavailableError('sample_to_data_plane requires data_plane_url')
-        if not callable(getattr(self.sampler, 'submit_generation', None)):
+        if not callable(getattr(self.sampler, 'submit', None)):
             raise EndpointUnavailableError('sampler_type must be vllm_async or sglang_async')
 
         adapter_path = None
@@ -316,22 +312,17 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         params_dict = dict(body.sampling_params or {})
         params_dict['num_samples'] = body.num_samples
         params = SamplingParams.from_dict(params_dict)
-        submission_id = uuid.uuid4().hex
 
         async def _generate_and_store():
-            # vLLM async engine owns generation concurrency, so the whole
-            # admit -> await -> store sequence runs as one background future
-            # (outside the serial compute queue) and its result is the DataRef.
+            # The async engine owns generation concurrency, so the whole submit -> await -> store
+            # sequence runs as one background future (outside the serial compute queue) and its
+            # result is the DataRef. One submit per input (num_samples rides SamplingParams),
+            # each handing back a LazyCollect the handler awaits locally -- no per-status RPC.
             async def generate():
-                await self.call_backend(
-                    self.sampler.submit_generation,
-                    submission_id,
-                    inputs,
-                    params,
-                    adapter_name=full_adapter_name,
-                    adapter_path=adapter_path,
-                )
-                return await _await_generation(self, submission_id)
+                futures, request_ids, _ = await self.call_backend(
+                    _submit_group, self, inputs, params,
+                    adapter_name=full_adapter_name, adapter_path=adapter_path)
+                return await _await_futures(self, futures, request_ids)
 
             responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(

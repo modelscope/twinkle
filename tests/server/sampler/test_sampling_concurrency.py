@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -334,16 +335,14 @@ async def test_data_plane_generation_blocks_mutations_through_collection(make_se
     stored = []
     service.data_plane = SimpleNamespace(enabled=True)
 
-    def submit_generation(*args, **kwargs):
+    pending = Future()
+
+    def submit(trajectory, params, adapter_name='', adapter_path=None):
+        trajectory['request_id'] = 'req-blocks-mutations'
         admitted.set()
+        return pending
 
-    def status(submission_id):
-        return {'status': 'completed' if completed.is_set() else 'running'}
-
-    service.sampler.submit_generation = submit_generation
-    service.sampler.get_generation_status = status
-    service.sampler.collect_generation = lambda submission_id: service.sampler.sample([{'input_ids': [1]}])
-    service.sampler.cancel_generation = lambda submission_id: None
+    service.sampler.submit = submit
 
     async def put(rows, **kwargs):
         from twinkle.protocol.types import DataRef
@@ -363,6 +362,7 @@ async def test_data_plane_generation_blocks_mutations_through_collection(make_se
         await _until(lambda: service.sampling_guard._waiting_writers == 1)
         assert service.sampler.template_calls == 0
         completed.set()
+        pending.set_result(service.sampler.sample([{'input_ids': [1]}]))
         await asyncio.gather(generation, mutation)
         assert stored[0]['tokens'] == [1]
         assert service.sampler.template_calls == 1
@@ -390,18 +390,6 @@ async def test_partial_checkpoint_failure_quarantines_changed_weights(make_servi
         await service.check_health()
 
 
-
-
-@pytest.mark.asyncio
-async def test_completed_generation_failure_does_not_quarantine_replica(make_service):
-    from twinkle.server.sampler.twinkle_handlers import _await_generation
-    service = make_service()
-    service.sampler.get_generation_status = lambda _: {'status': 'failed', 'error': 'invalid input'}
-    service.sampler.cancel_generation = lambda _: {'status': 'completed'}
-    with pytest.raises(RuntimeError, match='invalid input'):
-        await service.sampling_guard.run(lambda: _await_generation(service, 'bad'))
-    ref = await service.submit('twinkle')
-    assert _tokens(await service.result(ref), 'twinkle') == [7]
 
 
 @pytest.mark.asyncio

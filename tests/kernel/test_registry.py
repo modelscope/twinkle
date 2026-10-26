@@ -445,3 +445,50 @@ def test_kernelize_idempotent(fake_ops):
     kernelize(parent, {_SrcLayer: _DstLayer})
     kernelize(parent, {_SrcLayer: _DstLayer})
     assert type(parent[0]) is _DstLayer
+
+
+# ── 20. registry primitives: OpDefinition / lazy_import / is_liger_available ─
+
+
+def test_op_definition_holds_implementations_and_installer():
+    from twinkle.kernel.registry import OpDefinition
+
+    def _installer():
+        return True
+
+    definition = OpDefinition(
+        name='swiglu',
+        implementations={'liger': object(), 'torch': object()},
+        installer=_installer,
+    )
+    assert definition.name == 'swiglu'
+    assert set(definition.implementations) == {'liger', 'torch'}
+    assert definition.installer is _installer
+
+
+def test_lazy_import_defers_module_import_until_called():
+    import twinkle.kernel.registry as registry_module
+
+    factory = registry_module.lazy_import('math:pi')
+    # Nothing is imported at factory construction; calling resolves the attribute.
+    assert factory() is __import__('math').pi
+
+
+def test_lazy_import_missing_attribute_raises():
+    import pytest
+    import twinkle.kernel.registry as registry_module
+
+    factory = registry_module.lazy_import('math:no_such_attribute')
+    with pytest.raises(AttributeError):
+        factory()
+
+
+def test_is_liger_available_returns_tuple():
+    from twinkle.kernel.registry import is_liger_available
+
+    available, reason = is_liger_available()
+    assert isinstance(available, bool)
+    if not available:
+        assert reason is not None
+    else:
+        assert reason is None

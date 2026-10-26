@@ -88,14 +88,18 @@ class VLLMLoraWeights(Patch):
                 # loading weights, throwing an exception if validation fails.
                 peft_helper.validate_legal(self.lora_config)
                 # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
-                # to ensure correct loading of lora weights. Drop the QKV/MLP fusion
-                # substr maps so constituent names (e.g. `q_proj`) survive for the
-                # LoRA manager to pack, while keeping genuine renames/prefixes.
+                # to ensure correct loading of lora weights. Keep only renames so
+                # constituent names (e.g. `q_proj`) survive for the LoRA manager
+                # to pack; base-weight stacking maps would overwrite adapters.
                 # (align with vllm.lora.worker_manager.WorkerLoRAManager._load_adapter)
                 model = self._adapter_manager.model
                 hf_to_vllm_mapper = getattr(model, 'hf_to_vllm_mapper', None)
-                if hf_to_vllm_mapper is not None and hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
-                    hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
+                if hf_to_vllm_mapper is not None:
+                    if hasattr(hf_to_vllm_mapper, 'get_rename_mapper'):
+                        hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
+                    elif hasattr(hf_to_vllm_mapper, 'get_unstacked_mapper'):
+                        # Compatibility with vLLM versions using the previous API.
+                        hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
 
                 lora_request_kwargs = {
                     'peft_helper': peft_helper,

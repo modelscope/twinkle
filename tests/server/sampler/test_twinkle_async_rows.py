@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -85,28 +86,17 @@ class _SamplerManagement:
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):
         return fn(*args, **kwargs)
 
-    def submit_generation(self, submission_id, inputs, params, **kwargs):
-        self.submission_id = submission_id
-        self.inputs = inputs
-        self.params = params
-        self.generation_kwargs = kwargs
-
-    def get_generation_status(self, submission_id):
-        assert submission_id == self.submission_id
-        return {'status': 'completed'}
-
-    def collect_generation(self, submission_id):
-        assert submission_id == self.submission_id
-        return [SampleResponse(sequences=[SampledSequence(
+    def submit(self, trajectory, params, adapter_name='', adapter_path=None):
+        trajectory['request_id'] = 'req-rollout'
+        future = Future()
+        future.set_result([SampleResponse(sequences=[SampledSequence(
             stop_reason='stop',
             tokens=[7],
             logprobs=[[(7, -0.25)]],
             decoded='answer',
             new_input_feature={'input_ids': [1, 7], 'labels': [-100, 7]},
-        )])]
-
-    def cancel_generation(self, _submission_id):
-        raise AssertionError('completed generation must not be cancelled')
+        )])])
+        return future
 
     async def put(self, rows, *, kind, tags):
         self.put_rows = rows

@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
-from twinkle.utils.network import find_free_port, is_valid_ipv6_address
+from twinkle.utils.network import find_free_port
 from .base import CheckpointEngine, TensorMeta
 from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
+from .zmq_pubsub import connect_subscriber, start_publisher
 
 logger = get_logger()
 
@@ -151,34 +152,17 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         """Start ZMQ PUB server for metadata broadcast (master only)."""
-        import ray
-        self.ip = ray.util.get_node_ip_address().strip('[]')
+        from twinkle.infra import node_ip
+        self.ip = node_ip()
         self.listen_port = find_free_port()
         self.auth_key = generate_auth_key()  # 256-bit shared secret
 
-        context = zmq.Context()
-        self.socket = context.socket(zmq.PUB)
-        if is_valid_ipv6_address(self.ip):
-            address = f'tcp://[{self.ip}]:{self.listen_port}'
-            self.socket.setsockopt(zmq.IPV6, 1)
-        else:
-            address = f'tcp://{self.ip}:{self.listen_port}'
-
-        self.socket.bind(address)
+        self.socket = start_publisher(self.ip, self.listen_port)
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
         """Connect to the ZMQ PUB server as a subscriber (receiver only)."""
         self.auth_key = metadata.auth_key  # inherit the master's HMAC secret
-        context = zmq.Context()
-        self.socket = context.socket(zmq.SUB)
-        if is_valid_ipv6_address(metadata.zmq_ip):
-            address = f'tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}'
-            self.socket.setsockopt(zmq.IPV6, 1)
-        else:
-            address = f'tcp://{metadata.zmq_ip}:{metadata.zmq_port}'
-
-        self.socket.connect(address)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
+        self.socket = connect_subscriber(metadata.zmq_ip, metadata.zmq_port, self.topic)
 
     # ── Core lifecycle ───────────────────────────────────────────────────
 

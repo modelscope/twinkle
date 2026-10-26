@@ -10,6 +10,107 @@ from .resource_manager import ResourceManager
 T = TypeVar('T')
 
 
+class LazyCollect:
+    """A remote call's pending result, addressed through the Future protocol.
+
+    Holds the per-worker refs of one dispatched call and collects them on demand. ``result`` (and
+    the callable form) materialise the collected value; ``done``/``ready`` probe completion without
+    fetching any payload, so a driver can time control-plane side effects (release a pin, flip a
+    window) to the true end of a call while the payload keeps flowing as a reference to a
+    downstream actor. A FAILED task also reports ready (``ray.wait`` surfaces completion, not
+    success); the exception is raised at the real collect.
+    """
+
+    _is_lazy_collect = True
+
+    def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
+        self._futures = futures
+        self._method = method
+        self._collect_func = collect_func
+        self.device_mesh = device_mesh
+        self._result = None  # Cache collected results
+        self._timeout = timeout
+
+    def _get_result(self):
+        """Internal method to lazily collect and cache results"""
+        import ray
+        if self._result is None:
+            result = []
+            for future in self._futures:
+                if isinstance(future, ray.ObjectRef):
+                    result.append(ray.get(future, timeout=self._timeout))
+                else:
+                    result.append(future)
+            self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
+        return self._result
+
+    def __call__(self):
+        """Lazily collect results, support repeated calls (with caching)"""
+        return self._get_result()
+
+    def result(self, timeout=None):
+        """Materialise the collected value; an explicit timeout overrides the declared one."""
+        if timeout is not None:
+            self._timeout = timeout
+        return self._get_result()
+
+    def exception(self, timeout=None):
+        """The raised exception if the call failed, else ``None`` (Future protocol)."""
+        try:
+            self.result(timeout)
+            return None
+        except StopIteration:
+            raise
+        except Exception as exc:  # noqa
+            return exc
+
+    def done(self) -> bool:
+        """Whether every referenced task has finished (Future protocol alias of :meth:`ready`)."""
+        return self.ready()
+
+    def ready(self) -> bool:
+        """Whether every referenced task has finished, WITHOUT fetching any payload.
+
+        A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
+        adapter pin) to the true completion of a lazily-collected call, while the payload keeps
+        flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
+        never materialises the result, so ``_result`` stays untouched and no data returns to the
+        caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
+        exception is raised later, at the real :meth:`__call__` collect.
+        """
+        import ray
+        refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+        if not refs:
+            return True
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+        return len(ready) == len(refs)
+
+    def __iter__(self):
+        """Support iteration: automatically collect results then iterate"""
+        return iter(self._get_result())
+
+    def __len__(self):
+        """Support len() function"""
+        return len(self._get_result())
+
+    def __getitem__(self, key):
+        """Index into the collected value (a dict key or a list index/slice); materialises it.
+
+        Together with :meth:`get` / :meth:`__contains__` this lets the SAME subscript syntax read a
+        lazy remote return and a local plain dict/list -- a caller writes ``out['logps']`` and works
+        in both deployment forms without a shape branch.
+        """
+        return self._get_result()[key]
+
+    def get(self, key, default=None):
+        """Dict-style ``get`` over the collected value; materialises it (missing key -> ``default``)."""
+        return self._get_result().get(key, default)
+
+    def __contains__(self, key):
+        """Membership over the collected value; materialises it."""
+        return key in self._get_result()
+
+
 class RayHelper:
 
     resource_manager: Optional[ResourceManager] = None
@@ -98,7 +199,10 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            resources = RayHelper._get_ray_custom_resources(device_groups)
+            # Connecting to an existing cluster (e.g. RAY_ADDRESS set for multi-node): custom
+            # resources are declared at ``ray start`` time, and Ray rejects ``resources`` on connect.
+            connecting = bool(os.environ.get('RAY_ADDRESS'))
+            resources = None if connecting else RayHelper._get_ray_custom_resources(device_groups)
             ray.init(ignore_reinit_error=True, resources=resources or None)
 
         if RayHelper.resource_manager is None:
@@ -162,7 +266,7 @@ class RayHelper:
             remote_call = getattr(worker, method_name)
             result = remote_call.remote(*args, **kwargs)
             output.append(result)
-            # 逐个登记，后续 RPC 发送失败也不能丢失已发出的 refs。
+            # Register one by one so already-sent refs are never lost if a later RPC send fails.
             if on_submit is not None:
                 on_submit(worker, result)
         return output
@@ -207,61 +311,7 @@ class RayHelper:
                                 futures,
                                 device_mesh,
                                 timeout=None):
-        """Return a callable to collect results in the workers."""
-
-        class LazyCollect:
-
-            def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
-                self._futures = futures
-                self._method = method
-                self._collect_func = collect_func
-                self._is_lazy_collect = True
-                self.device_mesh = device_mesh
-                self._result = None  # Cache collected results
-                self._timeout = timeout
-
-            def _get_result(self):
-                """Internal method to lazily collect and cache results"""
-                import ray
-                if self._result is None:
-                    result = []
-                    for future in self._futures:
-                        if isinstance(future, ray.ObjectRef):
-                            result.append(ray.get(future, timeout=self._timeout))
-                        else:
-                            result.append(future)
-                    self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
-                return self._result
-
-            def __call__(self):
-                """Lazily collect results, support repeated calls (with caching)"""
-                return self._get_result()
-
-            def ready(self) -> bool:
-                """Whether every referenced task has finished, WITHOUT fetching any payload.
-
-                A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
-                adapter pin) to the true completion of a lazily-collected call, while the payload keeps
-                flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
-                never materialises the result, so ``_result`` stays untouched and no data returns to the
-                caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
-                exception is raised later, at the real :meth:`__call__` collect.
-                """
-                import ray
-                refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
-                if not refs:
-                    return True
-                ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
-                return len(ready) == len(refs)
-
-            def __iter__(self):
-                """Support iteration: automatically collect results then iterate"""
-                return iter(self._get_result())
-
-            def __len__(self):
-                """Support len() function"""
-                return len(self._get_result())
-
+        """Return the Future-protocol handle over one dispatched call's refs."""
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod

@@ -7,6 +7,9 @@ if TYPE_CHECKING:
     from .base import ModelLoaderProtocol, TrainableModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
     from .micro_batch import MicroBatchConfig
+    from .state_dict_utils import (MODULES_TO_SAVE_SEGMENT, collect_local_state, is_lora_state_key,
+                                   is_saveable_adapter_key, normalize_adapter_keys, remap_optimizer_state_names,
+                                   with_tied_weight_aliases)
     from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
                                TransformersValueModel)
 
@@ -14,6 +17,10 @@ else:
     _import_structure = {
         'base': ['ModelLoaderProtocol', 'TrainableModel'],
         'micro_batch': ['MicroBatchConfig'],
+        'state_dict_utils': [
+            'MODULES_TO_SAVE_SEGMENT', 'collect_local_state', 'is_lora_state_key', 'is_saveable_adapter_key',
+            'normalize_adapter_keys', 'remap_optimizer_state_names', 'with_tied_weight_aliases'
+        ],
         'transformers': [
             'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',
             'TransformersValueModel'

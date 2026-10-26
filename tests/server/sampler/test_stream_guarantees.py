@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI
 
 from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.twinkle_handlers import _await_generation, _register_twinkle_sampler_routes, _stream_queue
+from twinkle.server.sampler.twinkle_handlers import _stream_queue
 
 
 class _BlockingQueue:
@@ -84,30 +84,3 @@ async def test_stream_timeout_returns_error_payload_and_closes_queue():
     assert payload['request_id'] == 'req-stream'
     assert queue.closed is True
     assert queue.get_exited.wait(timeout=5)
-
-
-class _GenerationService:
-
-    def __init__(self) -> None:
-        self.cancelled = False
-        self.sampler = SimpleNamespace(
-            get_generation_status=lambda _submission_id: {'status': 'running'},
-            collect_generation=lambda _submission_id: [],
-            cancel_generation=self._cancel,
-        )
-
-    async def call_backend(self, fn, /, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    def _cancel(self, _submission_id: str) -> None:
-        self.cancelled = True
-
-
-@pytest.mark.asyncio
-async def test_generation_poll_has_total_timeout_and_cancels():
-    service = _GenerationService()
-
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(_await_generation(service, 'submission'), timeout=0.05)
-
-    assert service.cancelled is True

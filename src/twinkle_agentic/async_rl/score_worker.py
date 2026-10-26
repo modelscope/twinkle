@@ -1,13 +1,4 @@
-"""The generic scoring worker: the ONE remote boundary that orchestrates reward scoring.
-
-Algorithm-agnostic scoring orchestration for the streaming RL driver: resolve rollout-sample
-refs where the data lives, rebuild the scoring rows, run every ORM scorer, and return small
-sample-major reward rows -- the driver never materializes token-scale data. Both scoring
-CHANNELS (ORM outcome rows, PRM per-token process rewards) are protocol here and live in this
-base; algorithm-specific halves (advantage fusion, teacher reweighting) stay in the caller's
-subclass. The PRM step SEGMENTATION is an injected plugin callable (``prm_step_scorer``):
-the caller's object, executed inside this actor.
-"""
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
 import json
@@ -79,20 +70,6 @@ def _run_grouped(tasks: Sequence[Tuple[Any, Callable[[], Any]]]) -> List[Any]:
     return results
 
 
-def _stash(value: Any) -> Any:
-    """Keep a heavy payload out of the caller when this worker runs remote: a ref, else the value.
-
-    The return-path mirror of ``_resolve``: inside a remote worker a per-token vector crosses the
-    boundary as an ObjectRef (Ray derefs it again when the consumer's next remote call carries it);
-    a local worker shares the caller's process, so the value itself is the cheaper hand-off.
-    """
-    if not os.environ.get('WORKER_NAME'):
-        return value
-    import ray
-
-    return ray.put(value)
-
-
 @remote_class(execute='first')
 class ScoreWorker:
     """Score rollout samples where the data lives: one remote boundary for the ORM channel.
@@ -115,7 +92,6 @@ class ScoreWorker:
         self.prm_scorers = list(prm_scorers)
         self.prm_step_scorer = prm_step_scorer
         self._prm_weights = list(prm_weights) if prm_weights is not None else None
-        self._global_step = 0
 
     def _one_reward(self, scorer: Any, rows: List[dict]) -> List[float]:
         """One scorer's batch over trajectory rows -- the single call shape every kind shares.
@@ -129,7 +105,7 @@ class ScoreWorker:
         values = score(rows) if callable(score) else scorer(rows)
         return [None if value is None or value != value else float(value) for value in values]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def score_group(self, samples: List[Any]) -> List[List[float]]:
         """Score one group with every ORM scorer -> the ``[N][n_scorers]`` sample-major matrix.
 
@@ -147,15 +123,16 @@ class ScoreWorker:
         return [[None if value is None or value != value else float(value) for value in column]
                 for column in zip(*matrix)] if matrix else [[] for _ in samples]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=True, stash=(1,))
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
         """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
 
         Samples resolve and rows rebuild once, then each ORM scorer and each PRM sample's step
         batch is a task keyed by its scorer's placement: the ORM channel's device groups overlap
-        the PRM channel's forwards, each group strictly serial. Each sample's per-token process
-        vector is stashed (:func:`_stash`) so the heavy payloads stay out of the caller; the
-        matrix is the same sample-major, ``None``-normalized form ``score_group`` returns.
+        the PRM channel's forwards, each group strictly serial. The PRM channel is a declared
+        ``stash`` channel, so the process vectors ride out as per-sample references the training
+        side dereferences; the matrix is the same sample-major, ``None``-normalized form
+        ``score_group`` returns.
         """
         if self.prm_step_scorer is None or not self.prm_scorers:
             raise RuntimeError('score_group_prm was called without a wired PRM channel.')
@@ -174,7 +151,7 @@ class ScoreWorker:
         matrix = results[:len(self.orm_scorers)]
         rewards = ([[None if value is None or value != value else float(value) for value in column]
                     for column in zip(*matrix)] if matrix else [[] for _ in samples])
-        return rewards, [_stash(value) for value in results[len(self.orm_scorers):]]
+        return rewards, results[len(self.orm_scorers):]
 
     def _weighted_step_score(self, step_rows: List[Dict[str, Any]]) -> List[float]:
         """One weighted process score per PRM step row (nan-aware: a judge miss never poisons it)."""
@@ -213,8 +190,3 @@ class ScoreWorker:
                     'completion': resolved.decoded,
                     'rewards': per_func,
                 }, ensure_ascii=False) + '\n')
-
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def set_global_step(self, step: int) -> None:
-        """Track the driver's optimizer step for step-indexed logs."""
-        self._global_step = int(step)

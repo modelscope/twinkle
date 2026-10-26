@@ -20,10 +20,16 @@ label-roll / attention-mask semantics the real Template applies.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
+from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
+from twinkle.template.base import Template
+from twinkle.template.contract import MediaBundle, RolloutState
+from twinkle_agentic.rollout.ledger import TurnLedger
 from twinkle_agentic.utils.token_utils import extend_with_bridge
 
 
@@ -125,9 +131,12 @@ class EmptyBridgeTokenizer(FakeTokenizer):
 
 
 class FakeTemplate:
-    """Minimal Template mirroring the parts ``extend_with_bridge`` touches."""
+    """Minimal Template mirroring the parts ``extend_with_bridge`` touches; the delta is twinkle's own."""
     model_id = 'qwen-fake'
     truncation_strategy = 'right'
+    enable_thinking = False
+    render_delta = Template.render_delta
+    decode_tool_calls = staticmethod(Template.decode_tool_calls)
 
     def __init__(self, tokenizer: FakeTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -140,6 +149,9 @@ class FakeTemplate:
         pif['input_ids'] = input_ids
         pif['labels'] = [-100] * len(input_ids)
         return self._invoke_post_pipeline([pif])[0]
+
+    def finalize_appended_features(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._invoke_post_pipeline(inputs)
 
     def _invoke_post_pipeline(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
@@ -235,7 +247,7 @@ def test_empty_bridge_text_raises():
     messages = [{'role': 'user', 'content': 'hello'}]
     pif = _make_pif(template, messages)
 
-    with pytest.raises(RuntimeError, match='empty string'):
+    with pytest.raises(RuntimeError, match='no tokens'):
         extend_with_bridge(pif, [{'role': 'tool', 'content': 'x'}], template)
 
 
@@ -251,3 +263,79 @@ def test_labels_length_mismatch_raises():
 
     with pytest.raises(RuntimeError, match='labels length'):
         extend_with_bridge(pif, [{'role': 'tool', 'content': 'x'}], template)
+
+
+def test_turn_ledger_advances_feature_and_engine_bridges_independently():
+
+    class DualBridgeTemplate(FakeTemplate):
+
+        def __init__(self, tokenizer):
+            super().__init__(tokenizer)
+            self.calls = []
+
+        def render_delta(self, messages_before, appended, *, engine=False, backend='vllm', **kwargs):
+            self.calls.append((engine, backend))
+            return [41, 42] if engine else [31]
+
+        def _reasoning_started(self, input_ids):
+            return False
+
+    messages = [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'}]
+    template = DualBridgeTemplate(FakeTokenizer())
+    feature = template.encode({'messages': messages})
+    state = RolloutState(
+        feature=feature,
+        engine_input_ids=(11, 12),
+        messages=tuple(messages),
+        tools=(),
+        reasoning_started=False,
+        media=MediaBundle(),
+    )
+    ledger = TurnLedger(template, backend='sglang')
+    ledger._pif = feature
+    ledger._state = state
+
+    appended = [{'role': 'user', 'content': 'next'}]
+    assert ledger.observe(appended)
+    assert ledger.state is not None
+    assert ledger.input_feature['input_ids'] == feature['input_ids'] + [31]
+    assert ledger.state.engine_input_ids == (11, 12, 41, 42)
+    assert ledger.state.messages == tuple(messages + appended)
+    assert template.calls == [(False, 'vllm'), (True, 'sglang')]
+
+
+def test_partial_rollout_carries_state_across_retries_and_merge():
+
+    class Harness(PartialRolloutMixin):
+        template = type('Decoder', (), {'decode': staticmethod(str)})()
+
+    def response(tokens, stop_reason, input_ids, state):
+        return SampleResponse(sequences=[SampledSequence(
+            tokens=tokens,
+            stop_reason=stop_reason,
+            logprobs=[-0.1] * len(tokens),
+            new_input_feature={'input_ids': input_ids},
+            new_state=state,
+        )])
+
+    responses = iter([
+        response([3], 'abort', [1, 2, 3], 'state-1'),
+        response([4], 'stop', [1, 2, 3, 4], 'state-2'),
+    ])
+    seen_states = []
+
+    async def run_attempt(current_input, current_state, sampling_params, attempt):
+        seen_states.append(current_state)
+        return next(responses), attempt
+
+    outcome = asyncio.run(Harness()._run_partial_rollout(
+        {'input_ids': [1, 2]},
+        SamplingParams(max_tokens=2),
+        run_attempt=run_attempt,
+        original_state='state-0',
+        allow_partial_rollout=True,
+        max_retries=1,
+    ))
+    assert seen_states == ['state-0', 'state-1']
+    assert outcome.response.sequences[0].tokens == [3, 4]
+    assert outcome.response.sequences[0].new_state == 'state-2'

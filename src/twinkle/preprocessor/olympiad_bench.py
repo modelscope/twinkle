@@ -128,5 +128,8 @@ class OlympiadBenchProcessor(Preprocessor):
             messages=messages,
             user_data=[
                 ('ground_truth', ground_truth),
+                # The reward's multi-answer branch keys off this flag; leaving it unwritten made every
+                # multi-answer question score as single-answer (partial combinations got 0).
+                ('is_multiple_answer', bool(row.get('is_multiple_answer'))),
             ],
         )

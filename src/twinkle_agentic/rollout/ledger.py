@@ -25,17 +25,22 @@ and reads ``new_input_feature`` off it rather than encoding anything, and why
 prompt ids against what is already banked and refuses a prompt that does not
 extend it, rather than re-encoding to make it fit.
 """
+
+import inspect
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from dataclasses import replace
+from typing import Any, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
-from twinkle_agentic.utils.token_utils import _to_plain, append_ids, extend_with_bridge
+from twinkle.template.contract import RolloutState, coerce_tool_call_arguments
+from twinkle_agentic.utils.token_utils import _to_plain, append_ids
 
 
-def _input_order_labels(labels: List[int]) -> List[int]:
+def _input_order_labels(labels: list[int]) -> list[int]:
     """Undo twinkle's output-order roll to get labels aligned with ``input_ids``.
 
     ``append_ids`` stores labels shifted, so ``labels[i]`` is the target for position
@@ -45,7 +50,7 @@ def _input_order_labels(labels: List[int]) -> List[int]:
     return (labels[-1:] + labels[:-1]) if labels else []
 
 
-def _trainable_positions(input_ids: List[int], labels: List[int], completion_mask: Any) -> List[int]:
+def _trainable_positions(input_ids: list[int], labels: list[int], completion_mask: Any) -> list[int]:
     """Input-order positions of the policy-produced tokens, in order.
 
     ``labels != -100`` intersected with ``completion_mask`` when one is present. Labels AND
@@ -53,9 +58,12 @@ def _trainable_positions(input_ids: List[int], labels: List[int], completion_mas
     position-wise intersection.
     """
     in_labels = _input_order_labels(list(labels or []))
-    mask = (_input_order_labels(list(completion_mask))
-            if completion_mask is not None and len(completion_mask) == len(in_labels) else None)
-    positions: List[int] = []
+    mask = (
+        _input_order_labels(list(completion_mask))
+        if completion_mask is not None and len(completion_mask) == len(in_labels)
+        else None
+    )
+    positions: list[int] = []
     for j, lab in enumerate(in_labels):
         if lab == -100:
             continue
@@ -65,17 +73,17 @@ def _trainable_positions(input_ids: List[int], labels: List[int], completion_mas
     return positions
 
 
-def trainable_runs(encoded: Dict[str, Any]) -> List[List[int]]:
+def trainable_runs(encoded: dict[str, Any]) -> list[list[int]]:
     """Contiguous runs of trainable input_ids positions, one run per assistant turn.
 
     The ledger records a whole generation as trainable and every observation as
     masked, so the runs alternate one-to-one with the assistant turns.
     """
-    input_ids = list(encoded.get('input_ids') or [])
-    labels = list(encoded.get('labels') or [])
-    completion_mask = encoded.get('completion_mask')
+    input_ids = list(encoded.get("input_ids") or [])
+    labels = list(encoded.get("labels") or [])
+    completion_mask = encoded.get("completion_mask")
     positions = _trainable_positions(input_ids, labels, completion_mask)
-    runs: List[List[int]] = []
+    runs: list[list[int]] = []
     for j in positions:
         if runs and j == runs[-1][-1] + 1:
             runs[-1].append(j)
@@ -84,14 +92,14 @@ def trainable_runs(encoded: Dict[str, Any]) -> List[List[int]]:
     return runs
 
 
-def turn_token_spans(encoded: Dict[str, Any]) -> List[Tuple[int, int]]:
+def turn_token_spans(encoded: dict[str, Any]) -> list[tuple[int, int]]:
     """Per-assistant-turn ``[start, end)`` spans within the flat response tokens.
 
     The k-th contiguous trainable run occupies a contiguous slice of the flat
     response array, so this returns those slices as half-open spans -- the turn
     boundaries multi-turn PRM step segmentation needs.
     """
-    spans: List[Tuple[int, int]] = []
+    spans: list[tuple[int, int]] = []
     cursor = 0
     for run in trainable_runs(encoded):
         spans.append((cursor, cursor + len(run)))
@@ -99,30 +107,30 @@ def turn_token_spans(encoded: Dict[str, Any]) -> List[Tuple[int, int]]:
     return spans
 
 
-def sampled_token_logprobs(tokens: List[int], logprobs) -> List[float]:
+def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
     """Normalize sampler logprobs to one scalar for each sampled token."""
     if logprobs is None:
         return []
-    result: List[float] = []
-    for token, position in zip(tokens, logprobs):
+    result: list[float] = []
+    for token, position in zip(tokens, logprobs, strict=False):
         if isinstance(position, (int, float)):
             result.append(float(position))
             continue
         candidates = list(position or [])
         matched = next((value for token_id, value in candidates if int(token_id) == int(token)), None)
         if matched is None:
-            raise RuntimeError(f'sampled token {token} is missing from its returned logprobs: {candidates!r}.')
+            raise RuntimeError(f"sampled token {token} is missing from its returned logprobs: {candidates!r}.")
         result.append(float(matched))
     return result
 
 
-def last_assistant_text(messages: Optional[List[dict]]) -> str:
+def last_assistant_text(messages: list[dict] | None) -> str:
     """The newest assistant turn's text, for logging / rule-based reward.
 
     Delegates to the shared trajectory helper; multimodal content (a list of parts) is
     flattened to its text parts rather than read as a plain string.
     """
-    return _traj_last_assistant_text({'messages': messages})
+    return _traj_last_assistant_text({"messages": messages})
 
 
 class TurnLedger:
@@ -139,14 +147,12 @@ class TurnLedger:
     is left holding the last state that did fit, so a trajectory that overflowed
     is still complete up to the turn before.
 
-    ``input_feature`` is exposed rather than hidden because the surrounding loop
-    legitimately reads and annotates it (assistant metadata, withdrawing tool
-    schemas for a follow-up stage). What it must not do is *replace* the token
-    arrays in it; use :meth:`adopt` for a feature that came back from a step
-    which rebuilt them.
+    ``input_feature`` contains model fields only; conversation metadata lives in ``state``.
     """
 
-    def __init__(self, template: Template, *, label: str = 'trajectory', max_tokens: Optional[int] = None) -> None:
+    def __init__(
+        self, template: Template, *, label: str = "trajectory", max_tokens: int | None = None, backend: str = "vllm"
+    ) -> None:
         """
         Args:
             template: encodes the opening turn and every bridge after it. One
@@ -161,24 +167,38 @@ class TurnLedger:
         self.template = template
         self.label = label
         self.max_tokens = max_tokens
-        self._pif: Dict[str, Any] = {}
-        self._logprobs: List[Any] = []
+        self.backend = backend
+        self._pif: dict[str, Any] = {}
+        self._state: RolloutState | None = None
+        self._logprobs: list[Any] = []
         self._sampling_mask: Any = None
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
 
     @property
-    def input_feature(self) -> Dict[str, Any]:
-        """The encoded episode so far: ``input_ids``, ``labels``, ``messages``, …"""
+    def input_feature(self) -> dict[str, Any]:
+        """The encoded model fields for the episode so far."""
         return self._pif
 
     @property
-    def messages(self) -> List[Dict[str, Any]]:
-        return list(self._pif.get('messages') or [])
+    def state(self) -> RolloutState | None:
+        return self._state
 
     @property
-    def logprobs(self) -> List[Any]:
+    def messages(self) -> list[dict[str, Any]]:
+        if self._state is not None:
+            return list(self._state.messages)
+        return list(self._pif.get("messages") or [])
+
+    @property
+    def tools(self) -> list[dict[str, Any]]:
+        if self._state is not None:
+            return list(self._state.tools)
+        return list(self._pif.get("tools") or [])
+
+    @property
+    def logprobs(self) -> list[Any]:
         """One entry per policy-produced token, in order. Empty when unsampled."""
         return self._logprobs
 
@@ -191,7 +211,7 @@ class TurnLedger:
         """Has the episode reached :attr:`max_tokens`? Never true without one."""
         if self.max_tokens is None:
             return False
-        return len(self._pif.get('input_ids') or []) >= self.max_tokens
+        return len(self._pif.get("input_ids") or []) >= self.max_tokens
 
     # ------------------------------------------------------- text operations
     #
@@ -203,11 +223,13 @@ class TurnLedger:
     # trivially, because it has no template. The implementations stay in the
     # template; nothing is moved, this is a forwarding surface.
 
-    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
-        """Structured tool calls the model emitted in ``decoded`` (template markup)."""
-        return self.template.parse_tool_call(decoded)
+    def parse_tool_call(self, decoded: str) -> list[dict[str, Any]]:
+        """Structured tool calls, with arguments restored from this episode's tool schemas."""
+        calls = self.template.parse_tool_call(decoded)
+        tools = self._state.tools if self._state is not None else self._pif.get("tools") if self._pif else None
+        return list(coerce_tool_call_arguments(calls, tools))
 
-    def tool_call_errors(self, decoded: str) -> List[str]:
+    def tool_call_errors(self, decoded: str) -> list[str]:
         """Malformed tool-call markup errors in ``decoded`` (template-specific)."""
         return self.template.tool_call_errors(decoded)
 
@@ -217,44 +239,42 @@ class TurnLedger:
         Falls back to ``seq.decoded`` when there is no tokenizer or no tokens, so
         the loop's ``content`` rewrite works for a reply that carries text only.
         """
-        tokenizer = getattr(self.template, 'tokenizer', None)
+        tokenizer = getattr(self.template, "tokenizer", None)
         if tokenizer is None or not seq.tokens:
-            return seq.decoded or ''
+            return seq.decoded or ""
         return tokenizer.decode(seq.tokens, skip_special_tokens=True)
 
     # ---------------------------------------------------------------- writing
 
-    def open(self, trajectory: Trajectory, *, tools: Optional[List[Dict[str, Any]]] = None) -> None:
-        """Encode the opening messages. The one encode of the episode.
-
-        Everything after this extends the ids this produced; nothing re-encodes
-        them. ``tools`` overrides what the trajectory carries, for a caller whose
-        executing tool list comes from somewhere else than its prompt (an Env
-        that reported its own schemas, say).
-
-        The resolved tools must go INTO this encode, not just be recorded on the
-        feature afterwards. A local template bakes ``input_ids`` here exactly once
-        and the sampler then feeds those ids straight to the engine (its
-        ``is_trajectory`` is False because the feature already carries
-        ``input_ids``, so nothing re-encodes), which means tools written only to
-        ``pif['tools']`` never reach the prompt tokens: the model is never told it
-        can call anything and answers as a plain assistant. Injecting them into
-        the encode input is what makes the chat template render the schemas into
-        the system prompt. The message-level ``MessageLedger`` needs no such step
-        -- it sends ``tools`` to the API separately, and the API reads them off
-        the feature rather than off baked ids.
-        """
-        resolved_tools = (list(tools) if tools is not None else
-                          (list(trajectory.get('tools') or []) if 'tools' in trajectory else None))
-        encode_input = trajectory if resolved_tools is None else {**trajectory, 'tools': resolved_tools}
-        pif = _to_plain(self.template.encode(encode_input, add_generation_prompt=True))
-        # The template is not obliged to echo these back, and every consumer
-        # downstream reads the episode off the feature rather than off the
-        # trajectory it came from.
-        pif.setdefault('messages', list(trajectory.get('messages') or []))
-        if resolved_tools is not None:
-            pif['tools'] = resolved_tools
-        self._pif = pif
+    def open(self, trajectory: Trajectory, *, tools: list[dict[str, Any]] | None = None) -> None:
+        """Encode the opening once, including the resolved tool schemas."""
+        resolved_tools = (
+            list(tools)
+            if tools is not None
+            else (list(trajectory.get("tools") or []) if "tools" in trajectory else None)
+        )
+        encode_input = trajectory if resolved_tools is None else {**trajectory, "tools": resolved_tools}
+        encode_prompt = getattr(self.template, "encode_prompt", None)
+        prompt = None
+        if encode_prompt is not None:
+            parameters = inspect.signature(encode_prompt).parameters.values()
+            accepts_backend = any(
+                parameter.name == "backend" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            kwargs = {"add_generation_prompt": True}
+            if accepts_backend:
+                kwargs["backend"] = self.backend
+            prompt = encode_prompt(encode_input, **kwargs)
+        if prompt is None:
+            self._pif = _to_plain(self.template.encode(encode_input, add_generation_prompt=True))
+            self._pif.setdefault("messages", list(trajectory.get("messages") or []))
+            if resolved_tools is not None:
+                self._pif["tools"] = resolved_tools
+            self._state = None
+        else:
+            self._state = prompt.state
+            self._pif = _to_plain(self._state.feature)
         self._logprobs = []
         self._turns = 0
 
@@ -268,18 +288,29 @@ class TurnLedger:
         re-encoding the reply and training on ids that drift from the sampled
         ones.
         """
-        if seq.new_input_feature is None or 'input_ids' not in seq.new_input_feature:
-            raise RuntimeError(f'sampler returned a SampledSequence without '
-                               f'new_input_feature.input_ids for {self.label}; '
-                               f'cannot continue multi-turn.')
-        self._pif = _to_plain(dict(seq.new_input_feature))
+        if seq.new_input_feature is None or "input_ids" not in seq.new_input_feature:
+            raise RuntimeError(
+                f"sampler returned a SampledSequence without "
+                f"new_input_feature.input_ids for {self.label}; "
+                f"cannot continue multi-turn."
+            )
+        sampled_feature = _to_plain(dict(seq.new_input_feature))
+        new_state = getattr(seq, "new_state", None)
+        if new_state is not None:
+            self._state = new_state
+        elif self._state is not None:
+            completion = self.template.append_completion(self._state, list(seq.tokens or []))
+            if list(completion.state.feature.get("input_ids") or []) != list(sampled_feature.get("input_ids") or []):
+                raise RuntimeError("sampler new_input_feature disagrees with RolloutState token accounting.")
+            self._state = completion.state
+        self._pif = sampled_feature
         self._turns += 1
         self._extend_logprobs(seq)
         # The sampler's per-token sampling support set (sampling replay); banked per turn,
         # and merge exposes it only for a single-generation episode whose one CSR covers
         # the whole response -- a multi-turn episode would need the per-turn blocks
         # concatenated, which no consumer asks for yet.
-        self._sampling_mask = getattr(seq, 'sampling_mask', None)
+        self._sampling_mask = getattr(seq, "sampling_mask", None)
 
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
@@ -291,25 +322,62 @@ class TurnLedger:
         if seq.logprobs is None:
             return
         if len(seq.logprobs) != len(seq.tokens):
-            raise RuntimeError(f'logprobs length ({len(seq.logprobs)}) does not match '
-                               f'sampled token count ({len(seq.tokens)}) at turn '
-                               f'{self._turns} ({self.label})')
+            raise RuntimeError(
+                f"logprobs length ({len(seq.logprobs)}) does not match "
+                f"sampled token count ({len(seq.tokens)}) at turn "
+                f"{self._turns} ({self.label})"
+            )
         self._logprobs.extend(seq.logprobs)
 
-    def observe(self, messages: Sequence[Dict[str, Any]]) -> bool:
+    def observe(self, messages: Sequence[dict[str, Any]]) -> bool:
         """Append messages the model did not write: tool results, a new question.
 
         Their tokens are masked out of the loss -- they are the environment's
         words, and training on them teaches the model to predict its own
         observations. False means the append did not fit.
         """
-        extended = extend_with_bridge(self._pif, list(messages), self.template)
+        tools = list(self._state.tools) if self._state is not None else self._pif.get("tools")
+        render_kwargs = {
+            "gen_prompt_before": False,
+            "gen_prompt_after": True,
+            "tools": tools,
+        }
+        bridge_ids = self.template.render_delta(self.messages, list(messages), **render_kwargs)
+        engine_bridge_ids = self.template.render_delta(
+            self.messages, list(messages), engine=True, backend=self.backend, **render_kwargs
+        )
+        extended = append_ids(self._pif, bridge_ids, self.template, trainable=False)
         if extended is None:
             return False
+        if self._state is None:
+            extended["messages"] = self.messages + list(messages)
+            if tools:
+                extended["tools"] = list(tools)
         self._pif = extended
+        if self._state is not None:
+            self._state = replace(
+                self._state,
+                feature=extended,
+                engine_input_ids=self._state.engine_input_ids + tuple(engine_bridge_ids),
+                messages=self._state.messages + tuple(messages),
+                reasoning_started=self.template._reasoning_started(extended["input_ids"]),
+                render_cache=None,
+            )
         return True
 
-    def adopt(self, input_feature: Dict[str, Any]) -> None:
+    def replace_last_message(self, message: dict[str, Any]) -> None:
+        if self._state is not None:
+            self._state = replace(self._state, messages=self._state.messages[:-1] + (dict(message),))
+        elif self._pif.get("messages"):
+            self._pif["messages"][-1] = dict(message)
+
+    def clear_tools(self) -> None:
+        if self._state is not None:
+            self._state = replace(self._state, tools=())
+        else:
+            self._pif = {**self._pif, "tools": []}
+
+    def adopt(self, input_feature: dict[str, Any]) -> None:
         """Take an already-encoded feature as the current state.
 
         For the one caller that legitimately rebuilds it: an opening rewritten
@@ -318,12 +386,11 @@ class TurnLedger:
         how a run silently starts training on drifted ids.
         """
         self._pif = _to_plain(dict(input_feature))
+        self._state = None
 
-    def graft(self,
-              prompt_token_ids: Sequence[int],
-              seq: SampledSequence,
-              *,
-              messages: Optional[Sequence[Dict[str, Any]]] = None) -> bool:
+    def graft(
+        self, prompt_token_ids: Sequence[int], seq: SampledSequence, *, messages: Sequence[dict[str, Any]] | None = None
+    ) -> bool:
         """Bank one round of an episode this loop did not drive.
 
         An agent running as its own program resends the whole conversation on
@@ -348,25 +415,28 @@ class TurnLedger:
         ``messages`` is recorded for whoever reads the episode afterwards -- a
         trace, a reward function -- and has no bearing on the ids.
         """
-        banked = list(self._pif.get('input_ids') or [])
+        banked = list(self._pif.get("input_ids") or [])
         prompt = list(prompt_token_ids)
-        if len(prompt) < len(banked) or prompt[:len(banked)] != banked:
+        if len(prompt) < len(banked) or prompt[: len(banked)] != banked:
             return False
-        pif: Optional[Dict[str, Any]] = self._pif
-        observed = prompt[len(banked):]
+        pif: dict[str, Any] | None = self._pif
+        observed = prompt[len(banked) :]
         if observed:
             pif = append_ids(pif, observed, self.template, trainable=False)
             if pif is None:
                 return False
         if not seq.tokens:
-            raise RuntimeError(f'the endpoint returned an empty continuation for {self.label}; '
-                               'there is nothing to train on and nothing to append.')
+            raise RuntimeError(
+                f"the endpoint returned an empty continuation for {self.label}; "
+                "there is nothing to train on and nothing to append."
+            )
         pif = append_ids(pif, list(seq.tokens), self.template, trainable=True)
         if pif is None:
             return False
         if messages is not None:
-            pif['messages'] = list(messages)
+            pif["messages"] = list(messages)
         self._pif = pif
+        self._state = None
         self._turns += 1
         self._extend_logprobs(seq)
         return True
@@ -386,20 +456,23 @@ class TurnLedger:
         self.audit()
         out = dict(trajectory)
         out.update(self._pif)
-        out['messages'] = list(self._pif.get('messages') or trajectory.get('messages') or [])
-        out['logprobs'] = self._logprobs if self._logprobs else None
-        labels = self._pif.get('labels') or []
-        input_ids = self._pif.get('input_ids') or []
-        completion_mask = self._pif.get('completion_mask')
+        out["messages"] = self.messages or list(trajectory.get("messages") or [])
+        out["tools"] = self.tools
+        out["logprobs"] = self._logprobs if self._logprobs else None
+        labels = self._pif.get("labels") or []
+        input_ids = self._pif.get("input_ids") or []
+        completion_mask = self._pif.get("completion_mask")
         positions = _trainable_positions(input_ids, labels, completion_mask)
-        out['response_token_ids'] = [input_ids[j] for j in positions]
-        out['rollout_logprobs'] = (sampled_token_logprobs(out['response_token_ids'], self._logprobs)
-                                   if self._logprobs else [])
-        if 'routed_experts' in self._pif:
-            out['replay_mask'] = (list(completion_mask) if completion_mask is not None
-                                  else [int(label != -100) for label in labels])
+        out["response_token_ids"] = [input_ids[j] for j in positions]
+        out["rollout_logprobs"] = (
+            sampled_token_logprobs(out["response_token_ids"], self._logprobs) if self._logprobs else []
+        )
+        if "routed_experts" in self._pif:
+            out["replay_mask"] = (
+                list(completion_mask) if completion_mask is not None else [int(label != -100) for label in labels]
+            )
         if self._turns == 1 and self._sampling_mask is not None:
-            out['sampling_mask'] = self._sampling_mask
+            out["sampling_mask"] = self._sampling_mask
         out.update(fields)
         return out
 
@@ -417,19 +490,22 @@ class TurnLedger:
         """
         if not self._logprobs:
             return
-        labels = self._pif.get('labels') or []
-        completion_mask = self._pif.get('completion_mask')
+        labels = self._pif.get("labels") or []
+        completion_mask = self._pif.get("completion_mask")
         if completion_mask is None:
             expected = sum(1 for label in labels if label != -100)
         elif len(completion_mask) != len(labels):
-            raise RuntimeError(f'completion_mask/labels misaligned for {self.label}: '
-                               f'{len(completion_mask)} != {len(labels)}')
+            raise RuntimeError(
+                f"completion_mask/labels misaligned for {self.label}: {len(completion_mask)} != {len(labels)}"
+            )
         else:
-            expected = sum(1 for label, flag in zip(labels, completion_mask) if label != -100 and flag)
+            expected = sum(1 for label, flag in zip(labels, completion_mask, strict=False) if label != -100 and flag)
         if len(self._logprobs) != expected:
-            raise RuntimeError(f'logprobs/policy-token alignment failed for {self.label}: '
-                               f'{len(self._logprobs)} logprobs vs {expected} positions selected '
-                               'by (labels != -100) & completion_mask.')
+            raise RuntimeError(
+                f"logprobs/policy-token alignment failed for {self.label}: "
+                f"{len(self._logprobs)} logprobs vs {expected} positions selected "
+                "by (labels != -100) & completion_mask."
+            )
 
 
 class MessageLedger:
@@ -460,8 +536,9 @@ class MessageLedger:
     -- and a common base would be thinner than the disagreement between them.
     """
 
-    def __init__(self, *, label: str = 'trajectory', max_tokens: Optional[int] = None,
-                 template: Optional[Template] = None) -> None:
+    def __init__(
+        self, *, label: str = "trajectory", max_tokens: int | None = None, template: Template | None = None
+    ) -> None:
         self.label = label
         # Taken for signature parity with TurnLedger and ignored: there are no
         # tokens to budget at the message level.
@@ -477,13 +554,13 @@ class MessageLedger:
         # the loop (it withdraws tool schemas with ``['tools'] = []`` and rewrites
         # the last message). ``messages`` is the very list the writer methods
         # append to, so those annotations stay visible.
-        self._feature: Dict[str, Any] = {'messages': [], 'tools': []}
+        self._feature: dict[str, Any] = {"messages": [], "tools": []}
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
 
     @property
-    def input_feature(self) -> Dict[str, Any]:
+    def input_feature(self) -> dict[str, Any]:
         """The episode so far as a live ``{'messages', 'tools'}`` dict.
 
         Live rather than a copy because the loop annotates it in place. There are
@@ -493,11 +570,19 @@ class MessageLedger:
         return self._feature
 
     @property
-    def messages(self) -> List[Dict[str, Any]]:
-        return list(self._feature['messages'])
+    def state(self) -> RolloutState | None:
+        return None
 
     @property
-    def logprobs(self) -> List[Any]:
+    def messages(self) -> list[dict[str, Any]]:
+        return list(self._feature["messages"])
+
+    @property
+    def tools(self) -> list[dict[str, Any]]:
+        return list(self._feature["tools"])
+
+    @property
+    def logprobs(self) -> list[Any]:
         """Always empty: a text-only backend reports no logprobs."""
         return []
 
@@ -512,7 +597,7 @@ class MessageLedger:
 
     # ------------------------------------------------------- text operations
 
-    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+    def parse_tool_call(self, decoded: str) -> list[dict[str, Any]]:
         """Tool calls in ``decoded``: parsed via the template when one is present, else structural-only.
 
         A message-level episode with a local template (the TUI streaming tool turn) can read markup out
@@ -523,7 +608,7 @@ class MessageLedger:
             return self._template.parse_tool_call(decoded)
         return []
 
-    def tool_call_errors(self, decoded: str) -> List[str]:
+    def tool_call_errors(self, decoded: str) -> list[str]:
         """Malformed tool-call markup errors in ``decoded`` (template-specific); empty without a template."""
         if self._template is not None:
             return self._template.tool_call_errors(decoded)
@@ -531,18 +616,18 @@ class MessageLedger:
 
     def decode_tokens(self, seq: SampledSequence) -> str:
         """Text of a reply: decoded from its tokens when a template/tokenizer is present, else ``seq.decoded``."""
-        tokenizer = getattr(self._template, 'tokenizer', None) if self._template is not None else None
+        tokenizer = getattr(self._template, "tokenizer", None) if self._template is not None else None
         if tokenizer is None or not seq.tokens:
-            return seq.decoded or ''
+            return seq.decoded or ""
         return tokenizer.decode(seq.tokens, skip_special_tokens=True)
 
     # ---------------------------------------------------------------- writing
 
-    def open(self, trajectory: Trajectory, *, tools: Optional[List[Dict[str, Any]]] = None) -> None:
+    def open(self, trajectory: Trajectory, *, tools: list[dict[str, Any]] | None = None) -> None:
         """Take the opening messages as they are -- nothing is encoded."""
         self._feature = {
-            'messages': list(trajectory.get('messages') or []),
-            'tools': list(tools if tools is not None else (trajectory.get('tools') or [])),
+            "messages": list(trajectory.get("messages") or []),
+            "tools": list(tools if tools is not None else (trajectory.get("tools") or [])),
         }
         self._turns = 0
 
@@ -557,18 +642,25 @@ class MessageLedger:
         plain assistant message built from ``seq.decoded``.
         """
         feature = seq.new_input_feature
-        if isinstance(feature, dict) and feature.get('messages'):
-            self._feature['messages'] = list(feature['messages'])
-            if 'tools' in feature:
-                self._feature['tools'] = list(feature['tools'])
+        if isinstance(feature, dict) and feature.get("messages"):
+            self._feature["messages"] = list(feature["messages"])
+            if "tools" in feature:
+                self._feature["tools"] = list(feature["tools"])
         else:
-            self._feature['messages'].append({'role': 'assistant', 'content': seq.decoded or ''})
+            self._feature["messages"].append({"role": "assistant", "content": seq.decoded or ""})
         self._turns += 1
 
-    def observe(self, messages: Sequence[Dict[str, Any]]) -> bool:
+    def observe(self, messages: Sequence[dict[str, Any]]) -> bool:
         """Append messages the model did not write. Always fits: no token budget."""
-        self._feature['messages'].extend(dict(m) for m in messages)
+        self._feature["messages"].extend(dict(m) for m in messages)
         return True
+
+    def replace_last_message(self, message: dict[str, Any]) -> None:
+        if self._feature["messages"]:
+            self._feature["messages"][-1] = dict(message)
+
+    def clear_tools(self) -> None:
+        self._feature["tools"] = []
 
     # ---------------------------------------------------------------- closing
 
@@ -580,7 +672,8 @@ class MessageLedger:
         downstream consumer sees a transcript rather than an encoded feature.
         """
         out = dict(trajectory)
-        out['messages'] = list(self._feature['messages'])
+        out["messages"] = list(self._feature["messages"])
+        out["tools"] = list(self._feature["tools"])
         out.update(fields)
         return out
 

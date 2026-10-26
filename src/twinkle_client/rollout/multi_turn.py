@@ -1,51 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Client-side multi-turn agentic rollout orchestration.
-
-This module hosts :class:`ClientMultiTurnRollout`, a hand-maintained multi-turn
-rollout orchestrator whose algorithmic structure mirrors
-``twinkle_agentic.rollout.multi_turn.MultiTurnRollout`` but issues sampling over
-HTTP via ``twinkle_client.sampler.vLLMSampler.sample()`` instead of holding a
-Ray actor handle.
-
-Design notes:
-    * It deliberately does NOT subclass ``MultiTurnRollout``. That class is
-      decorated with ``@remote_class`` / ``@remote_function`` for Ray remote
-      dispatch and assumes ``self.sampler`` is a Ray actor handle, which does
-      not match the HTTP-client semantics here.
-    * The ``tool_manager`` type is reused directly from
-      ``twinkle_agentic.tools.tool_manager.ToolManager`` (imported, not copied).
-    * Bridge-token stitching is reused from
-      ``twinkle_agentic.utils.token_utils.extend_with_bridge``.
-"""
+"""Client-side trainable multi-turn rollout over HTTP."""
+from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template.base import Template
+from twinkle_agentic.rollout.ledger import TurnLedger
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_agentic.utils.token_utils import extend_with_bridge
 from twinkle_client.sampler import vLLMSampler
 
 
-@dataclasses.dataclass
-class _RolloutState:
-    pifs: list[dict[str, Any]]
-    all_logprobs: list[list[Any]]
-    stop_reasons: list[str | None]
-    turns: list[int]
-    truncated: list[bool]
-    done: list[bool]
-
-
 class ClientMultiTurnRollout:
-    """Agentic multi-turn rollout with tool use, driven over HTTP.
-
-    Mirrors the per-trajectory state machine of
-    ``twinkle_agentic.rollout.multi_turn.MultiTurnRollout`` but issues sampling
-    via ``vLLMSampler.sample()`` (an HTTP call to ``/twinkle/sample``) rather
-    than a Ray actor call.
-    """
+    """Drive safe text-only multi-turn sampling through ``/twinkle/sample``."""
 
     def __init__(
         self,
@@ -56,237 +24,148 @@ class ClientMultiTurnRollout:
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
     ):
-        # Validation aligned with MultiTurnRollout.__init__.
         if template is None:
             raise ValueError('ClientMultiTurnRollout requires a local Template instance')
         if max_turns < 1:
             raise ValueError(f'max_turns must be >= 1, got {max_turns}')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
-            raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got '
-                             f'{max_trajectory_tokens}')
-
+            raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}')
         self.sampler = sampler
         self.template = template
         self.tool_manager = tool_manager
         self.sampling_params = sampling_params or SamplingParams()
         self.max_turns = max_turns
         self.max_trajectory_tokens = max_trajectory_tokens
-
         if self.sampling_params.num_samples != 1:
-            raise ValueError(f'ClientMultiTurnRollout currently supports num_samples=1 only, '
+            raise ValueError('ClientMultiTurnRollout supports num_samples=1 only, '
                              f'got {self.sampling_params.num_samples}')
 
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
-        """Run the batched multi-turn rollout state machine over HTTP.
-
-        Structurally mirrors ``MultiTurnRollout.__call__`` but issues each
-        round's sampling through ``vLLMSampler.sample()`` (an HTTP POST to
-        ``/twinkle/sample``) rather than a Ray actor call. Every round makes a
-        SINGLE batched HTTP call for all currently-live trajectories so the
-        sampler can run them in parallel; finished trajectories are parked and
-        excluded from later batches.
-
-        Returns a ``List[Trajectory]`` of the same length and order as the
-        input, each augmented with ``messages`` / ``logprobs`` / ``turns`` /
-        ``stop_reason`` / ``truncated`` fields.
-
-        Exception handling and boundary truncation contract:
-            * ``new_input_feature`` missing / lacking ``input_ids`` -> RuntimeError
-              carrying both the batch index and the trajectory index.
-            * per-round ``len(seq.logprobs) != len(seq.tokens)`` -> RuntimeError
-              carrying the specific counts.
-            * final per-trajectory ``len(all_logprobs[i]) != count(labels != -100)``
-              -> RuntimeError (protects downstream GRPO old_logps alignment).
-            * ``vLLMSampler.sample()`` network/timeout errors propagate unchanged
-              (never wrapped or swallowed).
-            * tool_calls produced with no ``tool_manager`` -> ValueError.
-            * ``max_turns == 1`` with a first-round tool call -> the trajectory is
-              marked ``truncated=True, stop_reason='max_turns'`` and sampling stops.
-            * ``stop_reason == 'length'`` -> the trajectory is marked
-              ``truncated=True`` and sampling stops without dispatching any tool
-              call the cut reply contains.
-        """
         if isinstance(trajectories, dict):
-            raise TypeError('ClientMultiTurnRollout.__call__ expects a List[Trajectory]; '
-                            'wrap a single trajectory as [trajectory].')
+            raise TypeError('ClientMultiTurnRollout expects List[Trajectory]')
         trajectories = list(trajectories)
-        n = len(trajectories)
-        if n == 0:
+        if not trajectories:
             return []
-
         sampling_params = self._as_sampling_params_dict(kwargs.get('sampling_params', self.sampling_params))
-        tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
+        tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), len(trajectories))
+        ledgers = [
+            self._open_ledger(trajectory, tool_managers[index], index)
+            for index, trajectory in enumerate(trajectories)
+        ]
+        stop_reasons: List[Optional[str]] = [None] * len(trajectories)
+        truncated = [False] * len(trajectories)
+        done = [False] * len(trajectories)
 
-        state = self._initialize_state(trajectories)
         for _ in range(self.max_turns):
-            active = [index for index in range(n) if not state.done[index]]
+            active = [index for index, finished in enumerate(done) if not finished]
             if not active:
                 break
-
-            # One batched HTTP call for all live trajectories. Network and timeout
-            # errors intentionally propagate unchanged so retry policy stays upstream.
             responses = self.sampler.sample(
-                [state.pifs[index] for index in active],
-                sampling_params=sampling_params,
+                [ledgers[index].input_feature for index in active], sampling_params=sampling_params)
+            if len(responses) != len(active):
+                raise RuntimeError(f'sampler returned {len(responses)} responses for {len(active)} trajectories')
+            pending: List[tuple[int, List[Dict[str, Any]]]] = []
+            for batch_index, trajectory_index in enumerate(active):
+                response = responses[batch_index]
+                if len(response.sequences) != 1:
+                    raise RuntimeError('ClientMultiTurnRollout requires exactly one sequence per trajectory')
+                sequence = response.sequences[0]
+                ledger = ledgers[trajectory_index]
+                try:
+                    ledger.record(sequence)
+                except RuntimeError as error:
+                    raise RuntimeError(f'batch index {batch_index} (trajectory {trajectory_index}): {error}') from error
+                stop_reasons[trajectory_index] = sequence.stop_reason
+                if sequence.stop_reason == 'length':
+                    truncated[trajectory_index] = True
+                    done[trajectory_index] = True
+                    continue
+                if ledger.full():
+                    truncated[trajectory_index] = True
+                    done[trajectory_index] = True
+                    continue
+                message = ledger.messages[-1] if ledger.messages else {}
+                tool_calls = list(message.get('tool_calls') or ledger.parse_tool_call(sequence.decoded or ''))
+                if not tool_calls:
+                    done[trajectory_index] = True
+                    continue
+                if ledger.turns >= self.max_turns:
+                    truncated[trajectory_index] = True
+                    stop_reasons[trajectory_index] = 'max_turns'
+                    done[trajectory_index] = True
+                    continue
+                manager = tool_managers[trajectory_index]
+                if manager is None:
+                    raise ValueError(f'trajectory {trajectory_index} produced tool_calls but no tool_manager was provided')
+                observations = manager.call_many(tool_calls)
+                pending.append((trajectory_index, self._tool_messages(tool_calls, observations)))
+            for trajectory_index, messages in pending:
+                ledger = ledgers[trajectory_index]
+                if not ledger.observe(messages):
+                    truncated[trajectory_index] = True
+                    done[trajectory_index] = True
+                    continue
+                self._require_resubmittable(ledger, trajectory_index)
+
+        return [
+            ledger.merge(
+                trajectory,
+                turns=ledger.turns,
+                stop_reason=stop_reasons[index],
+                truncated=truncated[index],
             )
-            pending_bridges = self._process_responses(active, responses, state, tool_managers)
-            self._apply_bridges(state, pending_bridges)
+            for index, (trajectory, ledger) in enumerate(zip(trajectories, ledgers))
+        ]
 
-        self._validate_logprob_alignment(state.pifs, state.all_logprobs)
-        return self._build_outputs(
-            trajectories,
-            state.pifs,
-            state.all_logprobs,
-            state.turns,
-            state.stop_reasons,
-            state.truncated,
+    def _open_ledger(self, trajectory: Trajectory, manager: Optional[ToolManager], index: int) -> TurnLedger:
+        ledger = TurnLedger(
+            self.template,
+            label=f'trajectory {index}',
+            max_tokens=self.max_trajectory_tokens,
+            backend='vllm',
         )
+        tools = manager.tool_infos() if manager is not None else list(trajectory.get('tools') or [])
+        ledger.open(trajectory, tools=tools)
+        self._require_resubmittable(ledger, index)
+        return ledger
 
-    # ------------------------------------------------------------------ private
-
-    def _initialize_state(self, trajectories: List[Trajectory]) -> _RolloutState:
-        pifs: list[dict[str, Any]] = []
-        for trajectory in trajectories:
-            pif = self.template.encode(trajectory, add_generation_prompt=True)
-            pif.setdefault('messages', list(trajectory.get('messages', [])))
-            pifs.append(pif)
-        size = len(trajectories)
-        return _RolloutState(
-            pifs=pifs,
-            all_logprobs=[[] for _ in range(size)],
-            stop_reasons=[None] * size,
-            turns=[0] * size,
-            truncated=[False] * size,
-            done=[False] * size,
-        )
-
-    def _process_responses(self, active, responses, state: _RolloutState,
-                           tool_managers) -> list[tuple[int, list[dict]]]:
-        pending_bridges = []
-        for local_index, global_index in enumerate(active):
-            sequence = responses[local_index].sequences[0]
-            tool_messages = self._process_sequence(local_index, global_index, sequence, state,
-                                                   tool_managers[global_index])
-            if tool_messages is not None:
-                pending_bridges.append((global_index, tool_messages))
-        return pending_bridges
-
-    def _process_sequence(self, local_index, global_index, sequence, state: _RolloutState,
-                          tool_manager: ToolManager | None) -> list[dict] | None:
-        state.turns[global_index] += 1
-        if sequence.new_input_feature is None or 'input_ids' not in sequence.new_input_feature:
-            raise RuntimeError(f'Sampler returned a sequence without new_input_feature.input_ids at '
-                               f'batch index {local_index} (trajectory {global_index}); '
-                               f'cannot continue multi-turn.')
-
-        state.pifs[global_index] = dict(sequence.new_input_feature)
-        if sequence.logprobs is not None:
-            if len(sequence.logprobs) != len(sequence.tokens):
-                raise RuntimeError(f'logprobs length ({len(sequence.logprobs)}) does not match sampled '
-                                   f'token count ({len(sequence.tokens)}) at turn {state.turns[global_index]} '
-                                   f'(trajectory {global_index})')
-            state.all_logprobs[global_index].extend(sequence.logprobs)
-        state.stop_reasons[global_index] = sequence.stop_reason
-
-        if sequence.stop_reason == 'length' or self._at_token_limit(state.pifs[global_index]):
-            state.truncated[global_index] = True
-            state.done[global_index] = True
-            return None
-
-        messages = state.pifs[global_index].get('messages') or []
-        last_message = messages[-1] if messages else None
-        tool_calls = last_message.get('tool_calls') if isinstance(last_message, dict) else None
-        tool_calls = tool_calls or self.template.parse_tool_call(sequence.decoded or '')
-        if not tool_calls:
-            state.done[global_index] = True
-            return None
-        if state.turns[global_index] >= self.max_turns:
-            state.truncated[global_index] = True
-            state.stop_reasons[global_index] = 'max_turns'
-            state.done[global_index] = True
-            return None
-        if tool_manager is None:
-            raise ValueError(f'trajectory {global_index} produced tool_calls but no tool_manager '
-                             f'was provided (at construction time or as a per-call kwarg).')
-        return [{'role': 'tool', 'content': tool_manager(tool_call)} for tool_call in tool_calls]
-
-    def _at_token_limit(self, pif: dict[str, Any]) -> bool:
-        return self.max_trajectory_tokens is not None and len(pif.get('input_ids') or []) >= self.max_trajectory_tokens
-
-    def _apply_bridges(self, state: _RolloutState, pending_bridges: list[tuple[int, list[dict]]]) -> None:
-        for global_index, tool_messages in pending_bridges:
-            extended = extend_with_bridge(state.pifs[global_index], tool_messages, self.template)
-            if extended is None:
-                state.truncated[global_index] = True
-                state.done[global_index] = True
-            else:
-                state.pifs[global_index] = extended
+    def _require_resubmittable(self, ledger: TurnLedger, index: int) -> None:
+        state = ledger.state
+        feature_ids = list(ledger.input_feature.get('input_ids') or [])
+        if state is None or state.media:
+            raise NotImplementedError(
+                f'trajectory {index} requires server-side RolloutState state_id for HTTP multi-turn media')
+        if feature_ids != list(state.engine_input_ids):
+            raise NotImplementedError(
+                f'trajectory {index} requires server-side RolloutState state_id because feature and engine ids differ')
 
     @staticmethod
-    def _validate_logprob_alignment(pifs: List[Dict[str, Any]], all_logprobs: List[List[Any]]) -> None:
-        """Reject output that would corrupt downstream GRPO old-logprob alignment."""
-        for index, logprobs in enumerate(all_logprobs):
-            if not logprobs:
-                continue
-            labels = pifs[index].get('labels') or []
-            trainable = sum(1 for label in labels if label != -100)
-            if len(logprobs) != trainable:
-                raise RuntimeError(f'logprobs/labels misaligned for trajectory {index}: '
-                                   f'{len(logprobs)} logprobs vs {trainable} '
-                                   f'trainable labels (labels != -100). This invariant is '
-                                   f'required by grpo._pad_and_align_to_batch; a mismatch '
-                                   f'would silently corrupt GRPO old_logps alignment.')
-
-    @staticmethod
-    def _build_outputs(
-        trajectories: List[Trajectory],
-        pifs: List[Dict[str, Any]],
-        all_logprobs: List[List[Any]],
-        turns: List[int],
-        stop_reasons: List[Optional[str]],
-        truncated: List[bool],
-    ) -> List[Trajectory]:
-        """Merge final per-trajectory state while preserving input order."""
-        outputs: List[Trajectory] = []
-        for index, trajectory in enumerate(trajectories):
-            output = dict(trajectory)
-            output.update(pifs[index])
-            output['messages'] = list(pifs[index].get('messages') or output.get('messages', []))
-            output['logprobs'] = all_logprobs[index] or None
-            output['turns'] = turns[index]
-            output['stop_reason'] = stop_reasons[index]
-            output['truncated'] = truncated[index]
-            outputs.append(output)
-        return outputs
+    def _tool_messages(tool_calls: List[Dict[str, Any]], observations: List[str]) -> List[Dict[str, Any]]:
+        messages = []
+        for call, observation in zip(tool_calls, observations):
+            function = call.get('function') if isinstance(call.get('function'), dict) else {}
+            message: Dict[str, Any] = {'role': 'tool', 'content': str(observation)}
+            if call.get('id'):
+                message['tool_call_id'] = call['id']
+            if function.get('name'):
+                message['name'] = function['name']
+            messages.append(message)
+        return messages
 
     @staticmethod
     def _as_sampling_params_dict(sampling_params) -> Optional[Dict[str, Any]]:
-        """Coerce ``sampling_params`` into the ``Optional[Dict]`` that
-        ``vLLMSampler.sample()`` expects.
-
-        ``self.sampling_params`` is a core-lib :class:`SamplingParams` dataclass,
-        while the HTTP sampler wants a plain dict. A per-call kwarg override may
-        be either a dataclass or an already-built dict.
-        """
         if sampling_params is None:
             return None
         if isinstance(sampling_params, dict):
-            return sampling_params
+            return dict(sampling_params)
         if dataclasses.is_dataclass(sampling_params):
             return dataclasses.asdict(sampling_params)
         return sampling_params
 
     @staticmethod
-    def _resolve_tool_managers(arg, n: int) -> List[Optional[ToolManager]]:
-        """Broadcast a single ``ToolManager`` or validate a per-trajectory list.
-
-        Unlike the core-lib rollout, ``None`` is tolerated here and broadcast as
-        ``[None] * n``; the ValueError is raised lazily at the tool-dispatch site
-        only when a trajectory actually produces tool_calls.
-        """
+    def _resolve_tool_managers(arg, count: int) -> List[Optional[ToolManager]]:
         if isinstance(arg, list):
-            if len(arg) != n:
-                raise ValueError(f'per-call tool_manager list length ({len(arg)}) does '
-                                 f'not match number of trajectories ({n})')
+            if len(arg) != count:
+                raise ValueError(f'tool_manager list length ({len(arg)}) does not match trajectories ({count})')
             return list(arg)
-        return [arg] * n
+        return [arg] * count

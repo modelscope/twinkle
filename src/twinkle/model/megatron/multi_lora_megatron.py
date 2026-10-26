@@ -27,8 +27,9 @@ from twinkle.utils import get_logger
 from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
-from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
+from .mtp.mtp import MtpTrainingState
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -56,8 +57,11 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
-        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
-        MegatronStrategy.apply_process_env(ddp_config)
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant MegatronModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -65,12 +69,21 @@ class MultiLoraMegatronModel(MegatronModel):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
 
-        self._model_path = HubOperation.download_model(model_id)
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        self._model_path = HubOperation.download_model(model_id, revision=kwargs.pop('revision', None))
+        self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self.use_distributed_optimizer = False
+        kwargs.pop('use_distributed_optimizer', None)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
+        # Popped here so neither key reaches MegatronStrategy / ModelConfig; mirrors the parent.
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
+        self._router_replay_applied = False
+        if self._router_replay_enabled:
+            kwargs['moe_enable_routing_replay'] = True
+        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         self._try_init_process_group()
         ensure_mindspeed_adaptor_patched()
@@ -113,6 +126,8 @@ class MultiLoraMegatronModel(MegatronModel):
         self._finish_config = True
         # Active group for compatibility with single adapter
         self.active_group = None
+        # Inherited forward_backward reads this before any tenant adapter is added.
+        self._mtp = MtpTrainingState()
         self.multi_adapter.reset_adapter_status()
 
     def _check_adapter_valid(self, adapter_name: str):
@@ -146,11 +161,10 @@ class MultiLoraMegatronModel(MegatronModel):
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         num_microbatches: int = 1,
                          **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
-            return super().forward_backward(inputs=inputs, num_microbatches=num_microbatches, **kwargs)
+            return super().forward_backward(inputs=inputs, **kwargs)
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):
@@ -288,9 +302,8 @@ class MultiLoraMegatronModel(MegatronModel):
                             group_state[k] = v.to(device)
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
-        # RNG state is intentionally not restored in multi-tenant mode:
-        # restoring the global RNG would silently affect other active tenants'
-        # dropout / initialization behaviour.
+        # RNG is intentionally not restored: the global RNG is shared across tenants, and
+        # restoring it would silently affect other active adapters' dropout / init.
         if not no_load_rng and 'rng_state' in state_dict:
             logger.warning('Skipping RNG state restoration in multi-tenant mode. '
                            'Global RNG is shared across tenants; restoring it would '
@@ -383,9 +396,8 @@ class MultiLoraMegatronModel(MegatronModel):
         if dist.is_initialized():
             dist.barrier()
 
-    # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
-    # training-state dict immediately, so the lazy callable default would break it. Keeps this multi-LoRA
-    # megatron variant backend-equivalent with the others.
+    # lazy_collect=False: the driver consumes the returned dict immediately (loop.resume
+    # subscripts state['cur_step']); a lazy callable default would break it.
     @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
@@ -424,7 +436,9 @@ class MultiLoraMegatronModel(MegatronModel):
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        return self.multi_adapter.get_state_dict(**kwargs)
+        # MultiLora.get_state_dict takes the tenant name positionally; kwargs here
+        # only ever carries adapter_name.
+        return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
 
     @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
@@ -435,15 +449,15 @@ class MultiLoraMegatronModel(MegatronModel):
     ):
         # prevent opening requires_grad of the base model
         # prevent loading malicious code
-        assert not isinstance(
-            config_or_dir, str
-        ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
-        assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
+        if isinstance(config_or_dir, str):
+            raise ValueError('config_or_dir does not support str, '
+                             'because loading config from modelhub may causing unexpected behavior')
+        if not isinstance(config_or_dir, LoraConfig):
+            raise ValueError('config_or_dir must be a LoraConfig instance')
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
-        config_or_dir.modules_to_save = None
         config_or_dir.trainable_token_indices = None
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name

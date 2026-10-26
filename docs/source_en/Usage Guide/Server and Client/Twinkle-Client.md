@@ -217,6 +217,7 @@ The examples above are all single-turn training. If you want to do **multi-turn 
 - **vLLMSampler**: the client sampler pointing at the server's Sampler service.
 - **ToolManager** (optional): register your tools; if a trajectory produces tool_calls but no tool_manager is provided, a `ValueError` is raised at dispatch.
 - **`num_samples=1`**: each trajectory is sampled once. For a GRPO group, replicate the same prompt into `NUM_GENERATIONS` independent trajectories.
+- **Safe text-only trajectories**: after every turn, the client verifies that state has no media and `feature.input_ids == engine_input_ids`. The template may support multimodality; only trajectories carrying media or divergent dual encodings raise `NotImplementedError` until the server exposes a `state_id`.
 
 ### Minimal Example
 

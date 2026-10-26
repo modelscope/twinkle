@@ -29,7 +29,7 @@ from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
 from twinkle.server.task_queue.types import UserTaskError
 from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
-from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
+from .paths import CHECKPOINT_INFO_FILENAME, ensure_inside, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
 logger = get_logger()
@@ -238,7 +238,8 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         Returns:
             Path to checkpoint directory
         """
-        return self.training_run_manager.get_model_dir(model_id) / checkpoint_id
+        model_dir = self.training_run_manager.get_model_dir(model_id)
+        return ensure_inside(model_dir, model_dir / checkpoint_id)
 
     def get_save_dir(self, model_id: str, is_sampler: bool = False) -> str:
         """

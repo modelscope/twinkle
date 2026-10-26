@@ -62,13 +62,17 @@ class GRPOAdvantage(Advantage):
             raise ValueError('Invalid')
 
         if num_generations == 1:
-            if scale == 'batch':
-                std = rewards.std() if rewards.numel() > 1 else torch.ones(1, device=rewards.device)
-                return (rewards - rewards.mean()) / (std + 1e-8)
-            elif scale == 'none':
-                return rewards - rewards.mean()
-            else:
-                return rewards
+            # One sample per group: the group-relative advantage is identically zero (the group mean
+            # is the sample itself; legacy's ``rewards - group_mean`` reduces to the same zeros).
+            # Warn rather than refuse, and do NOT fall back to batch-centered or raw rewards: no
+            # scale below re-centers, so that silently turned a degenerate GRPO into un-baselined
+            # REINFORCE while 'none' paradoxically batch-centered (its own contract says no
+            # normalization).
+            import warnings
+
+            warnings.warn('num_generations == 1: GRPO group-relative advantages are identically zero. '
+                          'Raise num_generations for a meaningful group baseline.')
+            return torch.zeros_like(rewards)
 
         grouped = rewards.view(-1, num_generations)
         group_mean = grouped.mean(dim=1, keepdim=True)

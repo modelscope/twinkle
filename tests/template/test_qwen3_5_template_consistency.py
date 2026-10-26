@@ -72,11 +72,15 @@ class TestModelTemplateMapping:
         'Qwen2.5-7B-Instruct',
         'Qwen3-8B',
         'llama-3-8b',
-        'DeepSeek-V4-Flash',
         '',
     ])
     def test_non_family_models_fall_back_to_default(self, model_name):
         assert get_template_for_model(model_name) == DEFAULT_TEMPLATE
+
+    @pytest.mark.parametrize('model_name',
+                             ['DeepSeek-V4-Flash', 'deepseek-v4-flash', 'ms://org/Deepseek-V4-Flash'])
+    def test_deepseek_v4_maps_to_its_template(self, model_name):
+        assert get_template_for_model(model_name) == 'DeepseekV4Template'
 
     def test_qwen3_8_is_registered(self):
         """Regression guard: Qwen3.8 must not silently fall back to Template.

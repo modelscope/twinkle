@@ -1,17 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Process-global PyTorch setup, isolated from the infra / Ray control flow.
-
-Twinkle seeds the RNG, toggles tf32 and pins a few CUDA / tokenizer env vars in *every* process that
-runs compute: the driver (which, in local/torchrun mode, is itself the compute process) and each Ray
-worker. All of these are per-process globals, so they must be re-applied wherever the compute happens
-rather than once on the driver that issued ``initialize``.
-
-Keeping this in its own module stops torch-specific concerns from leaking into ``infra`` (mode /
-device group / remote dispatch) or ``_ray`` (worker placement). The whole knob set crosses the process
-boundary as ONE JSON blob in the ``EXTRA_TORCH_KWARGS`` env var, so adding a new torch knob never
-means threading another argument -- or another env var -- through ``initialize``, ``create_workers``
-and the worker bootstrap.
-"""
 import json
 import os
 from typing import Any, Dict, Optional

@@ -197,6 +197,10 @@ class Env(ABC):
         """
         raise NotImplementedError(f'{type(self).__name__} cannot run scripts')
 
+    def ensure_idle(self) -> None:
+        """同步执行层的安全边界；带后台或远程执行的环境必须覆盖并确认真实结束。"""
+        return None
+
     def ensure_ready(self) -> bool:
         """Re-establish this environment if it has gone away. True if it did.
 
@@ -320,6 +324,7 @@ class EnvLeases(Leases[Env]):
         doing it mid-job would swap the state being judged for an empty
         directory.
         """
+        env.ensure_idle()
         try:
             env.clear()
             return env

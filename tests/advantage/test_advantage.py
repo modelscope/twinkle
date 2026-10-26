@@ -71,24 +71,30 @@ class TestGRPOAdvantage:
 
     # --- num_generations=1 ---
 
+    # --- num_generations == 1 (updated for the K=1 contract change) ---
+    # GRPO with a single generation per prompt has no within-group baseline, so the
+    # group-relative advantage is identically zero. The estimator warns and returns zeros
+    # for every scale (the old raw-reward/batch-centered returns were a degenerate REINFORCE).
+
     def test_num_generations_1_scale_none(self):
         rewards = torch.tensor([1.0, 3.0, 5.0])
-        result = self.grpo(rewards, num_generations=1, scale='none')
-        # mean=3.0, advantages = [-2, 0, 2]
-        expected = torch.tensor([-2.0, 0.0, 2.0])
-        assert torch.allclose(result, expected, atol=1e-6)
+        with pytest.warns(UserWarning, match='num_generations == 1'):
+            result = self.grpo(rewards, num_generations=1, scale='none')
+        assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
     def test_num_generations_1_scale_batch(self):
         rewards = torch.tensor([1.0, 3.0, 5.0])
-        result = self.grpo(rewards, num_generations=1, scale='batch')
-        # mean=3.0, std≈2.0, advantages = [-2,0,2]/2
+        with pytest.warns(UserWarning, match='num_generations == 1'):
+            result = self.grpo(rewards, num_generations=1, scale='batch')
         assert result.shape == (3,)
+        assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
     def test_num_generations_1_scale_default(self):
-        """Default scale for num_generations=1 is 'group', which returns raw rewards."""
+        """Default scale for num_generations=1: group-relative advantages are identically zero."""
         rewards = torch.tensor([1.0, 2.0, 3.0])
-        result = self.grpo(rewards, num_generations=1)
-        assert torch.allclose(result, rewards)
+        with pytest.warns(UserWarning, match='num_generations == 1'):
+            result = self.grpo(rewards, num_generations=1)
+        assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
     # --- multi-dim rewards ---
 
@@ -110,8 +116,9 @@ class TestGRPOAdvantage:
             self.grpo(torch.tensor([1.0, 2.0, 3.0]), num_generations=2)
 
     def test_single_element_with_num_gen_1(self):
-        result = self.grpo(torch.tensor([5.0]), num_generations=1)
-        assert torch.allclose(result, torch.tensor([5.0]))
+        with pytest.warns(UserWarning, match='num_generations == 1'):
+            result = self.grpo(torch.tensor([5.0]), num_generations=1)
+        assert torch.allclose(result, torch.tensor([0.0]))
 
 
 class TestRLOOAdvantage:

@@ -383,9 +383,9 @@ class MultiLora:
                 for active_adapter in self.active_adapters:
                     if active_adapter not in lora_embedding_A_keys or self.disable_adapters:
                         continue
-                    _lora = self.find_lora(active_adapter)
+                    _lora = _self.find_lora(active_adapter)
                     target_modules = _lora.tenant_config.target_modules
-                    if not self.match_target_modules(self.layer_name, target_modules):
+                    if not _self.match_target_modules(self.layer_name, target_modules):
                         continue
 
                     embedding_A = self.lora_embedding_A[active_adapter]

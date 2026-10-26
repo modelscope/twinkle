@@ -212,6 +212,37 @@ class VLLMEngine(BaseSamplerEngine):
     2. Colocated with training (Ray): Single-tenant, weight sync via load_weights
     """
 
+    def _check_delta_availability(self):
+        if getattr(self, '_delta_unavailable', False):
+            raise RuntimeError('rollout is unavailable until delta synchronization completes a full valid round')
+
+    async def _delta_admitted_outputs(self, generator):
+        self._check_delta_availability()
+        # No await between the gate check and increment on the engine's event loop.
+        self._delta_admitting = getattr(self, '_delta_admitting', 0) + 1
+        admitted = False
+        try:
+            async for output in generator:
+                if not admitted:
+                    admitted = True
+                    self._delta_admitting -= 1
+                yield output
+        finally:
+            if not admitted:
+                self._delta_admitting -= 1
+            await generator.aclose()
+
+    async def pause_delta_generation(self, timeout: float):
+        self._delta_unavailable = True
+
+        async def pause():
+            while getattr(self, '_delta_admitting', 0):
+                await asyncio.sleep(0.01)
+            await self.engine.pause_generation(mode='abort')
+
+        # A barrier timeout keeps the gate closed and prevents worker writes.
+        await asyncio.wait_for(pause(), timeout=timeout)
+
     def __init__(
         self,
         model_id: str,
@@ -305,6 +336,7 @@ class VLLMEngine(BaseSamplerEngine):
             'dtype': self.dtype,
             'load_format': self.load_format,
             'disable_log_stats': True,
+            'enable_prefix_caching': self.enable_prefix_caching,
         }
 
         if self.tensor_parallel_size > 1:
@@ -315,9 +347,6 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.quantization is not None:
             engine_config['quantization'] = self.quantization
-
-        if self.enable_prefix_caching:
-            engine_config['enable_prefix_caching'] = True
 
         if self.enable_sleep_mode:
             engine_config['enable_sleep_mode'] = True
@@ -342,10 +371,27 @@ class VLLMEngine(BaseSamplerEngine):
             'twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension')
 
         engine_config.update(self.engine_kwargs)
+        weight_transfer = engine_config.get('weight_transfer_config')
+        backend = (weight_transfer.get('backend') if isinstance(weight_transfer, dict)
+                   else getattr(weight_transfer, 'backend', None))
+        if backend == 'twinkle_delta_ipc':
+            engine_config.setdefault('enable_sleep_mode', True)
+            self.enable_sleep_mode = engine_config['enable_sleep_mode']
+            from .delta.transfer_engine import register_twinkle_delta_weight_transfer_engine, require_vllm_delta_support
+            require_vllm_delta_support()
+            register_twinkle_delta_weight_transfer_engine()
+        elif backend == 'twinkle_delta_hccl':
+            # Ascend NPU: sleep mode stays opt-in (engine_args / enable_sleep_mode), it is not forced on here.
+            from .delta.transfer_engine import (register_twinkle_delta_hccl_weight_transfer_engine,
+                                                require_vllm_delta_support)
+            require_vllm_delta_support()
+            register_twinkle_delta_hccl_weight_transfer_engine()
         if self.enable_sampling_replay:
             engine_config['enable_return_sampling_mask'] = True
             engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
+        if backend in ('twinkle_delta_ipc', 'twinkle_delta_hccl') and 'weight_transfer_config' not in valid_args:
+            raise RuntimeError('delta_sharded requires vLLM AsyncEngineArgs.weight_transfer_config')
         filtered_engine_config, invalid_args = _filter_engine_config(
             engine_config,
             valid_args,
@@ -463,6 +509,7 @@ class VLLMEngine(BaseSamplerEngine):
             # check to avoid per-request RPC overhead.
             lora_request = self._synced_lora_request
 
+        self._check_delta_availability()
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=vllm_params,
@@ -473,7 +520,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         # Get final result
         result = None
-        async for output in generator:
+        async for output in self._delta_admitted_outputs(generator):
             result = output
 
         if result is None:
@@ -606,6 +653,7 @@ class VLLMEngine(BaseSamplerEngine):
                            'this pooling request')
             lora_request = None
 
+        self._check_delta_availability()
         generator = self.engine.encode(
             prompt=prompt_obj,
             pooling_params=vllm_pooling,
@@ -615,7 +663,7 @@ class VLLMEngine(BaseSamplerEngine):
         )
 
         result = None
-        async for output in generator:
+        async for output in self._delta_admitted_outputs(generator):
             result = output
         if result is None:
             raise RuntimeError('Pooling encode did not produce a result')
@@ -662,6 +710,7 @@ class VLLMEngine(BaseSamplerEngine):
         elif lora_request is None and self._synced_lora_request is not None:
             lora_request = self._synced_lora_request
 
+        self._check_delta_availability()
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=vllm_params,
@@ -671,14 +720,15 @@ class VLLMEngine(BaseSamplerEngine):
         )
 
         tokenizer = await self.get_tokenizer()
-        async for output in generator:
-            for comp_output in output.outputs:
-                delta_token_ids = list(comp_output.token_ids)
-                delta_text = tokenizer.decode(delta_token_ids, skip_special_tokens=True) if delta_token_ids else ''
-                finish_reason: Optional[str] = None
-                if comp_output.finish_reason is not None:
-                    finish_reason = _map_finish_reason(comp_output.finish_reason)
-                yield delta_text, finish_reason
+        async with contextlib.aclosing(self._delta_admitted_outputs(generator)) as outputs:
+            async for output in outputs:
+                for comp_output in output.outputs:
+                    delta_token_ids = list(comp_output.token_ids)
+                    delta_text = tokenizer.decode(delta_token_ids, skip_special_tokens=True) if delta_token_ids else ''
+                    finish_reason: Optional[str] = None
+                    if comp_output.finish_reason is not None:
+                        finish_reason = _map_finish_reason(comp_output.finish_reason)
+                    yield delta_text, finish_reason
 
     # -----------------------------------------------------------------
     # RL-training synced LoRA helpers
@@ -728,7 +778,7 @@ class VLLMEngine(BaseSamplerEngine):
             lora_path: Resolved filesystem path to the LoRA adapter directory.
 
         Returns:
-            ``LoRARequest`` or ``None`` if loading fails.
+            ``LoRARequest``; loading problems raise (see :meth:`_load_lora`).
         """
         if lora_path in self._lora_request_cache:
             logger.debug(f'Using cached LoRA request for {lora_path}')
@@ -750,14 +800,14 @@ class VLLMEngine(BaseSamplerEngine):
     async def _load_lora(self, lora_path: str):
         from vllm.lora.request import LoRARequest
 
+        # Fail loudly, matching the sglang side: a silent None here means the sampler keeps serving
+        # BASE weights -- an RL policy rollout would train on a different model than it samples.
         if not os.path.exists(lora_path):
-            logger.error(f'LoRA path does not exist: {lora_path}')
-            return None
+            raise FileNotFoundError(f'LoRA path does not exist: {lora_path}')
 
         config_path = os.path.join(lora_path, 'adapter_config.json')
         if not os.path.exists(config_path):
-            logger.error(f'adapter_config.json not found in {lora_path}')
-            return None
+            raise FileNotFoundError(f'adapter_config.json not found in {lora_path}')
 
         lora_int_id = self._generate_lora_id()
         lora_name = str(lora_int_id)
@@ -771,10 +821,9 @@ class VLLMEngine(BaseSamplerEngine):
         logger.info(f'Loading LoRA from {lora_path}')
         try:
             await self.engine.add_lora(lora_request)
-            return lora_request
         except Exception as e:
-            logger.error(f'Failed to load LoRA from {lora_path}: {e}')
-            return None
+            raise RuntimeError(f'Failed to load LoRA from {lora_path}: {e}') from e
+        return lora_request
 
     async def unload_lora_paths(self, adapter_paths: list[str]) -> None:
         """Evict selected LoRA requests without requiring their files to exist."""

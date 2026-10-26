@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import inspect
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -11,6 +12,31 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 _T = TypeVar('_T')
+
+
+def construct_template(template_cls, **kwargs):
+    template_spec = kwargs.pop('template_spec', None)
+    if template_spec is None:
+        import twinkle.template
+        from twinkle.template.base import Template
+        from twinkle.utils import construct_class
+
+        return construct_class(template_cls, Template, twinkle.template, **kwargs)
+    if kwargs:
+        raise TypeError(f'Unexpected TemplateSpec construction arguments: {sorted(kwargs)}')
+    if isinstance(template_cls, str):
+        module, separator, name = template_cls.rpartition('.')
+        if not separator:
+            raise ValueError('A TemplateSpec factory must be a dotted class path.')
+        template_cls = getattr(importlib.import_module(module), name)
+    from twinkle.template.contract import TemplateSpec
+
+    if isinstance(template_spec, dict):
+        template_spec = TemplateSpec.from_dict(template_spec)
+    factory = getattr(template_cls, 'from_spec', None)
+    if factory is None:
+        raise TypeError(f'{template_cls!r} does not implement from_spec().')
+    return factory(template_spec)
 
 
 def _coerce_ids_to_list(ids: Any) -> List[int]:
@@ -47,6 +73,7 @@ def _load_image(img: Any) -> Optional[Any]:
     """Load images to PIL format."""
     import io
     from PIL import Image
+    from twinkle.utils.safe_media import checked_media_path, safe_http_get
 
     if img is None:
         return None
@@ -54,12 +81,13 @@ def _load_image(img: Any) -> Optional[Any]:
         return img
     elif isinstance(img, str):
         if img.startswith(('http://', 'https://')):
-            import requests
-            resp = requests.get(img, timeout=30)
-            resp.raise_for_status()
+            # safe_http_get refuses non-public targets (private nets, loopback, cloud
+            # metadata) and re-validates every redirect hop: a URL from a dataset row or
+            # a serving request must not turn this process into an SSRF pivot.
+            resp = safe_http_get(img, timeout=30)
             return Image.open(io.BytesIO(resp.content))
         else:
-            return Image.open(img)
+            return Image.open(checked_media_path(img))
     elif isinstance(img, bytes):
         return Image.open(io.BytesIO(img))
     elif isinstance(img, dict) and 'bytes' in img:

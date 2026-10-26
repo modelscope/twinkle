@@ -60,6 +60,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         try:
             self.device = torch.npu.current_device()
         except Exception:
+            # torch_npu missing or no NPU visible (e.g. device-neutral construction): keep a
+            # placeholder so __init__ succeeds. The placeholder is never silently USED for real
+            # communication -- any actual HCCL path calls torch.npu bare and fails loudly there.
             self.device = 0
 
         self.is_master = False
@@ -185,8 +188,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
             if self.rank is not None and self.rank >= 0 and self.pyhccl is not None:
                 try:
                     self.pyhccl.destroyComm(self.pyhccl.comm)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f'Error destroying HCCL communicator: {e}')
                 self.pyhccl = None
 
             self.rank = None
@@ -257,7 +260,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
-        signal = torch.tensor([1], dtype=torch.int8, device=torch.npu.current_device())
+        # self.device (not a bare torch.npu.current_device()) so the barrier signal lands on the
+        # same device the communicator was built on.
+        signal = torch.tensor([1], dtype=torch.int8, device=self.device)
         self.pyhccl.all_reduce(signal)
 
         self._group_initialized = True
@@ -414,8 +419,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
-        logger.info(f'send_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
-                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+        logger.info(f'full-sync send_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+                       f'payload={total_bytes / (1 << 20):.1f}MB ({total_bytes / (1 << 30):.2f}GB), '
+                       f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
 
     @torch.no_grad()
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor]]:
@@ -502,5 +508,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
-        logger.info(f'receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
-                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+        logger.info(f'full-sync receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+                       f'payload={total_bytes / (1 << 20):.1f}MB ({total_bytes / (1 << 30):.2f}GB), '
+                       f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')

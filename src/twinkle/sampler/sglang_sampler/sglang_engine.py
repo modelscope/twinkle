@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""SGLang inference engine, the sglang counterpart of `vllm_engine.VLLMEngine`."""
 import inspect
 import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union

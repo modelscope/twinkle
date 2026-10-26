@@ -1,617 +1,255 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property-based tests for
-:class:`twinkle_client.rollout.multi_turn.ClientMultiTurnRollout`.
+from dataclasses import replace
 
-These tests are 100% CPU-only and do NOT require a GPU or a running server.
-They reuse the char-level Fake Tokenizer / Template infrastructure style from
-``tests/twinkle_agentic/test_multi_turn_rollout.py`` but adapt the fake sampler
-to the ``twinkle_client`` HTTP contract: ``FakeClientSampler.sample()`` mirrors
-``vLLMSampler.sample()`` and returns ``List[SampleResponseModel]`` (pydantic,
-from ``twinkle.protocol.types.sampler``) whose ``sequences[0]`` carries a populated
-``new_input_feature`` so the multi-turn loop can proceed round after round.
-
-Properties covered:
-    * Output length & order preservation
-    * stop_reason value range
-    * logprobs / trainable-label alignment
-    * Actual turns never exceed max_turns
-    * Forced truncation at the max_turns edge
-"""
-from __future__ import annotations
-
-import copy
-import json
 import pytest
-import re
-from collections import defaultdict
-from hypothesis import given, settings
-from hypothesis import strategies as st
-from typing import Any, Dict, List, Optional
 
-from twinkle.data_format.sampling import SamplingParams
-from twinkle_agentic.tools.base import Tool
-from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle.template.contract import (CompletionEncoding, DecodedResponse, MediaBundle, PromptEncoding, RolloutState,
+                                       refresh, splice, splice_state)
 from twinkle_client.rollout.multi_turn import ClientMultiTurnRollout
 from twinkle.protocol.types.sampler import SampledSequenceModel, SampleResponseModel
 
 
-# =============================================================================
-# Fakes (tokenizer / template mirror the twinkle_agentic test infra)
-# =============================================================================
-class FakeTokenizer:
-    """Char-level tokenizer with atomic special tokens.
+class _Template:
+    truncation_strategy = 'delete'
 
-    Guarantees ``decode(encode(s)) == s`` for any mix of raw chars and
-    registered specials, which is what makes ``extend_with_bridge``'s
-    template-space delta computation deterministic in the test.
-    """
-    SPECIALS = ('<|im_start|>', '<|im_end|>')
+    def __init__(self, *, multimodal=False, has_media=None, engine_delta=0, bridge_engine_delta=0):
+        self.is_multimodal = multimodal
+        self.has_media = multimodal if has_media is None else has_media
+        self.engine_delta = engine_delta
+        self.bridge_engine_delta = bridge_engine_delta
 
-    def __init__(self) -> None:
-        self._s2i: Dict[str, int] = {}
-        self._i2s: Dict[int, str] = {}
-        for s in self.SPECIALS:
-            self._add(s)
+    def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+        feature = {'input_ids': [1]}
+        state = RolloutState(
+            feature=feature,
+            engine_input_ids=(1 + self.engine_delta, ),
+            messages=tuple(trajectory.get('messages') or ()),
+            tools=tuple(trajectory.get('tools') or ()),
+            reasoning_started=False,
+            media=MediaBundle(images=('image.png', )) if self.has_media else MediaBundle(),
+        )
+        return PromptEncoding(state)
 
-    def _add(self, tok: str) -> int:
-        if tok not in self._s2i:
-            i = len(self._s2i)
-            self._s2i[tok] = i
-            self._i2s[i] = tok
-        return self._s2i[tok]
+    def append_completion(self, state, tokens, *, appended_as='completion', tool_calls=None):
+        next_state = splice_state(state, tokens, tokens, scored=True, sampled=True)
+        calls = ({'id': 'call-1', 'type': 'function',
+                  'function': {'name': 'tool', 'arguments': {}}}, ) if tokens == [10] else ()
+        response = DecodedResponse(content=f'answer-{tokens[0]}', tool_calls=calls, reasoning_started=False)
+        message = {'role': 'assistant', 'content': response.content}
+        if calls:
+            message['tool_calls'] = list(calls)
+        return CompletionEncoding(replace(next_state, messages=state.messages + (message, )), response)
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
-        ids: List[int] = []
-        i = 0
-        while i < len(text):
-            matched = False
-            for sp in self.SPECIALS:
-                if text.startswith(sp, i):
-                    ids.append(self._add(sp))
-                    i += len(sp)
-                    matched = True
-                    break
-            if not matched:
-                ids.append(self._add(text[i]))
-                i += 1
-        return ids
+    def render_delta(self, messages_before, appended, *, engine=False, **kwargs):
+        return [90 + (self.bridge_engine_delta if engine else 0)]
 
-    def decode(self, ids: List[int], skip_special_tokens: bool = False) -> str:
-        specials = set(self.SPECIALS)
-        toks = [self._i2s[int(i)] for i in ids]
-        if skip_special_tokens:
-            toks = [t for t in toks if t not in specials]
-        return ''.join(toks)
+    def finalize_appended_features(self, rows):
+        return [refresh(row) for row in rows]
 
-    def apply_chat_template(
-        self,
-        messages: List[Dict[str, Any]],
-        tokenize: bool = False,
-        add_generation_prompt: bool = False,
-        **_,
-    ):
-        s = ''
-        for m in messages:
-            role = m['role']
-            content = m['content']
-            s += f'<|im_start|>{role}\n{content}<|im_end|>\n'
-        if add_generation_prompt:
-            s += '<|im_start|>assistant\n'
-        if tokenize:
-            return self.encode(s)
-        return s
+    def parse_tool_call(self, decoded):
+        return []
+
+    def tool_call_errors(self, decoded):
+        return []
+
+    @staticmethod
+    def _reasoning_started(input_ids):
+        return False
 
 
-class FakeTemplate:
-    """Minimal Template mirroring the parts ClientMultiTurnRollout touches."""
-    model_id = 'qwen-fake'
-    truncation_strategy = 'right'
-    enable_thinking = False
+class _Sampler:
 
-    def __init__(self, tokenizer: FakeTokenizer) -> None:
-        self.tokenizer = tokenizer
+    def __init__(self, scripts=((10, 'stop'), (20, 'stop'))):
+        self.scripts = list(scripts)
+        self.calls = []
 
-    def encode(self, trajectory: Dict[str, Any], add_generation_prompt: bool = False) -> Dict[str, Any]:
-        messages = trajectory.get('messages', [])
-        s = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
-        input_ids = self.tokenizer.encode(s, add_special_tokens=False)
-        pif: Dict[str, Any] = dict(trajectory)  # preserve top-level fields (incl. _tid)
-        pif['input_ids'] = input_ids
-        pif['labels'] = [-100] * len(input_ids)  # inference mode
-        return self._invoke_post_pipeline([pif])[0]
-
-    def _invoke_post_pipeline(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
-        for pif in inputs:
-            pif = dict(pif)
-            input_ids = list(pif['input_ids'])
-            labels = list(pif.get('labels') or [])
-            if labels:
-                if len(labels) != len(input_ids):
-                    raise RuntimeError(f'FakeTemplate post_pipeline: labels({len(labels)}) '
-                                       f'!= input_ids({len(input_ids)})')
-                # np.roll(labels, -1): shift LEFT by 1 (output/shifted order)
-                labels = labels[1:] + labels[:1]
-            pif['input_ids'] = input_ids
-            pif['labels'] = labels
-            # completion_mask lives on the labels' index space, so the real
-            # _roll_labels rolls it the same way; a stub that skipped this would
-            # drift out of input order after the first append.
-            mask = pif.get('completion_mask')
-            if mask is not None:
-                mask = list(mask)
-                pif['completion_mask'] = mask[1:] + mask[:1]
-            pif['attention_mask'] = [1] * len(input_ids)
-            pif['position_ids'] = list(range(len(input_ids)))
-            pif['length'] = len(input_ids)
-            out.append(pif)
-        return out
-
-    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
-        matches = re.findall(r'<tool_call>\s*([\s\S]*?)\s*</tool_call>', decoded or '')
-        results: List[Dict[str, Any]] = []
-        for m in matches:
-            try:
-                d = json.loads(m)
-            except json.JSONDecodeError:
-                continue
-            name = d.get('name') or d.get('tool_name')
-            if not name:
-                continue
-            results.append({
-                'type': 'function',
-                'function': {
-                    'name': name,
-                    'arguments': d.get('arguments', {}),
-                },
-            })
-        return results
-
-    def tool_call_errors(self, decoded: str) -> List[str]:
-        """Why ``parse_tool_call`` returned fewer calls than the markup asked for.
-
-        Mirrors that method's two ``continue`` branches. Returning an empty list
-        would pass just as well and would quietly make the parse-failure retry in
-        MultiTurnRollout unreachable from these tests.
-        """
-        errors: List[str] = []
-        for m in re.findall(r'<tool_call>\s*([\s\S]*?)\s*</tool_call>', decoded or ''):
-            try:
-                d = json.loads(m)
-            except json.JSONDecodeError as exc:
-                errors.append(f'tool_call is not valid JSON: {exc.msg}')
-                continue
-            if not (d.get('name') or d.get('tool_name')):
-                errors.append('tool_call has no "name" field')
-        return errors
-
-    def concat_input_feature(self, pif: Dict[str, Any], new_tokens: List[int]) -> Dict[str, Any]:
-        result = copy.deepcopy(pif)
-        prompt_ids = list(result['input_ids'])
-        labels = list(result.get('labels') or [])
-        if labels:
-            # Unroll (shift RIGHT by 1): reverse the post_pipeline roll
-            labels = labels[-1:] + labels[:-1]
-        else:
-            labels = [-100] * len(prompt_ids)
-        # Same provenance bookkeeping the real concat_input_feature does: the
-        # sampled tokens are the policy's own completion, so the mask gets 1s.
-        mask = result.get('completion_mask')
-        if mask is None:
-            mask = [0 if label == -100 else 1 for label in labels]
-        else:
-            mask = list(mask)
-            mask = mask[-1:] + mask[:-1]
-        input_ids = prompt_ids + list(new_tokens)
-        labels = labels + list(new_tokens)  # assistant tokens trainable
-        result['input_ids'] = input_ids
-        result['labels'] = labels
-        result['completion_mask'] = mask + [1] * len(new_tokens)
-        result = self._invoke_post_pipeline([result])[0]
-        response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        messages = list(result.get('messages') or [])
-        messages.append({'role': 'assistant', 'content': response_text})
-        result['messages'] = messages
-        return result
-
-
-class FakeClientSampler:
-    """Script-driven sampler mirroring ``vLLMSampler.sample()``.
-
-    Adapts the ``twinkle_agentic`` fake sampler to the client HTTP contract:
-    ``sample()`` accepts ``(inputs, sampling_params=<dict>, ...)`` and returns
-    ``List[SampleResponseModel]`` (pydantic), each sequence carrying a populated
-    ``new_input_feature`` so the multi-turn loop can proceed.
-
-    Each trajectory is identified by a hidden ``_tid`` field that survives
-    ``encode`` / ``concat_input_feature`` / ``extend_with_bridge`` (all preserve
-    top-level keys), so we can look up its scripted turns regardless of how the
-    active set shrinks across rounds.
-    """
-
-    def __init__(self, template: FakeTemplate, scripts: Dict[int, List[Dict[str, Any]]]) -> None:
-        self.template = template
-        self.scripts = scripts
-        self.turn_counters: Dict[int, int] = defaultdict(int)
-        self.sample_calls = 0
-
-    def sample(self, inputs, sampling_params: Optional[Dict[str, Any]] = None, **kwargs):
-        if isinstance(inputs, dict):
-            inputs = [inputs]
-        assert isinstance(inputs, list), f'expects a list, got {type(inputs).__name__}'
-        # Contract check: the rollout coerces core-lib SamplingParams into a
-        # plain dict before calling the HTTP sampler.
-        assert sampling_params is None or isinstance(sampling_params, dict)
-
-        responses: List[SampleResponseModel] = []
-        for pif in inputs:
-            tid = pif['_tid']
-            script = self.scripts[tid]
-            idx = self.turn_counters[tid]
-            self.turn_counters[tid] += 1
-            self.sample_calls += 1
-
-            if idx < len(script):
-                turn = script[idx]
-            else:
-                # Defensive fallback: terminate cleanly if over-sampled.
-                turn = {'kind': 'terminal', 'stop_reason': 'stop', 'logprobs': False}
-
-            if turn['kind'] == 'tool':
-                decoded = _tool_call_text('search', {'q': f't{idx}'})
-                stop_reason = 'stop'
-            else:
-                decoded = f'final-{idx}'
-                stop_reason = turn['stop_reason']
-
-            raw = decoded + '<|im_end|>'
-            tokens = self.template.tokenizer.encode(raw, add_special_tokens=False)
-            logprobs = ([[(int(t), -0.1)] for t in tokens] if turn['logprobs'] else None)
-            new_pif = self.template.concat_input_feature(pif, tokens)
-
-            seq = SampledSequenceModel(
+    def sample(self, features, sampling_params=None):
+        self.calls.append(features)
+        token, stop_reason = self.scripts.pop(0)
+        responses = []
+        for feature in features:
+            updated = splice(feature, [token], scored=True, sampled=True)
+            sequence = SampledSequenceModel(
                 stop_reason=stop_reason,
-                tokens=tokens,
-                logprobs=logprobs,
-                decoded=decoded,
-                new_input_feature=new_pif,
+                tokens=[token],
+                logprobs=[[(token, -0.1)]],
+                decoded=f'answer-{token}',
+                new_input_feature=updated,
             )
-            responses.append(SampleResponseModel(sequences=[seq]))
+            responses.append(SampleResponseModel(sequences=[sequence]))
         return responses
 
 
-class EchoTool(Tool):
-    """Echoes its arguments as a JSON string."""
+class _ToolManager:
 
-    def __init__(self, name: str = 'search'):
-        self._name = name
+    @staticmethod
+    def tool_infos():
+        return [{'type': 'function', 'function': {'name': 'tool', 'parameters': {}}}]
 
-    def __call__(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        return f'echo[{tool_name}]:{json.dumps(arguments, sort_keys=True)}'
-
-    def tool_info(self):
-        return {
-            'type': 'function',
-            'function': {
-                'name': self._name,
-                'description': 'echo test tool',
-                'parameters': {},
-            },
-        }
+    @staticmethod
+    def call_many(tool_calls):
+        return ['observed'] * len(tool_calls)
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-def _tool_call_text(name: str, arguments: Dict[str, Any]) -> str:
-    return '<tool_call>' + json.dumps({'name': name, 'arguments': arguments}) + '</tool_call>'
+def _trajectory():
+    return {'messages': [{'role': 'user', 'content': 'question'}]}
 
 
-def _count_trainable(labels: List[int]) -> int:
-    return sum(1 for label in labels if label != -100)
+def test_text_http_multi_turn_preserves_tokens_messages_and_logprobs():
+    sampler = _Sampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+
+    result = rollout([_trajectory()])[0]
+
+    assert len(sampler.calls) == 2
+    assert result['input_ids'] == [1, 10, 90, 20]
+    assert result['logprobs'] == [[(10, -0.1)], [(20, -0.1)]]
+    assert [message['role'] for message in result['messages']] == ['user', 'assistant', 'tool', 'assistant']
+    assert result['turns'] == 2
+    assert result['truncated'] is False
 
 
-def _make_tool_manager() -> ToolManager:
-    mgr = ToolManager({})
-    mgr.register(EchoTool('search'))
-    return mgr
+def test_http_multi_turn_complete_trajectory_golden():
+    result = ClientMultiTurnRollout(
+        _Sampler(), _Template(), tool_manager=_ToolManager(), max_turns=2)([_trajectory()])[0]
+    assert result == {
+        'input_ids': [1, 10, 90, 20],
+        'labels': [10, -100, 20, -100],
+        'completion_mask': [1, 0, 1, 0],
+        'attention_mask': [1, 1, 1, 1],
+        'length': 4,
+        'messages': [
+            {'role': 'user', 'content': 'question'},
+            {'role': 'assistant', 'content': 'answer-10', 'tool_calls': [{
+                'id': 'call-1', 'type': 'function', 'function': {'name': 'tool', 'arguments': {}}
+            }]},
+            {'role': 'tool', 'content': 'observed', 'tool_call_id': 'call-1', 'name': 'tool'},
+            {'role': 'assistant', 'content': 'answer-20'},
+        ],
+        'tools': [{'type': 'function', 'function': {'name': 'tool', 'parameters': {}}}],
+        'logprobs': [[(10, -0.1)], [(20, -0.1)]],
+        'response_token_ids': [10, 20],
+        'rollout_logprobs': [-0.1, -0.1],
+        'turns': 2,
+        'stop_reason': 'stop',
+        'truncated': False,
+    }
 
 
-def _build_from_scripts(scripts_spec: List[Dict[str, Any]]):
-    """Turn a list of per-trajectory specs into (rollout inputs, sampler).
-
-    ``scripts_spec[k]`` = {'num_tools': int, 'terminal': 'stop'|'length',
-                           'logprobs': bool}. Each trajectory's script is
-    ``num_tools`` tool-call turns followed by one terminal turn.
-    """
-    tokenizer = FakeTokenizer()
-    template = FakeTemplate(tokenizer)
-
-    scripts: Dict[int, List[Dict[str, Any]]] = {}
-    trajectories: List[Dict[str, Any]] = []
-    for tid, spec in enumerate(scripts_spec):
-        turns: List[Dict[str, Any]] = []
-        for _ in range(spec['num_tools']):
-            turns.append({'kind': 'tool', 'stop_reason': 'stop', 'logprobs': spec['logprobs']})
-        turns.append({'kind': 'terminal', 'stop_reason': spec['terminal'], 'logprobs': spec['logprobs']})
-        scripts[tid] = turns
-        trajectories.append({'messages': [{'role': 'user', 'content': f'q{tid}'}], '_tid': tid})
-
-    sampler = FakeClientSampler(template, scripts)
-    return trajectories, sampler, template
+@pytest.mark.parametrize('template,match', [
+    (_Template(multimodal=True), 'state_id.*media'),
+    (_Template(engine_delta=1), 'state_id.*engine ids differ'),
+])
+def test_http_multi_turn_rejects_state_that_cannot_be_resubmitted(template, match):
+    sampler = _Sampler()
+    with pytest.raises(NotImplementedError, match=match):
+        ClientMultiTurnRollout(sampler, template)([_trajectory()])
+    assert sampler.calls == []
 
 
-# =============================================================================
-# Hypothesis strategies
-# =============================================================================
-_MAX_TOOLS = 5
+def test_multimodal_capability_template_allows_text_only_trajectory():
+    sampler = _Sampler(((30, 'stop'), ))
+    result = ClientMultiTurnRollout(sampler, _Template(multimodal=True, has_media=False))([_trajectory()])[0]
+    assert result['input_ids'] == [1, 30]
+    assert result['turns'] == 1
 
 
-def _traj_spec():
-    return st.fixed_dictionaries({
-        'num_tools': st.integers(min_value=0, max_value=_MAX_TOOLS),
-        'terminal': st.sampled_from(['stop', 'length']),
-        'logprobs': st.booleans(),
-    })
-
-
-def _batch_specs(min_size: int = 1, max_size: int = 4):
-    return st.lists(_traj_spec(), min_size=min_size, max_size=max_size)
-
-
-# =============================================================================
-# Multi-turn output length & order preservation
-# =============================================================================
-@settings(deadline=None, max_examples=60)
-@given(scripts_spec=_batch_specs(min_size=0, max_size=5), max_turns=st.integers(min_value=1, max_value=6))
-def test_output_length_and_order_preserved(scripts_spec, max_turns):
-    """``__call__`` returns a list of the same length as the input, in the exact
-    same order (verified via the hidden per-trajectory ``_tid`` tag)."""
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
+def test_http_multi_turn_rechecks_feature_engine_equality_after_bridge():
+    sampler = _Sampler()
     rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=max_turns)
-
-    outs = rollout(copy.deepcopy(trajectories))
-
-    assert len(outs) == len(trajectories)
-    for i, out in enumerate(outs):
-        assert out['_tid'] == i, 'output order must match input order'
+        sampler, _Template(bridge_engine_delta=1), tool_manager=_ToolManager(), max_turns=2)
+    with pytest.raises(NotImplementedError, match='state_id.*engine ids differ'):
+        rollout([_trajectory()])
+    assert len(sampler.calls) == 1
 
 
-# =============================================================================
-# stop_reason value range
-# =============================================================================
-@settings(deadline=None, max_examples=60)
-@given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_stop_reason_value_range(scripts_spec, max_turns):
-    """Every returned trajectory's ``stop_reason`` is one of
-    ``{'length', 'stop', 'max_turns'}``."""
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=max_turns)
+def test_http_multi_turn_requires_new_input_feature():
+    class BrokenSampler:
 
-    outs = rollout(copy.deepcopy(trajectories))
+        @staticmethod
+        def sample(features, sampling_params=None):
+            sequence = SampledSequenceModel(
+                stop_reason='stop', tokens=[10], logprobs=[[(10, -0.1)]], decoded='x')
+            return [SampleResponseModel(sequences=[sequence])]
 
-    for out in outs:
-        assert out['stop_reason'] in {'length', 'stop', 'max_turns'}, out['stop_reason']
+    with pytest.raises(RuntimeError, match='batch index 0.*trajectory 0.*new_input_feature'):
+        ClientMultiTurnRollout(BrokenSampler(), _Template())([_trajectory()])
 
 
-# =============================================================================
-# logprobs / trainable-label alignment
-# =============================================================================
-@settings(deadline=None, max_examples=60)
-@given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_logprobs_align_with_trainable_labels(scripts_spec, max_turns):
-    """For every returned trajectory with a non-empty ``logprobs`` list, its length
-    equals the number of trainable labels (``label != -100``)."""
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=max_turns)
-
-    outs = rollout(copy.deepcopy(trajectories))
-
-    for out in outs:
-        logprobs = out.get('logprobs')
-        if logprobs:
-            trainable = _count_trainable(out.get('labels') or [])
-            assert len(logprobs) == trainable, (f'logprobs({len(logprobs)}) != trainable labels({trainable})')
+def test_http_multi_turn_requires_tool_manager_only_when_called():
+    with pytest.raises(ValueError, match='trajectory 0.*tool_manager'):
+        ClientMultiTurnRollout(_Sampler(), _Template(), max_turns=2)([_trajectory()])
 
 
-# =============================================================================
-# Actual turns never exceed max_turns
-# =============================================================================
-@settings(deadline=None, max_examples=60)
-@given(scripts_spec=_batch_specs(), max_turns=st.integers(min_value=1, max_value=6))
-def test_turns_do_not_exceed_max_turns(scripts_spec, max_turns):
-    """Every returned trajectory's ``turns`` count is <= the configured
-    ``max_turns``."""
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=max_turns)
-
-    outs = rollout(copy.deepcopy(trajectories))
-
-    for out in outs:
-        assert out['turns'] <= max_turns, f"turns({out['turns']}) > max_turns({max_turns})"
+def test_http_multi_turn_marks_length_stop_as_truncated():
+    result = ClientMultiTurnRollout(_Sampler(((10, 'length'), )), _Template())([_trajectory()])[0]
+    assert result['turns'] == 1
+    assert result['stop_reason'] == 'length'
+    assert result['truncated'] is True
 
 
-# =============================================================================
-# Forced truncation at the max_turns edge
-# =============================================================================
-@settings(deadline=None, max_examples=60)
-@given(logprobs_flags=st.lists(st.booleans(), min_size=1, max_size=5))
-def test_max_turns_one_forces_truncation(logprobs_flags):
-    """With ``max_turns == 1`` and a first-round tool_call, every trajectory is
-    marked ``truncated=True`` and ``stop_reason='max_turns'`` and stops after
-    exactly one turn."""
-    # Every trajectory emits a tool_call on its first (and only allowed) turn.
-    scripts_spec = [{'num_tools': 3, 'terminal': 'stop', 'logprobs': lp} for lp in logprobs_flags]
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=1)
-
-    outs = rollout(copy.deepcopy(trajectories))
-
-    assert len(outs) == len(trajectories)
-    for out in outs:
-        assert out['truncated'] is True
-        assert out['stop_reason'] == 'max_turns'
-        assert out['turns'] == 1
+def test_http_multi_turn_preserves_batch_output_order():
+    trajectories = [dict(_trajectory(), sample_id=index) for index in range(4)]
+    results = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())(trajectories)
+    assert [result['sample_id'] for result in results] == [0, 1, 2, 3]
 
 
-@settings(deadline=None, max_examples=60)
-@given(logprobs_flags=st.lists(st.booleans(), min_size=1, max_size=5))
-def test_length_stop_marks_truncated(logprobs_flags):
-    """A reply cut off at the generation budget is ``truncated=True``.
-
-    Same flag as the ``max_turns`` edge above: a consumer that filters on
-    ``truncated`` to separate trajectories that concluded from ones that ran out
-    of room would otherwise treat a cut-off reply as a finished one.
-    """
-    # Terminal turn ends on 'length' with no tool-call turns before it, so the
-    # very first generation is the one that gets cut.
-    scripts_spec = [{'num_tools': 0, 'terminal': 'length', 'logprobs': lp} for lp in logprobs_flags]
-    trajectories, sampler, template = _build_from_scripts(scripts_spec)
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=4)
-
-    outs = rollout(copy.deepcopy(trajectories))
-
-    assert len(outs) == len(trajectories)
-    for out in outs:
-        assert out['stop_reason'] == 'length'
-        assert out['truncated'] is True
-        assert out['turns'] == 1
+@pytest.mark.parametrize('stop_reason', ['stop', 'length', 'abort', 'error'])
+def test_http_multi_turn_stop_reason_stays_in_public_range(stop_reason):
+    result = ClientMultiTurnRollout(_Sampler(((30, stop_reason), )), _Template())([_trajectory()])[0]
+    assert result['stop_reason'] in {'stop', 'length', 'abort', 'error', 'max_turns'}
 
 
-# =============================================================================
-# Deterministic unit tests: exception paths & dependency reuse (non-hypothesis)
-#
-# These cover the failure/edge contract described in the module docstring of
-# ``twinkle_client.rollout.multi_turn``.
-# All are CPU-only and reuse the Fake infra above.
-# =============================================================================
-class NetworkError(Exception):
-    """Stand-in for a requests-style transport error (connection reset/timeout)."""
+@pytest.mark.parametrize('scripts', [
+    ((10, 'stop'), (20, 'stop')),
+    ((10, 'stop'), (21, 'length')),
+])
+def test_http_multi_turn_scripts_keep_logprobs_aligned_with_policy_labels(scripts):
+    result = ClientMultiTurnRollout(
+        _Sampler(scripts), _Template(), tool_manager=_ToolManager(), max_turns=2)([_trajectory()])[0]
+    policy_positions = sum(
+        label != -100 and mask
+        for label, mask in zip(result['labels'], result['completion_mask'])
+    )
+    assert len(result['logprobs']) == policy_positions == result['turns']
 
 
-class _NullFeatureSampler:
-    """Sampler that violates the contract by returning ``new_input_feature=None``.
+def test_http_multi_turn_max_turns_one_truncates_before_tool_dispatch():
+    class RecordingTools(_ToolManager):
+        calls = 0
 
-    Mirrors ``vLLMSampler.sample()`` shape (returns ``List[SampleResponseModel]``)
-    but every sequence lacks ``new_input_feature``, which must make the multi-turn
-    loop raise a batch/trajectory-indexed ``RuntimeError``.
-    """
+        @classmethod
+        def call_many(cls, tool_calls):
+            cls.calls += 1
+            return super().call_many(tool_calls)
 
-    def __init__(self, template: FakeTemplate) -> None:
-        self.template = template
-        self.sample_calls = 0
-
-    def sample(self, inputs, sampling_params=None, **kwargs):
-        if isinstance(inputs, dict):
-            inputs = [inputs]
-        self.sample_calls += 1
-        responses: List[SampleResponseModel] = []
-        for _ in inputs:
-            seq = SampledSequenceModel(
-                stop_reason='stop',
-                tokens=[0, 1],
-                logprobs=None,
-                decoded='final',
-                new_input_feature=None,  # contract violation under test
-            )
-            responses.append(SampleResponseModel(sequences=[seq]))
-        return responses
+    result = ClientMultiTurnRollout(
+        _Sampler(((10, 'stop'), )), _Template(), tool_manager=RecordingTools(), max_turns=1)([_trajectory()])[0]
+    assert result['turns'] == 1
+    assert result['stop_reason'] == 'max_turns'
+    assert result['truncated'] is True
+    assert RecordingTools.calls == 0
 
 
-class _NetworkFailingSampler:
-    """Sampler whose ``sample()`` always raises a network-like exception.
+def test_http_multi_turn_propagates_network_error_unchanged():
+    class NetworkError(Exception):
+        pass
 
-    Used to assert the rollout NEVER wraps or swallows transport errors coming
-    from ``vLLMSampler.sample()``; they must propagate unchanged.
-    """
+    sentinel = NetworkError('connection reset')
 
-    def __init__(self, template: FakeTemplate, exc: Exception) -> None:
-        self.template = template
-        self._exc = exc
-        self.sample_calls = 0
+    class FailingSampler:
 
-    def sample(self, inputs, sampling_params=None, **kwargs):
-        self.sample_calls += 1
-        raise self._exc
+        @staticmethod
+        def sample(features, sampling_params=None):
+            raise sentinel
 
-
-def test_missing_new_input_feature_raises_indexed_runtime_error():
-    """new_input_feature=None -> RuntimeError naming batch AND trajectory index."""
-    trajectories, _script_sampler, template = _build_from_scripts([{
-        'num_tools': 0,
-        'terminal': 'stop',
-        'logprobs': False
-    }])
-    sampler = _NullFeatureSampler(template)
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        rollout(copy.deepcopy(trajectories))
-
-    msg = str(excinfo.value)
-    # Message must carry both the batch index and the trajectory index so the
-    # failure is localizable in a batched HTTP round.
-    assert 'batch index 0' in msg, msg
-    assert 'trajectory 0' in msg, msg
-    assert 'new_input_feature' in msg, msg
+    with pytest.raises(NetworkError) as error:
+        ClientMultiTurnRollout(FailingSampler(), _Template())([_trajectory()])
+    assert error.value is sentinel
 
 
-def test_tool_calls_without_tool_manager_raises_value_error():
-    """tool_calls produced but tool_manager missing -> ValueError."""
-    # One tool-call turn then a terminal turn; max_turns=2 so the tool-dispatch
-    # site (not the max_turns truncation edge) is what fails.
-    trajectories, sampler, template = _build_from_scripts([{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=None, max_turns=2)
-
-    with pytest.raises(ValueError) as excinfo:
-        rollout(copy.deepcopy(trajectories))
-
-    msg = str(excinfo.value)
-    assert 'tool_manager' in msg, msg
-    assert 'trajectory 0' in msg, msg
-
-
-def test_tool_calls_without_tool_manager_via_per_call_kwarg_raises_value_error():
-    """Passing tool_manager=None as a per-call kwarg also raises at dispatch."""
-    trajectories, sampler, template = _build_from_scripts([{'num_tools': 1, 'terminal': 'stop', 'logprobs': False}])
-    # Constructed WITH a manager, but the per-call override nulls it out.
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=2)
-
-    with pytest.raises(ValueError):
-        rollout(copy.deepcopy(trajectories), tool_manager=None)
-
-
-def test_sampler_network_error_propagates_unchanged():
-    """vLLMSampler.sample() network error propagates unchanged (not swallowed/wrapped)."""
-    trajectories, _script_sampler, template = _build_from_scripts([{
-        'num_tools': 0,
-        'terminal': 'stop',
-        'logprobs': False
-    }])
-    sentinel = NetworkError('simulated connection reset by peer')
-    sampler = _NetworkFailingSampler(template, sentinel)
-    rollout = ClientMultiTurnRollout(sampler=sampler, template=template, tool_manager=_make_tool_manager(), max_turns=3)
-
-    with pytest.raises(NetworkError) as excinfo:
-        rollout(copy.deepcopy(trajectories))
-
-    # Same exact exception object, neither re-wrapped nor replaced.
-    assert excinfo.value is sentinel
-    assert str(excinfo.value) == 'simulated connection reset by peer'
-    assert sampler.sample_calls == 1
-
-
-def test_dependencies_are_reused_not_reimplemented():
-    """ClientMultiTurnRollout imports (does not copy) ToolManager & extend_with_bridge."""
-    import twinkle_agentic.tools.tool_manager as tool_manager_mod
-    import twinkle_agentic.utils.token_utils as token_utils_mod
-    import twinkle_client.rollout.multi_turn as m
-
-    # Same object identity => the symbols are imported from the shared core-lib
-    # modules rather than re-defined locally.
-    assert m.ToolManager is tool_manager_mod.ToolManager
-    assert m.extend_with_bridge is token_utils_mod.extend_with_bridge
+def test_http_multi_turn_validates_public_arguments():
+    with pytest.raises(ValueError, match='Template'):
+        ClientMultiTurnRollout(object(), None)
+    with pytest.raises(ValueError, match='max_turns'):
+        ClientMultiTurnRollout(object(), _Template(), max_turns=0)

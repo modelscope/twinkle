@@ -1,27 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Cluster elasticity for online RL: estimate a resource plan, and adaptively move sampler replicas.
-
-The trainer world is immutable: runtime changes always move one COMPLETE replica (add/remove the
-sampler's Ray actors) and never alter training collectives or batch geometry. Three capabilities live
-here, one per recipe seam:
-
-* :func:`estimate_plan` -- pure static planning from the HF config + prompt lengths + card memory
-  ('manual' returns None; 'estimate'/'adaptive' produce an :class:`RLResourcePlan` and write the
-  derived parallel sizes back into the caller's configs). Runs BEFORE twinkle.initialize, so the
-  device groups and engine args are built from the planned sizes.
-* :class:`ClusterAdapter` -- the 'adaptive' runtime: observes trainer-idle / sampler-busy windows at
-  publish boundaries and moves whole replicas between a dedicated pool, a shared (borrowed-GPU) pool
-  and a pre-reserved flex pool. What dev split across an ``AdaptiveResourceController`` plus an
-  ``AdaptiveColocateHandover`` that pointed at each other is ONE object here.
-* :meth:`ClusterAdapter.publish` -- the whole weight-publication barrier as one call: quiesce
-  admission, run the controller's prepare/finish phases around the dedicated NCCL sync, borrow the
-  shared engines, and restore everything on failure. The recipe's visible loop body is
-  ``adapter.publish() if adapter else engine.sync_weights()``.
-
-Scale safety invariants kept from the dev original: a frozen model's rank count comes from its OWN
-parallel spec (never a hard-coded single GPU); flex GPUs are reserved at initialization and must hold
-one complete sampler replica; the plan's non-shared + flex ranks form a contiguous range from zero.
-"""
 from __future__ import annotations
 
 import math
@@ -30,7 +7,12 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from twinkle.perf import CounterRegistry
+
+if TYPE_CHECKING:
+    from .streaming_driver import DriverStats
 
 _GIB = 1024**3
 _ALLOWED_OVERRIDE_KEYS = frozenset({
@@ -131,12 +113,19 @@ class ModelMemoryEstimate:
 
 @dataclass
 class ResourceWindow:
-    """One observe-window sample of the trainer/sampler time balance (per optimizer step)."""
+    """One observe-window sample of the production/consumption time balance (per optimizer step).
+
+    ``trainer_idle`` / ``score_time`` / ``generation_time`` are the window's wall-clock deltas: the
+    trainer bubble, the scoring channel's occupancy (reap waits), and the generation channel's
+    occupancy (in-flight admit->collect time). ``blocked_passes`` counts admission passes gated by
+    backpressure (buffer capacity or the staleness window) -- the production-surplus signal.
+    """
 
     step: int
     trainer_idle: float
-    sampler_busy: float
     score_time: float
+    generation_time: float
+    blocked_passes: float
     handover_time: float
 
 
@@ -165,8 +154,8 @@ class RLResourceEstimator:
     @staticmethod
     def _cluster_min_gpu_memory_gib() -> float:
         try:
-            import ray
-            resources = ray.cluster_resources() if ray.is_initialized() else {}
+            from twinkle.infra import cluster_resources
+            resources = cluster_resources()
             for key, value in resources.items():
                 if key.startswith('accelerator_memory_gib_'):
                     return float(value)
@@ -608,8 +597,9 @@ class ClusterAdapter:
         self.in_generation = False
         self._closed = False
         self.last_error = None
-        self.borrow_time = 0.0
-        self.reclaim_time = 0.0
+        # Hand-over accounting rides the perf package's always-live counters: per-adapter
+        # lifecycle, monotonic, observe reads window deltas off it.
+        self._counters = CounterRegistry()
         self._windows: deque = deque(maxlen=window_steps)
         self._last_change_step = -min_hold_steps
         self._shared_pressure_windows = 0
@@ -770,15 +760,17 @@ class ClusterAdapter:
             except Exception as cleanup:
                 self.last_error = self.last_error or f'{type(cleanup).__name__}: {cleanup}'
             raise
-        self.borrow_time += time.perf_counter() - started
+        # Bare add (not time_span): the interval must exclude the except-path cleanup, which calls
+        # reclaim() and is timed there -- a time_span around the try would double-count it.
+        self._counters.add('handover', time.perf_counter() - started)
 
     def reclaim(self) -> None:
         """Stop shared admission, sleep the shared engines, and restore the trainer's GPU residency."""
         if not self.in_generation:
             return
-        started = time.perf_counter()
         shared_ids = self.sampler.worker_ids(shared=True)
-        try:
+        # time_span's finally carries the old try/finally semantics: failure paths still count.
+        with self._counters.time_span('handover'):
             self.sampler.pause_workers(shared_ids)
             self.sampler.pause_generation(_worker_ids=shared_ids)
             _wait(self.sampler.sleep(level=self.sleep_level, _worker_ids=shared_ids))
@@ -786,8 +778,6 @@ class ClusterAdapter:
             # only after the engines are down.
             self._reload_models()
             self.in_generation = False
-        finally:
-            self.reclaim_time += time.perf_counter() - started
 
     def _reload_models(self) -> None:
         error = None
@@ -846,7 +836,7 @@ class ClusterAdapter:
             if handle is not None and self._free_flex_groups:
                 group = self._free_flex_groups.popleft()
                 try:
-                    worker_ids = handle.add_workers(group, list(self._flex_groups[group]))
+                    worker_ids = handle.add_replicas(group)
                     self._rm_flex_workers[role] = (group, worker_ids)
                 except BaseException:
                     self._free_flex_groups.appendleft(group)
@@ -860,7 +850,7 @@ class ClusterAdapter:
                 # whole retirement (the scoring worker's in-flight call finishes on the actor Ray
                 # keeps alive until the call returns).
                 handle = self.elastic_models[role]
-                handle.remove_workers(worker_ids)
+                handle.remove_replicas(worker_ids)
                 self._rm_flex_workers.pop(role, None)
                 self._free_flex_groups.append(group)
         if decision is not None:
@@ -963,7 +953,7 @@ class ClusterAdapter:
                 except Exception:
                     pass
             try:
-                self.sampler.cancel_all_generations()
+                self.sampler.abort_all_inflight()
             finally:
                 self.reclaim()
         finally:
@@ -977,19 +967,26 @@ class ClusterAdapter:
 
     # --- observation / decision ------------------------------------------------------------------------
 
-    def observe(self, *, step: int, driver_stats: Any, score_time: float = 0.0) -> ResourceWindow:
-        """Fold one batch boundary's stat deltas into the decision window (the commit boundary)."""
+    def observe(self, *, step: int, driver_stats: DriverStats) -> ResourceWindow:
+        """Fold one batch boundary's stat deltas into the decision window (the commit boundary).
+
+        Every signal is a driver-local counter read off ``driver_stats`` (zero RPC): train / idle /
+        score / generation are mutually-exclusive wall-clock buckets on the driver thread, blocked
+        counts the backpressure-gated admission passes.
+        """
         current = {
             'train': float(driver_stats.train_active_time),
             'idle': float(driver_stats.idle_time),
-            'score': float(score_time),
-            'sampler': float(self.sampler.service_time),
-            'handover': self.borrow_time + self.reclaim_time,
+            'score': float(driver_stats.score_time),
+            'generation': float(driver_stats.generation_time),
+            'blocked': float(driver_stats.capacity_blocked_passes + driver_stats.staleness_blocked_passes),
+            'handover': self._counters.get('handover'),
         }
         delta = {key: value - self._last_stats.get(key, value) for key, value in current.items()}
         self._last_stats = current
         total = max(1e-9, delta['train'] + delta['idle'])
-        window = ResourceWindow(step, delta['idle'] / total, delta['sampler'], delta['score'], delta['handover'])
+        window = ResourceWindow(step, delta['idle'] / total, delta['score'], delta['generation'],
+                                delta['blocked'], delta['handover'])
         self._windows.append(window)
         return window
 
@@ -1013,20 +1010,27 @@ class ClusterAdapter:
                 return 'scale_down_sampler'
             if self._shared_enabled:
                 return 'deactivate_shared'
-        # RM-side elasticity: the scoring share of the cycle is the signal -- when half the window's
-        # wall time is group-barrier scoring, an extra frozen RM replica pays for itself (the RM is
-        # a stateless forward service: no weight sync, no in-flight migration). Reclaim the same way
-        # when scoring drops back to a quarter of the cycle. The threshold is a constant, not a
-        # knob: no consumer has tuning evidence yet.
+        # RM-side elasticity, channel-split: the production side's wall time divides into the scoring
+        # channel (score_time -- the reap waits) and the generation channel (generation_time -- in-flight
+        # occupancy); the scoring share picks WHICH channel grows, replacing the old merged share that
+        # could only ever pick the first role without a replica. The near-dead-band (score_share within
+        # 0.35..0.65) refuses the channel call: with the two channels at comparable speed, a replica on
+        # either side pays back too little to justify its engine-load cost, and acting would only
+        # oscillate -- paired with the per-change hold above (one change per min_hold_steps) this is the
+        # anti-oscillation pair. Backpressure (blocked passes) plus a drained idle window is the
+        # production-surplus signal for shrinking. The thresholds are constants, not knobs: no consumer
+        # has tuning evidence yet.
         if self.elastic_models:
             score = statistics.fmean(window.score_time for window in self._windows)
-            total = statistics.fmean(window.trainer_idle + window.score_time for window in self._windows)
-            share = score / total if total > 0 else 0.0
+            generation = statistics.fmean(window.generation_time for window in self._windows)
+            blocked = statistics.fmean(window.blocked_passes for window in self._windows)
+            channel_total = score + generation
+            score_share = score / channel_total if channel_total > 0 else 0.0
             has_rm_replica = any(self._rm_flex_workers.get(role) for role in self.elastic_models)
-            if share > 0.5 and self._free_flex_groups:
+            if score_share > 0.65 and idle > 0 and self._free_flex_groups:
                 return next((f'scale_up_rm:{role}' for role in self.elastic_models
                              if not self._rm_flex_workers.get(role)), None)
-            if share < 0.25 and has_rm_replica:
+            if score_share < 0.35 and has_rm_replica and (blocked > 0 or idle < 0.75 * handover):
                 return next((f'scale_down_rm:{role}' for role in self.elastic_models
                              if self._rm_flex_workers.get(role)), None)
         return None

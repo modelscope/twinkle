@@ -41,10 +41,7 @@ class HarnessLeases(Leases[AgentHarness]):
         """Drop the harness that was handed back and lend a fresh one."""
         close = getattr(harness, 'close', None)
         if close is not None:
-            try:
-                close()
-            except Exception:  # noqa: BLE001 -- a dead harness must not block the next job
-                pass
+            close()
         return self._factory()
 
 

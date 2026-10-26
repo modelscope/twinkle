@@ -7,16 +7,15 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, List, Type, TypeVar, Union
+from typing import TypeVar, Union
 
-from ..hub import HFHub, MSHub
 from .unsafe import trust_remote_code
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 #: Resolved plugin path (or hub id) -> imported module, so loading the same plugin twice is a no-op
 #: rather than a re-import, and two different plugins never collide on a shared module name.
-_LOADED_MODULES: Dict[str, ModuleType] = {}
+_LOADED_MODULES: dict[str, ModuleType] = {}
 
 #: Env var carrying a ``module:attr`` worker-startup hook the driver registers. A Ray worker inherits it
 #: through its ``runtime_env`` (``os.environ.copy()``), and :func:`run_worker_setup_hook` resolves and calls
@@ -24,7 +23,7 @@ _LOADED_MODULES: Dict[str, ModuleType] = {}
 #: in the environment, resolved lazily) keeps twinkle agnostic of whoever registers the hook: swift points
 #: it at its own plugin reloader so an ``--external_plugins`` file the driver imported is re-imported --
 #: and its ``@register`` side effects re-run -- in every worker.
-WORKER_SETUP_HOOK_ENV = 'TWINKLE_WORKER_SETUP_HOOK'
+WORKER_SETUP_HOOK_ENV = "TWINKLE_WORKER_SETUP_HOOK"
 
 
 def run_worker_setup_hook() -> None:
@@ -39,7 +38,7 @@ def run_worker_setup_hook() -> None:
     target = os.environ.get(WORKER_SETUP_HOOK_ENV)
     if not target:
         return
-    module_name, _, attr = target.partition(':')
+    module_name, _, attr = target.partition(":")
     getattr(importlib.import_module(module_name), attr)()
 
 
@@ -51,7 +50,7 @@ def _unique_module_name(path: Path) -> str:
     plugin was ignored". Deriving the name from the absolute path keeps distinct plugins distinct and
     makes reloading the same path idempotent.
     """
-    return f'twinkle_plugin_{hashlib.sha1(str(path).encode()).hexdigest()[:8]}_{path.stem}'
+    return f"twinkle_plugin_{hashlib.sha1(str(path).encode()).hexdigest()[:8]}_{path.stem}"
 
 
 def _load_local(path: Path) -> ModuleType:
@@ -62,13 +61,13 @@ def _load_local(path: Path) -> ModuleType:
     """
     path = path.expanduser().resolve()
     if path.is_dir():
-        folder, target = path, path / '__init__.py'
+        folder, target = path, path / "__init__.py"
         if not target.is_file():
-            raise FileNotFoundError(f'plugin folder {folder} has no __init__.py.')
+            raise FileNotFoundError(f"plugin folder {folder} has no __init__.py.")
     elif path.is_file():
         folder, target = path.parent, path
     else:
-        raise FileNotFoundError(f'plugin path {path} is neither a file nor a folder.')
+        raise FileNotFoundError(f"plugin path {path} is neither a file nor a folder.")
 
     key = str(target)
     if key in _LOADED_MODULES:
@@ -96,14 +95,16 @@ def _load_local(path: Path) -> ModuleType:
 
 def _load_hub(plugin_id: str, **kwargs) -> ModuleType:
     """Download a ``hf://`` / ``ms://`` plugin and import it. Refused in safe mode."""
+    from ..hub import HFHub, MSHub
+
     if not trust_remote_code():
-        raise ValueError('Twinkle does not support plugin in safe mode.')
-    if plugin_id.startswith('hf://'):
-        plugin_dir = HFHub.download_model(plugin_id[len('hf://'):], **kwargs)
-    elif plugin_id.startswith('ms://'):
-        plugin_dir = MSHub.download_model(plugin_id[len('ms://'):], **kwargs)
+        raise ValueError("Twinkle does not support plugin in safe mode.")
+    if plugin_id.startswith("hf://"):
+        plugin_dir = HFHub.download_model(plugin_id[len("hf://") :], **kwargs)
+    elif plugin_id.startswith("ms://"):
+        plugin_dir = MSHub.download_model(plugin_id[len("ms://") :], **kwargs)
     else:
-        raise ValueError(f'Unknown plugin id {plugin_id}, please use hf:// or ms://')
+        raise ValueError(f"Unknown plugin id {plugin_id}, please use hf:// or ms://")
     return _load_local(Path(plugin_dir))
 
 
@@ -122,7 +123,7 @@ def load_module(source: str, **kwargs) -> ModuleType:
     never collides. ``construct_class`` falls back here for a string it cannot find in the kernel
     namespace; swift's ``PluginRegistry.load_external`` calls it to run a plugin file's ``@register``.
     """
-    if source.startswith('hf://') or source.startswith('ms://'):
+    if source.startswith("hf://") or source.startswith("ms://"):
         return _load_hub(source, **kwargs)
     return _load_local(Path(source))
 
@@ -131,7 +132,7 @@ class Plugin:
     """Resolve a plugin source to a concrete subclass of a kernel base class."""
 
     @staticmethod
-    def load_plugin(plugin_id: str, plugin_base: Type[T], **kwargs) -> Type[T]:
+    def load_plugin(plugin_id: str, plugin_base: type[T], **kwargs) -> type[T]:
         """``plugin_id`` (local file/folder or ``hf://``/``ms://`` id) -> the ``plugin_base`` subclass it defines.
 
         Only classes DEFINED in the loaded module count (``__module__`` match), so a plugin that merely
@@ -141,11 +142,12 @@ class Plugin:
         for _, plugin_cls in inspect.getmembers(plugin_module, inspect.isclass):
             if plugin_base in plugin_cls.__mro__[1:] and plugin_cls.__module__ == plugin_module.__name__:
                 return plugin_cls
-        raise ValueError(f'Cannot find any subclass of {plugin_base.__name__} in {plugin_id}.')
+        raise ValueError(f"Cannot find any subclass of {plugin_base.__name__} in {plugin_id}.")
 
 
-def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: Union[List[ModuleType], ModuleType],
-                    **init_args) -> T:
+def construct_class(
+    func: str | type[T] | T, class_T: type[T], module_T: list[ModuleType] | ModuleType, **init_args
+) -> T:
     """Try to load a class.
 
     Args:

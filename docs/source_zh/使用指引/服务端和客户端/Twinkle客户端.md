@@ -216,6 +216,7 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 - **vLLMSampler**：指向服务端 Sampler 服务的客户端采样器。
 - **ToolManager**（可选）：注册你的工具；若某条 trajectory 产生了 tool_calls 但未提供 tool_manager，会在派发时抛 `ValueError`。
 - **`num_samples=1`**：当前每条 trajectory 只采样一次。做 GRPO group 时，把同一个 prompt 复制成 `NUM_GENERATIONS` 条独立 trajectory 即可。
+- **仅限可证明安全的纯文本轨迹**：客户端会逐轮验证 state 不含媒体且 `feature.input_ids == engine_input_ids`。模板可以具备多模态能力；只有当前轨迹实际携带媒体或两种编码不一致时才会抛 `NotImplementedError`，等待服务端 `state_id`。
 
 ### 最小示例
 

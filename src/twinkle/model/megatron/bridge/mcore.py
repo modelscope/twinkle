@@ -7,12 +7,8 @@ from typing import Any, Dict, List
 class MCoreBridgeBackend:
     """The default backend: build a Megatron model through mcore-bridge.
 
-    ``MegatronStrategy.get_model_config`` / ``create_megatron_model`` delegate here, so this is the
-    construction path a plain strategy run takes. Every branch matters beyond the forward loss a
-    bit-match test can see: backward grad scaling (``calculate_per_token_loss``), MoE dispatch
-    (``moe_token_dispatcher_type``), kernel fusion and NPU flash attention are all invisible to a
-    dense/GPU/forward-only check, so their correctness is carried by this code rather than a test.
-    """
+    Beyond the forward loss, this code carries backward grad scaling
+    (``calculate_per_token_loss``), MoE dispatch and fusion-flag/NPU correctness."""
     backend_name = 'mcore-bridge'
 
     @property
@@ -23,7 +19,7 @@ class MCoreBridgeBackend:
     def build_model_config(self, hf_config: Any, parallel_kwargs: Dict[str, Any], strategy: Any, **kwargs) -> Any:
         from mcore_bridge import ModelConfig, hf_to_mcore_config
         from twinkle import Platform
-        from twinkle.model.megatron._mindspeed_runtime import configure_mindspeed_runtime_args
+        from twinkle.model.megatron.utils._mindspeed_runtime import configure_mindspeed_runtime_args
         from twinkle.model.megatron.strategy.megatron import finalize_model_grads_for_lora
 
         # Internal provenance used by MegatronBridgeBackend to distinguish an explicit user option
@@ -37,20 +33,13 @@ class MCoreBridgeBackend:
         # MoE dispatch: variable_seq_lengths gates alltoall vs allgather (MoE models only).
         if 'moe_token_dispatcher_type' not in config_kwargs:
             config_kwargs['moe_token_dispatcher_type'] = ('alltoall' if strategy.variable_seq_lengths else 'allgather')
-        # Align fusion flags with legacy: mcore's TransformerConfig defaults them False, while legacy
-        # Megatron-SWIFT defaults them True and copies that onto ModelConfig. Leaving them unset makes
-        # the run use unfused kernels where legacy uses fused ones, which is not numerically equivalent
-        # in low precision (notably bias_activation_fusion's SwiGLU path). gradient_accumulation_fusion
-        # is excluded on purpose: it hard-fails without the optional APEX extension, whereas legacy
-        # falls back to unfused, so forcing it here would break setups legacy tolerates.
+        # Align fusion flags with legacy (mcore defaults them False); bias_activation_fusion
+        # changes SwiGLU arithmetic in low precision. gradient_accumulation_fusion is excluded
+        # because it hard-fails without APEX, which legacy tolerates.
         for _fusion_flag in ('bias_activation_fusion', 'masked_softmax_fusion', 'bias_dropout_fusion'):
             config_kwargs.setdefault(_fusion_flag, True)
-        # This backend builds the model on CPU and moves the shards to GPU in create_model, so it owns
-        # use_cpu_initialization=True. MegatronConfig also exposes a use_cpu_initialization field which
-        # forwarded model kwargs can carry into config_kwargs, so passing it explicitly below as well
-        # would give ModelConfig two values for the same keyword. Drop the forwarded one and let the
-        # bridge's required value win. (The megatron-bridge backend folds config kwargs by hasattr
-        # instead and never double-passes, so it needs no such guard.)
+        # This backend builds on CPU and moves shards to GPU in create_model, so it owns
+        # use_cpu_initialization=True; drop any forwarded copy to avoid a duplicate keyword.
         config_kwargs.pop('use_cpu_initialization', None)
         model_config = ModelConfig(
             use_cpu_initialization=True,

@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from copy import copy
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Union
+
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from copy import copy
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
@@ -30,45 +31,47 @@ class PackedSeqParams:
 @remote_class()
 class InputProcessor:
     padding_map = {
-        'input_ids': 0,
-        'mm_token_type_ids': 0,
-        'inputs_embeds': 0.0,
-        'attention_mask': 0,
-        'labels': -100,
-        'completion_mask': 0,
-        'loss_scale': 0.0,
-        'position_ids': -1,
-        'length': -1,
-        'pixel_values': 0.0,
-        'image_grid_thw': 0,
-        'pixel_values_videos': 0.0,
-        'video_grid_thw': 0,
-        'input_features': 0.0,
-        'feature_attention_mask': 0,
-        'routed_experts': 0,
-        'replay_mask': 0,
+        "input_ids": 0,
+        "mm_token_type_ids": 0,
+        "inputs_embeds": 0.0,
+        "attention_mask": 0,
+        "labels": -100,
+        "completion_mask": 0,
+        "loss_scale": 0.0,
+        "position_ids": -1,
+        "length": -1,
+        "pixel_values": 0.0,
+        "image_grid_thw": 0,
+        "pixel_values_videos": 0.0,
+        "video_grid_thw": 0,
+        "input_features": 0.0,
+        "feature_attention_mask": 0,
+        "routed_experts": 0,
+        "replay_mask": 0,
     }
 
     # VLM fields to concatenate (not pad) in batch
     VLM_CONCAT_FIELDS = {
-        'pixel_values',
-        'image_grid_thw',
-        'pixel_values_videos',
-        'video_grid_thw',
-        'input_features',
-        'input_features_mask',
-        'feature_attention_mask',
-        'grid_thws',
+        "pixel_values",
+        "image_grid_thw",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "input_features",
+        "input_features_mask",
+        "feature_attention_mask",
+        "grid_thws",
     }
 
-    def __init__(self,
-                 device_mesh: Optional[DeviceMesh] = None,
-                 padding_free: bool = False,
-                 framework: Literal['transformers', 'megatron'] = 'transformers',
-                 **kwargs):
+    def __init__(
+        self,
+        device_mesh: DeviceMesh | None = None,
+        padding_free: bool = False,
+        framework: Literal["transformers", "megatron"] = "transformers",
+        **kwargs,
+    ):
         self.device_mesh = device_mesh
         # right is always used in training, and is fit for megatron
-        self.padding_side = kwargs.get('padding_side', 'right')
+        self.padding_side = kwargs.get("padding_side", "right")
         self.padding_free = padding_free
         self.framework = framework
         self.process_pipeline = [
@@ -87,24 +90,22 @@ class InputProcessor:
 
     @remote_function()
     @timed
-    def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
-                 **kwargs) -> Union[InputFeature, List[InputFeature]]:
+    def __call__(self, inputs: InputFeature | list[InputFeature], **kwargs) -> InputFeature | list[InputFeature]:
         for pipe in self.process_pipeline:
             inputs = pipe(inputs, **kwargs)
         return inputs
 
-    def prepare_outputs(self, inputs: List[InputFeature], **kwargs) -> Union[List[InputFeature], InputFeature]:
-        if self.framework == 'transformers':
+    def prepare_outputs(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature] | InputFeature:
+        if self.framework == "transformers":
             return inputs[0]
         else:
             for _input in inputs:
-                if 'position_ids' in _input and _input['position_ids'] is not None and _input['position_ids'].dim() > 2:
+                if "position_ids" in _input and _input["position_ids"] is not None and _input["position_ids"].dim() > 2:
                     # megatron needs 3, 1, N
-                    _input['position_ids'] = _input['position_ids'][1:]
+                    _input["position_ids"] = _input["position_ids"][1:]
             return inputs
 
-    def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
-
+    def prepare_inputs(self, inputs: list[InputFeature] | InputFeature, **kwargs) -> list[InputFeature]:
         def to_tensor(_input):
             for key in list(_input.keys()):
                 value = _input[key]
@@ -115,8 +116,11 @@ class InputProcessor:
                     value = torch.from_numpy(value)
                 elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                     value = torch.tensor(value)
-                elif (key == 'labels' and isinstance(value, (int, float, np.number))
-                      and not isinstance(value, (bool, np.bool_))):
+                elif (
+                    key == "labels"
+                    and isinstance(value, (int, float, np.number))
+                    and not isinstance(value, (bool, np.bool_))
+                ):
                     # seq_cls / regression / reranker emit ONE scalar label per sequence (a class index or
                     # a regression target), not a per-token sequence. The branches above only catch ndarray
                     # and numeric LIST values, so a bare scalar would fall through, get collated into a
@@ -125,11 +129,11 @@ class InputProcessor:
                     # normal tensor path to a batched [B, 1] device tensor; SeqClsLoss reduces it back with
                     # view(-1) / squeeze. bool is excluded because it subclasses int.
                     value = torch.tensor([value])
-                elif key == 'position_ids' and not isinstance(value, torch.Tensor):
+                elif key == "position_ids" and not isinstance(value, torch.Tensor):
                     if value is None:
                         continue
                     value = torch.tensor(value)
-                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids', 'routed_experts'):
+                elif (isinstance(value, list)) and key in ("completion_mask", "mm_token_type_ids", "routed_experts"):
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
@@ -144,20 +148,21 @@ class InputProcessor:
 
         return [to_tensor(_input) for _input in inputs]
 
-    def apply_transformers_sp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        sp_strategy = kwargs.get('sp_strategy')
-        if self.framework != 'transformers' or sp_strategy is None:
+    def apply_transformers_sp(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
+        sp_strategy = kwargs.get("sp_strategy")
+        if self.framework != "transformers" or sp_strategy is None:
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         results = []
         for _input in inputs:
             payload = dict(_input)
-            payload['padding_free'] = padding_free
+            payload["padding_free"] = padding_free
             results.append(InputFeature(**sp_strategy.preprocess_inputs(payload)))
         return results
 
-    def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
-                              **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def postprocess_tensor_sp(
+        self, inputs: dict[str, Any], outputs: dict[str, Any], **kwargs
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Adjust SP tensors after forward and before loss computation.
 
         Pipeline: SP gather → packed-sequence unpack.
@@ -175,15 +180,15 @@ class InputProcessor:
         this method pools them to ``[n_seqs, num_labels]`` via the same packed-aware
         last-valid-token logic as embedding.
         """
-        sp_strategy = kwargs.get('sp_strategy')
-        task = kwargs.get('task', 'causal_lm')
-        if task == 'embedding':
+        sp_strategy = kwargs.get("sp_strategy")
+        task = kwargs.get("task", "causal_lm")
+        if task == "embedding":
             return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
-        if task == 'generative_reranker':
+        if task == "generative_reranker":
             return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
-        if task in ('seq_cls', 'reranker'):
+        if task in ("seq_cls", "reranker"):
             return self._postprocess_seq_cls(inputs, outputs, sp_strategy=sp_strategy)
-        if self.framework == 'transformers' and sp_strategy is not None:
+        if self.framework == "transformers" and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
         return inputs, outputs
 
@@ -196,10 +201,9 @@ class InputProcessor:
         boundaries = torch.cat([starts, end_anchor])
         return (boundaries[1:] - 1).long()
 
-    def _postprocess_embedding(self,
-                               inputs: Dict[str, Any],
-                               outputs: Dict[str, Any],
-                               sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def _postprocess_embedding(
+        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Pool per-token features to per-sequence embeddings (last-valid-token).
 
         Build a one-hot end-token mask in the un-padded global frame, route it
@@ -208,9 +212,10 @@ class InputProcessor:
         tensor across SP × RP. No feature gather; uniform across
         DP / Ulysses / zigzag-ring / padding-free.
         """
-        features = outputs.get('features')
+        features = outputs.get("features")
         assert features is not None, (
-            "outputs['features'] missing; ensure TransformersEmbeddingPatch is applied for task='embedding'.")
+            "outputs['features'] missing; ensure TransformersEmbeddingPatch is applied for task='embedding'."
+        )
 
         pooled, is_packed = self._pool_last_valid_token(features, inputs, sp_strategy=sp_strategy)
 
@@ -218,14 +223,13 @@ class InputProcessor:
         embeddings = F.normalize(pooled, p=2, dim=-1)
 
         outputs = copy(outputs)
-        outputs.pop('features', None)
-        outputs['embeddings'] = embeddings.contiguous()
+        outputs.pop("features", None)
+        outputs["embeddings"] = embeddings.contiguous()
         return inputs, outputs
 
-    def _postprocess_generative_reranker(self,
-                                         inputs: Dict[str, Any],
-                                         outputs: Dict[str, Any],
-                                         sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def _postprocess_generative_reranker(
+        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reduce per-token generative-reranker scores ``[B, T, 1]`` to ``[n_seqs, 1]``.
 
         Symmetric with embedding pooling (same last-valid-token gather, SP/packed-aware), but the
@@ -233,37 +237,42 @@ class InputProcessor:
         writes per token -- and there is NO L2 normalize: a relevance score is a scalar, not a
         direction. Mirrors legacy RerankerTrainer, which reads ``logits[batch, last_valid]``.
         """
-        logits = outputs.get('logits')
+        logits = outputs.get("logits")
         assert logits is not None, (
             "outputs['logits'] missing; ensure TransformersGenerativeRerankerPatch is applied and the "
-            'reranker loss sets require_logits=True.')
+            "reranker loss sets require_logits=True."
+        )
         pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
         outputs = copy(outputs)
-        outputs['logits'] = pooled.contiguous()
+        outputs["logits"] = pooled.contiguous()
         return inputs, outputs
 
-    def _postprocess_seq_cls(self,
-                             inputs: Dict[str, Any],
-                             outputs: Dict[str, Any],
-                             sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def _postprocess_seq_cls(
+        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Pool per-token seq_cls/reranker scores ``[B, T, num_labels]`` to ``[n_seqs, num_labels]``.
 
         Same last-valid-token logic as embedding/generative_reranker, packed-aware.
         TransformersValuePatch(squeeze_single=False) surfaces the per-token scores;
         this method reduces them so the loss sees one score per sequence.
         """
-        logits = outputs.get('logits')
+        logits = outputs.get("logits")
         assert logits is not None, (
-            "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'.")
+            "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'."
+        )
+        if logits.dim() == 2:
+            # A pre-pooled head (XLM-R-style ``*ForSequenceClassification`` pools the last valid
+            # token INSIDE forward, before the score head) already answered one score per sequence;
+            # the patch captured ``[n_seqs, num_labels]`` and there is nothing left to reduce.
+            return inputs, outputs
         pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
         outputs = copy(outputs)
-        outputs['logits'] = pooled.contiguous()
+        outputs["logits"] = pooled.contiguous()
         return inputs, outputs
 
-    def _pool_last_valid_token(self,
-                               features: torch.Tensor,
-                               inputs: Dict[str, Any],
-                               sp_strategy=None) -> tuple[torch.Tensor, bool]:
+    def _pool_last_valid_token(
+        self, features: torch.Tensor, inputs: dict[str, Any], sp_strategy=None
+    ) -> tuple[torch.Tensor, bool]:
         """Gather the last valid token per sequence from ``[B, T, C]`` -> ``[n_seqs, C]``.
 
         Build a one-hot end-token mask in the un-padded global frame, route it
@@ -273,13 +282,16 @@ class InputProcessor:
         DP / Ulysses / zigzag-ring / padding-free. Returns ``(pooled, is_packed)``.
         """
         sp_enabled = (
-            self.framework == 'transformers' and sp_strategy is not None and getattr(sp_strategy, 'enabled', False)
-            and getattr(sp_strategy, 'world_size', 1) > 1)
+            self.framework == "transformers"
+            and sp_strategy is not None
+            and getattr(sp_strategy, "enabled", False)
+            and getattr(sp_strategy, "world_size", 1) > 1
+        )
 
         if sp_enabled:
             ref_pos = sp_strategy.real_position_ids
-        elif inputs.get('position_ids') is not None:
-            ref_pos = inputs['position_ids']
+        elif inputs.get("position_ids") is not None:
+            ref_pos = inputs["position_ids"]
         else:
             # Standard padded batch: HF omits position_ids (it derives them internally).
             # Rebuild a position_ids-like reference (valid token -> its index, padding -> -1)
@@ -287,7 +299,7 @@ class InputProcessor:
             # validity and a single ``== 0`` per row for packing detection, still works.
             T = features.shape[1]
             arange = torch.arange(T, device=features.device)
-            am = inputs.get('attention_mask')
+            am = inputs.get("attention_mask")
             if am is None:
                 ref_pos = arange.expand(features.shape[0], T)
             else:
@@ -297,10 +309,9 @@ class InputProcessor:
         if ref_pos.dim() == 3:
             ref_pos = ref_pos[0]
         # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
-        cu_seq_lens_q = inputs.get('cu_seq_lens_q', inputs.get('cu_seqlens_q'))
+        cu_seq_lens_q = inputs.get("cu_seq_lens_q", inputs.get("cu_seqlens_q"))
 
-        is_packed = (
-            features.shape[0] == 1 and (cu_seq_lens_q is not None or int((ref_pos.reshape(-1) == 0).sum()) > 1))
+        is_packed = features.shape[0] == 1 and (cu_seq_lens_q is not None or int((ref_pos.reshape(-1) == 0).sum()) > 1)
 
         device, dtype = features.device, features.dtype
         T_real = ref_pos.shape[-1]
@@ -333,25 +344,25 @@ class InputProcessor:
             mask = sp_strategy.split(mask, dim=1, position_ids=rp_padded)
 
         assert mask.shape[1] == features.shape[1], (
-            f'mask seq-dim {mask.shape[1]} != features seq-dim {features.shape[1]}; '
-            'sp_strategy.split contract broken or T_real mismatched.')
+            f"mask seq-dim {mask.shape[1]} != features seq-dim {features.shape[1]}; "
+            "sp_strategy.split contract broken or T_real mismatched."
+        )
 
-        pooled = torch.einsum('bth,btn->bnh', features, mask)
+        pooled = torch.einsum("bth,btn->bnh", features, mask)
         pooled = pooled.squeeze(0) if is_packed else pooled.squeeze(1)
 
         if sp_enabled and dist.is_available() and dist.is_initialized():
-            for grp_attr, size_attr in (('_sp_group', 'sp_world_size'), ('_rp_group', 'rp_world_size')):
+            for grp_attr, size_attr in (("_sp_group", "sp_world_size"), ("_rp_group", "rp_world_size")):
                 grp = getattr(sp_strategy, grp_attr, None)
                 if grp is not None and getattr(sp_strategy, size_attr, 1) > 1:
                     dist.all_reduce(pooled, op=dist.ReduceOp.SUM, group=grp)
 
         return pooled, is_packed
 
-    def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-
+    def pad_cp(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         if self.device_mesh is None:
             return inputs
-        if self.framework == 'transformers':
+        if self.framework == "transformers":
             return inputs
 
         def _pad_cp(_input: InputFeature) -> InputFeature:
@@ -360,7 +371,7 @@ class InputProcessor:
             # 2. For sequence_parallel with TP > 1: seq_len must be divisible by TP size
             cp_size = self.device_mesh.cp_world_size
             tp_size = self.device_mesh.tp_world_size
-            position_ids = _input.get('position_ids')
+            position_ids = _input.get("position_ids")
 
             def pad_cp_inputs(input_tensor: torch.Tensor, padding_value: int) -> torch.Tensor:
                 if input_tensor is None:
@@ -382,18 +393,24 @@ class InputProcessor:
                 return input_tensor
 
             if cp_size > 1:
-                pos_for_cu = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 \
-                    else position_ids
+                pos_for_cu = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 else position_ids
                 position_ids_f = pos_for_cu.flatten()
                 indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
-                cu_seqlens = torch.cat([
-                    indices_q[position_ids_f == 0],
-                    torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
-                ])
+                cu_seqlens = torch.cat(
+                    [
+                        indices_q[position_ids_f == 0],
+                        torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
+                    ]
+                )
 
                 for key in [
-                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'loss_scale',
-                        'mm_token_type_ids'
+                    "input_ids",
+                    "position_ids",
+                    "attention_mask",
+                    "labels",
+                    "completion_mask",
+                    "loss_scale",
+                    "mm_token_type_ids",
                 ]:
                     value = _input.get(key)
                     if value is None:
@@ -402,15 +419,20 @@ class InputProcessor:
                     for i in range(cu_seqlens.shape[0]):
                         if i == cu_seqlens.shape[0] - 1:
                             break
-                        _value_slice = value[..., cu_seqlens[i]:cu_seqlens[i + 1]]
+                        _value_slice = value[..., cu_seqlens[i] : cu_seqlens[i + 1]]
                         result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map.get(key, 0)))
                     value = torch.cat(result, dim=-1)
                     _input[key] = value
             elif self.device_mesh.sequence_parallel and tp_size > 1:
                 # Sequence parallel without CP still requires seq_len % TP == 0
                 for key in [
-                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'loss_scale',
-                        'mm_token_type_ids'
+                    "input_ids",
+                    "position_ids",
+                    "attention_mask",
+                    "labels",
+                    "completion_mask",
+                    "loss_scale",
+                    "mm_token_type_ids",
                 ]:
                     value = _input.get(key)
                     if value is not None:
@@ -419,28 +441,26 @@ class InputProcessor:
 
         return [_pad_cp(_inp) for _inp in inputs]
 
-    def split_cp(self, inputs: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
-
+    def split_cp(self, inputs: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
         if self.device_mesh is None:
             return inputs
-        if self.framework == 'transformers':
+        if self.framework == "transformers":
             return inputs
 
-        def _split_cp(inputs: Dict[str, Any]) -> Dict[str, Any]:
-
+        def _split_cp(inputs: dict[str, Any]) -> dict[str, Any]:
             cp_size = self.device_mesh.cp_world_size
             cp_rank = self.device_mesh.cp_rank
-            input_ids = inputs.get('input_ids')
-            position_ids = inputs.get('position_ids')
-            attention_mask = inputs.get('attention_mask')
-            batch_labels = inputs.get('labels')
-            packed_seq_params: PackedSeqParams = inputs.get('packed_seq_params')
+            input_ids = inputs.get("input_ids")
+            position_ids = inputs.get("position_ids")
+            attention_mask = inputs.get("attention_mask")
+            batch_labels = inputs.get("labels")
+            packed_seq_params: PackedSeqParams = inputs.get("packed_seq_params")
             if packed_seq_params is not None:
-                cu_seqlens_q = getattr(packed_seq_params, 'cu_seqlens_q', None)
+                cu_seqlens_q = getattr(packed_seq_params, "cu_seqlens_q", None)
             else:
                 cu_seqlens_q = None
 
-            def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: Optional[torch.Tensor], dim: int):
+            def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: torch.Tensor | None, dim: int):
                 if inputs is None:
                     return inputs
                 if dim < 0:
@@ -453,8 +473,12 @@ class InputProcessor:
                         slices = [slice(None)] * inputs.ndim
                         slices[dim] = slice(cu_seqlens[i], cu_seqlens[i + 1])
                         val = inputs[tuple(slices)]
-                    view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] //
-                                  (2 * cp_size), *inputs.shape[dim + 1:])
+                    view_shape = (
+                        *inputs.shape[:dim],
+                        2 * cp_size,
+                        val.shape[dim] // (2 * cp_size),
+                        *inputs.shape[dim + 1 :],
+                    )
                     val = val.view(view_shape)
                     index = torch.tensor(
                         [cp_rank, (2 * cp_size - cp_rank - 1)],
@@ -462,7 +486,7 @@ class InputProcessor:
                         dtype=torch.long,
                     )
                     val = val.index_select(dim, index)
-                    view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
+                    view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1 :])
                     new_inputs.append(val.view(view_shape))
                 return torch.cat(new_inputs, dim=dim)
 
@@ -472,78 +496,82 @@ class InputProcessor:
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
-                completion_mask = inputs.get('completion_mask')
+                completion_mask = inputs.get("completion_mask")
                 if completion_mask is not None:
-                    inputs['completion_mask'] = split_cp_inputs(completion_mask, cu_seqlens_q, dim=-1)
+                    inputs["completion_mask"] = split_cp_inputs(completion_mask, cu_seqlens_q, dim=-1)
 
-                loss_scale = inputs.get('loss_scale')
+                loss_scale = inputs.get("loss_scale")
                 if loss_scale is not None:
-                    inputs['loss_scale'] = split_cp_inputs(loss_scale, cu_seqlens_q, dim=-1)
+                    inputs["loss_scale"] = split_cp_inputs(loss_scale, cu_seqlens_q, dim=-1)
 
-                mm_token_type_ids = inputs.get('mm_token_type_ids')
+                mm_token_type_ids = inputs.get("mm_token_type_ids")
                 if mm_token_type_ids is not None:
-                    inputs['mm_token_type_ids'] = split_cp_inputs(mm_token_type_ids, cu_seqlens_q, dim=-1)
+                    inputs["mm_token_type_ids"] = split_cp_inputs(mm_token_type_ids, cu_seqlens_q, dim=-1)
 
-            inputs['input_ids'] = input_ids
-            inputs['position_ids'] = position_ids
-            inputs['attention_mask'] = attention_mask
-            inputs['labels'] = batch_labels
+            inputs["input_ids"] = input_ids
+            inputs["position_ids"] = position_ids
+            inputs["attention_mask"] = attention_mask
+            inputs["labels"] = batch_labels
             return inputs
 
         return [_split_cp(input) for input in inputs]
 
-    def add_extra_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+    def add_extra_padding_free_args(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         for _inp in inputs:
             padding_free = bool(self.padding_free or self._any_packing([_inp]))
-            if padding_free and self.framework == 'megatron':
-                _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
+            if padding_free and self.framework == "megatron":
+                _inp["packed_seq_params"] = self._get_packed_seq_params(_inp["position_ids"])
         return inputs
 
-    def prepare_gdn_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        if self.framework != 'transformers' or not kwargs.get('gdn_padding_free_enabled', False):
+    def prepare_gdn_padding_free_args(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
+        if self.framework != "transformers" or not kwargs.get("gdn_padding_free_enabled", False):
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
-        if not padding_free or bool(kwargs.get('enable_sp', False)):
+        if not padding_free or bool(kwargs.get("enable_sp", False)):
             return inputs
 
-        hf_config = kwargs.get('hf_config')
-        attn_implementation = getattr(hf_config, '_attn_implementation', None)
+        hf_config = kwargs.get("hf_config")
+        attn_implementation = getattr(hf_config, "_attn_implementation", None)
         if not is_flash_attention_implementation(attn_implementation):
-            raise RuntimeError('Transformers padding_free/packed batches require a FlashAttention backend; '
-                               f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
-                               'logical sequences after they are concatenated into one physical row.')
+            raise RuntimeError(
+                "Transformers padding_free/packed batches require a FlashAttention backend; "
+                f"got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate "
+                "logical sequences after they are concatenated into one physical row."
+            )
 
         for _inp in inputs:
-            position_ids = _inp.get('position_ids')
+            position_ids = _inp.get("position_ids")
             if position_ids is None or not torch.is_tensor(position_ids):
                 continue
             packed_seq_params = self._get_packed_seq_params(position_ids)
-            _inp['cu_seq_lens_q'] = packed_seq_params.cu_seqlens_q.to(dtype=torch.int32, device=position_ids.device)
-            _inp['cu_seq_lens_k'] = packed_seq_params.cu_seqlens_kv.to(dtype=torch.int32, device=position_ids.device)
-            _inp['max_length_q'] = int(packed_seq_params.max_seqlen_q)
-            _inp['max_length_k'] = int(packed_seq_params.max_seqlen_kv)
+            _inp["cu_seq_lens_q"] = packed_seq_params.cu_seqlens_q.to(dtype=torch.int32, device=position_ids.device)
+            _inp["cu_seq_lens_k"] = packed_seq_params.cu_seqlens_kv.to(dtype=torch.int32, device=position_ids.device)
+            _inp["max_length_q"] = int(packed_seq_params.max_seqlen_q)
+            _inp["max_length_k"] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
-    def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+    def drop_causal_4d_mask(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         """On NPU, drop the generic 4D dense mask so MindSpeed can build
         its own compressed causal mask for FlashAttention."""
-        if Platform.device_prefix() != 'npu':
+        if Platform.device_prefix() != "npu":
             return inputs
-        attention_mask_type = kwargs.get('attention_mask_type')
-        if attention_mask_type != 'causal':
+        attention_mask_type = kwargs.get("attention_mask_type")
+        if attention_mask_type != "causal":
             return inputs
         for _inp in inputs:
-            attention_mask = _inp.get('attention_mask')
+            attention_mask = _inp.get("attention_mask")
             if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
-                _inp['attention_mask'] = None
+                _inp["attention_mask"] = None
         return inputs
 
     @staticmethod
     def _pad_sequence(sequences, padding_value, padding_side, concat=None):
-        if padding_side == 'right':
+        if padding_side == "right":
             from twinkle.utils import pad_and_stack_tensors
+
             return pad_and_stack_tensors(
-                sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2))
+                sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2)
+            )
         else:
             # left padding
             max_len = max([s.shape[0] for s in sequences])
@@ -552,7 +580,7 @@ class InputProcessor:
             for seq in sequences:
                 pad_length = max_len - seq.shape[0]
                 pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
-                padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), 'constant', padding_value)
+                padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), "constant", padding_value)
                 padded_sequences.append(padded_seq)
             return torch.stack(padded_sequences)
 
@@ -561,9 +589,10 @@ class InputProcessor:
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
         device = attention_mask[0].device
-        attention_mask = torch.tril(torch.ones((len(seq_lens), max_len, max_len), dtype=torch.bool,
-                                               device=device)).view(len(seq_lens), 1, max_len, max_len)
-        assert attention_mask.dtype is torch.bool, f'attention_mask.dtype: {attention_mask.dtype}'
+        attention_mask = torch.tril(
+            torch.ones((len(seq_lens), max_len, max_len), dtype=torch.bool, device=device)
+        ).view(len(seq_lens), 1, max_len, max_len)
+        assert attention_mask.dtype is torch.bool, f"attention_mask.dtype: {attention_mask.dtype}"
         for i, seq_len in enumerate(seq_lens):
             attention_mask[i, :, :, seq_len:] = 0
         attention_mask = ~attention_mask
@@ -576,10 +605,12 @@ class InputProcessor:
         position_ids_f = position_ids.flatten()
         indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
 
-        cu_seqlens = torch.cat([
-            indices_q[position_ids_f == 0],
-            torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
-        ])
+        cu_seqlens = torch.cat(
+            [
+                indices_q[position_ids_f == 0],
+                torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
+            ]
+        )
 
         max_length = cu_seqlens.diff().max()  # position_ids_f.max() + 1
         packed = PackedSeqParams(
@@ -587,7 +618,8 @@ class InputProcessor:
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_length,
             max_seqlen_kv=max_length,
-            qkv_format='thd')
+            qkv_format="thd",
+        )
         if torch_util.is_torch_npu_available():
             packed.cu_seqlens_q_padded = cu_seqlens
             packed.cu_seqlens_kv_padded = cu_seqlens
@@ -595,7 +627,7 @@ class InputProcessor:
         return packed
 
     @staticmethod
-    def _is_packed_position_ids(position_ids: 'torch.Tensor') -> bool:
+    def _is_packed_position_ids(position_ids: "torch.Tensor") -> bool:
         """Detect packed sequences by multiple (0, 1, ...) resets in position_ids."""
         if position_ids is None or not isinstance(position_ids, torch.Tensor):
             return False
@@ -613,18 +645,18 @@ class InputProcessor:
         return False
 
     @staticmethod
-    def _any_packing(inputs: List[InputFeature]):
+    def _any_packing(inputs: list[InputFeature]):
         for _input in inputs:
-            if InputProcessor._is_packed_position_ids(_input.get('position_ids')):
+            if InputProcessor._is_packed_position_ids(_input.get("position_ids")):
                 return True
         return False
 
     @staticmethod
     def _unpack_by_position_ids(
-        position_ids: 'torch.Tensor',
-        *tensors: 'torch.Tensor',
-        padding_values: Optional[List] = None,
-    ) -> 'List[torch.Tensor]':
+        position_ids: "torch.Tensor",
+        *tensors: "torch.Tensor",
+        padding_values: list | None = None,
+    ) -> "list[torch.Tensor]":
         """Split packed tensors into ``[num_seqs, max_seq_len, ...]``.
 
         Sequence boundaries are detected where ``position_ids`` resets to 0.
@@ -653,24 +685,24 @@ class InputProcessor:
             padding_values = [0] * len(tensors)
 
         results = []
-        for tensor, pad_val in zip(tensors, padding_values):
+        for tensor, pad_val in zip(tensors, padding_values, strict=False):
             # Normalize to [T, ...] (squeeze batch-1 dim if present)
             t = tensor.squeeze(0) if tensor.dim() >= 2 and tensor.shape[0] == 1 else tensor
             trailing = t.shape[1:]
-            seqs = [t[boundaries[i]:boundaries[i + 1]] for i in range(n_seqs)]
+            seqs = [t[boundaries[i] : boundaries[i + 1]] for i in range(n_seqs)]
             max_len = max(s.shape[0] for s in seqs)
             out = t.new_full((n_seqs, max_len, *trailing), pad_val)
             for i, s in enumerate(seqs):
-                out[i, :s.shape[0]] = s
+                out[i, : s.shape[0]] = s
             results.append(out)
         return results
 
     def unpack_packed_sequences(
         self,
-        inputs: Dict[str, Any],
-        outputs: Optional[Dict[str, Any]] = None,
-        task: str = 'causal_lm',
-    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        inputs: dict[str, Any],
+        outputs: dict[str, Any] | None = None,
+        task: str = "causal_lm",
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
@@ -685,10 +717,10 @@ class InputProcessor:
         and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
         ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
         """
-        if task in ('embedding', 'generative_reranker', 'seq_cls', 'reranker'):
+        if task in ("embedding", "generative_reranker", "seq_cls", "reranker"):
             return inputs, outputs
-        labels = inputs.get('labels')
-        position_ids = inputs.get('position_ids')
+        labels = inputs.get("labels")
+        position_ids = inputs.get("position_ids")
 
         if labels is None or position_ids is None:
             return inputs, outputs
@@ -702,18 +734,23 @@ class InputProcessor:
         # while ``loss_scale`` and ``completion_mask`` share the labels' index
         # space, so leaving them packed would hand the loss differently shaped
         # views of the same sequence.
-        input_specs = [('labels', labels, -100)]
-        if inputs.get('loss_scale') is not None:
-            input_specs.append(('loss_scale', inputs['loss_scale'], self.padding_map['loss_scale']))
-        if inputs.get('completion_mask') is not None:
-            input_specs.append(('completion_mask', inputs['completion_mask'], self.padding_map['completion_mask']))
-        output_specs = [(key, outputs[key], 0) for key in ('logps', 'values', 'entropies', 'logits')
-                        if outputs and outputs.get(key) is not None]
+        input_specs = [("labels", labels, -100)]
+        if inputs.get("loss_scale") is not None:
+            input_specs.append(("loss_scale", inputs["loss_scale"], self.padding_map["loss_scale"]))
+        if inputs.get("completion_mask") is not None:
+            input_specs.append(("completion_mask", inputs["completion_mask"], self.padding_map["completion_mask"]))
+        output_specs = [
+            (key, outputs[key], 0)
+            for key in ("logps", "values", "entropies", "logits")
+            if outputs and outputs.get(key) is not None
+        ]
 
         specs = input_specs + output_specs
         unpacked = iter(
             self._unpack_by_position_ids(
-                position_ids, *[tensor for _, tensor, _ in specs], padding_values=[pad for _, _, pad in specs]))
+                position_ids, *[tensor for _, tensor, _ in specs], padding_values=[pad for _, _, pad in specs]
+            )
+        )
 
         inputs = copy(inputs)
         for key, _, _ in input_specs:
@@ -726,7 +763,7 @@ class InputProcessor:
 
         return inputs, outputs
 
-    def unpack_inputs(self, inputs: List[Dict[str, Any]], task: str = 'causal_lm') -> List[Dict[str, Any]]:
+    def unpack_inputs(self, inputs: list[dict[str, Any]], task: str = "causal_lm") -> list[dict[str, Any]]:
         """Unpack a list of packed microbatch inputs into per-sequence format.
 
         For ``task='embedding'`` this is a no-op since embedding outputs are
@@ -735,36 +772,36 @@ class InputProcessor:
         return [self.unpack_packed_sequences(inp, task=task)[0] for inp in inputs]
 
     @staticmethod
-    def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+    def to_transformers_dict(inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         results = []
         for _input in inputs:
             output = {}
             _keys = [
-                'input_ids',
-                'inputs_embeds',
-                'attention_mask',
-                'position_ids',
-                'labels',
-                'completion_mask',
-                'loss_scale',
-                'channel',
-                'cu_seq_lens_q',
-                'cu_seq_lens_k',
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'max_length_q',
-                'max_length_k',
-                'packed_seq_params',
-                'routed_experts',
-                'replay_mask',
-                'mm_token_type_ids',
-                'second_per_grid_ts',
+                "input_ids",
+                "inputs_embeds",
+                "attention_mask",
+                "position_ids",
+                "labels",
+                "completion_mask",
+                "loss_scale",
+                "channel",
+                "cu_seq_lens_q",
+                "cu_seq_lens_k",
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "max_length_q",
+                "max_length_k",
+                "packed_seq_params",
+                "routed_experts",
+                "replay_mask",
+                "mm_token_type_ids",
+                "second_per_grid_ts",
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key not in _keys:
                     continue
                 value = _input[key]
-                if key == 'channel' or isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
+                if key == "channel" or isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
                     output[key] = value
                 else:
                     output[key] = np.array(value)
@@ -774,7 +811,7 @@ class InputProcessor:
     # when training on mixed text + multimodal data, some fields (e.g. mm_token_type_ids)
     # only exist on multimodal samples. We pad those fields for the missing samples instead of
     # letting collate blow up with a KeyError.
-    def _fill_optional_sequence_fields(self, batch: List[InputFeature]) -> None:
+    def _fill_optional_sequence_fields(self, batch: list[InputFeature]) -> None:
         if len(batch) < 2:
             return
         seq_fields = set(self.padding_map) - set(self.VLM_CONCAT_FIELDS)
@@ -785,7 +822,7 @@ class InputProcessor:
                 continue  # all-present (no gap) or all-absent (nothing to align to) -> leave as is
             pad_value = self.padding_map[key]
             for feat in missing:
-                input_ids = feat.get('input_ids')
+                input_ids = feat.get("input_ids")
                 if input_ids is None:
                     continue
                 # Match the row's device/dtype: prepare_inputs may already have moved rows to the
@@ -793,17 +830,18 @@ class InputProcessor:
                 reference = input_ids if isinstance(input_ids, torch.Tensor) else None
                 length = reference.shape[-1] if reference is not None else len(input_ids)
                 device = reference.device if reference is not None else None
+                shape = reference.shape if reference is not None else (length,)
                 # completion_mask is the one field with a derivation rule: every other layer
                 # (template, grpo, metric, ledger) reads "absent" as "whatever is scored is the
                 # policy's own completion", so a zero fill would silently drop the row from the
                 # loss instead of aligning it with the rest of the batch.
-                labels = feat.get('labels') if key == 'completion_mask' else None
+                labels = feat.get("labels") if key == "completion_mask" else None
                 if labels is not None:
                     labels = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(np.asarray(labels))
                     if labels.shape[-1] == length:
-                        feat[key] = (labels.reshape(-1) != -100).to(dtype=torch.long, device=device)
+                        feat[key] = (labels.reshape(shape) != -100).to(dtype=torch.long, device=device)
                         continue
-                feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
+                feat[key] = torch.full(shape, pad_value, dtype=torch.long, device=device)
 
     #: Audio fields whose leading dim is the audio count under the per-audio-batched contract
     #: (see _collate_macro_batch); the blanket squeeze must not fold that dim away. The
@@ -822,9 +860,9 @@ class InputProcessor:
     #: keeping only "audio fields skip the blanket squeeze and concat on dim 0". Land it with
     #: the template migration: the legacy gemma collator and test_multimodal assertions consume
     #: these fields and must change in the same commit.
-    _PER_AUDIO_BATCHED_FIELDS = ('input_features', 'feature_attention_mask')
+    _PER_AUDIO_BATCHED_FIELDS = ("input_features", "feature_attention_mask")
 
-    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+    def _collate_macro_batch(self, inputs: list[InputFeature]) -> InputFeature:
         # Two mutually-exclusive audio contracts share the `input_features` field name and are told
         # apart by the mask field that rides alongside it -- the producer (the model's template)
         # emits one pair or the other, so the field name IS the contract marker:
@@ -839,7 +877,7 @@ class InputProcessor:
         # ([freq*n, time, 1]), and the [n, time] mask could no longer describe the result.
         # TODO: this probe is a model-family check in disguise -- see _PER_AUDIO_BATCHED_FIELDS
         # for the cleanup plan.
-        per_audio_batched = any('feature_attention_mask' in _input for _input in inputs)
+        per_audio_batched = any("feature_attention_mask" in _input for _input in inputs)
         # Work on local copies so squeezing doesn't mutate the caller's original samples.
         squeezed = []
         for _input in inputs:
@@ -877,10 +915,10 @@ class InputProcessor:
         if padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
-                if key == 'attention_mask':
+                if key == "attention_mask":
                     # attention_mask is not needed
                     continue
-                if key == 'position_ids' and is_mm_position_ids(values[0]):
+                if key == "position_ids" and is_mm_position_ids(values[0]):
                     # mrope needs to cat the sequence and unsequeeze the middle dim
                     value = torch.cat(values, dim=-1).unsqueeze(1)
                 elif isinstance(values[0], torch.Tensor):
@@ -892,16 +930,17 @@ class InputProcessor:
         else:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
-                if self.framework == 'megatron' and key == 'attention_mask':
+                if self.framework == "megatron" and key == "attention_mask":
                     result[key] = self._create_4d_attention_mask(values)
-                elif key == 'position_ids' and is_mm_position_ids(values[0]):
+                elif key == "position_ids" and is_mm_position_ids(values[0]):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                     num_axes = values[0].shape[0]
                     result[key] = result[key].reshape(len(values), num_axes, -1).permute(1, 0, 2).contiguous()
                 elif isinstance(values[0], torch.Tensor):
-                    concat = False if (key == 'routed_experts') else None
-                    result[key] = InputProcessor._pad_sequence(values, self.padding_map.get(key, 0), self.padding_side,
-                                                               concat)
+                    concat = False if (key == "routed_experts") else None
+                    result[key] = InputProcessor._pad_sequence(
+                        values, self.padding_map.get(key, 0), self.padding_side, concat
+                    )
                     if result[key].dim() == 1:
                         result[key] = result[key].unsqueeze(0)
                 else:
@@ -915,12 +954,14 @@ class InputProcessor:
                         # Plane-masked audio contract: per-sample features are 2-D and get a
                         # trailing singleton; the 1-D mask is expanded to the feature plane. Batch
                         # is folded into dim 0 by the concat below.
-                        if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
+                        if (
+                            field == "input_features"
+                        ):  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
                             assert len(value.shape) == 2
                             value = value.unsqueeze(-1)
-                        if field == 'input_features_mask':  # [freq_bins,] -> [freq_bins, time_steps]
+                        if field == "input_features_mask":  # [freq_bins,] -> [freq_bins, time_steps]
                             assert len(value.shape) == 1
-                            input_features_shape = vlm_fields['input_features'][i].shape
+                            input_features_shape = vlm_fields["input_features"][i].shape
                             assert value.shape[0] == input_features_shape[0]
                             value = value.unsqueeze(1).expand(input_features_shape[:2])
                     # Per-audio-batched contract: `input_features` is already [n, freq, time] and
@@ -934,12 +975,10 @@ class InputProcessor:
                 result[field] = _values
         return result
 
-    def collate_fn(self,
-                   inputs: List[InputFeature],
-                   micro_batch_size: Optional[int] = None,
-                   variable_seq_lengths=False,
-                   **kwargs) -> List[InputFeature]:
-        if len(inputs) == 1 and self.framework != 'megatron':
+    def collate_fn(
+        self, inputs: list[InputFeature], micro_batch_size: int | None = None, variable_seq_lengths=False, **kwargs
+    ) -> list[InputFeature]:
+        if len(inputs) == 1 and self.framework != "megatron":
             return inputs
         if micro_batch_size is None:
             # normal collate
@@ -954,7 +993,7 @@ class InputProcessor:
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
-                _output = self._collate_macro_batch(inputs[i:i + micro_batch_size])
+                _output = self._collate_macro_batch(inputs[i : i + micro_batch_size])
                 for key in _output:
                     if key in self.VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
@@ -969,7 +1008,7 @@ class InputProcessor:
                 end = i + micro_batch_size
                 output = {}
                 for key in keys:
-                    if key == 'position_ids' and res[key].dim() > 2:
+                    if key == "position_ids" and res[key].dim() > 2:
                         output[key] = res[key][:, i:end, :]
                     elif key in self.VLM_CONCAT_FIELDS:
                         output[key] = torch.cat(res[key][i:end], dim=0)
@@ -991,6 +1030,7 @@ class InputProcessor:
         from megatron.core import parallel_state as mpu
 
         from twinkle.utils.torch_utils import gather_cp_load_balanced
+
         return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
 
     @staticmethod
@@ -1003,16 +1043,15 @@ class InputProcessor:
         seq_len = attention_mask.shape[1]
         return seq_len - 1 - torch.fliplr(attention_mask).argmax(dim=1)
 
-    def align_routed_experts(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
-
+    def align_routed_experts(self, inputs: list[InputFeature] | InputFeature, **kwargs) -> list[InputFeature]:
         def align_to(_input):
-            routed_experts = _input.get('routed_experts', None)
-            input_ids = _input.get('input_ids', None)
+            routed_experts = _input.get("routed_experts", None)
+            input_ids = _input.get("input_ids", None)
             input_seq_len = input_ids.shape[-1] if input_ids is not None else 0
             if routed_experts is None:
                 # No reference routing to replay, so a stray mask is meaningless (and would reach the model
                 # as an unexpected column) -- drop it.
-                _input.pop('replay_mask', None)
+                _input.pop("replay_mask", None)
                 return _input
             # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
             # This gap of 1 is expected
@@ -1022,10 +1061,10 @@ class InputProcessor:
             padding_routed_experts = routed_experts
             padding_len = input_seq_len - experts_seq_len
             if padding_len > 0:
-                padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
-                                                                 'constant',
-                                                                 self.padding_map.get('routed_experts', 0))
-            _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+                padding_routed_experts = torch.nn.functional.pad(
+                    routed_experts, (0, 0, 0, 0, 0, padding_len), "constant", self.padding_map.get("routed_experts", 0)
+                )
+            _input["routed_experts"] = padding_routed_experts.unsqueeze(0)
 
             # The per-token replay_mask rides alongside routed_experts and must stay token-aligned with it:
             # pad it to the SAME input_seq_len, and clamp away every row that has no reference routing -- the
@@ -1033,14 +1072,15 @@ class InputProcessor:
             # routing natively instead of replaying zero-filled expert ids. prepare_inputs already gave the
             # mask a leading batch dim ([1, seq]); restore that shape after the seq-axis pad. Kept as long
             # (0/1) to match routed_experts' int64 through the CP/SP scatter; consumers call ``.bool()``.
-            replay_mask = _input.get('replay_mask', None)
+            replay_mask = _input.get("replay_mask", None)
             if replay_mask is not None:
                 mask = replay_mask.reshape(-1)[:experts_seq_len]
                 mask_pad_len = input_seq_len - mask.shape[0]
                 if mask_pad_len > 0:
-                    mask = torch.nn.functional.pad(mask, (0, mask_pad_len), 'constant',
-                                                   self.padding_map.get('replay_mask', 0))
-                _input['replay_mask'] = mask.to(torch.long).unsqueeze(0)
+                    mask = torch.nn.functional.pad(
+                        mask, (0, mask_pad_len), "constant", self.padding_map.get("replay_mask", 0)
+                    )
+                _input["replay_mask"] = mask.to(torch.long).unsqueeze(0)
 
             return _input
 

@@ -368,57 +368,6 @@ def test_sampling_timeout_keeps_backend_owned_without_blocking_readers(clients, 
         ray.shutdown()
 
 
-def test_async_generation_cleanup_and_recovery_on_real_engine(clients):
-    import ray
-    from ray.util.state import list_actors
-    ray.init(address=os.environ['RAY_ADDRESS'], namespace='default', ignore_reinit_error=True,
-             log_to_driver=False)
-    actors = list_actors(address=os.environ.get('TWINKLE_TEST_RAY_DASHBOARD_URL', 'http://127.0.0.1:8395'),
-                         filters=[('class_name', '=', os.environ.get('TWINKLE_TEST_SAMPLER_CLASS', 'ServerVLLMSampler')), ('state', '=', 'ALIVE')], detail=True)
-    assert len(actors) == int(os.environ.get('TWINKLE_TEST_DP', '1'))
-    assert all(actor.state == 'ALIVE' for actor in actors)
-    actor = ray.get_actor(actors[0].name, namespace='default')
-    ids = _prompt(clients, 'Write a very long story of at least 2000 words about an astronaut.')
-    def call(method, *args):
-        return ray.get(getattr(actor, method).remote(*args), timeout=30)
-    def wait_status(key, terminal):
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            state = call('get_generation_status', key)
-            if state['status'] in terminal:
-                return state
-            time.sleep(.01)
-        raise AssertionError(f'{key} did not terminate: {state}')
-    try:
-        call('submit_generation', 'e2e-bad', [{'input_ids': [10**9]}],
-             {'max_tokens': 8, 'temperature': 0})
-        failed = wait_status('e2e-bad', {'failed'})
-        assert call('cancel_generation', 'e2e-bad')['status'] == 'completed'
-        # A failed prompt in ordinary sample() must wait for its live sibling.
-        batch = actor.sample.remote(
-            [{'input_ids': ids}, {'input_ids': [10**9]}],
-            {'max_tokens': 1024, 'temperature': 0})
-        with pytest.raises(ray.exceptions.RayTaskError):
-            ray.get(batch, timeout=30)
-
-        call('submit_generation', 'e2e-cancel', [{'input_ids': ids}],
-             {'max_tokens': 1024, 'temperature': 0})
-        time.sleep(.1)
-        assert call('get_generation_status', 'e2e-cancel')['status'] == 'running'
-        assert call('cancel_generation', 'e2e-cancel')['status'] == 'cancelled'
-        assert call('get_generation_status', 'e2e-cancel')['status'] == 'missing'
-        call('submit_generation', 'e2e-after', [{'input_ids': ids}],
-             {'max_tokens': 8, 'temperature': 0})
-        wait_status('e2e-after', {'completed'})
-        responses = call('collect_generation', 'e2e-after')
-        assert responses[0].sequences[0].tokens
-        _report(check='async_cleanup_recovery', failure=failed, recovered=True)
-    finally:
-        for key in ['e2e-bad', 'e2e-cancel', 'e2e-after']:
-            call('cancel_generation', key)
-        ray.shutdown()
-
-
 def test_data_plane_http_generation_and_failure_recovery(clients):
     from twinkle_client.data_plane import DataPlaneClient
     store = DataPlaneClient(transport=clients['twinkle']._transport)

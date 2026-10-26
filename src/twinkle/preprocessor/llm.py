@@ -112,7 +112,10 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
             Message(role='system', content=self.system_prompt),
             Message(role='user', content=query),
         ]
-        return Trajectory(messages=messages, user_data=[{'target': target, 'nums': nums}])
+        return Trajectory(messages=messages, user_data=[
+            ('target', target),
+            ('nums', nums),
+        ])
 
 
 class GSM8KProcessor(Preprocessor):

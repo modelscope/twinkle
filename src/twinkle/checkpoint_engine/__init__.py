@@ -16,6 +16,7 @@ Usage:
 """
 
 from .base import CheckpointEngine, TensorMeta
+from .delta import DeltaShardedCheckpointEngine, DeltaSyncConfig
 from .hccl_checkpoint_engine import HCCLCheckpointEngine
 from .ipc_checkpoint_engine import IPCCheckpointEngine
 from .manager import CheckpointEngineManager, CheckpointEngineMode
@@ -33,6 +34,8 @@ __all__ = [
     'HCCLCheckpointEngine',
     'IPCCheckpointEngine',
     'TensorMeta',
+    'DeltaSyncConfig',
+    'DeltaShardedCheckpointEngine',
     'generate_auth_key',
     'send_auth_pyobj',
     'recv_auth_pyobj',

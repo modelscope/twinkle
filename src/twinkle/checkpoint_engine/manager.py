@@ -1,12 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 import threading
+from contextlib import contextmanager
+from time import perf_counter
 from typing import List, Literal, Optional
 
 from twinkle.infra import get_worker_id
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
+from .delta import DeltaSyncConfig, resolve_delta_engine_cls
 from .mixin import CheckpointEngineMixin
 from .zmq_auth import generate_auth_key
 
@@ -27,6 +30,9 @@ class CheckpointEngineManager:
 
     ``auto`` resolves local objects to ``naive`` and Ray actor handlers to ``standalone``. It never
     guesses ``colocate`` because actor placement cannot be inferred reliably from the driver.
+
+    Delta synchronization follows verl's workflow ordering: finish training before syncing,
+    await sync before submitting more training, and do not overlap sync and close calls.
 
     Architecture (following verl's CheckpointEngineManager):
 
@@ -76,6 +82,8 @@ class CheckpointEngineManager:
         sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
         mode: CheckpointEngineMode = 'auto',
+        sync_backend: Literal['full', 'delta_sharded'] = 'full',
+        delta_config: Optional[DeltaSyncConfig] = None,
         channel: str = 'default',
         colocate_trainer_ranks: Optional[List[int]] = None,
         receiver_worker_ids: Optional[List[str]] = None,
@@ -85,6 +93,22 @@ class CheckpointEngineManager:
         self.requested_mode = mode
         self.mode = self._resolve_mode(mode, model, sampler)
         self.backend_cls = self.decide_backend_engine(platform, self.mode)
+        if sync_backend not in ('full', 'delta_sharded'):
+            raise ValueError(f'Unknown weight sync backend: {sync_backend}')
+        if sync_backend == 'delta_sharded' and self.mode != 'standalone':
+            raise ValueError('delta_sharded requires standalone trainer and rollout actors')
+        self.sync_backend = sync_backend
+        self.delta_config = delta_config or DeltaSyncConfig()
+        self.delta_engine_cls = None
+        self._delta_platform = None
+        if sync_backend == 'delta_sharded':
+            # Fail at construction, not mid-sync, when the platform has no delta transport.
+            self._delta_platform = Platform.get_platform(platform).__name__
+            self.delta_engine_cls = resolve_delta_engine_cls(self._delta_platform)
+        self._delta_replica_count = None
+        self._delta_round = 0
+        self._delta_failed = False
+        self.last_delta_metrics = None
         self._sync_lock = threading.RLock()
         self.receiver_worker_ids = self._validate_receiver_ids(receiver_worker_ids)
         self._receiver_snapshot = self.receiver_worker_ids
@@ -263,7 +287,13 @@ class CheckpointEngineManager:
                 # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
                 # dead socket -- and the next sync only rebuilds on membership change. Close here so
                 # the next attempt rebuilds the channel instead of reusing the broken one.
-                self.close()
+                try:
+                    self.close()
+                except Exception:
+                    # Mirror __init__: a failing close (e.g. the remote actor already died) must
+                    # not replace the original sync failure -- warn and re-raise the root cause.
+                    logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
+                                   self.channel, exc_info=True)
                 raise
 
     def _sync_weights(self, merge_and_sync=True):
@@ -286,6 +316,10 @@ class CheckpointEngineManager:
         Returns:
             None
         """
+        if self.sync_backend == 'delta_sharded':
+            with self._delta_rpc_timeouts():
+                self._sync_delta_weights(merge_and_sync)
+            return
         if self.mode == 'naive':
             self._sync_weights_naive(merge_and_sync)
             return
@@ -336,6 +370,113 @@ class CheckpointEngineManager:
             self.base_sync_done = True
             if not merge_and_sync:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    def _prepare_delta_transport(self):
+        capabilities = self.sampler.validate_delta_sampler(self.delta_config)
+        replicas = capabilities if isinstance(capabilities, list) else [capabilities]
+        if self._delta_platform == 'NPU':
+            return self._prepare_delta_transport_npu(replicas)
+        workers = self.sampler.delta_sampler_metadata()
+        if len(workers) != sum(replica['tp'] for replica in replicas):
+            raise ValueError('delta topology does not include every rollout TP worker')
+        devices = {(worker['node_ip'], worker['device_uuid']) for worker in workers}
+        if len(devices) != len(workers):
+            raise ValueError('delta checkpoint receivers must occupy distinct rollout GPUs')
+        metadata = self.model.prepare_delta_sync(self.delta_config)
+        return dict(metadata, world_size=len(workers) + 1, rollout_workers=workers), len(replicas)
+
+    def _prepare_delta_transport_npu(self, replicas):
+        """NPU rendezvous: workers join the trainer's HCCL group themselves, so there is no worker list.
+
+        Group rank 0 is the trainer; rollout workers follow replica-major, TP-minor, so the world size is
+        every replica's TP size plus the trainer.
+        """
+        metadata = self.model.prepare_delta_sync(self.delta_config)
+        for replica in replicas:
+            if replica['device'] != metadata['device']:
+                raise ValueError(f"delta device mismatch: trainer is {metadata['device']!r}, "
+                                 f"rollout worker is {replica['device']!r}")
+        ranks = [replica.get('replica_rank') for replica in replicas]
+        if sorted(ranks, key=lambda rank: (rank is None, rank)) != list(range(len(replicas))):
+            raise ValueError(f'delta replica ranks {ranks} must be exactly 0..{len(replicas) - 1} without duplicates')
+        world_size = sum(replica['tp'] for replica in replicas) + 1
+        return dict(metadata, world_size=world_size), len(replicas)
+
+    def _sync_delta_weights(self, merge_and_sync):
+        if not merge_and_sync:
+            raise ValueError('delta_sharded does not support LoRA synchronization')
+        if self._delta_failed:
+            raise RuntimeError('delta session failed; restart the entire training/rollout job before full seed')
+        started = perf_counter()
+        seed = self._delta_replica_count is None
+        if seed:
+            endpoint, replica_count = self._prepare_delta_transport()
+        try:
+            self.sampler.begin_delta_sync()
+            if seed:
+                trainer_init = self.model.init_delta_transport(endpoint)
+                sampler_init = self.sampler.init_delta_sampler_transport(endpoint)
+                trainer_init()
+                sampler_init()
+                self._delta_replica_count = replica_count
+            sender = self.model.send_delta_weights()
+            receiver = self.sampler.receive_delta_weights()
+            metrics = sender()
+            worker_metrics = receiver()
+            results = worker_metrics if isinstance(worker_metrics, list) else [worker_metrics]
+            if len(results) != self._delta_replica_count or any(
+                    result['changed'] != results[0]['changed'] for result in results):
+                raise ValueError('delta rollout replicas disagree about update completion')
+            self.sampler.publish_delta_sampler()
+            self._delta_round += 1
+            self.base_sync_done = True
+            self.last_delta_metrics = {'trainers': metrics, 'workers': worker_metrics,
+                                       'total_seconds': perf_counter() - started, 'seed': seed}
+        except Exception:
+            self._delta_failed = True
+            try:
+                self.sampler.fail_delta_sampler()
+            except Exception:
+                logger.exception('Could not pause failed delta sampler; restart rollout actors before serving')
+            raise
+
+    def close_sync_session(self):
+        """Release delta snapshots and communicators; keep rollout paused until a new full seed."""
+        with self._delta_rpc_timeouts():
+            if self.sync_backend == 'delta_sharded':
+                self._close_delta_session()
+
+    @contextmanager
+    def _delta_rpc_timeouts(self):
+        missing = object()
+        previous = [(actor, getattr(actor, '_ray_get_timeout', missing)) for actor in (self.model, self.sampler)]
+        try:
+            for actor, _ in previous:
+                actor._ray_get_timeout = self.delta_config.timeout_seconds
+            yield
+        finally:
+            for actor, timeout in previous:
+                if timeout is missing:
+                    # Ray driver proxies can inherit nn.Module without initializing its registries.
+                    object.__delattr__(actor, '_ray_get_timeout')
+                else:
+                    actor._ray_get_timeout = timeout
+
+    def _close_delta_session(self):
+        errors = []
+        close_methods = (self.sampler.close_delta_sampler, self.model.close_delta_trainer)
+        for close in close_methods:
+            try:
+                close()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            self._delta_failed = True
+            raise RuntimeError('delta cleanup failed; restart the affected actors') from errors[0]
+        self._delta_replica_count = None
+        self._delta_round = 0
+        # Cleanup cannot make an unknown partially updated model safe for a new session.
+        self.base_sync_done = False
 
     def _ensure_model_keys(self):
         if self._model_keys is not None:
