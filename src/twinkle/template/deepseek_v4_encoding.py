@@ -358,15 +358,21 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     'content_blocks': [tool_block],
                 })
         elif role == 'user':
-            text_block = {'type': 'text', 'text': msg.get('content', '')}
+            # A user already carrying content_blocks (a multimodal row, or this merge's
+            # own output being re-merged) keeps its blocks; a plain-text user contributes
+            # a single text block. A user carrying a task is a standalone quick-instruction
+            # unit and never merges into a predecessor, mirroring the reverse guard below.
+            incoming_blocks = list(msg.get('content_blocks') or [])
+            if not incoming_blocks:
+                incoming_blocks = [{'type': 'text', 'text': msg.get('content', '')}]
             if (merged and merged[-1].get('role') == 'user' and 'content_blocks' in merged[-1]
-                    and merged[-1].get('task') is None):
-                merged[-1]['content_blocks'].append(text_block)
+                    and merged[-1].get('task') is None and msg.get('task') is None):
+                merged[-1]['content_blocks'].extend(incoming_blocks)
             else:
                 new_msg = {
                     'role': 'user',
                     'content': msg.get('content', ''),
-                    'content_blocks': [text_block],
+                    'content_blocks': incoming_blocks,
                 }
                 for key in ('task', 'wo_eos', 'mask'):
                     if key in msg:

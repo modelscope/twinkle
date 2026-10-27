@@ -89,6 +89,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     When gpus_per_worker > 1 is set in DeviceGroup, tensor parallelism is used.
     """
 
+    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
+    # a multimodal row's pixel tensors can only be carried by the state (_encode_single rejects a media
+    # feature without one), and _generate_inputs already reads state.feature / engine_input_ids / media.
+    accepts_rollout_state = True
+
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize vLLMSampler.
 
@@ -434,6 +439,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
 
+            _session_ids: Ray driver-only routing metadata accepted by the decorator:
+                one session string per input, or None for ordinary load balancing.
+                Repeated sessions reuse their worker; bindings expire after 30 minutes
+                idle or are replaced when their worker is no longer eligible. Session
+                IDs must be unique within this sampler handle (include tenant/adapter
+                identity when needed). Requires a materialized list batch.
+
         Returns:
             SampleResponse containing sampled sequences.
             Total sequences = len(inputs) * num_samples.
@@ -457,7 +469,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 return_encoded=return_encoded,
                 use_base_model=use_base_model,
                 adapter_paths=adapter_paths,
-                allow_partial_rollout=allow_partial_rollout))
+                allow_partial_rollout=allow_partial_rollout,
+                token_only=token_only))
 
     async def _generate_inputs(
         self,
@@ -708,10 +721,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             return None
         logger.info(f'Loading LoRA from {adapter_path}')
         local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        lora_request = await self.engine._get_or_load_lora(local_path)
-        if lora_request is None:
-            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
-        return lora_request
+        return await self.engine._get_or_load_lora(local_path)
 
     def _load_lora(self, adapter_path: Optional[str]):
         """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.

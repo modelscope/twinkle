@@ -64,6 +64,12 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         default ``sync_weights(merge_and_sync=True)``, which sends merged base weights.
     """
 
+    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
+    # a multimodal row's image tensors can only be carried by the state (the media guard rejects a
+    # media feature without one), and _generate_inputs already reads state.feature / engine_input_ids /
+    # media. Mirrors :class:`vLLMSampler` / :class:`TransformersSampler`.
+    accepts_rollout_state = True
+
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize SGLangSampler.
 
@@ -255,6 +261,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         *,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        use_base_model: bool = False,
+        token_only: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -293,7 +301,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
                 adapter_name,
                 adapter_path,
                 adapter_paths=adapter_paths,
-                allow_partial_rollout=allow_partial_rollout))
+                use_base_model=use_base_model,
+                allow_partial_rollout=allow_partial_rollout,
+                token_only=token_only))
 
     async def _generate_inputs(
         self,
@@ -429,10 +439,11 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         *,
         image_data: Optional[List[Any]] = None,
         lora_name: Optional[str] = None,
+        state: Optional[RolloutState] = None,
     ) -> PoolingResponse:
         """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
         return await self.engine.encode(
-            prompt=feat['input_ids'],
+            prompt=list(state.engine_input_ids) if state is not None else feat['input_ids'],
             pooling_params=pooling_params,
             image_data=image_data,
             lora_name=lora_name,
@@ -492,12 +503,18 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         if is_trajectory:
             assert self.template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
-            encoded_inputs = [
-                self.encode_trajectory_for_sglang(traj, adapter_name, add_generation_prompt=False)
-                for traj in inputs_list
-            ]
+            # encode_prompt (the path generation takes) folds multimodal placeholders through the
+            # template's _engine_input_ids override; a raw encode would hand the engine unfolded ids
+            # and disagree with what generation sends for the same template.
+            encoded_inputs = []
+            input_states: list[Optional[RolloutState]] = []
+            for traj in inputs_list:
+                state = self.template.encode_prompt(traj, backend='sglang', add_generation_prompt=False).state
+                encoded_inputs.append(state.feature)
+                input_states.append(state)
         else:
             encoded_inputs = inputs_list
+            input_states = [None] * len(inputs_list)
 
         if adapter_paths is not None:
             lora_names = [self._register_lora(path) for path in adapter_paths]
@@ -512,8 +529,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
                     pooling_params,
                     image_data=image_data,
                     lora_name=lora_name,
-                ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)
-            ]
+                    state=state,
+                ) for feat, image_data, lora_name, state in zip(encoded_inputs, image_data_list, lora_names,
+                                                                input_states)]
             return await asyncio.gather(*tasks)
 
         return self._run_in_loop(_encode_all())
@@ -534,12 +552,22 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         if adapter_path in self._registered_loras:
             return self._registered_loras[adapter_path]
         lora_name = adapter_name or f'lora_{len(self._registered_loras)}'
-        logger.info(f'Loading LoRA {lora_name!r} from {adapter_path}')
-        # Offload the (blocking) hub download off the event loop so it cannot stall other in-flight
-        # generations sharing this loop.
-        local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
-        await self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path)
+        # Reserve the entry BEFORE the awaits: two concurrent registrations of DISTINCT unnamed
+        # adapters would otherwise read the same ``len`` here, register under one shared name, and
+        # silently overwrite each other's weights. The reservation itself advances the count so the
+        # next registration gets a different name; a failed load rolls the reservation back.
         self._registered_loras[adapter_path] = lora_name
+        logger.info(f'Loading LoRA {lora_name!r} from {adapter_path}')
+        try:
+            # Offload the (blocking) hub download off the event loop so it cannot stall other in-flight
+            # generations sharing this loop. Inside the rollback domain: a failed download must not leave
+            # the reservation behind, or later registrations of the same path would hit the cache and hand
+            # the engine a name that was never loaded.
+            local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
+            await self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path)
+        except BaseException:
+            self._registered_loras.pop(adapter_path, None)
+            raise
         return lora_name
 
     def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
@@ -569,12 +597,19 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
 
         feat = inputs
         if 'input_ids' not in feat:
-            feat = self.encode_trajectory_for_sglang(feat, adapter_name)
+            if self.template is None:
+                raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+            # Same encode_prompt path as generation (see encode): the engine sees folded ids for
+            # multimodal templates here too, not the raw encode output.
+            state = self.template.encode_prompt(feat, backend='sglang').state
+            prompt = list(state.engine_input_ids)
+        else:
+            prompt = feat['input_ids']
         lora_name = self._register_lora(adapter_path, adapter_name)
 
         yield from self._iter_in_loop(
             self.engine.generate_stream(
-                prompt=feat['input_ids'],
+                prompt=prompt,
                 sampling_params=sampling_params,
                 lora_name=lora_name,
             ))

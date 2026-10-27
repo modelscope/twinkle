@@ -12,7 +12,7 @@ from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_l
 
 from .continuous_work import _WORKER_ASYNC_PREFIX, _cw_barrier, _cw_batch_len, _cw_register, _cw_unregister, \
     _get_workers, _make_worker_async_companion, _resolve_sticky_key, _run_continous_work, _select_workers, \
-    _sticky_bind, _sticky_lookup, get_worker_id
+    _sticky_bind, _sticky_lookup, _validate_cw_session_ids, get_worker_id
 
 logger = get_logger()
 
@@ -46,6 +46,97 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
             exc._twinkle_caller_augmented = True
     except Exception:  # noqa
         pass
+
+
+class _SideEffectLazyCollect:
+    """The lazy-collect handle ``remote_function`` returns: LazyCollect's FULL access protocol plus the
+    driver-side hooks that must fire at the real collect.
+
+    The lazy path used to wrap the ``LazyCollect`` in a ``functools.wraps`` function and copy only
+    ``_futures`` / ``ready`` / ``_is_lazy_collect`` onto it. But ``.get`` / ``.result`` are instance
+    methods and ``[]`` / ``in`` / ``iter`` / ``len`` resolve on the TYPE -- a bare function carries none
+    of them -- so a consumer that reads a forwarded output directly (``forward_only(...).get('logps')``,
+    ``out['logits']``: the pattern the recipes and infer use) broke with ``'function' object has no
+    attribute 'get'``. This is a real class exposing every protocol entry point; all of them funnel
+    through one :meth:`_get_result` that runs the hooks EXACTLY once, at the real collect, so a cached
+    re-read cannot double-fire the deferred configuration-lock release or the continuous-work unregister.
+
+    Composition (not subclassing) keeps this module free of a module-level ``LazyCollect`` import, which
+    would cycle through ``infra/__init__`` (it imports dispatch). ``__getattr__`` forwards anything not
+    modelled here (``device_mesh``, ``_method``, ...) to the wrapped handle, so the proxy is transparent
+    to code that introspects the underlying ``LazyCollect``.
+    """
+
+    _is_lazy_collect = True
+
+    def __init__(self, base, *, on_error: Optional[Callable] = None, on_collect: Optional[Callable] = None):
+        self._base = base
+        #: Snapshot: the ``__next__`` path mutates ``base._futures`` BEFORE this proxy is built, and
+        #: resolvers read ``_futures`` off the returned handle (the old wrapper copied it too).
+        self._futures = getattr(base, '_futures', None)
+        self._on_error = on_error
+        self._on_collect = on_collect
+        self._succeeded = False
+        self._hook_done = False
+        self._value = None
+
+    def _get_result(self):
+        if self._succeeded:
+            return self._value
+        try:
+            self._value = self._base()
+            self._succeeded = True
+            return self._value
+        except Exception as _e:  # noqa
+            if self._on_error is not None:
+                self._on_error(_e)
+            raise
+        finally:
+            if self._on_collect is not None and not self._hook_done:
+                self._hook_done = True
+                self._on_collect()
+
+    def __call__(self):
+        return self._get_result()
+
+    def result(self, timeout=None):
+        if timeout is not None and not self._succeeded:
+            self._base._timeout = timeout
+        return self._get_result()
+
+    def exception(self, timeout=None):
+        try:
+            self.result(timeout)
+            return None
+        except StopIteration:
+            raise
+        except Exception as exc:  # noqa
+            return exc
+
+    def done(self) -> bool:
+        return self.ready()
+
+    def ready(self) -> bool:
+        return self._base.ready()
+
+    def __iter__(self):
+        return iter(self._get_result())
+
+    def __len__(self):
+        return len(self._get_result())
+
+    def __getitem__(self, key):
+        return self._get_result()[key]
+
+    def get(self, key, default=None):
+        return self._get_result().get(key, default)
+
+    def __contains__(self, key):
+        return key in self._get_result()
+
+    def __getattr__(self, name):
+        # Only reached for attrs not modelled above; ``_base`` is set first in __init__, so no recursion.
+        return getattr(self._base, name)
 
 
 def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
@@ -709,6 +800,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             whole. The caller's collect then materialises only the rest of the container, and the
             next remote call dereferences the stashed references at its worker. Local mode has no
             remote path, so the natural value passes through untouched.
+
+    Wrapped continuous-work calls also accept ``_session_ids``, a list or tuple of
+    non-empty session strings (or ``None`` for ordinary load balancing), aligned
+    with the materialized list batch. This metadata stays on the driver. Bindings
+    are local to the driver and method, survive completed calls, and expire after
+    30 minutes idle. A bound worker outside the current eligible subset causes
+    rebinding. LazyCollect inputs and ``sync=True`` do not support this option.
     """ # noqa
     if sticky and sticky_key is None:
         raise ValueError('remote_function(sticky=True) requires sticky_key (a field-path string or a callable).')
@@ -727,6 +825,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             _worker_reservation = None
             _worker_dispatching = False
             _configuration_lock = None
+            # Set when an exclusive + explicit-lazy_collect call hands back a future whose collection
+            # (not this method's return) releases _configuration_lock -- so the finally below skips it.
+            _lock_release_deferred = False
             _submitted_calls = []
             _call_completed = False
 
@@ -740,6 +841,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 device_mesh = getattr(self, 'device_mesh', None)
                 worker_ids = kwargs.pop('_worker_ids', None)
                 dispatch_context = kwargs.pop('_dispatch_context', None)
+                session_ids = kwargs.pop('_session_ids', None)
+                if session_ids is not None:
+                    if not enable_continous_work or sync:
+                        raise ValueError('_session_ids requires enable_continous_work=True and sync=False.')
+                    session_ids = _validate_cw_session_ids(session_ids, _cw_batch_len(args, kwargs))
                 # Sticky ownership: resolve the declared key once per call, on the driver only (the
                 # ownership table lives on the driver-side handler). A ``sticky`` call with an
                 # existing owner is pinned to that worker (request ownership); a ``control`` call
@@ -804,6 +910,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         # This is the driver
                         from ._ray import RayHelper
 
+                        if session_ids is not None and RayHelper.has_ref(args, kwargs):
+                            raise ValueError(
+                                '_session_ids does not support LazyCollect inputs; materialize the batch first.')
+
                         # Resolve the effective ray.get timeout before choosing execute_method:
                         # the decorator's explicit value wins, the instance attribute is the
                         # fallback. ``is not None`` (not ``or``) so that a decorator ``timeout=0``
@@ -834,6 +944,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _subset = worker_ids is not None
                         _workers = _get_workers(_select_workers(self, selected_ids), execute)
                         if not _workers:
+                            if session_ids:
+                                raise RuntimeError('No sampler worker is available for sticky session routing.')
                             return []
                         if _subset and worker_selector is not None:
                             args, kwargs = self._normalize_sampling_args(args, kwargs)
@@ -858,11 +970,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
                                               'which exists for collectives that must run in lock step.')
                             _batch_len = _cw_batch_len(args, kwargs)
-                            if _batch_len:
+                            if _batch_len or session_ids is not None:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
                                                            _batch_len,
                                                            _rgt,
-                                                           on_dispatched=_finish_dispatch)
+                                                           on_dispatched=_finish_dispatch, session_ids=session_ids)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -926,29 +1038,44 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             # This is the unique case that an object ref contains another
                             # And this is user independent, only decided by the code.
                             _local_lazy_collect = self._lazy_collect
-                        if _configuration_lock is not None:
+                        if _configuration_lock is not None and lazy_collect is not True:
+                            # An exclusive call normally collects eagerly so the configuration lock is
+                            # held through completion. A method that EXPLICITLY declared
+                            # lazy_collect=True (the two-phase checkpoint-engine weight sync) must still
+                            # hand back a future -- its lock release is deferred to collection below.
                             _local_lazy_collect = False
                         if _local_lazy_collect:
                             if _subset or _worker_reservation is not None:
                                 # When a subset call's payload crosses Ray, it must not capture the driver handler's locks or lifecycle state.
-                                return result_func
-                            _orig_result_func = result_func
-
-                            @functools.wraps(_orig_result_func)
-                            def _notifying_result_func(*rargs, **rkwargs):
-                                try:
-                                    return _orig_result_func(*rargs, **rkwargs)
-                                except Exception as _e:  # noqa
+                                _lazy_result = result_func
+                            else:
+                                # Notify exceptions and unregister continuous-work refs at the real collect.
+                                # A _SideEffectLazyCollect (NOT a functools.wraps function) so the wrapped
+                                # LazyCollect's full access protocol survives -- a bare function drops
+                                # ``.get`` / ``.result`` (instance methods) and ``[]`` / ``in`` / ``iter`` /
+                                # ``len`` (type-resolved dunders), breaking a driver that reads a forwarded
+                                # output directly (``forward_only(...).get('logps')``). ``_is_lazy_collect``
+                                # stays a class attr so the getattr-based resolvers (ScoreWorker._resolve,
+                                # scoring.response_token_scores, RayHelper.has_ref) still detect the handle.
+                                def _notify_collect_error(_e, _caller=_caller, _ctx=_ctx, _infra=infra):
                                     _tag_exc(_e, _caller)
-                                    notify_exception(infra._notifier, _ctx, _e, infra._name)
-                                    raise
-                                finally:
-                                    _cw_unregister(self, func.__name__, _tracked_refs)
+                                    notify_exception(_infra._notifier, _ctx, _e, _infra._name)
 
-                            for _attr in ('_futures', 'ready'):
-                                if hasattr(_orig_result_func, _attr):
-                                    setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
-                            return _notifying_result_func
+                                _lazy_result = _SideEffectLazyCollect(
+                                    result_func, on_error=_notify_collect_error,
+                                    on_collect=lambda: _cw_unregister(self, func.__name__, _tracked_refs))
+                            if _configuration_lock is not None:
+                                # exclusive + explicit lazy_collect (the two-phase checkpoint-engine weight
+                                # sync): the caller launches the peer half CONCURRENTLY and waits on both
+                                # futures, so the configuration lock must stay held until the future is
+                                # COLLECTED -- releasing at method return would let an ordinary call mutate
+                                # params mid-sync. The same driver thread collects, so releasing the
+                                # reentrant lock there is valid. Composition chains the inner hooks (notify /
+                                # unregister) ahead of this release, and the once-only guard in
+                                # _SideEffectLazyCollect keeps a cached re-read from releasing twice.
+                                _lock_release_deferred = True
+                                return _SideEffectLazyCollect(_lazy_result, on_collect=_configuration_lock.release)
+                            return _lazy_result
                         try:
                             output = result_func()
                             completed = getattr(self, '_worker_call_completed', None)
@@ -979,7 +1106,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         finally:
                             self._end_worker_call(_worker_reservation)
                 finally:
-                    if _configuration_lock is not None:
+                    if _configuration_lock is not None and not _lock_release_deferred:
                         _configuration_lock.release()
 
         wrapper._execute = execute

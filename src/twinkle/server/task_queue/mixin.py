@@ -127,6 +127,8 @@ class TaskQueueMixin:
         )
 
         self._backend_gate = BackendGate(enable_admission_gate=enable_admission_gate)
+        #: Strong references to in-flight fire-and-forget background tasks (see schedule_background_task).
+        self._background_tasks: set = set()
         self._event_loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -479,7 +481,12 @@ class TaskQueueMixin:
                 logger.error(f'[TaskQueue] Background task {request_id} FAILED, type={task_type or "unknown"}:\n'
                              f'{traceback.format_exc(limit=3)}')
 
-        asyncio.create_task(_run())
+        task = asyncio.create_task(_run())
+        # Hold a strong reference: the event loop keeps only a weak one, so an unreferenced task
+        # can be garbage-collected mid-run -- its state would stay RUNNING forever with no FAILED
+        # record to explain it (a minutes-long hub upload is the main victim).
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         return {'request_id': request_id, 'model_id': model_id}
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:

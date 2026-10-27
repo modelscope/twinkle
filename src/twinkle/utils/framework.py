@@ -49,7 +49,9 @@ class Framework(ABC):
                 # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
                 # DP group instead. When CP is enabled we must pick the DP+CP
                 # variant, otherwise the rank span for metric aggregation is wrong.
-                if importlib.util.find_spec('megatron.core') is not None:
+                # find_spec for a submodule imports its parent, which is optional.
+                if (importlib.util.find_spec('megatron') is not None
+                        and importlib.util.find_spec('megatron.core') is not None):
                     from megatron.core import parallel_state as mpu
                     if mpu.model_parallel_is_initialized():
                         process_group = mpu.get_data_parallel_group_gloo(

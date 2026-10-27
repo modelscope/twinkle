@@ -130,14 +130,21 @@ class TransformerStrategyBase(ABC):
 
     # ── layer 3: optional capabilities ─────────────────────────────────────
 
-    def offload_to_cpu(self, model, optimizer=None) -> None:
-        """Weight offload for colocation; strategies without it must refuse loudly."""
+    def offload_to_cpu(self, model, optimizer=None, *, offload_model: bool = True) -> None:
+        """Weight offload for colocation; strategies without it must refuse loudly.
+
+        ``offload_model=False`` asks to leave parameters resident and move only ``optimizer``
+        when one is passed. Strategies that cannot move either piece still refuse.
+        """
         raise NotImplementedError(
             f'{type(self).__name__} does not support weight offload, which the colocation '
-            'flow requires. Use a strategy with offload support (accelerate / megatron).')
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / megatron).')
 
     def reload_to_gpu(self, model, optimizer=None) -> None:
-        """Weight offload for colocation; strategies without it must refuse loudly."""
+        """Bring back whatever :meth:`offload_to_cpu` moved; a no-op when nothing was moved."""
+        from twinkle.model.offload import offload_record
+        if not any(offload_record(self)):
+            return
         raise NotImplementedError(
             f'{type(self).__name__} does not support weight offload, which the colocation '
-            'flow requires. Use a strategy with offload support (accelerate / megatron).')
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / megatron).')

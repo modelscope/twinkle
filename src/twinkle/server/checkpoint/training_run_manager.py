@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from twinkle import get_logger
-from .paths import SAVE_DIR_POINTER_KEY, TWINKLE_DEFAULT_SAVE_DIR, _hash_token, _resolve_client_save_dir
+from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
+from .paths import SAVE_DIR_POINTER_KEY, TWINKLE_DEFAULT_SAVE_DIR, _hash_token, _resolve_client_save_dir, ensure_inside
 
 logger = get_logger()
 
@@ -157,12 +158,15 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             Path to model directory
         """
         if save_dir:
-            return self._token_base_dir(save_dir) / model_id
+            base = self._token_base_dir(save_dir)
+            return ensure_inside(base, base / model_id)
 
         pointer = self._read_save_dir_pointer(model_id)
         if pointer and pointer.get('save_dir'):
-            return self._token_base_dir(pointer.get('save_dir')) / model_id
-        return self.get_base_dir() / model_id
+            base = self._token_base_dir(pointer.get('save_dir'))
+            return ensure_inside(base, base / model_id)
+        base = self.get_base_dir()
+        return ensure_inside(base, base / model_id)
 
     def _read_info(self, model_id: str) -> dict[str, Any]:
         """
@@ -260,19 +264,27 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """Merge fields and atomically replace the run metadata.
 
         Ordinary updates keep the existing save-dir pointer; relocation delegates
-        to _write_info to update both the destination and pointer.
+        to _write_info to update both the destination and pointer. The read-modify-write
+        runs under a per-model file lock: a concurrent delete's pointer refresh racing a
+        save's submission would otherwise lose one side's write.
         """
-        info = self._read_info(model_id)
-        if info:
-            save_dir = info.get('save_dir')
-            info.update(updates)
-            if info.get('save_dir') == save_dir:
-                # Ordinary updates commit only the run-info file. Its existing
-                # save-dir pointer is neither changed nor rewritten afterwards.
-                path = self.get_model_dir(model_id) / self.train_run_info_filename
-                self._write_json_atomic(path, info)
-            else:
-                self._write_info(model_id, info)
+        model_dir = self.get_model_dir(model_id)
+        lock = FileLock(str(model_dir / '.run.lock'))
+        acquire_lock(lock, blocking=True)
+        try:
+            info = self._read_info(model_id)
+            if info:
+                save_dir = info.get('save_dir')
+                info.update(updates)
+                if info.get('save_dir') == save_dir:
+                    # Ordinary updates commit only the run-info file. Its existing
+                    # save-dir pointer is neither changed nor rewritten afterwards.
+                    path = model_dir / self.train_run_info_filename
+                    self._write_json_atomic(path, info)
+                else:
+                    self._write_info(model_id, info)
+        finally:
+            release_lock(lock)
 
     def list_runs(self, limit: int = 20, offset: int = 0) -> Any:
         """

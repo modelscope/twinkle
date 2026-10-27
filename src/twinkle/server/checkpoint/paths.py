@@ -83,6 +83,23 @@ def validate_user_path(token: str, path: str) -> bool:
     return True
 
 
+def ensure_inside(base: Path, candidate: Path) -> Path:
+    """Refuse a path that escapes ``base`` after resolution; return ``candidate`` unchanged.
+
+    The string-level checks in :func:`validate_user_path` miss two escape routes: the
+    ``Path('/a') / '/b'`` absolute-reset semantics (a leading slash silently replaces the whole
+    prefix) and symlinks pointing outside the base. Containment is therefore verified on the
+    resolved paths here, at the single places where user-controlled ids become directory
+    segments (``get_model_dir`` / ``get_ckpt_dir``). The unresolved candidate is returned so
+    callers that inspect ``is_symlink()`` keep working; a symlink escaping ``base`` is rejected.
+    """
+    resolved_base = base.resolve()
+    resolved = candidate.resolve()
+    if resolved == resolved_base or not resolved.is_relative_to(resolved_base):
+        raise ValueError(f'Path escapes the permitted directory: {candidate}')
+    return candidate
+
+
 def validate_ownership(token: str, model_owner: str) -> bool:
     """
     Validate that the user owns the resource.

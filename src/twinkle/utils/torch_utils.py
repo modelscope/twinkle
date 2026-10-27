@@ -1,9 +1,11 @@
 import socket
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
 from .network import is_valid_ipv6_address
+from .utils import has_signature_parameter
 
 if TYPE_CHECKING:
     import torch
@@ -334,8 +336,9 @@ def stateless_init_process_group(
         device: The CUDA device to use. If None, uses current device.
         backend: The communication backend ("nccl" or "hccl").
         listen_socket: Optional pre-created listening socket for master (rank 0).
-            If provided, this socket will be reused instead of creating a new one.
-        listen_fd: Optional file descriptor of the listening socket.
+            Ownership is transferred to TCPStore; the Python socket is detached.
+        listen_fd: Optional owned listening file descriptor for master (rank 0),
+            used when listen_socket is not provided. TCPStore takes ownership.
 
     Returns:
         PyNcclCommunicator or PyHcclCommunicator instance.
@@ -358,7 +361,7 @@ def stateless_init_process_group(
     # Create the stateless process group
     launch_server = rank == 0
 
-    if launch_server and listen_socket is None:
+    if launch_server and listen_socket is None and listen_fd is None:
         # For master, create a listening socket if not provided
         if is_valid_ipv6_address(master_address):
             listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -367,30 +370,32 @@ def stateless_init_process_group(
         listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_socket.bind((master_address, master_port))
         listen_socket.listen()
-        listen_fd = listen_socket.fileno()
-    elif launch_server and listen_fd is None:
-        listen_fd = listen_socket.fileno()
+    if launch_server and listen_socket is not None:
+        # TCPStore adopts this descriptor. Keeping a Python owner can close the
+        # listener under its daemon thread and abort the process with POLLNVAL.
+        listen_fd = listen_socket.detach()
 
-    store = TCPStore(
-        host_name=master_address,
-        port=master_port,
-        world_size=world_size,
-        is_master=launch_server,
-        timeout=timedelta(seconds=300),
-        use_libuv=False,  # for compatibility
-        master_listen_fd=listen_fd,
-    )
+    try:
+        store = TCPStore(
+            host_name=master_address,
+            port=master_port,
+            world_size=world_size,
+            is_master=launch_server,
+            timeout=timedelta(seconds=300),
+            use_libuv=False,  # for compatibility
+            master_listen_fd=listen_fd,
+        )
+    except Exception:
+        if launch_server and listen_fd is not None:
+            with suppress(OSError):
+                socket.close(listen_fd)
+        raise
 
-    # Newer vLLM (e.g. 0.30) removed the ``socket`` field from StatelessProcessGroup; pass it only if present.
-    import dataclasses
-    pg_fields = {field.name for field in dataclasses.fields(StatelessProcessGroup)}
-    pg_kwargs = dict(rank=rank, world_size=world_size, store=store, data_expiration_seconds=3600)
-    if 'socket' in pg_fields:
-        pg_kwargs['socket'] = listen_socket
-    pg = StatelessProcessGroup(**pg_kwargs)
-    if 'socket' not in pg_fields and listen_socket is not None:
-        # TCPStore borrows this socket's fd via master_listen_fd; keep a reference so GC does not close it.
-        pg._twinkle_listen_socket = listen_socket
+    group_kwargs = dict(rank=rank, world_size=world_size, store=store, data_expiration_seconds=3600)
+    # Legacy vLLM requires this field; TCPStore owns the descriptor in both APIs.
+    if has_signature_parameter(StatelessProcessGroup, 'socket'):
+        group_kwargs['socket'] = None
+    pg = StatelessProcessGroup(**group_kwargs)
 
     communicator = Communicator(pg, device=device)
     return communicator

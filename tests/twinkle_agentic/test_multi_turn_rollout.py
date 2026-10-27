@@ -342,6 +342,21 @@ class FakeSampler:
     sample._enable_continous_work = True
 
 
+class SessionRecordingSampler(FakeSampler):
+    def __init__(self, template):
+        super().__init__(template)
+        self.sessions_seen = []
+
+    def sample(self, pifs, sampling_params=None, **kwargs):
+        session_ids = kwargs.get('_session_ids')
+        with self._lock:
+            self.sessions_seen.append((self._key_of(pifs[0]),
+                                       tuple(session_ids) if session_ids is not None else None))
+        return super().sample(pifs, sampling_params)
+
+    sample._enable_continous_work = True
+
+
 class EchoTool(Tool):
     """Echoes its arguments as a JSON string."""
 
@@ -445,6 +460,63 @@ def _user_traj(text: str = 'hi') -> dict[str, Any]:
 
 def _tool_call_text(name: str, arguments: dict[str, Any]) -> str:
     return '<tool_call>' + json.dumps({'name': name, 'arguments': arguments}) + '</tool_call>'
+
+
+# =============================================================================
+# Tests: sticky sessions
+# =============================================================================
+def test_sticky_session_id_is_created_once_per_episode(template, tool_manager):
+    sampler = SessionRecordingSampler(template)
+    for key in ('A', 'B'):
+        sampler.queue_for(key, _tool_call_text('search', {'q': key}))
+        sampler.queue_for(key, 'done')
+    rollout = MultiTurnRollout(sampler=sampler, template=template, tool_manager=tool_manager,
+                              max_turns=3, sticky_session=True)
+    outputs = rollout([_user_traj('A'), _user_traj('B')])
+    assert [output['turns'] for output in outputs] == [2, 2]
+    by_episode = {key: [ids for episode, ids in sampler.sessions_seen if episode == key] for key in ('A', 'B')}
+    assert all(len(ids) == 2 and ids[0] == ids[1] and len(ids[0]) == 1 for ids in by_episode.values())
+    assert by_episode['A'][0] != by_episode['B'][0]
+
+    sampler.queue_for('A', 'new episode')
+    rollout([_user_traj('A')])
+    assert sampler.sessions_seen[-1][1] != by_episode['A'][0]
+
+
+def test_explicit_session_ids_are_forwarded_without_enabling_constructor_flag(template):
+    sampler = SessionRecordingSampler(template)
+    sampler.queue_for('A', 'done-A')
+    sampler.queue_for('B', 'done-B')
+    rollout = MultiTurnRollout(sampler=sampler, template=template)
+    rollout([_user_traj('A'), _user_traj('B')], session_ids=['session-A', 'session-B'])
+    assert dict(sampler.sessions_seen) == {'A': ('session-A',), 'B': ('session-B',)}
+
+
+def test_sticky_session_is_opt_in(template):
+    sampler = SessionRecordingSampler(template)
+    sampler.queue('done')
+    rollout = MultiTurnRollout(sampler=sampler, template=template)
+    rollout([_user_traj()])
+    assert sampler.sessions_seen == [('hi', None)]
+
+
+@pytest.mark.parametrize('session_ids, error', [
+    ('session', TypeError),
+    ([], ValueError),
+    (['s1', 's2'], ValueError),
+    ([''], ValueError),
+    ([123], ValueError),
+])
+def test_rollout_rejects_invalid_session_ids_before_sampling(sampler, template, session_ids, error):
+    rollout = MultiTurnRollout(sampler=sampler, template=template)
+    with pytest.raises(error, match='session_ids'):
+        rollout([_user_traj()], session_ids=session_ids)
+    assert sampler.sample_calls == 0
+
+
+def test_sticky_session_rejects_a_callback_without_sampler():
+    with pytest.raises(ValueError, match='sticky_session requires a sampler'):
+        MultiTurnRollout(response_callback=lambda *args, **kwargs: None, sticky_session=True)
 
 
 # =============================================================================

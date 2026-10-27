@@ -61,8 +61,11 @@ def find_layers(model: nn.Module,
             module_name = module_name_list.pop()
             i = 1
             for inner_node in inner_nodes:
-                while module_name_list and inner_node.endswith(re.sub(
-                        r'\d+\.', '{}.', module_name)) or min_name_len and i < min_name_len:
+                # module_name_list must gate BOTH branches: with min_name_len on a
+                # top-level single-segment leaf the list is already empty, and popping
+                # it would raise IndexError -- the name stays as long as it can be.
+                while module_name_list and (inner_node.endswith(re.sub(
+                        r'\d+\.', '{}.', module_name)) or (min_name_len and i < min_name_len)):
                     module_name = f'{module_name_list.pop()}.{module_name}'
                     i += 1
             target_module_names.add(module_name)

@@ -2,6 +2,9 @@
 import functools
 import os
 import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from twinkle.utils import Platform, get_logger
@@ -20,6 +23,18 @@ def _get_workers(workers, execute):
         return workers[Platform.get_peer_index(len(workers))]
     else:
         raise ValueError(f'Unsupported execute method: {execute}')
+
+# Affinity survives completed calls, but idle sessions must not accumulate forever.
+# Expired entries are reclaimed on the next sticky call for the same method.
+_CW_SESSION_IDLE_TIMEOUT = 30 * 60
+# Limit bindings per driver and method; overflow evicts the least recently used session.
+_CW_SESSION_CACHE_SIZE = 10_000
+
+
+@dataclass
+class _StickySessionBinding:
+    worker_id: str
+    last_used: float
 
 
 def get_worker_id(worker) -> str:
@@ -123,6 +138,7 @@ def _cw_state(self):
                 'load': {},
                 'inflight': {},
                 'owners': {},
+                'session_bindings': {},
             }
             self._continous_work_state = state
         return state
@@ -230,6 +246,58 @@ def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]
     for idx in range(batch_len):
         target = min(range(n_workers), key=lambda w: load[w])
         per_worker[target].append(idx)
+        load[target] += 1
+    return per_worker
+
+
+def _validate_cw_session_ids(session_ids, batch_len: Optional[int]) -> tuple:
+    """Validate driver-only routing metadata before submitting any RPC."""
+    if not isinstance(session_ids, (list, tuple)):
+        raise TypeError('_session_ids must be a list or tuple aligned with the input batch.')
+    if batch_len is None:
+        raise ValueError('_session_ids requires a materialized list batch; LazyCollect inputs are not supported.')
+    if len(session_ids) != batch_len:
+        raise ValueError(f'_session_ids has {len(session_ids)} entries but the input batch has {batch_len}.')
+    if any(session_id is not None and (not isinstance(session_id, str) or not session_id)
+           for session_id in session_ids):
+        raise ValueError('_session_ids entries must be non-empty strings or None.')
+    return tuple(session_ids)
+
+
+def _sticky_session_cw_plan(worker_ids: tuple, load: List[int], session_ids: tuple,
+                            session_bindings: OrderedDict, *, now: Optional[float] = None) -> List[List[int]]:
+    """Plan session affinity under the caller's continuous-work lock.
+
+    New sessions use least load; existing sessions keep their stable actor ID even
+    when workers are reordered or added. Idle expiry, LRU eviction, or a bound
+    actor missing from this call's eligible workers permits rebinding. ``None``
+    uses ordinary least-load routing without retaining a binding. Like ``_cw_plan``, update the
+    local planning loads; the RPC submission loop owns actual load accounting.
+    """
+    if not worker_ids:
+        raise RuntimeError('No sampler worker is available for sticky session routing.')
+    if now is None:
+        now = time.monotonic()
+    # Entries are ordered by last use, so cleanup scans only expired sessions.
+    while session_bindings:
+        oldest = next(iter(session_bindings.values()))
+        if now - oldest.last_used < _CW_SESSION_IDLE_TIMEOUT:
+            break
+        session_bindings.popitem(last=False)
+
+    by_id = {worker_id: index for index, worker_id in enumerate(worker_ids)}
+    per_worker: List[List[int]] = [[] for _ in worker_ids]
+    for index, session_id in enumerate(session_ids):
+        binding = session_bindings.get(session_id) if session_id is not None else None
+        target = by_id.get(binding.worker_id) if binding is not None else None
+        if target is None:
+            target = min(range(len(worker_ids)), key=lambda worker_index: load[worker_index])
+        if session_id is not None:
+            session_bindings[session_id] = _StickySessionBinding(worker_ids[target], now)
+            session_bindings.move_to_end(session_id)
+            while len(session_bindings) > _CW_SESSION_CACHE_SIZE:
+                session_bindings.popitem(last=False)
+        per_worker[target].append(index)
         load[target] += 1
     return per_worker
 
@@ -345,7 +413,7 @@ def _resolve_sticky_key(sticky_key, func, args, kwargs):
 
 
 def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
-                        ray_get_timeout: Optional[float], *, on_dispatched=None):
+                        ray_get_timeout: Optional[float], *, on_dispatched=None, session_ids=None):
     """Submit one call per chosen worker and return results in the caller's order.
 
     Submission happens under the lock so that picking a worker and charging it are
@@ -367,7 +435,11 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
                 ready, _ = ray.wait(pending, num_returns=len(pending), timeout=0)
                 _cw_drop_locked(state, ready)
             load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
-            plan = _cw_plan(len(workers), load, batch_len)
+            if session_ids is not None:
+                bindings = state['session_bindings'].setdefault(func_name, OrderedDict())
+                plan = _sticky_session_cw_plan(worker_ids, load, session_ids, bindings)
+            else:
+                plan = _cw_plan(len(workers), load, batch_len)
             for worker_index, indices in enumerate(plan):
                 if not indices:
                     continue

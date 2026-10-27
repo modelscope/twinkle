@@ -1,10 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import copy
 import re
-import threading
-import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Optional
 
@@ -17,7 +15,7 @@ from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
+from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout, SampleHandle
 from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
 
@@ -110,36 +108,6 @@ class RolloutSample:
     def prompt_index(self) -> str:
         """Back-compat alias for the group id."""
         return self.prompt_id
-
-
-@dataclass(eq=False)
-class SampleHandle:
-    """One in-flight trajectory admitted by :meth:`MultiTurnRollout.admit`.
-
-    Carries the submit-time facts collect/cancel need; identity is ``submission_id``
-    (two handles for one submission are the same trajectory).
-    """
-
-    submission_id: str
-    prompt_idx: Any
-    trajectory_idx: int
-    prompt_extras: dict[str, Any] | None = None
-    require_logprobs: bool = True
-    policy_version: int = 0
-    # The ORIGINAL prompt messages, stamped onto the collected sample (sample.prompt).
-    prompt: list[dict] | None = None
-    # Ref-only remote result (a LazyCollect the driver never resolves early); the local
-    # engine shape leaves it unset and runs the episode on a Future instead.
-    payload: Any = None
-    # The admission pin's adapter path. None marks the in_place strategy, whose collect
-    # stamps a version span; a pinned path (adapter_snapshot) spans nothing.
-    adapter_path: str | None = None
-
-    def __hash__(self) -> int:
-        return hash(self.submission_id)
-
-    def __eq__(self, other: Any) -> bool:
-        return isinstance(other, SampleHandle) and self.submission_id == other.submission_id
 
 
 def _build_sampling_params(num_samples: int, sampling_params: dict | None, force_logprobs: bool) -> SamplingParams:
@@ -385,6 +353,11 @@ class MultiTurnRollout(Rollout):
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
+        * ``sticky_session``: keep every turn of an episode on the same sampler
+          worker. Generate one session ID per episode when enabled.
+        * ``session_ids``: explicit per-trajectory session strings (or ``None``
+          for load balancing), aligned with the trajectory batch. Supplying them
+          also enables sticky routing. Requires a continuous-work sampler.
     """
 
     def __init__(
@@ -410,6 +383,7 @@ class MultiTurnRollout(Rollout):
         allow_partial_rollout: bool = False,
         tools_factory: Callable[[Any], tuple[Any, list[Any], Any]] | None = None,
         tools_config: Any = None,
+        sticky_session: bool = False,
     ):
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
@@ -451,8 +425,11 @@ class MultiTurnRollout(Rollout):
             )
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f"max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}")
+        if sticky_session and not getattr(getattr(type(sampler), "sample", None), "_enable_continous_work", False):
+            raise ValueError("sticky_session requires a sampler with enable_continous_work=True.")
         self._init_common(max_turns=max_turns, sampling_params=sampling_params, concurrency=concurrency, tracer=tracer)
         self.sampler = sampler
+        self.sticky_session = sticky_session
         self.template = template
         self._template_backend = getattr(type(sampler), "template_backend", "vllm") if sampler is not None else "vllm"
         # No template -> account in messages, not tokens (see ``_new_ledger``).
@@ -613,8 +590,28 @@ class MultiTurnRollout(Rollout):
         if params is None:
             params = SamplingParams()
         # Fall back to the construction-time tool_manager, as __call__/_resolve_call does, so a caller
-        # that wired tools at build time need not re-pass them per stream.
+        # that wired tools at build time need not re-pass them per stream. A tools_factory sandbox
+        # carries no shared manager (it was rejected at construction); the single streamed episode
+        # leases one env for the whole conversation turn and builds its manager from it, exactly as
+        # _run_one does per training episode.
         tool_manager = tool_manager if tool_manager is not None else self.tool_manager
+        lease = contextlib.ExitStack()
+        try:
+            if tool_manager is None and self._per_episode_tools:
+                env = lease.enter_context(self.env_pool.lease())
+                tool_manager = self._tool_manager_for(env, self.tool_plugins)
+            yield from self._stream_episode(trajectory, params, adapter_path, tool_manager)
+        finally:
+            lease.close()
+
+    def _stream_episode(
+        self,
+        trajectory: Trajectory,
+        params: SamplingParams,
+        adapter_path: str | None,
+        tool_manager: ToolManager | None,
+    ):
+        """The streaming loop proper; the lease above is held for all of it."""
         # Message-level accounting, but template-aware so a reply's tool-call markup still parses. The
         # feature stays a {'messages','tools'} dict with no input_ids, so sample_stream re-encodes the
         # whole trajectory each turn and the tool schema reaches the prompt tokens.
@@ -759,56 +756,27 @@ class MultiTurnRollout(Rollout):
         ``prompt_idx`` / ``trajectory_idx`` are carried for the collect-side group
         stamping; ``policy_version`` is the admission pin, stamped onto the sample. A
         REMOTE deployment parks the lazy generate on the handle's payload; a local one
-        runs the episode on a daemon-thread Future. This method also runs on a Ray
-        proxy whose ``__init__`` never executed, which is why every state it touches
-        is either on the handle or lazy.
+        runs the episode on a daemon-thread Future.
         """
-        handle = SampleHandle(
-            submission_id=uuid.uuid4().hex,
-            prompt_idx=prompt_idx,
-            trajectory_idx=trajectory_idx,
-            prompt_extras=dict(prompt_extras) if prompt_extras else None,
-            policy_version=policy_version,
-            prompt=list(prompt) if prompt is not None else None,
+        handle = self._new_handle(
+            prompt, trajectory_idx, prompt_idx=prompt_idx, prompt_extras=prompt_extras,
+            adapter_path=adapter_path, policy_version=policy_version)
+        generate_kwargs = dict(
+            num_samples=1,
+            sampling_params=sampling_params,
+            prompt_extras=[prompt_extras] if prompt_extras else None,
+            force_logprobs=True,
             adapter_path=adapter_path,
         )
         if hasattr(self, "_actors"):
             # The remote episode runs on the actor: the generate call itself returns a
             # LazyCollect immediately, so admission never blocks the driver thread.
-            handle.payload = self.generate(
-                [prompt],
-                num_samples=1,
-                sampling_params=sampling_params,
-                prompt_extras=[prompt_extras] if prompt_extras else None,
-                force_logprobs=True,
-                adapter_path=adapter_path,
-            )
+            handle.payload = self.generate([prompt], **generate_kwargs)
             return handle
-        futures: dict[str, Future] = self.__dict__.setdefault("_episode_futures", {})
-        future: Future = Future()
-        futures[handle.submission_id] = future
-
-        def _work() -> None:
-            try:
-                future.set_result(
-                    self.generate(
-                        [prompt],
-                        num_samples=1,
-                        sampling_params=sampling_params,
-                        prompt_extras=[prompt_extras] if prompt_extras else None,
-                        force_logprobs=True,
-                        adapter_path=adapter_path,
-                    )
-                )
-            except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
-                future.set_exception(exc)
-
-        threading.Thread(target=_work, name=f"episode-{handle.submission_id[:8]}", daemon=True).start()
-        return handle
+        return self._admit_local(handle, lambda: self.generate([prompt], **generate_kwargs))
 
     def poll(self, handles: list[SampleHandle]) -> list[SampleHandle]:
         """Non-blocking as-completed query; a failed local episode raises here, fail-loudly."""
-        futures: dict[str, Future] = getattr(self, "_episode_futures", {})
         completed: list[SampleHandle] = []
         for handle in handles:
             if handle.payload is not None:
@@ -817,13 +785,8 @@ class MultiTurnRollout(Rollout):
                 if handle.payload.ready():
                     completed.append(handle)
                 continue
-            future = futures.get(handle.submission_id)
-            if future is None or not future.done():
-                continue
-            error = future.exception()
-            if error is not None:
-                raise RuntimeError(f"streaming episode {handle.submission_id} failed: {error}") from error
-            completed.append(handle)
+            if self._episode_done(handle):
+                completed.append(handle)
         return completed
 
     def collect(self, handle: SampleHandle) -> RolloutSample:
@@ -831,21 +794,12 @@ class MultiTurnRollout(Rollout):
         if handle.payload is not None:
             samples = handle.payload()
         else:
-            future = getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
-            if future is None:
-                raise RuntimeError(
-                    f"collect called for an unknown or already-collected submission {handle.submission_id}."
-                )
-            samples = future.result()
+            samples = self._pop_episode_future(handle).result()
         if len(samples) != 1:
             raise RuntimeError(
                 f"episode collect expected exactly 1 sample (submission {handle.submission_id}), got {len(samples)}."
             )
-        sample = samples[0]
-        sample.prompt_id = str(handle.prompt_idx)
-        sample.policy_version = handle.policy_version
-        sample.prompt = handle.prompt
-        return sample
+        return self._stamp_admission(samples[0], handle)
 
     def cancel(self, handle: SampleHandle | None) -> None:
         """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
@@ -858,7 +812,17 @@ class MultiTurnRollout(Rollout):
         if handle.payload is not None:
             # The in-actor episode finishes on its own; its result is discarded with the ref.
             return
-        getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
+        self._drop_episode_future(handle.submission_id)
+
+    def stop(self, submission_id: str) -> None:
+        """End an in-flight submission at driver teardown (abort + settle).
+
+        The local episode's future is dropped -- its daemon thread runs to completion
+        discarded, a thread being the one thing Python will not end early. A remote
+        episode's payload ref is dropped by the caller together with the handle, so
+        there is nothing further to end here.
+        """
+        self._drop_episode_future(submission_id)
 
     # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
     # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
@@ -908,9 +872,25 @@ class MultiTurnRollout(Rollout):
         response_callback = kwargs.get("response_callback", self.response_callback)
         if not callable(response_callback):
             raise TypeError("response_callback must be callable")
+        session_ids = kwargs.get("session_ids")
+        if kwargs.get("sticky_session", self.sticky_session) or session_ids is not None:
+            sample = getattr(type(self.sampler), "sample", None)
+            if not getattr(sample, "_enable_continous_work", False):
+                raise ValueError("sticky_session requires a sampler with enable_continous_work=True.")
+            if session_ids is None:
+                # Resolve once before launching episode threads, never once per turn.
+                session_ids = [uuid.uuid4().hex for _ in range(n)]
+            elif not isinstance(session_ids, (list, tuple)):
+                raise TypeError("session_ids must be a list or tuple aligned with trajectories.")
+            elif len(session_ids) != n:
+                raise ValueError(f"session_ids must contain {n} entries, got {len(session_ids)}.")
+            if any(sid is not None and (not isinstance(sid, str) or not sid) for sid in session_ids):
+                raise ValueError("session_ids entries must be non-empty strings or None.")
+            session_ids = tuple(session_ids)
         return {
             "sampling_params": sampling_params,
             "adapter_kwargs": adapter_kwargs,
+            "session_ids": session_ids,
             "response_callback": response_callback,
             "tool_managers": self._broadcast(kwargs.get("tool_manager", self.tool_manager), n, name="tool_manager"),
             "followup_fn": kwargs.get("followup_fn", self.followup_fn),
@@ -970,7 +950,11 @@ class MultiTurnRollout(Rollout):
     def _run_episode(self, trajectory: Trajectory, index: int, ctx: dict[str, Any], harness=None) -> Trajectory:
         tool_manager: ToolManager = ctx["tool_managers"][index]
         followup_fn = ctx["followup_fn"]
-        adapter_kwargs: dict[str, Any] = ctx["adapter_kwargs"]
+        # Each episode owns its metadata; mutating the shared dict would let
+        # concurrent episodes overwrite one another's session ID.
+        adapter_kwargs: dict[str, Any] = dict(ctx["adapter_kwargs"])
+        if ctx.get("session_ids") is not None:
+            adapter_kwargs["_session_ids"] = [ctx["session_ids"][index]]
         response_callback: ResponseCallback = ctx["response_callback"]
 
         # The token account for this episode. Every id the trajectory ends up

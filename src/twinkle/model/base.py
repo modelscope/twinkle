@@ -368,7 +368,7 @@ class TrainableModel(ABC):
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     @timed
-    def offload_to_cpu(self) -> None:
+    def offload_to_cpu(self, *, offload_model: bool = True, offload_optimizer: bool = True) -> None:
         """Hand this rank's training memory back so a colocated process can use the device.
 
         Colocation -- an online-RL rollout engine, or an in-training generative-eval sampler, sharing
@@ -381,8 +381,10 @@ class TrainableModel(ABC):
 
         This is the driver-facing handle over ``strategy.offload_to_cpu(model, optimizer)``; both
         concrete models carry the ``strategy`` / ``model`` / ``optimizer_group`` / ``_get_default_group``
-        shape it reads. A strategy with no offload of its own (deepspeed, native FSDP -- whose sharded
-        parameters need backend-specific handling, not a plain move) leaves nothing to delegate to.
+        shape it reads. ``offload_model`` and ``offload_optimizer`` select which piece moves; both
+        default on so existing callers still step the whole trainer aside. Passing both false leaves
+        the rank resident and records nothing for :meth:`reload_to_gpu`. A strategy with no offload
+        of its own (deepspeed, Megatron-FSDP) still refuses when a piece is requested.
 
         ``@remote_function`` is what makes the handle reach the workers: under Ray the model on the
         driver is a proxy with no ``strategy`` of its own, so an undecorated method would run against
@@ -391,7 +393,17 @@ class TrainableModel(ABC):
         so Ray's per-actor ordering cannot guarantee the GPU is actually free before the caller wakes
         the engine and lets it allocate its KV cache.
         """
-        self.strategy.offload_to_cpu(self.model, self._colocation_optimizer())
+        if not offload_model and not offload_optimizer:
+            from twinkle.model.offload import record_offload
+            record_offload(self.strategy, model=False, optimizer=False)
+            return
+        optimizer = self._colocation_optimizer() if offload_optimizer else None
+        if offload_model:
+            # Keep the historical positional call so strategies and tests that only accept
+            # (model, optimizer) keep working when both pieces move.
+            self.strategy.offload_to_cpu(self.model, optimizer)
+        else:
+            self.strategy.offload_to_cpu(self.model, optimizer, offload_model=False)
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     @timed

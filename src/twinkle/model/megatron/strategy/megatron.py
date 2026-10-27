@@ -527,33 +527,50 @@ class MegatronStrategy:
             config.finalize_model_grads_func = original_finalize_model_grads_func
 
     @torch.no_grad()
-    def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
+    def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None, *, offload_model: bool = True) -> None:
         """Release this rank's training memory for colocation (buffer-level work is Megatron's
-        own offload_to_cpu). Reversed by :meth:`reload_to_gpu`; both read what is currently
-        resident, so a repeated call is a no-op."""
+        own offload_to_cpu). ``offload_model=False`` leaves the chunks resident and moves only
+        ``optimizer`` when one is passed. Reversed by :meth:`reload_to_gpu`; both read what is
+        currently resident, so a repeated call is a no-op."""
+        from twinkle.model.offload import record_offload
+        if not offload_model and optimizer is None:
+            record_offload(self, model=False, optimizer=False)
+            return
+        # Touch every chunk first so a Megatron-FSDP model still refuses, even when only the
+        # optimizer was requested: its parameter storage is not the DDP bucket layout this path moves.
+        for chunk in model:
+            self._flat_buffers(chunk)
         # Buffers are about to have their storage freed; make sure nothing is still writing to it.
         torch_util.synchronize()
-        for chunk in model:
-            buffers = self._flat_buffers(chunk)
-            for buffer in buffers:
-                buffer.offload_to_cpu()
-            self._move_loose_params(chunk, buffers, 'cpu')
+        if offload_model:
+            for chunk in model:
+                buffers = self._flat_buffers(chunk)
+                for buffer in buffers:
+                    buffer.offload_to_cpu()
+                self._move_loose_params(chunk, buffers, 'cpu')
         if optimizer is not None:
             self._move_optimizer_state(optimizer, 'cpu')
+        record_offload(self, model=offload_model, optimizer=optimizer is not None)
         gc.collect()
         torch_util.empty_cache()
 
     @torch.no_grad()
     def reload_to_gpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
-        """Bring back what :meth:`offload_to_cpu` released."""
+        """Bring back what :meth:`offload_to_cpu` released. A no-op when nothing was moved."""
+        from twinkle.model.offload import clear_offload_record, offload_record
+        moved_model, moved_optimizer = offload_record(self)
+        if not moved_model and not moved_optimizer:
+            return
         device = Platform.get_local_device()
-        for chunk in model:
-            buffers = self._flat_buffers(chunk)
-            for buffer in buffers:
-                buffer.reload_from_cpu()
-            self._move_loose_params(chunk, buffers, device)
-        if optimizer is not None:
+        if moved_model:
+            for chunk in model:
+                buffers = self._flat_buffers(chunk)
+                for buffer in buffers:
+                    buffer.reload_from_cpu()
+                self._move_loose_params(chunk, buffers, device)
+        if moved_optimizer and optimizer is not None:
             self._move_optimizer_state(optimizer, device)
+        clear_offload_record(self)
         gc.collect()
         torch_util.empty_cache()
 

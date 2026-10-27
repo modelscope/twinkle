@@ -5,7 +5,7 @@ import pytest
 
 from twinkle.loss import CrossEntropyLoss, GRPOLoss
 from twinkle.loss.base import Loss
-from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch, sequence_length
 from twinkle.model.optimizer_group import BaseOptimizerGroup
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
@@ -535,3 +535,87 @@ def test_forward_only_encodes_trajectories_once(micro_batch_size):
     result = TransformersModel.forward_only.__wrapped__(ModelHarness(), inputs=inputs, **options)
     template.batch_encode.assert_called_once_with(inputs)
     assert result['embeddings'].tolist() == [[1], [3]]
+
+
+class TestMicroBatchConfigValidation:
+
+    def test_non_positive_micro_batch_size_is_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match='micro_batch_size must be positive'):
+            MicroBatchConfig(micro_batch_size=0)
+
+    def test_unknown_packing_algorithm_is_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match='packing_algorithm must be ffd or kk'):
+            MicroBatchConfig(micro_batch_size=1, dynamic_batching=True, max_tokens_per_micro_batch=8,
+                             packing_algorithm='binpack')
+
+    @pytest.mark.parametrize('max_tokens', [None, 0, -1])
+    def test_dynamic_batching_requires_positive_token_budget(self, max_tokens):
+        with pytest.raises(ValueError, match='max_tokens_per_micro_batch must be positive'):
+            MicroBatchConfig(micro_batch_size=1, dynamic_batching=True, max_tokens_per_micro_batch=max_tokens)
+
+    def test_static_config_needs_no_token_budget(self):
+        config = MicroBatchConfig(micro_batch_size=2, dynamic_batching=False, max_tokens_per_micro_batch=None)
+        assert config.packing_algorithm == 'ffd'
+
+
+class TestMicroBatchConfigFromKwargs:
+
+    def test_absent_options_yield_none(self):
+        assert MicroBatchConfig.from_kwargs({}) is None
+        assert MicroBatchConfig.from_kwargs({'learning_rate': 0.1}) is None
+
+    def test_partial_configuration_requires_micro_batch_size(self):
+        with pytest.raises(ValueError, match='micro_batch_size is required'):
+            MicroBatchConfig.from_kwargs({'dynamic_batching': True})
+
+    def test_full_configuration_pops_every_option(self):
+        kwargs = {
+            'micro_batch_size': '2',
+            'dynamic_batching': 1,
+            'max_tokens_per_micro_batch': 64,
+            'packing_algorithm': 'kk',
+            'learning_rate': 0.1,
+        }
+        config = MicroBatchConfig.from_kwargs(kwargs)
+        assert config == MicroBatchConfig(micro_batch_size=2, dynamic_batching=True,
+                                          max_tokens_per_micro_batch=64, packing_algorithm='kk')
+        # from_kwargs consumes only its own options; foreign keys stay untouched.
+        assert kwargs == {'learning_rate': 0.1}
+
+
+class TestSequenceLength:
+
+    def test_tensor_input_uses_last_dimension(self):
+        import torch
+        assert sequence_length({'input_ids': torch.zeros(2, 5, dtype=torch.long)}) == 5
+
+    def test_list_input_uses_length(self):
+        assert sequence_length({'input_ids': [1, 2, 3]}) == 3
+
+
+class TestSelectBatch:
+
+    def test_list_with_matching_length_is_indexed(self):
+        value = ['a', 'b', 'c']
+        assert select_batch(value, [2, 0], 3) == ['c', 'a']
+
+    def test_list_with_foreign_length_is_returned_untouched(self):
+        value = ['a', 'b']
+        result = select_batch(value, [0], 3)
+        assert result == ['a', 'b']
+        assert result is value
+
+    def test_tuple_with_matching_length_is_indexed(self):
+        value = ('a', 'b', 'c')
+        assert select_batch(value, [1], 3) == ('b',)
+
+    def test_tensor_with_matching_first_dim_is_indexed(self):
+        import torch
+        value = torch.arange(6).reshape(3, 2)
+        assert torch.equal(select_batch(value, [2, 0], 3), value[[2, 0]])
+
+    def test_values_without_shape_pass_through(self):
+        assert select_batch({'k': 1}, [0], 3) == {'k': 1}
+        assert select_batch(3.5, [0], 3) == 3.5

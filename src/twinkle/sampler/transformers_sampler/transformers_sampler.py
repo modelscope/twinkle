@@ -47,6 +47,11 @@ logger = get_logger()
 class TransformersSampler(Sampler):
     """Sample with ``AutoModelForCausalLM.generate()``."""
 
+    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
+    # a multimodal row's pixel tensors can only be carried by the state (encode_all rejects a media
+    # feature without one), and the token account is the same object either way.
+    accepts_rollout_state = True
+
     def __init__(
         self,
         model_id: str = None,
@@ -147,7 +152,7 @@ class TransformersSampler(Sampler):
     def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False, exclusive=True, replay=True)
     def set_template(self, template_cls, **kwargs):
         """Set the template that turns messages into token ids.
 
@@ -161,7 +166,10 @@ class TransformersSampler(Sampler):
 
     # ------------------------------------------------------------------ sampling
 
-    @remote_function(dispatch="slice_dp", collect="flatten", lazy_collect=False)
+    # enable_continous_work=True, as vLLM/sglang declare: the rollout path samples one trajectory
+    # per call, and a slice_dp sampler raises when a worker gets nothing from a batch of one.
+    @remote_function(dispatch="slice_dp", collect="flatten", lazy_collect=False,
+                     enable_continous_work=True)
     @timed
     def sample(
         self,

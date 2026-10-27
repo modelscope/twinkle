@@ -70,10 +70,15 @@ class BaseOptimizerGroup:
             except KeyError as exc:
                 raise ValueError(
                     f'Unknown loss_key={loss_key!r}; registered keys are {list(self.loss_registry)}') from exc
-        if len(self.loss_registry) > 1:
-            raise ValueError(f'loss_key is required when multiple losses are registered: {list(self.loss_registry)}')
         if len(self.loss_registry) == 1:
             return next(iter(self.loss_registry.values()))
+        if len(self.loss_registry) > 1:
+            # Multiple keyed losses registered AND a keyless primary exists: the keyless getter means the
+            # primary training loss (set_loss(None)'s loss_instance) -- the probe/eval callers that never
+            # carry a key must keep working when CHORD registers its second, keyed loss.
+            if self.loss_instance is not None:
+                return self.loss_instance
+            raise ValueError(f'loss_key is required when multiple losses are registered: {list(self.loss_registry)}')
         return self.loss_instance
 
     def prepare_backward_transaction(self, finalize_gradients: bool, loss_weight: float) -> bool:

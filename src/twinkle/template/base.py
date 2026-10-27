@@ -351,6 +351,19 @@ class Template:
     def _engine_input_ids(self, input_ids):
         return input_ids
 
+    @staticmethod
+    def _engine_ids_tuple(input_ids) -> tuple[int, ...]:
+        """``input_ids`` as a tuple of plain python ints, for :attr:`RolloutState.engine_input_ids`.
+
+        ``_encode_messages`` materialises ``input_ids`` as a numpy array, so a plain
+        ``tuple(input_ids)`` yields numpy scalars. ``engine_input_ids`` flows into the serving
+        engines' request payloads (vLLM ``TokensPrompt``), whose msgpack encoder refuses
+        ``numpy.int64`` -- a generation would die at request encoding with "Object of type
+        numpy.int64 is not serializable". Normalising here covers both construction sites
+        (``encode_prompt`` and the plain-feature branch of ``append_completion``).
+        """
+        return tuple(int(token) for token in input_ids)
+
     def _check_max_length(self, input_feature: InputFeature) -> list[InputFeature]:
         if not self.max_length or "input_ids" not in input_feature:
             return [input_feature]
@@ -946,13 +959,19 @@ class Template:
     ) -> PromptEncoding:
         media = MediaBundle.from_sources(sample)
         feature = self.encode(sample, add_generation_prompt=add_generation_prompt)
+        if feature is None:
+            # ``truncation_strategy='delete'`` drops over-long rows dataset-side; a single prompt
+            # (rollout generation) has no row to drop, so say so instead of crashing on None below.
+            raise ValueError(
+                'the prompt exceeds max_length and truncation_strategy=\'delete\' cannot encode a '
+                'single prompt; use a truncation strategy that shortens instead of dropping')
         feature.pop("messages", None)
         feature.pop("tools", None)
         engine_ids = self._engine_input_ids(feature["input_ids"])
         media = media or MediaBundle.from_sources(feature)
         state = RolloutState(
             feature=feature,
-            engine_input_ids=tuple(engine_ids),
+            engine_input_ids=self._engine_ids_tuple(engine_ids),
             messages=tuple(deepcopy(sample.get("messages") or ())),
             tools=tuple(deepcopy(sample.get("tools") or ())),
             reasoning_started=self._reasoning_started(feature["input_ids"]),
@@ -977,7 +996,7 @@ class Template:
                 raise NotImplementedError("multimodal continuation requires RolloutState.")
             state = RolloutState(
                 feature=feature,
-                engine_input_ids=tuple(feature["input_ids"]),
+                engine_input_ids=self._engine_ids_tuple(feature["input_ids"]),
                 messages=messages,
                 tools=tools,
                 reasoning_started=self._reasoning_started(feature["input_ids"]),

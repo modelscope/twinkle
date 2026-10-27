@@ -142,21 +142,6 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             sampler_kwargs.update(kwargs)
         self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
 
-        # Pin the chat template at construction when the deployment configured one, so the replica
-        # serves Trajectory inputs from its first request without waiting for the gateway's lazy
-        # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
-        # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
-        self._template_pinned = False
-        if template and hasattr(self.sampler, 'set_template'):
-            template_kwargs = dict(template)
-            template_cls = template_kwargs.pop('template_cls', None)
-            if template_cls is None:
-                raise ValueError(
-                    "template must carry a 'template_cls' key naming the template class; got keys: "
-                    f'{sorted(template_kwargs) or "none"}')
-            await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
-            self._template_pinned = True
-
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
         self.data_plane = DataPlaneProxy(data_plane_url)
@@ -171,6 +156,22 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         # backend result so a timed-out request cannot release live weights.
         self.sampler._ray_get_timeout = None
         self.sampling_guard = SamplerConcurrency()
+
+        # Pin the chat template at construction when the deployment configured one, so the replica
+        # serves Trajectory inputs from its first request without waiting for the gateway's lazy
+        # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
+        # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
+        # Runs after _init_task_queue: call_backend needs the BackendGate it installs.
+        self._template_pinned = False
+        if template and hasattr(self.sampler, 'set_template'):
+            template_kwargs = dict(template)
+            template_cls = template_kwargs.pop('template_cls', None)
+            if template_cls is None:
+                raise ValueError(
+                    "template must carry a 'template_cls' key naming the template class; got keys: "
+                    f'{sorted(template_kwargs) or "none"}')
+            await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
+            self._template_pinned = True
         if sampler_type != 'mock' and not self._template_pinned:
             await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
 

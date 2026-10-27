@@ -12,6 +12,9 @@ def postprocess_task_outputs(inputs, outputs, *, task='causal_lm', sp_strategy=N
         features = outputs.get('features') if task == 'embedding' else outputs.get('logits')
         if features is None:
             raise ValueError(f'Missing per-token features for task={task!r}')
+        # Classification heads may already return one score per sequence.
+        if task in ('seq_cls', 'reranker') and features.dim() == 2:
+            return inputs, outputs
         pool = sp_strategy.pool_last_valid_token if sp_strategy is not None else pool_last_valid_token
         pooled, _ = pool(features, inputs)
         outputs = copy(outputs)

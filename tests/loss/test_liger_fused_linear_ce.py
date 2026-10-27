@@ -32,7 +32,49 @@ def _has_accelerator():
     return None
 
 
-requires_device = pytest.mark.skipif(not _has_accelerator(), reason='no CUDA/NPU available for Liger kernel')
+def _probe_accelerator():
+    """Return ``(device, skip_reason)`` for a device that can actually execute kernels.
+
+    ``is_available()`` only reports that a device exists. A device running against a CANN install
+    whose kernel package is missing or version-mismatched still accepts H2D copies but fails every
+    compute op with ``ACLNN_ERR_INNER_NULLPTR`` (561103, "Parse dynamic kernel config fail").
+    Probing a trivial tensor op once turns that into a skip that carries the real error, instead of
+    one opaque failure per fused-path test.
+    """
+    device = _has_accelerator()
+    if device is None:
+        return None, 'no CUDA/NPU available for Liger kernel'
+    try:
+        probe = torch.ones(2, 2, device=device)
+        (probe @ probe).sum().item()
+    except Exception as error:  # noqa: BLE001 - any launch failure means the device is unusable
+        return None, f'{device} is visible but cannot execute a trivial tensor op: {error}'
+    return device, ''
+
+
+_DEVICE, _DEVICE_SKIP_REASON = _probe_accelerator()
+requires_device = pytest.mark.skipif(_DEVICE is None, reason=_DEVICE_SKIP_REASON)
+
+
+def _device_fixtures(bs, seq, hidden, vocab, seed, *, ignore_second_half=True, freeze_head=False):
+    """Seeded fixtures built on CPU, then moved to the accelerator.
+
+    The fused and reference paths only need to share the same values, so they are not generated
+    with backend RNG kernels: NPU routes ``randint``/``randn`` through ``aclnnInplaceRandom``, which
+    some CANN builds reject with error 561103. Building on CPU also keeps the fixture identical on
+    CUDA, NPU and CPU-only boxes.
+    """
+    assert _DEVICE is not None, _DEVICE_SKIP_REASON
+    torch.manual_seed(seed)
+    hidden_states = torch.randn(bs, seq, hidden, dtype=torch.float32).to(_DEVICE).requires_grad_(True)
+    lm_head = torch.nn.Linear(hidden, vocab, bias=False, dtype=torch.float32).to(_DEVICE)
+    if freeze_head:
+        for param in lm_head.parameters():
+            param.requires_grad_(False)
+    labels = torch.randint(0, vocab, (bs, seq))
+    if ignore_second_half:
+        labels[:, seq // 2:] = -100
+    return hidden_states, lm_head, labels.to(_DEVICE)
 
 
 # ── CPU: registration + flags ────────────────────────────────────────────────
@@ -86,20 +128,33 @@ def test_fallback_all_ignored_yields_zero_loss():
     assert out['loss'].item() == pytest.approx(0.0, abs=1e-6)
 
 
+@pytest.mark.skipif(_HAS_LIGER, reason='liger_kernel installed: the fused path is available')
+def test_missing_liger_degrades_to_materialised_ce():
+    """Without liger_kernel the loss must still construct and degrade on a fused-shaped call."""
+    torch.manual_seed(3)
+    bs, seq, hidden_size, vocab = 2, 5, 8, 12
+    hidden = torch.randn(bs, seq, hidden_size, dtype=torch.float32)
+    lm_head = torch.nn.Linear(hidden_size, vocab, bias=False, dtype=torch.float32)
+    labels = torch.randint(0, vocab, (bs, seq))
+    labels[:, seq // 2:] = -100
+
+    fused = LigerFusedLinearCrossEntropyLoss(ignore_index=-100, reduction='mean')
+    out = fused({'labels': labels}, {'logits': hidden, 'lm_head': lm_head})
+
+    expected = CrossEntropyLoss(ignore_index=-100, reduction='mean')(
+        {'labels': labels}, {'logits': lm_head(hidden)})
+    assert torch.allclose(out['loss'], expected['loss'], atol=1e-6)
+    assert fused._fused_broken is True
+
+
 # ── Device: fused-path numerical correctness vs CrossEntropyLoss ───────────────
 
 
 @requires_liger
 @requires_device
 def test_fused_path_matches_cross_entropy_on_device():
-    device = _has_accelerator()
-    torch.manual_seed(123)
     bs, seq, hidden, vocab = 2, 16, 8, 32
-    # hidden states + a real lm_head weight
-    hidden_states = torch.randn(bs, seq, hidden, device=device, dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.float32)
-    labels = torch.randint(0, vocab, (bs, seq), device=device)
-    labels[:, seq // 2:] = -100
+    hidden_states, lm_head, labels = _device_fixtures(bs, seq, hidden, vocab, seed=123)
 
     # Reference: materialise logits via lm_head, then CrossEntropyLoss.
     with torch.no_grad():
@@ -121,14 +176,9 @@ def test_fused_path_matches_cross_entropy_on_device():
 def test_fused_path_backward_grad_flows_to_hidden_states():
     """Gradient must reach hidden_states (connects back to the LoRA backbone);
     lm_head is frozen so grad_weight need not be populated."""
-    device = _has_accelerator()
-    torch.manual_seed(7)
     bs, seq, hidden, vocab = 2, 8, 8, 16
-    hidden_states = torch.randn(bs, seq, hidden, device=device, dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.float32)
-    for p in lm_head.parameters():
-        p.requires_grad_(False)  # frozen lm_head, LoRA-style
-    labels = torch.randint(0, vocab, (bs, seq), device=device)
+    hidden_states, lm_head, labels = _device_fixtures(
+        bs, seq, hidden, vocab, seed=7, ignore_second_half=False, freeze_head=True)
 
     fused = LigerFusedLinearCrossEntropyLoss(ignore_index=-100, reduction='mean')
     out = fused({'labels': labels}, {'logits': hidden_states, 'lm_head': lm_head})
@@ -142,14 +192,11 @@ def test_fused_path_backward_grad_flows_to_hidden_states():
 @requires_device
 def test_fused_path_ignores_padding_tokens():
     """Labels == -100 must be excluded exactly (Liger's ignore_index)."""
-    device = _has_accelerator()
-    torch.manual_seed(99)
     bs, seq, hidden, vocab = 1, 6, 8, 12
-    hidden_states = torch.randn(bs, seq, hidden, device=device, dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.float32)
-    labels = torch.randint(0, vocab, (bs, seq), device=device)
+    hidden_states, lm_head, labels = _device_fixtures(
+        bs, seq, hidden, vocab, seed=99, ignore_second_half=False)
     # blank half the tokens
-    mask = torch.zeros(bs, seq, dtype=torch.bool, device=device)
+    mask = torch.zeros(bs, seq, dtype=torch.bool, device=labels.device)
     mask[:, seq // 2:] = True
     labels_full = labels.clone()
     labels_masked = labels.clone()
@@ -183,14 +230,9 @@ def test_fused_kernel_failure_falls_back_to_materialised_ce():
     fall back to materialised-CE via the stashed lm_head weight (NOT its
     identity-patched forward) and match CrossEntropyLoss; subsequent calls must
     skip the fused path (broken flag)."""
-    device = _has_accelerator()
-    torch.manual_seed(5)
     bs, seq, hidden, vocab = 2, 6, 8, 14
-    hidden_states = torch.randn(bs, seq, hidden, device=device, dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.float32)
-    for p in lm_head.parameters():
-        p.requires_grad_(False)
-    labels = torch.randint(0, vocab, (bs, seq), device=device)
+    hidden_states, lm_head, labels = _device_fixtures(
+        bs, seq, hidden, vocab, seed=5, ignore_second_half=False, freeze_head=True)
 
     # Reference: materialise logits via lm_head, standard CE.
     with torch.no_grad():
@@ -248,14 +290,9 @@ def test_fused_kernel_failure_falls_back_to_materialised_ce():
 def test_fused_kernel_success_does_not_mark_broken():
     """Sanity: a successful fused call must NOT set the broken flag (fallback
     path stays inactive)."""
-    device = _has_accelerator()
-    torch.manual_seed(8)
     bs, seq, hidden, vocab = 2, 8, 8, 16
-    hidden_states = torch.randn(bs, seq, hidden, device=device, dtype=torch.float32, requires_grad=True)
-    lm_head = torch.nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.float32)
-    for p in lm_head.parameters():
-        p.requires_grad_(False)
-    labels = torch.randint(0, vocab, (bs, seq), device=device)
+    hidden_states, lm_head, labels = _device_fixtures(
+        bs, seq, hidden, vocab, seed=8, ignore_second_half=False, freeze_head=True)
     fused = LigerFusedLinearCrossEntropyLoss(ignore_index=-100, reduction='mean')
     fused({'labels': labels}, {'logits': hidden_states.detach(), 'lm_head': lm_head})
     assert fused._fused_broken is False

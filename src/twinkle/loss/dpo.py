@@ -419,8 +419,9 @@ class DPOLoss(PreferenceLossBase):
             reference_chosen_logps = torch.zeros_like(policy_chosen_logps)
             reference_rejected_logps = torch.zeros_like(policy_rejected_logps)
         else:
-            zero = (policy_chosen_logps.sum() + policy_rejected_logps.sum()) * 0.0
-            return LossOutput(loss=zero, num_tokens=0)
+            # Neither a reference nor reference-free: silently returning a zero loss would let the
+            # whole training run no-op with nothing but a suspiciously constant 0 in the logs.
+            raise ValueError('DPO requires ref_logps unless reference_free=True')
 
         # Compute DPO loss
         dpo_loss = self._compute_dpo_loss(

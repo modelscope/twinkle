@@ -12,8 +12,10 @@ _VCP_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-# `「始ESCAPE」...「末ESCAPE」` is the nesting-safe variant; pair them strictly
-# so an escaped value is not closed by a bare `「末」` from an inner block.
+# `「始ESCAPE」...「末ESCAPE」` is the strict-pairing variant: an escaped value is
+# not closed by a bare `「末」` from inside it. It cannot carry the outer END marker
+# itself -- the block regex ends at the first `<<<[END_TOOL_REQUEST]>>>`, before KV
+# parsing ever sees an escaped value spanning one.
 _VCP_KV_RE = re.compile(
     r'(?P<key>[A-Za-z_]\w*)\s*:\s*'
     r'(?:「始ESCAPE」(?P<val_esc>.*?)「末ESCAPE」'
@@ -27,7 +29,8 @@ class VCPParser(ToolCallParser):
 
     Outer markers ``<<<[TOOL_REQUEST]>>> ... <<<[END_TOOL_REQUEST]>>>`` wrap
     one call; parameters use full-width brackets ``「始」value「末」`` (escape
-    variant ``「始ESCAPE」...「末ESCAPE」`` permits nested outer markers).
+    variant ``「始ESCAPE」...「末ESCAPE」`` pairs strictly, so a value containing
+    a bare ``「末」`` survives verbatim).
     The canonical function name lives in the ``tool_name`` field.
     """
 

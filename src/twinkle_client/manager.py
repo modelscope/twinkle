@@ -250,7 +250,7 @@ class TwinkleClient:
     # Training Runs
     # ------------------------------------------------------------------
 
-    def list_training_runs(self, limit: int = 20, offset: int = 0, all_users: bool = False) -> list[TrainingRun]:
+    def list_training_runs(self, limit: int = 20, offset: int = 0) -> list[TrainingRun]:
         """
         List training runs.
 
@@ -259,7 +259,6 @@ class TwinkleClient:
         Args:
             limit: Maximum number of results (default: 20).
             offset: Offset for pagination (default: 0).
-            all_users: If True, return all runs (if permission allows).
 
         Returns:
             List of :class:`~twinkle.protocol.types.training.TrainingRun` objects.
@@ -268,8 +267,6 @@ class TwinkleClient:
             TwinkleHTTPError: If the request fails.
         """
         params: dict[str, Any] = {'limit': limit, 'offset': offset}
-        if all_users:
-            params['all_users'] = 'true'
 
         response = self._transport.get(self._get_url('/training_runs'), params=params)
         data = response.json()
@@ -280,7 +277,6 @@ class TwinkleClient:
         self,
         limit: int = 20,
         offset: int = 0,
-        all_users: bool = False,
     ) -> tuple[list[TrainingRun], Cursor]:
         """
         List training runs with pagination info.
@@ -288,7 +284,6 @@ class TwinkleClient:
         Args:
             limit: Maximum number of results (default: 20).
             offset: Offset for pagination (default: 0).
-            all_users: If True, return all runs (if permission allows).
 
         Returns:
             Tuple of (list of TrainingRun, Cursor with pagination info).
@@ -297,8 +292,6 @@ class TwinkleClient:
             TwinkleHTTPError: If the request fails.
         """
         params: dict[str, Any] = {'limit': limit, 'offset': offset}
-        if all_users:
-            params['all_users'] = 'true'
 
         response = self._transport.get(self._get_url('/training_runs'), params=params)
         data = response.json()

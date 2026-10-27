@@ -551,3 +551,74 @@ class TestRougeBleu:
 
     def test_nothing_accumulated(self):
         assert _no_dist_metric(RougeBleu).calculate() == {}
+
+
+class TestTextMetricBase:
+
+    def _metric(self):
+        from twinkle.metric.generation import TextMetric
+        return TextMetric()
+
+    def test_accumulate_appends_parallel_pairs(self):
+        metric = self._metric()
+        metric.accumulate(predictions=['a', 'b'], references=['a', 'c'])
+        assert metric.predictions == ['a', 'b']
+        assert metric.references == ['a', 'c']
+
+    def test_accumulate_without_pairs_is_a_no_op(self):
+        metric = self._metric()
+        metric.accumulate(inputs=[1], outputs=[2])
+        metric.accumulate(predictions=None, references=None)
+        assert metric.predictions == []
+        assert metric.references == []
+
+    def test_mismatched_lengths_are_rejected(self):
+        import pytest
+        metric = self._metric()
+        with pytest.raises(AssertionError, match='parallel'):
+            metric.accumulate(predictions=['a'], references=['a', 'b'])
+
+    def test_reset_clears_accumulated_pairs(self):
+        metric = self._metric()
+        metric.accumulate(predictions=['a'], references=['b'])
+        metric.reset()
+        assert metric.predictions == []
+        assert metric.references == []
+
+
+class TestExactMatchMetric:
+
+    def test_calculate_reports_mean_accuracy(self):
+        from twinkle.metric.generation import ExactMatch
+
+        metric = ExactMatch()
+        metric.accumulate(predictions=['a', 'b'], references=['a', 'c'])
+        result = metric.calculate()
+        assert result == {'acc': 0.5}
+
+    def test_calculate_without_pairs_returns_empty(self):
+        from twinkle.metric.generation import ExactMatch
+
+        assert ExactMatch().calculate() == {}
+
+
+class TestReportingHelpers:
+
+    def test_finite_number_accepts_scalars_and_tensor_strings(self):
+        from twinkle.metric.reporting import _finite_number
+
+        assert _finite_number(3) == 3
+        assert _finite_number(True) == 1
+        assert _finite_number(2.5) == 2.5
+        assert _finite_number('  tensor(1.5)  ') == 1.5
+        assert _finite_number('nan') is None
+        assert _finite_number(float('inf')) is None
+        assert _finite_number('not a number') is None
+        assert _finite_number([1]) is None
+
+    def test_safe_name_sanitizes_and_never_returns_empty(self):
+        from twinkle.metric.reporting import _safe_name
+
+        assert _safe_name('loss/epoch:1') == 'loss_epoch_1'
+        assert _safe_name('///') == 'default'
+        assert _safe_name('keep-this.v2') == 'keep-this.v2'

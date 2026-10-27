@@ -21,6 +21,7 @@ import torch
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
+from twinkle.patch.vllm_weight_loader import streaming_weight_sync
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
@@ -197,6 +198,7 @@ class TwinkleWorkerExtension:
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
 
+    @streaming_weight_sync()
     def update_weights_from_ipc(
         self,
         peft_config: Optional[Dict] = None,
@@ -609,6 +611,7 @@ class TwinkleWorkerExtension:
         drafter_model.load_weights(weights)
 
     def get_state_keys(self):
+        """Return internal parameter names; each loader adapts its own input names."""
         keys = list(self.model_runner.model.state_dict().keys())
         drafter_model = self._drafter_model()
         if drafter_model is not None:

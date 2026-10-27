@@ -314,6 +314,7 @@ def main():
         template=rollout_template,
         sampling_params=sampling_params,
         max_turns=MAX_TURNS,
+        sticky_session=True,  # One ID per episode, reused by every per-turn sample().
     )
 
     advantage_fn = GRPOAdvantage()

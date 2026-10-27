@@ -1,12 +1,29 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from __future__ import annotations
+
 import hashlib
 import inspect
 import os
 import re
 from collections import defaultdict
 from contextlib import contextmanager
-from datasets.utils.filelock import FileLock
 from datetime import timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datasets.utils.filelock import FileLock
+
+
+def __getattr__(name: str):
+    """Re-export ``FileLock`` lazily so importing this module does not require HF datasets.
+
+    ``twinkle.loss`` and ``twinkle.hub`` reach this module on their own import paths, while
+    ``FileLock`` is only needed by ``processing_lock`` and the checkpoint manager.
+    """
+    if name == 'FileLock':
+        from datasets.utils.filelock import FileLock
+        return FileLock
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 _LOCK_DIR = '.locks'
 os.makedirs(_LOCK_DIR, exist_ok=True)
@@ -293,6 +310,10 @@ def processing_lock(lock_file: str, sticky: bool = False):
         return
 
     lock_name = _sanitize_lock_name(lock_file)
+    # Imported here, not at module scope: ``datasets`` is only needed when this fallback path
+    # actually runs, and importing it at module scope made ``import twinkle.loss`` require the
+    # whole HF datasets stack even for losses that never touch it.
+    from datasets.utils.filelock import FileLock
     lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
 
     if acquire_lock(lock, False):

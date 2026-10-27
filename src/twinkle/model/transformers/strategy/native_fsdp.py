@@ -329,6 +329,56 @@ class NativeFSDPStrategy(TransformerStrategyBase):
     def unwrap_model(self, model):
         return model
 
+    def offload_to_cpu(self, model, optimizer=None, *, offload_model: bool = True) -> None:
+        """Move this rank's FSDP shard and/or optimizer state to CPU.
+
+        Sharded parameters stay DTensors; ``module.to('cpu')`` is the FSDP2 placement move
+        (the same one a colocated FSDP actor uses when parameter offload is requested).
+        ``offload_model=False`` leaves the shard resident. :meth:`reload_to_gpu` restores
+        only the pieces this call moved, back to the device they occupied.
+        """
+        import torch
+        from twinkle.model.offload import move_grads, move_optimizer_state, parameter_device, record_offload
+
+        module = self.unwrap_model(model)
+        if not offload_model and optimizer is None:
+            record_offload(self, model=False, optimizer=False)
+            return
+        if getattr(self, '_offload_device', None) is None:
+            self._offload_device = parameter_device(module)
+        if offload_model:
+            # Blocking copy: FSDP's ``_apply`` may read the CPU tensors before a queued
+            # non_blocking transfer has finished.
+            module.to('cpu', non_blocking=False)
+            move_grads(module, torch.device('cpu'))
+        if optimizer is not None:
+            move_optimizer_state(optimizer, torch.device('cpu'))
+        record_offload(self, model=offload_model, optimizer=optimizer is not None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def reload_to_gpu(self, model, optimizer=None) -> None:
+        """Bring back the shard and optimizer state :meth:`offload_to_cpu` moved."""
+        import torch
+        from twinkle.model.offload import clear_offload_record, move_grads, move_optimizer_state, offload_record
+
+        moved_model, moved_optimizer = offload_record(self)
+        if not moved_model and not moved_optimizer:
+            return
+        device = getattr(self, '_offload_device', None)
+        if device is None:
+            clear_offload_record(self)
+            return
+        module = self.unwrap_model(model)
+        if moved_model:
+            module.to(device, non_blocking=False)
+            move_grads(module, device)
+        if moved_optimizer and optimizer is not None:
+            move_optimizer_state(optimizer, device)
+        clear_offload_record(self)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     def _ep_gather_context(self):
         """Return (ep_group, ep_world_size) for the EP submesh, or (None, 1) when EP is off."""
         ep_fsdp_mesh = self.ep_fsdp_device_mesh

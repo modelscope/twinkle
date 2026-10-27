@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     # rollout domain's vocabulary and the collaborators are twinkle's own classes.
     from .cluster_adapter import ClusterAdapter
     from .score_worker import ScoreWorker
-    from ..rollout import MultiTurnRollout, RolloutSample, SampleHandle
+    from ..rollout import Rollout, RolloutSample, SampleHandle
     from twinkle.model.base import TrainableModel
 
 #: One in-flight trajectory: the sampler handle to poll/collect it by, the policy it was pinned to
@@ -169,7 +169,7 @@ class StreamingDriver:
                  poll: Optional[Callable[[Sequence[SampleHandle]], Sequence[SampleHandle]]] = None,
                  collect: Optional[Callable[[SampleHandle], RolloutSample]] = None,
                  assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
-                 rollout: Optional[MultiTurnRollout] = None,
+                 rollout: Optional[Rollout] = None,
                  group_pull: Optional[bool] = None,
                  need_rows: Optional[int] = None,
                  version_control: bool = False,
@@ -251,12 +251,14 @@ class StreamingDriver:
                                 f'-- inject it explicitly or pass a rollout to default-bind it')
         # ``consume`` is optional: providing it selects the blocking regime (run() trains in-process, the
         # PPO/RFT/distill path); omitting it selects the iterator regime (run() is bridged to __next__ and
-        # the recipe trains, see __iter__). ``score`` is the iterator regime's per-sample scoring seam --
-        # optional and algorithm-agnostic.
-        for name, fn in (('consume', consume), ('score', score)):
-            if fn is not None and not callable(fn):
-                raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
-                                f'got {type(fn).__name__}')
+        # the recipe trains, see __iter__). ``score`` is the iterator regime's scoring seam -- optional and
+        # algorithm-agnostic -- but it is NOT validated here: it was already checked above against its TWO
+        # legal shapes (a local callable, or a score worker carrying ``score_group``). Re-checking ``score``
+        # for plain callability would wrongly reject the score-worker shape this driver explicitly supports
+        # (``self._score_worker``), which is what the disaggregated GRPO/PPO assemblies inject.
+        if consume is not None and not callable(consume):
+            raise TypeError(f'StreamingDriver optional seam \'consume\' must be callable or None, '
+                            f'got {type(consume).__name__}')
         if max_group_regenerations < 0:
             raise ValueError(f'max_group_regenerations must be non-negative, got {max_group_regenerations}')
         # The control plane is OPTIONAL: version_control=True is the RL regime; False is the infer regime
@@ -342,6 +344,9 @@ class StreamingDriver:
         self._committed_steps = 0
         self._iter_thread: Optional[threading.Thread] = None
         self._run_error: Optional[BaseException] = None
+        #: Set by :meth:`abort` (recipe-side exception teardown): the run loop checks it at every pass
+        #: boundary and breaks, so its own finally stops the in-flight generations and unpins windows.
+        self._aborted = False
         #: External publication request (see :meth:`request_publish`): a one-shot push callable the run loop
         #: consumes at the next pass boundary. Guarded by ``_publish_lock`` because the request is SET from the
         #: consumer thread (the recipe / UI) and TAKEN on the run-loop thread. ``None`` when no publish is due;
@@ -531,7 +536,7 @@ class StreamingDriver:
         regen_counts: Dict[str, int] = {}
         try:
             while True:
-                if exhausted or self._default_reached_max():
+                if exhausted or self._aborted or self._default_reached_max():
                     break
 
                 # (1) Publish phase: run an EXTERNALLY-requested publication (see request_publish). The driver
@@ -686,6 +691,17 @@ class StreamingDriver:
                         for key in self._reap_scores(ready, blocking=False):
                             self._maybe_group_complete(key, ready, group_counts, group_prompt,
                                                        resolved_groups, regen_queue, regen_counts)
+
+                # Drain-path tail wait: the stream is over, nothing is generating, and the last poll's
+                # score submissions may still be in flight. Block for them here (the pull boundary does
+                # the same for a batch about to be trained) so the final groups complete and train in
+                # this pass's consumption phase instead of the finally below dropping them unscored.
+                if (stream_done and not handles and not regen_queue and ready
+                        and self._score_worker is not None
+                        and any(record.score_ref is not None for record in ready)):
+                    for key in self._reap_scores(ready, blocking=True):
+                        self._maybe_group_complete(key, ready, group_counts, group_prompt,
+                                                   resolved_groups, regen_queue, regen_counts)
 
                 # (4) Consumption: train whatever the assembly rule says is ready (exact-global-batch
                 #     pulls only; the remainder stays buffered for the next batch).
@@ -1062,7 +1078,13 @@ class StreamingDriver:
         self._committed_steps = 0
         self._ack_event.clear()
         self._batch_queue.put(batch)
-        self._ack_event.wait()
+        # A single wait() would deadlock against abort(): abort's lone set() can land before this
+        # clear() (the whole pass between two consumes is that window) and be erased, leaving the
+        # wait blocked forever while abort() joins this thread. Polling the flag closes the window:
+        # an aborted run returns 0 and run() breaks at the next pass boundary.
+        while not self._ack_event.wait(timeout=1.0):
+            if self._aborted:
+                return 0
         return self._committed_steps
 
     # --- iterator regime (``for batch in driver:``) ------------------------------------------------------
@@ -1098,6 +1120,23 @@ class StreamingDriver:
         self._iter_thread = threading.Thread(target=_runner, name='streaming-driver', daemon=True)
         self._iter_thread.start()
         return self
+
+    def abort(self) -> None:
+        """Stop the background run from outside -- the recipe-side exception teardown.
+
+        In the iterator regime the driver thread blocks on the bridge ack right after handing a
+        batch to ``__next__``; if the recipe thread leaves the loop with an exception (training
+        kernel error, OOM, KeyboardInterrupt), no ``commit`` ever arrives, and neither that wait
+        nor ``run``'s own teardown would execute -- the run would leak its in-flight generations
+        and race the recipe's sampler shutdown. This releases the ack wait, asks the run loop to
+        break at the next pass boundary (its finally then stops and unpins everything), and joins
+        the background thread. Safe when not iterating and safe to call repeatedly.
+        """
+        self._aborted = True
+        self._ack_event.set()
+        thread = self._iter_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join()
 
     def __next__(self) -> Any:
         """The next assembled batch, blocking until the driver thread produces one or the run ends.

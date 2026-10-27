@@ -22,15 +22,17 @@ how to invoke one particular program and knows nothing about training. This modu
 is the small amount of wiring between them.
 """
 import subprocess
+import threading
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template.base import Template
-from .base import STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
+from .base import STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout, SampleHandle
 from .endpoint import PolicyEndpoint, Round
 from .ledger import LedgerBook
+from .multi_turn import RolloutSample, trajectory_to_rollout_sample
 from .trace import TraceWriter
 
 # What a timed-out command reports, following the convention of ``timeout(1)``.
@@ -105,6 +107,15 @@ class ExternalRollout(Rollout):
     rewrote its own history mid-episode produced more than one account (see
     :class:`~.ledger.LedgerBook`); the last is returned, being the one the reward
     is about, and ``segments`` on the trajectory says how many there were.
+
+    Besides the batch ``__call__`` form, the streaming protocol the async driver
+    default-binds is implemented here too (:meth:`admit` / :meth:`poll` /
+    :meth:`collect` / :meth:`stop`): one agent process per admitted episode runs on
+    a daemon thread, and collect settles through the same LedgerBook accounting.
+    Weight updates reach the endpoint's sampler through the trainer's own sync --
+    the admission therefore carries the policy version only as a stamp, never as
+    an adapter switch. A sandboxed ``env`` stays on the batch form: its per-call
+    dispatch has no streaming equivalent.
     """
 
     def __init__(
@@ -169,6 +180,112 @@ class ExternalRollout(Rollout):
         """
         self.endpoint.stop()
 
+    # ------------------------------------------------------------ streaming
+
+    def admit(
+        self,
+        prompt: List[Dict[str, Any]],
+        trajectory_idx: int = 0,
+        *,
+        prompt_idx: Any = 0,
+        sampling_params: Optional[Dict[str, Any]] = None,
+        prompt_extras: Optional[Dict[str, Any]] = None,
+        adapter_path: Optional[str] = None,
+        policy_version: int = 0,
+    ) -> SampleHandle:
+        """Admit ONE episode without blocking; poll/collect/stop complete the protocol.
+
+        The same contract :meth:`Rollout.admit` gives the streaming driver: the handle
+        carries the submission identity and the admission stamp, and the episode (the
+        agent process) runs on a daemon thread. ``sampling_params`` and
+        ``adapter_path`` are protocol slots this rollout fills from construction --
+        the endpoint serves its constructor defaults and the trainer's sync keeps
+        its sampler current -- so only ``policy_version`` is carried onward, as the
+        stamp collect writes onto the sample.
+        """
+        handle = self._new_handle(
+            prompt, trajectory_idx, prompt_idx=prompt_idx, prompt_extras=prompt_extras,
+            adapter_path=adapter_path, policy_version=policy_version)
+        return self._admit_local(
+            handle, lambda: self._episode(handle.submission_id, prompt, prompt_extras))
+
+    def poll(self, handles: List[SampleHandle]) -> List[SampleHandle]:
+        """Non-blocking as-completed query; a failed episode raises here, fail-loudly."""
+        return [handle for handle in handles if self._episode_done(handle)]
+
+    def collect(self, handle: SampleHandle) -> RolloutSample:
+        """Collect ONE completed episode, stamped with its group id / pin version / prompt."""
+        trajectory = self._pop_episode_future(handle).result()
+        extra = dict(handle.prompt_extras) if handle.prompt_extras else {}
+        for key in ('agent_exit_code', 'segments', 'agent_output'):
+            if key in trajectory:
+                extra[key] = trajectory[key]
+        return self._stamp_admission(
+            trajectory_to_rollout_sample(trajectory, str(handle.prompt_idx), extra), handle)
+
+    def stop(self, submission_id: str) -> None:
+        """End an admitted-but-uncollected episode: terminate its agent process.
+
+        The episode thread then settles on whatever the LedgerBook banked before the
+        kill, so a later collect still returns the partial trajectory rather than
+        nothing. The future is kept -- dropping it here would race the thread that
+        is about to set it.
+        """
+        done = getattr(self, '_episode_processes', {}).get(submission_id)
+        if done is not None:
+            done.terminate()
+
+    def cancel(self, handle: SampleHandle | None) -> None:
+        """Drop an admitted-but-uncollected episode: the agent process runs to its own
+        end and the result is discarded with the future."""
+        if handle is None:
+            return
+        self._drop_episode_future(handle.submission_id)
+
+    def _episode(self, submission_id: str, prompt: List[Dict[str, Any]],
+                 prompt_extras: Optional[Dict[str, Any]]) -> Trajectory:
+        """One streaming episode on its own thread: spawn the agent, settle the account."""
+        # Started under a lock rather than inline: two episodes finding the endpoint
+        # down at once would race to bind the port.
+        lock = self.__dict__.setdefault('_endpoint_lock', threading.Lock())
+        with lock:
+            if not self.endpoint.running:
+                self.endpoint.start()
+        trajectory: Dict[str, Any] = dict(prompt_extras) if prompt_extras else {}
+        trajectory['messages'] = list(prompt)
+        # The API key IS the LedgerBook account name: readable in alignment errors,
+        # and unique because the submission id is.
+        key = f'ep-{submission_id[:8]}'
+        command = self.agent(
+            task=self.task_fn(trajectory),
+            base_url=self.endpoint.base_url,
+            api_key=key,
+            workspace='',
+        )
+        exit_code, output = self._spawn_tracked(submission_id, command)
+        return self._settle(trajectory, key, exit_code, output)
+
+    def _spawn_tracked(self, submission_id: str, command: str) -> Tuple[int, str]:
+        """Run the agent to completion with the process registered for :meth:`stop`.
+
+        The local (no-env) form of :meth:`_spawn` as a Popen, so teardown can
+        terminate a still-running agent and the episode settles on the partial
+        account instead of burning the machine past the rollout's lifetime.
+        """
+        processes: Dict[str, Any] = self.__dict__.setdefault('_episode_processes', {})
+        done = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes[submission_id] = done
+        try:
+            stdout, stderr = done.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            done.kill()
+            stdout, stderr = done.communicate()
+            return TIMEOUT_EXIT_CODE, (stdout or '') + (stderr or '')
+        finally:
+            processes.pop(submission_id, None)
+        return done.returncode, (stdout or '') + (stderr or '')
+
     def _on_round(self, round_: Round) -> None:
         """File one served request. Never raises at the agent."""
         self.book.bank(round_.key, round_.prompt_token_ids, round_.sequence, messages=round_.messages)
@@ -196,6 +313,10 @@ class ExternalRollout(Rollout):
             workspace=str(getattr(env, 'workspace', '') or ''),
         )
         exit_code, output = self._spawn(env, command)
+        return self._settle(trajectory, key, exit_code, output)
+
+    def _settle(self, trajectory: Trajectory, key: str, exit_code: int, output: str) -> Trajectory:
+        """Close the account and merge the trajectory: the settle half every episode shares."""
         ledgers = self.book.close(key)
 
         if not ledgers:

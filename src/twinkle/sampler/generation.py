@@ -130,12 +130,24 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
     tensor keys, so a plain batch returns ``{}``.
     """
     collected: dict[str, list[torch.Tensor]] = {}
+    per_token: dict[str, list[torch.Tensor]] = {}
     for index in chunk:
         for key, value in encoded[index].items():
             if key in ("input_ids", "attention_mask", "labels") or not isinstance(value, torch.Tensor):
                 continue
-            collected.setdefault(key, []).append(value)
-    return {key: torch.cat(values, dim=0) for key, values in collected.items()}
+            if key.endswith("_token_type_ids"):
+                # A per-token companion (mm_token_type_ids and friends): the model indexes it as
+                # [batch, position] against the LEFT-PADDED input_ids the engine builds, so it is
+                # stacked to a [B, width] batch here, never concatenated flat like pixel_values.
+                per_token.setdefault(key, []).append(value)
+            else:
+                collected.setdefault(key, []).append(value)
+    result = {key: torch.cat(values, dim=0) for key, values in collected.items()}
+    for key, values in per_token.items():
+        width = max(value.shape[-1] for value in values)
+        rows = [torch.nn.functional.pad(value, (width - value.shape[-1], 0)) for value in values]
+        result[key] = torch.stack(rows, dim=0)
+    return result
 
 
 def attach_features(

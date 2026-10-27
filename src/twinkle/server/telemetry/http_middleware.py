@@ -39,7 +39,9 @@ def create_metrics_middleware(deployment: str) -> Callable:
         response = await call_next(request)
         elapsed = time.monotonic() - start
         status = str(response.status_code)
-        method = request.scope['route'].path if 'route' in request.scope else request.url.path
+        # The HTTP verb is the ``method`` label (standard RED semantics); the route template would
+        # merge GET/POST and make the label useless for read/write split.
+        method = request.method
         m = MetricsRegistry.get().request_metrics(deployment)
         m.requests_total.inc(tags={
             'deployment': deployment,
