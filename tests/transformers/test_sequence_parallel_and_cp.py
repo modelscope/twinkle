@@ -252,7 +252,6 @@ def _make_strategy(model: LlamaForCausalLM, device_mesh: DeviceMesh, ulysses_siz
         sp_config={
             'enabled': True,
             'ulysses_size': ulysses_size,
-            'gather_logits': True,
         },
         model=model,
         tokenizer_id=None,
@@ -536,7 +535,7 @@ def _run_precision_worker(rank: int,
             use_cache=False,
         )
         local_logits = sp_outputs.logits
-        gathered_outputs = strategy.postprocess_outputs(sp_outputs)
+        _, gathered_outputs = strategy.gather_loss_tensors({}, sp_outputs, sp_gather_keys=('logits',))
         sp_logits = gathered_outputs.logits.detach().float()
 
         sp_loss_sum, sp_num_tokens = _compute_training_path_loss(local_logits, local_labels, strategy)
@@ -722,7 +721,8 @@ class TestDerivedRingPrecision:
             join=True)
 
 
-def _run_multi_model_worker(rank: int, world_size: int, port: int, backend_config: dict):
+def _run_multi_model_worker(rank: int, world_size: int, port: int, backend_config: dict,
+                            attn_implementation: str):
     """Two SP-enabled models (policy/ref style) with interleaved forwards.
 
     Same architecture, different weights and different sequence lengths. Each
@@ -736,13 +736,13 @@ def _run_multi_model_worker(rank: int, world_size: int, port: int, backend_confi
         vocab_size = 256
 
         _seed_backend(1234, device_type)
-        policy_base = _build_tiny_llama(case, device, device_type)
+        policy_base = _build_tiny_llama(case, device, device_type, attn_implementation)
         _seed_backend(5678, device_type)
-        ref_base = _build_tiny_llama(case, device, device_type)
+        ref_base = _build_tiny_llama(case, device, device_type, attn_implementation)
 
-        policy_sp = _build_tiny_llama(case, device, device_type)
+        policy_sp = _build_tiny_llama(case, device, device_type, attn_implementation)
         policy_sp.load_state_dict(policy_base.state_dict())
-        ref_sp = _build_tiny_llama(case, device, device_type)
+        ref_sp = _build_tiny_llama(case, device, device_type, attn_implementation)
         ref_sp.load_state_dict(ref_base.state_dict())
 
         seq_len_p = int(case['seq_len'])
@@ -813,14 +813,17 @@ def _run_multi_model_worker(rank: int, world_size: int, port: int, backend_confi
         if ref_strategy._ctx.real_position_ids.shape[-1] != seq_len_r:
             raise AssertionError('multi_model: ref ctx position_ids polluted by policy forward.')
 
-        # Capture per-rank local logits (with grad) before postprocess_outputs
-        # replaces outputs['logits'] with the grad-less gathered tensor.
+        # Capture per-rank local logits (with grad) before loss-side gathering.
+        # Both paths must use the same registered gather implementation as training.
         local_logits_p1 = sp_outputs_p1.logits
         local_logits_r = sp_outputs_r.logits
 
-        sp_logits_p1 = policy_strategy.postprocess_outputs(sp_outputs_p1).logits.detach().float()
-        sp_logits_r = ref_strategy.postprocess_outputs(sp_outputs_r).logits.detach().float()
-        sp_logits_p2 = policy_strategy.postprocess_outputs(sp_outputs_p2).logits.detach().float()
+        _, gathered = policy_strategy.gather_loss_tensors({}, sp_outputs_p1, sp_gather_keys=('logits',))
+        sp_logits_p1 = gathered.logits.detach().float()
+        _, gathered = ref_strategy.gather_loss_tensors({}, sp_outputs_r, sp_gather_keys=('logits',))
+        sp_logits_r = gathered.logits.detach().float()
+        _, gathered = policy_strategy.gather_loss_tensors({}, sp_outputs_p2, sp_gather_keys=('logits',))
+        sp_logits_p2 = gathered.logits.detach().float()
 
         _assert_logits_close('multi_model policy fwd1', rank, base_logits_p, sp_logits_p1, seq_len_p, None)
         _assert_logits_close('multi_model ref fwd', rank, base_logits_r, sp_logits_r, seq_len_r, None)
@@ -869,13 +872,15 @@ class TestMultiModelSequenceParallel:
             pytest.skip(f'Requires at least {world_size} {backend["label"]} devices.')
         return backend
 
-    def test_two_models_interleaved_forward(self):
+    @pytest.mark.parametrize('attn_implementation', ['sdpa', 'flash_attention_2'])
+    def test_two_models_interleaved_forward(self, attn_implementation):
         world_size = 2
         backend = self._get_backend_or_skip(world_size)
-        if not is_flash_attn_available():
-            pytest.skip('flash_attention_2 is required for multi-model SP tests.')
+        if attn_implementation == 'flash_attention_2' and not is_flash_attn_available():
+            pytest.skip('flash_attention_2 is unavailable.')
         port = _find_free_port()
-        mp.spawn(_run_multi_model_worker, args=(world_size, port, backend), nprocs=world_size, join=True)
+        mp.spawn(_run_multi_model_worker, args=(world_size, port, backend, attn_implementation),
+                 nprocs=world_size, join=True)
 
 
 class TestDerivedRingMemoryProfile:

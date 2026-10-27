@@ -536,9 +536,9 @@ class InputProcessor:
         input_specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
         output_specs = BUILTIN_OUTPUT_KEYS if output_key_specs is None else output_key_specs
         input_keys = [spec for spec in input_specs
-                      if spec.stage == 'auxiliary' and spec.need_unpack and inputs.get(spec.name) is not None]
+                      if spec.stage == 'auxiliary' and spec.unpack_packed and inputs.get(spec.name) is not None]
         output_keys = [spec for spec in output_specs
-                       if spec.need_unpack and outputs and outputs.get(spec.name) is not None]
+                       if spec.unpack_packed and outputs and outputs.get(spec.name) is not None]
         all_specs = input_keys + output_keys
         all_tensors = [inputs[spec.name] for spec in input_keys] + [outputs[spec.name] for spec in output_keys]
         # The unpack primitive expects [1, T, ...]; restore the declared axis

@@ -215,7 +215,6 @@ def _make_strategy(model: torch.nn.Module, world_size: int) -> SequenceParallelS
         sp_config={
             'enabled': True,
             'ulysses_size': world_size,
-            'gather_logits': True,
         },
         model=model,
         tokenizer_id=None,
@@ -350,7 +349,7 @@ def _run_prefill_alignment_worker(rank: int,
             position_ids=position_ids,
             use_cache=False,
         )
-        gathered_outputs = strategy.postprocess_outputs(copy.copy(sp_outputs))
+        _, gathered_outputs = strategy.gather_loss_tensors({}, sp_outputs, sp_gather_keys=('logits',))
         gathered_logits = gathered_outputs.logits.float()
         if not torch.allclose(gathered_logits, baseline_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
             max_diff = (gathered_logits - baseline_logits).abs().max().item()

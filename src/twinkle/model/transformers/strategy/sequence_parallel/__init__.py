@@ -10,11 +10,12 @@ from transformers import PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 from weakref import WeakKeyDictionary, WeakMethod
 
+from twinkle.data_fields import _FORWARD_KEYS, _PROCESSING_BOUNDARIES
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh, get_logger
 from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
-from .adapters import ModelSPAdapter, adapters_for_model, register_model_sp_adapter
+from .adapters import ModelSPAdapter, adapters_for_model
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
                     post_all2all)
@@ -472,7 +473,7 @@ class SequenceParallel:
                 cache_position = kwargs.get('cache_position', None)
                 specs = tuple(spec for spec in self.input_key_registry
                               if spec.pad_at == 'forward' or spec.split_at == 'forward')
-                common_names = ('input_ids', 'inputs_embeds', 'position_ids', 'attention_mask')
+                common_names = _FORWARD_KEYS
                 keys = SPKeyCollection.from_mapping(kwargs, specs, common_names=common_names)
                 self.pad_and_split_inputs(keys, boundary='forward', real_position_ids=real_position_ids,
                                           cache_position=cache_position)
@@ -629,10 +630,22 @@ class SequenceParallel:
         empty_embeds = torch.empty(
             (input_ids.shape[0], input_ids.shape[1], mm_embeds.shape[-1])).to(mm_embeds.device).to(mm_embeds.dtype)
         empty_embeds[visual_mask] = mm_embeds
-        embeds_spec = DataKeySpec('visual_sequence_embeds', split_dim=1, pad_value=0, stage='model_internal',
-                                  pad_at='model_internal', split_at='model_internal')
-        mask_spec = DataKeySpec('visual_position_mask', split_dim=-1, pad_value=0, stage='model_internal',
-                                pad_at='model_internal', split_at='model_internal')
+        embeds_spec = DataKeySpec(
+            'visual_sequence_embeds',
+            split_dim=1,
+            pad_value=0,
+            stage='model_internal',
+            pad_at='model_internal',
+            split_at='model_internal',
+        )
+        mask_spec = DataKeySpec(
+            'visual_position_mask',
+            split_dim=-1,
+            pad_value=0,
+            stage='model_internal',
+            pad_at='model_internal',
+            split_at='model_internal',
+        )
         keys = SPKeyCollection()
         keys.add(SPKeyValue(embeds_spec, empty_embeds))
         keys.add(SPKeyValue(mask_spec, visual_mask))
@@ -765,7 +778,7 @@ class SequenceParallel:
     def _split_key(self, value, spec, position_ids=None, legacy_roll=False):
         if value is None or not spec.need_split:
             return value
-        if spec.need_roll or legacy_roll:
+        if spec.roll or legacy_roll:
             value = torch.roll(value, shifts=-1, dims=spec.split_dim)
         return self.split(value, dim=spec.split_dim, position_ids=position_ids)
 
@@ -783,7 +796,7 @@ class SequenceParallel:
         """
         if not isinstance(keys, SPKeyCollection):
             raise TypeError('pad_and_split_inputs expects an SPKeyCollection')
-        if boundary not in ('prepare', 'forward', 'model_internal', 'router_replay'):
+        if boundary not in _PROCESSING_BOUNDARIES:
             raise ValueError(f'Unknown SP processing boundary: {boundary!r}')
 
         position_ids = keys.get_value('position_ids')
@@ -810,9 +823,10 @@ class SequenceParallel:
             if not torch.is_tensor(value):
                 raise TypeError(f'SP input {spec.name!r} must be a tensor')
             if spec.pad_at == boundary:
-                # Preserve the existing attention-mask contract: it is padded
-                # only for ordinary batched sequences, not packed batch_size=1.
-                if spec.name != 'attention_mask' or (batch_size is not None and batch_size > 1):
+                # Dense SDPA also needs a global padding mask for batch_size=1;
+                # FlashAttention's packed path keeps its existing mask handling.
+                if (spec.name != 'attention_mask' or (batch_size is not None and batch_size > 1)
+                        or not is_flash_attention_implementation(self.attn_implementation)):
                     value = self._pad_key(value, spec, real_position_ids)
             item.value = value
 
@@ -825,7 +839,8 @@ class SequenceParallel:
 
         # Keep the legacy generated 2D mask and causal-mask conversion on the
         # forward boundary; these depend on model inputs and cache state.
-        if boundary == 'forward' and padded_model_inputs is not None and batch_size > 1:
+        if (boundary == 'forward' and padded_model_inputs is not None
+                and (batch_size > 1 or not is_flash_attention_implementation(self.attn_implementation))):
             attn_item = keys.get('attention_mask')
             if attn_item is None or attn_item.value is None:
                 attention_mask = (padded_positions != -1).to(dtype=torch.int64)
@@ -912,7 +927,6 @@ class SequenceParallel:
 class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
-    gather_logits: bool = True
 
 
 class SequenceParallelStrategy:
@@ -1035,7 +1049,7 @@ class SequenceParallelStrategy:
     def register_input_key(self, spec: DataKeySpec) -> None:
         """Declare a token-aligned input on this model only.
 
-        pad_at/split_at select execution boundaries; need_gather selects
+        pad_at/split_at select execution boundaries; gather_at selects
         loss-side collection. The model wrapper owns input routing and merges
         these explicit declarations into the processor schema.
         """
@@ -1061,7 +1075,7 @@ class SequenceParallelStrategy:
     def register_key_specs(self, input_key_specs, output_key_specs):
         """Consume model-resolved field definitions for SP execution."""
         for spec in input_key_specs:
-            if spec.name not in self._ctx.input_key_registry._FORWARD_KEYS:
+            if spec.name not in _FORWARD_KEYS:
                 self._ctx.input_key_registry.register(spec)
         for spec in output_key_specs:
             self._ctx.output_key_registry.register(spec)
@@ -1077,26 +1091,6 @@ class SequenceParallelStrategy:
     def model_sp_adapters(self) -> Tuple[ModelSPAdapter, ...]:
         """The model-family adapters selected during context preparation."""
         return self._ctx.model_adapters
-
-    def postprocess_outputs(self, outputs: Any) -> Any:
-        if (not self.enabled or self.ulysses_size <= 1 or not self.sp_config.get('gather_logits', True)):
-            return outputs
-        # Twinkle expects dict-like ModelOutput containers in the main training path
-        # (uses `.get(...)` and `outputs[...] = ...`). Keep SP postprocess consistent.
-        if outputs is None or not hasattr(outputs, 'get') or not hasattr(outputs, '__setitem__'):
-            raise TypeError('SequenceParallelStrategy.postprocess_outputs expects a dict-like ModelOutput. '
-                            f'Got type={type(outputs)}')
-        logits = outputs.get('logits', None)
-        if logits is None or not torch.is_tensor(logits) or logits.dim() < 2:
-            return outputs
-        gathered = self._ctx.gather(logits, dim=1, position_ids=self._ctx.real_position_ids)
-        # Scheme A: SP pads to make seq_len divisible by sp_size. Trim back to the original
-        # (unpadded) length using the cached real_position_ids.
-        real_pos = self._ctx.real_position_ids
-        if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
-            gathered = gathered[:, :real_pos.shape[1]].contiguous()
-        outputs['logits'] = gathered
-        return outputs
 
     def _trim_gathered_sequence_padding(self, tensor: torch.Tensor, real_position_ids: torch.Tensor,
                                         dim: int = 1) -> torch.Tensor:
@@ -1146,7 +1140,7 @@ class SequenceParallelStrategy:
         real_position_ids = self._ctx.real_position_ids
         for spec in self.input_key_specs:
             value = inputs.get(spec.name)
-            if spec.stage == 'auxiliary' and spec.need_gather and value is not None:
+            if spec.stage == 'auxiliary' and spec.gather_at == 'loss' and value is not None:
                 inputs[spec.name] = self._gather_key(value, spec, real_position_ids)
 
         fused_hidden = outputs.get('logps') is None and 'lm_head' in outputs and inputs.get('labels') is not None
@@ -1167,7 +1161,7 @@ class SequenceParallelStrategy:
             raise KeyError(f'Loss declared SP gather key(s) {sorted(missing_keys)}, but the model output is missing them.')
         for spec in self.output_key_specs:
             value = outputs.get(spec.name)
-            if value is not None and (spec.need_gather or spec.name in required_keys
+            if value is not None and (spec.gather_at == 'loss' or spec.name in required_keys
                                       or (spec.name == 'logits' and fused_hidden)):
                 outputs[spec.name] = self._gather_key(value, spec, real_position_ids)
         return inputs, outputs

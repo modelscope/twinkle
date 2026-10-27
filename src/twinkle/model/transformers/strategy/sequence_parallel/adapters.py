@@ -117,23 +117,6 @@ class MoEAuxSPAdapter(ModelSPAdapter):
 _ADAPTERS = [Qwen3VLSPAdapter(), Qwen35LinearAttentionSPAdapter(), MoEAuxSPAdapter()]
 
 
-def register_model_sp_adapter(adapter):
-    """Register an adapter instance for future SP model initialization."""
-    if isinstance(adapter, type):
-        adapter = adapter()
-    if not isinstance(adapter, ModelSPAdapter):
-        raise TypeError('A model SP adapter must derive from ModelSPAdapter')
-    if not adapter.name or adapter.name == 'generic':
-        raise ValueError('A registered model SP adapter needs a stable non-generic name')
-    for current in _ADAPTERS:
-        if current.name == adapter.name:
-            if type(current) is type(adapter):
-                return current
-            raise ValueError(f'Conflicting model SP adapter name: {adapter.name!r}')
-    _ADAPTERS.append(adapter)
-    return adapter
-
-
 def adapters_for_model(model):
     """Return every matching adapter; families can compose capabilities."""
     return tuple(adapter for adapter in _ADAPTERS if adapter.matches(model))

@@ -1135,7 +1135,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
-            loss_require_values = getattr(loss_instance, 'require_values', False)
             input_key_specs, output_key_specs = self._get_field_specs(loss_instance)
             inputs: Dict[str, Any] = processor(
                 inputs,

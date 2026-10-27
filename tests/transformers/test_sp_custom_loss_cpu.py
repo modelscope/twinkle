@@ -22,9 +22,15 @@ class TokenRegressionLoss(Loss):
     """Example plugin loss with custom sequence input and output keys."""
 
     require_logps = False
-    input_key_specs = (DataKeySpec('token_targets', split_dim=1, pad_value=0, owner='loss'),)
-    output_key_specs = (DataKeySpec('token_scores', split_dim=1, side='output', stage='output',
-                                       need_split=False, need_gather=True, autograd=True, owner='loss'),)
+    input_key_specs = (DataKeySpec('token_targets', split_dim=1, pad_value=0),)
+    output_key_specs = (DataKeySpec(
+        'token_scores',
+        split_dim=1,
+        side='output',
+        stage='output',
+        gather_at='loss',
+        autograd=True,
+    ),)
 
     def __call__(self, inputs, outputs, **kwargs):
         scores = outputs['token_scores']

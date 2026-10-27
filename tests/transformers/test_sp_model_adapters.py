@@ -19,7 +19,7 @@ def test_builtin_model_adapters_are_selected_by_model_family(model_type, expecte
     assert {adapter.name for adapter in sp_adapters.adapters_for_model(model)} == expected
 
 
-def test_model_adapter_registration_and_declared_key_specs(monkeypatch):
+def test_model_adapter_declared_key_specs(monkeypatch):
     class CustomAdapter(sp_adapters.ModelSPAdapter):
         name = 'test_custom_sp_adapter'
 
@@ -29,9 +29,8 @@ def test_model_adapter_registration_and_declared_key_specs(monkeypatch):
         def input_key_specs(self):
             return (sp.DataKeySpec('custom_features', pad_value=-3),)
 
-    monkeypatch.setattr(sp_adapters, '_ADAPTERS', list(sp_adapters._ADAPTERS))
-    adapter = sp_adapters.register_model_sp_adapter(CustomAdapter)
-    assert adapter is sp_adapters.register_model_sp_adapter(CustomAdapter())
+    adapter = CustomAdapter()
+    monkeypatch.setattr(sp_adapters, '_ADAPTERS', [*sp_adapters._ADAPTERS, adapter])
     model = torch.nn.Linear(2, 2)
     model.config = SimpleNamespace(model_type='custom_sp_test')
     context = sp.SequenceParallel()

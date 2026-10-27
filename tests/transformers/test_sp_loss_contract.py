@@ -52,7 +52,7 @@ def test_custom_loss_declares_and_consumes_a_registered_output_key(monkeypatch):
 
     strategy = _strategy()
     strategy.register_output_key(
-        DataKeySpec('values', split_dim=1, side='output', stage='output', need_split=False, autograd=True))
+        DataKeySpec('values', split_dim=1, side='output', stage='output', autograd=True))
     _mock_gather(monkeypatch)
     _, outputs = strategy.gather_loss_tensors({}, {'values': torch.tensor([[1.0, 2.0, 3.0]])},
                                              sp_gather_keys=ToyValueLoss.sp_gather_keys)
@@ -65,10 +65,23 @@ def test_custom_loss_declares_and_consumes_a_registered_output_key(monkeypatch):
 def test_loss_can_declare_custom_sequence_inputs_and_outputs(monkeypatch):
     class TokenAlignmentLoss(Loss):
         require_logps = False
-        sp_input_key_specs = (DataKeySpec('token_targets', split_dim=1, pad_value=-1,
-                                          need_gather=True, autograd=True, owner='loss'),)
-        sp_output_key_specs = (DataKeySpec('token_scores', split_dim=1, side='output', stage='output',
-                                           need_split=False, need_gather=True, autograd=True, owner='loss'),)
+        sp_input_key_specs = (DataKeySpec(
+            'token_targets',
+            split_dim=1,
+            pad_value=-1,
+            gather_at='loss',
+            autograd=True,
+            pad_at='prepare',
+            split_at='prepare',
+        ),)
+        sp_output_key_specs = (DataKeySpec(
+            'token_scores',
+            split_dim=1,
+            side='output',
+            stage='output',
+            gather_at='loss',
+            autograd=True,
+        ),)
 
         def __call__(self, inputs, outputs, **kwargs):
             return LossOutput(loss=(outputs['token_scores'] - inputs['token_targets']).square().mean(),
@@ -380,3 +393,18 @@ def test_sp_pooling_and_gradients_match_full_sequence():
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     mp.spawn(_sp_pooling_worker, args=(port,), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize('task', ['seq_cls', 'reranker'])
+def test_prepooled_classification_logits_skip_token_pooling(task):
+    from twinkle.model.transformers.task_outputs import postprocess_task_outputs
+
+    def unexpected_pool(*args):
+        raise AssertionError('Already pooled classification logits must bypass token pooling')
+
+    inputs = {'attention_mask': torch.ones(2, 5)}
+    outputs = {'logits': torch.tensor([[1., 2.], [3., 4.]])}
+    strategy = SimpleNamespace(pool_last_valid_token=unexpected_pool)
+    actual_inputs, actual_outputs = postprocess_task_outputs(inputs, outputs, task=task, sp_strategy=strategy)
+    assert actual_inputs is inputs
+    assert actual_outputs is outputs
