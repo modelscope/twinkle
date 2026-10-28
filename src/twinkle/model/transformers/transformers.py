@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union, overload
+from weakref import ref
 
 import twinkle
 import twinkle.module.optimizer
@@ -848,7 +849,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return payload
 
     def _get_field_specs(self, loss_instance):
-        """Resolve model/loss fields even when sequence parallelism is disabled."""
+        """Cache model/loss declarations independently of SP and batch contents.
+
+        Configure provider declarations before forwarding. Model/strategy/loss
+        replacement and direct registrations invalidate the single-entry cache;
+        set_loss also invalidates it when reconfiguring the same loss instance.
+        """
+        owners = (self.model, self.strategy, self.sp_strategy, loss_instance)
+        direct_fields = self.sp_strategy.field_declarations if self.sp_strategy is not None else None
+        declarations = ((direct_fields.input_key_specs, direct_fields.output_key_specs)
+                        if direct_fields is not None else ((), ()))
+        cached = getattr(self, '_field_specs_cache', None)
+        if (cached is not None and all(previous() is current for previous, current in zip(cached[0], owners))
+                and cached[1] == declarations):
+            return cached[2]
+
         from twinkle.utils.transformers_utils import get_llm_model
         from .strategy.sequence_parallel.adapters import adapters_for_model
 
@@ -858,10 +873,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         adapters = tuple(adapter for candidate in models for adapter in adapters_for_model(candidate))
         # Direct registration is a legacy declaration interface. Merge only
         # those explicit declarations, not SP's derived execution registry.
-        direct_fields = self.sp_strategy.field_declarations if self.sp_strategy is not None else None
         specs = resolve_key_specs(*models, *adapters, loss_instance, direct_fields)
         if self.sp_strategy is not None:
             self.sp_strategy.register_key_specs(*specs)
+        # Replacing a model/strategy must not leave its parameters alive through
+        # the cache. Non-weakrefable lightweight providers still need identity checks.
+        owner_refs = []
+        for owner in owners:
+            try:
+                owner_refs.append(ref(owner))
+            except TypeError:
+                owner_refs.append(lambda owner=owner: owner)
+        self._field_specs_cache = (tuple(owner_refs), declarations, specs)
         return specs
 
     def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
@@ -1876,6 +1899,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
         optimizer_config.set_loss(loss_instance, loss_key=loss_key)
+        self._field_specs_cache = None
         if self.sp_strategy is not None:
             self.sp_strategy.register_loss_key_specs(loss_instance)
 

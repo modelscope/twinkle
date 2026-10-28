@@ -16,9 +16,6 @@ class Loss:
     # data_format; the base class does not depend on an SP strategy.
     input_key_specs = ()
     output_key_specs = ()
-    # Compatibility for existing loss plugins. New declarations use the common names.
-    sp_input_key_specs = ()
-    sp_output_key_specs = ()
     # Request per-token values from the Transformers wrapper (e.g. PPO critic).
     require_values = False
 

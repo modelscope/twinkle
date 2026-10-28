@@ -4,7 +4,6 @@ Adapters own model-family detection and the model-specific setup steps. The
 sequence-parallel context remains responsible for generic padding, sharding and
 collectives; adapters only install behavior that depends on model internals.
 """
-from dataclasses import dataclass
 from typing import Tuple
 
 import torch

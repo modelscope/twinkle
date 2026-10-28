@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from weakref import WeakKeyDictionary, WeakMethod
 
 from twinkle.data_format.sequence_fields import _PROCESSING_BOUNDARIES
+from twinkle.processor.fields import _FORWARD_KEYS
 from twinkle.utils import DeviceMesh, get_logger
 from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
@@ -18,7 +19,7 @@ from .adapters import ModelSPAdapter, adapters_for_model
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
                     post_all2all)
-from .data_keys import _FORWARD_KEYS, DataKeySpec, InputKeyRegistry, OutputKeyRegistry, SPKeyCollection, SPKeyValue
+from .data_keys import DataKeySpec, InputKeyRegistry, OutputKeyRegistry, SPKeyCollection, SPKeyValue
 
 
 # ---------------------------------------------------------------------------
@@ -489,8 +490,7 @@ class SequenceParallel:
                 cache_position = kwargs.get('cache_position', None)
                 specs = tuple(spec for spec in self.input_key_registry
                               if spec.pad_at == 'forward' or spec.split_at == 'forward')
-                common_names = _FORWARD_KEYS
-                keys = SPKeyCollection.from_mapping(kwargs, specs, common_names=common_names)
+                keys = SPKeyCollection.from_mapping(kwargs, specs)
                 self.pad_and_split_inputs(keys, boundary='forward', real_position_ids=real_position_ids,
                                           cache_position=cache_position)
                 for item in keys.values():
@@ -791,11 +791,9 @@ class SequenceParallel:
         pad_value = self.tokenizer.pad_token_id if spec.pad_value == 'tokenizer' else spec.pad_value
         return self.pad(value, padding_value=pad_value, dim=spec.sequence_dim(value.dim()), position_ids=position_ids)
 
-    def _split_key(self, value, spec, position_ids=None, legacy_roll=False):
+    def _split_key(self, value, spec, position_ids=None):
         if value is None or not spec.need_split:
             return value
-        if spec.roll or legacy_roll:
-            value = torch.roll(value, shifts=-1, dims=spec.split_dim)
         return self.split(value, dim=spec.split_dim, position_ids=position_ids)
 
     def pad_and_split_inputs(self,
@@ -863,7 +861,7 @@ class SequenceParallel:
                 if attn_item is None:
                     spec = self.input_key_registry.get('attention_mask')
                     attn_item = SPKeyValue(spec, attention_mask)
-                    keys.add(attn_item, common=True)
+                    keys.add(attn_item)
                 else:
                     attn_item.value = attention_mask
             else:
@@ -932,7 +930,7 @@ class SequenceParallel:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         specs = tuple(spec for spec in self.input_key_registry
                       if spec.pad_at == 'prepare' or spec.split_at == 'prepare')
-        keys = SPKeyCollection.from_mapping(inputs, specs, common_names=('labels', 'completion_mask', 'loss_scale'))
+        keys = SPKeyCollection.from_mapping(inputs, specs)
         self.pad_and_split_inputs(keys, boundary='prepare', real_position_ids=real_position_ids)
         for item in keys.values():
             inputs[item.name] = item.value
@@ -1009,9 +1007,8 @@ class SequenceParallelStrategy:
         return True
 
     # -- SP context delegates -------------------------------------------------
-    # Processors / router replay access SP state through the strategy. These
-    # delegates forward to this model's own context (they previously did not
-    # exist, silently disabling SP-aware paths such as last-token pooling).
+    # Last-token pooling reads topology and calls pad/split through this model's
+    # strategy; processors do not access the parallel context.
 
     @property
     def world_size(self) -> int:
@@ -1046,11 +1043,6 @@ class SequenceParallelStrategy:
         if self._ctx.world_size is None:
             return tensor
         return self._ctx.split(tensor, *args, **kwargs)
-
-    def gather(self, tensor, *args, **kwargs):
-        if self._ctx.world_size is None:
-            return tensor
-        return self._ctx.gather(tensor, *args, **kwargs)
 
     def preprocess_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not self.enabled or self.ulysses_size <= 1:
@@ -1107,11 +1099,6 @@ class SequenceParallelStrategy:
 
         self.register_key_specs(tuple(declared_key_specs(loss, 'input')),
                                 tuple(declared_key_specs(loss, 'output')))
-
-    @property
-    def model_sp_adapters(self) -> Tuple[ModelSPAdapter, ...]:
-        """The model-family adapters selected during context preparation."""
-        return self._ctx.model_adapters
 
     def _trim_gathered_sequence_padding(self, tensor: torch.Tensor, real_position_ids: torch.Tensor,
                                         dim: int = 1) -> torch.Tensor:

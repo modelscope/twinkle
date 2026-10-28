@@ -34,10 +34,12 @@ Model postprocessing interprets task outputs and performs SP collectives; proces
 
 - `data_format/sequence_fields.py` defines `DataKeySpec` and provider contracts, without a global list of all fields.
 - `processor/fields.py` owns supported encoded text/media/replay/control inputs and collation/restoration rules. Templates encode raw media first. Internal `length` metadata is not a forward argument.
-- `model/transformers/strategy/sequence_parallel/data_keys.py` owns SP execution defaults and batch-local collections. Media pixels and control arguments are not blindly sharded as tokens.
+- `model/transformers/strategy/sequence_parallel/data_keys.py` derives SP execution defaults from the common processor layouts, adding processing boundaries and autograd settings without repeating axes or padding values. It also owns batch-local collections. Media pixels and control arguments are not blindly sharded as tokens.
 - Model adapters and losses declare their own extensions.
 
 Processor defaults do not schedule SP operations. Custom loss fields remain available with SP disabled.
+
+Declare extensions on the model, adapter or loss; adding a custom key does not require editing either built-in list. Model-side schema resolution is cached for the current model/strategy/loss instances. Direct input/output registrations and `set_loss()` invalidate the cache. Configure provider declarations before forwarding; if reconfiguring an existing loss instance, call `set_loss()` again. Field rules only pad, split and gather; they do not shift token targets.
 
 ```python
 from twinkle.data_format.sequence_fields import DataKeySpec

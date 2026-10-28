@@ -17,7 +17,6 @@ class DataKeySpec:
     name: str
     split_dim: int = -1
     pad_value: int | float | str = 0
-    roll: bool = False
     side: str = "input"
     stage: str = "auxiliary"
     autograd: bool = False
@@ -51,8 +50,6 @@ class DataKeySpec:
             raise ValueError("Only sharded input keys can request gathering")
         if self.stage == "forward" and self.gather_at is not None:
             raise ValueError("Model-forward keys cannot request loss gathering")
-        if self.roll and not self.need_split:
-            raise ValueError("Rolling requires a split boundary")
         if self.model_input is None:
             object.__setattr__(self, "model_input", self.stage == "forward")
         if self.unpack_packed is None:

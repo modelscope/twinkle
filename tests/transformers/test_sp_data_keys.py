@@ -34,16 +34,16 @@ def test_builtin_labels_match_existing_pad_split(rank, length):
 
 
 @pytest.mark.parametrize('rank', [0, 1])
-def test_custom_key_padding_dimension_roll_and_model_isolation(rank):
+def test_custom_key_padding_dimension_and_model_isolation(rank):
     strategy = _strategy(rank)
     other = _strategy(rank)
-    spec = DataKeySpec('token_weights', split_dim=1, pad_value=-2, roll=True, pad_at='prepare', split_at='prepare')
+    spec = DataKeySpec('token_weights', split_dim=1, pad_value=-2, pad_at='prepare', split_at='prepare')
     strategy.register_input_key(spec)
     strategy.register_input_key(spec)  # Identical declarations are safe.
     values = torch.arange(10).reshape(1, 5, 2)
     positions = torch.arange(5).unsqueeze(0)
     prepared = strategy.preprocess_inputs({'token_weights': values, 'position_ids': positions})
-    expected = torch.cat((values, torch.full((1, 1, 2), -2)), dim=1).roll(-1, dims=1)
+    expected = torch.cat((values, torch.full((1, 1, 2), -2)), dim=1)
     torch.testing.assert_close(prepared['token_weights'], expected[:, rank * 3:(rank + 1) * 3])
     untouched = other.preprocess_inputs({'token_weights': values, 'position_ids': positions})
     assert untouched['token_weights'] is values
@@ -70,7 +70,7 @@ def test_key_collection_executes_only_at_declared_boundary(rank):
         'token_type_ids': torch.arange(5).expand(2, -1),
     }
     specs = tuple(spec for spec in ctx.input_key_registry if spec.stage == 'forward')
-    keys = SPKeyCollection.from_mapping(values, specs, common_names=('input_ids', 'position_ids', 'attention_mask'))
+    keys = SPKeyCollection.from_mapping(values, specs)
     ctx.pad_and_split_inputs(keys, boundary='forward', real_position_ids=values['position_ids'])
     assert keys.get('input_ids').value.shape == (2, 3)
     assert keys.get('position_ids').value.shape == (2, 3)
@@ -79,10 +79,10 @@ def test_key_collection_executes_only_at_declared_boundary(rank):
     torch.testing.assert_close(keys.get('attention_mask').value, torch.tensor([[1, 1, 1, 1, 1, 0]]).expand(2, -1))
 
 
-def test_key_collection_rejects_duplicate_names_across_common_and_extra():
+def test_key_collection_rejects_duplicate_names():
     spec = DataKeySpec('token_type_ids', stage='forward', pad_at='forward', split_at='forward')
     keys = SPKeyCollection()
-    keys.add(SPKeyValue(spec, torch.ones(1, 2)), common=True)
+    keys.add(SPKeyValue(spec, torch.ones(1, 2)))
     with pytest.raises(ValueError, match='Duplicate SP key'):
         keys.add(SPKeyValue(spec, torch.zeros(1, 2)))
 
@@ -495,6 +495,82 @@ def test_direct_registration_survives_model_schema_resolution_and_processor(monk
     assert strategy.field_declarations.input_key_specs == (spec,)
 
 
+@pytest.mark.parametrize('enable_sp', [False, True])
+def test_model_field_specs_cache_tracks_loss_model_and_direct_registrations(monkeypatch, enable_sp):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from twinkle.model.transformers import transformers as model_module
+
+    resolve = Mock(wraps=model_module.resolve_key_specs)
+    monkeypatch.setattr(model_module, 'resolve_key_specs', resolve)
+    wrapper = SimpleNamespace(model=torch.nn.Linear(2, 2),
+                              strategy=SimpleNamespace(unwrap_model=Mock(side_effect=lambda model: model)),
+                              sp_strategy=_strategy() if enable_sp else None)
+    get_specs = model_module.TransformersModel._get_field_specs
+    loss = SimpleNamespace(input_key_specs=(DataKeySpec('targets'),))
+    first = get_specs(wrapper, loss)
+    assert get_specs(wrapper, loss) is first
+    assert resolve.call_count == wrapper.strategy.unwrap_model.call_count == 1
+
+    # Replacing a loss object cannot reuse the previous loss's schema.
+    other_loss = SimpleNamespace(input_key_specs=(DataKeySpec('other_targets'),))
+    second = get_specs(wrapper, other_loss)
+    assert any(spec.name == 'other_targets' for spec in second[0])
+    assert not any(spec.name == 'targets' for spec in second[0])
+    assert resolve.call_count == 2
+
+    wrapper.model = torch.nn.Linear(2, 2)
+    get_specs(wrapper, other_loss)
+    assert resolve.call_count == 3
+    wrapper.strategy = SimpleNamespace(unwrap_model=lambda model: model)
+    get_specs(wrapper, other_loss)
+    assert resolve.call_count == 4
+    if enable_sp:
+        wrapper.sp_strategy.register_input_key(DataKeySpec('late_targets'))
+        assert any(spec.name == 'late_targets' for spec in get_specs(wrapper, other_loss)[0])
+        wrapper.sp_strategy.register_output_key(DataKeySpec('late_scores', side='output', stage='output'))
+        assert any(spec.name == 'late_scores' for spec in get_specs(wrapper, other_loss)[1])
+        assert resolve.call_count == 6
+        wrapper.sp_strategy = _strategy()
+        assert not any(spec.name == 'late_targets' for spec in get_specs(wrapper, other_loss)[0])
+        assert resolve.call_count == 7
+
+
+def test_set_loss_invalidates_cached_declarations_of_the_same_instance():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from twinkle.loss import CrossEntropyLoss
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    loss = CrossEntropyLoss()
+    loss.input_key_specs = (DataKeySpec('targets'),)
+    wrapper = SimpleNamespace(model=torch.nn.Linear(2, 2),
+                              strategy=SimpleNamespace(unwrap_model=lambda model: model), sp_strategy=None,
+                              optimizer_group={'default': SimpleNamespace(set_loss=Mock())},
+                              _get_default_group=lambda: 'default')
+    first = TransformersModel._get_field_specs(wrapper, loss)
+    loss.input_key_specs = (DataKeySpec('new_targets'),)
+    TransformersModel.set_loss.__wrapped__(wrapper, loss)
+    second = TransformersModel._get_field_specs(wrapper, loss)
+    assert second is not first
+    assert any(spec.name == 'new_targets' for spec in second[0])
+
+
+def test_field_specs_cache_does_not_keep_replaced_model_alive():
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    wrapper = SimpleNamespace(model=torch.nn.Linear(2, 2),
+                              strategy=SimpleNamespace(unwrap_model=lambda model: model), sp_strategy=None)
+    previous_model = weakref.ref(wrapper.model)
+    TransformersModel._get_field_specs(wrapper, None)
+    wrapper.model = torch.nn.Linear(2, 2)
+    gc.collect()
+    assert previous_model() is None
+
+
 @pytest.mark.parametrize('label_type', ['tensor', 'numpy', 'python'])
 @pytest.mark.parametrize('framework', ['transformers', 'megatron'])
 def test_scalar_classification_labels_collate_with_common_schema(monkeypatch, label_type, framework):
@@ -546,15 +622,20 @@ def test_packed_output_logits_restore_without_labels():
 
 
 @pytest.mark.parametrize('operation', ['pad', 'split'])
-def test_loss_only_fields_reject_unreachable_forward_operations(operation):
+@pytest.mark.parametrize('entry_point', ['registry', 'schema'])
+def test_loss_only_fields_reject_unreachable_forward_operations(operation, entry_point):
     from dataclasses import replace
+    from types import SimpleNamespace
+
+    register = (_strategy().register_input_key if entry_point == 'registry' else
+                lambda spec: resolve_key_specs(SimpleNamespace(input_key_specs=(spec,))))
 
     spec = (DataKeySpec('token_targets', pad_at='forward') if operation == 'pad' else
             DataKeySpec('token_targets', pad_at='prepare', split_at='forward'))
     with pytest.raises(ValueError, match='Loss-only input.*forward boundary'):
-        _strategy().register_input_key(spec)
+        register(spec)
     # Model arguments can reach the forward hook, regardless of their stage name.
-    _strategy().register_input_key(replace(spec, model_input=True))
+    register(replace(spec, model_input=True))
 
 
 @pytest.mark.parametrize('pad_at,split_at', [(None, None), ('prepare', None), (None, 'forward'),
@@ -565,7 +646,7 @@ def test_parallel_switches_are_derived_from_boundaries(pad_at, split_at):
     spec = DataKeySpec('token_features', pad_at=pad_at, split_at=split_at, model_input=True)
     assert spec.need_pad is (pad_at is not None)
     assert spec.need_split is (split_at is not None)
-    assert not {'need_pad', 'need_split', 'need_gather', 'owner'} & {field.name for field in fields(spec)}
+    assert not {'need_pad', 'need_split', 'need_gather', 'owner', 'roll'} & {field.name for field in fields(spec)}
 
 
 @pytest.mark.parametrize('kwargs,message', [
@@ -573,7 +654,6 @@ def test_parallel_switches_are_derived_from_boundaries(pad_at, split_at):
     ({'split_at': 'output'}, 'split boundary'),
     ({'gather_at': 'forward'}, 'gather boundary'),
     ({'gather_at': 'loss'}, 'Only sharded input'),
-    ({'roll': True}, 'Rolling requires'),
     ({'side': 'output', 'stage': 'output', 'pad_at': 'prepare'}, 'Output keys cannot'),
 ])
 def test_invalid_parallel_operation_boundaries_are_rejected(kwargs, message):
@@ -613,7 +693,7 @@ def test_processor_public_layout_query(configured, packed):
 
 def test_processor_supported_fields_include_multimodal_replay_and_control_inputs():
     from twinkle.processor import InputProcessor
-    from twinkle.processor.fields import TRANSFORMERS_INPUT_KEYS, LAYOUT_ONLY_KEYS
+    from twinkle.processor.fields import TRANSFORMERS_INPUT_KEYS
 
     required = {'pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw',
                 'input_features', 'input_features_mask', 'feature_attention_mask', 'grid_thws',
@@ -621,7 +701,7 @@ def test_processor_supported_fields_include_multimodal_replay_and_control_inputs
                 'cu_seq_lens_q', 'cu_seq_lens_k', 'cu_seqlens_q', 'cu_seqlens_kv',
                 'cache_position', 'padding_free', 'packed_seq_params'}
     assert required <= TRANSFORMERS_INPUT_KEYS
-    assert set(InputProcessor.padding_map) <= TRANSFORMERS_INPUT_KEYS | set(LAYOUT_ONLY_KEYS)
+    assert set(InputProcessor.padding_map) - TRANSFORMERS_INPUT_KEYS == {'length'}
     value = torch.ones(1, 2)
     sample = {key: value for key in required}
     sample.update(length=2, unregistered=value)
@@ -642,6 +722,35 @@ def test_processor_defaults_do_not_schedule_parallel_operations():
     assert labels.pad_at == labels.split_at == 'prepare'
     assert labels.gather_at == 'loss'
     assert strategy._ctx.output_key_registry.get('logps').gather_at == 'loss'
+
+
+def test_sp_builtin_execution_rules_preserve_common_layouts():
+    from dataclasses import fields
+    from twinkle.processor.fields import COMMON_INPUT_SPECS, COMMON_OUTPUT_SPECS
+    from twinkle.model.transformers.strategy.sequence_parallel.data_keys import (
+        BUILTIN_INPUT_KEYS, BUILTIN_OUTPUT_KEYS)
+
+    for common, parallel in ((COMMON_INPUT_SPECS, BUILTIN_INPUT_KEYS), (COMMON_OUTPUT_SPECS, BUILTIN_OUTPUT_KEYS)):
+        assert [spec.name for spec in common] == [spec.name for spec in parallel]
+        for layout, execution in zip(common, parallel):
+            for item in fields(DataKeySpec):
+                if item.name not in ('pad_at', 'split_at', 'gather_at', 'autograd'):
+                    assert getattr(layout, item.name) == getattr(execution, item.name)
+
+
+def test_processor_padding_values_follow_common_layouts():
+    from twinkle.processor.fields import COMMON_INPUT_SPECS, PADDING_VALUES
+
+    for spec in COMMON_INPUT_SPECS:
+        # The processor/CP numeric fallback remains 0 without a tokenizer;
+        # only SP resolves the tokenizer sentinel to the model's pad ID.
+        expected = 0 if spec.pad_value == 'tokenizer' else spec.pad_value
+        assert PADDING_VALUES[spec.name] == expected
+        assert isinstance(PADDING_VALUES[spec.name], (int, float))
+    assert PADDING_VALUES['mm_token_type_ids'] == 0
+    assert PADDING_VALUES['length'] == -1
+    assert PADDING_VALUES['pixel_values'] == 0.0
+    assert PADDING_VALUES['routed_experts'] == PADDING_VALUES['replay_mask'] == 0
 
 
 def test_direct_builtin_output_declaration_keeps_model_schema_and_sp_registry_consistent():
