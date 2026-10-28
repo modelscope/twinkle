@@ -89,7 +89,10 @@ def train():
                 'enabled': ENABLE_EP,
                 'router_dtype': 'fp32',
                 'keep_router_logits': False,
-            }
+            },
+            # Optional per-field precision overrides (native FSDP2 only), e.g. BF16 compute
+            # with FP32 gradient reduction; omitted fields follow the `mixed_precision` base.
+            # 'mixed_precision': {'param_dtype': 'bf16', 'reduce_dtype': 'fp32'},
         },
     )
     # Kernel mode: torch (TWINKLE_TORCH_BASELINE=1, no fusion) | npu (default,

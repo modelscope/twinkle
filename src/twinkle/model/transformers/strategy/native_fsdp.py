@@ -12,6 +12,7 @@ from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
 from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from .base import TransformerStrategyBase
 from .base import fsdp_pretrained_load_context
+from .mixed_precision import parse_mp_overrides
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -34,6 +35,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
+        # Per-field precision overrides from fsdp_config['mixed_precision'], resolved (and
+        # validated) once at construction; empty means the mixed_precision string alone rules.
+        self._mp_overrides = parse_mp_overrides(self.fsdp_config.get('mixed_precision'))
+        _check_mp_dtypes(mixed_precision, self._mp_overrides)
         self._memory_efficient_init = memory_efficient_init
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
@@ -162,7 +167,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
                 _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
-            mp_policy = _build_mp_policy(self.mixed_precision)
+            mp_policy = _build_mp_policy(self.mixed_precision, self._mp_overrides)
             reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
 
             if ep_enabled:
@@ -492,18 +497,60 @@ def _ep_expert_state_dict_gather_dim(name: str) -> int:
     return 0
 
 
-def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
+def _effective_mp_dtypes(mixed_precision: str,
+                         overrides: Optional[Dict[str, torch.dtype]] = None) -> tuple:
+    """Resolve the base string + overrides into the three effective field dtypes.
+
+    ``mixed_precision`` sets the base dtype shared by all three fields ('no'/'fp8' leave the
+    base as None, so FSDP follows each parameter's own dtype); ``overrides`` replaces only
+    the fields the user configured.
+    """
+    base_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(mixed_precision)
+    overrides = overrides or {}
+    return (overrides.get('param_dtype', base_dtype),
+            overrides.get('reduce_dtype', base_dtype),
+            overrides.get('output_dtype', base_dtype))
+
+
+def _check_mp_dtypes(mixed_precision: str, overrides: Optional[Dict[str, torch.dtype]]) -> None:
+    """Reject configs whose effective ``output_dtype`` forms a dtype boundary against ``param_dtype``.
+
+    ``output_dtype`` casts every FSDP unit's forward output while ``cast_forward_inputs``
+    re-casts the next unit's inputs to ``param_dtype``. When an effective ``output_dtype`` is
+    set and differs from ``param_dtype``, gradient-checkpointing recompute can run against
+    tensors captured on the other side of that boundary -- validated on 4x NPU with Qwen3.5:
+    RoPE-promoted FP32 q/k meet a BF16 v and SDPA raises "Expected query, key, and value to
+    have the same dtype". An effective ``output_dtype`` of None performs no output cast, so
+    the tensor stream stays uniform in ``param_dtype`` and remains legal. ``reduce_dtype``
+    only affects gradient reduction and is not constrained.
+    """
+    param_dtype, _, output_dtype = _effective_mp_dtypes(mixed_precision, overrides)
+    if output_dtype is not None and output_dtype != param_dtype:
+        raise ValueError(
+            f"fsdp_config['mixed_precision'] must not give output_dtype ({output_dtype}) a different "
+            f"effective dtype than param_dtype ({param_dtype}) [mixed_precision={mixed_precision!r}]: "
+            f'the unit-boundary dtype cast breaks gradient-checkpointing recompute. Set output_dtype '
+            f'equal to param_dtype or leave both unconfigured; reduce_dtype is unconstrained.')
+
+
+def _build_mp_policy(mixed_precision: str,
+                     overrides: Optional[Dict[str, torch.dtype]] = None) -> 'MixedPrecisionPolicy':
+    """Build the FSDP2 MixedPrecisionPolicy from the base string plus per-field overrides.
+
+    ``overrides`` is the resolved ``fsdp_config['mixed_precision']`` (see
+    :func:`parse_mp_overrides`), e.g. BF16 compute with FP32 gradient reduction; param/output
+    boundary combinations are rejected earlier, at strategy construction (see
+    :func:`_check_mp_dtypes`). ``cast_forward_inputs`` keeps its legacy value (FSDP2 only acts
+    on it when ``param_dtype`` is set, so it is inert for the all-None 'no' case).
+    """
     from torch.distributed.fsdp import MixedPrecisionPolicy
-    if mixed_precision == 'bf16':
-        dtype = torch.bfloat16
-    elif mixed_precision == 'fp16':
-        dtype = torch.float16
-    else:
+    param_dtype, reduce_dtype, output_dtype = _effective_mp_dtypes(mixed_precision, overrides)
+    if param_dtype is None and reduce_dtype is None and output_dtype is None:
         return MixedPrecisionPolicy()
     return MixedPrecisionPolicy(
-        param_dtype=dtype,
-        reduce_dtype=dtype,
-        output_dtype=dtype,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
         cast_forward_inputs=True,
     )
 
