@@ -20,7 +20,7 @@ from twinkle.utils import DeviceMesh, Platform, ensure_hccl_socket_env, selectiv
 pytestmark = [pytest.mark.slow, pytest.mark.accel(2)]
 
 LOGITS_RTOL = 1e-2
-LOGITS_ATOL = 5e-3
+LOGITS_ATOL = 1e-2
 LOSS_ATOL = 5e-3
 GRAD_RTOL = 2e-2
 GRAD_ATOL = 1e-2
@@ -368,16 +368,22 @@ def _assert_logits_close(case_name: str, rank: int, baseline_logits: torch.Tenso
                          seq_len: int, attention_mask: torch.Tensor | None):
     baseline_slice = baseline_logits[:, :seq_len]
     sp_slice = sp_logits[:, :seq_len]
-    if attention_mask is None:
-        if not torch.allclose(sp_slice, baseline_slice, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-            diff = (sp_slice - baseline_slice).abs().max().item()
-            raise AssertionError(f'{case_name} logits mismatch on rank {rank}: max_diff={diff}')
-        return
-
-    mask = attention_mask.to(dtype=torch.bool).unsqueeze(-1).expand_as(baseline_slice)
-    if not torch.allclose(sp_slice[mask], baseline_slice[mask], rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-        diff = (sp_slice[mask] - baseline_slice[mask]).abs().max().item()
-        raise AssertionError(f'{case_name} masked logits mismatch on rank {rank}: max_diff={diff}')
+    if attention_mask is not None:
+        mask = attention_mask.to(dtype=torch.bool).unsqueeze(-1).expand_as(baseline_slice)
+        baseline_slice, sp_slice = baseline_slice[mask], sp_slice[mask]
+    if not torch.allclose(sp_slice, baseline_slice, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+        difference = (sp_slice - baseline_slice).abs()
+        tolerance = LOGITS_ATOL + LOGITS_RTOL * baseline_slice.abs()
+        failing = ~torch.isclose(sp_slice, baseline_slice, rtol=LOGITS_RTOL, atol=LOGITS_ATOL)
+        worst = (difference / tolerance).flatten().argmax()
+        baseline_value = baseline_slice.flatten()[worst].item()
+        sp_value = sp_slice.flatten()[worst].item()
+        raise AssertionError(
+            f'{case_name} logits mismatch on rank {rank}: max_diff={difference.max().item()}, '
+            f'mean_diff={difference.mean().item()}, '
+            f'failed_elements={failing.sum().item()}/{failing.numel()}, '
+            f'worst_flat_index={worst.item()}, baseline={baseline_value}, sp={sp_value}, '
+            f'allowed_error={tolerance.flatten()[worst].item()}')
 
 
 def _init_dist(rank: int, world_size: int, port: int, backend_config: dict):

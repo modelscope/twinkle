@@ -136,9 +136,9 @@ _TRAIN_FEATURE_KEYS = ("input_ids", "labels", "completion_mask", "routed_experts
 
 def _vision_feature_keys() -> frozenset:
     """The multimodal feature keys to lift from the engine's feature into ``encoded``."""
-    from twinkle.processor.base import InputProcessor
+    from twinkle.processor.fields import VLM_CONCAT_FIELDS
 
-    return frozenset(InputProcessor.VLM_CONCAT_FIELDS) | frozenset(("mm_token_type_ids", "second_per_grid_ts"))
+    return frozenset(VLM_CONCAT_FIELDS) | frozenset(("mm_token_type_ids", "second_per_grid_ts"))
 
 
 def trajectory_to_rollout_sample(traj: dict[str, Any], prompt_id: str, extra: dict[str, Any]) -> RolloutSample:

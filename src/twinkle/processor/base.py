@@ -32,9 +32,6 @@ class PackedSeqParams:
 class InputProcessor:
     padding_map = PADDING_VALUES
 
-    # VLM fields to concatenate (not pad) in batch
-    VLM_CONCAT_FIELDS = VLM_CONCAT_FIELDS
-
     def __init__(
         self,
         device_mesh: DeviceMesh | None = None,
@@ -115,7 +112,7 @@ class InputProcessor:
                     value = torch.tensor(value)
                 elif (isinstance(value, list)) and key in ("completion_mask", "mm_token_type_ids", "routed_experts"):
                     value = torch.tensor(value)
-                elif key in self.VLM_CONCAT_FIELDS:
+                elif key in VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
                         value = [torch.tensor(v) for v in value]
                         value = torch.cat(value, dim=0)
@@ -556,7 +553,7 @@ class InputProcessor:
         results = []
         for _input in inputs:
             output = {}
-            _keys = TRANSFORMERS_INPUT_KEYS | set(InputProcessor.VLM_CONCAT_FIELDS) | set(registered_keys)
+            _keys = TRANSFORMERS_INPUT_KEYS | set(registered_keys)
             for key in list(_input.keys()):
                 if key not in _keys:
                     continue
@@ -604,7 +601,7 @@ class InputProcessor:
     def _fill_optional_sequence_fields(self, batch: list[InputFeature]) -> None:
         if len(batch) < 2:
             return
-        seq_fields = set(self.padding_map) - set(self.VLM_CONCAT_FIELDS)
+        seq_fields = set(self.padding_map) - set(VLM_CONCAT_FIELDS)
         present = {k for feat in batch for k in feat if k in seq_fields}
         for key in present:
             missing = [feat for feat in batch if feat.get(key) is None]
@@ -676,11 +673,11 @@ class InputProcessor:
         inputs = squeezed
         self._fill_optional_sequence_fields(inputs)
 
-        vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
+        vlm_fields = {k: [] for k in VLM_CONCAT_FIELDS}
         text_inputs = []
         for inp in inputs:
             inp = dict(inp)
-            for field in self.VLM_CONCAT_FIELDS:
+            for field in VLM_CONCAT_FIELDS:
                 if field in inp:
                     vlm_fields[field].append(inp.pop(field))
             text_inputs.append(inp)
@@ -777,7 +774,7 @@ class InputProcessor:
             # normal collate
             outputs = self._collate_macro_batch(inputs, input_key_specs=input_key_specs)
             for key in outputs:
-                if key in self.VLM_CONCAT_FIELDS:
+                if key in VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
             return [outputs]
         padding_free = self.is_padding_free(inputs)
@@ -789,7 +786,7 @@ class InputProcessor:
                 _output = self._collate_macro_batch(inputs[i:i + micro_batch_size],
                                                     input_key_specs=input_key_specs)
                 for key in _output:
-                    if key in self.VLM_CONCAT_FIELDS:
+                    if key in VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
                 outputs.append(_output)
             return outputs
@@ -804,7 +801,7 @@ class InputProcessor:
                 for key in keys:
                     if key == "position_ids" and res[key].dim() > 2:
                         output[key] = res[key][:, i:end, :]
-                    elif key in self.VLM_CONCAT_FIELDS:
+                    elif key in VLM_CONCAT_FIELDS:
                         output[key] = torch.cat(res[key][i:end], dim=0)
                     else:
                         output[key] = res[key][i:end]

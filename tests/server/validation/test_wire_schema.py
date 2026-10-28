@@ -12,7 +12,6 @@ from pydantic import TypeAdapter, ValidationError
 from typing import Union, get_args, get_origin
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS, is_encoded
-from twinkle.processor.base import InputProcessor
 from twinkle.protocol.types import data as wire
 
 _INPUTS = TypeAdapter(wire.WireInputBatch)
@@ -202,7 +201,9 @@ def test_vlm_field_set_matches_the_processor():
     A field added to ``VLM_CONCAT_FIELDS`` and not here would be silently absent from
     the wire while the batching code still expects it.
     """
-    assert wire.VLM_TENSOR_FIELDS == frozenset(InputProcessor.VLM_CONCAT_FIELDS)
+    from twinkle.processor.fields import VLM_CONCAT_FIELDS
+
+    assert wire.VLM_TENSOR_FIELDS == frozenset(VLM_CONCAT_FIELDS)
 
 
 if __name__ == '__main__':

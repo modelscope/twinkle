@@ -72,7 +72,7 @@ MediaList = list[str]
 
 # The VLM tensor fields batched by concatenation rather than padding. Declared here
 # because this module must stay free of Twinkle_Core's heavyweight imports; a
-# consistency test asserts this set equals ``InputProcessor.VLM_CONCAT_FIELDS``, so a
+# consistency test asserts this set equals ``processor.fields.VLM_CONCAT_FIELDS``, so a
 # future addition there fails loudly instead of being silently dropped on the wire.
 VLM_TENSOR_FIELDS: frozenset[str] = frozenset({
     'pixel_values',

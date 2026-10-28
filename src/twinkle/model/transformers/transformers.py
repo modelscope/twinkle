@@ -67,6 +67,30 @@ logger = get_logger()
 CHECKPOINT_ADAPTER_NAME = 'default'
 
 
+class _FieldSpecsCache:
+    """Process-local declarations cache; transport always starts with an empty cache."""
+
+    def __init__(self, owners=(), declarations=(), specs=None):
+        self.owners = []
+        for owner in owners:
+            try:
+                self.owners.append(ref(owner))
+            except TypeError:
+                self.owners.append(lambda owner=owner: owner)
+        self.declarations = declarations
+        self.specs = specs
+
+    def matches(self, owners, declarations):
+        return (len(self.owners) == len(owners)
+                and all(previous() is current for previous, current in zip(self.owners, owners))
+                and self.declarations == declarations)
+
+    def __reduce__(self):
+        # Weak references and fallback closures belong to this process. Neither
+        # pickle nor cloudpickle should transport them or stale identity checks.
+        return type(self), ()
+
+
 def _get_vocab_size(config: PretrainedConfig) -> int:
     """Resolve the LM vocabulary size without running a sharded model forward."""
     vocab_size = getattr(config, 'vocab_size', None)
@@ -860,9 +884,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         declarations = ((direct_fields.input_key_specs, direct_fields.output_key_specs)
                         if direct_fields is not None else ((), ()))
         cached = getattr(self, '_field_specs_cache', None)
-        if (cached is not None and all(previous() is current for previous, current in zip(cached[0], owners))
-                and cached[1] == declarations):
-            return cached[2]
+        if cached is not None and cached.matches(owners, declarations):
+            return cached.specs
 
         from twinkle.utils.transformers_utils import get_llm_model
         from .strategy.sequence_parallel.adapters import adapters_for_model
@@ -876,15 +899,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         specs = resolve_key_specs(*models, *adapters, loss_instance, direct_fields)
         if self.sp_strategy is not None:
             self.sp_strategy.register_key_specs(*specs)
-        # Replacing a model/strategy must not leave its parameters alive through
-        # the cache. Non-weakrefable lightweight providers still need identity checks.
-        owner_refs = []
-        for owner in owners:
-            try:
-                owner_refs.append(ref(owner))
-            except TypeError:
-                owner_refs.append(lambda owner=owner: owner)
-        self._field_specs_cache = (tuple(owner_refs), declarations, specs)
+        self._field_specs_cache = _FieldSpecsCache(owners, declarations, specs)
         return specs
 
     def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
@@ -995,7 +1010,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         inputs: Dict[str, Any] = processor(
             inputs,
             input_key_specs=input_key_specs,
-            model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
             gdn_padding_free_enabled=self._gdn_padding_free_enabled,
@@ -1162,7 +1176,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             inputs: Dict[str, Any] = processor(
                 inputs,
                 input_key_specs=input_key_specs,
-                model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
                 gdn_padding_free_enabled=self._gdn_padding_free_enabled,

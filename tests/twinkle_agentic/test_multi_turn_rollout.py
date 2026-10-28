@@ -1481,3 +1481,10 @@ def test_a_stage_reply_that_looks_like_a_tool_call_is_kept_whole(sampler, templa
     assert '<|im_end|>' not in last['content']
     # And it was not dispatched: a dispatch appends a tool message.
     assert [m['role'] for m in out['messages'] if m['role'] == 'tool'] == []
+
+
+def test_vision_feature_keys_follow_processor_field_declarations():
+    from twinkle.processor.fields import VLM_CONCAT_FIELDS
+    from twinkle_agentic.rollout.multi_turn import _vision_feature_keys
+
+    assert _vision_feature_keys() == frozenset(VLM_CONCAT_FIELDS) | {'mm_token_type_ids', 'second_per_grid_ts'}

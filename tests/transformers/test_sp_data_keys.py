@@ -841,14 +841,13 @@ def test_megatron_cp_reconstruction_packed_loss_and_embedding_hook():
     mp.spawn(_megatron_processor_cp_worker, args=(port,), nprocs=2, join=True)
 
 
-def test_processor_filter_preserves_existing_vlm_extension_hook(monkeypatch):
+def test_processor_filter_preserves_all_declared_vlm_fields():
     from twinkle.processor import InputProcessor
+    from twinkle.processor.fields import VLM_CONCAT_FIELDS
 
-    monkeypatch.setattr(InputProcessor, 'VLM_CONCAT_FIELDS',
-                        InputProcessor.VLM_CONCAT_FIELDS | {'custom_media_features'})
     value = torch.ones(1, 3, 4)
-    output = InputProcessor.to_transformers_dict([{'custom_media_features': value}])[0]
-    assert output['custom_media_features'] is value
+    output = InputProcessor.to_transformers_dict([{key: value for key in VLM_CONCAT_FIELDS}])[0]
+    assert all(output[key] is value for key in VLM_CONCAT_FIELDS)
 
 
 def test_model_forward_key_ownership_is_preserved_without_sp():
@@ -857,3 +856,22 @@ def test_model_forward_key_ownership_is_preserved_without_sp():
 
     with pytest.raises(ValueError, match='model forward hook'):
         resolve_key_specs(SimpleNamespace(input_key_specs=(DataKeySpec('input_ids', stage='forward'),)))
+
+
+@pytest.mark.parametrize('serializer_name', ['pickle', 'ray.cloudpickle'])
+def test_field_specs_cache_serialization_rebuilds_without_retaining_owners(serializer_name):
+    from types import SimpleNamespace
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    serializer = pytest.importorskip(serializer_name)
+    wrapper = SimpleNamespace(model=torch.nn.Linear(2, 2),
+                              strategy=SimpleNamespace(unwrap_model=torch.nn.Identity()), sp_strategy=None)
+    loss = None
+    expected = TransformersModel._get_field_specs(wrapper, loss)
+    restored = serializer.loads(serializer.dumps(wrapper))
+    assert restored._field_specs_cache.specs is None
+    actual = TransformersModel._get_field_specs(restored, loss)
+    assert actual == expected
+    assert TransformersModel._get_field_specs(restored, loss) is actual
+    # Serializing leaves the sender's warm cache intact.
+    assert TransformersModel._get_field_specs(wrapper, loss) is expected
