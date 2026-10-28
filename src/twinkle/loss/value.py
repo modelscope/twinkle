@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 from twinkle.loss.grpo import GRPOLoss
-from twinkle.data_fields import DataKeySpec
+from twinkle.data_format.sequence_fields import DataKeySpec
 
 if TYPE_CHECKING:
     import torch

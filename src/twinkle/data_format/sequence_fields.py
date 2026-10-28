@@ -1,10 +1,9 @@
-"""Shared sequence-field schemas consumed by processors, model wrappers and SP."""
+"""Sequence-field declarations shared by data processors and model/loss providers."""
 
 from dataclasses import dataclass
 
 _BOUNDARIES = ("forward", "auxiliary", "model_internal", "router_replay", "output")
 _PROCESSING_BOUNDARIES = ("prepare", "forward", "model_internal", "router_replay")
-_FORWARD_KEYS = ("input_ids", "inputs_embeds", "position_ids", "attention_mask")
 
 
 @dataclass(frozen=True)
@@ -78,92 +77,6 @@ class DataKeySpec:
         return dim
 
 
-BUILTIN_INPUT_KEYS = (
-    DataKeySpec("input_ids", split_dim=1, pad_value="tokenizer", stage="forward", pad_at="forward", split_at="forward"),
-    DataKeySpec("inputs_embeds", split_dim=1, stage="forward", pad_at="forward", split_at="forward"),
-    DataKeySpec("position_ids", pad_value=-1, stage="forward", pad_at="forward", split_at="forward"),
-    DataKeySpec("attention_mask", split_dim=1, stage="forward", pad_at="forward"),
-    DataKeySpec("labels", pad_value=-100, pad_at="prepare", split_at="prepare", gather_at="loss", unpack_packed=True),
-    # Loss-only global fields still need per-sample restoration after packing.
-    DataKeySpec("completion_mask", unpack_packed=True),
-    DataKeySpec("loss_scale", unpack_packed=True),
-)
-
-# Control arguments are preserved without sequence transforms.
-PROCESSOR_PASSTHROUGH_KEYS = ("cache_position", "padding_free")
-
-BUILTIN_OUTPUT_KEYS = (
-    DataKeySpec(
-        "logps", split_dim=1, side="output", stage="output", gather_at="loss", autograd=True, unpack_packed=True
-    ),
-    DataKeySpec(
-        "entropies", split_dim=1, side="output", stage="output", gather_at="loss", autograd=True, unpack_packed=True
-    ),
-    # Real logits are opt-in; fused CE explicitly gathers this hidden-state slot.
-    DataKeySpec("logits", split_dim=1, side="output", stage="output", autograd=True, unpack_packed=True),
-)
-
-
-class InputKeyRegistry:
-    """Collect provider declarations; reject conflicting definitions.
-
-    Auxiliary keys are processed at their declared boundary (usually
-    preprocessing). Custom model-forward keys remain global until the forward
-    hook, so every key is sharded at most once.
-    """
-
-    _SPECIAL_KEYS = frozenset(PROCESSOR_PASSTHROUGH_KEYS)
-
-    def __init__(self):
-        self._specs = {spec.name: spec for spec in BUILTIN_INPUT_KEYS}
-
-    def register(self, spec: DataKeySpec):
-        if not isinstance(spec, DataKeySpec):
-            raise TypeError("Expected a DataKeySpec")
-        if spec.side != "input" or spec.stage not in ("auxiliary", "forward"):
-            raise ValueError("Register only auxiliary or model-forward input keys here")
-        if spec.name in _FORWARD_KEYS:
-            raise ValueError(f"{spec.name!r} is owned by the model forward hook")
-        if spec.name in self._SPECIAL_KEYS:
-            raise ValueError(f"{spec.name!r} is a special processor/model argument, not an SP data key")
-        if not spec.model_input and "forward" in (spec.pad_at, spec.split_at):
-            raise ValueError(
-                f"Loss-only input {spec.name!r} cannot use the forward boundary; "
-                "use prepare, or set model_input=True for a model argument"
-            )
-        existing = self._specs.get(spec.name)
-        if existing is not None and existing != spec:
-            raise ValueError(f"Conflicting SP input rule for {spec.name!r}")
-        self._specs[spec.name] = spec
-
-    def __iter__(self):
-        return iter(self._specs.values())
-
-    def get(self, name):
-        return self._specs.get(name)
-
-
-class OutputKeyRegistry:
-    def __init__(self):
-        self._specs = {spec.name: spec for spec in BUILTIN_OUTPUT_KEYS}
-
-    def register(self, spec):
-        if not isinstance(spec, DataKeySpec):
-            raise TypeError("Expected a DataKeySpec")
-        if spec.side != "output":
-            raise ValueError("Expected an output key rule")
-        existing = self._specs.get(spec.name)
-        if existing is not None and existing != spec:
-            raise ValueError(f"Conflicting SP output rule for {spec.name!r}")
-        self._specs[spec.name] = spec
-
-    def __iter__(self):
-        return iter(self._specs.values())
-
-    def get(self, name):
-        return self._specs.get(name)
-
-
 def declared_key_specs(provider, side):
     """Read common field declarations, retaining legacy loss declaration names."""
     specs = getattr(provider, f"{side}_key_specs", ())
@@ -174,16 +87,6 @@ def declared_key_specs(provider, side):
         if isinstance(entries, DataKeySpec):
             entries = (entries,)
         yield from entries or ()
-
-
-def resolve_key_specs(*providers):
-    """Build a call-local schema independently of any parallel strategy."""
-    inputs, outputs = InputKeyRegistry(), OutputKeyRegistry()
-    for provider in providers:
-        for side, registry in (("input", inputs), ("output", outputs)):
-            for spec in declared_key_specs(provider, side):
-                registry.register(spec)
-    return tuple(inputs), tuple(outputs)
 
 
 def partition_model_inputs(inputs, input_key_specs):

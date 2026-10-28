@@ -7,17 +7,19 @@ class Loss:
     require_logits = False
     require_entropy = False
     require_logps = True
-    # Sequence-aligned outputs this loss needs in full-sequence layout.
-    # Keys must be declared in the model/loss output schema.
+    # Full-sequence outputs required by this loss call; missing keys raise an
+    # error in Transformers SP. output_key_specs defines their layout, while
+    # this selector requests collection for the current objective only.
     sp_gather_keys = ()
-    # A loss may declare additional sequence-aligned input/output contracts.
-    # Keep the core loss API independent of the Transformers backend by
-    # importing DataKeySpec only in concrete loss implementations.
+    # Provider-owned layouts/routing for custom tensors, also consumed by the
+    # processor when SP is disabled. Concrete losses import DataKeySpec from
+    # data_format; the base class does not depend on an SP strategy.
     input_key_specs = ()
     output_key_specs = ()
     # Compatibility for existing loss plugins. New declarations use the common names.
     sp_input_key_specs = ()
     sp_output_key_specs = ()
+    # Request per-token values from the Transformers wrapper (e.g. PPO critic).
     require_values = False
 
     def __call__(self, inputs: InputFeature, outputs: ModelOutput, **kwargs) -> LossOutput:

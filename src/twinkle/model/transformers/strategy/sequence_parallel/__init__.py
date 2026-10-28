@@ -10,8 +10,7 @@ from transformers import PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 from weakref import WeakKeyDictionary, WeakMethod
 
-from twinkle.data_fields import _FORWARD_KEYS, _PROCESSING_BOUNDARIES
-from twinkle.patch import apply_patch
+from twinkle.data_format.sequence_fields import _PROCESSING_BOUNDARIES
 from twinkle.utils import DeviceMesh, get_logger
 from twinkle.utils.transformers_utils import get_llm_model, is_flash_attention_implementation
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
@@ -19,7 +18,7 @@ from .adapters import ModelSPAdapter, adapters_for_model
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
                     post_all2all)
-from .data_keys import DataKeySpec, InputKeyRegistry, OutputKeyRegistry, SPKeyCollection, SPKeyValue
+from .data_keys import _FORWARD_KEYS, DataKeySpec, InputKeyRegistry, OutputKeyRegistry, SPKeyCollection, SPKeyValue
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +68,20 @@ def _current_ctx():
 def _register_module_tree(model: torch.nn.Module, ctx) -> None:
     for module in model.modules():
         _MODULE_TO_CTX[module] = ctx
+
+
+def _call_flash_attention(origin, *args, **kwargs):
+    position_ids = kwargs.get('position_ids')
+    if torch.is_tensor(position_ids):
+        # These are boundary metadata, not the positions used for RoPE. HF may
+        # infer sequence starts from position_ids.min(); SP's -1 padding would
+        # then hide every real sequence. Continue the preceding positions over
+        # padding while retaining all real positions and packed restarts.
+        indices = torch.arange(position_ids.shape[-1], device=position_ids.device)
+        last_valid = torch.where(position_ids != -1, indices, 0).cummax(dim=-1).values
+        continued = position_ids.gather(-1, last_valid).clamp_min(0) + indices - last_valid
+        kwargs['position_ids'] = torch.where(position_ids == -1, continued, position_ids)
+    return origin(*args, **kwargs)
 
 
 def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_position_or_past_key_values, *args,
@@ -314,7 +327,7 @@ class SequenceParallel:
                 backend = getattr(getattr(_sp_module, 'config', None), '_attn_implementation', None)
                 origin = ALL_ATTENTION_FUNCTIONS.get(f'{backend}_origin',
                                                      ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'])
-                return origin(_sp_module, query, key, value, *args, **kwargs)[0]
+                return _call_flash_attention(origin, _sp_module, query, key, value, *args, **kwargs)[0]
 
             dist_attn.local_attn = _attention
 
@@ -395,6 +408,9 @@ class SequenceParallel:
 
             modeling_flash_attention_utils._flash_attention_forward_origin = _flash_attention_forward
 
+            def local_flash_attention_forward(*args, **kwargs):
+                return _call_flash_attention(_flash_attention_forward, *args, **kwargs)
+
             def flash_attention_forward(query_states: torch.Tensor, key_states: torch.Tensor,
                                         value_states: torch.Tensor, attention_mask: Optional[torch.Tensor], q_len,
                                         *args, **kwargs):
@@ -402,7 +418,7 @@ class SequenceParallel:
                 if sp is None or sp.world_size == 1:
                     return _flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len,
                                                     *args, **kwargs)
-                dist_attn = sp._get_dist_attn('flash_attention_utils', _flash_attention_forward)
+                dist_attn = sp._get_dist_attn('flash_attention_utils', local_flash_attention_forward)
                 return dist_attn(query_states, key_states, value_states, attention_mask, q_len * sp.sp_world_size,
                                  *args, **kwargs)
 
@@ -1074,15 +1090,20 @@ class SequenceParallelStrategy:
 
     def register_key_specs(self, input_key_specs, output_key_specs):
         """Consume model-resolved field definitions for SP execution."""
+        from twinkle.processor.fields import COMMON_INPUT_SPECS, COMMON_OUTPUT_SPECS
+
+        input_defaults = {spec.name: spec for spec in COMMON_INPUT_SPECS}
+        output_defaults = {spec.name: spec for spec in COMMON_OUTPUT_SPECS}
         for spec in input_key_specs:
-            if spec.name not in _FORWARD_KEYS:
+            if spec != input_defaults.get(spec.name) and spec.name not in _FORWARD_KEYS:
                 self._ctx.input_key_registry.register(spec)
         for spec in output_key_specs:
-            self._ctx.output_key_registry.register(spec)
+            if spec != output_defaults.get(spec.name):
+                self._ctx.output_key_registry.register(spec)
 
     def register_loss_key_specs(self, loss) -> None:
         """Compatibility entry point; field ownership remains with the provider."""
-        from twinkle.data_fields import declared_key_specs
+        from twinkle.data_format.sequence_fields import declared_key_specs
 
         self.register_key_specs(tuple(declared_key_specs(loss, 'input')),
                                 tuple(declared_key_specs(loss, 'output')))

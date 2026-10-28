@@ -10,6 +10,7 @@ from typing import Dict, List
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
 from twinkle.perf import timed
+from .fields import PADDING_VALUES, VLM_CONCAT_FIELDS, TRANSFORMERS_INPUT_KEYS
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
@@ -29,37 +30,10 @@ class PackedSeqParams:
 
 @remote_class()
 class InputProcessor:
-    padding_map = {
-        "input_ids": 0,
-        "mm_token_type_ids": 0,
-        "inputs_embeds": 0.0,
-        "attention_mask": 0,
-        "labels": -100,
-        "completion_mask": 0,
-        "loss_scale": 0.0,
-        "position_ids": -1,
-        "length": -1,
-        "pixel_values": 0.0,
-        "image_grid_thw": 0,
-        "pixel_values_videos": 0.0,
-        "video_grid_thw": 0,
-        "input_features": 0.0,
-        "feature_attention_mask": 0,
-        "routed_experts": 0,
-        "replay_mask": 0,
-    }
+    padding_map = PADDING_VALUES
 
     # VLM fields to concatenate (not pad) in batch
-    VLM_CONCAT_FIELDS = {
-        "pixel_values",
-        "image_grid_thw",
-        "pixel_values_videos",
-        "video_grid_thw",
-        "input_features",
-        "input_features_mask",
-        "feature_attention_mask",
-        "grid_thws",
-    }
+    VLM_CONCAT_FIELDS = VLM_CONCAT_FIELDS
 
     def __init__(
         self,
@@ -105,9 +79,9 @@ class InputProcessor:
 
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], input_key_specs=None,
                        **kwargs) -> List[InputFeature]:
-        from twinkle.data_fields import BUILTIN_INPUT_KEYS
+        from .fields import COMMON_INPUT_SPECS
 
-        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
+        specs = COMMON_INPUT_SPECS if input_key_specs is None else input_key_specs
         registered_keys = {spec.name for spec in specs}
 
         def to_tensor(_input):
@@ -324,7 +298,7 @@ class InputProcessor:
     def prepare_gdn_padding_free_args(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         if self.framework != "transformers" or not kwargs.get("gdn_padding_free_enabled", False):
             return inputs
-        padding_free = bool(self.padding_free or self._any_packing(inputs))
+        padding_free = bool(self.is_padding_free(inputs))
         if not padding_free or bool(kwargs.get("enable_sp", False)):
             return inputs
 
@@ -449,6 +423,11 @@ class InputProcessor:
                 return True
         return False
 
+    def is_padding_free(self, inputs: InputFeature | list[InputFeature]) -> bool:
+        """Return the effective packed/padding-free layout without applying parallelism."""
+        rows = inputs if isinstance(inputs, list) else [inputs]
+        return bool(self.padding_free or self._any_packing(rows))
+
     @staticmethod
     def _unpack_by_position_ids(
         position_ids: "torch.Tensor",
@@ -529,12 +508,12 @@ class InputProcessor:
 
         from copy import copy
 
-        from twinkle.data_fields import (
-            BUILTIN_INPUT_KEYS, BUILTIN_OUTPUT_KEYS,
+        from .fields import (
+            COMMON_INPUT_SPECS, COMMON_OUTPUT_SPECS,
         )
 
-        input_specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
-        output_specs = BUILTIN_OUTPUT_KEYS if output_key_specs is None else output_key_specs
+        input_specs = COMMON_INPUT_SPECS if input_key_specs is None else input_key_specs
+        output_specs = COMMON_OUTPUT_SPECS if output_key_specs is None else output_key_specs
         input_keys = [spec for spec in input_specs
                       if spec.stage == 'auxiliary' and spec.unpack_packed and inputs.get(spec.name) is not None]
         output_keys = [spec for spec in output_specs
@@ -572,33 +551,12 @@ class InputProcessor:
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], input_key_specs=None, **kwargs) -> List[InputFeature]:
         import torch
-        from twinkle.data_fields import PROCESSOR_PASSTHROUGH_KEYS
 
         registered_keys = [spec.name for spec in input_key_specs] if input_key_specs is not None else []
         results = []
         for _input in inputs:
             output = {}
-            _keys = [
-                'input_ids',
-                'inputs_embeds',
-                'attention_mask',
-                'position_ids',
-                'labels',
-                'completion_mask',
-                'loss_scale',
-                'channel',
-                'cu_seq_lens_q',
-                'cu_seq_lens_k',
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'max_length_q',
-                'max_length_k',
-                'packed_seq_params',
-                'routed_experts',
-                'replay_mask',
-                'mm_token_type_ids',
-                'second_per_grid_ts',
-            ] + list(InputProcessor.VLM_CONCAT_FIELDS) + registered_keys + list(PROCESSOR_PASSTHROUGH_KEYS)
+            _keys = TRANSFORMERS_INPUT_KEYS | set(InputProcessor.VLM_CONCAT_FIELDS) | set(registered_keys)
             for key in list(_input.keys()):
                 if key not in _keys:
                     continue
@@ -683,10 +641,10 @@ class InputProcessor:
 
     def _collate_macro_batch(self, inputs: List[InputFeature], input_key_specs=None) -> InputFeature:
         import torch
-        from twinkle.data_fields import BUILTIN_INPUT_KEYS
+        from .fields import COMMON_INPUT_SPECS
 
-        builtin_names = {spec.name for spec in BUILTIN_INPUT_KEYS}
-        specs = BUILTIN_INPUT_KEYS if input_key_specs is None else input_key_specs
+        builtin_names = {spec.name for spec in COMMON_INPUT_SPECS}
+        specs = COMMON_INPUT_SPECS if input_key_specs is None else input_key_specs
         key_specs = {spec.name: spec for spec in specs
                      if spec.stage == 'auxiliary' or (spec.stage == 'forward' and spec.name not in builtin_names)}
         # Two mutually-exclusive audio contracts share the `input_features` field name and are told
@@ -738,7 +696,7 @@ class InputProcessor:
                 return False
             return position_ids.dim() > 1 and position_ids.shape[0] > 1
 
-        padding_free = self.padding_free or self._any_packing(inputs)
+        padding_free = self.is_padding_free(inputs)
         if padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
@@ -822,7 +780,7 @@ class InputProcessor:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
             return [outputs]
-        padding_free = self.padding_free or self._any_packing(inputs)
+        padding_free = self.is_padding_free(inputs)
         if variable_seq_lengths or padding_free:
             # each micro batch has its own packed length
             assert len(inputs) >= micro_batch_size

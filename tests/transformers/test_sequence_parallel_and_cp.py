@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from datetime import timedelta
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
+from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
 from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
@@ -872,12 +873,22 @@ class TestMultiModelSequenceParallel:
             pytest.skip(f'Requires at least {world_size} {backend["label"]} devices.')
         return backend
 
-    @pytest.mark.parametrize('attn_implementation', ['sdpa', 'flash_attention_2'])
+    @pytest.mark.parametrize('attn_implementation', ['sdpa', 'flash_attention_2', 'flash_attention_3'])
     def test_two_models_interleaved_forward(self, attn_implementation):
         world_size = 2
         backend = self._get_backend_or_skip(world_size)
-        if attn_implementation == 'flash_attention_2' and not is_flash_attn_available():
-            pytest.skip('flash_attention_2 is unavailable.')
+        if attn_implementation == 'flash_attention_2':
+            # CUDA must detect FA2 specifically; another installed FA backend
+            # does not satisfy the model's flash_attention_2 dispatch check.
+            available = (is_flash_attn_2_available() if backend['device_type'] == 'cuda'
+                         else is_flash_attn_available())
+            if not available:
+                pytest.skip('flash_attention_2 is unavailable.')
+        elif attn_implementation == 'flash_attention_3':
+            if backend['device_type'] != 'cuda':
+                pytest.skip('This flash_attention_3 test requires CUDA.')
+            if not is_flash_attn_3_available():
+                pytest.skip('flash_attention_3 is unavailable.')
         port = _find_free_port()
         mp.spawn(_run_multi_model_worker, args=(world_size, port, backend, attn_implementation),
                  nprocs=world_size, join=True)

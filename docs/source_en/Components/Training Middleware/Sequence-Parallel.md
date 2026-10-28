@@ -1,68 +1,95 @@
 # Sequence Parallel (SP)
 
-Sequence Parallel splits long sequences across multiple GPUs along the sequence dimension, enabling training with sequence lengths that exceed single-GPU memory. Twinkle implements Ulysses-style sequence parallel with optional derived ring attention.
-
-## Overview
-
-| Concept | Description |
-|---------|-------------|
-| **SequenceParallelConfig** | Configuration dataclass for SP |
-| **SequenceParallelStrategy** | Strategy class that wraps SP lifecycle |
-| **SequenceParallel** | Core implementation handling pad/split/gather |
+Transformers SP shards token sequences and runs attention through Ulysses and optional Ring communication. Each model owns an independent `SequenceParallel` context. Process-wide wrappers resolve that context at call time.
 
 ## Configuration
 
 ```python
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelConfig
 
-config = SequenceParallelConfig(
-    enabled=True,           # Enable sequence parallel
-    ulysses_size=None,      # Ulysses SP degree (auto-derived from DeviceMesh if None)
-    gather_logits=True,     # Gather logits after forward for loss computation
-)
+config = SequenceParallelConfig(enabled=True, ulysses_size=None)
 ```
 
-## Usage with DeviceMesh
-
-SP is activated by setting `ulysses_size` in `DeviceMesh.from_sizes()`:
+A `None` degree is derived from DeviceMesh. The old `gather_logits` option has been removed: output rules and the current loss determine collection.
 
 ```python
 from twinkle.utils import DeviceMesh
 
-# 8 GPUs: 4-way Ulysses SP × 2-way data parallel
-device_mesh = DeviceMesh.from_sizes(
-    world_size=8,
-    dp_size=2,
-    ulysses_size=4,
+# Eight devices forming two SP=4 groups.
+mesh = DeviceMesh.from_sizes(dp_size=8, fsdp_size=1, ulysses_size=4)
+```
+
+## Processing responsibilities
+
+1. Processor converts tensors, collates samples, applies ordinary padding and exposes `is_padding_free()` as a layout query. It neither receives nor calls an SP strategy.
+2. The model wrapper partitions model inputs and loss inputs. The strategy shards labels and explicitly local auxiliary fields at the prepare boundary.
+3. Forward hooks pad/split model token inputs at their declared boundaries. Attention masks retain global layout, including padding masks for single-sample SDPA batches.
+4. Attention wrappers perform communication and invoke the configured backend.
+5. Model-side `postprocess_task_outputs()` handles task semantics: embedding pooling/normalization, classification/reranker pooling, or token-loss SP collection.
+6. Processor's `unpack_packed_sequences()` restores already collected sequences to per-sample layouts before loss calculation.
+
+Model postprocessing interprets task outputs and performs SP collectives; processor postprocessing restores layouts.
+
+## Field ownership
+
+- `data_format/sequence_fields.py` defines `DataKeySpec` and provider contracts, without a global list of all fields.
+- `processor/fields.py` owns supported encoded text/media/replay/control inputs and collation/restoration rules. Templates encode raw media first. Internal `length` metadata is not a forward argument.
+- `model/transformers/strategy/sequence_parallel/data_keys.py` owns SP execution defaults and batch-local collections. Media pixels and control arguments are not blindly sharded as tokens.
+- Model adapters and losses declare their own extensions.
+
+Processor defaults do not schedule SP operations. Custom loss fields remain available with SP disabled.
+
+```python
+from twinkle.data_format.sequence_fields import DataKeySpec
+
+# Global loss input, restored per sample after packing.
+input_key_specs = (DataKeySpec('token_targets', pad_value=-100),)
+
+# Explicitly scheduled model-forward input.
+model_input_key_specs = (
+    DataKeySpec('token_features', split_dim=1, stage='forward',
+                pad_at='forward', split_at='forward'),
 )
 ```
 
-## How It Works
+`pad_at/split_at` accept `prepare`, `forward`, `model_internal`, `router_replay`, or `None`. `need_pad/need_split` are derived properties. `stage` classifies fields (including `auxiliary` and `output`), rather than naming the execution boundary.
 
-1. **Pad** — input sequences are padded to a length divisible by SP world size
-2. **Split** — padded inputs are evenly split across SP ranks along the sequence dimension
-3. **Distributed Attention** — FlashAttention2 is patched to perform Ulysses all-to-all communication before/after attention computation
-4. **Gather** — after forward, logits are gathered back to full sequence length for loss computation
+## Loss declarations
 
-## Supported Attention Backends
+CE uses the default collected `logps`. Other objectives may need values or custom sequence outputs; SP cannot infer their requirements from arbitrary Python code.
 
-| Backend | Status |
-|---------|--------|
-| FlashAttention2 | Fully supported (including packed/padding-free sequences) |
-| SDPA | Supported (non-packed batches only) |
-| Derived Ring Attention | Supported with FlashAttention2 only (`rp_world_size > 1`) |
+- `input_key_specs/output_key_specs` describe layout, routing and optional parallel operations. Processor consumes layouts even without SP.
+- `sp_gather_keys` lists full-sequence outputs required by the current loss call. Missing required outputs raise an error. A field's `gather_at='loss'` instead requests default collection when that output is present.
+- `require_values` requests per-token `values` from the Transformers wrapper; PPOValueLoss then collects them.
+- Earlier `sp_input_key_specs/sp_output_key_specs` names are still read for compatibility. New code uses the common names.
 
-## Qwen3.5 Linear Attention
+PPOValueLoss declares:
 
-SP automatically detects Qwen3.5 GatedDeltaNet linear attention layers and applies the `Qwen3_5GatedDeltaNetUlyssesPatch` for correct sequence-parallel behavior on hybrid attention architectures.
+```python
+require_logps = False
+require_values = True
+sp_gather_keys = ('values',)
+output_key_specs = (
+    DataKeySpec('values', split_dim=1, side='output', stage='output', autograd=True),
+)
+```
 
-## MoE Auxiliary Loss
+Schema defines tensor handling; required-output declarations specify this call's needs. Full vocabulary logits are not gathered unconditionally. Fused CE handles its hidden-state slot separately. Global completion masks, loss weights and default custom targets do not incur an unnecessary split/gather cycle.
 
-For MoE models, SP automatically installs a forward hook that gathers router logits across SP ranks before auxiliary loss computation, ensuring correct load-balancing signals.
+## Attention backends
 
-## Key Constraints
+| Backend | Implementation scope |
+|---|---|
+| FlashAttention2 / FlashAttention3 | Shared SP wrapper and packed/varlen preparation; concrete kernels follow model configuration and require their own dependencies/device capabilities |
+| SDPA | Ordinary non-packed batches; padding-free/packed inputs are rejected |
+| Derived Ring | FA2/FA3 dispatch is implemented and requires batch_size=1; the FA3 path rejects dropout and ALiBi |
 
-- `num_key_value_heads` must be divisible by `ulysses_size` (for Ulysses) or use ring attention fallback
-- Packed/padding-free batches require FlashAttention2
-- Derived ring attention requires `batch_size == 1` (packed format)
-- `torch.distributed` must be initialized
+Implementation support does not establish runtime acceptance on every device. Record FA3 validation separately from FA2.
+
+## Model adapters and Megatron
+
+Adapters configure Qwen3-VL DeepStack/mRoPE, Qwen3.5 GatedDeltaNet and MoE router auxiliary loss using the owning model's context.
+
+This page describes Transformers SP. Megatron has its own CP/TP-SP path: `MegatronEmbeddingPatch` handles embeddings, Megatron forward_step handles classification/reranking, and `postprocess_tensor_cp()` reconstructs CP shards. Both paths share processor collation and packed restoration. Shared-path regression does not replace full Megatron training validation.
+
+Initialize `torch.distributed` before distributed execution. Attention-head count and the configured SP degree determine the Ulysses/Ring topology.

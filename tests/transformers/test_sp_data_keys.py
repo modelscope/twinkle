@@ -3,7 +3,8 @@ import pytest
 import torch
 
 from twinkle.model.transformers.strategy.sequence_parallel import DataKeySpec, SequenceParallelStrategy
-from twinkle.data_fields import partition_model_inputs, resolve_key_specs
+from twinkle.data_format.sequence_fields import partition_model_inputs
+from twinkle.processor.fields import resolve_key_specs
 from twinkle.model.transformers.strategy.sequence_parallel.data_keys import SPKeyCollection, SPKeyValue
 
 
@@ -596,3 +597,154 @@ def test_single_sample_sdpa_builds_a_padded_global_attention_mask(rank, explicit
     ctx.pad_and_split_inputs(keys, boundary='forward', real_position_ids=positions)
     torch.testing.assert_close(keys.get_value('attention_mask'), torch.tensor([[1, 1, 1, 1, 1, 0]]))
     assert keys.get_value('input_ids').shape == (1, 3)
+
+
+@pytest.mark.parametrize('configured,packed', [(False, False), (True, False), (False, True)])
+def test_processor_public_layout_query(configured, packed):
+    from twinkle.processor import InputProcessor
+
+    positions = torch.tensor([[0, 1, 0, 1]]) if packed else torch.arange(4).unsqueeze(0)
+    batch = {'position_ids': positions}
+    processor = InputProcessor(padding_free=configured)
+    assert processor.is_padding_free(batch) is (configured or packed)
+    assert processor.is_padding_free([batch]) is (configured or packed)
+    assert batch['position_ids'] is positions
+
+
+def test_processor_supported_fields_include_multimodal_replay_and_control_inputs():
+    from twinkle.processor import InputProcessor
+    from twinkle.processor.fields import TRANSFORMERS_INPUT_KEYS, LAYOUT_ONLY_KEYS
+
+    required = {'pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw',
+                'input_features', 'input_features_mask', 'feature_attention_mask', 'grid_thws',
+                'routed_experts', 'replay_mask', 'mm_token_type_ids', 'second_per_grid_ts',
+                'cu_seq_lens_q', 'cu_seq_lens_k', 'cu_seqlens_q', 'cu_seqlens_kv',
+                'cache_position', 'padding_free', 'packed_seq_params'}
+    assert required <= TRANSFORMERS_INPUT_KEYS
+    assert set(InputProcessor.padding_map) <= TRANSFORMERS_INPUT_KEYS | set(LAYOUT_ONLY_KEYS)
+    value = torch.ones(1, 2)
+    sample = {key: value for key in required}
+    sample.update(length=2, unregistered=value)
+    output = InputProcessor.to_transformers_dict([sample])[0]
+    assert set(output) == required
+    assert all(output[key] is value for key in required)
+
+
+def test_processor_defaults_do_not_schedule_parallel_operations():
+    from twinkle.processor.fields import resolve_key_specs
+
+    inputs, outputs = resolve_key_specs()
+    assert all(spec.pad_at is None and spec.split_at is None and spec.gather_at is None
+               for spec in (*inputs, *outputs))
+    strategy = _strategy()
+    strategy.register_key_specs(inputs, outputs)
+    labels = strategy._ctx.input_key_registry.get('labels')
+    assert labels.pad_at == labels.split_at == 'prepare'
+    assert labels.gather_at == 'loss'
+    assert strategy._ctx.output_key_registry.get('logps').gather_at == 'loss'
+
+
+def test_direct_builtin_output_declaration_keeps_model_schema_and_sp_registry_consistent():
+    from twinkle.processor.fields import resolve_key_specs
+
+    strategy = _strategy()
+    logits = strategy._ctx.output_key_registry.get('logits')
+    strategy.register_output_key(logits)
+    inputs, outputs = resolve_key_specs(strategy.field_declarations)
+    assert next(spec for spec in outputs if spec.name == 'logits') == logits
+    strategy.register_key_specs(inputs, outputs)
+
+
+def _megatron_processor_cp_worker(rank, port):
+    import os
+    from datetime import timedelta
+    from types import SimpleNamespace
+    import torch.distributed as dist
+    from megatron.core import parallel_state as mpu
+    from twinkle.processor import InputProcessor
+    from twinkle.loss import CrossEntropyLoss
+    from twinkle.patch.megatron_emb import _output_embedding_hook
+
+    os.environ['RANK'], os.environ['WORLD_SIZE'] = str(rank), '2'
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank,
+                            world_size=2, timeout=timedelta(seconds=120))
+    original = mpu.get_context_parallel_group
+    # Only resolve the CP group here; pad/split/gather and unpack are real code.
+    mpu.get_context_parallel_group = lambda: dist.group.WORLD
+    try:
+        mesh = SimpleNamespace(cp_world_size=2, cp_rank=rank, tp_world_size=1, sequence_parallel=False)
+        processor = InputProcessor(device_mesh=mesh, framework='megatron', padding_free=True)
+        processor.device_mesh = mesh
+        rows = [dict(input_ids=torch.arange(1, length + 1).unsqueeze(0),
+                     position_ids=torch.arange(length).unsqueeze(0),
+                     labels=torch.arange(1, length + 1).unsqueeze(0),
+                     loss_scale=torch.ones(1, length), completion_mask=torch.ones(1, length, dtype=torch.long))
+                for length in (3, 5)]
+        padded = processor.pad_cp(rows)
+        full = processor.collate_fn(padded)[0]
+        full = processor.add_extra_padding_free_args([full])[0]
+        cu = full['packed_seq_params'].cu_seqlens_q
+        torch.testing.assert_close(cu, torch.tensor([0, 4, 12], dtype=cu.dtype))
+        local = processor.split_cp([dict(full)])[0]
+        reconstructed = dict(local)
+        for key in ('labels', 'position_ids', 'loss_scale', 'completion_mask'):
+            reconstructed[key] = processor.postprocess_tensor_cp(local[key], cu_seqlens=cu)
+            torch.testing.assert_close(reconstructed[key], full[key])
+        # Match Megatron.forward_step_func: CP reconstruction followed by unpack.
+        full_logps = -full['labels'].clamp_min(0).float() / 10
+        local_logps = -local['labels'].clamp_min(0).float() / 10
+        gathered_logps = processor.postprocess_tensor_cp(local_logps, cu_seqlens=cu)
+        expected_inputs, expected_outputs = processor.unpack_packed_sequences(full, {'logps': full_logps})
+        actual_inputs, actual_outputs = processor.unpack_packed_sequences(reconstructed, {'logps': gathered_logps})
+        for key in ('labels', 'completion_mask', 'loss_scale'):
+            torch.testing.assert_close(actual_inputs[key], expected_inputs[key])
+        torch.testing.assert_close(actual_inputs['labels'],
+                                   torch.tensor([[1, 2, 3, -100, -100, -100, -100, -100],
+                                                 [1, 2, 3, 4, 5, -100, -100, -100]]))
+        loss = CrossEntropyLoss(reduction='sum')
+        torch.testing.assert_close(loss(actual_inputs, actual_outputs)['loss'],
+                                   loss(expected_inputs, expected_outputs)['loss'])
+        # Megatron's embedding hook remains independent of Transformers pooling.
+        full_features = torch.arange(24, dtype=torch.float32).reshape(1, 12, 2) + 1
+        chunks = []
+        for start, end in ((0, 4), (4, 12)):
+            pieces = full_features[:, start:end].chunk(4, dim=1)
+            chunks.extend((pieces[rank], pieces[3 - rank]))
+        local_features = torch.cat(chunks, dim=1)
+        pooled = _output_embedding_hook(SimpleNamespace(cp_group=dist.group.WORLD), (),
+                                        {'packed_seq_params': full['packed_seq_params']}, local_features)
+        expected = torch.nn.functional.normalize(full_features[0, torch.tensor([3, 11])], p=2, dim=1)
+        torch.testing.assert_close(pooled, expected)
+    finally:
+        mpu.get_context_parallel_group = original
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+def test_megatron_cp_reconstruction_packed_loss_and_embedding_hook():
+    import socket
+    import torch.multiprocessing as mp
+
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_megatron_processor_cp_worker, args=(port,), nprocs=2, join=True)
+
+
+def test_processor_filter_preserves_existing_vlm_extension_hook(monkeypatch):
+    from twinkle.processor import InputProcessor
+
+    monkeypatch.setattr(InputProcessor, 'VLM_CONCAT_FIELDS',
+                        InputProcessor.VLM_CONCAT_FIELDS | {'custom_media_features'})
+    value = torch.ones(1, 3, 4)
+    output = InputProcessor.to_transformers_dict([{'custom_media_features': value}])[0]
+    assert output['custom_media_features'] is value
+
+
+def test_model_forward_key_ownership_is_preserved_without_sp():
+    from types import SimpleNamespace
+    from twinkle.processor.fields import resolve_key_specs
+
+    with pytest.raises(ValueError, match='model forward hook'):
+        resolve_key_specs(SimpleNamespace(input_key_specs=(DataKeySpec('input_ids', stage='forward'),)))

@@ -9,6 +9,54 @@ import twinkle.model.transformers.strategy.sequence_parallel as sp
 from twinkle.model.transformers.strategy.sequence_parallel import linear_attention_sp
 
 
+@pytest.mark.parametrize('positions, expected', [
+    ([[0, 1, 2, -1]], [[0, 1, 2, 3]]),
+    ([[0, 1, -1, -1]], [[0, 1, 2, 3]]),
+    ([[0, 1, -1, 0, 1, -1]], [[0, 1, 2, 0, 1, 2]]),
+    ([[5, 6, -1, 5, 6, -1]], [[5, 6, 7, 5, 6, 7]]),
+    ([[0, 1, -1], [0, 1, 2]], [[0, 1, 2], [0, 1, 2]]),
+    ([[-1, -1, -1]], [[0, 1, 2]]),
+])
+def test_flash_boundary_positions_preserve_real_tokens_and_packed_starts(positions, expected):
+    positions = torch.tensor(positions)
+    original = positions.clone()
+    received = sp._call_flash_attention(lambda **kwargs: kwargs['position_ids'], position_ids=positions)
+    torch.testing.assert_close(received, torch.tensor(expected))
+    torch.testing.assert_close(positions, original)
+    # Mirrors Transformers 5.15's minimum-based boundary detection.
+    for actual_row, expected_row in zip(received, torch.tensor(expected)):
+        actual_starts = (actual_row == actual_row.min()).nonzero().flatten()
+        expected_starts = (expected_row == expected_row.min()).nonzero().flatten()
+        torch.testing.assert_close(actual_starts, expected_starts)
+        assert actual_starts[0].item() == 0
+
+
+@pytest.mark.parametrize('backend', ['flash_attention_2', 'flash_attention_3'])
+def test_flash_origin_receives_valid_boundary_metadata(monkeypatch, backend):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    positions = torch.tensor([[0, 1, 2, -1]])
+
+    def origin(module, query, key, value, *args, **kwargs):
+        torch.testing.assert_close(kwargs['position_ids'], torch.tensor([[0, 1, 2, 3]]))
+        assert kwargs['is_causal'] is True
+        return query.transpose(1, 2), None
+
+    # Global wrapper installation keeps this compatibility alias even when
+    # the selected backend is FA3 and no FA2 kernel is installed.
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, 'flash_attention_2_origin', origin)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, f'{backend}_origin', origin)
+    ctx = sp.SequenceParallel()
+    ctx.world_size = ctx.sp_world_size = ctx.rp_world_size = 1
+    module = torch.nn.Linear(2, 2)
+    module.config = SimpleNamespace(_attn_implementation=backend)
+    query = torch.randn(1, 2, 4, 2)
+    actual, _ = ctx._local_flash_attn_impl(
+        module, query, query, query, None, position_ids=positions, is_causal=True)
+    torch.testing.assert_close(actual, query.transpose(1, 2))
+    torch.testing.assert_close(positions, torch.tensor([[0, 1, 2, -1]]))
+
+
 @pytest.mark.parametrize('backend', ['sdpa', 'flash_attention_2'])
 def test_attention_cache_routes_current_module_and_releases_owners(monkeypatch, backend):
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS

@@ -56,7 +56,8 @@ from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
-from twinkle.data_fields import partition_model_inputs, resolve_key_specs
+from twinkle.data_format.sequence_fields import partition_model_inputs
+from twinkle.processor.fields import resolve_key_specs
 
 from .task_outputs import postprocess_task_outputs
 
@@ -837,7 +838,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if self.sp_strategy is None:
             return inputs
         payload = dict(inputs)
-        payload['padding_free'] = bool(processor.padding_free or processor._any_packing([inputs]))
+        payload['padding_free'] = processor.is_padding_free(inputs)
         # Sentence-level labels describe whole sequences rather than tokens.
         sentence_task = task in ('seq_cls', 'reranker', 'embedding', 'generative_reranker')
         sequence_labels = payload.pop('labels', None) if sentence_task else None
@@ -986,8 +987,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 sampling_masks=sampling_masks,
                 temperature=temperature,
                 vocab_size=_get_vocab_size(self.hf_config),
-                allow_packed_masks=(processor.padding_free
-                                    or processor._is_packed_position_ids(inputs.get('position_ids'))),
+                allow_packed_masks=processor.is_padding_free(inputs),
             )
         optimizer_config.accumulate_metrics(True)
 
@@ -1149,13 +1149,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             labels = loss_inputs.get('labels')
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
-                packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
                 replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
                     labels=labels,
                     sampling_masks=sampling_masks,
                     temperature=temperature,
                     vocab_size=_get_vocab_size(self.hf_config),
-                    allow_packed_masks=processor.padding_free or packed_position_ids,
+                    allow_packed_masks=processor.is_padding_free(inputs),
                 )
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
