@@ -870,7 +870,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 del logits
         if getattr(loss_instance, 'require_values', False):
             values = outputs['logits']
-            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
+            outputs['values'] = values.squeeze(-1) if values.dim() == 3 and values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -878,8 +878,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
                                   forward_kwargs, loss_instance, return_logits, recorded_routing):
         """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+        inputs, outputs = processor.postprocess_outputs(
+            inputs, outputs, task=task,
+            gather_fn=self.sp_strategy.gather_loss_tensors if self.sp_strategy is not None else None,
+            reduce_fn=self.sp_strategy.all_reduce if self.sp_strategy is not None else None)
         status = optimizer_config.train_status if is_training else optimizer_config.eval_status
         status.inputs = inputs
         status.outputs = outputs

@@ -852,12 +852,72 @@ def _slim_cpu_worker(rank, port, checkpoint):
         again, _ = baseline(base_p, inputs_p)
         torch.testing.assert_close(again, baseline_p, rtol=0, atol=0)
 
+        processor = InputProcessor()
+        # No logps and no labels: critic-style outputs must still gather with autograd.
+        projection = torch.nn.Linear(3, 1, bias=False)
+        full = torch.randn(1, 7, 3)
+        original = projection(full)
+        expected_loss = original.square().mean()
+        expected_loss.backward()
+        expected_grad = projection.weight.grad.clone()
+        projection.zero_grad()
+        prepared = policy_sp.prepare_model_inputs({'input_ids': inputs_p})
+        indices = prepared['_sequence_layout']['indices']
+        padded = F.pad(full, (0, 0, 0, 1))
+        local = padded.gather(1, indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, 3))
+        _, gathered = policy_sp.gather_loss_tensors(prepared, {'values': projection(local)})
+        torch.testing.assert_close(gathered['values'], original, rtol=1e-6, atol=1e-7)
+        gathered['values'].square().mean().backward()
+        dist.all_reduce(projection.weight.grad)
+        projection.weight.grad.div_(2)
+        torch.testing.assert_close(projection.weight.grad, expected_grad, rtol=1e-6, atol=1e-7)
+
+        # Both Ulysses and zigzag Ring layouts; pure communication, no Flash kernel substitution.
+        for ring in (False, True):
+            strategy = SequenceParallelStrategy(mesh, {'ulysses_size': 2})
+            ctx = strategy._ctx
+            ctx.seq_world_size = ctx.world_size = 2
+            ctx.sp_world_size, ctx.rp_world_size = (1, 2) if ring else (2, 1)
+            ctx._init_device_mesh(mesh)
+            ctx.tokenizer = SimpleNamespace(pad_token_id=0)
+            ctx.attn_implementation = 'flash_attention_2'  # packed layout, not an attention-kernel test
+            for positions in (torch.tensor([[-1, 0, 1, -1, 3, 4, -1]]),
+                              torch.tensor([[0, 1, 0, 1, 2, 0, 1]])):
+                if ring and positions[0, 0] < 0:
+                    with pytest.raises(NotImplementedError, match='left padding'):
+                        strategy.prepare_model_inputs({'input_ids': inputs_p, 'position_ids': positions})
+                    continue
+                inputs = {'input_ids': inputs_p, 'position_ids': positions,
+                          'labels': torch.arange(7).unsqueeze(0),
+                          'completion_mask': torch.tensor([[0, 1, 0, 1, 1, 1, 1]]),
+                          'loss_scale': torch.linspace(0., 1., 7).unsqueeze(0)}
+                expected_input = {'position_ids': positions}
+                full = torch.randn(1, 7, 3)
+                projection = torch.nn.Linear(3, 2, bias=False)
+                expected, _ = processor._pool_last_valid_token(projection(full), expected_input)
+                expected.square().sum().backward()
+                expected_grad = projection.weight.grad.clone()
+                projection.zero_grad()
+                prepared = strategy.prepare_model_inputs(inputs)
+                padded = ctx.pad(full, padding_value=0., position_ids=positions)
+                padded_positions = ctx.pad(positions, padding_value=-1, position_ids=positions)
+                local = ctx.split(padded, dim=1, position_ids=padded_positions)
+                pooled, _ = processor._pool_last_valid_token(projection(local), prepared,
+                                                              reduce_fn=strategy.all_reduce)
+                torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-7)
+                restored, _ = strategy.gather_loss_tensors(prepared, {})
+                for name in ('labels', 'completion_mask', 'loss_scale'):
+                    torch.testing.assert_close(restored[name], inputs[name])
+                pooled.square().sum().backward()
+                dist.all_reduce(projection.weight.grad)
+                projection.weight.grad.div_(2)
+                torch.testing.assert_close(projection.weight.grad, expected_grad, rtol=1e-5, atol=1e-6)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize('checkpoint', [None, False, True])
-def test_slim_sp_cpu_interleaved_gradients_and_recompute(checkpoint):
+def test_slim_sp_cpu_logits_gradients_values_pooling_and_recompute(checkpoint):
     mp.spawn(_slim_cpu_worker, args=(_find_free_port(), checkpoint), nprocs=2, join=True)
 
 
@@ -943,6 +1003,13 @@ def test_sp_rejects_unsupported_backend_before_building_groups(backend):
         SequenceParallel().prepare(2, model, SimpleNamespace(pad_token_id=0))
 
 
+def test_single_local_token_value_keeps_its_sequence_axis():
+    from twinkle.model.transformers.transformers import TransformersModel
+    outputs = {'logits': torch.ones(2, 1)}
+    TransformersModel._postprocess_forward_outputs(
+        None, outputs, labels=None, task='value', temperature=1., sampling_masks=None,
+        return_logits=False, loss_instance=SimpleNamespace(require_values=True))
+    assert outputs['values'].shape == (2, 1)
 
 
 def test_sentence_loss_metadata_stays_global_while_model_tokens_split():

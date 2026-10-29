@@ -459,7 +459,7 @@ if __name__ == '__main__':
     pytest.main([__file__])
 
 
-def _qwen35_cpu_worker(rank, port, layer_types):
+def _qwen35_cpu_worker(rank, port, layer_types, padded=False):
     from types import SimpleNamespace
     from torch.utils.checkpoint import DefaultDeviceType
     DefaultDeviceType.set_device_type('cpu')
@@ -481,15 +481,22 @@ def _qwen35_cpu_worker(rank, port, layer_types):
         strategy._tokenizer = SimpleNamespace(pad_token_id=0)
         strategy.initialize()
         ids = torch.tensor([[1, 3, 5, 7, 9, 11, 13]])
-        expected = baseline(input_ids=ids, use_cache=False).logits
-        inputs = strategy.prepare_model_inputs({'input_ids': ids})
+        if padded:
+            # The HF recurrent mask takes the tail on both ranks. Rank zero
+            # needs the prefix instead, including all four valid short tokens.
+            ids = torch.cat((ids, torch.tensor([[2, 4, 6, 8, 0, 0, 0]])))
+        mask = ids.ne(0).long()
+        expected = baseline(input_ids=ids, attention_mask=mask, use_cache=False).logits
+        inputs = strategy.prepare_model_inputs({'input_ids': ids, 'attention_mask': mask})
         inputs.pop('_sequence_layout')
         with strategy.context():
             output = model(**inputs, use_cache=False)
         _, gathered = strategy.gather_loss_tensors({}, output)
-        torch.testing.assert_close(gathered.logits, expected, rtol=3e-4, atol=3e-6)
-        expected.square().mean().backward()
-        gathered.logits.square().mean().backward()
+        # Padding outputs are not supervised; compare every valid token and
+        # backpropagate the same full-sequence objective on both paths.
+        torch.testing.assert_close(gathered.logits[mask.bool()], expected[mask.bool()], rtol=3e-4, atol=3e-6)
+        expected[mask.bool()].square().mean().backward()
+        gathered.logits[mask.bool()].square().mean().backward()
         for (name, parameter), (_, original) in zip(model.named_parameters(), baseline.named_parameters()):
             if original.grad is None:
                 assert parameter.grad is None
@@ -504,5 +511,6 @@ def _qwen35_cpu_worker(rank, port, layer_types):
 
 @pytest.mark.skipif(not _HAS_QWEN35, reason='transformers Qwen3.5 is unavailable')
 @pytest.mark.parametrize('layer_types', [('linear_attention',), ('full_attention',), ('linear_attention', 'full_attention')])
-def test_qwen35_cpu_torch_fallback_sp_and_checkpoint_match_baseline(layer_types):
-    mp.spawn(_qwen35_cpu_worker, args=(_find_free_port(), layer_types), nprocs=2, join=True)
+@pytest.mark.parametrize('padded', [False, True])
+def test_qwen35_cpu_torch_fallback_sp_and_checkpoint_match_baseline(layer_types, padded):
+    mp.spawn(_qwen35_cpu_worker, args=(_find_free_port(), layer_types, padded), nprocs=2, join=True)

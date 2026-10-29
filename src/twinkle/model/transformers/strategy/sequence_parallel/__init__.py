@@ -1189,7 +1189,7 @@ class SequenceParallelStrategy:
             return inputs, outputs
         inputs, outputs = copy(inputs), copy(outputs)
         positions = self._ctx.real_position_ids
-        for name in ('logps', 'entropies', 'logits'):
+        for name in ('logps', 'entropies', 'values', 'logits'):
             value = outputs.get(name)
             if value is None:
                 continue
@@ -1206,36 +1206,13 @@ class SequenceParallelStrategy:
         inputs['position_ids'] = positions
         return inputs, outputs
 
-
-    @property
-    def world_size(self):
-        return self._ctx.world_size or 1
-
-    @property
-    def sp_world_size(self):
-        return self._ctx.sp_world_size or 1
-
-    @property
-    def rp_world_size(self):
-        return self._ctx.rp_world_size or 1
-
-    @property
-    def _sp_group(self):
-        return self._ctx._sp_group
-
-    @property
-    def _rp_group(self):
-        return self._ctx._rp_group
-
-    @property
-    def real_position_ids(self):
-        return self._ctx.real_position_ids
-
-    def pad(self, tensor, *args, **kwargs):
-        return self._ctx.pad(tensor, *args, **kwargs)
-
-    def split(self, tensor, *args, **kwargs):
-        return self._ctx.split(tensor, *args, **kwargs)
+    def all_reduce(self, tensor, op=dist.ReduceOp.SUM):
+        from torch.distributed.nn.functional import all_reduce
+        for group, size in ((self._ctx._sp_group, self._ctx.sp_world_size),
+                            (self._ctx._rp_group, self._ctx.rp_world_size)):
+            if size and size > 1:
+                tensor = all_reduce(tensor, op=op, group=group)
+        return tensor
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()

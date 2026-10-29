@@ -206,3 +206,14 @@ class TestGRPOMode:
         out = proc.collate_fn(batch)
         assert out[0]['input_ids'].shape == (1, 6)
         assert out[0]['labels'].shape == (1, 6)
+
+
+def test_prepooled_score_head_keeps_local_path_but_rejects_sequence_shards():
+    import pytest
+    processor = InputProcessor()
+    outputs = {'logits': torch.ones(2, 3)}
+    inputs, actual = processor.postprocess_outputs({}, outputs, task='seq_cls')
+    assert actual['logits'] is outputs['logits']
+    with pytest.raises(NotImplementedError, match='per-token score head'):
+        processor.postprocess_outputs({'_sequence_layout': {}}, outputs, task='seq_cls',
+                                      reduce_fn=lambda value, op: value)
