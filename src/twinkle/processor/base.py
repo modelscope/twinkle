@@ -84,7 +84,6 @@ class InputProcessor:
             self.prepare_gdn_padding_free_args,
             self.drop_causal_4d_mask,
             self.split_cp,
-            self.apply_transformers_sp,
             self.prepare_outputs,
         ]
 
@@ -147,6 +146,10 @@ class InputProcessor:
             return _input
 
         return [to_tensor(_input) for _input in inputs]
+
+    @staticmethod
+    def token_level_labels(task):
+        return task not in ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
 
     def apply_transformers_sp(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         sp_strategy = kwargs.get("sp_strategy")

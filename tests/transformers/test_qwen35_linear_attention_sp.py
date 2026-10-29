@@ -12,7 +12,7 @@ from transformers.utils.import_utils import is_flash_linear_attention_available
 from types import MethodType, SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
-from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.model.transformers.strategy.sequence_parallel.linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
 from twinkle.utils import DeviceMesh, selective_log_softmax
 
@@ -41,8 +41,7 @@ else:
     _FLA_CAUSAL_CONV1D_FN = None
     _FLA_CHUNK_GATED_DELTA_RULE = None
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy Qwen3.5 SP linear-attention test (FLA + multi-GPU); not viable on dual-V100 CI, run manually.')
+
 
 WORLD_SIZE = 2
 LOGITS_RTOL = 5e-3
@@ -277,6 +276,7 @@ def _compute_training_path_loss(
     loss_inputs = {'labels': labels}
     loss_outputs = {'logps': selective_log_softmax(logits, masked_labels)}
     if strategy is not None:
+        loss_inputs['_sequence_layout'] = {'sharded': ('labels',)}
         loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
     result = CrossEntropyLoss(reduction='sum')(loss_inputs, loss_outputs)
     num_tokens = result['num_tokens']
@@ -337,20 +337,20 @@ def _run_prefill_alignment_worker(rank: int,
         baseline_qkv_grad = _get_qkv_weight(baseline_model).grad.detach().float().cpu() / max(baseline_num_tokens, 1)
 
         strategy = _make_strategy(sp_model, world_size)
-        processed_inputs = strategy.preprocess_inputs({
+        processed_inputs = strategy.prepare_model_inputs({
             'input_ids': input_ids,
             'position_ids': position_ids,
             'labels': labels,
             'padding_free': packed,
+            'attention_mask': attention_mask,
         })
         local_labels = processed_inputs['labels']
-        sp_outputs = sp_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-        )
-        gathered_outputs = strategy.postprocess_outputs(copy.copy(sp_outputs))
+        model_inputs = dict(processed_inputs)
+        model_inputs.pop('labels', None)
+        model_inputs.pop('_sequence_layout', None)
+        with strategy.context():
+            sp_outputs = sp_model(**model_inputs, use_cache=False)
+        _, gathered_outputs = strategy.gather_loss_tensors({}, copy.copy(sp_outputs))
         gathered_logits = gathered_outputs.logits.float()
         if not torch.allclose(gathered_logits, baseline_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
             max_diff = (gathered_logits - baseline_logits).abs().max().item()
@@ -367,7 +367,7 @@ def _run_prefill_alignment_worker(rank: int,
         if sp_num_tokens != baseline_num_tokens:
             raise AssertionError(
                 f'prefill num_tokens mismatch on rank {rank}: baseline={baseline_num_tokens} sp={sp_num_tokens}')
-        sp_qkv_grad = _average_qkv_grad_over_group(sp_model, sequence_parallel._data_rank_group) / max(sp_num_tokens, 1)
+        sp_qkv_grad = _average_qkv_grad_over_group(sp_model, strategy._ctx._data_rank_group) / max(sp_num_tokens, 1)
         if not torch.allclose(sp_qkv_grad, baseline_qkv_grad, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (sp_qkv_grad - baseline_qkv_grad).abs().max().item()
             raise AssertionError(f'qkv grad mismatch on rank {rank}: max_diff={max_diff}')
@@ -382,6 +382,8 @@ def _run_prefill_alignment_worker(rank: int,
     not (torch.cuda.is_available() and torch.cuda.device_count() >= WORLD_SIZE), reason='requires 2 CUDA devices')
 @pytest.mark.skipif(
     not _HAS_FLA_PREFILL, reason='requires flash-linear-attention kernels for Qwen3.5 SP linear attention tests')
+@pytest.mark.slow
+@pytest.mark.accel(2)
 class TestQwen35LinearAttentionSP:
 
     def test_qwen35_linear_attention_prefill_logits_and_qkv_grad_alignment(self):
@@ -455,3 +457,52 @@ class TestQwen35LinearAttentionSP:
 
 if __name__ == '__main__':
     pytest.main([__file__])
+
+
+def _qwen35_cpu_worker(rank, port, layer_types):
+    from types import SimpleNamespace
+    from torch.utils.checkpoint import DefaultDeviceType
+    DefaultDeviceType.set_device_type('cpu')
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank, world_size=2)
+    try:
+        torch.manual_seed(92)
+        config = Qwen3_5TextConfig(vocab_size=32, hidden_size=32, intermediate_size=64,
+                                  num_hidden_layers=len(layer_types), num_attention_heads=2, num_key_value_heads=2, head_dim=16,
+                                  linear_conv_kernel_dim=4, linear_key_head_dim=8, linear_value_head_dim=8,
+                                  linear_num_key_heads=2, linear_num_value_heads=4,
+                                  layer_types=list(layer_types), use_cache=False)
+        config._attn_implementation = 'sdpa'
+        baseline = Qwen3_5ForCausalLM(config).train()
+        model = copy.deepcopy(baseline)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        mesh = DeviceMesh.from_sizes(fsdp_size=2, dp_size=1, ulysses_size=2, device_type='cpu')
+        strategy = SequenceParallelStrategy(mesh, {'ulysses_size': 2}, model=model)
+        strategy._tokenizer = SimpleNamespace(pad_token_id=0)
+        strategy.initialize()
+        ids = torch.tensor([[1, 3, 5, 7, 9, 11, 13]])
+        expected = baseline(input_ids=ids, use_cache=False).logits
+        inputs = strategy.prepare_model_inputs({'input_ids': ids})
+        inputs.pop('_sequence_layout')
+        with strategy.context():
+            output = model(**inputs, use_cache=False)
+        _, gathered = strategy.gather_loss_tensors({}, output)
+        torch.testing.assert_close(gathered.logits, expected, rtol=3e-4, atol=3e-6)
+        expected.square().mean().backward()
+        gathered.logits.square().mean().backward()
+        for (name, parameter), (_, original) in zip(model.named_parameters(), baseline.named_parameters()):
+            if original.grad is None:
+                assert parameter.grad is None
+                continue
+            assert parameter.grad is not None, name
+            dist.all_reduce(parameter.grad)
+            parameter.grad.div_(2)
+            torch.testing.assert_close(parameter.grad, original.grad, rtol=5e-4, atol=3e-6, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not _HAS_QWEN35, reason='transformers Qwen3.5 is unavailable')
+@pytest.mark.parametrize('layer_types', [('linear_attention',), ('full_attention',), ('linear_attention', 'full_attention')])
+def test_qwen35_cpu_torch_fallback_sp_and_checkpoint_match_baseline(layer_types):
+    mp.spawn(_qwen35_cpu_worker, args=(_find_free_port(), layer_types), nprocs=2, join=True)

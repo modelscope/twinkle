@@ -185,8 +185,9 @@ class RouterReplay:
         # SP: slice full-sequence routed_experts (and the per-token replay_mask) to local SP rank tokens.
         # Both travel in one pad_and_split_inputs call so the mask is split identically to the indices and
         # stays token-aligned with them.
-        from ..strategy.sequence_parallel import sequence_parallel as sp
-        sp_world_size = getattr(sp, 'sp_world_size', None) or 1
+        from ..strategy.sequence_parallel import _MODULE_TO_CTX
+        sp = _MODULE_TO_CTX.get(model)
+        sp_world_size = getattr(sp, 'world_size', None) or 1
         if sp_world_size > 1:
             extra_split_values = [(routed_experts, 0, 1)]
             if replay_mask is not None:
@@ -255,8 +256,9 @@ class RouterReplay:
         routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
 
         # SP: all-gather local routing data across SP ranks along seq_len dim.
-        from ..strategy.sequence_parallel import sequence_parallel as sp
-        sp_world_size = getattr(sp, 'sp_world_size', None) or 1
+        from ..strategy.sequence_parallel import _MODULE_TO_CTX
+        sp = _MODULE_TO_CTX.get(model)
+        sp_world_size = getattr(sp, 'world_size', None) or 1
         if sp_world_size > 1:
             routed_experts = sp.gather(routed_experts, dim=1, position_ids=sp.real_position_ids)
 

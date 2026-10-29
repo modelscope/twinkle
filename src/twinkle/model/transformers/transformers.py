@@ -111,11 +111,11 @@ def _resolve_task_context(model, task, template=None):
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
-    ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
     'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_tensor_sp`` too.
+    last-valid-token reduction is deferred to ``postprocess_outputs`` too.
     'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
-    ``postprocess_tensor_sp`` can do packed-aware last-token reduction (same as embedding).
+    ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
     """
     if task in (None, 'causal_lm'):
         return contextlib.nullcontext()
@@ -936,11 +936,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
-            sp_strategy=self.sp_strategy,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
             gdn_padding_free_enabled=self._gdn_padding_free_enabled,
         )
+        if self.sp_strategy is not None:
+            inputs = self.sp_strategy.prepare_model_inputs(
+                inputs, token_labels=processor.token_level_labels(task), padding_free=processor.padding_free)
+        sequence_layout = inputs.pop('_sequence_layout', None)
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
@@ -979,11 +982,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         unwrapped_model = self.strategy.unwrap_model(self.model)
         with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
-            outputs = self.model(**inputs)
+            with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
+                outputs = self.model(**inputs)
 
         recorded_routing = rr.finish()
 
         self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+        if sequence_layout is not None:
+            inputs['_sequence_layout'] = sequence_layout
         self._postprocess_forward_outputs(
             outputs,
             labels=labels,
@@ -1103,11 +1109,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     raise ValueError('sampling replay does not support sequence or context parallelism')
             inputs: Dict[str, Any] = processor(
                 inputs,
-                sp_strategy=self.sp_strategy,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
                 gdn_padding_free_enabled=self._gdn_padding_free_enabled,
             )
+            if self.sp_strategy is not None:
+                inputs = self.sp_strategy.prepare_model_inputs(
+                    inputs, token_labels=processor.token_level_labels(task), padding_free=processor.padding_free)
+            sequence_layout = inputs.pop('_sequence_layout', None)
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
@@ -1145,11 +1154,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
             with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
-                outputs = self.model(**inputs)
+                with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
+                    outputs = self.model(**inputs)
 
             recorded_routing = rr.finish()
 
             self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+            if sequence_layout is not None:
+                inputs['_sequence_layout'] = sequence_layout
             self._postprocess_forward_outputs(
                 outputs,
                 labels=labels,
