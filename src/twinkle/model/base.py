@@ -168,11 +168,11 @@ class TwinkleModel(ABC):
             if self._should_bind_device_id_for_process_group(backend):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
-            if backend == 'hccl':
+            if Platform.get_platform().requires_unbound_default_pg():
                 default_pg = dist.distributed_c10d._get_default_group()
                 if getattr(default_pg, 'bound_device_id', None) is not None:
-                    # If the default HCCL PG keeps a bound device id, PyTorch may
-                    # propagate that binding into later Gloo subgroup creation. That
-                    # breaks the metrics/object-gather path on NPU, so clear it
-                    # before Megatron creates its Gloo DP groups.
+                    # A bound device id propagates into later subgroup creation
+                    # (Gloo DP groups on NPU) or triggers a communicator split
+                    # the backend cannot perform (XPU). Clear it before
+                    # Megatron creates its subgroups.
                     default_pg.bound_device_id = None

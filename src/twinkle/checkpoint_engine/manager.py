@@ -45,7 +45,7 @@ class CheckpointEngineManager:
         self,
         model: 'CheckpointEngineMixin',
         sampler: 'CheckpointEngineMixin',
-        platform: str = 'GPU',
+        platform: Optional[str] = None,
     ) -> None:
         self.model = model
         self.sampler = sampler
@@ -67,14 +67,15 @@ class CheckpointEngineManager:
 
     @staticmethod
     def decide_backend_engine(platform: Optional[str] = None) -> 'CheckpointEngine':
-        if Platform.get_platform(platform).__name__ == 'GPU':
-            from twinkle.checkpoint_engine import NCCLCheckpointEngine
-            return NCCLCheckpointEngine
-        elif Platform.get_platform(platform).__name__ == 'NPU':
-            from twinkle.checkpoint_engine import HCCLCheckpointEngine
-            return HCCLCheckpointEngine
-        else:
-            raise NotImplementedError
+        """Resolve the weight-sync engine class for *platform*.
+
+        Leave ``platform`` as ``None`` so the detected hardware decides. A
+        literal ``'GPU'`` masks Ascend NPU and Kunlunxin XPU, because
+        ``Platform.get_platform('GPU')`` always resolves to the NVIDIA
+        platform; the driver then builds the topology with the NCCL engine
+        while the workers instantiate the HCCL/XCCL one.
+        """
+        return Platform.get_platform(platform).checkpoint_engine()[0]
 
     def sync_weights(self, merge_and_sync=True):
         """

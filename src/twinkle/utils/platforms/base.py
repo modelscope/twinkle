@@ -2,7 +2,7 @@
 import os
 import shutil
 from abc import ABC
-from typing import List, Type
+from typing import Any, Dict, List, Tuple, Type
 
 
 class Platform(ABC):
@@ -17,7 +17,7 @@ class Platform(ABC):
 
     @staticmethod
     def get_platform_names() -> List[str]:
-        return ['GPU', 'NPU', 'MPS']
+        return ['GPU', 'NPU', 'XPU', 'MPS']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
@@ -27,6 +27,10 @@ class Platform(ABC):
                 from .npu import NPU, ensure_npu_backend
                 ensure_npu_backend()
                 return NPU
+            elif shutil.which('xpu-smi'):
+                from .xpu import XPU, ensure_xpu_compat
+                ensure_xpu_compat()
+                return XPU
             elif shutil.which('nvidia-smi'):
                 from .gpu import GPU
                 return GPU
@@ -43,6 +47,10 @@ class Platform(ABC):
             from .npu import NPU, ensure_npu_backend
             ensure_npu_backend()
             return NPU
+        elif platform.upper() == 'XPU':
+            from .xpu import XPU, ensure_xpu_compat
+            ensure_xpu_compat()
+            return XPU
         elif platform.upper() == 'MPS':
             from .mps import MPS
             return MPS
@@ -157,3 +165,51 @@ class Platform(ABC):
         if state is None:
             return
         Platform.get_platform(platform).set_device_rng_state(state)
+
+    # ── Backend capability queries ────────────────────────────────────────
+
+    @staticmethod
+    def bootstrap() -> None:
+        """One-shot runtime fixups, run when ``twinkle.utils.platforms`` is imported."""
+
+    @staticmethod
+    def requires_unbound_default_pg() -> bool:
+        """Whether the default process group's ``bound_device_id`` must be cleared.
+
+        Queried once right after ``init_process_group``.  ``True`` for backends
+        that cannot carry a device binding into later subgroup creation (see the
+        NPU/XPU overrides for the concrete failure modes).
+        """
+        return False
+
+    @staticmethod
+    def requires_unbound_pg_for_subgroups() -> bool:
+        """Whether the binding must be cleared again right before ``new_group``.
+
+        Deliberately separate from ``requires_unbound_default_pg``: that one is
+        about the state left behind by ``init_process_group``, this one is about
+        a default PG created by someone else (eager init outside twinkle) that
+        is about to be split into model-parallel subgroups.  ``False`` means
+        "no extra guard needed here" and asserts nothing about the backend.
+        """
+        return False
+
+    @staticmethod
+    def ray_resources() -> Dict[str, float]:
+        """Accelerator resources that must be registered with ``ray.init`` explicitly.
+
+        Empty when Ray can autodetect the devices itself, which is the case
+        for CUDA GPUs.
+        """
+        return {}
+
+    @staticmethod
+    def checkpoint_engine() -> Tuple[Type[Any], Dict[str, Any]]:
+        """The weight-sync engine class for this platform plus its default kwargs.
+
+        Returning the kwargs here keeps platform-specific engine options (such
+        as NPU's communicator reuse) in a single place instead of duplicating
+        them in every construction site.
+        """
+        raise NotImplementedError('This platform has no checkpoint engine implementation')
+

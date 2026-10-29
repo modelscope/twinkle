@@ -17,8 +17,10 @@ from .base import CheckpointEngine, TensorMeta
 from .hccl_checkpoint_engine import HCCLCheckpointEngine
 from .manager import CheckpointEngineManager
 from .mixin import CheckpointEngineMixin
-# Import backend implementations to register them
+# Backend implementations; the concrete one is selected by
+# ``Platform.checkpoint_engine()``.
 from .nccl_checkpoint_engine import NCCLCheckpointEngine
+from .xpu_checkpoint_engine import XCCLCheckpointEngine
 from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
 
 __all__ = [
@@ -27,6 +29,7 @@ __all__ = [
     'CheckpointEngineManager',
     'NCCLCheckpointEngine',
     'HCCLCheckpointEngine',
+    'XCCLCheckpointEngine',
     'TensorMeta',
     'generate_auth_key',
     'send_auth_pyobj',

@@ -22,7 +22,8 @@ class CheckpointEngine(ABC):
     processes. The typical workflow is:
 
     In trainer process (rank 0):
-    >>> engine = CheckpointEngineRegistry.new('nccl', bucket_size=512<<20)
+    >>> engine_cls, engine_kwargs = Platform.get_platform().checkpoint_engine()
+    >>> engine = engine_cls(bucket_size=512<<20, **engine_kwargs)
     >>> engine.is_master = True  # set before prepare()
     >>> engine.prepare()
     >>> engine.init_process_group(rank=0, world_size=5, master_metadata=metadata)
@@ -30,7 +31,8 @@ class CheckpointEngine(ABC):
     >>> engine.finalize()
 
     In rollout process:
-    >>> engine = CheckpointEngineRegistry.new('nccl', bucket_size=512<<20)
+    >>> engine_cls, engine_kwargs = Platform.get_platform().checkpoint_engine()
+    >>> engine = engine_cls(bucket_size=512<<20, **engine_kwargs)
     >>> engine.prepare()
     >>> engine.init_process_group(rank=1, world_size=5, master_metadata=metadata)
     >>> async for name, tensor in engine.receive_weights():

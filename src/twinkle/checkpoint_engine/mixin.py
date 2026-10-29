@@ -12,18 +12,8 @@ class CheckpointEngineMixin:
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
         if self._checkpoint_engine is None:
-            if Platform.get_platform().__name__ == 'GPU':
-                from twinkle.checkpoint_engine import NCCLCheckpointEngine
-                self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
-            elif Platform.get_platform().__name__ == 'NPU':
-                from twinkle.checkpoint_engine import HCCLCheckpointEngine
-
-                # Reusing HCCL communicator across sync steps avoids frequent
-                # stream/channel allocation and reduces resource exhaustion risk.
-                self._checkpoint_engine = HCCLCheckpointEngine(
-                    self._bucket_size,
-                    rebuild_group=False,
-                )
+            engine_cls, engine_kwargs = Platform.get_platform().checkpoint_engine()
+            self._checkpoint_engine = engine_cls(self._bucket_size, **engine_kwargs)
         return self._checkpoint_engine
 
     @remote_function(collect='first', lazy_collect=False)

@@ -112,6 +112,18 @@ class MegatronStrategy:
         }
         if Platform.device_prefix() == 'npu':
             init_kwargs['create_gloo_process_groups'] = True
+        # Clear the default PG's device binding immediately before the
+        # model-parallel ``new_group`` calls, regardless of who initialized the
+        # default PG (eager init can happen outside twinkle). On backends that
+        # answer ``requires_unbound_pg_for_subgroups`` a leftover
+        # ``bound_device_id`` makes ``new_group`` take the comm-split path,
+        # which XPU's ``ProcessGroupXCCL`` cannot perform.
+        if Platform.get_platform().requires_unbound_pg_for_subgroups():
+            import torch.distributed as _dist
+            if _dist.is_initialized():
+                _default_pg = _dist.distributed_c10d._get_default_group()
+                if getattr(_default_pg, 'bound_device_id', None) is not None:
+                    _default_pg.bound_device_id = None
         mpu.initialize_model_parallel(**init_kwargs)
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(self.seed)

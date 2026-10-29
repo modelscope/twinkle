@@ -37,3 +37,8 @@ class GPU(Platform):
         import torch
         if torch.cuda.is_available():
             torch.cuda.set_rng_state(state)
+
+    @staticmethod
+    def checkpoint_engine():
+        from twinkle.checkpoint_engine import NCCLCheckpointEngine
+        return NCCLCheckpointEngine, {}

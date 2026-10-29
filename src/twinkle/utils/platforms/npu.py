@@ -154,3 +154,31 @@ class NPU(Platform):
             return
         if hasattr(torch, 'npu') and torch.npu.is_available():
             torch.npu.set_rng_state(state)
+
+    @staticmethod
+    def requires_unbound_default_pg() -> bool:
+        # If the default HCCL PG keeps a bound device id, PyTorch propagates
+        # that binding into later Gloo subgroup creation, which breaks the
+        # metrics/object-gather path on NPU.
+        return True
+
+    @staticmethod
+    def ray_resources():
+        # Ray cannot autodetect Ascend NPUs; register them as a custom
+        # resource so placement groups can request them.
+        try:
+            import torch
+
+            npu = getattr(torch, 'npu', None)
+            npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
+        except (ImportError, AttributeError, RuntimeError):
+            return {}
+        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+
+    @staticmethod
+    def checkpoint_engine():
+        from twinkle.checkpoint_engine import HCCLCheckpointEngine
+
+        # Reusing the HCCL communicator across sync steps avoids frequent
+        # stream/channel allocation and reduces resource exhaustion risk.
+        return HCCLCheckpointEngine, {'rebuild_group': False}

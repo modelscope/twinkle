@@ -18,28 +18,20 @@ class RayHelper:
 
     @staticmethod
     def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
-        """Return custom accelerator resources needed for local Ray startup.
+        """Return accelerator resources needed for local Ray startup.
 
-        Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
-        NPUs, need to be registered as Ray custom resources so that placement
-        groups can request them.
+        Ray discovers CUDA GPUs itself.  Other accelerators -- Ascend NPUs, and
+        Kunlunxin XPUs whose runtime ships no nvidia-smi -- must be registered
+        explicitly so that placement groups can request them.  Each platform
+        answers for itself via ``Platform.ray_resources()``; the detected
+        platform is authoritative because XPU runs declare their device type as
+        the cuda-alike 'GPU'.
         """
+        # ResourceManager supports one accelerator type per run.
         device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
-
-        # ResourceManager supports one accelerator type per run.  Only NPU
-        # currently needs an explicit Ray custom-resource registration.
-        if device_types != {'NPU'}:
+        if not device_types:
             return {}
-
-        try:
-            import torch
-
-            npu = getattr(torch, 'npu', None)
-            npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
-        except (ImportError, AttributeError, RuntimeError):
-            return {}
-
-        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+        return Platform.get_platform().ray_resources()
 
     @staticmethod
     def init_registry():
@@ -104,7 +96,11 @@ class RayHelper:
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
             resources = RayHelper._get_ray_custom_resources(device_groups)
-            ray.init(ignore_reinit_error=True, resources=resources or None)
+            # XPU registers the cuda-alike 'GPU' count, but 'GPU' is one of Ray's
+            # default resources and ray.init() rejects it via `resources=`; route
+            # it through `num_gpus` instead.
+            num_gpus = int(resources.pop('GPU')) if 'GPU' in resources else None
+            ray.init(ignore_reinit_error=True, resources=resources or None, num_gpus=num_gpus)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -326,6 +322,8 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(pg_idx)
+                visible_devices_str = ','.join([str(r) for r in deploy_pg['gpu_rank']])
+                local_rank_str = str(0)
                 env_vars = os.environ.copy()
                 env_vars.update({
                     'WORLD_SIZE':
@@ -333,13 +331,13 @@ class RayHelper:
                     'RANK':
                     str(pg_idx),
                     'LOCAL_RANK':
-                    str(0),
+                    local_rank_str,
                     'CLUSTER_NAME':
                     cluster_name,
                     'WORKER_NAME':
                     worker_name,
                     Platform.get_platform(device_type_upper).visible_device_env():
-                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
+                    visible_devices_str,
                     'TWINKLE_MODE':
                     'ray',
                     'TWINKLE_SEED':
