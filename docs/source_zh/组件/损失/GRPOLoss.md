@@ -10,7 +10,7 @@
 from twinkle.loss import GRPOLoss
 
 loss_fn = GRPOLoss(
-    clip_range=0.2,
+    epsilon=0.2,
     beta=0.01,        # KL 惩罚系数
 )
 
@@ -18,7 +18,8 @@ model.set_loss(loss_fn)
 ```
 
 **参数:**
-- `clip_range`: 重要性权重的 PPO 裁剪范围（默认: 0.2）
+- `epsilon`: 重要性权重的 PPO 裁剪范围，下界为 `1 - epsilon`（默认: 0.2）
+- `epsilon_high`: 上界为 `1 + epsilon_high`（默认与 `epsilon` 相同）；`CISPOLoss` 在 `1 + epsilon_high` 处截断 IS 权重
 - `beta`: KL 散度惩罚系数。设为 0 以禁用 KL 正则化
 
 损失函数同时处理标准批次和打包序列（通过 `position_ids` 检测）。它计算每个 token 的重要性权重，应用 PPO 裁剪，并可选地添加针对参考策略的 KL 惩罚项。
@@ -33,7 +34,7 @@ Twinkle 提供了多种 GRPO 变体:
 
 ```python
 from twinkle.loss import GSPOLoss
-loss_fn = GSPOLoss(clip_range=0.2, beta=0.01)
+loss_fn = GSPOLoss(epsilon=0.2, beta=0.01)
 ```
 
 ### SAPOLoss
@@ -42,7 +43,7 @@ loss_fn = GSPOLoss(clip_range=0.2, beta=0.01)
 
 ```python
 from twinkle.loss import SAPOLoss
-loss_fn = SAPOLoss(clip_range=0.2, beta=0.01, tau=1.0)
+loss_fn = SAPOLoss(beta=0.01, tau_pos=1.0, tau_neg=1.0)
 ```
 
 ### CISPOLoss
@@ -51,7 +52,7 @@ loss_fn = SAPOLoss(clip_range=0.2, beta=0.01, tau=1.0)
 
 ```python
 from twinkle.loss import CISPOLoss
-loss_fn = CISPOLoss(clip_range=0.2, beta=0.01)
+loss_fn = CISPOLoss(epsilon=0.2, epsilon_high=4.0, beta=0.01)
 ```
 
 ### BNPOLoss
@@ -60,7 +61,7 @@ loss_fn = CISPOLoss(clip_range=0.2, beta=0.01)
 
 ```python
 from twinkle.loss import BNPOLoss
-loss_fn = BNPOLoss(clip_range=0.2, beta=0.01)
+loss_fn = BNPOLoss(epsilon=0.2, beta=0.01)
 ```
 
 ### DRGRPOLoss
@@ -69,7 +70,7 @@ loss_fn = BNPOLoss(clip_range=0.2, beta=0.01)
 
 ```python
 from twinkle.loss import DRGRPOLoss
-loss_fn = DRGRPOLoss(clip_range=0.2, beta=0.01)
+loss_fn = DRGRPOLoss(epsilon=0.2, beta=0.01)
 ```
 
 > 所有 GRPO 变体共享相同的打包序列处理、对数概率对齐和 KL 惩罚计算基础流水线。它们的主要区别在于重要性权重和优势值的组合方式。
