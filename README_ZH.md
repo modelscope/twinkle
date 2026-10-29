@@ -389,6 +389,7 @@ for epoch in range(3):
 | 组件类型 | 组件链接                                                                                           | 组件功能                                                                      | 作者              |
 | -------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------- |
 | Patch    | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | 修复 Qwen3 MoE 模型在 FSDP2 训练期间挂起的问题，适用于 transformers==4.x | ModelScope 官方 |
+| Decision | [决策模型训练](cookbook/transformers/decision/README.md) | 候选打分、软标签损失、LoRA 打分头保存与问题级精度 | 社区 |
 
 ## 开源贡献
 
