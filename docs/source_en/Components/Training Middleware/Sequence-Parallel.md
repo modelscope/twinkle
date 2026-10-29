@@ -66,10 +66,6 @@ For MoE models, SP automatically installs a forward hook that gathers router log
 - Derived ring attention requires `batch_size == 1` (packed format)
 - `torch.distributed` must be initialized
 
-## Per-model ownership and Processor callbacks
+## Isolating per-model SP contexts
 
-Each strategy owns its own context. `prepare_model_inputs` splits fixed model/loss tensors once; multimodal text is split after visual features have been merged. The model calls forward inside `with sp.context()`. Checkpoint recomputation restores the owning batch context too. Registered vision modules explicitly run locally; missing text registrations fail rather than silently falling back.
-
-Task pooling and unpacking remain in `InputProcessor.postprocess_outputs`. The model supplies only `gather_fn(inputs, outputs)` and differentiable `reduce_fn(tensor, op)` callbacks. A batch-local `_sequence_layout` contains plain position/index tensors for local pooling and is removed from HF model arguments. Processors do not import or receive a concrete SP strategy. No callbacks are needed without SP. `values` are gathered even when logps or labels are absent; single-token values retain `[B, 1]` layout. KV-cache decode is unsupported.
-
-Loss declarations and math are unchanged. Ring keeps per-segment padding and zigzag ordering; left-padded Ring inputs are rejected. Qwen3.5 GDN uses its owning context's global padding mask before selecting a shard, including on Transformers versions that crop the recurrent mask to the local tail.
+Each SequenceParallelStrategy owns its own SequenceParallel context, which stores that model's communication group, ranks, and current batch state, so algorithms that use multiple models, such as DPO, can enable SP training at the same time.
