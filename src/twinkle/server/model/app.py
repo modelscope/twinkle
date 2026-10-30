@@ -39,6 +39,42 @@ __all__ = ['ModelManagement', 'build_model_app']
 _LORA_ONLY_CTOR_KWARGS = ('max_loras', 'max_r', 'max_length', 'target_modules', 'lora_config')
 
 
+def _validate_model_task(kw: dict[str, Any]) -> None:
+    """Check the persisted head once, before choosing a CS backend."""
+    task_type = kw.get('task_type')
+    if task_type is None:
+        return
+    from transformers import AutoConfig
+    from twinkle.hub import HubOperation
+
+    path = HubOperation.download_model(kw['model_id'])
+    loader = kw.get('model_loader')
+    config = (loader.process_config(loader.build_config(path)) if loader is not None else
+              AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code()))
+    architectures = getattr(config, 'architectures', None) or []
+    classification = any(name.endswith('ForSequenceClassification') for name in architectures)
+    num_labels = kw.get('num_labels')
+    if task_type == 'seq_cls':
+        if not classification:
+            raise ValueError('seq_cls requires a persisted ForSequenceClassification checkpoint')
+        if num_labels is None or getattr(config, 'num_labels', None) != num_labels:
+            raise ValueError('num_labels does not match the persisted classification head')
+        from pathlib import Path
+        from safetensors import safe_open
+        head_found = False
+        for file in Path(path).glob('model*.safetensors'):
+            with safe_open(str(file), framework='pt', device='cpu') as weights:
+                for key in weights.keys():
+                    if key.endswith(('score.weight', 'classifier.weight')):
+                        if weights.get_slice(key).get_shape()[0] != num_labels:
+                            raise ValueError('Persisted head weight shape does not match num_labels')
+                        head_found = True
+        if not head_found:
+            raise ValueError('seq_cls requires persisted score/classifier weights in safetensors format')
+    elif classification:
+        raise ValueError('causal_lm cannot use a classification checkpoint')
+
+
 def _make_mock_model(kw: dict[str, Any]) -> Any:
     from .backends.mock_model import TwinkleCompatMockModel
 
@@ -216,6 +252,8 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             ctor_kwargs['model_loader'] = _resolve_model_loader(model_loader_spec, model_id)
         if self.device_mesh is not None:
             ctor_kwargs['device_mesh'] = self.device_mesh
+        if backend != 'mock':
+            await asyncio.to_thread(_validate_model_task, ctor_kwargs)
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
         await self.wait_for_training_workers()
 

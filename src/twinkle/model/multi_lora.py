@@ -331,7 +331,8 @@ class MultiLora:
         """Ensure every requested target resolves inside the preallocated LoRA layers."""
         if not target_modules and target_parameters:
             return
-        layers = [name for name, layer in self.module.named_modules() if isinstance(layer, LoraLayer)]
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        layers = [name for module in modules for name, layer in module.named_modules() if isinstance(layer, LoraLayer)]
         if target_modules == 'all-linear' or (isinstance(target_modules,
                                                          (list, set)) and 'all-linear' in target_modules):
             return

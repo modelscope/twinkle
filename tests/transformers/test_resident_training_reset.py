@@ -122,7 +122,7 @@ def test_megatron_reload_resets_optimizer_state_only_when_requested(reload_kwarg
         assert fresh.adapter_name == '' and fresh.optimizer is None and fresh.cur_step == 0
 
 
-def _megatron_dpo_loss_callback(*, forward_only, disable_lora, kwargs=None, ref_logps=None):
+def _megatron_dpo_loss_callback(*, forward_only, disable_lora, kwargs=None, ref_logps=None, return_logits=False):
     from twinkle.loss import DPOLoss
 
     path = Path(__file__).resolve().parents[2] / 'src/twinkle/model/megatron/megatron.py'
@@ -138,7 +138,7 @@ def _megatron_dpo_loss_callback(*, forward_only, disable_lora, kwargs=None, ref_
         'torch': torch, 'ModelOutput': dict,
         'Platform': SimpleNamespace(get_local_device=lambda: 'cpu'),
         'forward_only': forward_only, 'disable_lora': disable_lora, 'kwargs': dict(kwargs or {}),
-        '_mb_counter': [0], 'return_logits': False, 'loss_instance': DPOLoss(),
+        '_mb_counter': [0], 'return_logits': return_logits, 'loss_instance': DPOLoss(),
         'loss_extra_kwargs_per_mb': [{} if ref_logps is None else {'ref_logps': ref_logps}],
         'self': SimpleNamespace(strategy=SimpleNamespace(
             reduce_loss=lambda loss, count, logits, logps: [loss, count, {'logits': logits, 'logps': logps}])),
@@ -173,3 +173,61 @@ def test_megatron_non_reference_dpo_still_computes_a_nonzero_loss(forward_only):
     result = callback(torch.zeros(2, 2, 4), {'labels': torch.ones(2, 2, dtype=torch.long)},
                       torch.tensor([[-1., -2.], [-3., -4.]]))
     assert result[0].item() > 0 and result[1].item() == 1
+
+
+def test_megatron_empty_probe_reports_pooled_scores_not_token_logits():
+    callback = _megatron_dpo_loss_callback(forward_only=True, disable_lora=True, return_logits=True)
+    pooled = torch.randn(2, 3)
+    result = callback(torch.randn(2, 7, 3), {}, None, unpacked_logits=pooled)
+    torch.testing.assert_close(result[2]['logits'], pooled)
+    assert result[0].item() == 0 and result[1].item() == 0
+
+
+def test_megatron_empty_probe_reports_canonical_embeddings():
+    callback = _megatron_dpo_loss_callback(forward_only=True, disable_lora=True)
+    embeddings = torch.randn(2, 8, requires_grad=True)
+    result = callback(embeddings, {}, None, embeddings=embeddings)
+    torch.testing.assert_close(result[2]['embeddings'], embeddings)
+    assert not result[2]['embeddings'].requires_grad
+
+
+def test_megatron_empty_logits_are_omitted_before_dp_collection():
+    path = Path(__file__).resolve().parents[2] / 'src/twinkle/model/megatron/megatron.py'
+    model_class = next(node for node in ast.parse(path.read_text()).body
+                       if isinstance(node, ast.ClassDef) and node.name == 'MegatronModel')
+    method = next(node for node in model_class.body
+                  if isinstance(node, ast.FunctionDef) and node.name == 'forward_backward')
+    normalizer = next(node for node in reversed(method.body) if isinstance(node, ast.If)
+                      and any(isinstance(child, ast.Name) and child.id == 'return_logits'
+                              for child in ast.walk(node.test)))
+    namespace = {'logits': [], 'return_logits': True, 'torch': torch}
+    exec(compile(ast.Module(body=[normalizer], type_ignores=[]), str(path), 'exec'), namespace)
+    assert namespace['logits'] is None
+
+    logits = torch.randn(2, 3)
+    namespace['logits'] = logits
+    exec(compile(ast.Module(body=[normalizer], type_ignores=[]), str(path), 'exec'), namespace)
+    assert namespace['logits'] is logits
+
+
+def test_megatron_seq_cls_lora_checkpoint_opens_bridge_head_load_gate():
+    from twinkle.model.megatron.multi_lora_megatron import _seq_cls_head_lora_load_gate
+
+    class Bridge:
+        _peft_format = True
+        config = SimpleNamespace(task_type='seq_cls')
+        hf_score_key = 'score.weight'
+
+        def __init__(self):
+            self.loaded_keys = None
+
+        def _convert_post_process(self, mg_model, hf_state_dict, hf_prefix, to_mcore):
+            self.loaded_keys = set(hf_state_dict)
+
+    bridge = Bridge()
+    checkpoint = {'score.lora_A.weight': object(), 'score.lora_B.weight': object()}
+    with _seq_cls_head_lora_load_gate(bridge):
+        bridge._convert_post_process(None, checkpoint, '', True)
+    assert bridge.loaded_keys == {'score.weight', 'score.lora_A.weight', 'score.lora_B.weight'}
+    assert 'score.weight' not in checkpoint
+    assert bridge._convert_post_process.__self__ is bridge

@@ -58,6 +58,17 @@ class TrainingArguments(BaseModel):
     model_loader: str | None = None
     gradient_checkpointing: bool | None = Field(default=None, strict=True)
     mixed_precision: Literal["no", "fp8", "fp16", "bf16"] | None = None
+    task_type: Literal["causal_lm", "seq_cls"] | None = None
+    num_labels: int | None = Field(default=None, gt=0, strict=True)
+    language_model_only: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_head(self):
+        if self.task_type == "seq_cls" and self.num_labels is None:
+            raise ValueError('task_type="seq_cls" requires num_labels')
+        if self.num_labels is not None and self.task_type != "seq_cls":
+            raise ValueError('num_labels requires task_type="seq_cls"')
+        return self
 
     @model_validator(mode="after")
     def _validate_replicas(self):
@@ -110,6 +121,8 @@ class ModelArgs(TrainingArguments, LoraArguments):
                 raise ValueError("model_cls requires a transformers LoRA deployment without hybrid")
         if self.model_loader is not None and self.backend != "transformers":
             raise ValueError("model_loader requires the transformers backend")
+        if self.language_model_only is not None and self.backend != "megatron":
+            raise ValueError("language_model_only requires the megatron backend")
         return self
 
 

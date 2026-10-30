@@ -1,5 +1,4 @@
 # ST multi-tenant LoRA over the on-demand training pool.
-# Validated with Swift 7e4203a961416952e1c8ea5b8fb1763139d56bfa and sentence-transformers 6.2.0.
 # The original ST pipeline remains the base model; checkpoints contain tenant adapters.
 proxy_location: EveryNode
 http_options:

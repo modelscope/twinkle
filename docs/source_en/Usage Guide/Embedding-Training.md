@@ -117,6 +117,7 @@ Client-side embedding training follows the same call order as the bare library:
 ```
 set_processor('InputProcessor')
   -> set_loss('InfonceLoss', ...)
+  -> set_optimizer('Adam', ...)
   -> add_metric('EmbeddingMetric', is_training=True)
   -> loop: forward_backward(inputs=mb, task='embedding') + clip_grad_and_step(...)
   -> calculate_metric(is_training=True)
@@ -129,13 +130,12 @@ The difference from the bare library is that the client passes **class-name stri
 ```python
 from peft import LoraConfig
 from twinkle import init_twinkle_client
-from twinkle_client.model import MultiLoraTransformersModel
 
 # --- Connect to the running Twinkle server ---
-init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
 
 # --- Build the client model with a LoRA adapter for embedding ---
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model = client.model('ms://Qwen/Qwen3.5-4B')
 model.add_adapter_to_model('emb_adapter', LoraConfig(target_modules='all-linear'))
 model.set_template('Qwen3_5Template')
 
@@ -143,6 +143,7 @@ model.set_template('Qwen3_5Template')
 # NOTE: pass class names as strings; the server resolves them to core-lib classes.
 model.set_processor('InputProcessor')
 model.set_loss('InfonceLoss', temperature=0.07, use_batch=True, hard_negatives=None)
+model.set_optimizer('Adam', lr=1e-4)
 model.add_metric('EmbeddingMetric', is_training=True)
 
 # --- Training loop ---
@@ -158,7 +159,7 @@ metric = model.calculate_metric(is_training=True)
 
 **No manual apply_patch needed.** As long as you pass `task='embedding'` to `forward_backward` (or `forward_only`), the server automatically switches to embedding mode for that single `forward` call and rolls back afterwards — you do **not** need to call `apply_patch(...)` explicitly. So after a `forward_backward(task='embedding')`, calling `forward_only` without `task` on the same adapter still returns normal vocab-dimension `logits`, unaffected.
 
-The only three explicit setup steps on the client side are: `set_processor('InputProcessor')`, `set_loss('InfonceLoss', ...)`, `add_metric('EmbeddingMetric', is_training=True)`. Parameter meanings and recommended values are in "Key Parameters" above; returned metrics are in "Monitoring" below.
+After creating the adapter and configuring its template, set the processor, loss and optimizer explicitly. Metrics are optional. See `cookbook/client/twinkle/embedding.py` for a standalone example including save, cold recreation, optimizer resume and final release; parameter meanings and recommended values are in "Key Parameters" above.
 
 ---
 

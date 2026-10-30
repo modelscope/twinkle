@@ -1,0 +1,64 @@
+# Qwen3.5 text-only Megatron tasks. Prepare with --mcore-native first.
+# Tokenizers can stay in output/cs-models; these bases use model.language_model.* keys.
+http_options:
+  host: 127.0.0.1
+  port: 8000
+telemetry:
+  enabled: false
+persistence:
+  mode: memory
+resources:
+  startup_timeout_s: 600
+  shutdown_timeout_s: 120
+applications:
+- name: server
+  import_path: server
+  route_prefix: /api/v1
+  args:
+    supported_models: [cs-embedding, cs-reranker, cs-seq_cls]
+  deployments:
+  - name: GatewayServer
+    ray_actor_options: {num_cpus: 0.1}
+- name: embedding
+  import_path: model
+  route_prefix: /api/v1/model/cs-embedding
+  args: &model_args
+    backend: megatron
+    model_id: output/cs-models-mcore/embedding
+    train_mode: lora
+    task_type: causal_lm
+    language_model_only: true
+    max_loras: 2
+    max_r: 8
+    max_length: 256
+    min_replicas: 0
+    max_replicas: 1
+    idle_timeout_s: 60
+    nproc_per_node: 2
+    device_group: {name: model, ranks: 2, device_type: cuda}
+    device_mesh: {device_type: cuda, dp_size: 2}
+    target_modules: [linear_qkv]
+    queue_config: {execution_timeout: 600}
+  deployments: &deployments
+  - name: ModelManagement
+    ray_actor_options: {num_cpus: 0.1}
+- name: reranker
+  import_path: model
+  route_prefix: /api/v1/model/cs-reranker
+  args:
+    <<: *model_args
+    model_id: output/cs-models-mcore/reranker
+    task_type: seq_cls
+    num_labels: 1
+    target_modules: [linear_qkv, output_layer]
+  deployments: *deployments
+- name: seq-cls
+  import_path: model
+  route_prefix: /api/v1/model/cs-seq_cls
+  args:
+    <<: *model_args
+    model_id: output/cs-models-mcore/seq_cls
+    task_type: seq_cls
+    num_labels: 3
+    target_modules: [linear_qkv, output_layer]
+  deployments: *deployments
