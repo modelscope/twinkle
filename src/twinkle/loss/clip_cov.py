@@ -27,6 +27,8 @@ class ClipCovLoss(GRPOLoss):
         clip_cov_ub: Upper bound for covariance selection window (default 5.0).
     """
 
+    requires_full_batch = True
+
     def __init__(self, clip_cov_ratio: float = 0.0002, clip_cov_lb: float = 1.0, clip_cov_ub: float = 5.0, **kwargs):
         super().__init__(**kwargs)
         if clip_cov_ratio <= 0:

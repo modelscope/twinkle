@@ -215,6 +215,10 @@ class InfonceLoss(EmbeddingLoss):
         self.include_dd = include_dd
         self.process_group = process_group
 
+    @property
+    def requires_full_batch(self):
+        return self.use_batch
+
     def _gather_across_dp(self, sentences: torch.Tensor, labels: torch.Tensor):
         """All-gather embeddings & labels across DP ranks; only local shard keeps grad.
 
@@ -464,6 +468,7 @@ class OnlineContrastiveLoss(EmbeddingLoss):
     require_logits = True
     require_entropy = False
     require_logps = False
+    requires_full_batch = True
 
     def __init__(self, margin: float = 0.5, distance_metric='cosine', mrl_dims=None, **kwargs):
         super().__init__(mrl_dims=mrl_dims)

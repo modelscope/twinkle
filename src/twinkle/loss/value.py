@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 from twinkle.loss.grpo import GRPOLoss
+from twinkle.loss.utils import count_loss_tokens
 
 if TYPE_CHECKING:
     import torch
@@ -28,7 +29,9 @@ class PPOValueLoss(Loss):
         self._aligner = GRPOLoss(ignore_index=ignore_index)
 
     def micro_batch_scale(self, inputs, indices):
-        return len(indices) / len(inputs)
+        token_counts = [count_loss_tokens(row, self.ignore_index) for row in inputs]
+        total_tokens = sum(token_counts)
+        return sum(token_counts[index] for index in indices) / total_tokens if total_tokens else 0.0
 
     def __call__(
         self,
