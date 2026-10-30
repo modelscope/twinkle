@@ -1540,6 +1540,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         local_batch_size = len(inputs)
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
         loss_instance = optimizer_config.get_loss(loss_key)
+        loss_instance.validate_micro_batching(len(plan))
         total_loss = 0.0
         outputs = {}
         for micro_batch_index, indices in enumerate(plan):

@@ -8,9 +8,21 @@ class Loss:
     require_entropy = False
     require_logps = True
     require_values = False
+    # This loss needs all local inputs in one evaluation to preserve its batch context.
+    requires_full_batch = False
 
     def __call__(self, inputs: InputFeature, outputs: ModelOutput, **kwargs) -> LossOutput:
         ...
+
+    def validate_micro_batching(self, num_micro_batches: int) -> None:
+        """Validate the actual local plan; one micro-batch preserves the full batch context."""
+        if num_micro_batches <= 1 or not self.requires_full_batch:
+            return
+        raise NotImplementedError(
+            f'{type(self).__name__} requires the full local batch for its loss computation, but the '
+            f'current batch would be split into {num_micro_batches} micro-batches. This loss does not '
+            'support micro-batching, including dynamic batching. Increase micro_batch_size or the '
+            'dynamic token budget so the full local batch fits in a single micro-batch.')
 
     def micro_batch_scale(self, inputs: list[InputFeature], indices: list[int]) -> float:
         if len(indices) == len(inputs):

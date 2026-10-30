@@ -30,6 +30,8 @@ class KLCovLoss(GRPOLoss):
         ppo_kl_coef: Coefficient for the KL penalty term (default 1.0).
     """
 
+    requires_full_batch = True
+
     def __init__(self, kl_cov_ratio: float = 0.0002, ppo_kl_coef: float = 1.0, **kwargs):
         super().__init__(**kwargs)
         if kl_cov_ratio <= 0:
