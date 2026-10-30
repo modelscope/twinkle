@@ -1,14 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Owned real-device CS acceptance, including directly executed cookbook CLIs."""
+"""Owned real-device CS acceptance: training progress, tenant isolation, checkpoint and release."""
 import argparse
 import copy
-import importlib
 import json
 import os
 from pathlib import Path
 import socket
-import subprocess
-import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,13 +18,11 @@ from transformers import AutoTokenizer
 def validate(base_url, controller, args):
     import ray
     from twinkle import init_twinkle_client
+    from tests.server.integration.cs_tasks.task_models import encoded_batch
     from tests.server.integration.on_demand_training.acceptance_support import wait_until
 
-    root = Path(__file__).resolve().parents[3]
-    directory = Path(args.run_dir)
     base_path = str(Path(args.model_dir, args.task).resolve())
-    recipe = importlib.import_module('cookbook.client.twinkle.' + args.task)
-    batch = recipe.encoded_batch(AutoTokenizer.from_pretrained(base_path))
+    batch = encoded_batch(args.task, AutoTokenizer.from_pretrained(base_path))
     targets = (['q_proj', 'v_proj'] if args.backend == 'transformers' else ['linear_qkv'])
     if args.task != 'embedding':
         targets += ['score' if args.backend == 'transformers' else 'output_layer']
@@ -39,27 +34,6 @@ def validate(base_url, controller, args):
         diagnostics = ray.get(controller.diagnostics.remote(base_model='cs-' + args.task))
         return all(row['state'] == 'STOPPED' for row in diagnostics['instances'])
 
-    # Execute the user-facing main rather than inferring coverage from imported helpers.
-    command = [sys.executable, '-u', str(root / f'cookbook/client/twinkle/{args.task}.py'),
-               '--backend', args.backend, '--base-url', base_url, '--tokenizer', base_path,
-               '--steps', str(args.steps), '--result-json', str(directory / 'cli-result.json')]
-    with (directory / 'cli.log').open('w') as output:
-        completed = subprocess.run(command, cwd=root, stdout=output, stderr=subprocess.STDOUT, timeout=1800)
-    assert completed.returncode == 0, (directory / 'cli.log').read_text()[-6000:]
-    cli = json.loads((directory / 'cli-result.json').read_text())
-    assert np.isfinite(cli['losses']).all()
-    first_loss = float(np.mean(cli['losses'][:3]))
-    last_loss = float(np.mean(cli['losses'][-3:]))
-    loss_drop = (first_loss - last_loss) / first_loss
-    assert loss_drop >= args.min_loss_drop, (cli['losses'], loss_drop)
-    assert cli['progress']['cur_step'] == args.steps
-    assert cli['progress']['consumed_train_samples'] == args.steps * len(batch)
-    assert np.max(np.abs(np.asarray(cli['trained']) - np.asarray(cli['before']))) > 1e-7
-    wait_until(stopped, 180, 'CLI did not release the instance')
-    if args.cli_only:
-        return {'passed': True, 'task': args.task, 'backend': args.backend, 'cli': True,
-                'slot_reuse': None, 'progress': cli['progress'], 'losses': cli['losses'],
-                'loss_drop': loss_drop}
     clients, live = [], []
 
     def create(token, label):
@@ -98,7 +72,9 @@ def validate(base_url, controller, args):
             kwargs['micro_batch_size'] = 6
         result = model.forward_backward(inputs=copy.deepcopy(batch), **kwargs).result
         assert np.isfinite(result['loss'])
+        # Call after every backward; the backend gates updates at its GA boundary.
         model.clip_grad_and_step()
+        return float(result['loss'])
 
     def save(model, name, samples):
         return model.save(name, save_optimizer=True, consumed_train_samples=samples)
@@ -107,6 +83,24 @@ def validate(base_url, controller, args):
         return load_file(str(Path(saved.checkpoint_dir, 'adapter_model.safetensors')))
 
     try:
+        # Longer single-tenant run: the loss must clearly fall and the checkpoint must record progress.
+        trainer = create('task-owner-train', 'train')
+        before = read(trainer)
+        losses = [step(trainer) for _ in range(args.steps)]
+        assert np.max(np.abs(read(trainer) - before)) > 1e-7
+        first_loss = float(np.mean(losses[:3]))
+        last_loss = float(np.mean(losses[-3:]))
+        loss_drop = (first_loss - last_loss) / first_loss
+        assert loss_drop >= args.min_loss_drop, (losses, loss_drop)
+        trained_progress = save(trainer, 'train-final', args.steps * len(batch))
+        state = json.loads(Path(trained_progress.checkpoint_dir, 'trainer_state.json').read_text())
+        assert state['cur_step'] == args.steps and state['consumed_train_samples'] == args.steps * len(batch)
+        release(trainer)
+        wait_until(stopped, 180, 'Training run did not release the instance')
+        if args.training_only:
+            return {'passed': True, 'task': args.task, 'backend': args.backend, 'slot_reuse': None,
+                    'losses': losses, 'loss_drop': loss_drop}
+
         a, b = create('task-owner-a', 'tenant'), create('task-owner-b', 'tenant')
         diagnostics = ray.get(controller.diagnostics.remote(base_model='cs-' + args.task))
         ready = [row for row in diagnostics['instances'] if row['state'] == 'READY']
@@ -153,8 +147,8 @@ def validate(base_url, controller, args):
         release(cold)
         wait_until(stopped, 180, 'Cold instance did not stop')
         return {'passed': True, 'task': args.task, 'backend': args.backend,
-                'cli': True, 'slot_reuse': True, 'progress': progress, 'head_update_keys': updates,
-                'losses': cli['losses'], 'loss_drop': loss_drop}
+                'slot_reuse': True, 'progress': progress, 'head_update_keys': updates,
+                'losses': losses, 'loss_drop': loss_drop}
     finally:
         try:
             for model in reversed(live):
@@ -168,14 +162,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--backend', choices=['transformers', 'megatron'], required=True)
     parser.add_argument('--task', choices=['embedding', 'reranker', 'seq_cls'], nargs='+', required=True)
-    parser.add_argument('--model-dir', required=True)
+    parser.add_argument('--model-dir', required=True,
+                        help='Bases from cs_tasks/task_models.py; Megatron Qwen3.5 needs the -mcore output')
     parser.add_argument('--run-dir', required=True)
     parser.add_argument('--steps', type=int, default=31)
     parser.add_argument('--reranker-steps', type=int, default=63)
     parser.add_argument('--min-loss-drop', type=float, default=0.1)
-    parser.add_argument('--cli-only', action='store_true')
+    parser.add_argument('--training-only', action='store_true')
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[3]
     directory = Path(args.run_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     import ray
@@ -183,7 +177,7 @@ def main():
     from twinkle.server.config import ServerConfig
     from twinkle.server.launcher.server_launcher import ServerLauncher
 
-    config = ServerConfig.from_yaml(root / f'cookbook/client/twinkle/task_server_{args.backend}.yaml')
+    config = ServerConfig.from_yaml(Path(__file__).with_name('cs_tasks') / f'task_server_{args.backend}.yaml')
     model_apps = []
     aliases = {}
     for task in args.task:

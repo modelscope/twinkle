@@ -34,5 +34,5 @@ def test_task_cli_isolation_checkpoint_and_release(tmp_path):
     assert completed.returncode == 0, (directory / 'server.log').read_text()[-6000:]
     for task in ['embedding', 'reranker', 'seq_cls']:
         result = json.loads((directory / (backend + '-' + task) / 'results.json').read_text())
-        assert result['passed'] and result['cli'] and result['slot_reuse']
+        assert result['passed'] and result['slot_reuse']
         assert result['loss_drop'] >= 0.1

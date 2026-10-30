@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from cookbook.client.twinkle.prepare_sequence_model import _mcore_native_key
+from tests.server.integration.cs_tasks.task_models import _mcore_native_key, encoded_batch
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.training import TrainingArguments
 from twinkle.server.model.app import _validate_model_task
+
+TASK_CONFIGS = Path(__file__).resolve().parents[1] / 'integration' / 'cs_tasks'
 
 
 @pytest.mark.parametrize('options', [
@@ -23,8 +25,7 @@ def test_task_head_arguments_fail_fast(options):
 
 @pytest.mark.parametrize('backend', ['transformers', 'megatron'])
 def test_task_recipe_yaml_preserves_head_contract(backend):
-    root = Path(__file__).resolve().parents[3]
-    config = ServerConfig.from_yaml(root / f'cookbook/client/twinkle/task_server_{backend}.yaml')
+    config = ServerConfig.from_yaml(TASK_CONFIGS / f'task_server_{backend}.yaml')
     models = {model.name: model for model in config.training_config.models}
     assert set(models) == {'cs-embedding', 'cs-reranker', 'cs-seq_cls'}
     assert models['cs-reranker'].config.num_labels == 1
@@ -38,14 +39,13 @@ def test_task_recipe_yaml_preserves_head_contract(backend):
         assert app.args.language_model_only is True
 
 
-def test_qwen35_megatron_yaml_uses_native_bases():
+def test_cookbook_seq_cls_yaml_declares_heads():
     root = Path(__file__).resolve().parents[3]
-    config = ServerConfig.from_yaml(root / 'cookbook/client/twinkle/task_server_megatron_qwen35.yaml')
-    apps = [app for app in config.applications if app.import_path == 'model']
-    assert len(apps) == 3
-    for app in apps:
-        assert app.args.model_id.startswith('output/cs-models-mcore/')
-        assert app.args.language_model_only is True
+    config = ServerConfig.from_yaml(root / 'cookbook/client/server/transformer/server_config_seq_cls.yaml')
+    models = {model.name: model.config for model in config.training_config.models}
+    assert models['Qwen3.5-4B-reranker'].num_labels == 1
+    assert models['Qwen3.5-4B-seq-cls'].num_labels == 3
+    assert all('score' in model.target_modules for model in models.values())
 
 
 def test_mcore_native_weights_keep_the_language_model_prefix():
@@ -89,15 +89,13 @@ def test_default_model_path_does_not_load_head_metadata(monkeypatch):
 
 
 @pytest.mark.parametrize('task', ['embedding', 'reranker', 'seq_cls'])
-def test_cookbook_batches_match_the_wire_contract(task):
-    import importlib
+def test_task_batches_match_the_wire_contract(task):
     from pydantic import TypeAdapter
     from twinkle.protocol.types.data import WireInputBatch
 
-    recipe = importlib.import_module('cookbook.client.twinkle.' + task)
     def tokenizer(text, **kwargs):
         return {'input_ids': [4, 5, 6], 'attention_mask': [1, 1, 1]}
-    batch = recipe.encoded_batch(tokenizer)
+    batch = encoded_batch(task, tokenizer)
     parsed = TypeAdapter(WireInputBatch).validate_python(batch)
     assert len(parsed) == 12
     assert all(type(label) is int for row in parsed for label in row.labels)

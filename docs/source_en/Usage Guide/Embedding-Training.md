@@ -159,7 +159,7 @@ metric = model.calculate_metric(is_training=True)
 
 **No manual apply_patch needed.** As long as you pass `task='embedding'` to `forward_backward` (or `forward_only`), the server automatically switches to embedding mode for that single `forward` call and rolls back afterwards — you do **not** need to call `apply_patch(...)` explicitly. So after a `forward_backward(task='embedding')`, calling `forward_only` without `task` on the same adapter still returns normal vocab-dimension `logits`, unaffected.
 
-After creating the adapter and configuring its template, set the processor, loss and optimizer explicitly. Metrics are optional. See `cookbook/client/twinkle/embedding.py` for a standalone example including save, cold recreation, optimizer resume and final release; parameter meanings and recommended values are in "Key Parameters" above.
+After creating the adapter and configuring its template, set the processor, loss and optimizer explicitly. Metrics are optional. See `cookbook/client/twinkle/embedding.py` for a standalone example including the final save; parameter meanings and recommended values are in "Key Parameters" above.
 
 ---
 

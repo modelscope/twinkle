@@ -55,8 +55,7 @@ def test_head_lora_tenants_and_cold_optimizer_resume(tmp_path, monkeypatch, task
     from peft import LoraConfig
     from safetensors.torch import load_file
     from transformers import AutoTokenizer
-    from cookbook.client.twinkle.prepare_sequence_model import prepare_models, tiny_backbone
-    from cookbook.client.twinkle import embedding, reranker, seq_cls
+    from tests.server.integration.cs_tasks.task_models import encoded_batch, prepare_models, tiny_backbone
     from twinkle import Platform, initialize
     from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
 
@@ -65,8 +64,7 @@ def test_head_lora_tenants_and_cold_optimizer_resume(tmp_path, monkeypatch, task
     initialize(mode='local')
     paths = prepare_models(tiny_backbone(tmp_path / 'source'), tmp_path / 'bases')
     targets = ['q_proj', 'v_proj'] + ([] if task == 'embedding' else ['score'])
-    recipe = {'embedding': embedding, 'reranker': reranker, 'seq_cls': seq_cls}[task]
-    batch = recipe.encoded_batch(AutoTokenizer.from_pretrained(paths[task]))
+    batch = encoded_batch(task, AutoTokenizer.from_pretrained(paths[task]))
     assert all(row['input_ids'] for row in batch), batch
 
     def build():

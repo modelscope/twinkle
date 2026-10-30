@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Prepare fixed text backbones and classification heads for CS training.
+"""Fixed bases and batches for the CS task acceptance (embedding, reranker, seq_cls).
 
-    python cookbook/client/twinkle/prepare_sequence_model.py --model ms://Qwen/Qwen3.5-4B
-    python cookbook/client/twinkle/prepare_sequence_model.py --model ms://Qwen/Qwen3.5-4B --mcore-native
-    python cookbook/client/twinkle/prepare_sequence_model.py --tiny
+From the repository root:
+    python -m tests.server.integration.cs_tasks.task_models --tiny
+    python -m tests.server.integration.cs_tasks.task_models --model ms://Qwen/Qwen3.5-4B
+    python -m tests.server.integration.cs_tasks.task_models --model ms://Qwen/Qwen3.5-4B --mcore-native
 
 Checkpoints land in output/cs-models/{embedding,reranker,seq_cls}. Cold workers
 load these complete bases, never a newly randomized classification head.
@@ -18,6 +19,46 @@ import shutil
 import torch
 import transformers
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+
+# Each group is (query, positive, negative). Labels mark group starts, not relevance.
+EMBEDDING_TRIPLETS = [
+    ('cat animal', 'cat pet', 'plane sky'),
+    ('dog animal', 'dog pet', 'stock market'),
+    ('apple fruit', 'apple sweet', 'car vehicle'),
+    ('boat vehicle', 'boat water', 'banana fruit'),
+]
+# Wire labels are integer 0/1; PointwiseRerankerLoss casts them to the score dtype.
+RERANKER_PAIRS = [
+    ('cat animal', 'cat pet', 1), ('cat animal', 'plane sky', 0),
+    ('dog animal', 'dog pet', 1), ('dog animal', 'stock market', 0),
+    ('apple fruit', 'apple sweet', 1), ('apple fruit', 'car vehicle', 0),
+    ('boat vehicle', 'boat water', 1), ('boat vehicle', 'banana fruit', 0),
+    ('cat animal', 'cat pet', 1), ('cat animal', 'plane sky', 0),
+    ('dog animal', 'dog pet', 1), ('dog animal', 'stock market', 0),
+]
+# Class IDs match the three-output head: animal=0, fruit=1, vehicle=2.
+SEQ_CLS_SAMPLES = [
+    ('cat animal', 0), ('dog pet', 0), ('apple fruit', 1), ('banana sweet', 1),
+    ('car vehicle', 2), ('boat water', 2), ('cat pet', 0), ('dog animal', 0),
+    ('orange fruit', 1), ('apple sweet', 1), ('train vehicle', 2), ('boat vehicle', 2),
+]
+
+
+def encoded_batch(task, tokenizer):
+    """Return twelve right-paddable features; Megatron DP=2 keeps whole embedding triplets per rank."""
+    if task == 'embedding':
+        texts = [(text, int(index == 0)) for group in EMBEDDING_TRIPLETS for index, text in enumerate(group)]
+    elif task == 'reranker':
+        texts = [('Query: ' + query + '\nDocument: ' + document, label) for query, document, label in RERANKER_PAIRS]
+    else:
+        texts = SEQ_CLS_SAMPLES
+    rows = []
+    for text, label in texts:
+        row = dict(tokenizer(text, truncation=True, max_length=128))
+        row['labels'] = [label]
+        row['position_ids'] = list(range(len(row['input_ids'])))
+        rows.append(row)
+    return rows
 
 
 def tiny_backbone(directory, tokenizer_source='ms://Qwen/Qwen3.5-4B', seed=42):

@@ -159,7 +159,7 @@ metric = model.calculate_metric(is_training=True)
 
 **无需手动 apply_patch。** 只要在 `forward_backward`（或 `forward_only`）中传入 `task='embedding'`，服务端就会在这一次 `forward` 期间自动切换到 embedding 模式、并在结束后自动回滚——你**不需要**显式调用 `apply_patch(...)`。因此同一个 adapter 在 `forward_backward(task='embedding')` 之后，再调用不带 `task` 的 `forward_only` 仍会返回正常的词表维度 `logits`，互不影响。
 
-创建 adapter 并配置模板后，需要显式设置 processor、loss 和 optimizer；metric 按需添加。可直接运行的完整示例见 `cookbook/client/twinkle/embedding.py`，包含保存、冷重建、optimizer 恢复和最终释放。各参数含义与取值建议见上文「关键参数」。
+创建 adapter 并配置模板后，需要显式设置 processor、loss 和 optimizer；metric 按需添加。可直接运行的完整示例见 `cookbook/client/twinkle/embedding.py`，包含训练后的保存。各参数含义与取值建议见上文「关键参数」。
 
 ---
 

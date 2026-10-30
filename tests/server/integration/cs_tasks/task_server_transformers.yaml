@@ -1,5 +1,5 @@
-# Qwen3.5 text-only Megatron tasks. Prepare with --mcore-native first.
-# Tokenizers can stay in output/cs-models; these bases use model.language_model.* keys.
+# Prepare the persisted bases with task_models.py before starting this server from the repository root.
+# Each public alias has one frozen base and two independent LoRA tenant slots.
 http_options:
   host: 127.0.0.1
   port: 8000
@@ -23,21 +23,22 @@ applications:
   import_path: model
   route_prefix: /api/v1/model/cs-embedding
   args: &model_args
-    backend: megatron
-    model_id: output/cs-models-mcore/embedding
+    backend: transformers
+    model_id: output/cs-models/embedding
     train_mode: lora
     task_type: causal_lm
-    language_model_only: true
+    gradient_checkpointing: false
+    mixed_precision: 'no'
     max_loras: 2
     max_r: 8
     max_length: 256
     min_replicas: 0
     max_replicas: 1
     idle_timeout_s: 60
-    nproc_per_node: 2
-    device_group: {name: model, ranks: 2, device_type: cuda}
-    device_mesh: {device_type: cuda, dp_size: 2}
-    target_modules: [linear_qkv]
+    nproc_per_node: 1
+    device_group: {name: model, ranks: 1, device_type: cuda}
+    device_mesh: {device_type: cuda, dp_size: 1}
+    target_modules: [q_proj, v_proj]
     queue_config: {execution_timeout: 600}
   deployments: &deployments
   - name: ModelManagement
@@ -47,18 +48,18 @@ applications:
   route_prefix: /api/v1/model/cs-reranker
   args:
     <<: *model_args
-    model_id: output/cs-models-mcore/reranker
+    model_id: output/cs-models/reranker
     task_type: seq_cls
     num_labels: 1
-    target_modules: [linear_qkv, output_layer]
+    target_modules: [q_proj, v_proj, score]
   deployments: *deployments
 - name: seq-cls
   import_path: model
   route_prefix: /api/v1/model/cs-seq_cls
   args:
     <<: *model_args
-    model_id: output/cs-models-mcore/seq_cls
+    model_id: output/cs-models/seq_cls
     task_type: seq_cls
     num_labels: 3
-    target_modules: [linear_qkv, output_layer]
+    target_modules: [q_proj, v_proj, score]
   deployments: *deployments

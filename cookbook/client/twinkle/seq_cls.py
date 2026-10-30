@@ -1,127 +1,106 @@
-# Copyright (c) ModelScope Contributors. All rights reserved.
-"""Train a three-class CS model with backbone and classification-head LoRA.
+# Twinkle Client - Sequence Classification Training Example
+#
+# Trains a three-class text classifier (animal / fruit / vehicle) over HTTP:
+#
+#   add_adapter_to_model(LoRA on the backbone + the 'score' head)
+#     -> set_processor('InputProcessor')
+#     -> set_loss('SeqClsLoss', problem_type='single_label_classification', num_labels=3)
+#     -> set_optimizer('Adam', ...)
+#     -> loop: forward_backward(inputs=batch, task='seq_cls') + clip_grad_and_step
+#     -> save(...)
+#
+# Data format: one text per sample, ``labels`` = [class_id] with an int class_id
+# in [0, num_labels).
+#
+# Before running (from the repository root):
+#   1. python cookbook/client/twinkle/prepare_seq_cls_model.py --num-labels 3 --output-dir output/Qwen3.5-4B-seq-cls
+#   2. ray start --head --num-gpus=2
+#   3. python -m twinkle.server launch --config cookbook/client/server/transformer/server_config_seq_cls.yaml
 
-From the repository root:
-    python cookbook/client/twinkle/prepare_sequence_model.py --tiny
-    twinkle-server launch --config cookbook/client/twinkle/task_server_transformers.yaml
-    python cookbook/client/twinkle/seq_cls.py
-
-For Megatron with the tiny model, use task_server_megatron.yaml and pass --backend megatron.
-For Qwen3.5, prepare with --model ms://Qwen/Qwen3.5-4B --mcore-native, launch
-with task_server_megatron_qwen35.yaml, and keep the tokenizer in output/cs-models/seq_cls.
-The base checkpoint must contain a fixed three-output head;
-this recipe does not train a full head through modules_to_save.
-"""
-import argparse
-import json
-import os
-from pathlib import Path
-
+import dotenv
 import numpy as np
+import os
 from peft import LoraConfig
-from transformers import AutoTokenizer
 
+from twinkle import get_logger
 from twinkle import init_twinkle_client
+from twinkle.template import Qwen3_5Template
 
-# Class IDs match the head width in the service YAML: animal=0, fruit=1, vehicle=2.
+dotenv.load_dotenv('.env')
+logger = get_logger()
+
+# ========== Configuration ==========
+MODEL = 'Qwen3.5-4B-seq-cls'            # the model route in server_config_seq_cls.yaml
+TOKENIZER_ID = 'ms://Qwen/Qwen3.5-4B'   # the prepared base keeps the original tokenizer
+NUM_LABELS = 3                          # must match num_labels in the server config
+LEARNING_RATE = 1e-4
+MAX_STEPS = 10
+
+LABELS = ['animal', 'fruit', 'vehicle']
 SAMPLES = [
-    ('cat animal', 0), ('dog pet', 0), ('apple fruit', 1), ('banana sweet', 1),
-    ('car vehicle', 2), ('boat water', 2), ('cat pet', 0), ('dog animal', 0),
-    ('orange fruit', 1), ('apple sweet', 1), ('train vehicle', 2), ('boat vehicle', 2),
+    ('The cat is sleeping on the sofa.', 'animal'),
+    ('A dog barked at the mailman.', 'animal'),
+    ('The horse galloped across the field.', 'animal'),
+    ('An eagle flew over the mountains.', 'animal'),
+    ('I ate a crisp red apple.', 'fruit'),
+    ('Bananas are rich in potassium.', 'fruit'),
+    ('She squeezed fresh oranges for juice.', 'fruit'),
+    ('The grapes on the vine are ripe.', 'fruit'),
+    ('He drove his car to work.', 'vehicle'),
+    ('The train arrived at the station on time.', 'vehicle'),
+    ('A bus stopped at the corner.', 'vehicle'),
+    ('The airplane took off from the runway.', 'vehicle'),
 ]
 
 
-def encoded_batch(tokenizer):
-    rows = []
-    for text, class_id in SAMPLES:
-        row = dict(tokenizer(text, truncation=True, max_length=128))
-        row['labels'] = [class_id]
-        row['position_ids'] = list(range(len(row['input_ids'])))
-        rows.append(row)
-    return rows
+def build_batch(tokenizer):
+    """One feature per text; ``labels`` holds the class index of that text."""
+    batch = []
+    for text, label in SAMPLES:
+        input_ids = tokenizer.encode(text)
+        batch.append({
+            'input_ids': input_ids,
+            'attention_mask': [1] * len(input_ids),
+            'labels': [LABELS.index(label)],
+        })
+    return batch
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--backend', choices=['transformers', 'megatron'], default='transformers')
-    parser.add_argument('--base-url', default=os.environ.get('TWINKLE_SERVER_URL', 'http://127.0.0.1:8000'))
-    parser.add_argument('--api-key', default=os.environ.get('TWINKLE_SERVER_TOKEN', 'classification-example'))
-    parser.add_argument('--model', default='cs-seq_cls', help='Public model alias in the server YAML')
-    parser.add_argument('--tokenizer', default='output/cs-models/seq_cls')
-    parser.add_argument('--steps', type=int, default=7, help='Backward batches; save on a GA=2 update boundary')
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--atol', type=float, default=2e-5)
-    parser.add_argument('--result-json', help='Optional local file for model outputs and training progress')
-    args = parser.parse_args()
-    if args.steps < 3 or args.steps % 2 == 0:
-        parser.error('--steps must be odd and at least 3 so GA=2 has no unsaved pending gradients')
-    if not np.isfinite(args.lr) or args.lr <= 0 or not np.isfinite(args.atol) or args.atol < 0:
-        parser.error('lr must be positive; atol must be finite and nonnegative')
-    batch = encoded_batch(AutoTokenizer.from_pretrained(args.tokenizer))
-    client = init_twinkle_client(base_url=args.base_url, api_key=args.api_key)
-    model = None
-    targets = (['q_proj', 'v_proj', 'score'] if args.backend == 'transformers' else
-               ['linear_qkv', 'output_layer'])
-    forward_kwargs = {'task': 'seq_cls', 'return_logits': True}
-    if args.backend == 'megatron':
-        forward_kwargs.update(micro_batch_size=6, compute_loss=False)
-    try:
-        model = client.model(args.model)
-        model.add_adapter_to_model('classification', LoraConfig(r=4, lora_alpha=8, target_modules=targets),
-                                   gradient_accumulation_steps=2)
-        model.set_template('Template', max_length=128)
-        model.set_processor('InputProcessor', padding_side='right')
-        # Cross entropy consumes one integer class ID per input sequence.
-        model.set_loss('SeqClsLoss', problem_type='single_label_classification', num_labels=3)
-        model.set_optimizer('Adam', lr=args.lr)
-        before = model.forward_only(inputs=batch, **forward_kwargs).result['logits']
-        losses = []
-        for _ in range(args.steps):
-            kwargs = {'task': 'seq_cls', 'gradient_accumulation_steps': 2}
-            if args.backend == 'megatron':
-                kwargs['micro_batch_size'] = 6
-            result = model.forward_backward(inputs=batch, **kwargs).result
-            # Call after every backward; the backend gates updates at its GA boundary.
-            model.clip_grad_and_step(max_grad_norm=1.0)
-            losses.append(float(result['loss']))
-        trained = model.forward_only(inputs=batch, **forward_kwargs).result['logits']
-        saved = model.save('classification-trained', save_optimizer=True,
-                           consumed_train_samples=args.steps * len(batch))
-        model.remove_adapter()
-        model = None
+def train():
+    # Step 1: connect to the running Twinkle server.
+    client = init_twinkle_client(
+        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
+    )
 
-        # Restore both LoRA (including score-head LoRA) and optimizer, not a new random head.
-        model = client.model(args.model)
-        model.add_adapter_to_model('restored', LoraConfig(r=4, lora_alpha=8, target_modules=targets),
-                                   gradient_accumulation_steps=2)
-        model.set_template('Template', max_length=128)
-        model.set_processor('InputProcessor', padding_side='right')
-        model.set_loss('SeqClsLoss', problem_type='single_label_classification', num_labels=3)
-        model.set_optimizer('Adam', lr=args.lr)
-        progress = model.resume_from_checkpoint(saved.twinkle_path)
-        restored = model.forward_only(inputs=batch, **forward_kwargs).result['logits']
-        np.testing.assert_allclose(restored, trained, rtol=0, atol=args.atol)
-        for _ in range(2):
-            kwargs = {'task': 'seq_cls', 'gradient_accumulation_steps': 2}
-            if args.backend == 'megatron':
-                kwargs['micro_batch_size'] = 6
-            model.forward_backward(inputs=batch, **kwargs)
-            model.clip_grad_and_step()
-        continued = model.forward_only(inputs=batch, **forward_kwargs).result['logits']
-        result = {'task': 'seq_cls', 'backend': args.backend, 'losses': losses,
-                  'checkpoint': saved.twinkle_path, 'checkpoint_dir': saved.checkpoint_dir,
-                  'progress': progress, 'before': before, 'trained': trained,
-                  'restored': restored, 'continued': continued}
-        if args.result_json:
-            Path(args.result_json).write_text(json.dumps(result, indent=2))
-        print(json.dumps({'losses': losses, 'checkpoint': saved.twinkle_path, 'progress': progress}))  # noqa: T201
-    finally:
-        try:
-            if model is not None:
-                model.remove_adapter()
-        finally:
-            client.close()
+    # Step 2: create a LoRA adapter. 'score' is the classification head: give it its
+    # own LoRA too, otherwise the head stays at its random initialization.
+    model = client.model(MODEL)
+    model.add_adapter_to_model('seq_cls', LoraConfig(target_modules=['q_proj', 'v_proj', 'score']))
+    model.set_template('Template')
+
+    # Step 3: configure processor, loss and optimizer.
+    model.set_processor('InputProcessor')
+    model.set_loss('SeqClsLoss', problem_type='single_label_classification', num_labels=NUM_LABELS)
+    model.set_optimizer('Adam', lr=LEARNING_RATE)
+
+    # Step 4: tokenize the samples locally.
+    tokenizer = Qwen3_5Template(model_id=TOKENIZER_ID).tokenizer
+    batch = build_batch(tokenizer)
+
+    # Step 5: training loop. task='seq_cls' returns one [num_labels] score row per text.
+    for step in range(MAX_STEPS):
+        output = model.forward_backward(inputs=batch, task='seq_cls')
+        model.clip_grad_and_step(max_grad_norm=1.0)
+        logger.info(f'Step {step}: loss={output.result["loss"]:.4f}')
+
+    # Step 6: check the predictions, then save the adapter and optimizer state.
+    logits = model.forward_only(inputs=batch, task='seq_cls', return_logits=True).result['logits']
+    for (text, label), row in zip(SAMPLES, logits):
+        logger.info(f'{text!r}: predicted={LABELS[int(np.argmax(row))]}, expected={label}')
+    saved = model.save('seq-cls-final', save_optimizer=True)
+    logger.info(f'Saved checkpoint: {saved.twinkle_path}')
 
 
 if __name__ == '__main__':
-    main()
+    train()
