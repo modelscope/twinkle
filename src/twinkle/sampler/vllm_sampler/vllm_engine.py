@@ -1043,6 +1043,7 @@ class VLLMEngine(BaseSamplerEngine):
         proper cleanup of the vLLM AsyncLLM engine and its subprocesses.
         """
         import gc
+        import inspect
 
         logger.info('Shutting down VLLMEngine...')
 
@@ -1054,11 +1055,15 @@ class VLLMEngine(BaseSamplerEngine):
             try:
                 # vLLM v1 AsyncLLM has shutdown() method
                 if hasattr(self.engine, 'shutdown'):
-                    await self.engine.shutdown()
+                    result = self.engine.shutdown()
+                    if inspect.isawaitable(result):
+                        await result
                 elif hasattr(self.engine, 'engine_core'):
                     # For older versions, try to stop engine core
                     if hasattr(self.engine.engine_core, 'shutdown'):
-                        await self.engine.engine_core.shutdown()
+                        result = self.engine.engine_core.shutdown()
+                        if inspect.isawaitable(result):
+                            await result
             except Exception as e:
                 logger.warning(f'Error during engine shutdown: {e}')
             finally:
