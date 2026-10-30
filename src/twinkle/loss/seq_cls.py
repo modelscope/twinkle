@@ -44,6 +44,9 @@ class SeqClsLoss(Loss):
         self.problem_type = problem_type
         self.num_labels = num_labels
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:
         logits = outputs['logits']
         labels = inputs['labels'].to(logits.device)

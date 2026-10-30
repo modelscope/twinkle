@@ -759,6 +759,24 @@ def test_hybrid_context_keeps_fft_slot_selected_between_operations(monkeypatch):
     assert fft_wrapper.active_adapters == []
 
 
+def test_hybrid_restores_lora_gradients_if_fft_restore_fails(monkeypatch):
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+
+    def fail_restore(_adapter):
+        raise RuntimeError('FFT restore failed')
+
+    monkeypatch.setattr(spectral, 'activate_fft_slot', fail_restore)
+    with pytest.raises(RuntimeError, match='FFT restore failed'):
+        with service._adapter_context('hybrid', disable_lora=True):
+            pass
+    assert all(parameter.requires_grad for name, parameter in model.named_parameters() if 'lora_' in name)
+
+
 def test_hybrid_context_switches_between_two_fft_tenants():
     from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
 
@@ -871,11 +889,15 @@ def test_disable_lora_restores_slots_after_operation_fails():
     assert all(parameter.requires_grad for name, parameter in model.named_parameters() if 'lora_' in name)
 
 
-def test_multi_tenant_hybrid_isolation_and_non_destructive_merge():
+@pytest.mark.parametrize('fft_disabled', [False, True])
+def test_multi_tenant_hybrid_isolation_and_non_destructive_merge(fft_disabled):
     base, model, manager, spectral = _make_multi_tenant_hybrid()
     inputs = torch.randn(2, 8)
     with manager.adapter('regular'):
         regular_before = model(inputs).detach().clone()
+    if fft_disabled:
+        # A normal LoRA selection can disable auxiliary FFT wrappers in PEFT.
+        spectral._get_fft_wrapper('layers.0.self_attn.q_proj').enable_adapters(False)
 
     hybrid = manager.find_lora_by_tenant('hybrid')
     modules = dict(model.named_modules())
@@ -1091,14 +1113,14 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
 
         @staticmethod
         def save_optimizer_checkpoint(_model, optimizer, output_path, *, param_name_mapping=None):
-            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = optimizer.state_dict()
             remap_optimizer_state_names(state, param_name_mapping or {})
             torch.save(state, output_path)
 
         @staticmethod
         def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
-            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = torch.load(input_path, map_location='cpu', weights_only=False)
             remap_optimizer_state_names(state, param_name_mapping or {})
             optimizer.load_state_dict(state)
@@ -1163,6 +1185,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
         'cur_step': 3,
         'consumed_train_samples': 17,
         'gradient_accumulation_steps': 2,
+        'component_states': {},
     }
 
     hybrid.tenant_config.lora_alpha += 1
@@ -1212,14 +1235,14 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
 
         @staticmethod
         def save_optimizer_checkpoint(_model, optimizer, output_path, *, param_name_mapping=None):
-            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = optimizer.state_dict()
             remap_optimizer_state_names(state, param_name_mapping or {})
             torch.save(state, output_path)
 
         @staticmethod
         def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
-            from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+            from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = torch.load(input_path, map_location='cpu', weights_only=False)
             remap_optimizer_state_names(state, param_name_mapping or {})
             optimizer.load_state_dict(state)
@@ -1303,7 +1326,7 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
     uninterrupted_optimizer = uninterrupted.optimizer_group['hybrid'].optimizer.state_dict()
     resumed_optimizer = resumed.optimizer_group['hybrid'].optimizer.state_dict()
     # Normalized optimizer groups must match despite different runtime slots.
-    from twinkle.model.transformers.strategy.optimizer_state import remap_optimizer_state_names
+    from twinkle.model.state_dict_utils import remap_optimizer_state_names
     remap_optimizer_state_names(
         uninterrupted_optimizer,
         uninterrupted._optimizer_param_name_mapping(

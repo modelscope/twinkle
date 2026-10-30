@@ -61,13 +61,14 @@ drain itself (no ``torch.cuda`` / ``Platform.is_npu`` probes); the cookbook owns
 it.
 """
 from __future__ import annotations
+from typing import Optional
 
 import torch.nn.functional as F
-from typing import Optional
 
 from twinkle import get_logger
 from twinkle.data_format import LossOutput, ModelOutput
 from .base import Loss
+from .utils import count_loss_tokens
 
 logger = get_logger()
 
@@ -150,6 +151,20 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         self._liger = None
         self._fused_broken = False
         self._warned = False
+
+    def micro_batch_scale(self, inputs, indices):
+        if self.reduction == 'sum':
+            return 1.0
+        token_counts = [count_loss_tokens(model_input, self.ignore_index) for model_input in inputs]
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
+
+    def batch_normalizer(self, inputs):
+        if self.reduction != 'sum':
+            return None
+        return sum(count_loss_tokens(model_input, self.ignore_index) for model_input in inputs)
 
     def _ensure_liger(self):
         if self._liger is None:

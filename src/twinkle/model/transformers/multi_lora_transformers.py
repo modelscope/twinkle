@@ -43,6 +43,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
             model_loader: Optional[ModelLoaderProtocol] = None,
+            gradient_checkpointing: bool = True,
+            gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
             acc_strategy: str = 'token',
             model_arch: Optional[Dict[str, Any]] = None,
             **kwargs):
@@ -57,7 +59,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
-        self._ddp_config = ddp_config or {}
+        if self._fsdp_config.get('reshard_after_forward', True) is not True:
+            raise ValueError('Multi-LoRA FSDP requires reshard_after_forward=True for safe adapter switching.')
+        self._ddp_config = dict(ddp_config or {})
+        if self._ddp_config.get('find_unused_parameters') is False or self._ddp_config.get('static_graph', False):
+            raise ValueError('Multi-LoRA DDP requires find_unused_parameters=True and static_graph=False.')
+        self._ddp_config.setdefault('find_unused_parameters', True)
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
@@ -118,7 +125,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
-        self.model.gradient_checkpointing_enable()
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={'use_reentrant': False, **(gradient_checkpointing_kwargs or {})})
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
         # PEFT creates LoRA parameters in FP32 even when the base model uses a
         # lower-precision dtype. Align the preallocated slots before FSDP2
@@ -153,6 +162,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         pass
 
+    def _lazy_wrap_model(self):
+        if self._model_wrapped:
+            return
+        # PEFT freezes inactive slots. DDP must nevertheless register all slots,
+        # since a later tenant may activate any of them on this resident model.
+        with self.multi_adapter.trainable_slots():
+            super()._lazy_wrap_model()
+            # Reset must restore the synchronized (and possibly sharded) basis,
+            # not the rank-local initialization captured before model wrapping.
+            self.multi_adapter.save_initial_weights()
+
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
             raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')
@@ -172,9 +192,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     @contextmanager
     def _adapter_context(self, adapter_name: str, disable_lora: bool = False):
-        """Activate one LoRA tenant for a model operation."""
-        with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora) as slot_name:
-            yield slot_name
+        """Activate a tenant while keeping FSDP2's trainable parameter set stable."""
+        try:
+            with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora) as slot_name:
+                self.multi_adapter.enable_slot_gradients()
+                yield slot_name
+        finally:
+            # Leaving a disable_lora context re-enables adapter layers, which flips the flags again.
+            self.multi_adapter.enable_slot_gradients()
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -344,6 +369,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
+        self._lazy_wrap_model()
         with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
@@ -354,6 +380,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
+        # Establish the synchronized reset basis before checkpoint weights can
+        # replace it, including when load is the first model operation.
+        self._lazy_wrap_model()
         with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:

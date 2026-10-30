@@ -107,6 +107,35 @@ class TestMOPDLoss:
 
         torch.testing.assert_close(mopd['loss'], opsd['loss'])
 
+    @pytest.mark.parametrize('teacher_format', ['tensor', 'list'])
+    @pytest.mark.parametrize('indices', [[0, 1], [2, 3], [3, 1]])
+    def test_single_teacher_micro_batch_slicing_matches_opsd(self, teacher_format, indices):
+        inputs, outputs = _make_batch(batch_size=4)
+        teacher = torch.arange(24, dtype=torch.float32).reshape(4, 6) * -0.1
+        if teacher_format == 'list':
+            mask = inputs['labels'] != -100
+            teacher = [row[row_mask].tolist() for row, row_mask in zip(teacher, mask, strict=True)]
+            expected_teacher = [teacher[index] for index in indices]
+        else:
+            expected_teacher = teacher[indices]
+
+        loss = MOPDLoss()
+        micro_kwargs = loss.micro_batch_kwargs(
+            {'teacher_logps': teacher, 'ref_logps': teacher, 'advantages': [0.1, 0.2, 0.3, 0.4]}, indices, 4)
+        if teacher_format == 'tensor':
+            torch.testing.assert_close(micro_kwargs['teacher_logps'], expected_teacher)
+            torch.testing.assert_close(micro_kwargs['ref_logps'], expected_teacher)
+        else:
+            assert micro_kwargs['teacher_logps'] == expected_teacher
+            assert micro_kwargs['ref_logps'] == expected_teacher
+        assert micro_kwargs['advantages'] == [[0.1, 0.2, 0.3, 0.4][index] for index in indices]
+
+        micro_inputs = {'labels': inputs['labels'][indices]}
+        micro_outputs = {'logps': outputs['logps'][indices]}
+        expected = OPSDLoss()(micro_inputs, micro_outputs, teacher_logps=expected_teacher)
+        actual = loss(micro_inputs, micro_outputs, **micro_kwargs)
+        torch.testing.assert_close(actual['loss'], expected['loss'])
+
     def test_ragged_multi_teacher_matches_dense(self):
         inputs, outputs = _make_batch()
         logps = outputs['logps']

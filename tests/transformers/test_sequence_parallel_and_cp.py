@@ -13,11 +13,10 @@ from transformers.modeling_flash_attention_utils import is_flash_attn_available
 from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
-from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.utils import DeviceMesh, Platform, ensure_hccl_socket_env, selective_log_softmax, torch_util
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy SP/CP test (mp.spawn, world_size up to 4); not viable on dual-V100 CI, run manually.')
+
 
 LOGITS_RTOL = 1e-2
 LOGITS_ATOL = 5e-3
@@ -263,7 +262,7 @@ def _make_strategy(model: LlamaForCausalLM, device_mesh: DeviceMesh, ulysses_siz
 def _prepare_label_inputs(strategy: SequenceParallelStrategy, input_ids: torch.Tensor,
                           position_ids: torch.Tensor) -> torch.Tensor:
     labels = _make_labels(input_ids)
-    processed = strategy.preprocess_inputs({
+    processed = strategy.prepare_model_inputs({
         'input_ids': input_ids,
         'position_ids': position_ids,
         'labels': labels,
@@ -306,6 +305,7 @@ def _compute_training_path_loss(
     loss_inputs = {'labels': labels}
     loss_outputs = {'logps': selective_log_softmax(logits, masked_labels)}
     if strategy is not None:
+        loss_inputs['_sequence_layout'] = {'sharded': ('labels',)}
         loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
     result = CrossEntropyLoss(reduction='sum')(loss_inputs, loss_outputs)
     num_tokens = result['num_tokens']
@@ -421,12 +421,10 @@ def _measure_peak_memory(
     device_module = _get_device_module(device_type)
     device_module.empty_cache()
     device_module.reset_peak_memory_stats(device)
-    outputs = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attention_mask=None,
-        use_cache=False,
-    )
+    prepared = strategy.prepare_model_inputs({'input_ids': input_ids, 'position_ids': position_ids})
+    prepared.pop('_sequence_layout')
+    with strategy.context():
+        outputs = model(**prepared, use_cache=False)
     local_logits = outputs.logits
     loss_sum, _ = _compute_training_path_loss(local_logits, local_labels, strategy)
     loss_sum.backward()
@@ -519,28 +517,25 @@ def _run_precision_worker(rank: int,
             device_type=backend_config['device_type'],
         )
         strategy = _make_strategy(sp_model, device_mesh, int(case['ulysses_size']))
-        processed_inputs = strategy.preprocess_inputs({
-            'input_ids': input_ids,
-            'position_ids': position_ids,
-            'labels': labels,
+        processed_inputs = strategy.prepare_model_inputs({
+            'input_ids': input_ids, 'position_ids': position_ids, 'labels': labels,
+            'attention_mask': attention_mask,
         })
         local_labels = processed_inputs['labels']
 
         sp_model.zero_grad(set_to_none=True)
-        sp_outputs = sp_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
+        processed_inputs.pop('labels')
+        processed_inputs.pop('_sequence_layout')
+        with strategy.context():
+            sp_outputs = sp_model(**processed_inputs, use_cache=False)
         local_logits = sp_outputs.logits
-        gathered_outputs = strategy.postprocess_outputs(sp_outputs)
+        _, gathered_outputs = strategy.gather_loss_tensors({}, sp_outputs)
         sp_logits = gathered_outputs.logits.detach().float()
 
         sp_loss_sum, sp_num_tokens = _compute_training_path_loss(local_logits, local_labels, strategy)
         sp_loss_sum.backward()
         global_loss = sp_loss_sum / max(sp_num_tokens, 1)
-        _average_model_grads_over_group(sp_model, sequence_parallel._data_rank_group)
+        _average_model_grads_over_group(sp_model, strategy._ctx._data_rank_group)
         sp_attention_grads = _normalize_grad_dict(_collect_attention_param_grads(sp_model), sp_num_tokens)
 
         if sp_num_tokens != base_num_tokens:
@@ -653,6 +648,8 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str, ba
         dist.destroy_process_group()
 
 
+@pytest.mark.slow
+@pytest.mark.accel(2)
 class TestDerivedRingPrecision:
 
     def _get_backend_or_skip(self, world_size: int = 4) -> dict:
@@ -720,6 +717,8 @@ class TestDerivedRingPrecision:
             join=True)
 
 
+@pytest.mark.slow
+@pytest.mark.accel(2)
 class TestDerivedRingMemoryProfile:
 
     def _get_backend_or_skip(self, world_size: int = 4) -> dict:
@@ -760,3 +759,333 @@ class TestDerivedRingMemoryProfile:
         backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
         mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_sp_memory', backend), nprocs=world_size, join=True)
+
+
+def test_explicit_sp_context_restores_nested_and_exception_paths():
+    from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, _current_ctx, _attention_context
+    first, second = SequenceParallel(), SequenceParallel()
+    first.model_name = 'policy'
+    assert _current_ctx() is None
+    with first.context():
+        with pytest.raises(RuntimeError, match='unregistered attention'):
+            _attention_context(torch.nn.Linear(2, 2))
+        with pytest.raises(ValueError, match='forward failed'):
+            with second.context():
+                assert _current_ctx() is second
+                raise ValueError('forward failed')
+        assert _current_ctx() is first
+    assert _current_ctx() is None
+
+
+def test_flash_padding_metadata_preserves_real_packed_boundaries():
+    from twinkle.model.transformers.strategy.sequence_parallel import _call_flash_attention
+    positions = torch.tensor([[0, 1, 2, -1, 0, 1, -1, -1]])
+    original = positions.clone()
+    normalized = _call_flash_attention(lambda **kw: kw['position_ids'], position_ids=positions)
+    assert normalized.tolist() == [[0, 1, 2, 3, 0, 1, 2, 3]]
+    # Equivalent boundary rule used by TF 5.15.1; the tail must not become a new sequence.
+    assert (normalized == normalized.min()).nonzero()[:, -1].tolist() == [0, 4]
+    torch.testing.assert_close(positions, original)
+
+
+def _slim_cpu_worker(rank, port, checkpoint):
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import DefaultDeviceType
+    from twinkle.processor import InputProcessor
+    from twinkle.model.transformers.strategy.sequence_parallel import _current_ctx, SequenceParallel
+    DefaultDeviceType.set_device_type('cpu')
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank, world_size=2)
+    try:
+        torch.manual_seed(42)
+        config = LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+                             num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+                             attention_dropout=0., use_cache=False)
+        config._attn_implementation = 'sdpa'
+        base_p, base_r = LlamaForCausalLM(config).train(), LlamaForCausalLM(config).train()
+        policy, reference = copy.deepcopy(base_p), copy.deepcopy(base_r)
+        if checkpoint is not None:
+            for model in (base_p, base_r, policy, reference):
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': checkpoint})
+        mesh = DeviceMesh.from_sizes(fsdp_size=2, dp_size=1, ulysses_size=2, device_type='cpu')
+        policy_sp, ref_sp = _make_strategy(policy, mesh, 2), _make_strategy(reference, mesh, 2)
+        inputs_p = torch.tensor([[1, 3, 5, 7, 9, 11, 13]])
+        inputs_r = torch.tensor([[1, 4, 6, 8, 10, 12, 14, 16, 18]])
+
+        def baseline(model, ids):
+            logits = model(input_ids=ids, use_cache=False).logits
+            labels = _make_labels(ids)
+            loss = F.cross_entropy(logits.reshape(-1, 32), labels.reshape(-1), ignore_index=-100)
+            return logits, loss
+
+        def parallel(strategy, model, ids):
+            inputs = strategy.prepare_model_inputs({'input_ids': ids, 'labels': _make_labels(ids)})
+            labels, layout = inputs.pop('labels'), inputs.pop('_sequence_layout')
+            with strategy.context():
+                output = model(**inputs, use_cache=False)
+            inputs.update(labels=labels, _sequence_layout=layout)
+            inputs, output = strategy.gather_loss_tensors(inputs, output)
+            loss = F.cross_entropy(output.logits.reshape(-1, 32), inputs['labels'].reshape(-1), ignore_index=-100)
+            return output.logits, loss
+
+        baseline_p, loss_p = baseline(base_p, inputs_p)
+        baseline_r, loss_r = baseline(base_r, inputs_r)
+        logits_p, parallel_p = parallel(policy_sp, policy, inputs_p)
+        logits_r, parallel_r = parallel(ref_sp, reference, inputs_r)
+        # Reuse a context with another batch before the first backward: recompute must restore its own positions.
+        parallel(policy_sp, policy, inputs_r)
+        for actual, expected in ((logits_p, baseline_p), (logits_r, baseline_r),
+                                 (parallel_p, loss_p), (parallel_r, loss_r)):
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+        parallel_r.backward()
+        parallel_p.backward()
+        loss_r.backward()
+        loss_p.backward()
+        for model, base in ((policy, base_p), (reference, base_r)):
+            for (_, parameter), (_, original) in zip(model.named_parameters(), base.named_parameters()):
+                assert parameter.grad is not None and original.grad is not None
+                dist.all_reduce(parameter.grad)
+                parameter.grad.div_(2)
+                torch.testing.assert_close(parameter.grad, original.grad, rtol=3e-4, atol=3e-6)
+        assert _current_ctx() is None
+        # The non-SP baseline still uses the origin after all global wrappers have been installed.
+        again, _ = baseline(base_p, inputs_p)
+        torch.testing.assert_close(again, baseline_p, rtol=0, atol=0)
+
+        processor = InputProcessor()
+        # No logps and no labels: critic-style outputs must still gather with autograd.
+        projection = torch.nn.Linear(3, 1, bias=False)
+        full = torch.randn(1, 7, 3)
+        original = projection(full)
+        expected_loss = original.square().mean()
+        expected_loss.backward()
+        expected_grad = projection.weight.grad.clone()
+        projection.zero_grad()
+        prepared = policy_sp.prepare_model_inputs({'input_ids': inputs_p})
+        indices = prepared['_sequence_layout']['indices']
+        padded = F.pad(full, (0, 0, 0, 1))
+        local = padded.gather(1, indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, 3))
+        _, gathered = policy_sp.gather_loss_tensors(prepared, {'values': projection(local)})
+        torch.testing.assert_close(gathered['values'], original, rtol=1e-6, atol=1e-7)
+        gathered['values'].square().mean().backward()
+        dist.all_reduce(projection.weight.grad)
+        projection.weight.grad.div_(2)
+        torch.testing.assert_close(projection.weight.grad, expected_grad, rtol=1e-6, atol=1e-7)
+
+        # Both Ulysses and zigzag Ring layouts; pure communication, no Flash kernel substitution.
+        for ring in (False, True):
+            strategy = SequenceParallelStrategy(mesh, {'ulysses_size': 2})
+            ctx = strategy._ctx
+            ctx.seq_world_size = ctx.world_size = 2
+            ctx.sp_world_size, ctx.rp_world_size = (1, 2) if ring else (2, 1)
+            ctx._init_device_mesh(mesh)
+            ctx.tokenizer = SimpleNamespace(pad_token_id=0)
+            ctx.attn_implementation = 'flash_attention_2'  # packed layout, not an attention-kernel test
+            for positions in (torch.tensor([[-1, 0, 1, -1, 3, 4, -1]]),
+                              torch.tensor([[0, 1, 0, 1, 2, 0, 1]])):
+                if ring and positions[0, 0] < 0:
+                    with pytest.raises(NotImplementedError, match='left padding'):
+                        strategy.prepare_model_inputs({'input_ids': inputs_p, 'position_ids': positions})
+                    continue
+                inputs = {'input_ids': inputs_p, 'position_ids': positions,
+                          'labels': torch.arange(7).unsqueeze(0),
+                          'completion_mask': torch.tensor([[0, 1, 0, 1, 1, 1, 1]]),
+                          'loss_scale': torch.linspace(0., 1., 7).unsqueeze(0)}
+                expected_input = {'position_ids': positions}
+                full = torch.randn(1, 7, 3)
+                projection = torch.nn.Linear(3, 2, bias=False)
+                expected, _ = processor._pool_last_valid_token(projection(full), expected_input)
+                expected.square().sum().backward()
+                expected_grad = projection.weight.grad.clone()
+                projection.zero_grad()
+                prepared = strategy.prepare_model_inputs(inputs)
+                padded = ctx.pad(full, padding_value=0., position_ids=positions)
+                padded_positions = ctx.pad(positions, padding_value=-1, position_ids=positions)
+                local = ctx.split(padded, dim=1, position_ids=padded_positions)
+                pooled, _ = processor._pool_last_valid_token(projection(local), prepared,
+                                                              reduce_fn=strategy.all_reduce)
+                torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-7)
+                restored, _ = strategy.gather_loss_tensors(prepared, {})
+                for name in ('labels', 'completion_mask', 'loss_scale'):
+                    torch.testing.assert_close(restored[name], inputs[name])
+                pooled.square().sum().backward()
+                dist.all_reduce(projection.weight.grad)
+                projection.weight.grad.div_(2)
+                torch.testing.assert_close(projection.weight.grad, expected_grad, rtol=1e-5, atol=1e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('checkpoint', [None, False, True])
+def test_slim_sp_cpu_logits_gradients_values_pooling_and_recompute(checkpoint):
+    mp.spawn(_slim_cpu_worker, args=(_find_free_port(), checkpoint), nprocs=2, join=True)
+
+
+def _slim_qwen_vl_worker(rank, port):
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+    from torch.utils.checkpoint import DefaultDeviceType
+    DefaultDeviceType.set_device_type('cpu')
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank, world_size=2)
+    try:
+        torch.manual_seed(81)
+        import transformers
+        text_config = dict(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                           num_attention_heads=2, num_key_value_heads=2, head_dim=16)
+        # 4.x names this test configuration rope_scaling; 5.x uses rope_parameters.
+        rope_key = 'rope_scaling' if int(transformers.__version__.split('.')[0]) < 5 else 'rope_parameters'
+        text_config[rope_key] = {'rope_type': 'default', 'rope_theta': 10000., 'mrope_section': [2, 3, 3]}
+        config = Qwen3VLConfig(
+            text_config=text_config,
+            vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=4,
+                               patch_size=2, spatial_merge_size=2, temporal_patch_size=1,
+                               out_hidden_size=32, num_position_embeddings=16, deepstack_visual_indexes=[0]),
+            image_token_id=60, video_token_id=61, vision_start_token_id=59, vision_end_token_id=58)
+        config._attn_implementation = 'sdpa'
+        baseline = Qwen3VLForConditionalGeneration(config).train()
+        model = torch.nn.parallel.DistributedDataParallel(copy.deepcopy(baseline))
+        mesh = DeviceMesh.from_sizes(fsdp_size=2, dp_size=1, ulysses_size=2, device_type='cpu')
+        strategy = _make_strategy(model, mesh, 2)
+        ids = torch.tensor([[1, 59, 60, 60, 60, 60, 58, 5, 6]])
+        inputs = dict(input_ids=ids, pixel_values=torch.randn(16, 12), image_grid_thw=torch.tensor([[1, 4, 4]]),
+                      mm_token_type_ids=torch.tensor([[0, 0, 1, 1, 1, 1, 0, 0, 0]]), use_cache=False)
+        expected = baseline(**inputs).logits
+        prepared = strategy.prepare_model_inputs(inputs)
+        prepared.pop('_sequence_layout')
+        assert 'position_ids' not in prepared
+        with strategy.context():
+            output = model(**prepared)
+        _, gathered = strategy.gather_loss_tensors({}, output)
+        torch.testing.assert_close(gathered.logits, expected, rtol=3e-5, atol=3e-6)
+        expected.square().mean().backward()
+        gathered.logits.square().mean().backward()
+        for (name, parameter), (_, original) in zip(model.named_parameters(), baseline.named_parameters()):
+            if original.grad is None:
+                assert parameter.grad is None
+                continue
+            assert parameter.grad is not None, name
+            dist.all_reduce(parameter.grad)
+            parameter.grad.div_(2)
+            torch.testing.assert_close(parameter.grad, original.grad, rtol=3e-4, atol=3e-6, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_qwen3_vl_vision_stays_local_and_text_is_split_after_visual_merge():
+    from transformers.utils import is_torch_available
+    assert is_torch_available()
+    mp.spawn(_slim_qwen_vl_worker, args=(_find_free_port(),), nprocs=2, join=True)
+
+
+def test_sp_weak_registry_does_not_retain_the_model():
+    import gc
+    import weakref
+    from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
+    model = LlamaForCausalLM(LlamaConfig(vocab_size=16, hidden_size=8, intermediate_size=16,
+                                        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2))
+    ref = weakref.ref(model)
+    ctx = SequenceParallel()
+    ctx._prepare_forward_boundaries(model, model.model)
+    ctx.causal_mask_func = model.forward
+    del model
+    gc.collect()
+    assert ref() is None
+    assert ctx.causal_mask_func is None
+
+
+@pytest.mark.parametrize('backend', ['eager', 'flash_attention_2', 'flash_attention_3'])
+def test_sp_rejects_unsupported_backend_before_building_groups(backend):
+    from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
+    model = LlamaForCausalLM(LlamaConfig(vocab_size=16, hidden_size=8, intermediate_size=16,
+                                        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2))
+    model.config._attn_implementation = backend
+    with pytest.raises(NotImplementedError, match='unsupported attention|kernel unavailable'):
+        SequenceParallel().prepare(2, model, SimpleNamespace(pad_token_id=0))
+
+
+def test_single_local_token_value_keeps_its_sequence_axis():
+    from twinkle.model.transformers.transformers import TransformersModel
+    outputs = {'logits': torch.ones(2, 1)}
+    TransformersModel._postprocess_forward_outputs(
+        None, outputs, labels=None, task='value', temperature=1., sampling_masks=None,
+        return_logits=False, loss_instance=SimpleNamespace(require_values=True))
+    assert outputs['values'].shape == (2, 1)
+
+
+def test_sentence_loss_metadata_stays_global_while_model_tokens_split():
+    strategy = SequenceParallelStrategy(sp_config={'ulysses_size': 2})
+    ctx = strategy._ctx
+    ctx.world_size = ctx.sp_world_size = 2
+    ctx.rp_world_size = 1
+    ctx.attn_implementation = 'sdpa'
+    ctx.tokenizer = SimpleNamespace(pad_token_id=0)
+    labels, weights = torch.tensor([[1]]), torch.tensor([[0.3]])
+    inputs = strategy.prepare_model_inputs(
+        {'input_ids': torch.arange(7).unsqueeze(0), 'labels': labels, 'loss_scale': weights},
+        token_labels=False)
+    assert inputs['input_ids'].shape == (1, 4)
+    assert inputs['labels'] is labels and inputs['loss_scale'] is weights
+    assert inputs['_sequence_layout']['sharded'] == []
+
+
+def _heterogeneous_context_cpu_worker(rank, port):
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import DefaultDeviceType
+    DefaultDeviceType.set_device_type('cpu')
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank, world_size=4)
+    try:
+        torch.manual_seed(73)
+        cases = []
+        for sp_size, heads, length in ((4, 4, 7), (2, 2, 9)):
+            config = LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                 num_hidden_layers=1, num_attention_heads=heads, num_key_value_heads=heads,
+                                 attention_dropout=0., use_cache=False)
+            config._attn_implementation = 'sdpa'
+            base = LlamaForCausalLM(config)
+            model = copy.deepcopy(base)
+            ids = (torch.arange(length) + 1).unsqueeze(0)
+            labels = _make_labels(ids)
+            baseline = base(input_ids=ids, use_cache=False).logits
+            base_loss = F.cross_entropy(baseline.flatten(0, 1), labels.flatten(), ignore_index=-100)
+            mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=1, ulysses_size=sp_size, device_type='cpu')
+            strategy = _make_strategy(model, mesh, sp_size)
+            prepared = strategy.prepare_model_inputs({'input_ids': ids, 'labels': labels})
+            local_labels, layout = prepared.pop('labels'), prepared.pop('_sequence_layout')
+            with strategy.context():
+                output = model(**prepared, use_cache=False)
+            prepared.update(labels=local_labels, _sequence_layout=layout)
+            prepared, output = strategy.gather_loss_tensors(prepared, output)
+            torch.testing.assert_close(output.logits, baseline, rtol=2e-5, atol=2e-6)
+            loss = F.cross_entropy(output.logits.flatten(0, 1), prepared['labels'].flatten(), ignore_index=-100)
+            torch.testing.assert_close(loss, base_loss, rtol=2e-5, atol=2e-6)
+            cases.append((strategy, model, base, loss, base_loss))
+        assert cases[0][0]._ctx is not cases[1][0]._ctx
+        for strategy, model, base, loss, base_loss in reversed(cases):
+            loss.backward()
+            base_loss.backward()
+            for parameter, expected in zip(model.parameters(), base.parameters()):
+                dist.all_reduce(parameter.grad)
+                parameter.grad.div_(4)
+                torch.testing.assert_close(parameter.grad, expected.grad, rtol=3e-4, atol=3e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+def test_heterogeneous_sp4_sp2_contexts_logits_loss_and_parameter_gradients_cpu():
+    mp.spawn(_heterogeneous_context_cpu_worker, args=(_find_free_port(),), nprocs=4, join=True)
+
+
+def test_disabled_strategy_context_stays_local_and_failed_registration_is_atomic():
+    from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, _current_ctx, _MODULE_TO_CTX
+    strategy = SequenceParallelStrategy(sp_config={'enabled': False, 'ulysses_size': 2})
+    with strategy.context():
+        assert _current_ctx() is None
+    model = torch.nn.Linear(2, 2)
+    ctx = SequenceParallel()
+    with pytest.raises(NotImplementedError, match='text attention modules'):
+        ctx._prepare_forward_boundaries(model, model)
+    assert model not in _MODULE_TO_CTX
+    with pytest.raises(RuntimeError, match='Initialize sequence parallel'):
+        SequenceParallelStrategy(sp_config={'ulysses_size': 2}).context()

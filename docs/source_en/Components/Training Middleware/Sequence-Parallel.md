@@ -18,7 +18,6 @@ from twinkle.model.transformers.strategy.sequence_parallel import SequenceParall
 config = SequenceParallelConfig(
     enabled=True,           # Enable sequence parallel
     ulysses_size=None,      # Ulysses SP degree (auto-derived from DeviceMesh if None)
-    gather_logits=True,     # Gather logits after forward for loss computation
 )
 ```
 
@@ -41,16 +40,16 @@ device_mesh = DeviceMesh.from_sizes(
 
 1. **Pad** — input sequences are padded to a length divisible by SP world size
 2. **Split** — padded inputs are evenly split across SP ranks along the sequence dimension
-3. **Distributed Attention** — FlashAttention2 is patched to perform Ulysses all-to-all communication before/after attention computation
-4. **Gather** — after forward, logits are gathered back to full sequence length for loss computation
+3. **Distributed Attention** — SDPA and FlashAttention 2/3 are patched to perform Ulysses all-to-all communication before/after attention computation
+4. **Gather** — collect the present logps, entropies, values and requested logits before the unchanged full-sequence loss
 
 ## Supported Attention Backends
 
 | Backend | Status |
 |---------|--------|
-| FlashAttention2 | Fully supported (including packed/padding-free sequences) |
+| FlashAttention 2 / 3 | Ulysses and packed/padding-free paths; requires a compatible installed kernel |
 | SDPA | Supported (non-packed batches only) |
-| Derived Ring Attention | Supported with FlashAttention2 only (`rp_world_size > 1`) |
+| Derived Ring Attention | CUDA FlashAttention 2/3 only (`rp_world_size > 1`); incompatible platforms fail during initialization |
 
 ## Qwen3.5 Linear Attention
 
@@ -63,6 +62,10 @@ For MoE models, SP automatically installs a forward hook that gathers router log
 ## Key Constraints
 
 - `num_key_value_heads` must be divisible by `ulysses_size` (for Ulysses) or use ring attention fallback
-- Packed/padding-free batches require FlashAttention2
+- Packed/padding-free batches require FlashAttention 2 or 3
 - Derived ring attention requires `batch_size == 1` (packed format)
 - `torch.distributed` must be initialized
+
+## Isolating per-model SP contexts
+
+Each SequenceParallelStrategy owns its own SequenceParallel context, which stores that model's communication group, ranks, and current batch state, so algorithms that use multiple models, such as DPO, can enable SP training at the same time.

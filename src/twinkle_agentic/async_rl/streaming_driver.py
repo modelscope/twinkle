@@ -800,14 +800,14 @@ class StreamingDriver:
         # None means the consumer did not report a count. An explicit 0 is a real report.
         steps = 1 if steps is None else int(steps)
         self._last_pull_steps = steps
+        current = self._current_version()
         if steps > 0:
-            current = self._current_version()
             self.stats.train_pulls += 1
-            self.stats.optimizer_steps += steps
-            for record in records:
-                self.stats.consumed += 1
-                if current - record.version > 0:
-                    self.stats.off_policy_consumed += 1
+        self.stats.optimizer_steps += steps
+        for record in records:
+            self.stats.consumed += 1
+            if current - record.version > 0:
+                self.stats.off_policy_consumed += 1
 
     def _register_initial_policy(self) -> None:
         """Pin the version-0 policy so the first admissions reference a real version, never an unpinned base.

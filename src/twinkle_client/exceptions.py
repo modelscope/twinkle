@@ -80,6 +80,7 @@ class TaskFailedError(Exception):
         request_id: str,
         error_code: int | None = None,
         details: list[dict[str, Any]] | None = None,
+        traceback: str | None = None,
     ) -> None:
         super().__init__(error)
         self.error = error
@@ -87,6 +88,7 @@ class TaskFailedError(Exception):
         self.request_id = request_id
         self.error_code = error_code
         self.details = details
+        self.traceback = traceback
 
 
 class TaskCancelledError(Exception):

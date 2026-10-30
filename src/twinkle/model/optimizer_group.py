@@ -135,36 +135,31 @@ class BaseOptimizerGroup:
         """Get learning rates from optimizer. Override in subclass."""
         return []
 
+    def _metric_kwargs(self, status: TrainStatus, metric_step: Optional[int] = None) -> Dict[str, Any]:
+        """Use actual optimizer state while retaining the selected loss's reduction."""
+        forward_kwargs = dict(status.forward_kwargs)
+        loss_key = forward_kwargs.pop('_metric_loss_key', None)
+        return {
+            **forward_kwargs,
+            'lr': self._get_lr(),
+            'step': self.cur_step - 1 if metric_step is None else metric_step,
+            'gradient_accumulation_steps': self.gradient_accumulation_steps,
+            'grad_norm': self._last_grad_norm,
+            'loss_reduction': status.loss_reduction or getattr(self.get_loss(loss_key), 'reduction', 'mean'),
+        }
+
     def accumulate_metrics(self, is_training, include_default: bool = True, metric_step: Optional[int] = None):
-        """Accumulate metrics for train/eval status. Override in subclass if needed."""
+        """Accumulate metrics through one argument merge and keyed-loss dispatch."""
         status = self.train_status if is_training else self.eval_status
-        if metric_step is None:
-            metric_step = self.cur_step - 1
-        if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
-            # forward_kwargs is the raw kwargs the forward was called with. A caller that drives
-            # gradient accumulation threads gradient_accumulation_steps through it (the Megatron
-            # forward_backward pops it for do_grad_sync, but the dict stored on train_status still
-            # carries it). It must not be forwarded to the metric verbatim: this method passes the
-            # authoritative self.gradient_accumulation_steps explicitly, so a second copy inside
-            # **forward_kwargs raises "got multiple values for keyword argument". Pop it here -- the
-            # TransformersOptimizerGroup override does the same -- so both backends accumulate metrics
-            # identically (basic principle: backend equivalence, no per-backend special casing).
-            forward_kwargs = dict(status.forward_kwargs)
-            forward_kwargs.pop('gradient_accumulation_steps', None)
-            loss_key = forward_kwargs.pop('_metric_loss_key', None)
-            for metric in status.metrics:
-                metric_loss_key = getattr(metric, '_twinkle_loss_key', None)
-                if metric_loss_key != loss_key or (metric_loss_key is None and not include_default):
-                    continue
-                metric.accumulate(
-                    status.inputs,
-                    status.outputs,
-                    lr=self._get_lr(),
-                    step=metric_step,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm,
-                    loss_reduction=status.loss_reduction or getattr(self.get_loss(loss_key), 'reduction', 'mean'),
-                    **forward_kwargs)
+        if not status.metrics or status.inputs is None or status.outputs is None:
+            return
+        loss_key = status.forward_kwargs.get('_metric_loss_key')
+        metric_kwargs = self._metric_kwargs(status, metric_step)
+        for metric in status.metrics:
+            metric_loss_key = getattr(metric, '_twinkle_loss_key', None)
+            if metric_loss_key != loss_key or (metric_loss_key is None and not include_default):
+                continue
+            metric.accumulate(status.inputs, status.outputs, **metric_kwargs)
 
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""

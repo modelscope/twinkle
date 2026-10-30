@@ -43,6 +43,9 @@ class PreferenceLossBase(Loss):
     def __init__(self, ignore_index: int = -100):
         self.ignore_index = ignore_index
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def _compute_logps_from_logits(
         self,
         logits: 'torch.Tensor',

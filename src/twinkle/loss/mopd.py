@@ -59,6 +59,17 @@ class MOPDLoss(OPSDLoss):
       the two are interchangeable at a call site.
     """
 
+    def micro_batch_kwargs(self, kwargs, indices, batch_size):
+        from twinkle.model.micro_batch import select_batch
+
+        selected = super().micro_batch_kwargs(kwargs, indices, batch_size)
+        channels = kwargs.get("teacher_logps")
+        if self._is_multi_teacher(channels):
+            selected["teacher_logps"] = [select_batch(channel, indices, batch_size) for channel in channels]
+        if "teacher_weights" in kwargs:
+            selected["teacher_weights"] = kwargs["teacher_weights"]
+        return selected
+
     def _is_multi_teacher(self, teacher_logps) -> bool:
         """True iff ``teacher_logps`` is the MOPD list-of-K-channels form (not an OPSD single teacher).
 
@@ -119,6 +130,8 @@ class MOPDLoss(OPSDLoss):
         ref_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         **kwargs,
     ) -> LossOutput:
+        if isinstance(teacher_logps, dict):
+            teacher_logps = list(teacher_logps.values())
         # Single-teacher / missing-teacher inputs are OPSD's contract verbatim -- delegate so MOPD is a
         # strict superset and the two losses are drop-in interchangeable at a call site.
         if teacher_logps is None or not self._is_multi_teacher(teacher_logps):

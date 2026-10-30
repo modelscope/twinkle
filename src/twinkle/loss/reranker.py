@@ -41,6 +41,9 @@ class PointwiseRerankerLoss(Loss):
     require_entropy = False
     require_logps = False
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:
         logits = _extract_scores(outputs)
         labels = inputs['labels'].to(logits.dtype).view(-1)
@@ -77,6 +80,9 @@ class ListwiseRerankerLoss(Loss):
                              'non-positive value would flip or destroy the ranking signal.')
         self.temperature = temperature
         self.min_group_size = min_group_size
+
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
 
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:
         logits = _extract_scores(outputs)

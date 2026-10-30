@@ -149,9 +149,7 @@ def test_transformers_forward_backward_executes_real_micro_batches(
             self.processor = InputProcessor(padding_free=False)
             self.template = None
             self.train_status = SimpleNamespace(loss_value=None, num_tokens=0.0)
-            self.loss_instance = SimpleNamespace(
-                micro_batch_scale=lambda inputs, indices: len(indices) / len(inputs),
-            )
+            self.loss_instance = GRPOLoss()
             self._dp_group = None
 
         def _ensure_dp_group(self):

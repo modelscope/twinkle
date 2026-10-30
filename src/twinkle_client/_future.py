@@ -99,6 +99,7 @@ def _unwrap(env: TaskEnvelope, model_cls) -> Any:
             request_id=env.request_id,
             error_code=p.error_code,
             details=p.details,
+            traceback=p.traceback,
         )
     if env.status == 'cancelled':
         p = env.error

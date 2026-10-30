@@ -26,7 +26,7 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip uninstall autoawq -y
     pip uninstall lmdeploy -y
     pip uninstall tensorflow -y
-    pip install ray==2.48
+    pip install ray==2.55.1
     pip install optimum
 
     # test with install

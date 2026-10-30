@@ -7,18 +7,25 @@ therefore intentionally carries **no** underscore prefix.
 """
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from enum import StrEnum
+from typing import Any, Optional
 
 from .base import ResponseModel, StrictRequest
-from .errors import ErrorPayload, QueueStateLiteral
+from .errors import ErrorPayload, QueueState
 
-# The lifecycle status of a queued task. Kept in sync with the server-side
-# ``TaskStatus`` enum values (a consistency test asserts the two sets are equal).
-TaskStatus = Literal['pending', 'queued', 'running', 'completed', 'failed', 'cancelled']
 
-# The two states past which a task never changes again. ``frozenset`` so a caller
-# cannot mutate the shared set.
-TERMINAL_STATUSES: frozenset[str] = frozenset({'completed', 'failed', 'cancelled'})
+class TaskStatus(StrEnum):
+    """Canonical task states shared by the wire envelope and server execution."""
+
+    PENDING = 'pending'
+    QUEUED = 'queued'
+    RUNNING = 'running'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    CANCELLED = 'cancelled'
+
+
+TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value})
 
 
 class RetrieveFutureRequest(StrictRequest):
@@ -79,5 +86,5 @@ class TaskEnvelope(ResponseModel):
     status: TaskStatus
     result: Any | None = None  # set iff status == 'completed'
     error: ErrorPayload | None = None  # set iff status == 'failed'
-    queue_state: QueueStateLiteral | None = None
+    queue_state: QueueState | None = None
     queue_state_reason: str | None = None

@@ -184,9 +184,15 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         apply_mask_to_padding_states = getattr(modeling_module, 'apply_mask_to_padding_states')
 
         local_attention_mask = attention_mask
-        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+        if _sp_is_enabled(sequence_parallel_context):
+            # New HF recurrent-mask helpers crop to the tail on every rank.
+            # Recover the owning batch's global mask before selecting this rank.
+            global_mask = sequence_parallel_context.extra_kwargs.get('attention_mask')
+            if torch.is_tensor(global_mask) and global_mask.dim() == 2:
+                local_attention_mask = global_mask
+        if torch.is_tensor(local_attention_mask) and local_attention_mask.dim() == 2:
             local_attention_mask = _get_local_padding_mask(
-                attention_mask,
+                local_attention_mask,
                 hidden_states.shape[1],
                 sequence_parallel_context,
             )
@@ -340,7 +346,8 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
                 _origin_forward=origin_forward,
                 **extra_kwargs,
             ):
-                sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', sequence_parallel)
+                from . import _attention_context
+                sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', _attention_context(mod))
                 if not _sp_is_enabled(sequence_parallel_context):
                     return _origin_forward(
                         mod,

@@ -10,6 +10,9 @@ from twinkle.server.gateway import use_cases as services
 
 class _State:
 
+    async def assert_future_owner(self, request_id, token):
+        return None
+
     def __init__(self, records):
         self.records = list(records)
 
@@ -43,7 +46,7 @@ def test_gateway_services_do_not_import_protocol_models():
 class _FakeGateway:
     """Minimal ``GatewayServer`` stand-in; ``poll_future`` is patched so state is unused."""
 
-    state = None
+    state = _State([])
 
 
 def _parity_client(monkeypatch, canonical_record):

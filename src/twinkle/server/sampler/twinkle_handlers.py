@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -33,6 +33,7 @@ from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
+from .runtime import request_execution_scope
 
 logger = get_logger()
 
@@ -283,7 +284,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        return await self.submit_concurrent_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
+        return await self.submit_concurrent_and_peek(
+            _task,
+            token=token,
+            input_tokens=input_tokens,
+            task_type='sample',
+            execution_scope=request_execution_scope(request))
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(
@@ -335,7 +341,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             return ref.model_dump()
 
         return await self.submit_concurrent_and_peek(
-            _generate_and_store, model_id=full_adapter_name or None, task_type='sample_to_data_plane')
+            _generate_and_store,
+            model_id=full_adapter_name or None,
+            task_type='sample_to_data_plane',
+            execution_scope=request_execution_scope(request))
 
     @app.post('/twinkle/encode', response_model=types.TaskEnvelope)
     async def encode(
@@ -357,11 +366,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             inputs = to_backend_inputs(body.inputs)
             pooling_params = PoolingParams.from_dict(body.pooling_params) if body.pooling_params else None
             adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name) or ''
-            responses = await self.call_backend(self.sampler.encode, inputs, pooling_params,
-                                                adapter_name=adapter_name)
+            responses = await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.encode, inputs, pooling_params, adapter_name=adapter_name))
             return {'data': [list(response.data) for response in responses]}
 
-        return await self.submit_concurrent_and_peek(_task, token=token, input_tokens=0, task_type='encode')
+        return await self.submit_concurrent_and_peek(
+            _task, token=token, input_tokens=0, task_type='encode', execution_scope=request_execution_scope(request))
 
     @app.post('/twinkle/unload_adapter_paths')
     async def unload_adapter_paths(
@@ -426,8 +436,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             raise RequestRejectedError('`adapter_name` is required and must be non-empty.')
         full_adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
 
-        from peft import LoraConfig
-        config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
+        def build_config():
+            from peft import LoraConfig
+            return LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
+
+        config = await asyncio.to_thread(build_config)
 
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
             await self.sampling_guard.run(
@@ -463,7 +476,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """
         token = await self._on_request_start(request)
 
-        adapter_path = None
+        resolved_uri = None
         adapter_name = body.adapter_name or ''
         full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
@@ -471,8 +484,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-            await self.call_backend(self.sampler.reset_prefix_cache)
-            adapter_path = await resolve_sampler_weights(self, resolved_uri)
 
         # Streaming accepts exactly one input; the shared seam enforces that and
         # returns a single parsed object. Its ValueError maps to the same 400 this
@@ -488,7 +499,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         from ray.util.queue import Queue
 
-        from .backends import STREAM_SENTINEL
+        from .backends.streaming import STREAM_SENTINEL
 
         request_id = f'req_{uuid.uuid4().hex}'
         actors = self.sampler._actors
@@ -501,14 +512,31 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             return StreamingResponse(_no_actor_generator(), media_type='application/x-ndjson')
         q = Queue(maxsize=128)
         actor = actors[0]
-        actor.sample_stream_to_queue.remote(
-            q,
-            inputs_parsed,
-            params,
-            adapter_name=full_adapter_name,
-            adapter_path=adapter_path,
-        )
 
+        async def stream_job():
+
+            async def _stream_generation(adapter_path):
+                # Retain the actor result, not merely the HTTP queue iterator.
+                ref = actor.sample_stream_to_queue.remote(
+                    q, inputs_parsed, params, adapter_name=full_adapter_name, adapter_path=adapter_path)
+                try:
+                    await ref
+                except BaseException as error:
+                    # An errored bridge cannot certify the inner engine request
+                    # exited. Controller must confirm worker death before reuse.
+                    self.sampling_guard.invalidate_weights(error)
+                    raise
+
+            try:
+                await sample_with_weights(self, resolved_uri, _stream_generation)
+            except Exception as error:
+                try:
+                    await q.put_async(error)
+                    await q.put_async(STREAM_SENTINEL)
+                except Exception:
+                    pass
+
+        self.request_runtime.start_stream_job(stream_job, execution_scope=request_execution_scope(request))
         return StreamingResponse(
             _stream_queue(
                 q,

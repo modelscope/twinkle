@@ -126,6 +126,9 @@ class EmbeddingLoss(Loss):
                              '(e.g. InfonceLoss).')
         self.mrl_dims = mrl_dims
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def _mrl_reduce(self, sentences: torch.Tensor, compute: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
         """Weighted sum of ``compute(sentences)`` over each Matryoshka prefix.
 

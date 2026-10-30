@@ -84,7 +84,6 @@ class InputProcessor:
             self.prepare_gdn_padding_free_args,
             self.drop_causal_4d_mask,
             self.split_cp,
-            self.apply_transformers_sp,
             self.prepare_outputs,
         ]
 
@@ -148,49 +147,25 @@ class InputProcessor:
 
         return [to_tensor(_input) for _input in inputs]
 
-    def apply_transformers_sp(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
-        sp_strategy = kwargs.get("sp_strategy")
-        if self.framework != "transformers" or sp_strategy is None:
-            return inputs
-        padding_free = bool(self.padding_free or self._any_packing(inputs))
-        results = []
-        for _input in inputs:
-            payload = dict(_input)
-            payload["padding_free"] = padding_free
-            results.append(InputFeature(**sp_strategy.preprocess_inputs(payload)))
-        return results
+    @staticmethod
+    def token_level_labels(task):
+        return task not in ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
 
-    def postprocess_tensor_sp(
-        self, inputs: dict[str, Any], outputs: dict[str, Any], **kwargs
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Adjust SP tensors after forward and before loss computation.
+    def postprocess_outputs(self, inputs, outputs, *, task='causal_lm', gather_fn=None, reduce_fn=None):
+        """Task reduction, loss-tensor collection and packed layout restoration.
 
-        Pipeline: SP gather → packed-sequence unpack.
-        After this call, logps and labels are in per-sequence batch format
-        ``[num_sequences, max_seq_len]`` when the input was packed, or left
-        unchanged for normal (non-packed) batches.
-
-        For ``task='embedding'`` this also performs the last-valid-token
-        pooling (with padding-free / SP gather awareness) and writes the
-        pooled ``[n_seqs, H]`` tensor to ``outputs['embeddings']``; the raw
-        per-token ``outputs['features']`` is consumed and removed.
-
-        For ``task='seq_cls'``/``'reranker'`` the model outputs per-token scores
-        ``[B, T, num_labels]`` (TransformersValuePatch skips HF's internal pooling);
-        this method pools them to ``[n_seqs, num_labels]`` via the same packed-aware
-        last-valid-token logic as embedding.
+        Callbacks contain only communication; token selection and task semantics
+        stay here. Without callbacks, both training backends keep their local path.
         """
-        sp_strategy = kwargs.get("sp_strategy")
-        task = kwargs.get("task", "causal_lm")
-        if task == "embedding":
-            return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
-        if task == "generative_reranker":
-            return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
-        if task in ("seq_cls", "reranker"):
-            return self._postprocess_seq_cls(inputs, outputs, sp_strategy=sp_strategy)
-        if self.framework == "transformers" and sp_strategy is not None:
-            return sp_strategy.gather_loss_tensors(inputs, outputs)
-        return inputs, outputs
+        if task == 'embedding':
+            inputs, outputs = self._postprocess_embedding(inputs, outputs, reduce_fn=reduce_fn)
+        elif task == 'generative_reranker':
+            inputs, outputs = self._postprocess_generative_reranker(inputs, outputs, reduce_fn=reduce_fn)
+        elif task in ('seq_cls', 'reranker'):
+            inputs, outputs = self._postprocess_seq_cls(inputs, outputs, reduce_fn=reduce_fn)
+        elif gather_fn is not None:
+            inputs, outputs = gather_fn(inputs, outputs)
+        return self.unpack_packed_sequences(inputs, outputs, task=task)
 
     @staticmethod
     def _packed_last_indices(position_ids: torch.Tensor, total_len: int) -> torch.Tensor:
@@ -202,7 +177,7 @@ class InputProcessor:
         return (boundaries[1:] - 1).long()
 
     def _postprocess_embedding(
-        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+        self, inputs: dict[str, Any], outputs: dict[str, Any], reduce_fn=None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Pool per-token features to per-sequence embeddings (last-valid-token).
 
@@ -217,7 +192,7 @@ class InputProcessor:
             "outputs['features'] missing; ensure TransformersEmbeddingPatch is applied for task='embedding'."
         )
 
-        pooled, is_packed = self._pool_last_valid_token(features, inputs, sp_strategy=sp_strategy)
+        pooled, is_packed = self._pool_last_valid_token(features, inputs, reduce_fn=reduce_fn)
 
         # Normalize after pool+reduce so swapping pooling strategy (last/mean/CLS) stays mathematically correct.
         embeddings = F.normalize(pooled, p=2, dim=-1)
@@ -228,7 +203,7 @@ class InputProcessor:
         return inputs, outputs
 
     def _postprocess_generative_reranker(
-        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+        self, inputs: dict[str, Any], outputs: dict[str, Any], reduce_fn=None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reduce per-token generative-reranker scores ``[B, T, 1]`` to ``[n_seqs, 1]``.
 
@@ -242,13 +217,13 @@ class InputProcessor:
             "outputs['logits'] missing; ensure TransformersGenerativeRerankerPatch is applied and the "
             "reranker loss sets require_logits=True."
         )
-        pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
+        pooled, _ = self._pool_last_valid_token(logits, inputs, reduce_fn=reduce_fn)
         outputs = copy(outputs)
         outputs["logits"] = pooled.contiguous()
         return inputs, outputs
 
     def _postprocess_seq_cls(
-        self, inputs: dict[str, Any], outputs: dict[str, Any], sp_strategy=None
+        self, inputs: dict[str, Any], outputs: dict[str, Any], reduce_fn=None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Pool per-token seq_cls/reranker scores ``[B, T, num_labels]`` to ``[n_seqs, num_labels]``.
 
@@ -261,35 +236,30 @@ class InputProcessor:
             "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'."
         )
         if logits.dim() == 2:
+            if reduce_fn is not None and inputs.get('_sequence_layout') is not None:
+                raise NotImplementedError('Sequence-parallel scoring requires a per-token score head')
             # A pre-pooled head (XLM-R-style ``*ForSequenceClassification`` pools the last valid
             # token INSIDE forward, before the score head) already answered one score per sequence;
             # the patch captured ``[n_seqs, num_labels]`` and there is nothing left to reduce.
             return inputs, outputs
-        pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
+        pooled, _ = self._pool_last_valid_token(logits, inputs, reduce_fn=reduce_fn)
         outputs = copy(outputs)
         outputs["logits"] = pooled.contiguous()
         return inputs, outputs
 
     def _pool_last_valid_token(
-        self, features: torch.Tensor, inputs: dict[str, Any], sp_strategy=None
+        self, features: torch.Tensor, inputs: dict[str, Any], reduce_fn=None
     ) -> tuple[torch.Tensor, bool]:
         """Gather the last valid token per sequence from ``[B, T, C]`` -> ``[n_seqs, C]``.
 
-        Build a one-hot end-token mask in the un-padded global frame, route it
-        through the same pad+split as ``input_ids`` so it aligns with local
-        features, pool locally, then ``all_reduce`` only the ``[n_seqs, C]``
-        tensor across SP × RP. No feature gather; uniform across
-        DP / Ulysses / zigzag-ring / padding-free. Returns ``(pooled, is_packed)``.
+        Select endpoints in the unpadded global frame, then use the batch-local
+        token index mapping to align the mask with local features. The optional
+        callback reduces only the pooled tensor; this method does not own any
+        process groups or sequence-splitting logic.
         """
-        sp_enabled = (
-            self.framework == "transformers"
-            and sp_strategy is not None
-            and getattr(sp_strategy, "enabled", False)
-            and getattr(sp_strategy, "world_size", 1) > 1
-        )
-
-        if sp_enabled:
-            ref_pos = sp_strategy.real_position_ids
+        layout = inputs.get('_sequence_layout')
+        if layout is not None:
+            ref_pos = layout['position_ids']
         elif inputs.get("position_ids") is not None:
             ref_pos = inputs["position_ids"]
         else:
@@ -308,6 +278,9 @@ class InputProcessor:
                 ref_pos = torch.where(am.bool(), arange, arange.new_tensor(-1))
         if ref_pos.dim() == 3:
             ref_pos = ref_pos[0]
+        attention_mask = inputs.get('attention_mask')
+        if torch.is_tensor(attention_mask) and attention_mask.shape == ref_pos.shape:
+            ref_pos = ref_pos.masked_fill(~attention_mask.bool(), -1)
         # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
         cu_seq_lens_q = inputs.get("cu_seq_lens_q", inputs.get("cu_seqlens_q"))
 
@@ -328,7 +301,8 @@ class InputProcessor:
         else:
             n_seqs = ref_pos.shape[0]
             # clamp_min(0) prevents negative indexing when a row is fully padded (sum == 0).
-            end_idx = ((ref_pos >= 0).long().sum(-1) - 1).clamp_min(0)
+            indices = torch.arange(T_real, device=ref_pos.device).expand_as(ref_pos)
+            end_idx = indices.masked_fill(ref_pos < 0, -1).amax(-1).clamp_min(0)
             batch_idx = torch.arange(n_seqs, device=device)
             target_idx = torch.zeros(n_seqs, dtype=torch.long, device=device)
             B_mask, n_targets = n_seqs, 1
@@ -336,26 +310,21 @@ class InputProcessor:
         mask = torch.zeros(B_mask, T_real, n_targets, dtype=dtype, device=device)
         mask[batch_idx, end_idx, target_idx] = 1.0
 
-        if sp_enabled:
-            # Route mask through the same pad+split as input_ids to align with local features.
-            rp = sp_strategy.real_position_ids
-            rp_padded = sp_strategy.pad(rp, padding_value=-1, position_ids=rp, dim=-1)
-            mask = sp_strategy.pad(mask, padding_value=0, position_ids=rp, dim=1)
-            mask = sp_strategy.split(mask, dim=1, position_ids=rp_padded)
+        if layout is not None:
+            indices = layout['indices']
+            mask = mask.gather(1, indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, n_targets))
+            mask = mask * (indices >= 0).unsqueeze(-1)
 
         assert mask.shape[1] == features.shape[1], (
             f"mask seq-dim {mask.shape[1]} != features seq-dim {features.shape[1]}; "
-            "sp_strategy.split contract broken or T_real mismatched."
+            "sequence layout does not match local features."
         )
 
         pooled = torch.einsum("bth,btn->bnh", features, mask)
         pooled = pooled.squeeze(0) if is_packed else pooled.squeeze(1)
 
-        if sp_enabled and dist.is_available() and dist.is_initialized():
-            for grp_attr, size_attr in (("_sp_group", "sp_world_size"), ("_rp_group", "rp_world_size")):
-                grp = getattr(sp_strategy, grp_attr, None)
-                if grp is not None and getattr(sp_strategy, size_attr, 1) > 1:
-                    dist.all_reduce(pooled, op=dist.ReduceOp.SUM, group=grp)
+        if reduce_fn is not None:
+            pooled = reduce_fn(pooled, torch.distributed.ReduceOp.SUM)
 
         return pooled, is_packed
 
@@ -550,13 +519,13 @@ class InputProcessor:
             _inp["max_length_k"] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
+    @staticmethod
+    def _backend_builds_causal_mask(attention_mask_type: str | None) -> bool:
+        return attention_mask_type == "causal" and Platform.device_prefix() == "npu"
+
     def drop_causal_4d_mask(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
-        """On NPU, drop the generic 4D dense mask so MindSpeed can build
-        its own compressed causal mask for FlashAttention."""
-        if Platform.device_prefix() != "npu":
-            return inputs
-        attention_mask_type = kwargs.get("attention_mask_type")
-        if attention_mask_type != "causal":
+        """Drop a dense mask when the accelerator synthesizes its causal mask."""
+        if not self._backend_builds_causal_mask(kwargs.get("attention_mask_type")):
             return inputs
         for _inp in inputs:
             attention_mask = _inp.get("attention_mask")
@@ -712,7 +681,7 @@ class InputProcessor:
         skipped.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
-        by ``postprocess_tensor_sp``, so this is a no-op. Same for
+        by ``postprocess_outputs``, so this is a no-op. Same for
         ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``,
         and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
         ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
@@ -862,7 +831,9 @@ class InputProcessor:
     #: these fields and must change in the same commit.
     _PER_AUDIO_BATCHED_FIELDS = ("input_features", "feature_attention_mask")
 
-    def _collate_macro_batch(self, inputs: list[InputFeature]) -> InputFeature:
+    def _collate_macro_batch(
+        self, inputs: list[InputFeature], *, omit_megatron_attention_mask: bool = False
+    ) -> InputFeature:
         # Two mutually-exclusive audio contracts share the `input_features` field name and are told
         # apart by the mask field that rides alongside it -- the producer (the model's template)
         # emits one pair or the other, so the field name IS the contract marker:
@@ -931,7 +902,7 @@ class InputProcessor:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
                 if self.framework == "megatron" and key == "attention_mask":
-                    result[key] = self._create_4d_attention_mask(values)
+                    result[key] = None if omit_megatron_attention_mask else self._create_4d_attention_mask(values)
                 elif key == "position_ids" and is_mm_position_ids(values[0]):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                     num_axes = values[0].shape[0]
@@ -980,9 +951,12 @@ class InputProcessor:
     ) -> list[InputFeature]:
         if len(inputs) == 1 and self.framework != "megatron":
             return inputs
+        omit_megatron_attention_mask = (
+            self.framework == "megatron" and self._backend_builds_causal_mask(kwargs.get("attention_mask_type"))
+        )
         if micro_batch_size is None:
             # normal collate
-            outputs = self._collate_macro_batch(inputs)
+            outputs = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             for key in outputs:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
@@ -993,7 +967,9 @@ class InputProcessor:
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
-                _output = self._collate_macro_batch(inputs[i : i + micro_batch_size])
+                _output = self._collate_macro_batch(
+                    inputs[i : i + micro_batch_size], omit_megatron_attention_mask=omit_megatron_attention_mask
+                )
                 for key in _output:
                     if key in self.VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
@@ -1001,14 +977,16 @@ class InputProcessor:
             return outputs
         else:
             # each macro batch shares the same length
-            res = self._collate_macro_batch(inputs)
+            res = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             keys = list(res.keys())
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 end = i + micro_batch_size
                 output = {}
                 for key in keys:
-                    if key == "position_ids" and res[key].dim() > 2:
+                    if res[key] is None:
+                        output[key] = None
+                    elif key == "position_ids" and res[key].dim() > 2:
                         output[key] = res[key][:, i:end, :]
                     elif key in self.VLM_CONCAT_FIELDS:
                         output[key] = torch.cat(res[key][i:end], dim=0)

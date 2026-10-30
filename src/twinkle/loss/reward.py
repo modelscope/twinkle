@@ -39,6 +39,9 @@ class RewardLoss(Loss):
         super().__init__()
         self.center_rewards_coefficient = center_rewards_coefficient or 0.0
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:
         import torch
         import torch.nn.functional as F

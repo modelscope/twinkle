@@ -27,6 +27,9 @@ class PPOValueLoss(Loss):
         self.ignore_index = ignore_index
         self._aligner = GRPOLoss(ignore_index=ignore_index)
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def __call__(
         self,
         inputs: Dict,

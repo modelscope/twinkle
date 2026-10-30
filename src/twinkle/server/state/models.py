@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
 
@@ -12,6 +12,16 @@ def _now_iso() -> str:
     # it and with time.time(); a naive local string would be misread as UTC and skew
     # every expiry comparison by the host's UTC offset.
     return datetime.now(timezone.utc).isoformat()
+
+
+class RuntimeContext(BaseModel):
+    """Allocation identity passed to a worker; never a client request payload."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    namespace: str
+    registry_name: str
+    instance_id: str
 
 
 class SessionRecord(BaseModel):
@@ -35,6 +45,9 @@ class ModelRecord(BaseModel):
     lora_config: Any = None
     replica_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
+    controller_epoch: str | None = None
+    training_namespace: str | None = None
+    instance_id: str | None = None
 
 
 class SamplingSessionRecord(BaseModel):
@@ -57,32 +70,10 @@ class FutureFailureRecord(BaseModel):
     diagnostic: str | None = None
 
 
-# Canonical set of protocol-independent failure reason codes. The Twinkle and Tinker
-# gateways each map this same key set to their own wire vocabularies; keeping the set
-# in one place lets a consistency test catch a map that drifts out of coverage.
-FAILURE_REASON_CODES: frozenset[str] = frozenset({
-    'invalid_request',
-    'request_rejected',
-    'resource_not_found',
-    'full_mode_busy',
-    'input_tokens_exceeded',
-    'batch_size_invalid',
-    'rate_limit_exceeded',
-    'resource_quota_exceeded',
-    'cancelled',
-    'endpoint_unavailable',
-    'state_contention',
-    'backend_gate_unavailable',
-    'orphaned_replica',
-    'execution_timeout',
-    'deadline_exceeded',
-    'internal_error',
-})
-
-
 class FutureRecord(BaseModel):
     """Represents an async task future / request status."""
 
+    owner_token: str | None = None
     status: str
     model_id: str | None = None
     reason: str | None = None

@@ -20,9 +20,10 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.sampler.weights import sample_with_weights
-from twinkle.server.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
+from .runtime import request_execution_scope
 
 logger = get_logger()
 
@@ -84,7 +85,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 # Base-model sampling is valid when no model_path was provided.
                 if adapter_uri and not os.path.exists(adapter_uri):
-                    raise UserTaskError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
+                    raise RequestRejectedError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
 
                 # Convert tinker SamplingParams to twinkle SamplingParams if needed
                 sampling_params = None
@@ -153,4 +154,5 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             token=token,
             input_tokens=input_tokens,
             task_type='sample',
+            execution_scope=request_execution_scope(request),
         )

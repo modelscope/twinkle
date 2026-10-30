@@ -56,6 +56,9 @@ class GKDLoss(Loss):
         self.chunk_size = chunk_size
         self.sft_alpha = sft_alpha
 
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
+
     def __call__(
         self,
         inputs,

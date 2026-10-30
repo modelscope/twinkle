@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from twinkle.data_format import LossOutput
 from .base import Loss
+from .utils import count_loss_tokens
 
 # Lazily-built singleton autograd.Function, so we neither pay the
 # class-construction cost on every forward nor force a top-level torch import.
@@ -132,17 +133,16 @@ class ChunkedCrossEntropyLoss(Loss):
     def micro_batch_scale(self, inputs, indices):
         if self.reduction == 'sum':
             return 1.0
-        token_counts = []
-        for model_input in inputs:
-            labels = model_input['labels']
-            if hasattr(labels, 'ne'):
-                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
-            else:
-                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        token_counts = [count_loss_tokens(model_input, self.ignore_index) for model_input in inputs]
         total_tokens = sum(token_counts)
         if total_tokens == 0:
             return 0.0
         return sum(token_counts[index] for index in indices) / total_tokens
+
+    def batch_normalizer(self, inputs):
+        if self.reduction != 'sum':
+            return None
+        return sum(count_loss_tokens(model_input, self.ignore_index) for model_input in inputs)
 
     def __call__(self, inputs, outputs, **kwargs):
         labels = inputs['labels']

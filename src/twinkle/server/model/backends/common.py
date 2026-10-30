@@ -10,7 +10,8 @@ from numbers import Number
 from tinker import types
 from typing import Any, List
 
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, remote_function
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
 
@@ -172,6 +173,35 @@ class TwinkleCompatModelBase:
                 epsilon = kwargs.pop('epsilon', 0.2)
                 grpo_beta = kwargs.pop('beta', 0.0)
                 self.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
+
+    @remote_function(dispatch='all', collect='none')
+    def preflight_loss_inputs(self, *, inputs, adapter_name: str = None, loss_fn: str = None, **kwargs) -> None:
+        """Validate the full, unsliced batch on every rank before any forward.
+
+        Each backend's ``forward_backward`` is dispatched with ``slice_dp``, so a
+        rank that rejects its slice inside the loss has already forwarded while
+        its peers enter the backward collective, which deadlocks the replica
+        (BUG-05). Running the loss's own rule on the full batch first, on every
+        rank, makes them fail together before any collective is entered.
+
+        ``loss_fn`` is the tinker route's loss selector: tinker batches carry
+        their RL features inside the datums, so the loss has to be set up and
+        the datums converted before the same rule applies. Twinkle-native
+        batches already pass ``old_logps``/``ref_logps``/``advantages`` as
+        keyword arguments and leave ``loss_fn`` unset.
+        """
+        adapter_name = adapter_name or self._get_default_group()
+        if loss_fn is not None:
+            loss_values = extract_rl_features_for_loss(inputs)
+            loss_values.pop('ref_outputs', None)
+            self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
+            inputs = datum_to_input_feature(inputs, self.get_template(adapter_name))
+            loss_values.update(kwargs)
+        else:
+            loss_values = kwargs
+        loss = getattr(self.optimizer_group.get(adapter_name), 'loss_instance', None)
+        if loss is not None:
+            loss.validate_inputs(inputs, **loss_values)
 
     def _ensure_dpo_metric(self, adapter_name: str, beta: float):
         """Add DPOMetric for the adapter if not already present.

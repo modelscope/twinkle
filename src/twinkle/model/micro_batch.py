@@ -186,6 +186,8 @@ def plan_micro_batches(
 
 
 def select_batch(value: Any, indices: list[int], batch_size: int) -> Any:
+    if isinstance(value, dict):
+        return {key: select_batch(item, indices, batch_size) for key, item in value.items()}
     if isinstance(value, list):
         return [value[index] for index in indices] if len(value) == batch_size else value
     if isinstance(value, tuple):

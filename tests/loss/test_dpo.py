@@ -75,12 +75,12 @@ class TestDPOLoss:
         result = loss_fn(inputs, outputs)
         assert result['loss'].dim() == 0
 
-    def test_dpo_no_ref_returns_zero(self):
-        """Without ref_logps and not reference_free, loss should be zero."""
+    def test_dpo_no_ref_is_rejected_unless_reference_free(self):
+        """Missing references must fail before producing a misleading zero loss."""
         loss_fn = DPOLoss(beta=0.1)
         inputs, outputs, _ = _make_preference_batch(with_ref=False)
-        result = loss_fn(inputs, outputs)
-        assert result['loss'].item() == pytest.approx(0.0, abs=1e-6)
+        with pytest.raises(ValueError, match='requires ref_logps'):
+            loss_fn(inputs, outputs)
 
     def test_dpo_with_label_smoothing(self):
         loss_fn = DPOLoss(beta=0.1, label_smoothing=0.1, loss_type='sigmoid')
