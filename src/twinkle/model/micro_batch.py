@@ -126,10 +126,18 @@ class _KKState:
         return self.spread > other.spread
 
 
-def _kk_partition(lengths: list[int], group_count: int) -> list[list[int]]:
+def _kk_partition(lengths: list[int], group_count: int, *, equal_size: bool = False) -> list[list[int]]:
+    ordered = sorted((value, index) for index, value in enumerate(lengths))
+    if equal_size:
+        if len(ordered) % group_count:
+            raise ValueError(f"equal-size KK needs len(lengths) % group_count == 0, got {len(ordered)} % {group_count}")
+        # Seeding each state with one item per group keeps every final group the same size.
+        seeds = [ordered[start : start + group_count] for start in range(0, len(ordered), group_count)]
+    else:
+        seeds = [[item] for item in ordered]
     queue = []
-    for value, index in sorted((value, index) for index, value in enumerate(lengths)):
-        heapq.heappush(queue, _KKState([(index, value)], group_count))
+    for seed in seeds:
+        heapq.heappush(queue, _KKState([(index, value) for value, index in seed], group_count))
     while len(queue) > 1:
         first = heapq.heappop(queue)
         second = heapq.heappop(queue)
@@ -169,13 +177,31 @@ def plan_micro_batches(
     if not inputs:
         raise ValueError("cannot plan micro-batches for empty inputs")
     if not config.dynamic_batching:
-        return [
-            list(range(start, min(start + config.micro_batch_size, len(inputs))))
-            for start in range(0, len(inputs), config.micro_batch_size)
-        ]
-    if min_micro_batches <= 0 or min_micro_batches > len(inputs):
-        raise ValueError(f"invalid min_micro_batches={min_micro_batches} for {len(inputs)} inputs")
+        return _fixed_plan(len(inputs), config.micro_batch_size)
     lengths = [sequence_length(model_input) for model_input in inputs]
+    return plan_micro_batches_for_lengths(
+        lengths, config, padding_free=padding_free, min_micro_batches=min_micro_batches
+    )
+
+
+def _fixed_plan(count: int, micro_batch_size: int) -> list[list[int]]:
+    return [list(range(start, min(start + micro_batch_size, count))) for start in range(0, count, micro_batch_size)]
+
+
+def plan_micro_batches_for_lengths(
+    lengths: list[int],
+    config: MicroBatchConfig,
+    *,
+    padding_free: bool,
+    min_micro_batches: int = 1,
+) -> list[list[int]]:
+    """Same as :func:`plan_micro_batches`, for samples given by their sequence lengths."""
+    if not lengths:
+        raise ValueError("cannot plan micro-batches for empty inputs")
+    if not config.dynamic_batching:
+        return _fixed_plan(len(lengths), config.micro_batch_size)
+    if min_micro_batches <= 0 or min_micro_batches > len(lengths):
+        raise ValueError(f"invalid min_micro_batches={min_micro_batches} for {len(lengths)} inputs")
     capacity = config.max_tokens_per_micro_batch
     oversized = [length for length in lengths if length > capacity]
     if oversized:

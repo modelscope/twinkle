@@ -975,7 +975,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                outputs = self.model(**inputs)
+                # Without gradient checkpointing use_cache stays True, and Transformers skips
+                # detecting padding-free packed sequences whenever a KV cache exists.
+                outputs = self.model(**inputs, use_cache=False)
 
         recorded_routing = rr.finish()
 
@@ -1147,7 +1149,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
             with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                    outputs = self.model(**inputs)
+                    # In eval mode use_cache defaults to True, and Transformers skips detecting
+                    # padding-free packed sequences whenever a KV cache exists.
+                    outputs = self.model(**inputs, use_cache=False)
 
             recorded_routing = rr.finish()
 
