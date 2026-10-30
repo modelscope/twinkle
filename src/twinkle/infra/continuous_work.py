@@ -70,14 +70,24 @@ _CW_CREATE_LOCK = threading.Lock()
 _WORKER_ASYNC_PREFIX = '_twinkle_async_'
 
 
+# Threads that wait for a generation are cheap: they park on a future and hold no engine
+# resource, so their number should track the in-flight request count a rollout driver keeps
+# open (a hundred-plus episodes is normal), not the actor's admission concurrency. Threads
+# spawn lazily up to this ceiling, so a large default costs nothing when idle.
+_WORKER_WAIT_THREADS_FLOOR = 256
+
+
 def _worker_executor(self, ):
     """Threads for running a blocking worker method off the actor's event loop.
 
-    Sized from ``TWINKLE_ACTOR_MAX_CONCURRENCY``, which ``create_workers`` sets to
-    the actor's ``max_concurrency``: any fewer threads than that would throttle
-    below the concurrency the actor was configured for. A private executor rather
-    than the loop's default one, so this never changes behaviour for anything else
-    running on that loop.
+    The floor is decoupled from the actor's ``max_concurrency`` on purpose: a waiting thread
+    blocks on a future for the whole generation while holding no engine resource, so sizing it
+    like the admission concurrency (24) caps the in-flight generations at 24 -- measured on the
+    vLLM sampler as a 3.5x per-request slowdown for a 100-request rollout. ``
+    TWINKLE_ACTOR_MAX_CONCURRENCY`` (set by ``create_workers``) still raises the floor when the
+    actor is configured wider than it, and ``TWINKLE_ACTOR_WORKER_THREADS`` overrides both.
+    A private executor rather than the loop's default one, so this never changes behaviour for
+    anything else running on that loop.
     """
     executor = getattr(self, '_twinkle_worker_executor', None)
     if executor is not None:
@@ -86,7 +96,8 @@ def _worker_executor(self, ):
         executor = getattr(self, '_twinkle_worker_executor', None)
         if executor is None:
             from concurrent.futures import ThreadPoolExecutor
-            n = int(os.environ.get('TWINKLE_ACTOR_MAX_CONCURRENCY') or 0) or 1
+            n = int(os.environ.get('TWINKLE_ACTOR_WORKER_THREADS') or 0) or max(
+                int(os.environ.get('TWINKLE_ACTOR_MAX_CONCURRENCY') or 0), _WORKER_WAIT_THREADS_FLOOR)
             executor = ThreadPoolExecutor(max_workers=n, thread_name_prefix='twinkle-worker')
             self._twinkle_worker_executor = executor
         return executor

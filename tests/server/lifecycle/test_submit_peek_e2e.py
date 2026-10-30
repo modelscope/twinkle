@@ -13,7 +13,7 @@ import pytest
 ray = pytest.importorskip('ray')
 
 from twinkle.server.state import ServerState                              # noqa: E402
-from twinkle.server.task_queue.config import TaskQueueConfig        # noqa: E402
+from twinkle.server.config.task_queue import TaskQueueConfig        # noqa: E402
 from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 from twinkle_client import _future                                        # noqa: E402
 from twinkle_client.exceptions import TaskFailedError                     # noqa: E402

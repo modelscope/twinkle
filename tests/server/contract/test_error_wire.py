@@ -9,6 +9,9 @@ from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_rout
 
 class _State:
 
+    async def assert_future_owner(self, request_id, token):
+        return None
+
     async def get_future(self, request_id: str):
         return {
             'status': 'failed',

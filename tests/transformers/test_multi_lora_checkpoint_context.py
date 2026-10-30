@@ -21,6 +21,7 @@ def test_checkpoint_activates_target_tenant_before_optimizer_state_initializatio
     wrapper = object.__new__(MultiLoraTransformersModel)
     wrapper.__dict__['model'] = model
     wrapper.multi_adapter = manager
+    wrapper._model_wrapped = True
     wrapper.strategy = SimpleNamespace(unwrap_model=lambda value: value)
     with manager.adapter('first'):
         params = [param for name, param in model.named_parameters() if '.lora_0.' in name]
@@ -46,3 +47,39 @@ def test_checkpoint_activates_target_tenant_before_optimizer_state_initializatio
             wrapper.load(str(tmp_path), adapter_name='first', load_optimizer=True)
     assert model.active_adapter == 'lora_0'
     assert set(model.peft_config) == {'lora_0', 'lora_1'}
+
+
+def _make_two_tenant_wrapper():
+    manager = MultiLora(max_loras=2, max_r=4)
+    config = LoraConfig(r=4, lora_alpha=8, target_modules=['0'])
+    model = manager.patch(torch.nn.Sequential(torch.nn.Linear(4, 4)), target_modules=['0'], lora_config=config)
+    manager.reset_adapter_status()
+    manager.acquire_lora('first', config)
+    manager.acquire_lora('second', config)
+    wrapper = object.__new__(MultiLoraTransformersModel)
+    wrapper.multi_adapter = manager
+    return wrapper, model
+
+
+def _lora_params(model):
+    return {name: param for name, param in model.named_parameters() if 'lora_' in name}
+
+
+@pytest.mark.parametrize('disable_lora', [False, True])
+def test_adapter_context_keeps_every_slot_trainable(disable_lora):
+    wrapper, model = _make_two_tenant_wrapper()
+    for tenant in ('second', 'first', 'second'):
+        with wrapper._adapter_context(tenant, disable_lora=disable_lora):
+            assert all(param.requires_grad for param in _lora_params(model).values())
+        assert all(param.requires_grad for param in _lora_params(model).values())
+
+
+def test_adapter_context_only_active_slot_receives_gradient():
+    wrapper, model = _make_two_tenant_wrapper()
+    for param in _lora_params(model).values():
+        torch.nn.init.normal_(param)
+    with wrapper._adapter_context('second'):
+        model(torch.randn(2, 4)).sum().backward()
+    grads = {name: param.grad for name, param in _lora_params(model).items()}
+    assert all(grad is not None for name, grad in grads.items() if '.lora_1.' in name)
+    assert all(grad is None for name, grad in grads.items() if '.lora_0.' in name)

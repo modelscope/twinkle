@@ -20,9 +20,13 @@ import contextlib
 import functools
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from ray.exceptions import GetTimeoutError
 from typing import Any
 
-from .types import BackendBusyError
+from twinkle.server.exceptions import BackendBusyError
+
+# Backend execution has the same deadline semantics for asyncio and Ray waits.
+BACKEND_TIMEOUT_EXCEPTIONS = (TimeoutError, GetTimeoutError)
 
 
 class BackendGate:

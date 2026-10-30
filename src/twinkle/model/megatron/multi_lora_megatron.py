@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from contextlib import contextmanager
+from copy import deepcopy
 from functools import partial
 from peft import LoraConfig
 from torch.optim import Optimizer
@@ -33,6 +34,36 @@ from .mtp.mtp import MtpTrainingState
 from .strategy import MegatronStrategy
 
 logger = get_logger()
+
+
+@contextmanager
+def _seq_cls_head_lora_load_gate(bridge):
+    """Let mcore-bridge restore a LoRA-only sequence classification head.
+
+    mcore-bridge 1.6.4 checks for ``score.weight`` before entering its head loader,
+    but a PEFT checkpoint contains only ``score.lora_A/B.weight``. Provide the key
+    as a load-time gate; the LoRA branch never reads the corresponding base tensor.
+    """
+    required = ('_convert_post_process', '_peft_format', 'hf_score_key', 'config')
+    if any(not hasattr(bridge, name) for name in required):
+        raise RuntimeError('seq_cls head LoRA restore requires the mcore-bridge 1.6.4 loader API')
+    original = bridge._convert_post_process
+
+    def convert_post_process(mg_model, hf_state_dict, hf_prefix, to_mcore):
+        if to_mcore and bridge._peft_format and bridge.config.task_type == 'seq_cls':
+            head_key = bridge.hf_score_key
+            module_key, _, param_key = head_key.rpartition('.')
+            lora_key = f'{module_key}.lora_A.{param_key}'
+            if head_key not in hf_state_dict and lora_key in hf_state_dict:
+                hf_state_dict = dict(hf_state_dict)
+                hf_state_dict[head_key] = hf_state_dict[lora_key]
+        return original(mg_model, hf_state_dict, hf_prefix, to_mcore)
+
+    bridge._convert_post_process = convert_post_process
+    try:
+        yield
+    finally:
+        bridge._convert_post_process = original
 
 
 @remote_class(execute='all')
@@ -377,7 +408,7 @@ class MultiLoraMegatronModel(MegatronModel):
         else:
             checkpoint_dir = os.path.join(output_dir, name)
         bridge = self.strategy.bridge
-        with self.multi_adapter.save_context(adapter_name) as real_adapter_name:
+        with self.multi_adapter.save_context(adapter_name) as real_adapter_name, _seq_cls_head_lora_load_gate(bridge):
             model = self.strategy.unwrap_model(self.model)
             bridge.load_weights(
                 model,
@@ -454,8 +485,12 @@ class MultiLoraMegatronModel(MegatronModel):
                              'because loading config from modelhub may causing unexpected behavior')
         if not isinstance(config_or_dir, LoraConfig):
             raise ValueError('config_or_dir must be a LoraConfig instance')
+        config_or_dir = deepcopy(config_or_dir)
+        if config_or_dir.modules_to_save:
+            raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
+        self.multi_adapter.validate_tenant_target_modules(config_or_dir.target_modules,
+                                                         getattr(config_or_dir, 'target_parameters', None))
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
-        config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
         config_or_dir.trainable_token_indices = None

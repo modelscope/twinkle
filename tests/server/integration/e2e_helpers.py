@@ -290,3 +290,34 @@ def assert_metrics_valid(metrics: Any, label: str) -> None:
                 assert math.isfinite(val), (
                     f'[{label}] Metric {key}={val} is not finite!')
     log(f'[{label}] Metrics valid: {metrics}')
+
+
+def sampled_datum(prompt_tokens, sample, advantage):
+    from tinker import types
+
+    tokens = prompt_tokens + list(sample.tokens)
+    prompt_positions = len(prompt_tokens) - 1
+    size = len(tokens) - 1
+
+    def tensor(values, dtype):
+        return types.TensorData(data=values, dtype=dtype, shape=[size])
+
+    return types.Datum(
+        model_input=types.ModelInput.from_ints(tokens[:-1]),
+        loss_fn_inputs={
+            'target_tokens': tensor(tokens[1:], 'int64'),
+            'weights': tensor([0.0] * prompt_positions + [1.0] * len(sample.tokens), 'float32'),
+            'logprobs': tensor([0.0] * prompt_positions + list(sample.logprobs), 'float32'),
+            'advantages': tensor([0.0] * prompt_positions + [advantage] * len(sample.tokens), 'float32'),
+        },
+    )
+
+
+def completion_logprobs(client, datum, timeout):
+    result = client.forward([datum], 'cross_entropy').result(timeout=timeout)
+    values = np.asarray(result.loss_fn_outputs[0]['logprobs'].tolist(), dtype=np.float64)
+    weights = np.asarray(datum.loss_fn_inputs['weights'].tolist())
+    assert len(values) >= len(weights)
+    values = values[:len(weights)][weights != 0]
+    assert values.size and np.isfinite(values).all()
+    return values

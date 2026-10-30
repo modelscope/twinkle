@@ -22,7 +22,7 @@ the spec, so a later reader cannot merge these away):
    ``status_code`` -- an execution-time failure is delivered with HTTP 200, so the
    value is systematically unequal to the response status code.
 4. A closed value set on a wire field is declared as ``Literal`` / enum, never a
-   bare ``str`` (see ``QueueStateLiteral`` in ``errors.py``).
+   bare ``str`` (see ``QueueState`` in ``errors.py``).
 
 Field roles
 -----------

@@ -368,6 +368,8 @@ class _ServerTools:
         sampler_list = samplers or []
         if backend not in ('transformers', 'megatron'):
             raise ValueError(f'Unsupported training backend: {backend!r}')
+        if backend == 'megatron' and train_gpus < 2:
+            raise ValueError('megatron training instances require at least 2 devices')
 
         # Sanitize model name for use in route/names
         def _short(mid: str) -> str:
@@ -428,6 +430,9 @@ class _ServerTools:
                 'args': {
                     'backend': backend,
                     'model_id': f'ms://{model_id}',
+                    'min_replicas': 0,
+                    'max_replicas': 1,
+                    'idle_timeout_s': 600,
                     'max_length': 500000,  # total tokens per forward pass (must match max_input_tokens)
                     'nproc_per_node': train_gpus,
                     'device_group': {

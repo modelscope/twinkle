@@ -24,6 +24,14 @@ class Loss:
             'support micro-batching, including dynamic batching. Increase micro_batch_size or the '
             'dynamic token budget so the full local batch fits in a single micro-batch.')
 
+    def validate_inputs(self, inputs, **kwargs) -> None:
+        """Reject a batch before any rank starts its forward pass.
+
+        Loss implementations whose alignment rules can fail per sample override
+        this hook. The default accepts every batch.
+        """
+        return None
+
     def micro_batch_scale(self, inputs: list[InputFeature], indices: list[int]) -> float:
         if len(indices) == len(inputs):
             return 1.0

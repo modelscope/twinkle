@@ -5,6 +5,7 @@ import functools
 import time
 from typing import Any
 
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .base import BaseManager
@@ -12,100 +13,114 @@ from .models import FutureFailureRecord, FutureRecord, _now_iso
 
 logger = get_logger()
 
-# Status sets used by the do-not-regress guard inside the atomic transform.
-_TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
-_NON_TERMINAL_STATUSES = frozenset({'pending', 'queued', 'running'})
 
+class FutureTransitions:
+    """Pure, picklable atomic transitions; the manager owns I/O and retention."""
 
-def _future_record_transform(
-    existing: dict | None,
-    *,
-    request_id: str,
-    new_status: str,
-    model_id: str | None,
-    reason: str | None,
-    result: Any,
-    failure: dict[str, Any] | None,
-    queue_state: str | None,
-    queue_state_reason: str | None,
-    replica_id: str | None,
-    absolute_deadline: float | None,
-    now: str,
-) -> dict | None:
-    """Atomic transform body for :meth:`FutureManager.store_status`.
+    terminal = TERMINAL_STATUSES
+    cancellable = frozenset({'pending', 'queued'})
+    order = {'pending': 0, 'queued': 1, 'running': 2}
 
-    Module-level so it remains picklable when forwarded across the Ray actor
-    boundary (closures and lambdas cannot be).
+    @staticmethod
+    def update(
+        existing: dict | None,
+        *,
+        request_id: str,
+        new_status: str,
+        model_id: str | None,
+        reason: str | None,
+        result: Any,
+        failure: dict[str, Any] | None,
+        queue_state: str | None,
+        queue_state_reason: str | None,
+        replica_id: str | None,
+        absolute_deadline: float | None,
+        now: str,
+        owner_token: str | None = None,
+    ) -> dict | None:
+        """Atomic transform body for :meth:`FutureManager.store_status`.
 
-    A record already in a terminal state is never overwritten (returns ``None``,
-    which ``update_atomic`` treats as "keep current value"). A write of a
-    *different* terminal state is logged; a write of the *same* terminal state is
-    dropped silently (State_Backend idempotent retries produce these and they
-    indicate no defect).
-    """
-    existing_status = existing.get('status') if existing is not None else None
-    if existing_status in _TERMINAL_STATUSES:
-        if new_status != existing_status:
-            logger.warning('future %s already terminal as %r; refusing %r', request_id, existing_status, new_status)
-        return None
+        A static method remains picklable across the Ray actor boundary.
 
-    if existing is None:
-        record = FutureRecord(
-            status=new_status,
-            model_id=model_id,
-            reason=reason,
-            result=result,
-            failure=failure,
-            queue_state=queue_state,
-            queue_state_reason=queue_state_reason,
-            replica_id=replica_id,
-            absolute_deadline=absolute_deadline,
-            created_at=now,
-            updated_at=now,
-        )
-        return record.model_dump()
+        A record already in a terminal state is never overwritten (returns ``None``,
+        which ``update_atomic`` treats as "keep current value"). A write of a
+        *different* terminal state is logged; a write of the *same* terminal state is
+        dropped silently (State_Backend idempotent retries produce these and they
+        indicate no defect).
+        """
+        existing_status = existing.get('status') if existing is not None else None
+        if existing_status in FutureTransitions.terminal:
+            if new_status != existing_status:
+                logger.warning('future %s already terminal as %r; refusing %r', request_id, existing_status, new_status)
+            return None
+        if new_status in FutureTransitions.order and existing_status in FutureTransitions.order:
+            if FutureTransitions.order[new_status] <= FutureTransitions.order[existing_status]:
+                return None
+        if new_status == 'cancelled' and existing_status == 'running':
+            return None
 
-    updated = dict(existing)
-    updated['status'] = new_status
-    updated['model_id'] = model_id
-    updated['updated_at'] = now
-    # replica_id is set at creation and is deliberately NOT overwritten here.
-    if reason is not None:
-        updated['reason'] = reason
-    if new_status in _TERMINAL_STATUSES:
-        if new_status in ('failed', 'cancelled'):
-            updated['result'] = None
-            updated['failure'] = failure
-        else:
-            updated['failure'] = None
+        if existing is None:
+            record = FutureRecord(
+                owner_token=owner_token,
+                status=new_status,
+                model_id=model_id,
+                reason=reason,
+                result=result,
+                failure=failure,
+                queue_state=queue_state,
+                queue_state_reason=queue_state_reason,
+                replica_id=replica_id,
+                absolute_deadline=absolute_deadline,
+                created_at=now,
+                updated_at=now,
+            )
+            return record.model_dump()
+
+        updated = dict(existing)
+        updated['status'] = new_status
+        updated['model_id'] = model_id
+        updated['updated_at'] = now
+        # replica_id is set at creation and is deliberately NOT overwritten here.
+        if reason is not None:
+            updated['reason'] = reason
+        if new_status in FutureTransitions.terminal:
+            if new_status in ('failed', 'cancelled'):
+                updated['result'] = None
+                updated['failure'] = failure
+            else:
+                updated['failure'] = None
+                updated['result'] = result
+        elif result is not None:
             updated['result'] = result
-    elif result is not None:
-        updated['result'] = result
-    if queue_state is not None:
-        updated['queue_state'] = queue_state
-    if queue_state_reason is not None:
-        updated['queue_state_reason'] = queue_state_reason
-    return updated
+        if queue_state is not None:
+            updated['queue_state'] = queue_state
+        if queue_state_reason is not None:
+            updated['queue_state_reason'] = queue_state_reason
+        return updated
 
+    @staticmethod
+    def start(existing: dict | None, *, now: str) -> dict | None:
+        """Acquire execution only from pending/queued, using the existing record."""
+        if existing is None or existing.get('status') not in FutureTransitions.cancellable:
+            return None
+        return {**existing, 'status': 'running', 'queue_state': 'active', 'updated_at': now}
 
-_CANCELLABLE_STATUSES = frozenset({'pending', 'queued'})
+    @staticmethod
+    def cancel(existing: dict | None, *, failure: dict, now: str) -> dict | None:
+        """Atomic transform: cancel iff the task has not started (pending/queued).
 
-
-def _cancel_if_not_started_transform(existing: dict | None, *, failure: dict, now: str) -> dict | None:
-    """Atomic transform: cancel iff the task has not started (pending/queued).
-
-    Returns ``None`` (no change) for running/terminal/missing records so a task
-    already executing is never interrupted -- cancel is best-effort on the queue.
-    """
-    status = existing.get('status') if existing is not None else None
-    if status not in _CANCELLABLE_STATUSES:
-        return None
-    updated = dict(existing)
-    updated['status'] = 'cancelled'
-    updated['result'] = None
-    updated['failure'] = failure
-    updated['updated_at'] = now
-    return updated
+        Returns ``None`` (no change) for running/terminal/missing records so a task
+        already executing is never interrupted -- cancel is best-effort on the queue.
+        """
+        status = existing.get('status') if existing is not None else None
+        if status not in FutureTransitions.cancellable:
+            return None
+        updated = dict(existing)
+        updated['status'] = 'cancelled'
+        updated['result'] = None
+        updated['failure'] = failure
+        updated['updated_at'] = now
+        return updated
 
 
 class FutureManager(BaseManager[FutureRecord]):
@@ -128,6 +143,7 @@ class FutureManager(BaseManager[FutureRecord]):
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
+        owner_token: str | None = None,
     ) -> None:
         """Create or update a future record with the latest status.
 
@@ -153,7 +169,7 @@ class FutureManager(BaseManager[FutureRecord]):
         await self._backend.update_atomic(
             self._make_key(request_id),
             functools.partial(
-                _future_record_transform,
+                FutureTransitions.update,
                 request_id=request_id,
                 new_status=status,
                 model_id=model_id,
@@ -164,8 +180,17 @@ class FutureManager(BaseManager[FutureRecord]):
                 queue_state_reason=queue_state_reason,
                 replica_id=replica_id,
                 absolute_deadline=absolute_deadline,
+                owner_token=owner_token,
                 now=now,
             ),
+        )
+
+    async def try_start(self, request_id: str) -> bool:
+        """True only when this attempt atomically acquired execution rights."""
+        return await self._backend.update_atomic(
+            self._make_key(request_id),
+            functools.partial(FutureTransitions.start, now=_now_iso()),
+            return_changed=True,
         )
 
     async def cancel_if_pending(self, request_id: str) -> str | None:
@@ -183,7 +208,7 @@ class FutureManager(BaseManager[FutureRecord]):
         )
         result = await self._backend.update_atomic(
             self._make_key(request_id),
-            functools.partial(_cancel_if_not_started_transform, failure=failure.model_dump(), now=_now_iso()),
+            functools.partial(FutureTransitions.cancel, failure=failure.model_dump(), now=_now_iso()),
         )
         return result.get('status') if result else None
 
@@ -219,14 +244,14 @@ class FutureManager(BaseManager[FutureRecord]):
         now = time.time()
         expired_ids: list[str] = []
         for request_id, record in all_records.items():
-            if record.status in _TERMINAL_STATUSES:
+            if record.status in FutureTransitions.terminal:
                 timestamp = self._parse_timestamp(record.updated_at or record.created_at)
                 if timestamp < cutoff_time:
                     expired_ids.append(request_id)
                 continue
 
             # Non-terminal records are never deleted -- only ever written ``failed``.
-            # replica_id None (pre-upgrade) => ownership unknown => treated as alive.
+            # Unowned background tasks have no replica; only explicit owners can be declared dead.
             replica_id = record.replica_id
             replica_alive = (replica_id is None or alive_replica_ids is None or replica_id in alive_replica_ids)
             if not replica_alive:

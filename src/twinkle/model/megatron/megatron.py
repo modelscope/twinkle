@@ -450,7 +450,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # a KTO z_KL / adapter-disabled reference batch carries no label/ref_logps, which the loss
         # would reject). eval/training omit it; megatron's calculate_loss is a raise, so eval_loss
         # depends on forward_only computing it here.
-        compute_loss = kwargs.pop('compute_loss', True)
+        compute_loss = kwargs.pop('compute_loss', not (forward_only and disable_lora))
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         # MoE routing replay (R2/R3): the driver passes the MODE scalar, resolved below to this
@@ -497,11 +497,17 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             # Compatible with DPO
             micro_batch_size = min(2, len(inputs))
         unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+        # No config in the Megatron stack declares ``attention_mask_type``, so this
+        # lookup always fell through to None and the processor could never tell that
+        # the task is causal. Default it for decoder-only causal_lm.
+        attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
+        if attention_mask_type is None and task == 'causal_lm':
+            attention_mask_type = 'causal'
         inputs = processor(
             inputs,
             micro_batch_size=micro_batch_size,
             variable_seq_lengths=self.variable_seq_lengths,
-            attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
+            attention_mask_type=attention_mask_type,
         )
         if compute_loss:
             loss_instance.validate_micro_batching(len(inputs))
@@ -572,17 +578,18 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 if entropies is not None:
                     outputs['entropies'] = entropies
             if not compute_loss:
-                # Empty-loss probe: skip the loss but still route a zero loss through reduce_loss so
-                # the logps reach its returned dict unchanged (the transformers forward_only contract).
+                # Empty-loss probes still use the common task-output reporting path.
                 zero = torch.zeros((), device=Platform.get_local_device(), dtype=torch.float32)
-                return self.strategy.reduce_loss(zero, zero.clone(), output_tensor, logps)
-            result = loss_instance(inputs, outputs, **current_kwargs)
+                result = {'loss': zero, 'num_tokens': zero.clone()}
+            else:
+                result = loss_instance(inputs, outputs, **current_kwargs)
+            reported_logits = outputs.get('logits') if return_logits else None
             if unpacked_logits is not None:
                 outputs.pop('logits', None)
                 del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
-            if not counts:
+            if compute_loss and not counts:
                 # Later will gather this value, so it becomes:
                 # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
                 # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps )
@@ -592,7 +599,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
-            reduced = self.strategy.reduce_loss(losses, counts, output_tensor, logps)
+            reduced = self.strategy.reduce_loss(losses, counts, reported_logits, logps)
+            if embeddings is not None:
+                reduced[2]['embeddings'] = embeddings.detach()
             if result.get('channel_loss') is not None:
                 reduced[2]['channel_loss'] = result['channel_loss']
             return reduced
@@ -789,6 +798,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         loss = torch.tensor(0.0).to(Platform.get_local_device())
         logits = []
         logps = []
+        embedding_batches = []
         channel_loss = {}
         count = 0
         n_loss_entries = 0
@@ -798,10 +808,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
                         n_loss_entries += 1
-                    if 'logits' in loss_dict:
+                    if loss_dict.get('logits') is not None:
                         logits.append(loss_dict['logits'])
-                    if 'logps' in loss_dict:
+                    if loss_dict.get('logps') is not None:
                         logps.append(loss_dict['logps'])
+                    if loss_dict.get('embeddings') is not None:
+                        embedding_batches.append(loss_dict['embeddings'])
                     if 'num_tokens' in loss_dict:
                         count += loss_dict['num_tokens']
                     for channel, stats in loss_dict.get('channel_loss', {}).items():
@@ -846,7 +858,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             logps = torch.cat(logps, dim=0)
         elif not logps:
             logps = None
-        if logits and not self.variable_seq_lengths:
+        if logits and (not self.variable_seq_lengths or task in ('seq_cls', 'reranker', 'generative_reranker')):
             logits = torch.cat(logits, dim=0)
         if transactional:
             dp_world_size = self.device_mesh._get_dp_fsdp_world_size()
@@ -858,10 +870,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             loss = loss.detach().float().item()
         if isinstance(num_tokens, torch.Tensor):
             num_tokens = num_tokens.detach().float().item()
-        if not return_logits:
+        if not return_logits or (isinstance(logits, list) and not logits):
             logits = None
         inputs = processor.unpack_inputs(inputs, task=task)
         model_output = ModelOutput(logits=logits, loss=loss, logps=logps, num_tokens=num_tokens)
+        if embedding_batches:
+            model_output['embeddings'] = torch.cat(embedding_batches, dim=0)
         if channel_loss:
             model_output['channel_loss'] = channel_loss
         # R2 RECORD: hand the captured whole-model routing back to the driver (symmetric with
@@ -1387,6 +1401,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         for _model in self.strategy.unwrap_model(self.model):
             for param in _model.parameters():
                 param.grad = None
+        if kwargs.get('reset_training_state', False):
+            self.optimizer_group = {_default_adapter_name: self._construct_default_optimizer_group()}
+            self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         if dist.is_initialized():
             dist.barrier()
 

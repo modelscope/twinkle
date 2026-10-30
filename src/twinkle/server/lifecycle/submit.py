@@ -16,6 +16,8 @@ from twinkle.data_format import InputFeature, Trajectory, is_encoded
 from twinkle.protocol.types.base import FieldRole, fields_with_role
 from twinkle.protocol.types.data import export_batch
 from twinkle.protocol.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.model import (AdapterRequest, DataPlaneForwardRequest, ForwardBackwardTaskRequest,
+                                          TrainingRequest)
 from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
 
@@ -85,11 +87,11 @@ def backend_kwargs(body: Any) -> dict[str, Any]:
     model_cls = type(body)
     kwargs: dict[str, Any] = {}
     for name in fields_with_role(model_cls, FieldRole.BackendKwarg):
-        value = getattr(body, name, None)
+        value = getattr(body, name)
         if value is not None:
             kwargs[name] = value
     for name in fields_with_role(model_cls, FieldRole.Passthrough):
-        region = getattr(body, name, None) or {}
+        region = getattr(body, name) or {}
         overlap = set(region) & set(kwargs)
         if overlap:
             raise ValueError(f'{name} collides with declared backend parameters: {", ".join(sorted(overlap))}')
@@ -123,7 +125,7 @@ def resolve_twinkle_adapter_name(request: Request, adapter_name: str | None) -> 
 async def run_submit(
     self: QueuedDeployment,
     request: Request,
-    body: Any,
+    body: TrainingRequest,
     *,
     task_type: str,
     backend_call: Callable[..., Coroutine],
@@ -152,13 +154,10 @@ async def run_submit(
     signature-patching wrapper once deepened the route graph past CPython's C-stack
     recursion guard during ``serve.ingress``).
 
-    Four queued endpoints deliberately do NOT route through here and call
-    ``submit_and_peek`` / ``submit_background_and_peek`` directly: model
-    ``add_adapter_to_model`` (creates the adapter, so the resource assertion cannot
-    apply and it owns the train_mode/full-mode checks), model ``upload_to_hub`` (pure
-    I/O, background task), and sampler ``sample`` / ``sample_to_data_plane`` (no adapter
-    semantics). Zero-write and admission still hold for them because both live inside
-    ``schedule_task`` -> ``_perform_preflight_checks``, not in this shell.
+    Upload uses the background I/O path; sampling uses concurrent admission.
+    Their scheduling entrypoints apply the same preflight and Future ownership rules.
+    Training creation/release belongs to the public Router and Controller, rather
+    than this compute-operation shell.
 
     ``backend_call(self, body, adapter_name, token)`` runs the endpoint-specific call
     and returns the JSON-safe task result. ``metrics(self, body)`` supplies scheduling
@@ -168,7 +167,7 @@ async def run_submit(
     not implemented by every backend.
     """
     token = await self._on_request_start(request)
-    adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name)
+    adapter_name = body.training_id
 
     # ---- Preflight: decidable from the body plus this deployment's backend, so it
     # runs before any state write and before the enqueue. ----
@@ -192,29 +191,40 @@ async def run_submit(
     # forward_backward would be dropped as a duplicate AND handed the first adapter's
     # loss. That is a silent wrong-result bug, i.e. the exact failure this dedup
     # exists to prevent, one level up. ----
-    request_id = f'req_{uuid.uuid4().hex}'
-    seq_id = getattr(body, 'seq_id', None)
-    dedup_key = None
-    if seq_id is not None:
-        session_id = get_session_id_from_request(request) or request.state.request_id
-        dedup_key = f'seq::{session_id}::{adapter_name or "-"}::{seq_id}'
-        ttl = int(self.task_queue_config.effective_execution_timeout) + 60
-        prior_request_id = await self.state.claim_seq(dedup_key, request_id, ttl)
-        if prior_request_id is not None:
-            return await self._peek_terminal(prior_request_id, fallback_status='pending')
+    sequenced = isinstance(body, (AdapterRequest, ForwardBackwardTaskRequest, DataPlaneForwardRequest))
+    return await submit_training_task(
+        self,
+        _task,
+        training_id=body.training_id,
+        stream=f'native::{get_session_id_from_request(request)}::{task_type}',
+        seq_id=body.seq_id if sequenced else None,
+        peek=True,
+        token=token,
+        task_type=task_type,
+        **schedule_kwargs)
 
-    # ---- Decision_Boundary: preflight (in schedule_task) then peek ----
+
+async def submit_training_task(self,
+                               factory,
+                               *,
+                               training_id: str,
+                               stream: str,
+                               seq_id: int | None,
+                               peek: bool = False,
+                               **kwargs):
+    """Submit with explicit request identity; retain claims once any future was written."""
+    request_id = kwargs.pop('request_id', None) or f'req_{uuid.uuid4().hex}'
+    if seq_id is not None:
+        prior = await self.state.claim_training_seq(training_id, stream, seq_id, request_id, self.sequence_retention_s)
+        if prior is not None:
+            if peek:
+                return await self._peek_terminal(prior, fallback_status='pending')
+            return {'request_id': prior, 'model_id': training_id}
+    submit = self.submit_and_peek if peek else self.schedule_task
     try:
-        return await self.submit_and_peek(
-            _task, model_id=adapter_name, token=token, task_type=task_type, request_id=request_id, **schedule_kwargs)
+        return await submit(factory, model_id=training_id, request_id=request_id, **kwargs)
     except Exception:
-        # Release the seq claim only when the task never made it onto the queue --
-        # decided by whether a future record exists, NOT by the exception type. A
-        # preflight rejection raises before any record is written, so releasing lets
-        # a retry re-enqueue. But a failure *after* enqueue (e.g. a transient state
-        # error inside the peek) leaves a live task that will still run; releasing
-        # there would let a retry enqueue a duplicate -> the exact double-apply this
-        # dedup prevents. When unsure (record exists), keep the claim.
-        if dedup_key is not None and await self.state.get_future(request_id) is None:
-            await self.state.release_seq(dedup_key)
+        # A failed response after enqueue must not allow the same update to run twice.
+        if seq_id is not None and await self.state.get_future(request_id) is None:
+            await self.state.release_training_seq(training_id, stream, seq_id, request_id)
         raise

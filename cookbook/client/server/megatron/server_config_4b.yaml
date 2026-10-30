@@ -39,6 +39,8 @@ applications:
     args:
       backend: megatron
       model_id: "ms://Qwen/Qwen3.5-4B" # ModelScope model identifier
+      min_replicas: 1
+      max_replicas: 1
       max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
@@ -53,7 +55,7 @@ applications:
         tps_limit: 100000                           # Max tokens per second for a single user
         max_input_tokens: 60000                    # Maximum input tokens per request
       adapter_config:
-        adapter_timeout: 30                        # Seconds before idle adapter unload
+        adapter_timeout: 30                        # Seconds without a session heartbeat before release
         adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
       max_loras: 5                                 # Maximum number of LoRA adapters per model
     deployments:

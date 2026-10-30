@@ -18,6 +18,8 @@ from typing import Any
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
 
+# Deliberately local: this layer works on canonical records and must not import the
+# protocol models (see test_gateway_services_do_not_import_protocol_models).
 _TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
 
 

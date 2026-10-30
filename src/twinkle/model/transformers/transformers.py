@@ -242,26 +242,7 @@ class OptimizerGroup(BaseOptimizerGroup):
 
     def accumulate_metrics(self, is_training, include_default: bool = True, metric_step: Optional[int] = None):
         self._ensure_dp_group()
-        status = self.train_status if is_training else self.eval_status
-        if metric_step is None:
-            metric_step = self.cur_step - 1
-        if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
-            forward_kwargs = copy(status.forward_kwargs)
-            forward_kwargs.pop('gradient_accumulation_steps', None)
-            loss_key = forward_kwargs.pop('_metric_loss_key', None)
-            for metric in status.metrics:
-                metric_loss_key = getattr(metric, '_twinkle_loss_key', None)
-                if metric_loss_key != loss_key or (metric_loss_key is None and not include_default):
-                    continue
-                metric.accumulate(
-                    status.inputs,
-                    status.outputs,
-                    lr=self._get_lr(),
-                    step=metric_step,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm,
-                    loss_reduction=status.loss_reduction or getattr(self.get_loss(loss_key), 'reduction', 'mean'),
-                    **forward_kwargs)
+        super().accumulate_metrics(is_training, include_default=include_default, metric_step=metric_step)
 
 
 _default_adapter_name = ''
@@ -1746,7 +1727,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return result
 
         forbidden_name_patterns = [r'bias', r'layernorm', r'rmsnorm', r'(?:^|\.)norm(?:$|\.)', r'_norm(?:$|\.)']
-        decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm], forbidden_name_patterns)
+        # Match names from the same unwrapped model used by _get_trainable_parameters.
+        # DDP's module prefix otherwise changes optimizer groups for later tenants.
+        decay_parameters = get_parameter_names(
+            self.strategy.unwrap_model(self.model), [torch.nn.LayerNorm], forbidden_name_patterns)
         params = self._get_trainable_parameters(adapter_name)
         decay_param_names = [n for n, p in params.items() if (n in decay_parameters and p.requires_grad)]
         no_decay_param_names = [n for n, p in params.items() if (n not in decay_parameters and p.requires_grad)]
@@ -2286,6 +2270,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         (exclusive) model, so the next tenant starts from clean pretrained
         weights instead of the previous tenant's trained weights.
         """
+        if kwargs.get('reset_training_state', False):
+            for optimizer_group in self.optimizer_group.values():
+                self.unregister_mm_forward_hook(optimizer_group)
+            self.optimizer_group = {_default_adapter_name: self._construct_default_optimizer_group()}
+            self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
+            self.active_group = _default_adapter_name
+            if self._model_wrapped:
+                self.register_mm_forward_hook(self.optimizer_group[_default_adapter_name])
+
         if not self.model_id:
             logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
             return

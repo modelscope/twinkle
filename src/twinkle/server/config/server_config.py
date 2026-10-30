@@ -19,10 +19,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
 
 from twinkle.server.exceptions import ConfigParseError
-from twinkle.server.task_queue.config import TaskQueueConfig
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
+from .resources import ResourceOptions
+from .task_queue import TaskQueueConfig
 from .telemetry import TelemetryConfig
+from .training import TrainingConfig, TrainingModelConfig
 
 
 class ServerConfig(BaseModel):
@@ -36,6 +38,7 @@ class ServerConfig(BaseModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     task_queue: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    resources: ResourceOptions = Field(default_factory=ResourceOptions)
     applications: list[ApplicationSpec] = Field(default_factory=list)
 
     # ---- loading ---------------------------------------------------------- #
@@ -69,9 +72,29 @@ class ServerConfig(BaseModel):
 
     @model_validator(mode='after')
     def _validate_cross_field(self) -> ServerConfig:
+        if sum(app.import_path == 'server' for app in self.applications) > 1:
+            raise ValueError('configure one gateway per server')
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
+        if self.training_config.models:
+            static = [app for app in self.applications if app.import_path != 'model']
+            names = {app.name for app in static}
+            for model in self.training_config.models:
+                if model.name in names:
+                    raise ValueError(f'training model name conflicts with application: {model.name}')
+                path = model.route_prefix
+                if any(app.route_prefix.rstrip('/') == path for app in static):
+                    raise ValueError(f'training route conflicts with application: {path}')
         return self
+
+    @property
+    def training_config(self) -> TrainingConfig:
+        """Normalize model application args into the internal runtime catalog."""
+        return TrainingConfig(
+            **self.resources.model_dump(),
+            models=[
+                TrainingModelConfig.from_application(app) for app in self.applications if app.import_path == 'model'
+            ])
 
     # ---- round-trip / serialization -------------------------------------- #
 

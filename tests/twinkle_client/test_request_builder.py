@@ -32,7 +32,7 @@ def no_network(monkeypatch):
 
 
 def test_a_declared_name_goes_to_its_field():
-    body = build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', task='embedding')
+    body = build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', task='embedding', training_id='training-a')
     assert body.task == 'embedding'
     assert body.loss_kwargs == {}
 
@@ -46,7 +46,7 @@ def test_an_undeclared_name_goes_to_the_single_passthrough_region():
         }],
         adapter_name='a',
         advantages=[0.5],
-        old_logps=[[-1.0]])
+        old_logps=[[-1.0]], training_id='training-a')
     assert body.loss_kwargs == {'advantages': [0.5], 'old_logps': [[-1.0]]}
 
 
@@ -71,7 +71,7 @@ def test_an_ambiguous_target_is_an_error_rather_than_a_guess():
 
 def test_a_model_without_a_region_rejects_an_unknown_name():
     with pytest.raises(TwinkleClientValidationError) as raised:
-        build_request(model_types.SaveRequest, adapter_name='a', name='ckpt', typo=1)
+        build_request(model_types.SaveRequest, adapter_name='a', name='ckpt', typo=1, training_id='training-a')
     assert 'typo' in str(raised.value)
 
 
@@ -81,7 +81,7 @@ def test_an_explicit_region_and_a_routed_key_are_merged():
         loss_cls='DPOLoss',
         adapter_name='a',
         init_kwargs={'beta': 0.1},
-        loss_type='sigmoid')
+        loss_type='sigmoid', training_id='training-a')
     assert body.init_kwargs == {'beta': 0.1, 'loss_type': 'sigmoid'}
 
 
@@ -89,7 +89,7 @@ def test_a_key_passed_twice_is_an_error():
     """Silently letting one win would make the effective value depend on merge order."""
     with pytest.raises(TwinkleClientValidationError, match='both directly and inside'):
         build_request(
-            model_types.SetLossRequest, loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': 0.1}, beta=0.2)
+            model_types.SetLossRequest, loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': 0.1}, beta=0.2, training_id='training-a')
 
 
 def test_an_omitted_optional_argument_is_not_routed_into_the_region():
@@ -98,7 +98,7 @@ def test_an_omitted_optional_argument_is_not_routed_into_the_region():
     Routing an explicit ``None`` would hand the backend a null argument it never received
     before, changing behaviour for callers who simply did not pass anything.
     """
-    body = build_request(model_types.SetLossRequest, loss_cls='DPOLoss', adapter_name='a', unused=None)
+    body = build_request(model_types.SetLossRequest, loss_cls='DPOLoss', adapter_name='a', unused=None, training_id='training-a')
     assert body.init_kwargs == {}
 
 
@@ -109,28 +109,28 @@ def test_an_omitted_optional_argument_is_not_routed_into_the_region():
 
 def test_a_wrongly_typed_field_fails_in_process():
     with pytest.raises(ValidationError):
-        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', temperature='hot')
+        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', temperature='hot', training_id='training-a')
 
 
 def test_an_out_of_range_value_fails_in_process():
     with pytest.raises(ValidationError):
-        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', temperature=0)
+        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', temperature=0, training_id='training-a')
 
 
 def test_malformed_inputs_fail_in_process():
     """The client shares the server's schema, so it catches this without asking."""
     with pytest.raises(ValidationError):
-        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [True]}], adapter_name='a')
+        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [True]}], adapter_name='a', training_id='training-a')
 
 
 def test_a_missing_required_field_fails_in_process():
     with pytest.raises(ValidationError):
-        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}])
+        build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], training_id='training-a')
 
 
 def test_forward_only_requires_an_adapter_context():
     with pytest.raises(ValidationError):
-        build_request(model_types.ForwardOnlyRequest, inputs=[{'input_ids': [1]}])
+        build_request(model_types.ForwardOnlyRequest, inputs=[{'input_ids': [1]}], training_id='training-a')
 
 
 # --------------------------------------------------------------------------- #
@@ -141,9 +141,9 @@ def test_forward_only_requires_an_adapter_context():
 def test_unset_optionals_stay_off_the_wire():
     """Absent and "not requested" must look the same, or the server needs its own defaults."""
     import json
-    body = build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a')
+    body = build_request(model_types.ForwardRequest, inputs=[{'input_ids': [1]}], adapter_name='a', training_id='training-a')
     payload = json.loads(request_json(body))
-    assert payload == {'inputs': [{'input_ids': [1]}], 'adapter_name': 'a', 'loss_kwargs': {}}
+    assert payload == {'training_id': 'training-a', 'inputs': [{'input_ids': [1]}], 'adapter_name': 'a', 'loss_kwargs': {}}
 
 
 def test_a_lora_config_is_serialized_to_the_form_the_server_decodes():

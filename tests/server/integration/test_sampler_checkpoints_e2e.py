@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 
-from tests.server.integration.test_tinker_rl_correctness_e2e import _completion_logprobs, _datum
+from tests.server.integration.e2e_helpers import completion_logprobs, sampled_datum
 
 pytestmark = pytest.mark.skipif(os.environ.get('TWINKLE_TEST_GPU_E2E') != '1',
                                 reason='Requires a real trainer and vLLM sampler')
@@ -58,15 +58,15 @@ def test_named_save_and_cached_overwrite():
     sampler_x = service.create_sampling_client(base_model=model_id, model_path=x)
     first = sample(sampler_x)
     same(sample(sampler_x), first)
-    datum = _datum(prompt, first, 1.0)
-    before = _completion_logprobs(client, datum, timeout)
+    datum = sampled_datum(prompt, first, 1.0)
+    before = completion_logprobs(client, datum, timeout)
     losses = []
     for _ in range(3):
         result = client.forward_backward([datum], 'cross_entropy').result(timeout=timeout)
         losses.append(float(result.metrics['loss:mean']))
         assert np.isfinite(losses[-1])
         client.optim_step(types.AdamParams(learning_rate=1e-4)).result(timeout=timeout)
-    after = _completion_logprobs(client, datum, timeout)
+    after = completion_logprobs(client, datum, timeout)
     assert float(np.mean(after - before)) > 1e-4
 
     y = client.save_weights_for_sampler(name='y').result(timeout=timeout).path

@@ -797,6 +797,7 @@ class StreamingDriver:
             if group_counts is not None:
                 group_counts.pop(record.group_key, None)
         steps = self._consume_batch(records)
+        # None means the consumer did not report a count. An explicit 0 is a real report.
         steps = 1 if steps is None else int(steps)
         self._last_pull_steps = steps
         current = self._current_version()
@@ -1153,18 +1154,18 @@ class StreamingDriver:
             raise StopIteration
         return batch
 
-    def commit(self, optimizer_steps: int = 1) -> None:
+    def commit(self, optimizer_steps: Optional[int] = 1) -> None:
         """Release the driver thread blocked in the bridge, reporting the real optimizer steps just run.
 
         The recipe calls this after training the batch ``__next__`` handed it. The count becomes the
         bridge's consume return, which drives the publish cadence (twinkle publishes after consume returns,
-        so the trained weights -- not stale ones -- are what the next admission window samples from). A zero
-        count reports no optimizer update. The same count also feeds the internal
-        ``max_steps`` budget, so a driver constructed with a numeric budget exits on its own.
+        so the trained weights -- not stale ones -- are what the next admission window samples from). Omitting
+        the count, or passing ``None``, means one step. An explicit ``0`` means this batch did not update the
+        optimizer and does not consume the ``max_steps`` budget. The same count also feeds that budget, so a
+        driver constructed with a numeric budget exits on its own.
         """
-        if optimizer_steps < 0:
-            raise ValueError('optimizer_steps must be non-negative')
-        self._committed_steps = int(optimizer_steps)
+        # None means the caller omitted the count. An explicit 0 does not consume budget.
+        self._committed_steps = 1 if optimizer_steps is None else int(optimizer_steps)
         self._budget_steps += self._committed_steps
         self._ack_event.set()
 

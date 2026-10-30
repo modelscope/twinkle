@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
-from twinkle.server.exceptions import ResourceQuotaExceededError
+from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
@@ -24,6 +24,7 @@ from .model_manager import ModelManager
 from .models import FutureFailureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
 from .sampling_manager import SamplingSessionManager
 from .session_manager import SessionManager
+from .training_store import TrainingSequences, TrainingStore
 
 logger = get_logger()
 
@@ -131,6 +132,7 @@ class ServerState:
         self._model_mgr = ModelManager(self._backend, expiration_timeout, per_token_model_limit)
         self._sampling_mgr = SamplingSessionManager(self._backend, expiration_timeout)
         self._future_mgr = FutureManager(self._backend, expiration_timeout)
+        self.training_sequences = TrainingSequences(self._backend)
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
@@ -173,6 +175,33 @@ class ServerState:
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
 
+    @property
+    def models(self) -> ModelManager:
+        return self._model_mgr
+
+    @property
+    def sessions(self) -> SessionManager:
+        return self._session_mgr
+
+    @property
+    def futures(self) -> FutureManager:
+        return self._future_mgr
+
+    @property
+    def sampling_sessions(self) -> SamplingSessionManager:
+        return self._sampling_mgr
+
+    def create_training_store(self, namespace: str) -> TrainingStore:
+        """Compose a namespaced repository; construction performs no I/O."""
+        return TrainingStore(
+            namespace,
+            self._backend,
+            models=self.models,
+            sessions=self.sessions,
+            futures=self.futures,
+            sequences=self.training_sequences,
+            expiration_timeout=self.expiration_timeout)
+
     # ----- Session Management -----
 
     async def create_session(self, payload: dict[str, Any]) -> str:
@@ -212,6 +241,9 @@ class ServerState:
             Last heartbeat timestamp, or None if the session does not exist.
         """
         return await self._session_mgr.get_last_heartbeat(session_id)
+
+    async def get_session_last_heartbeats(self, session_ids: list[str]) -> dict[str, float | None]:
+        return await self._session_mgr.get_last_heartbeats(session_ids)
 
     # ----- Model Registration -----
 
@@ -429,7 +461,13 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
-    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int) -> str | None:
+    async def assert_future_owner(self, request_id: str, token: str) -> None:
+        record = await self._future_mgr.get(request_id)
+        owner = record.owner_token if record is not None else None
+        if owner is not None and owner != token:
+            raise ResourceNotFoundError('Unknown future')
+
+    async def claim_seq(self, dedup_key: str, request_id: str, ttl: int | None) -> str | None:
         """Idempotency claim for a client seq_id.
 
         Atomically records ``dedup_key -> request_id`` if unseen and returns ``None``
@@ -445,6 +483,17 @@ class ServerState:
         """Drop a seq dedup claim (used when the claimed request never enqueued, e.g.
         preflight rejected it) so a retry can be admitted rather than see a phantom."""
         await self._backend.delete(dedup_key)
+
+    async def claim_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str,
+                                 retention: float) -> str | None:
+        return await self.training_sequences.claim(training_id, stream, sequence, request_id, retention)
+
+    async def release_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str) -> None:
+        await self.training_sequences.release(training_id, stream, sequence, request_id)
+
+    async def try_start_future(self, request_id: str) -> bool:
+        """Acquire task execution atomically, without inferring ownership from reads."""
+        return await self._future_mgr.try_start(request_id)
 
     async def cancel_future(self, request_id: str) -> dict[str, Any]:
         """Best-effort cancel: drop the task iff it has not started running.
@@ -470,6 +519,7 @@ class ServerState:
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
+        owner_token: str | None = None,
     ) -> None:
         """Store task status with either a success result or domain failure.
 
@@ -501,6 +551,7 @@ class ServerState:
             queue_state_reason=queue_state_reason,
             replica_id=replica_id,
             absolute_deadline=absolute_deadline,
+            owner_token=owner_token,
         )
 
     # ----- Resource Cleanup -----
@@ -613,7 +664,7 @@ def get_server_state(cache_key: str = 'twinkle_server_state',
     # launcher-propagated env (so a non-gateway worker honours the operator's
     # YAML instead of the hardcoded default), else the module default.
     from twinkle.server.config.application_spec import ServerStateArgs
-    env_policy = ServerStateArgs.from_env()
+    env_policy = ServerStateArgs.from_env() or ServerStateArgs()
 
     def _resolve(explicit, env_value, default):
         if explicit is not None:
@@ -622,13 +673,11 @@ def get_server_state(cache_key: str = 'twinkle_server_state',
             return env_value
         return default
 
-    expiration_timeout = _resolve(expiration_timeout, getattr(env_policy, 'expiration_timeout', None),
-                                  _DEFAULT_EXPIRATION_TIMEOUT)
-    cleanup_interval = _resolve(cleanup_interval, getattr(env_policy, 'cleanup_interval', None),
-                                _DEFAULT_CLEANUP_INTERVAL)
-    per_token_model_limit = _resolve(per_token_model_limit, getattr(env_policy, 'per_token_model_limit', None),
+    expiration_timeout = _resolve(expiration_timeout, env_policy.expiration_timeout, _DEFAULT_EXPIRATION_TIMEOUT)
+    cleanup_interval = _resolve(cleanup_interval, env_policy.cleanup_interval, _DEFAULT_CLEANUP_INTERVAL)
+    per_token_model_limit = _resolve(per_token_model_limit, env_policy.per_token_model_limit,
                                      _DEFAULT_PER_TOKEN_MODEL_LIMIT)
-    metrics_update_interval = _resolve(metrics_update_interval, getattr(env_policy, 'metrics_update_interval', None),
+    metrics_update_interval = _resolve(metrics_update_interval, env_policy.metrics_update_interval,
                                        _DEFAULT_METRICS_UPDATE_INTERVAL)
 
     state = ServerState(

@@ -329,4 +329,5 @@ class LazyCleanupMixin:
             await self.state.start_cleanup_task()
         except Exception as e:
             logger.warning(f'Failed to start ServerState cleanup task: {e}')
-        self._state_cleanup_started = True
+        else:
+            self._state_cleanup_started = True
