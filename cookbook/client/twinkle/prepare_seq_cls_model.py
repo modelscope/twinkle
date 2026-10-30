@@ -35,10 +35,11 @@ text_config.num_labels = args.num_labels
 # The classifier scores the last non-padding token; batched inputs need the pad id to find it.
 text_config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
-torch.manual_seed(42)
-# The load report lists the vision weights as UNEXPECTED and score.weight as MISSING:
-# both are expected, the vision tower is dropped and the new head is initialized here.
+# The load report lists the vision weights as UNEXPECTED and score.weight as MISSING.
 model = AutoModelForSequenceClassification.from_pretrained(model_dir, config=text_config, torch_dtype='auto')
+# 显式初始化新分类头：不能依赖缺失权重加载时的隐式初始化。
+torch.manual_seed(42)
+torch.nn.init.normal_(model.score.weight, mean=0.0, std=text_config.initializer_range)
 model.save_pretrained(args.output_dir)
 tokenizer.save_pretrained(args.output_dir)
 print(f'Saved {type(model).__name__} with {args.num_labels} label(s) to {args.output_dir}')  # noqa: T201

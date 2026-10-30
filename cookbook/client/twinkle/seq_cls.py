@@ -90,9 +90,10 @@ def train():
 
     # Step 5: training loop. task='seq_cls' returns one [num_labels] score row per text.
     for step in range(MAX_STEPS):
-        output = model.forward_backward(inputs=batch, task='seq_cls')
+        model.forward_backward(inputs=batch, task='seq_cls')
         model.clip_grad_and_step(max_grad_norm=1.0)
-        logger.info(f'Step {step}: loss={output.result["loss"]:.4f}')
+        metric = model.calculate_metric(is_training=True)
+        logger.info(f'Step {step}: {metric.result}')
 
     # Step 6: check the predictions, then save the adapter and optimizer state.
     logits = model.forward_only(inputs=batch, task='seq_cls', return_logits=True).result['logits']

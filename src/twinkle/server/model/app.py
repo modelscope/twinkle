@@ -101,6 +101,10 @@ def _make_model_class(base: type) -> type:
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
+    # The head comes from the persisted config checked by ``_validate_model_task``; HF model
+    # constructors do not accept these deployment keys, unlike Megatron's bridge config.
+    kw.pop('task_type', None)
+    kw.pop('num_labels', None)
     # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
     # constructor -- it would either be rejected by the remote-class layer in safe mode
     # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only

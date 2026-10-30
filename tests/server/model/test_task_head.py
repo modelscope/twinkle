@@ -99,3 +99,13 @@ def test_task_batches_match_the_wire_contract(task):
     parsed = TypeAdapter(WireInputBatch).validate_python(batch)
     assert len(parsed) == 12
     assert all(type(label) is int for row in parsed for label in row.labels)
+
+
+def test_transformers_backend_does_not_forward_head_keys(monkeypatch):
+    from twinkle.server.model import app
+    from twinkle.server.model.backends import transformers_model
+
+    received = {}
+    monkeypatch.setattr(transformers_model, 'TwinkleCompatTransformersModel', lambda **kwargs: received.update(kwargs))
+    app._make_transformers_model({'model_id': 'unused', 'task_type': 'seq_cls', 'num_labels': 3})
+    assert received == {'model_id': 'unused'}

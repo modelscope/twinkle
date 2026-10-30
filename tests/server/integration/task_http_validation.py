@@ -70,11 +70,12 @@ def validate(base_url, controller, args):
         kwargs = {'task': args.task, 'gradient_accumulation_steps': 2}
         if args.backend == 'megatron':
             kwargs['micro_batch_size'] = 6
-        result = model.forward_backward(inputs=copy.deepcopy(batch), **kwargs).result
-        assert np.isfinite(result['loss'])
+        model.forward_backward(inputs=copy.deepcopy(batch), **kwargs)
         # Call after every backward; the backend gates updates at its GA boundary.
         model.clip_grad_and_step()
-        return float(result['loss'])
+        loss = float(model.calculate_metric(is_training=True).result['loss'])
+        assert np.isfinite(loss)
+        return loss
 
     def save(model, name, samples):
         return model.save(name, save_optimizer=True, consumed_train_samples=samples)
