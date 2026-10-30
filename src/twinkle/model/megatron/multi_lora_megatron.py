@@ -44,6 +44,9 @@ def _seq_cls_head_lora_load_gate(bridge):
     but a PEFT checkpoint contains only ``score.lora_A/B.weight``. Provide the key
     as a load-time gate; the LoRA branch never reads the corresponding base tensor.
     """
+    required = ('_convert_post_process', '_peft_format', 'hf_score_key', 'config')
+    if any(not hasattr(bridge, name) for name in required):
+        raise RuntimeError('seq_cls head LoRA restore requires the mcore-bridge 1.6.4 loader API')
     original = bridge._convert_post_process
 
     def convert_post_process(mg_model, hf_state_dict, hf_prefix, to_mcore):
@@ -485,7 +488,8 @@ class MultiLoraMegatronModel(MegatronModel):
         config_or_dir = deepcopy(config_or_dir)
         if config_or_dir.modules_to_save:
             raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
-        self.multi_adapter.validate_tenant_target_modules(config_or_dir.target_modules)
+        self.multi_adapter.validate_tenant_target_modules(config_or_dir.target_modules,
+                                                         getattr(config_or_dir, 'target_parameters', None))
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False

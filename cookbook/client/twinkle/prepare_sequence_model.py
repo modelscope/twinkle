@@ -20,22 +20,23 @@ import transformers
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 
-def tiny_backbone(directory, seed=42):
-    from tokenizers.pre_tokenizers import ByteLevel
-    from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen2Tokenizer
+def tiny_backbone(directory, tokenizer_source='ms://Qwen/Qwen3.5-4B', seed=42):
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    from twinkle.hub import HubOperation
 
+    tokenizer_path = HubOperation.download_model(tokenizer_source)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
-        config = Qwen2Config(vocab_size=512, hidden_size=64, intermediate_size=128,
+        config = Qwen2Config(vocab_size=len(tokenizer), hidden_size=64, intermediate_size=128,
                              num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-                             max_position_embeddings=512, pad_token_id=0, bos_token_id=2, eos_token_id=3,
+                             max_position_embeddings=512, pad_token_id=tokenizer.pad_token_id,
+                             bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
                              attention_dropout=0., tie_word_embeddings=False)
         Qwen2ForCausalLM(config).save_pretrained(directory)
-    vocab = {'[PAD]': 0, '[UNK]': 1, '[BOS]': 2, '[EOS]': 3}
-    # Use the model family's tokenizer so AutoTokenizer preserves its byte vocabulary.
-    vocab.update({token: index + 4 for index, token in enumerate(sorted(ByteLevel.alphabet()))})
-    Qwen2Tokenizer(vocab=vocab, merges=[], pad_token='[PAD]', unk_token='[UNK]',
-                   bos_token='[BOS]', eos_token='[EOS]').save_pretrained(directory)
+    tokenizer.save_pretrained(directory)
     return str(directory)
 
 
@@ -75,6 +76,10 @@ def prepare_models(model_id, output_dir, *, seed=42, mcore_native=False):
     directory = Path(output_dir)
     source = HubOperation.download_model(str(model_id))
     config = AutoConfig.from_pretrained(source, trust_remote_code=False)
+    if config.model_type == 'qwen3_5':
+        from packaging.version import Version
+        if Version(transformers.__version__) < Version('5.8'):
+            raise RuntimeError('Qwen3.5 preparation requires transformers>=5.8; use --tiny or upgrade')
     if mcore_native and config.model_type != 'qwen3_5':
         raise ValueError('--mcore-native currently supports Qwen3.5 checkpoints')
     tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=False)
@@ -82,6 +87,12 @@ def prepare_models(model_id, output_dir, *, seed=42, mcore_native=False):
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token_id is None:
         raise ValueError('The tokenizer needs a pad or EOS token')
+    task_directories = [directory / task for task in ('embedding', 'reranker', 'seq_cls')]
+    if mcore_native:
+        task_directories += [Path(str(directory) + '-mcore')]
+    for path in task_directories:
+        if path.exists() and any(path.iterdir()):
+            raise ValueError(f'Output directory is not empty: {path}; choose a new directory or clear it first')
     base = getattr(transformers, config.architectures[0]).from_pretrained(source, torch_dtype='auto')
     backbone = base.model
     text_config = getattr(config, 'text_config', config)
@@ -119,14 +130,16 @@ def prepare_models(model_id, output_dir, *, seed=42, mcore_native=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--model', default='ms://Qwen/Qwen3.5-4B')
+    parser.add_argument('--model', help='Source model; omit it to build a tiny model with the Qwen3.5 tokenizer')
     parser.add_argument('--output-dir', default='output/cs-models')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--tiny', action='store_true', help='Build a small offline Qwen2 backbone')
+    parser.add_argument('--tiny', action='store_true', help='Build a small Qwen2 backbone with the source tokenizer')
     parser.add_argument('--mcore-native', action='store_true',
                         help='Also write Qwen3.5 Megatron-native text-only checkpoints')
     args = parser.parse_args()
-    source = tiny_backbone(Path(args.output_dir) / 'source', args.seed) if args.tiny else args.model
+    tokenizer_source = args.model or 'ms://Qwen/Qwen3.5-4B'
+    source = tiny_backbone(Path(args.output_dir) / 'source', tokenizer_source, args.seed) \
+        if args.tiny or args.model is None else args.model
     prepare_models(source, args.output_dir, seed=args.seed, mcore_native=args.mcore_native)
 
 
