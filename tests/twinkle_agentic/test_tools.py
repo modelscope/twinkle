@@ -8,7 +8,6 @@ from twinkle.data_format.message import Tool as ToolInfo
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager, _extract_name
 
-
 # ---------------------------------------------------------------------------
 # Mock tools
 # ---------------------------------------------------------------------------
@@ -39,6 +38,13 @@ class CalculatorTool(Tool):
 
     def tool_info(self) -> ToolInfo:
         return {'function': {'name': 'calculator', 'description': 'Basic calculator.'}}
+
+
+class BoundTool(MockTool):
+
+    def __init__(self, env, name='bound_tool'):
+        super().__init__(name)
+        self._env = env
 
 
 class FailingTool(Tool):
@@ -245,3 +251,34 @@ class TestToolManager:
                 return {}  # missing function.name
         with pytest.raises(ValueError, match='non-empty'):
             ToolManager([BadTool()])
+
+    def test_bound_envs_empty_and_deduplicated_by_identity(self):
+        class Env:
+            def __init__(self):
+                self.idle_calls = 0
+
+            def ensure_idle(self):
+                self.idle_calls += 1
+
+        env = Env()
+        manager = ToolManager([BoundTool(env, 'first'), BoundTool(env, 'second'), MockTool('stateless')])
+        assert ToolManager().bound_envs() == ()
+        assert manager.bound_envs() == (env, )
+
+        manager.ensure_idle()
+        assert env.idle_calls == 1
+
+    def test_bound_envs_returns_each_distinct_environment(self):
+        first, second = object(), object()
+        manager = ToolManager([BoundTool(first, 'first'), BoundTool(second, 'second')])
+        assert manager.bound_envs() == (first, second)
+
+    def test_ensure_idle_failure_propagates(self):
+        class Env:
+            @staticmethod
+            def ensure_idle():
+                raise RuntimeError('execution unknown')
+
+        manager = ToolManager([BoundTool(Env())])
+        with pytest.raises(RuntimeError, match='execution unknown'):
+            manager.ensure_idle()

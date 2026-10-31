@@ -137,9 +137,39 @@ TWINKLE_BATCH_SIZE % (
 
 | File | Role |
 |---|---|
-| `client_orchestrated_grpo.py` | Client-side async GRPO orchestration |
+| `client_orchestrated_grpo.py` | Single-turn DataRef GRPO with FIFO partitions |
+| `multi_turn_grpo.py` | Materialized multi-turn GRPO with independent AgentENV workspaces |
 | `run_server.sh` | Start Ray and the dedicated component server |
 | `server_config.yaml` | Qwen3.5-4B Model, Sampler, DataPlane, Gateway, and Processor deployment |
+
+## Multi-turn AgentENV recipe
+
+`multi_turn_grpo.py` keeps the same client-owned training schedule, but each GRPO
+attempt receives a separate AgentENV workspace and returns a complete trajectory
+to the client. It uses four attempts per prompt and overlaps two prompt groups;
+there is no SDK-managed Trainer or rollout job.
+
+Prerequisites beyond the server setup above:
+
+```bash
+pip install 'e2b>=2.7'
+export AGENTENV_API_URL=http://your-agentenv-gateway:8080
+export AGENTENV_TEMPLATE=your-python-template
+python cookbook/client/async_rl/multi_turn_grpo.py
+```
+
+The user code creates, initializes, verifies, and closes environments. The
+rollout only borrows their `ToolManager` objects. Each group names one immutable
+`policy-N` checkpoint; a successful update saves a new URI for later groups.
+Provider and verifier-infrastructure failures are not candidate low rewards and
+are not retried blindly.
+
+This recipe intentionally keeps the original single-turn DataRef example
+unchanged. Multi-turn trajectories are materialized on the client: no multi-turn
+DataRef output, automatic checkpoint pruning, remote abort, or whole-episode
+wall-clock deadline is added. Cancellation stops subsequent work and drains the
+current operation before safe environments and the client are closed. Environments
+whose execution state is unknown are quarantined for provider/operator handling.
 
 ## Troubleshooting
 

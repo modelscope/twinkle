@@ -16,18 +16,16 @@
 # The server must be running first (see server.py / server_config.yaml). Both the
 # model and sampler services must be configured.
 #
-# NOTE on weight sync: ``ClientMultiTurnRollout`` samples with the sampler's
-# currently loaded server-side weights. A full RL loop would periodically
-# ``model.save(is_sampler=True)`` and point the sampler at the saved adapter; that
-# sync is intentionally omitted here to keep the rollout example focused.
+# Each rollout call names one immutable saved adapter URI. Training saves a new
+# policy after each update, so an in-flight episode never switches weights.
 
-import dotenv
 import os
-from peft import LoraConfig
 from typing import Any, Dict, List, Tuple
 
-from twinkle import get_logger
-from twinkle import init_twinkle_client
+import dotenv
+from peft import LoraConfig
+
+from twinkle import get_logger, init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
@@ -185,24 +183,30 @@ def train():
     )
 
     advantage_fn = GRPOAdvantage()
+    policy_uri = model.save(name='policy-0', save_optimizer=False).twinkle_path
 
     for step in range(MAX_STEPS):
         # 1. Reset independent OpenEnv episodes and run the batched rollout.
         n_trajectories = BATCH_SIZE * NUM_GENERATIONS
         trajectories, tool_managers, env_tools_list, environments = prepare_trajectories(n_trajectories)
         try:
-            rolled = rollout(trajectories, tool_manager=tool_managers)
+            rolled = rollout(
+                trajectories,
+                tool_manager=tool_managers,
+                adapter_name=ADAPTER_NAME,
+                adapter_uri=policy_uri,
+            )
             rewards = extract_rewards(env_tools_list)
         finally:
             for env in environments:
+                env.ensure_idle()
                 env.close()
 
-        # 2. Read back per-trajectory logprobs (top-1 chosen-token logprob).
+        # 2. Reuse the ledger's sampled-token logprobs without decoding top-k entries.
         all_inputs: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
         for traj in rolled:
-            logprobs = traj.get('logprobs') or []
-            all_old_logps.append([lp[0][1] for lp in logprobs])
+            all_old_logps.append(traj['rollout_logprobs'])
             all_inputs.append(traj)
 
         avg_turns = sum(t.get('turns') or 0 for t in rolled) / len(rolled)
@@ -217,6 +221,7 @@ def train():
         # 4. Policy update over the rolled-out trajectories.
         model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
         model.clip_grad_and_step()
+        policy_uri = model.save(name=f'policy-{step + 1}', save_optimizer=False).twinkle_path
         logger.info(f'[Step {step}] {model.calculate_metric(is_training=True).result}')
 
     logger.info('Multi-turn rollout example finished.')
