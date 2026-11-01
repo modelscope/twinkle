@@ -65,17 +65,22 @@ def _api_followup_response(
     input_feature: Dict[str, Any],
     adapter_kwargs: Dict[str, Any],
     followups: int,
+    rollout_state: Any = None,
     **kwargs: Any,
 ) -> SampledSequence:
-    """Use the API for appended stages and the primary backend otherwise."""
+    """Use the API for appended stages and the primary backend otherwise.
+
+    An API turn reads the conversation off the ``RolloutState`` when the rollout
+    supplies one -- the same preference ``default_response_callback`` applies --
+    because a bare encoded feature carries no messages for APISampler to send."""
     if followups:
         if api is None:
             raise ValueError('a follow-up stage was routed to the API but none was configured')
-        return api(input_feature, sampling_params, **adapter_kwargs)
+        return api(rollout_state or input_feature, sampling_params, **adapter_kwargs)
     if sampler is not None:
         return _sample_one(sampler, input_feature, sampling_params, adapter_kwargs)
     if api is not None:
-        return api(input_feature, sampling_params, **adapter_kwargs)
+        return api(rollout_state or input_feature, sampling_params, **adapter_kwargs)
     raise ValueError('AgenticChallenger has neither a sampler nor an API backend')
 
 
