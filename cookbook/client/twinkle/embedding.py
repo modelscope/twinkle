@@ -11,16 +11,16 @@
 #     -> add_metric('EmbeddingMetric', is_training=True)
 #     -> loop: forward_backward(inputs=mb, task='embedding') + clip_grad_and_step
 #     -> calculate_metric(is_training=True)
+#     -> save(...)
 #
 # Data format (anchor/positive contrastive pairs):
 #   inputs: [anchor_0, positive_0, anchor_1, positive_1, ...]
 #   labels:  [      1,          0,        1,          0, ...]
 #   (labels==1 marks a new group's anchor; labels==0 marks its positive)
 #
-# The server must be running first (see server.py / server_config.yaml). Only the
-# model service is required (no sampler). Works against both the transformers and
-# megatron backends: each single-sequence feature carries ``position_ids`` so the
-# megatron mrope model gets valid positions (transformers derives them internally).
+# The server must be running first, e.g. with
+# cookbook/client/server/transformer/server_config.yaml. Only the model service is
+# required (no sampler), and the base model is used as is (no extra head).
 
 import dotenv
 import os
@@ -88,7 +88,7 @@ def train():
     # Step 2: build the client model with a fresh LoRA adapter.
     model = client.model(MODEL_ID)
     model.add_adapter_to_model(ADAPTER_NAME, LoraConfig(target_modules='all-linear'))
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template')
 
     # Step 3: configure the embedding-training pipeline (ORDER MATTERS).
     # Pass class names as strings; the server resolves them to core-lib classes.
@@ -107,15 +107,20 @@ def train():
     # Step 5: training loop. task='embedding' selects the embedding pooling +
     # InfoNCE path on the server (TransformersEmbeddingPatch/MegatronEmbeddingPatch
     # is applied and rolled back automatically inside the forward).
+    # On a megatron server, also pass micro_batch_size=<samples per DP rank>: its
+    # default micro batch of 2 would leave a single pair (no negatives) per step.
     for step in range(MAX_STEPS):
         model.forward_backward(inputs=minibatch, task='embedding')
         model.clip_grad_and_step(max_grad_norm=1.0)
         metric = model.calculate_metric(is_training=True)
-        metric = getattr(metric, 'result', metric)
-        logger.info(f'Step {step}: {metric}')
+        logger.info(f'Step {step}: {metric.result}')
 
-    logger.info('Embedding training finished. Healthy training shows pos_sim rising '
-                'and neg_sim stable/decreasing.')
+    # Step 6: save the LoRA adapter (and optimizer state, so training can be
+    # resumed later with model.resume_from_checkpoint(saved.twinkle_path)).
+    saved = model.save('embedding-final', save_optimizer=True)
+    logger.info(f'Saved checkpoint: {saved.twinkle_path}')
+    logger.info('Embedding training finished. Healthy training shows loss falling, '
+                'pos_sim rising and neg_sim stable/decreasing.')
 
 
 if __name__ == '__main__':

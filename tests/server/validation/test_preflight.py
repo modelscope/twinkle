@@ -28,22 +28,23 @@ class _Deployment:
         self.futures: dict[str, dict] = {}
         self.backend_calls: list = []
         self.claimed: list = []
+        self.sequence_retention_s = 3600
         self._task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
         self.state = SimpleNamespace(
-            claim_seq=self._claim_seq,
+            claim_training_seq=self._claim_seq,
             get_future=self._get_future,
-            release_seq=self._release_seq,
+            release_training_seq=self._release_seq,
         )
 
-    async def _claim_seq(self, dedup_key, request_id, ttl):
-        self.claimed.append(dedup_key)
+    async def _claim_seq(self, training_id, stream, sequence, request_id, retention):
+        self.claimed.append((training_id, stream, sequence))
         return None
 
     async def _get_future(self, request_id):
         return self.futures.get(request_id)
 
-    async def _release_seq(self, dedup_key):
-        self.claimed.remove(dedup_key)
+    async def _release_seq(self, training_id, stream, sequence, request_id):
+        self.claimed.remove((training_id, stream, sequence))
 
     async def _on_request_start(self, request):
         return 'token'
@@ -82,7 +83,7 @@ def test_megatron_rejects_the_split_gradient_endpoints_with_501():
     for capability in (BackendCapability.Forward, BackendCapability.Backward, BackendCapability.CalculateLoss):
         with pytest.raises(EndpointUnavailableError) as raised:
             assert_request_supported(
-                _Deployment('megatron'), model_types.AdapterRequest(adapter_name='a'), capability=capability)
+                _Deployment('megatron'), model_types.AdapterRequest(adapter_name='a', training_id='training-a'), capability=capability)
         assert raised.value.error_code == 501
         assert 'forward_backward' in str(raised.value), 'the alternative endpoints must be named'
 
@@ -90,14 +91,14 @@ def test_megatron_rejects_the_split_gradient_endpoints_with_501():
 def test_transformers_serves_the_split_gradient_endpoints():
     assert_request_supported(
         _Deployment('transformers'),
-        model_types.AdapterRequest(adapter_name='a'),
+        model_types.AdapterRequest(adapter_name='a', training_id='training-a'),
         capability=BackendCapability.Forward)
 
 
 def test_mock_backend_serves_every_endpoint():
     """The mock is a test double; restricting it would only break tests."""
     assert_request_supported(
-        _Deployment('mock'), model_types.AdapterRequest(adapter_name='a'), capability=BackendCapability.Forward)
+        _Deployment('mock'), model_types.AdapterRequest(adapter_name='a', training_id='training-a'), capability=BackendCapability.Forward)
 
 
 @pytest.mark.asyncio
@@ -107,7 +108,7 @@ async def test_capability_rejection_writes_no_future_and_calls_no_backend():
         await run_submit(
             deployment,
             _request(),
-            model_types.AdapterRequest(adapter_name='a'),
+            model_types.AdapterRequest(adapter_name='a', training_id='training-a'),
             task_type='backward',
             backend_call=_call,
             capability=BackendCapability.Backward)
@@ -123,7 +124,7 @@ async def test_capability_rejection_writes_no_future_and_calls_no_backend():
 
 def test_a_megatron_only_parameter_is_rejected_on_transformers():
     with pytest.raises(RequestRejectedError) as raised:
-        assert_request_supported(_Deployment('transformers'), model_types.SaveRequest(adapter_name='a', merge_lora=True))
+        assert_request_supported(_Deployment('transformers'), model_types.SaveRequest(adapter_name='a', merge_lora=True, training_id='training-a'))
     assert raised.value.error_code == 422
     assert 'merge_lora' in str(raised.value)
     assert 'megatron' in str(raised.value)
@@ -132,7 +133,7 @@ def test_a_megatron_only_parameter_is_rejected_on_transformers():
 def test_a_transformers_only_parameter_is_rejected_on_megatron():
     with pytest.raises(RequestRejectedError):
         assert_request_supported(
-            _Deployment('megatron'), model_types.LoadRequest(adapter_name='a', name='ckpt', strict=True))
+            _Deployment('megatron'), model_types.LoadRequest(adapter_name='a', name='ckpt', strict=True, training_id='training-a'))
 
 
 def test_an_unset_backend_only_parameter_is_not_rejected():
@@ -142,8 +143,8 @@ def test_an_unset_backend_only_parameter_is_not_rejected():
     backend's own default, it would look sent on every request and the other half of the
     fleet would reject everything.
     """
-    assert_request_supported(_Deployment('transformers'), model_types.SaveRequest(adapter_name='a'))
-    assert_request_supported(_Deployment('megatron'), model_types.LoadRequest(adapter_name='a', name='ckpt'))
+    assert_request_supported(_Deployment('transformers'), model_types.SaveRequest(adapter_name='a', training_id='training-a'))
+    assert_request_supported(_Deployment('megatron'), model_types.LoadRequest(adapter_name='a', name='ckpt', training_id='training-a'))
 
 
 def test_every_restricted_field_is_optional_with_a_none_default():
@@ -178,14 +179,14 @@ def test_a_real_parameter_read_from_kwargs_is_not_rejected():
     assert_request_supported(
         _Deployment(),
         model_types.SetProcessorRequest(
-            processor_cls='InputProcessor', adapter_name='a', init_kwargs={'padding_side': 'right'}))
+            processor_cls='InputProcessor', adapter_name='a', init_kwargs={'padding_side': 'right'}, training_id='training-a'))
 
 
 def test_an_unrecognised_plugin_argument_is_forwarded():
     """Plugins accept ``**kwargs``, so "unknown" cannot mean "wrong"."""
     assert_request_supported(
         _Deployment(),
-        model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'my_custom_knob': 1}))
+        model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'my_custom_knob': 1}, training_id='training-a'))
 
 
 def test_no_plugin_download_happens_during_validation(monkeypatch):
@@ -195,7 +196,7 @@ def test_no_plugin_download_happens_during_validation(monkeypatch):
                         lambda *a, **k: pytest.fail('validation must not download a plugin'))
     assert_request_supported(
         _Deployment(),
-        model_types.SetLossRequest(loss_cls='ms://someone/MyLoss', adapter_name='a', init_kwargs={'beta': 0.1}))
+        model_types.SetLossRequest(loss_cls='ms://someone/MyLoss', adapter_name='a', init_kwargs={'beta': 0.1}, training_id='training-a'))
 
 
 # --------------------------------------------------------------------------- #
@@ -210,32 +211,32 @@ def test_control_fields_are_never_forwarded_to_the_backend():
     into a backend signature.
     """
     body = model_types.ForwardBackwardTaskRequest(
-        inputs=[{'input_ids': [1, 2]}], adapter_name='a', seq_id=3, task='embedding')
+        inputs=[{'input_ids': [1, 2]}], adapter_name='a', seq_id=3, task='embedding', training_id='training-a')
     assert backend_kwargs(body) == {'task': 'embedding'}
 
 
 def test_unset_backend_parameters_are_not_forwarded():
-    body = model_types.ForwardRequest(inputs=[{'input_ids': [1]}], adapter_name='a')
+    body = model_types.ForwardRequest(inputs=[{'input_ids': [1]}], adapter_name='a', training_id='training-a')
     assert backend_kwargs(body) == {}
 
 
 def test_passthrough_contents_are_flattened():
     body = model_types.ForwardBackwardTaskRequest(
-        inputs=[{'input_ids': [1]}], adapter_name='a', loss_kwargs={'advantages': [0.5]})
+        inputs=[{'input_ids': [1]}], adapter_name='a', loss_kwargs={'advantages': [0.5]}, training_id='training-a')
     assert backend_kwargs(body) == {'advantages': [0.5]}
 
 
 def test_a_passthrough_key_shadowing_a_declared_parameter_is_an_error():
     """Silently letting one win would make the effective value depend on merge order."""
     body = model_types.ForwardRequest(inputs=[{'input_ids': [1]}], adapter_name='a', task='causal_lm',
-                                      loss_kwargs={'task': 'embedding'})
+                                      loss_kwargs={'task': 'embedding'}, training_id='training-a')
     with pytest.raises(ValueError, match='collides'):
         backend_kwargs(body)
 
 
 def test_plugin_identifiers_are_not_forwarded_as_kwargs():
     """The handler passes ``loss_cls`` positionally; forwarding it too would duplicate it."""
-    body = model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': 0.1})
+    body = model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': 0.1}, training_id='training-a')
     assert backend_kwargs(body) == {'beta': 0.1}
 
 

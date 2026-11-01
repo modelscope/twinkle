@@ -2,9 +2,55 @@
 """Helpers for constructing protocol-layer ``ErrorPayload`` values."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
+
+
+@dataclass(frozen=True)
+class FailureResponse:
+    """How a domain failure is presented inside a response, not its HTTP status."""
+
+    error_code: int
+    category: ErrorCategory
+
+    @classmethod
+    def for_reason(cls, reason: str) -> FailureResponse:
+        policies = cls._policies()
+        return policies.get(reason, policies['internal_error'])
+
+    @classmethod
+    def reasons(cls) -> frozenset[str]:
+        return frozenset(cls._policies())
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def _policies(cls) -> dict[str, FailureResponse]:
+        return {
+            'capacity_unavailable': cls(error_code=409, category=ErrorCategory.User),
+            'startup_failed': cls(error_code=500, category=ErrorCategory.Server),
+            'startup_timeout': cls(error_code=504, category=ErrorCategory.Server),
+            'invalid_request': cls(error_code=400, category=ErrorCategory.User),
+            'request_rejected': cls(error_code=400, category=ErrorCategory.User),
+            'resource_not_found': cls(error_code=404, category=ErrorCategory.User),
+            'full_mode_busy': cls(error_code=409, category=ErrorCategory.User),
+            'input_tokens_exceeded': cls(error_code=422, category=ErrorCategory.User),
+            'batch_size_invalid': cls(error_code=422, category=ErrorCategory.User),
+            'rate_limit_exceeded': cls(error_code=429, category=ErrorCategory.User),
+            'resource_quota_exceeded': cls(error_code=429, category=ErrorCategory.User),
+            'cancelled': cls(error_code=499, category=ErrorCategory.User),
+            'endpoint_unavailable': cls(error_code=501, category=ErrorCategory.Server),
+            'state_contention': cls(error_code=503, category=ErrorCategory.Server),
+            'backend_gate_unavailable': cls(error_code=503, category=ErrorCategory.Server),
+            'orphaned_replica': cls(error_code=503, category=ErrorCategory.Server),
+            'backend_cancelled': cls(error_code=503, category=ErrorCategory.Server),
+            'execution_timeout': cls(error_code=504, category=ErrorCategory.Server),
+            'deadline_exceeded': cls(error_code=500, category=ErrorCategory.Server),
+            'internal_error': cls(error_code=500, category=ErrorCategory.Server),
+        }
+
 
 _ERROR_MAX = 1024
 _TRACEBACK_MAX = 65536

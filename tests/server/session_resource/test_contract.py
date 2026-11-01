@@ -7,7 +7,6 @@ from unittest import mock
 import pytest
 
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.session_resource.adapter import AdapterManagerMixin
 from twinkle.server.session_resource.base import SessionResourceMixin
 from twinkle.server.session_resource.processor import ProcessorManagerMixin
 
@@ -39,16 +38,12 @@ class _MissingBaseHook(SessionResourceMixin):
     pass
 
 
-class _MissingAdapterHook(AdapterManagerMixin):
-    pass
-
-
 class _MissingProcessorHook(ProcessorManagerMixin):
     pass
 
 
 def test_all_resource_expiry_hooks_are_abstract() -> None:
-    for cls in (_MissingBaseHook, _MissingAdapterHook, _MissingProcessorHook):
+    for cls in (_MissingBaseHook, _MissingProcessorHook):
         with pytest.raises(TypeError):
             cls()
 

@@ -233,9 +233,6 @@ applications:
         rps_limit: 100                                 # Max requests per second
         tps_limit: 10000                               # Max tokens per second per user
         max_input_tokens: 10000                        # Maximum input tokens per request
-      adapter_config:
-        adapter_timeout: 30                            # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000                    # Maximum adapter lifetime (seconds)
       max_loras: 1                                     # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
@@ -328,9 +325,6 @@ The difference from the Megatron backend is only in the `backend` parameter of t
       device_mesh:
         device_type: cuda
         dp_size: 2
-      adapter_config:
-        adapter_timeout: 1800                          # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -479,3 +473,58 @@ raises. During that window newly arriving tasks fail fast with a `server`/503 er
 Each persisted future stores its immutable `absolute_deadline` when it is created.
 Cleanup therefore reaches the same decision regardless of which deployment process
 holds the cleanup lease.
+
+## On-demand training and device reclamation
+
+Training services can load models when a request arrives and release devices when they are no longer needed. Keep the existing `applications` format and configure the `args` of an `import_path: model` entry:
+
+```yaml
+- name: training-qwen
+  route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+  import_path: model
+  args:
+    model_id: ms://Qwen/Qwen3.5-4B
+    backend: transformers
+    train_mode: lora
+    nproc_per_node: 2
+    device_group: {name: model, ranks: 2, device_type: cuda}
+    device_mesh: {device_type: cuda, dp_size: 2}
+    max_loras: 3
+    min_replicas: 0
+    max_replicas: 2
+    idle_timeout_s: 600
+```
+
+| Setting | How to use it |
+|---------|---------------|
+| `device_group`, `device_mesh` | Set the devices and parallel layout for each training instance. Adjust them to fit your model and available devices. Megatron requires at least two devices per instance. |
+| `min_replicas` | Training instances to keep loaded at startup. With `0`, the first training request waits for model loading. |
+| `max_replicas` | Maximum number of training instances. |
+| `max_loras` | Maximum LoRA trainings per instance. Used only for LoRA training. |
+| `idle_timeout_s` | Seconds of training inactivity before its handle is released. Heartbeats and result polling do not extend this time. Queued or running training operations are protected. |
+
+This example allows two instances, each holding three LoRA trainings. Clients are also subject to `server_config.per_token_model_limit`; clients using the same token share that token's quota.
+
+For full-parameter training, set `train_mode: full` and remove `max_loras`. Each full training uses its own instance. To offer LoRA and full training for the same weights, configure two model applications with different `name` and `route_prefix` values and select the mode in each. Clients choose the model alias from the corresponding route. See [Hybrid LoRA Training](../Hybrid-LoRA-Training.md) for Hybrid LoRA configuration.
+
+Release models when training finishes; Twinkle clients can call `remove_adapter()`. After the last training releases an instance, empty instances above `min_replicas` shut down. Save checkpoints regularly. If a handle expires or the service restarts, create a new training and restore from a checkpoint. Upgrade the Twinkle SDK together with the server.
+
+Complete configurations are available in `cookbook/client/server/transformer/server_config.yaml` and `cookbook/client/server/megatron/server_config.yaml`.
+
+### Automatic sampling scaling
+
+Set instance counts and the scaling target in the `args` of your `import_path: sampler` entry. For example:
+
+```yaml
+nproc_per_node: 1
+device_group: {name: sampler, ranks: 1, device_type: cuda}
+device_mesh: {device_type: cuda, dp_size: 1}
+min_replicas: 2
+max_replicas: 4
+target_ongoing_requests: 16
+idle_timeout_s: 600
+```
+
+This configuration loads two sampling instances at startup and scales up to four as requests increase. Extra instances shut down after 600 seconds of continuous inactivity, leaving two loaded. `target_ongoing_requests` is the target number of in-flight requests per instance; a smaller value triggers earlier scaling. `device_group` and `device_mesh` determine the devices used by each instance. Allow enough devices for both training and sampling.
+
+Clients keep using the existing sampling API without selecting an instance. LoRA checkpoints load as requests need them. After a service restart, reapply custom templates and other runtime settings.

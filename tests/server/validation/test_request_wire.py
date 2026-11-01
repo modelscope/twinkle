@@ -55,7 +55,7 @@ def _post(client: TestClient, path: str, body: dict):
 
 
 def _valid_forward(**overrides) -> dict:
-    return {'inputs': [{'input_ids': [1, 2, 3]}], 'adapter_name': 'a', **overrides}
+    return {'training_id': 'training-a', 'inputs': [{'input_ids': [1, 2, 3]}], 'adapter_name': 'a', **overrides}
 
 
 def test_a_valid_body_reaches_the_handler(client):
@@ -140,6 +140,7 @@ def test_a_dynamic_plugin_argument_is_accepted_inside_its_region(client):
     response = _post(client, '/set_loss', {
         'loss_cls': 'DPOLoss',
         'adapter_name': 'a',
+        'training_id': 'training-a',
         'init_kwargs': {'beta': 0.1, 'anything_at_all': [1, 2]},
     })
     assert response.status_code == 200
@@ -154,7 +155,7 @@ def test_a_non_json_value_fails_in_the_client_before_any_request():
     """
     from pydantic import ValidationError
     with pytest.raises(ValidationError) as raised:
-        model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': object()})
+        model_types.SetLossRequest(loss_cls='DPOLoss', adapter_name='a', init_kwargs={'beta': object()}, training_id='training-a')
     assert 'init_kwargs' in str(raised.value), 'the error must name the field that holds the bad value'
 
 
@@ -246,3 +247,12 @@ def test_sampler_add_adapter_accepts_a_dict_config_where_model_rejects_it():
 
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__, '-v']))
+
+
+def test_missing_training_handle_is_rejected_before_handler(client):
+    body = _valid_forward()
+    body.pop('training_id')
+    response = _post(client, '/forward', body)
+    assert response.status_code == 422
+    assert any(detail['field'] == 'training_id' for detail in response.json()['details'])
+    assert 'reached_handler' not in response.json()

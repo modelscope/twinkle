@@ -19,9 +19,9 @@ from __future__ import annotations
 from fastapi import Request
 from typing import Any, Protocol, runtime_checkable
 
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.lifecycle.envelope import TaskEnvelope
 from twinkle.server.state import ServerState
-from twinkle.server.task_queue.config import TaskQueueConfig
 
 
 @runtime_checkable

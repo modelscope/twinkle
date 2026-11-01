@@ -2,7 +2,7 @@
 """Static check: model backend calls map the tenant adapter name (F002 / P002).
 
 ``run_submit`` hands each ``backend_call`` a *tenant-scoped* adapter name
-(``owner_id-<name>``). Before that reaches a backend model method it must be
+(``training_id``). Before that reaches a backend model method it must be
 translated by ``ModelManagement.resolve_model_adapter_name`` — which returns
 ``''`` in full-parameter mode (the empty-string default optimizer group) and the
 name unchanged in LoRA mode. The inline forward/backward/step endpoints did this;

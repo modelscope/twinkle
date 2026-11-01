@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Protocol
 from twinkle import get_logger
 from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
-from twinkle.server.task_queue.types import UserTaskError
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
 from .paths import CHECKPOINT_INFO_FILENAME, ensure_inside, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
@@ -371,7 +371,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """
         explicit_name = self.get_ckpt_name(name) if name else None
         if explicit_name == 'latest':
-            raise UserTaskError('Checkpoint name "latest" is reserved for unnamed sampler saves.')
+            raise RequestRejectedError('Checkpoint name "latest" is reserved for unnamed sampler saves.')
         version_id = uuid.uuid4().hex
         checkpoint_name = explicit_name or 'latest'
         uri_name = explicit_name or f'live_{version_id}'
@@ -457,10 +457,22 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """Remove a checkpoint and refresh only its kind's last-checkpoint pointer.
 
         Sampler links own versions under .versions; legacy directories remain
-        supported. Missing checkpoints or traversal attempts return False.
+        supported. Missing checkpoints, traversal attempts, and paths that are
+        not a real checkpoint all return False.
         """
         # Basic safety check to prevent directory traversal
         if '..' in checkpoint_id:
+            return False
+
+        # Delete only a checkpoint that the manager itself can resolve. This
+        # rejects kind roots (``weights``), the run root (``.``), aliases whose
+        # metadata names another checkpoint (``sampler_weights/latest``), and
+        # any directory that has no checkpoint metadata.
+        try:
+            checkpoint = self.get(model_id, checkpoint_id)
+        except ValueError:
+            return False
+        if checkpoint is None or checkpoint.checkpoint_id != checkpoint_id:
             return False
 
         ckpt_dir = self.get_ckpt_dir(model_id, checkpoint_id)

@@ -1,0 +1,77 @@
+# Twinkle Server Configuration - Reranker / Sequence Classification (Transformers backend)
+#
+# Serves the two bases written by cookbook/client/twinkle/prepare_seq_cls_model.py.
+# Launch from the repository root so the relative model paths resolve (one GPU per model):
+#   ray start --head --num-gpus=2
+#   python -m twinkle.server launch --config cookbook/client/server/transformer/server_config_seq_cls.yaml
+# Then run cookbook/client/twinkle/reranker.py and cookbook/client/twinkle/seq_cls.py.
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+persistence:
+  mode: memory
+
+applications:
+
+  # 1. GatewayServer - The central API server
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    deployments:
+      - name: GatewayServer
+        ray_actor_options:
+          num_cpus: 0.1
+
+  # 2. Reranker - one relevance score per (query, document) sequence
+  - name: models-Qwen3.5-4B-reranker
+    route_prefix: /api/v1/model/Qwen3.5-4B-reranker   # clients call client.model('Qwen3.5-4B-reranker')
+    import_path: model
+    args:
+      backend: transformers
+      model_id: output/Qwen3.5-4B-reranker   # prepared with --num-labels 1
+      task_type: seq_cls                     # load the ForSequenceClassification head
+      num_labels: 1                          # must match the prepared head
+      target_modules: [q_proj, v_proj, score]  # LoRA slots, including the score head
+      min_replicas: 1
+      max_replicas: 1
+      max_length: 2048
+      nproc_per_node: 1
+      device_group:
+        name: model
+        ranks: 1
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+    deployments:
+      - name: ModelManagement
+        ray_actor_options:
+          num_cpus: 0.1
+
+  # 3. Sequence classification - three classes
+  - name: models-Qwen3.5-4B-seq-cls
+    route_prefix: /api/v1/model/Qwen3.5-4B-seq-cls     # clients call client.model('Qwen3.5-4B-seq-cls')
+    import_path: model
+    args:
+      backend: transformers
+      model_id: output/Qwen3.5-4B-seq-cls    # prepared with --num-labels 3
+      task_type: seq_cls
+      num_labels: 3
+      target_modules: [q_proj, v_proj, score]
+      min_replicas: 1
+      max_replicas: 1
+      max_length: 2048
+      nproc_per_node: 1
+      device_group:
+        name: model
+        ranks: 1
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+    deployments:
+      - name: ModelManagement
+        ray_actor_options:
+          num_cpus: 0.1

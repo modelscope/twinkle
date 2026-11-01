@@ -1,4 +1,8 @@
-# Twinkle Server Configuration - Megatron Backend
+# Twinkle Server Configuration - Megatron LoRA Backend
+# Candidate for 8 x L20D (~269 GiB each): 2-4 single-GPU sampler instances
+# plus up to 2 two-GPU LoRA training instances (3 handles each, 6 total).
+# Validate 27B/32K peak memory, throughput and optimizer resume on L20D
+# before production rollout; local smaller-model tests do not prove those limits.
 
 # proxy_location: determines where the HTTP proxy runs.
 # "EveryNode" means each Ray node runs its own proxy (good for multi-node).
@@ -26,6 +30,13 @@ persistence:
   mode: redis
   redis_url: redis://localhost:6380
 
+# Independent allocation, startup and confirmed-shutdown budgets.
+resources:
+  allocation_timeout_s: 3
+  startup_timeout_s: 1800
+  shutdown_timeout_s: 180
+  sweep_interval_s: 5
+
 # Applications: each entry defines a service component deployed on the server
 applications:
 
@@ -36,7 +47,7 @@ applications:
     import_path: server            # Python module to import
     args:
       server_config:
-        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
+        per_token_model_limit: 3      # Global per-token limit; shared-token clients share these 3 slots
       supported_models:
         - Qwen/Qwen3.8-27B
 
@@ -56,30 +67,33 @@ applications:
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  #    Config: TP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, ~37GB for KV cache + LoRA
+  #    Each instance has DP=1 and one GPU. Two are preloaded; scale to four.
+  #    Memory usage includes each engine's preallocated KV cache, not just weights.
   - name: sampler-Qwen3.8-27B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.8-27B
     import_path: sampler
     args:
       model_id: "ms://Qwen/Qwen3.8-27B"  # ModelScope model identifier
-      nproc_per_node: 4               # Number of GPU processes per node
+      nproc_per_node: 1               # One GPU per independently allocated instance
+      min_replicas: 2
+      max_replicas: 4
+      target_ongoing_requests: 16
+      idle_timeout_s: 600
       sampler_type: vllm              # Inference engine: vllm
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 32768           # Maximum sequence length the engine supports
-        gpu_memory_utilization: 0.75   # 80% utilization, ~64GB/GPU, leaves buffer for safety
+        gpu_memory_utilization: 0.75   # 75% engine memory budget; does not free Ray GPU reservations
         enable_lora: true             # Allow loading LoRA adapters during inference
         max_loras: 5                  # Max allowed loras working on vLLM at the same time
-        max_lora_rank: 32             # Support up to rank 64 LoRA adapters
+        max_lora_rank: 32             # Maximum supported LoRA rank
         enable_tower_connector_lora: true
       device_group:                   # Logical device group for the sampler
         name: sampler
-        gpus_per_worker: 2
-        ranks: 4                   # GPU rank indices to use
+        ranks: 1                   # Per-instance device count, not fixed physical GPU IDs
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2
-        tp_size: 2                  # 2 TP replicas for multi-tenant throughput
+        dp_size: 1                 # Pool instance count is controlled by args.min/max_replicas
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
@@ -97,8 +111,9 @@ applications:
               TWINKLE_TRUST_REMOTE_CODE: "0"
               TWINKLE_LONG_POLL_TIMEOUT: "120"
 
-  # 2. Model Service - Hosts the base model for training.
-  #    Config: PP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, comfortable for LoRA training
+  # 2. Model Service - LoRA-only, independently queued two-GPU instances.
+  #    Megatron instances require at least two devices; PP=2 shards each model.
+  #    min=0 enables cold startup; max=2 limits total training devices to four.
   - name: models-Qwen3.8-27B
     route_prefix: /api/v1/model/Qwen/Qwen3.8-27B
     import_path: model
@@ -106,24 +121,28 @@ applications:
       backend: megatron                          # Use Megatron-LM backend
       model_id: "ms://Qwen/Qwen3.8-27B"          # ModelScope model identifier
       max_length: 32768                           # model max length
-      max_loras: 3                                # model max loras
-      nproc_per_node: 4                           # Number of GPU processes per node
+      train_mode: lora
+      adapter_config:
+        adapter_timeout: 120                       # Seconds without a session heartbeat before release
+        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
+      max_loras: 3                                # Handles per instance, not simultaneous backward calls
+      min_replicas: 0                             # Do not reserve training GPUs at startup
+      max_replicas: 2                             # Up to 2 independent two-GPU instances
+      idle_timeout_s: 600                         # Business idle; heartbeats/polling do not renew it
+      nproc_per_node: 2                           # Two workers per training instance
       device_group:
         name: model
-        ranks: 4
+        ranks: 2
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2
+        dp_size: 1
         pp_size: 2
 
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
         max_input_tokens: 32768
-      adapter_config:
-        adapter_timeout: 120                       # Seconds before idle adapter unload
-        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
         autoscaling_config:

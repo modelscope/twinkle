@@ -74,6 +74,8 @@ class StateBackend(ABC):
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
         """Read key, call ``transform(current_value)``, write the result atomically.
 
@@ -86,6 +88,10 @@ class StateBackend(ABC):
           on the same backend; Redis-backed implementations use WATCH+MULTI+EXEC
           and may raise :class:`ConcurrencyError` after exhausting internal
           retries (currently 16).
+
+        With ``return_changed=True``, return whether THIS call committed a
+        write, not the stored value. A lost write acknowledgement raises; it
+        must never be inferred as success from a later read.
 
         ``transform`` must be picklable when running against a Ray-backed
         backend — pass module-level functions wrapped with ``functools.partial``,

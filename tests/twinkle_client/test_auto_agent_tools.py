@@ -81,6 +81,15 @@ def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, 
     gateway = next(app for app in config.applications if app.import_path == 'server')
     assert gateway.deployments[0]['name'] == 'GatewayServer'
     assert gateway.args.supported_models == ['Qwen/student'] + [s['model_id'] for s in samplers]
+    application = next(app for app in config.applications if app.import_path == 'model')
+    assert application.name == 'models-student'
+    assert application.args.train_mode == 'lora'
+    assert application.args.adapter_config.adapter_timeout == 600
+    model = config.training_config.models[0]
+    assert model.env_vars['TWINKLE_TRUST_REMOTE_CODE'] == '1'
+    assert model.mode == 'lora'
+    assert model.config.min_replicas == 0 and model.config.max_replicas == 1
+    assert model.config.num_devices == 2 and model.config.idle_timeout_s == 600
     if samplers:
         sampler = next(app for app in config.applications if app.import_path == 'sampler')
         assert sampler.args.nproc_per_node == 4
@@ -99,6 +108,14 @@ def test_removed_sampler_is_not_advertised_or_written(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='Unsupported sampler engine'):
         ToolExecutor._generate_server_config(
             'Qwen/student', train_gpus=1, samplers=[{'model_id': 'Qwen/teacher', 'engine': 'torch'}])
+    assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()
+
+
+def test_single_device_megatron_config_is_not_written(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    with pytest.raises(ValueError, match='at least 2 devices'):
+        ToolExecutor._generate_server_config('Qwen/student', train_gpus=1, backend='megatron')
     assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()
 
 

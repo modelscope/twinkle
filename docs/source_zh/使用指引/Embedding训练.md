@@ -117,6 +117,7 @@ client 化的 Embedding 训练遵循与裸库一致的调用顺序：
 ```
 set_processor('InputProcessor')
   -> set_loss('InfonceLoss', ...)
+  -> set_optimizer('Adam', ...)
   -> add_metric('EmbeddingMetric', is_training=True)
   -> loop: forward_backward(inputs=mb, task='embedding') + clip_grad_and_step(...)
   -> calculate_metric(is_training=True)
@@ -129,13 +130,12 @@ set_processor('InputProcessor')
 ```python
 from peft import LoraConfig
 from twinkle import init_twinkle_client
-from twinkle_client.model import MultiLoraTransformersModel
 
 # --- Connect to the running Twinkle server ---
-init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
 
 # --- Build the client model with a LoRA adapter for embedding ---
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model = client.model('ms://Qwen/Qwen3.5-4B')
 model.add_adapter_to_model('emb_adapter', LoraConfig(target_modules='all-linear'))
 model.set_template('Qwen3_5Template')
 
@@ -143,6 +143,7 @@ model.set_template('Qwen3_5Template')
 # NOTE: pass class names as strings; the server resolves them to core-lib classes.
 model.set_processor('InputProcessor')
 model.set_loss('InfonceLoss', temperature=0.07, use_batch=True, hard_negatives=None)
+model.set_optimizer('Adam', lr=1e-4)
 model.add_metric('EmbeddingMetric', is_training=True)
 
 # --- Training loop ---
@@ -158,7 +159,7 @@ metric = model.calculate_metric(is_training=True)
 
 **无需手动 apply_patch。** 只要在 `forward_backward`（或 `forward_only`）中传入 `task='embedding'`，服务端就会在这一次 `forward` 期间自动切换到 embedding 模式、并在结束后自动回滚——你**不需要**显式调用 `apply_patch(...)`。因此同一个 adapter 在 `forward_backward(task='embedding')` 之后，再调用不带 `task` 的 `forward_only` 仍会返回正常的词表维度 `logits`，互不影响。
 
-client 侧真正需要显式配置的只有三步：`set_processor('InputProcessor')`、`set_loss('InfonceLoss', ...)`、`add_metric('EmbeddingMetric', is_training=True)`；各参数含义与取值建议见上文「关键参数」，返回指标见下文「监控指标」。
+创建 adapter 并配置模板后，需要显式设置 processor、loss 和 optimizer；metric 按需添加。可直接运行的完整示例见 `cookbook/client/twinkle/embedding.py`，包含训练后的保存。各参数含义与取值建议见上文「关键参数」。
 
 ---
 

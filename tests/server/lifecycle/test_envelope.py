@@ -12,12 +12,18 @@ def test_wire_maps_cover_exactly_the_canonical_reason_codes():
     """The Twinkle and Tinker failure maps must both stay in lockstep with the
     canonical reason-code set, so a newly added domain reason cannot silently
     fall back to 500 on one protocol face."""
-    from twinkle.server.gateway.tinker_handlers import _TINKER_FAILURE_WIRE
-    from twinkle.server.lifecycle.envelope import _FAILURE_WIRE
-    from twinkle.server.state.models import FAILURE_REASON_CODES
+    from twinkle.server.gateway.tinker_handlers import _tinker_error_from_failure
+    from twinkle.server.lifecycle.envelope import error_payload_from_failure
+    from twinkle.server.task_errors import FailureResponse
 
-    assert set(_FAILURE_WIRE) == FAILURE_REASON_CODES
-    assert set(_TINKER_FAILURE_WIRE) == FAILURE_REASON_CODES
+    for reason in FailureResponse.reasons():
+        policy = FailureResponse.for_reason(reason)
+        failure = {'reason_code': reason, 'message': 'failed', 'attribution': policy.category.value}
+        native = error_payload_from_failure(failure, request_id='request')
+        assert native.error_code == policy.error_code
+        assert native.category is policy.category
+        assert _tinker_error_from_failure(failure, request_id='request') == native.model_dump(
+            mode='json', exclude_none=True)
 
 
 def test_completed_with_none_result_is_a_success_not_a_failure():

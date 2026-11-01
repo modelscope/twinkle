@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from tests.server.state.fake_backend import FakeBackend
 
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW
+from twinkle.server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW, ResourceCleanupCoordinator
 from twinkle.server.telemetry import MetricsRegistry
 
 
@@ -100,13 +104,7 @@ async def test_renew_keeps_leader() -> None:
 
 @pytest.mark.asyncio
 async def test_leader_recovers_after_renewal_failure() -> None:
-    """Regression: when a leader's renewal raises, it releases
-    the lease best-effort so the very next election tick re-acquires leadership
-    without waiting LEASE_TTL.
-
-    On unfixed code ``_is_leader`` flips to False while the lease value lingers
-    in the backend, so ``set_nx`` keeps returning False for up to LEASE_TTL.
-    """
+    """An unconfirmed renewal fences cleanup until the original lease expires."""
     backend = RayActorBackend()
     state = ServerState(backend=backend, cleanup_interval=600.0)
 
@@ -128,11 +126,13 @@ async def test_leader_recovers_after_renewal_failure() -> None:
     from unittest import mock
     with mock.patch.object(backend, 'update_atomic', side_effect=flaky_update_atomic):
         await state._try_acquire_or_renew()
-        # Renewal failed → no longer leader, and the stale lease was released.
         assert state._is_leader is False
 
-    # The lease key was deleted best-effort, so the next tick re-acquires
-    # immediately (no LEASE_TTL wait, no lingering self-owned lease).
+    assert await backend.get(LEADER_KEY) == state._leader_id
+    await state._try_acquire_or_renew()
+    assert state._is_leader is False
+    await backend.set(LEADER_KEY, state._leader_id, ttl=1)
+    await asyncio.sleep(1.1)
     await state._try_acquire_or_renew()
     assert state._is_leader is True
 
@@ -157,6 +157,75 @@ async def test_renewal_failure_does_not_steal_other_leader_lease() -> None:
         assert follower._is_leader is False
 
     assert await backend.get(LEADER_KEY) == leader_value, 'follower stole the real leader lease'
+
+
+def coordinator(backend=None):
+    models = SimpleNamespace(rebuild_indexes=AsyncMock())
+    return ResourceCleanupCoordinator(backend or FakeBackend(), {'models': models},
+                                      cleanup_interval=600, expiration_timeout=300,
+                                      sweep_processor_quotas=AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_stale_leader_renewal_failure_preserves_successor(monkeypatch):
+    backend = FakeBackend()
+    cleanup = coordinator(backend)
+    await cleanup._try_acquire_or_renew()
+    assert cleanup.is_leader
+
+    async def successor_then_fail(*args, **kwargs):
+        await backend.set(LEADER_KEY, 'successor', ttl=30)
+        raise ConnectionError('renewal acknowledgement lost')
+
+    monkeypatch.setattr(backend, 'update_atomic', successor_then_fail)
+    await cleanup._try_acquire_or_renew()
+    assert not cleanup.is_leader
+    assert await backend.get(LEADER_KEY) == 'successor'
+
+
+@pytest.mark.asyncio
+async def test_cleanup_concurrent_start_rebuilds_once_and_stop_joins():
+    cleanup = coordinator()
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    async def rebuild():
+        entered.set()
+        await proceed.wait()
+
+    cleanup._managers['models'].rebuild_indexes.side_effect = rebuild
+    first = asyncio.create_task(cleanup.start())
+    await entered.wait()
+    second = asyncio.create_task(cleanup.start())
+    proceed.set()
+    assert await asyncio.gather(first, second) == [True, False]
+    tasks = (cleanup._cleanup_task, cleanup._leader_task)
+    assert await cleanup.stop()
+    assert all(task.done() for task in tasks)
+    assert not await cleanup.stop()
+    cleanup._managers['models'].rebuild_indexes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_cleanup_start_can_retry():
+    cleanup = coordinator()
+    cleanup._managers['models'].rebuild_indexes.side_effect = [RuntimeError('offline'), None]
+    with pytest.raises(RuntimeError, match='offline'):
+        await cleanup.start()
+    assert cleanup._cleanup_task is None and cleanup._leader_task is None
+    assert await cleanup.start()
+    await cleanup.stop()
+
+
+@pytest.mark.asyncio
+async def test_lazy_cleanup_retries_after_failed_start():
+    from twinkle.server.deployment import LazyCleanupMixin
+    client = LazyCleanupMixin()
+    client.state = SimpleNamespace(start_cleanup_task=AsyncMock(side_effect=[RuntimeError('offline'), True]))
+    await client._ensure_state_cleanup_started()
+    assert not client._state_cleanup_started
+    await client._ensure_state_cleanup_started()
+    assert client._state_cleanup_started
+    assert client.state.start_cleanup_task.await_count == 2
 
 
 # ============================================================

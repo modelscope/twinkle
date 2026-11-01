@@ -32,6 +32,8 @@ applications:
     args:
       backend: transformers
       model_id: "ms://Qwen/Qwen3.5-4B"
+      min_replicas: 1
+      max_replicas: 1
       max_length: 10240
       max_loras: 10
       nproc_per_node: 2

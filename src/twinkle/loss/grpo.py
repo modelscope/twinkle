@@ -232,10 +232,10 @@ class GRPOLoss(Loss):
           * Response-only form (e.g. ``old_logps`` from vLLM): length equals
             the number of trainable positions in ``mask[i]`` and is scattered
             directly onto those positions.
-          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward,
-            right-padded to ``mask.shape[1]``): length ``>= mask.shape[1]``;
-            we slice to ``seq_len`` and index by ``mask[i]`` to extract the
-            trainable positions, then scatter.
+          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward):
+            every trainable mask position must exist in the per-sample row.
+            Rows need not include the batch's right-padding; we index by
+            ``mask[i]`` to extract the trainable positions, then scatter.
 
         Any other length is a real bug and triggers a hard assert — never
         silently truncate, since that misaligns IS ratios to the wrong tokens.
@@ -276,24 +276,95 @@ class GRPOLoss(Loss):
             pos = mask[i].nonzero(as_tuple=True)[0]
             n_pos = len(pos)
             n_sample = sample.numel()
+            last_pos = int(pos[-1].item()) if n_pos else -1
+            if not self._alignment_supported(n_pos, n_sample, last_pos):
+                self._raise_alignment_mismatch(i, n_pos, n_sample, seq_len)
 
             if n_sample == 1:
                 result[i, pos] = sample.item()
             elif n_sample == n_pos:
                 # Response-only form (e.g. old_logps from vLLM).
                 result[i, pos] = sample
-            elif n_pos == 0 or (n_sample > 0 and pos[-1].item() < n_sample):
+            else:
                 # Variable-length full-sequence form. The processor right-pads the
                 # batch, but per-sample RL fields from Tinker remain unpadded. They
                 # are valid when every selected mask position exists in this row.
                 result[i, pos] = sample[pos]
-            else:
-                raise AssertionError(f'data/mask length mismatch at sample {i}: '
-                                     f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                                     '(expected n_sample == n_pos for response-only form, or all masked positions '
-                                     'to exist in the per-sample full-sequence form)')
 
         return result
+
+    @staticmethod
+    def _alignment_supported(n_pos: int, n_sample: int, last_pos: int) -> bool:
+        """Whether one ragged row fits the response-only or full-sequence form."""
+        return (n_sample == 1 or n_sample == n_pos or n_pos == 0 or (n_sample > 0 and last_pos < n_sample))
+
+    @staticmethod
+    def _raise_alignment_mismatch(sample_index: int, n_pos: int, n_sample: int, seq_len: int):
+        raise AssertionError(f'data/mask length mismatch at sample {sample_index}: '
+                             f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
+                             '(expected n_sample == n_pos for response-only form, or all masked positions '
+                             'to exist in the per-sample full-sequence form)')
+
+    @staticmethod
+    def _alignment_rows(data, batch_size: int):
+        """Return one row per sample, or None when the shape is not attributable."""
+        import numpy as np
+        import torch
+
+        if torch.is_tensor(data):
+            if data.dim() == 1 and data.shape[0] == batch_size:
+                return [data[index].reshape(1) for index in range(batch_size)]
+            if data.dim() >= 2 and data.shape[0] == batch_size:
+                return list(data)
+            return None
+        if isinstance(data, np.ndarray):
+            return GRPOLoss._alignment_rows(torch.as_tensor(data), batch_size)
+        if isinstance(data, (list, tuple)) and len(data) == batch_size:
+            return list(data)
+        return None
+
+    def validate_inputs(self, inputs, *, old_logps=None, ref_logps=None, advantages=None, **kwargs) -> None:
+        """Reject ragged per-sample lengths before any rank starts its forward.
+
+        ``_pad_and_align_to_batch`` already rejects these shapes, but it runs inside
+        the loss on each rank independently. Raising there lets one rank return
+        while the others enter the DDP backward collective, which deadlocks the
+        replica. Running the same rule on the full, unsliced batch first makes
+        every rank fail together before any collective is entered.
+        """
+        import torch
+
+        if old_logps is None and ref_logps is None and advantages is None:
+            return
+        samples = inputs if isinstance(inputs, list) else [inputs]
+        if not samples:
+            return
+        for data in (old_logps, ref_logps, advantages):
+            if data is None:
+                continue
+            rows = self._alignment_rows(data, len(samples))
+            if rows is None:
+                # The shape does not map one row per sample; the in-loss check
+                # remains the only applicable validation for this batch.
+                continue
+            for index, (sample, row) in enumerate(zip(samples, rows)):
+                if not isinstance(sample, dict):
+                    continue
+                labels = sample.get('labels')
+                if labels is None:
+                    continue
+                if not torch.is_tensor(labels):
+                    labels = torch.as_tensor(labels)
+                if labels.dim() == 1:
+                    labels = labels.unsqueeze(0)
+                mask = self._resolve_loss_mask(sample, labels)[0]
+                pos = mask.nonzero(as_tuple=True)[0]
+                row_tensor = row if torch.is_tensor(row) else torch.as_tensor(row)
+                n_sample = row_tensor.numel()
+                n_pos = len(pos)
+                last_pos = int(pos[-1].item()) if n_pos else -1
+                if not self._alignment_supported(n_pos, n_sample, last_pos):
+                    self._raise_alignment_mismatch(index, n_pos, n_sample, labels.shape[-1])
 
     def _resolve_loss_mask(self, inputs: Dict, labels: 'torch.Tensor') -> 'torch.Tensor':
         """Positions this loss may score: trainable *and* log-prob-bearing.

@@ -120,6 +120,10 @@ class HybridFftSlots:
         fft_adapter_name = self._fft_adapter_name(adapter_name) if self.is_hybrid(adapter_name) else None
         selected_adapters = [fft_adapter_name] if fft_adapter_name is not None else []
         for wrapper in self._iter_fft_wrappers():
+            # Selecting a regular LoRA can disable auxiliary wrappers. Restoring
+            # an FFT slot name alone does not restore its execution state.
+            if fft_adapter_name is not None and wrapper.disable_adapters:
+                wrapper.enable_adapters(True)
             if wrapper.active_adapters != selected_adapters:
                 wrapper.set_adapter(selected_adapters)
             self._enable_preallocated_fft_grad(wrapper)

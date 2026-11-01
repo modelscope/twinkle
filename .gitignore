@@ -169,3 +169,8 @@ tests/server/contract/client_api_baseline.json
 
 # Redis dump file produced by a local redis-server (test infra), never source.
 *.rdb
+
+# Local ST dependency reproducers and acceptance notes.
+/cookbook/client/swift_model/README-st.md
+/cookbook/client/swift_model/reproduce_st_dependency.py
+/cookbook/client/swift_model/requirements-st.txt

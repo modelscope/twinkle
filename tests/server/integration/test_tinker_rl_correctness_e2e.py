@@ -14,6 +14,8 @@ import os
 import numpy as np
 import pytest
 
+from tests.server.integration.e2e_helpers import completion_logprobs, sampled_datum
+
 pytestmark = pytest.mark.skipif(
     os.environ.get('TWINKLE_TEST_GPU_E2E', '0') != '1',
     reason='Requires a running training + vLLM server on real accelerators',
@@ -83,50 +85,20 @@ def live_clients():
     return service, model_id, prompt_tokens, samples[0], timeout
 
 
-def _datum(prompt_tokens, sample, advantage):
-    from tinker import types
-
-    tokens = prompt_tokens + list(sample.tokens)
-    prompt_positions = len(prompt_tokens) - 1
-    size = len(tokens) - 1
-
-    def tensor(values, dtype):
-        return types.TensorData(data=values, dtype=dtype, shape=[size])
-
-    return types.Datum(
-        model_input=types.ModelInput.from_ints(tokens[:-1]),
-        loss_fn_inputs={
-            'target_tokens': tensor(tokens[1:], 'int64'),
-            'weights': tensor([0.0] * prompt_positions + [1.0] * len(sample.tokens), 'float32'),
-            'logprobs': tensor([0.0] * prompt_positions + list(sample.logprobs), 'float32'),
-            'advantages': tensor([0.0] * prompt_positions + [advantage] * len(sample.tokens), 'float32'),
-        },
-    )
-
-
-def _completion_logprobs(client, datum, timeout):
-    result = client.forward([datum], 'cross_entropy').result(timeout=timeout)
-    values = np.asarray(result.loss_fn_outputs[0]['logprobs'].tolist(), dtype=np.float64)
-    weights = np.asarray(datum.loss_fn_inputs['weights'].tolist())
-    assert len(values) >= len(weights)
-    values = values[:len(weights)][weights != 0]
-    assert values.size and np.isfinite(values).all()
-    return values
-
 
 def test_live_unsupported_losses_are_rejected_without_changing_policy(live_clients):
     from tinker import BadRequestError
 
     service, model_id, prompt, sample, timeout = live_clients
     client = service.create_lora_training_client(base_model=model_id, rank=16, seed=2026)
-    datum = _datum(prompt, sample, -1.0)
-    before = _completion_logprobs(client, datum, timeout)
+    datum = sampled_datum(prompt, sample, -1.0)
+    before = completion_logprobs(client, datum, timeout)
     for loss_fn in ('ppo', 'cispo', 'dro'):
         with pytest.raises(BadRequestError) as exc:
             client.forward_backward([datum], loss_fn).result(timeout=timeout)
         assert exc.value.status_code == 400
         assert f"Unsupported Tinker loss_fn '{loss_fn}'" in str(exc.value)
-        after = _completion_logprobs(client, datum, timeout)
+        after = completion_logprobs(client, datum, timeout)
         np.testing.assert_allclose(after, before, rtol=0, atol=1e-5)
         _report(check='unsupported_loss', loss_fn=loss_fn, http_status=400, policy_unchanged=True)
 
@@ -138,15 +110,15 @@ def test_live_importance_sampling_updates_policy_in_reward_direction(live_client
 
     service, model_id, prompt, sample, timeout = live_clients
     client = service.create_lora_training_client(base_model=model_id, rank=16, seed=2026)
-    datum = _datum(prompt, sample, advantage)
-    before = _completion_logprobs(client, datum, timeout)
+    datum = sampled_datum(prompt, sample, advantage)
+    before = completion_logprobs(client, datum, timeout)
     sampler_difference = float(np.mean(np.abs(before - np.asarray(sample.logprobs))))
     assert sampler_difference < 0.05, f'Sampler/trainer logprob mismatch: {sampler_difference}'
     result = client.forward_backward([datum] * batch_size, 'importance_sampling').result(timeout=timeout)
     assert len(result.loss_fn_outputs) == batch_size
     assert np.isfinite(float(result.metrics['loss:mean']))
     client.optim_step(types.AdamParams(learning_rate=1e-4)).result(timeout=timeout)
-    after = _completion_logprobs(client, datum, timeout)
+    after = completion_logprobs(client, datum, timeout)
     delta = float(np.mean(after) - np.mean(before))
     _report(
         check='reward_direction',
@@ -166,7 +138,7 @@ def test_live_dpo_still_requires_pairs(live_clients):
 
     service, model_id, prompt, sample, timeout = live_clients
     client = service.create_lora_training_client(base_model=model_id, rank=16, seed=2026)
-    datum = _datum(prompt, sample, 1.0)
+    datum = sampled_datum(prompt, sample, 1.0)
     reference = client.forward([datum], 'cross_entropy').result(timeout=timeout)
     datum.loss_fn_inputs['ref_logps'] = reference.loss_fn_outputs[0]['logprobs']
     with pytest.raises(UnprocessableEntityError) as exc:

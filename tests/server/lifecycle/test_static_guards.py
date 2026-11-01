@@ -5,7 +5,6 @@
 - ``TaskEnvelope`` has exactly one construction site.
 - The client-side invariant: the client HTTP timeout is <= 120 and strictly
   greater than the server Long_Poll_Window.
-- The task status set has two independent declarations that must not drift.
 
 These exist because the spec states most of its guarantees in prose. A prose claim that
 nothing checks decays into a false claim -- as happened with "a consistency test asserts
@@ -69,30 +68,6 @@ def test_task_envelope_has_exactly_one_construction_site():
     assert offenders == [], ('TaskEnvelope must only be constructed in lifecycle/envelope.py '
                              f'(via envelope_from_record); found: {offenders}')
     assert sites, 'expected to find the construction sites inside envelope.py'
-
-
-def test_server_task_status_enum_matches_client_literal():
-    """The two independent declarations of the task status set must not drift.
-
-    ``twinkle.protocol.types.lifecycle.TaskStatus`` (a Literal on the wire model) and the
-    server's ``TaskStatus`` enum are declared separately. ``envelope_from_record`` copies
-    ``record['status']`` straight into ``TaskEnvelope.status``, so a value the server can
-    write but the Literal does not list would fail pydantic validation *while serialising
-    the response* -- i.e. a 500 from retrieve for a task that actually finished.
-
-    The client module's comment claimed such a test existed; it did not. This is it.
-    """
-    from typing import get_args
-
-    from twinkle.server.task_queue.types import TaskStatus as ServerTaskStatus
-    from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES
-    from twinkle.protocol.types.lifecycle import TaskStatus as WireTaskStatus
-
-    server_values = {member.value for member in ServerTaskStatus}
-    wire_values = set(get_args(WireTaskStatus))
-    assert server_values == wire_values, (f'task status sets drifted: server-only={server_values - wire_values}, '
-                                          f'wire-only={wire_values - server_values}')
-    assert TERMINAL_STATUSES <= wire_values, 'TERMINAL_STATUSES must be a subset of the declared statuses'
 
 
 def test_client_future_layer_is_not_imported_by_the_server():

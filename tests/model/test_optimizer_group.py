@@ -7,7 +7,7 @@ existing suites only pass stub objects shaped like it. These cases drive real ``
 and ``Loss`` objects through the real class on CPU (no model, no GPU, no distributed):
 
 * ``do_grad_sync`` gradient-accumulation gating and its state side effect,
-* the ``__setattr__`` seam that wraps any assigned ``loss_instance`` in ``safe_loss``,
+* loss assignment / selection and numerical transparency,
 * ``accumulate_metrics`` / ``calculate_metrics`` against a real ``LossMetric``.
 """
 import pytest
@@ -17,7 +17,6 @@ from twinkle.loss import CrossEntropyLoss
 from twinkle.loss.base import Loss
 from twinkle.metric import LossMetric
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.utils.nccl_safe import SafeLossWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -90,47 +89,41 @@ class TestDoGradSync:
 
 
 # ---------------------------------------------------------------------------
-# __setattr__ safe_loss wrapping seam
+# Loss assignment / selection
 # ---------------------------------------------------------------------------
 
-class TestSafeLossWrapping:
+class TestLossSelection:
 
-    def test_assigning_loss_wraps_in_safe_loss_wrapper(self):
+    def test_assigned_loss_is_selected_without_changing_identity(self):
         group = BaseOptimizerGroup()
         raw = CrossEntropyLoss(reduction='sum')
         group.loss_instance = raw
-        assert isinstance(group.loss_instance, SafeLossWrapper)
-        assert isinstance(group.loss_instance, Loss)
-        assert group.loss_instance._loss_instance is raw
+        assert group.get_loss() is raw
+        assert isinstance(group.get_loss(), Loss)
 
-    def test_wrapping_is_idempotent(self):
+    def test_reassignment_is_idempotent(self):
         group = BaseOptimizerGroup()
         raw = CrossEntropyLoss(reduction='sum')
         group.loss_instance = raw
-        wrapped_once = group.loss_instance
-        # Re-assigning the already-wrapped instance must not nest a second wrapper.
-        group.loss_instance = wrapped_once
-        assert group.loss_instance is wrapped_once
-        assert group.loss_instance._loss_instance is raw
+        group.loss_instance = group.get_loss()
+        assert group.get_loss() is raw
 
-    def test_assigning_none_is_not_wrapped(self):
+    def test_assigning_none_clears_default_loss(self):
         group = BaseOptimizerGroup()
         group.loss_instance = CrossEntropyLoss(reduction='sum')
         group.loss_instance = None
-        assert group.loss_instance is None
+        assert group.get_loss() is None
 
-    def test_wrapped_loss_delegates_transparently(self, monkeypatch):
-        # Default fail-fast mode makes the wrapper a pass-through, so the seam must not
-        # change the numeric contract of the underlying loss.
-        monkeypatch.setenv('TWINKLE_FAIL_FAST', '1')
+    def test_selected_loss_keeps_numeric_contract_and_propagates_errors(self):
         group = BaseOptimizerGroup()
-        raw = CrossEntropyLoss(reduction='sum')
-        group.loss_instance = raw
+        group.loss_instance = CrossEntropyLoss(reduction='sum')
         inputs = {'labels': torch.tensor([[1, 2, -100]])}
         outputs = {'logps': torch.tensor([[-1.0, -2.0, -3.0]])}
-        wrapped_out = group.loss_instance(inputs, outputs)
-        raw_out = CrossEntropyLoss(reduction='sum')(inputs, outputs)
-        assert wrapped_out['loss'].item() == pytest.approx(raw_out['loss'].item())
+        selected = group.get_loss()(inputs, outputs)
+        raw = CrossEntropyLoss(reduction='sum')(inputs, outputs)
+        assert selected['loss'].item() == pytest.approx(raw['loss'].item())
+        with pytest.raises(KeyError):
+            group.get_loss()(inputs, {})
 
 
 # ---------------------------------------------------------------------------

@@ -89,5 +89,5 @@ def test_env_var_overrides_when_flag_omitted(monkeypatch) -> None:
 def test_example_config_loads_via_server_config() -> None:
     cfg = ServerConfig.from_yaml(EXAMPLE)
     assert isinstance(cfg, ServerConfig)
-    assert any(a.import_path == 'model' for a in cfg.applications)
+    assert cfg.training_config.models[0].backend == 'mock'
     assert any(a.import_path == 'sampler' for a in cfg.applications)

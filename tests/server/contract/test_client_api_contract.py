@@ -66,7 +66,7 @@ def test_new_client_types_importable():
 
     for symbol in ('StrictRequest', 'ResponseModel', 'DataModel', 'backend_only'):
         assert hasattr(base, symbol)
-    for symbol in ('ErrorPayload', 'ErrorCategory', 'QueueStateLiteral'):
+    for symbol in ('ErrorPayload', 'ErrorCategory', 'QueueState'):
         assert hasattr(errors, symbol)
 
 

@@ -10,7 +10,7 @@ CalculateMetricResponse CancelRequest CancelResponse CapacityInfoResponse Checkp
 CheckpointsListResponse ClientFeatures ClipGradAndStepRequest ClipGradAndStepResponse ClipGradNormRequest
 ClipGradNormResponse CreateModelRequest CreateRequest CreateResponse CreateSessionRequest CreateSessionResponse Cursor
 DataAppendRequest DataGetRequest DataModel DataPlaneForwardOnlyRequest DataPlaneForwardRequest DataPlaneSampleRequest
-DataPutRequest DataRef DataReleaseRequest DataRowsResponse DeleteCheckpointResponse FieldRole ForwardBackwardResponse
+DataPutRequest DataRef DataReleaseRequest EncodeRequest DataRowsResponse DeleteCheckpointResponse FieldRole ForwardBackwardResponse
 ForwardBackwardTaskRequest ForwardOnlyRequest ForwardRequest ForwardResponse GetServerCapabilitiesResponse
 GetTrainConfigsResponse HealthResponse LoadRequest LoadResponse LoraConfig LrStepRequest LrStepResponse ModelResult
 OkResponse ParsedCheckpointTwinklePath ProcessorCallRequest ProcessorCallResponse ProcessorCreateRequest
@@ -27,9 +27,9 @@ backend_only declared_wire_keys export_batch fields_with_role passthrough read_b
 """.split())
 
 
-def test_protocol_exports_match_pre_migration_snapshot() -> None:
+def test_protocol_exports_match_committed_snapshot() -> None:
     import twinkle.protocol.types as types
 
     assert set(types.__all__) == _MIGRATED_NAMES
-    assert len(types.__all__) == 120
+    assert len(types.__all__) == 121
     assert 'ErrorResponse' not in types.__all__

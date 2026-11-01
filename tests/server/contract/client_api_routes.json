@@ -45,12 +45,22 @@
       "response": "GetServerCapabilitiesResponse",
       "statusCode": 200
     },
+    "GET /health": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
     "GET /healthz": {
       "body": [],
       "response": "HealthResponse",
       "statusCode": 200
     },
     "GET /models": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
+    "GET /ping": {
       "body": [],
       "response": null,
       "statusCode": 200
@@ -127,6 +137,11 @@
       "response": null,
       "statusCode": 200
     },
+    "POST /completions": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
     "POST /create_model": {
       "body": [
         "CreateModelRequest"
@@ -146,6 +161,11 @@
         "CreateSessionRequest"
       ],
       "response": "CreateSessionResponse",
+      "statusCode": 200
+    },
+    "POST /embeddings": {
+      "body": [],
+      "response": null,
       "statusCode": 200
     },
     "POST /forward": {
@@ -169,6 +189,11 @@
       "response": "Any",
       "statusCode": 200
     },
+    "POST /infer": {
+      "body": [],
+      "response": null,
+      "statusCode": 200
+    },
     "POST /load_weights": {
       "body": [
         "LoadWeightsRequest"
@@ -181,6 +206,11 @@
         "OptimStepRequest"
       ],
       "response": "Any",
+      "statusCode": 200
+    },
+    "POST /ping": {
+      "body": [],
+      "response": null,
       "statusCode": 200
     },
     "POST /retrieve_future": {
@@ -587,6 +617,13 @@
     "POST /twinkle/create": {
       "body": [],
       "response": "SamplerCreateResponse",
+      "statusCode": 200
+    },
+    "POST /twinkle/encode": {
+      "body": [
+        "EncodeRequest"
+      ],
+      "response": "TaskEnvelope",
       "statusCode": 200
     },
     "POST /twinkle/sample": {

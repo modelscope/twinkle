@@ -7,8 +7,7 @@ Named ``session_resource`` (not ``lifecycle``) to avoid colliding with
 session-driven expiration of session-bound resources.
 """
 
-from .adapter import AdapterManagerMixin
 from .base import SessionResourceMixin
 from .processor import ProcessorManagerMixin
 
-__all__ = ['AdapterManagerMixin', 'ProcessorManagerMixin', 'SessionResourceMixin']
+__all__ = ['ProcessorManagerMixin', 'SessionResourceMixin']

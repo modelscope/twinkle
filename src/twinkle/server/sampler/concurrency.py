@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 
-from twinkle.server.task_queue.types import BackendBusyError
+from twinkle.server.exceptions import BackendBusyError
 
 
 class SamplerConcurrency:
     """Readers share stable weights; mutations wait for every reader to finish.
 
     Jobs retain their lock if an HTTP waiter leaves. Admission and execution
-    timeouts belong to ComputeWorker, not this lock.
+    timeouts belong to the caller; the pool may also bound lock admission.
     """
 
     def __init__(self):
@@ -35,13 +35,17 @@ class SamplerConcurrency:
     def close(self):
         self._closed = True
 
-    async def _execute(self, factory, exclusive: bool):
+    async def _execute(self, factory, exclusive: bool, queue_timeout):
         async with self._condition:
             if exclusive:
                 self._waiting_writers += 1
             try:
-                await self._condition.wait_for(lambda: not self._writer and
-                                               (self._readers == 0 if exclusive else self._waiting_writers == 0))
+
+                def available():
+                    return not self._writer and (self._readers == 0 if exclusive else self._waiting_writers == 0)
+
+                if not available():
+                    await asyncio.wait_for(self._condition.wait_for(available), queue_timeout)
                 self.check_available()
                 if exclusive:
                     self._writer = True
@@ -61,7 +65,7 @@ class SamplerConcurrency:
                     self._readers -= 1
                 self._condition.notify_all()
 
-    async def run(self, factory, *, exclusive: bool = False):
+    async def run(self, factory, *, exclusive: bool = False, queue_timeout: float | None = None):
         self.check_available()
         started = False
 
@@ -70,7 +74,7 @@ class SamplerConcurrency:
             started = True
             return await factory()
 
-        job = asyncio.create_task(self._execute(call, exclusive))
+        job = asyncio.create_task(self._execute(call, exclusive, queue_timeout))
         self._jobs.add(job)
 
         def finished(task):

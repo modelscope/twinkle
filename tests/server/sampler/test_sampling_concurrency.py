@@ -22,8 +22,8 @@ from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
 from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.server.task_queue.backend_gate import BackendGate
-from twinkle.server.task_queue.config import TaskQueueConfig
-from twinkle.server.task_queue.types import BackendBusyError
+from twinkle.server.config.task_queue import TaskQueueConfig
+from twinkle.server.exceptions import BackendBusyError
 from twinkle.server.task_queue.worker import ComputeWorker
 
 
@@ -40,6 +40,13 @@ class _State:
 
     async def store_future_status(self, request_id, status, model_id=None, **kwargs):
         self.records[request_id] = {'status': status, **kwargs}
+
+    async def try_start_future(self, request_id):
+        record = self.records.get(request_id)
+        if record is None or record['status'] not in ('pending', 'queued'):
+            return False
+        record['status'] = 'running'
+        return True
 
     async def get_future(self, request_id):
         return self.records.get(request_id)

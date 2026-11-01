@@ -1,98 +1,61 @@
-# Twinkle Server Configuration - serving a model family whose runtime object is
-# not a plain AutoModel: a sentence-transformers encoder (BAAI/bge-m5) served
-# for multi-tenant LoRA fine-tuning through the transformers backend.
-#
-# The `model_cls` field on the model app is the whole point of this example.
-# `model_loader` (see the gemma-4 example next door) lets a factory take over
-# config / processor / model construction while twinkle's own model class keeps
-# running the show; `model_cls` goes further and names the model class itself --
-# here swift's `MultiLoraSentenceTransformerModel`, which wraps the
-# sentence-transformers pipeline (the ST pipeline is an nn.Sequential, not an
-# AutoModel, so the generic path cannot build it) and owns the multi-tenant LoRA
-# machinery on its HF backbone.
-#
-# twinkle never hardcodes a swift symbol: it imports whatever spec this file
-# names *inside the model actor*, wraps the class in its own tinker/twinkle
-# compat mixin, and serves it exactly like a built-in backend. The spec crosses
-# the Ray boundary as plain data, so it is gated behind TWINKLE_TRUST_REMOTE_CODE
-# (set below) exactly like any other remote-code import.
-#
-# Constraints (enforced by the config schema, not silently ignored):
-#   - `model_cls` requires backend=transformers, train_mode=lora and no hybrid.
-#   - the named class must subclass twinkle's TrainableModel.
-#
-# Requirements:
-#   - ms-swift importable in the server env (see the gemma-4 example).
-#   - sentence-transformers installed in the model actor env.
-
+# ST multi-tenant LoRA over the on-demand training pool.
+# The original ST pipeline remains the base model; checkpoints contain tenant adapters.
 proxy_location: EveryNode
-
 http_options:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8000
-
 telemetry:
   enabled: false
-  otlp_endpoint: http://localhost:4317
-
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
-
+  mode: memory
+resources:
+  startup_timeout_s: 600
+  shutdown_timeout_s: 120
 applications:
-
-  # 1. Gateway / API server.
-  - name: server
-    route_prefix: /api/v1
-    import_path: server
-    args:
-      supported_models:
-        - BAAI/bge-m5
-    deployments:
-      - name: TinkerCompatServer
-        max_ongoing_requests: 50
-        autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
-          target_ongoing_requests: 128
-        ray_actor_options:
-          num_cpus: 0.1
-
-  # 2. Training model. The sentence-transformers pipeline runs on one GPU of the
-  #    `model` device group; LoRA slots go on its HF backbone.
-  - name: models-bge-m5
-    route_prefix: /api/v1/model/BAAI/bge-m5
-    import_path: model
-    args:
-      backend: transformers
-      model_id: "ms://BAAI/bge-m5"
-      train_mode: lora
-      # The swift class that builds and runs the ST pipeline. Remove this line
-      # and the generic AutoModel path takes over -- which cannot build a
-      # sentence-transformers pipeline.
-      model_cls: swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel
-      max_loras: 4
-      nproc_per_node: 1
-      device_group:
-        name: model
-        ranks: 1
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        dp_size: 1
-      queue_config:
-        rps_limit: 100
-        tps_limit: 100000
-      adapter_config:
-        adapter_timeout: 30
-    deployments:
-      - name: ModelManagement
-        autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
-          target_ongoing_requests: 16
-        ray_actor_options:
-          num_cpus: 0.1
-          runtime_env:
-            env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "1"
+- name: server
+  route_prefix: /api/v1
+  import_path: server
+  args:
+    supported_models:
+    - sentence-transformers/all-MiniLM-L6-v2
+  deployments:
+  - name: GatewayServer
+    ray_actor_options:
+      num_cpus: 0.1
+- name: models-minilm
+  route_prefix: /api/v1/model/sentence-transformers/all-MiniLM-L6-v2
+  import_path: model
+  args:
+    backend: transformers
+    model_id: hf://sentence-transformers/all-MiniLM-L6-v2
+    train_mode: lora
+    model_cls: swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel
+    gradient_checkpointing: false
+    mixed_precision: 'no'
+    min_replicas: 0
+    max_replicas: 1
+    idle_timeout_s: 60
+    max_loras: 2
+    max_r: 8
+    max_length: 256
+    target_modules:
+    - query
+    - value
+    nproc_per_node: 1
+    device_group:
+      name: model
+      ranks: 1
+      device_type: cuda
+    device_mesh:
+      device_type: cuda
+      dp_size: 1
+    env_vars:
+      TWINKLE_TRUST_REMOTE_CODE: '1'
+    queue_config:
+      execution_timeout: 300
+    adapter_config:
+      adapter_timeout: 300
+  deployments:
+  - name: ModelManagement
+    ray_actor_options:
+      num_cpus: 0.1

@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import (BatchSizeError, InputTokensExceededError, RateLimitExceededError,
                                        RequestRejectedError, TwinkleServerError)
-from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 
 

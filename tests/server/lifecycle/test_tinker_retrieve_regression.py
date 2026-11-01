@@ -15,6 +15,9 @@ from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_rout
 
 class _State:
 
+    async def assert_future_owner(self, request_id, token):
+        return None
+
     def __init__(self, record):
         self._record = record
 

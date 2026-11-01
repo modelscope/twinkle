@@ -144,6 +144,106 @@ class TestSelectiveLogSoftmax:
         # bfloat16 resolution rather than float32's.
         assert torch.allclose(result.float(), expected, atol=5e-2)
 
+    def test_bfloat16_does_not_quantize_large_negative_logps(self):
+        # A peaked row pushes the selected log-prob to ~-100.3, where the
+        # bfloat16 ULP is 0.5. Computing the softmax in float32 and only then
+        # selecting keeps the result at float32 resolution.
+        vocab_size = 4096
+        logits = torch.zeros(2, vocab_size, dtype=torch.bfloat16)
+        logits[:, 0] = 100.0
+        logits[:, 1] = -0.3
+        index = torch.ones(2, dtype=torch.long)
+
+        result = selective_log_softmax(logits, index)
+        expected = torch.gather(
+            logits.double().log_softmax(-1), -1, index.unsqueeze(-1)).squeeze(-1)
+
+        # Computing wide only helps if the result stays wide: narrowing it back to
+        # bfloat16 would re-quantize to the 0.5 ULP this test exists to catch, and
+        # no other test in the suite asserts the output dtype.
+        assert result.dtype == torch.float32
+        assert torch.allclose(result.double(), expected, atol=1e-3)
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_backward_saves_no_extra_full_vocab_activation(self, dtype, return_entropy):
+        # Every tensor handed to save_for_backward stays resident from the end of
+        # forward until backward runs, so a per-row copy of the vocabulary is as
+        # expensive as materializing the whole log_softmax. Recomputing in
+        # backward must keep nothing wider than the labels.
+        rows, vocab_size = 8, 512
+        logits = torch.randn(rows, vocab_size, dtype=dtype, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        logits_storage = logits.untyped_storage().data_ptr()
+        extra_storages = {}
+
+        def pack(tensor):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() != logits_storage:
+                extra_storages[storage.data_ptr()] = storage.nbytes()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index, return_entropy=return_entropy)
+
+        outputs = result if return_entropy else (result, )
+        torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
+
+        vocab_bytes = vocab_size * logits.element_size()
+        assert all(size < vocab_bytes for size in extra_storages.values())
+
+    def test_scales_with_chunks_not_with_rows(self):
+        # The per-row Python loop issued one save per row per intermediate, i.e.
+        # thousands of tiny kernel launches at production sequence lengths.
+        rows, vocab_size = 512, 512
+        logits = torch.randn(rows, vocab_size, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        save_calls = []
+
+        def pack(tensor):
+            save_calls.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index)
+        result.sum().backward()
+
+        assert len(save_calls) <= 32
+
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_gradient_matches_naive_implementation(self, return_entropy):
+        # The backward is hand-written -- recompute-in-backward for the logps, plus
+        # a separate term for the entropy -- so it needs a numerical reference. The
+        # two tests above both run backward but assert only on saved-storage size
+        # and save count, so they would still pass with a wrong gradient, and a
+        # wrong gradient is silent: training proceeds and just converges somewhere
+        # else.
+        torch.manual_seed(0)
+        rows, vocab_size = 6, 37
+        index = torch.randint(0, vocab_size, (rows, ))
+
+        # float64, so gradcheck's finite differences are not the limiting error.
+        logits = torch.randn(rows, vocab_size, dtype=torch.float64, requires_grad=True)
+        assert torch.autograd.gradcheck(
+            lambda t: selective_log_softmax(t, index, return_entropy=return_entropy),
+            (logits, ), eps=1e-6, atol=1e-5, rtol=1e-4)
+
+        def naive(t):
+            log_probs = t.log_softmax(-1)
+            gathered = torch.gather(log_probs, -1, index.unsqueeze(-1)).squeeze(-1)
+            if not return_entropy:
+                return (gathered, )
+            return gathered, -(log_probs.exp() * log_probs).sum(-1)
+
+        x_new = torch.randn(rows, vocab_size, requires_grad=True)
+        x_ref = x_new.detach().clone().requires_grad_(True)
+        out_new = selective_log_softmax(x_new, index, return_entropy=return_entropy)
+        out_ref = naive(x_ref)
+        out_new = out_new if return_entropy else (out_new, )
+        torch.autograd.backward(list(out_new), [torch.ones_like(o) for o in out_new])
+        torch.autograd.backward(list(out_ref), [torch.ones_like(o) for o in out_ref])
+        assert torch.allclose(x_new.grad, x_ref.grad, atol=1e-5)
+
 
 class TestPadAndStackTensors:
 

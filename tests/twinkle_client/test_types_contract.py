@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Contract-base consistency and naming-disambiguation tests.
 
-- ``QueueStateLiteral`` value set equals the server ``QueueState`` enum.
 - naming disambiguation guard.
 
 The two SDKs already share public names. The contract freezes that legacy set and
@@ -12,12 +11,9 @@ from __future__ import annotations
 
 import ast
 import pathlib
-import typing
 
 import twinkle
-from twinkle.server.task_queue.types import QueueState
 from twinkle.protocol.types import model as model_types
-from twinkle.protocol.types.errors import QueueStateLiteral
 from twinkle.protocol.types.server import GetServerCapabilitiesResponse
 
 _TWINKLE_SRC = pathlib.Path(twinkle.__file__).resolve().parent
@@ -42,11 +38,6 @@ _LEGACY_PUBLIC_NAME_OVERLAP = frozenset({
     'checkpoint',
 })
 
-
-def test_queue_state_literal_matches_server_enum():
-    literal_values = set(typing.get_args(QueueStateLiteral))
-    enum_values = {state.value for state in QueueState}
-    assert literal_values == enum_values, (f'QueueStateLiteral {literal_values} != QueueState {enum_values}')
 
 
 def test_old_capabilities_response_gets_conservative_defaults():

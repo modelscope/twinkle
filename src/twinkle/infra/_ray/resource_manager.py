@@ -20,6 +20,39 @@ def _gpu_placement_group_cpus(node_cpu: int, nproc_per_node: int) -> int:
 
 class ResourceManager:
 
+    @classmethod
+    def from_allocation(cls, group: DeviceGroup, placement_group, devices: list[str]):
+        """Use an allocation owned by a lifecycle controller, without reserving again.
+
+        Ranks are local to this allocation; devices are the actual Ray-selected IDs.
+        The controller owns removal, so this view's destroy method is a no-op.
+        """
+        import ray
+        manager = cls.__new__(cls)
+        width = group.gpus_per_worker
+        if len(devices) % width:
+            raise ValueError('Allocation device count must be divisible by gpus_per_worker')
+        chunks = [devices[index:index + width] for index in range(0, len(devices), width)]
+        ranks = list(range(len(chunks)))
+        group.ranks = ranks
+        manager.group_configs = [group]
+        manager.placement_groups = [placement_group]
+        manager.cpu_placement_groups = []
+        manager._external_allocation = True
+        manager.device_groups = {
+            group.name: [{
+                'gpu_rank': chunk,
+                'placement_group': placement_group,
+                'ray_address': str(ray.get_runtime_context().gcs_address)
+            } for chunk in chunks]
+        }
+        if (group.device_type or '').upper() == 'CPU':
+            manager.device_groups[group.name] = [{
+                'placement_group': placement_group,
+                'ray_address': str(ray.get_runtime_context().gcs_address)
+            } for _ in devices]
+        return manager
+
     def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
         # CPU placement group default strategy:
         # - Old approach: use node_cpu//4 as CPU bundle per node, even if only 1~2 CPU processes are needed,
@@ -319,6 +352,8 @@ class ResourceManager:
         return self.device_groups[group]
 
     def destroy_placement_group(self):
+        if getattr(self, '_external_allocation', False):
+            return
         import ray
         for pg in self.placement_groups:
             ray.util.remove_placement_group(pg)

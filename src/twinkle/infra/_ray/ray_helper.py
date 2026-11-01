@@ -174,13 +174,20 @@ class RayHelper:
             def clear(self):
                 self.config.clear()
 
+        registry_name = os.environ.get('TWINKLE_RAY_REGISTRY_NAME', 'config_registry')
+        registry_namespace = os.environ.get('TWINKLE_RAY_NAMESPACE')
         try:
-            RayHelper._registry = ray.get_actor('config_registry')
+            RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         except ValueError:
             try:
-                RayHelper._registry = WorkerRegistry.options(name='config_registry', lifetime='detached').remote()
+                RayHelper._registry = WorkerRegistry.options(
+                    name=registry_name,
+                    namespace=registry_namespace,
+                    lifetime='detached',
+                    # Preserve Ray's default CPU policy outside managed instances.
+                    num_cpus=0.01 if registry_namespace else None).remote()
             except ValueError:
-                RayHelper._registry = ray.get_actor('config_registry')
+                RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         assert RayHelper._registry is not None
 
     @staticmethod
@@ -444,7 +451,7 @@ class RayHelper:
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
                     'name': worker_name,
-                    'namespace': 'default',
+                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
@@ -468,6 +475,8 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
+                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 except BaseException:
@@ -510,7 +519,7 @@ class RayHelper:
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
                     'name': worker_name,
-                    'namespace': 'default',
+                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
@@ -518,6 +527,8 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
+                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 except BaseException:

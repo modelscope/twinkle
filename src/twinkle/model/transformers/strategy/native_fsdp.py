@@ -344,23 +344,26 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         """
         import torch
         from twinkle.model.offload import (
-            move_grads, move_optimizer_state, parameter_device, record_offload, release_caching_allocator)
+            move_grads, move_optimizer_state, offload_record, parameter_device, record_offload,
+            release_caching_allocator)
 
         module = self.unwrap_model(model)
         if not offload_model and optimizer is None:
-            record_offload(self, model=False, optimizer=False)
             release_caching_allocator()
             return
-        if getattr(self, '_offload_device', None) is None:
+        moved_model, moved_optimizer = offload_record(self)
+        # Lazy FSDP wrapping may place an initially CPU model on CUDA between rounds.
+        # Refresh the target for each new round, but retain it for repeated offloads.
+        if not moved_model and not moved_optimizer:
             self._offload_device = parameter_device(module)
-        if offload_model:
+        if offload_model and not moved_model:
             # Blocking copy: FSDP's ``_apply`` may read the CPU tensors before a queued
             # non_blocking transfer has finished.
             module.to('cpu', non_blocking=False)
             move_grads(module, torch.device('cpu'))
-        if optimizer is not None:
+        if optimizer is not None and not moved_optimizer:
             move_optimizer_state(optimizer, torch.device('cpu'))
-        record_offload(self, model=offload_model, optimizer=optimizer is not None)
+        record_offload(self, model=moved_model or offload_model, optimizer=moved_optimizer or optimizer is not None)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -382,9 +385,9 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             move_grads(module, device)
         if moved_optimizer and optimizer is not None:
             move_optimizer_state(optimizer, device)
-        clear_offload_record(self)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        clear_offload_record(self)
 
     def _ep_gather_context(self):
         """Return (ep_group, ep_world_size) for the EP submesh, or (None, 1) when EP is off."""

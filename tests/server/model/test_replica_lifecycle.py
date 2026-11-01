@@ -34,6 +34,7 @@ def _make_lifecycle_manager(state: _CapacityState, replica_id: str, max_loras: i
     manager.state = state
     manager.replica_id = replica_id
     manager.max_loras = max_loras
+    manager.train_mode = 'lora'
     manager._replica_registered = False
     manager.data_plane = SimpleNamespace(close=AsyncMock())
     manager.shutdown_task_queue = AsyncMock()
@@ -54,24 +55,26 @@ async def test_replica_lifecycle_updates_shared_capacity() -> None:
     assert await state.get_capacity_info() == {'max_loras': 6, 'used_loras': 0, 'free_loras': 6}
 
     await second.shutdown()
+    # Only the owner retires capacity after confirming the GPU workers stopped.
+    assert await state.get_capacity_info() == {'max_loras': 6, 'used_loras': 0, 'free_loras': 6}
+    await state.unregister_replica(second.replica_id)
     assert await state.get_capacity_info() == {'max_loras': 3, 'used_loras': 0, 'free_loras': 3}
 
 
 @pytest.mark.asyncio
 async def test_async_constructor_registers_replica_before_ready() -> None:
     state = SimpleNamespace(register_replica=AsyncMock(), touch_replica_last_seen=AsyncMock())
-    replica_context = SimpleNamespace(replica_id=SimpleNamespace(unique_id='replica-1'))
     manager = ModelManagement.__new__(ModelManagement)
     manager._task_queue_config = SimpleNamespace(effective_execution_timeout=1800.0)
 
     with patch('twinkle.server.model.app.DeviceGroup', return_value=SimpleNamespace(name='group')), \
          patch('twinkle.server.model.app.init_twinkle_runtime', return_value=None), \
-         patch('twinkle.server.model.app.serve.get_replica_context', return_value=replica_context), \
          patch.object(MODEL_SELECTOR, 'construct', return_value=MagicMock()), \
          patch('twinkle.server.model.app.get_server_state', return_value=state), \
          patch('twinkle.server.data_plane.DataPlaneProxy', return_value=MagicMock()), \
          patch.object(ModelManagement, '_init_task_queue'), \
-         patch.object(ModelManagement, '_init_adapter_manager'):
+         patch.object(ModelManagement, 'initialize_training_runtime', new_callable=AsyncMock), \
+         patch.object(ModelManagement, 'wait_for_training_workers', new_callable=AsyncMock):
         await ModelManagement.__init__(
             manager,
             model_id='model',
@@ -80,6 +83,10 @@ async def test_async_constructor_registers_replica_before_ready() -> None:
             device_mesh={},
             backend='mock',
             max_loras=3,
+            training_context={'instance_id': 'replica-1', 'epoch': 'epoch', 'namespace': 'test',
+                              'registry_name': 'test', 'controller_name': 'test'},
+            placement_group=None,
+            allocation_devices=[],
         )
 
     state.register_replica.assert_awaited_once_with('replica-1', 3)

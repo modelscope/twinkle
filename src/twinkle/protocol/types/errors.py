@@ -20,10 +20,14 @@ from typing import Any, Literal, Optional
 
 from .base import ResponseModel
 
-# Closed value set, kept in sync with the server-side ``QueueState`` enum values
-# (a consistency test asserts the two sets are equal). Wire fields carrying a queue
-# state declare this alias, never a bare ``str`` (naming ruling 4).
-QueueStateLiteral = Literal['active', 'paused_rate_limit', 'paused_capacity', 'unknown']
+
+class QueueState(StrEnum):
+    """Scheduling hints; these are independent of a task's lifecycle status."""
+
+    ACTIVE = 'active'
+    PAUSED_RATE_LIMIT = 'paused_rate_limit'
+    PAUSED_CAPACITY = 'paused_capacity'
+    UNKNOWN = 'unknown'
 
 
 class ErrorCategory(StrEnum):

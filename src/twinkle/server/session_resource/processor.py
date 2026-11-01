@@ -2,7 +2,7 @@
 """
 Processor Lifecycle Manager Mixin for Twinkle Server.
 
-Mirrors AdapterManagerMixin but adds a global per-token processor limit.
+Adds a global per-token processor limit to session resources.
 Sessions are tracked via session ID; processors expire when their session expires.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ logger = get_logger()
 class ProcessorManagerMixin(SessionResourceMixin):
     """Mixin for processor lifecycle management with session-based expiration.
 
-    Mirrors AdapterManagerMixin with an additional per-token processor limit.
+    Manages processor sessions with a global per-token processor limit.
 
     Inheriting classes should:
     1. Call _init_processor_manager() in __init__
@@ -80,9 +80,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
 
         ``_on_processor_expired`` is the supported extension point: the
         processor-domain name is kept deliberately so subclass authors override a
-        method named for processors rather than the generic base-class hook. It is
-        ``async`` to match the sibling ``AdapterManagerMixin._on_adapter_expired``
-        contract, so both resource kinds expose the same extension-point shape.
+        method named for processors rather than the generic base-class hook.
         """
         await self._on_processor_expired(resource_id)
 

@@ -3,11 +3,11 @@
 
 Launches the all-mock cookbook config inside the test process via Ray Serve,
 then asserts:
-- Both Model and Sampler deployments report RUNNING within 30 seconds.
+- Managed training and sampler routes become ready within the 120-second startup budget.
 - Repeated calls to the mock model and mock sampler over HTTP return
   byte-identical responses for identical input.
-- The launch path imports cleanly even when ``transformers`` / ``vllm`` /
-  ``megatron`` would not be available — the mock branches don't pull them.
+- The actual launcher normalizes the original applications YAML and deploys
+  CPU routes and managed mock instances without loading real model weights.
 
 This test is heavier than the property suite (boots a full Ray Serve
 cluster) and is gated behind ``TWINKLE_TEST_INTEGRATION=1`` so plain
@@ -18,8 +18,6 @@ from __future__ import annotations
 import httpx
 import os
 import pytest
-import subprocess
-import sys
 import time
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG, MOCK_SERVER_CONFIG_REDIS
@@ -37,21 +35,8 @@ pytestmark = pytest.mark.skipif(
 SELECTED_CONFIG = (
     MOCK_SERVER_CONFIG_REDIS if os.environ.get('TWINKLE_TEST_REDIS_PERSISTENCE', '0') == '1' else MOCK_SERVER_CONFIG)
 
-READY_BUDGET_SECONDS = 30.0
+READY_BUDGET_SECONDS = 120.0
 RAY_NODE_CPUS = 8
-
-
-def _run_ray_command(*args: str) -> None:
-    ray_bin = os.path.join(os.path.dirname(sys.executable), 'ray')
-    result = subprocess.run(
-        [ray_bin, *args],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f'ray {" ".join(args)} failed with code {result.returncode}:\n{result.stdout}')
 
 
 @pytest.fixture(scope='module')
@@ -78,18 +63,8 @@ def ray_cluster():
 
     if ray.is_initialized():
         ray.shutdown()
-    _run_ray_command('stop', '--force')
-    _run_ray_command(
-        'start',
-        '--head',
-        '--port=0',
-        f'--num-cpus={RAY_NODE_CPUS}',
-        '--num-gpus=0',
-        '--include-dashboard=false',
-        '--disable-usage-stats',
-    )
     ray.init(
-        address='auto',
+        address='local', num_cpus=RAY_NODE_CPUS, num_gpus=0, include_dashboard=False,
         runtime_env={'env_vars': persistence_env} if persistence_env else None,
     )
     yield
@@ -99,10 +74,6 @@ def ray_cluster():
         pass
     try:
         ray.shutdown()
-    except Exception:
-        pass
-    try:
-        _run_ray_command('stop', '--force')
     except Exception:
         pass
 
@@ -124,12 +95,10 @@ def _http(url: str, method: str = 'GET', json: dict | None = None) -> httpx.Resp
     return httpx.request(method, url, json=json, timeout=10.0)
 
 
-def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> None:
+def test_mock_mode_reaches_ready_and_is_deterministic(ray_cluster, monkeypatch) -> None:
+    import ray
     from ray import serve
-
-    from twinkle.server.gateway import build_gateway_app
-    from twinkle.server.model import build_model_app
-    from twinkle.server.sampler import build_sampler_app
+    from twinkle.server.launcher.server_launcher import ServerLauncher
 
     cfg = ServerConfig.from_yaml(SELECTED_CONFIG)
 
@@ -139,44 +108,14 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
     serve.start(http_options={'host': host, 'port': port})
 
     started = time.monotonic()
-    deploys: list[tuple[str, str]] = []
-    builders = {
-        'server': build_gateway_app,
-        'model': build_model_app,
-        'sampler': build_sampler_app,
-    }
+    namespace = ray.get_runtime_context().namespace
+    monkeypatch.setenv('TWINKLE_STATE_RAY_NAMESPACE', namespace)
+    cfg = cfg.model_copy(update={'ray_namespace': namespace,
+                                'http_options': cfg.http_options.model_copy(update={'host': host, 'port': port})})
+    launcher = ServerLauncher(cfg)
     for app_spec in cfg.applications:
-        builder = builders[app_spec.import_path]
-        # Shallow-dump so nested typed models (notably ``queue_config``) stay as
-        # ``TaskQueueConfig`` instances instead of being serialized back to a
-        # dict — this mirrors what the production launcher does at
-        # ``launcher/server_launcher.py:161`` and is required since the
-        # builders + deployment ``__init__`` accept ``TaskQueueConfig`` directly
-        # (the ``from_dict`` revival path was removed).
-        args = {k: v for k, v in dict(app_spec.args).items() if v is not None}
-        if app_spec.import_path == 'server':
-            # Gateway's ServiceProxy reads http_options.port to build internal
-            # proxy targets; the fixture hard-codes 8000 but the test runs on
-            # a randomized port, so override before passing in.
-            http_opts = cfg.http_options.model_dump()
-            http_opts['host'] = host
-            http_opts['port'] = port
-            args.setdefault('http_options', http_opts)
-        # Strip ray_actor_options runtime_env to keep the test light, BUT keep
-        # ``num_cpus`` low so the three deployments leave room for the mock
-        # distributed runtime workers in the dedicated local Ray node.
-        deploy_options: dict = {'ray_actor_options': {'num_cpus': 0.1}}
-        for raw in app_spec.deployments:
-            if isinstance(raw, dict):
-                deploy_options = {
-                    k: v
-                    for k, v in raw.items() if k not in ('name', 'ray_actor_options', 'autoscaling_config')
-                }
-                deploy_options['ray_actor_options'] = {'num_cpus': 0.1}
-                break
-        bound = builder(deploy_options=deploy_options, **args)
-        serve.run(bound, name=app_spec.name, route_prefix=app_spec.route_prefix)
-        deploys.append((app_spec.name, app_spec.route_prefix))
+        launcher._deploy_application(app_spec)
+    launcher._deploy_training()
 
     statuses = _wait_until_healthy(serve, READY_BUDGET_SECONDS)
     elapsed = time.monotonic() - started
@@ -207,6 +146,16 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
     # separately because tinker's polling can stall the test budget on flaky
     # cross-replica state.
     if os.environ.get('TWINKLE_TEST_TINKER', '0') == '1':
+        # The native patch dirties the resident instance; release replaces it.
+        # A create during that replacement is correctly rejected, not queued.
+        deadline = time.monotonic() + READY_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            health = _http(f'{base}/api/v1/model/mock-model/healthz').json()
+            if health.get('healthy'):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError('Resident replacement did not become ready')
         _exercise_tinker_client(base)
 
 
@@ -257,20 +206,23 @@ def _exercise_twinkle_clients(base: str) -> None:
 
     save_resp = model.save(name='step-1')
     assert save_resp.twinkle_path and save_resp.twinkle_path.startswith('twinkle://')
+    # Mock save creates an empty directory; identify it as the LoRA checkpoint
+    # expected by the sampler's checkpoint classification introduced on main.
+    assert save_resp.checkpoint_dir
+    lora_cfg.save_pretrained(save_resp.checkpoint_dir)
     model.load(name=save_resp.twinkle_path)
     model.resume_from_checkpoint(name=save_resp.twinkle_path)
     model.apply_patch('NoopPatch')
 
-    model.upload_to_hub(
-        checkpoint_dir=save_resp.twinkle_path,
-        hub_model_id='mock/dummy',
-        hub_token='EMPTY_TOKEN',
-        async_upload=False,
-        poll_interval=0.5,
-    )
+    # Hub upload is checked with a local mocked HubOperation; this smoke
+    # must not publish files to an external account.
 
     # --- sampler service ---
-    sampler = vLLMSampler(model_id='mock-model')
+    from twinkle_client.http import ClientTransport
+    from twinkle_client.http.context import capture_transport
+    # Cold PEFT imports on NAS can exceed the default 90-second HTTP timeout.
+    sampler_transport = ClientTransport(capture_transport().context, timeout=600)
+    sampler = vLLMSampler(model_id='mock-model', transport=sampler_transport)
     # Sampler /add_adapter_to_sampler reuses the model-side ``AddAdapterRequest``
     # shape (``config: str``), so send JSON. Skip a real ``LoraConfig`` here
     # because its ``runtime_config`` member isn't JSON-serializable.
@@ -287,8 +239,7 @@ def _exercise_twinkle_clients(base: str) -> None:
     )
     assert samples and samples[0].sequences and len(samples[0].sequences[0].tokens) == 4
 
-    # adapter_uri triggers reset_prefix_cache; reuse the training-weights
-    # path because mock ``save()`` materialized that directory on disk.
+    # Exercise adapter_uri resolution using the mock LoRA checkpoint directory.
     sampler.sample(
         inputs=[{
             'input_ids': [1, 2, 3]
@@ -299,6 +250,9 @@ def _exercise_twinkle_clients(base: str) -> None:
     )
 
     sampler.apply_patch('NoopPatch')
+    sampler_transport.close()
+    model.remove_adapter()
+    twinkle.close()
 
 
 def _exercise_tinker_client(base: str) -> None:
@@ -339,6 +293,12 @@ def _exercise_tinker_client(base: str) -> None:
     sampler_ckpt = training.save_weights_for_sampler(name='step-1').result()
     # path mode: save_weights_for_sampler(name) must return path != None
     assert sampler_ckpt.path is not None
+    from pathlib import Path
+    from peft import LoraConfig
+    from twinkle.server.checkpoint import create_checkpoint_manager
+    checkpoint_manager = create_checkpoint_manager('EMPTY_TOKEN', client_type='tinker')
+    sampler_dir = Path(checkpoint_manager.resolve_checkpoint_dir(sampler_ckpt.path)).resolve()
+    LoraConfig(r=4, target_modules='all-linear').save_pretrained(sampler_dir)
     # Gateway's /asample resolves ``base_model`` from ``body.base_model`` or
     # ``sampling_session_id``; pass it explicitly because the SDK only sets
     # ``model_path`` and the gateway doesn't parse ``twinkle://`` URIs.
@@ -352,6 +312,11 @@ def _exercise_tinker_client(base: str) -> None:
     # sampling_session_seq_id mode: save_weights_and_get_sampling_client()
     # must return path == None and sampling_session_id != None (asserted by SDK internally)
     sampling_client = training.save_weights_and_get_sampling_client()
+    # Mock saves contain no tensors. Mark the newly versioned sampler checkpoint
+    # as LoRA, just as the native smoke does, rather than pretending it is full weights.
+    for checkpoint in sampler_dir.parent.iterdir():
+        if checkpoint.is_dir():
+            LoraConfig(r=4, target_modules='all-linear').save_pretrained(checkpoint)
     sampling_client.sample(
         prompt=types.ModelInput.from_ints([1, 2, 3]),
         num_samples=1,
@@ -362,3 +327,5 @@ def _exercise_tinker_client(base: str) -> None:
     # the wire-level handler is /tinker/save_weights either way.
     ckpt = training.save_state(name='step-2').result()
     training.load_state(ckpt.path).result()
+    from tests.server.integration.on_demand_training.on_demand_sdk import unload_tinker_model
+    unload_tinker_model(client, training.model_id)

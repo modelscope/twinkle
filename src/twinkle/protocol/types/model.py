@@ -28,7 +28,9 @@ from .data import WireInputBatch
 
 
 class CreateRequest(StrictRequest):
-    """Body of ``POST /twinkle/create``: a session-establishing no-op."""
+    """Body of ``POST /twinkle/create``: CPU-only capability handshake."""
+
+    training_handles: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -36,7 +38,14 @@ class CreateRequest(StrictRequest):
 # --------------------------------------------------------------------------- #
 
 
-class AdapterRequest(StrictRequest):
+class TrainingRequest(StrictRequest):
+    """A training handle is control metadata, never a backend kwarg."""
+
+    training_id: str = Field(min_length=1)
+    adapter_name: str
+
+
+class AdapterRequest(TrainingRequest):
     """The shared shape of an adapter-scoped operation.
 
     ``seq_id`` is an idempotency key, not a backend parameter: the submit shell
@@ -46,7 +55,6 @@ class AdapterRequest(StrictRequest):
     which would silently disable that dedup.
     """
 
-    adapter_name: str
     seq_id: int | None = None
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
 
@@ -83,10 +91,9 @@ class ClipGradAndStepRequest(ClipGradNormRequest):
     optim_params: dict[str, JsonValue] | None = backend_kwarg(default=None)
 
 
-class CalculateMetricRequest(StrictRequest):
+class CalculateMetricRequest(TrainingRequest):
     """Body of ``POST /twinkle/calculate_metric``."""
 
-    adapter_name: str
     is_training: bool = True
 
 
@@ -105,7 +112,7 @@ class CalculateMetricRequest(StrictRequest):
 # --------------------------------------------------------------------------- #
 
 
-class _InlineForwardBase(StrictRequest):
+class _InlineForwardBase(TrainingRequest):
     """Fields common to the three inline forward endpoints."""
 
     inputs: WireInputBatch
@@ -127,7 +134,6 @@ class _InlineForwardBase(StrictRequest):
 class ForwardRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward``: keeps the graph, mutates no gradients."""
 
-    adapter_name: str
     disable_lora: bool | None = backend_kwarg(default=None)
 
 
@@ -139,14 +145,12 @@ class ForwardOnlyRequest(_InlineForwardBase):
     nothing is mutated to be idempotent about.
     """
 
-    adapter_name: str
     disable_lora: bool | None = backend_kwarg(default=None)
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward_backward``: accumulates gradients."""
 
-    adapter_name: str
     seq_id: int | None = None
     sync_gradients: bool | None = backend_kwarg(default=None)
     loss_scale: float | None = backend_kwarg(default=None)
@@ -161,7 +165,7 @@ class ForwardBackwardTaskRequest(_InlineForwardBase):
 # --------------------------------------------------------------------------- #
 
 
-class DataPlaneForwardRequest(StrictRequest):
+class DataPlaneForwardRequest(TrainingRequest):
     """Body of the ``*_from_data_plane`` forward endpoints."""
 
     input_refs: list[DataRef] = Field(min_length=1)
@@ -169,7 +173,6 @@ class DataPlaneForwardRequest(StrictRequest):
     # Values are *field paths*, not parameter values, so this is not a passthrough
     # region: nothing in it is forwarded verbatim.
     kwarg_fields: dict[str, str] = Field(default_factory=dict)
-    adapter_name: str
     seq_id: int | None = None
     task: str | None = backend_kwarg(default=None)
     temperature: float | None = backend_kwarg(default=None, gt=0)
@@ -180,7 +183,7 @@ class DataPlaneForwardRequest(StrictRequest):
     loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class DataPlaneForwardOnlyRequest(StrictRequest):
+class DataPlaneForwardOnlyRequest(TrainingRequest):
     """Body of ``POST /twinkle/forward_only_from_data_plane``.
 
     This endpoint is read-only, so it deliberately has no ``seq_id`` idempotency
@@ -191,7 +194,6 @@ class DataPlaneForwardOnlyRequest(StrictRequest):
     input_refs: list[DataRef] = Field(min_length=1)
     input_field: str | None = None
     kwarg_fields: dict[str, str] = Field(default_factory=dict)
-    adapter_name: str
     task: str | None = backend_kwarg(default=None)
     temperature: float | None = backend_kwarg(default=None, gt=0)
     return_logits: bool | None = backend_kwarg(default=None)
@@ -222,25 +224,22 @@ class DataPlaneForwardOnlyRequest(StrictRequest):
 # --------------------------------------------------------------------------- #
 
 
-class SetLossRequest(StrictRequest):
+class SetLossRequest(TrainingRequest):
     loss_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class SetOptimizerRequest(StrictRequest):
+class SetOptimizerRequest(TrainingRequest):
     optimizer_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class SetLrSchedulerRequest(StrictRequest):
+class SetLrSchedulerRequest(TrainingRequest):
     scheduler_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class SetTemplateRequest(StrictRequest):
+class SetTemplateRequest(TrainingRequest):
     """Body of ``POST /twinkle/set_template``.
 
     No top-level ``model_id``: the backend always overrides it with its own
@@ -250,26 +249,22 @@ class SetTemplateRequest(StrictRequest):
     """
 
     template_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class SetProcessorRequest(StrictRequest):
+class SetProcessorRequest(TrainingRequest):
     processor_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class AddMetricRequest(StrictRequest):
+class AddMetricRequest(TrainingRequest):
     metric_cls: str
-    adapter_name: str
     is_training: bool | None = None
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class ApplyPatchRequest(StrictRequest):
+class ApplyPatchRequest(TrainingRequest):
     patch_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
@@ -278,8 +273,7 @@ class ApplyPatchRequest(StrictRequest):
 # --------------------------------------------------------------------------- #
 
 
-class SaveRequest(StrictRequest):
-    adapter_name: str
+class SaveRequest(TrainingRequest):
     name: str | None = None
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
@@ -287,8 +281,7 @@ class SaveRequest(StrictRequest):
     merge_lora: bool | None = backend_only('megatron', default=None)
 
 
-class LoadRequest(StrictRequest):
-    adapter_name: str
+class LoadRequest(TrainingRequest):
     name: str
     load_optimizer: bool = False
     no_load_optim: bool | None = backend_only('megatron', default=None)
@@ -296,7 +289,7 @@ class LoadRequest(StrictRequest):
     strict: bool | None = backend_only('transformers', default=None)
 
 
-class ResumeFromCheckpointRequest(StrictRequest):
+class ResumeFromCheckpointRequest(TrainingRequest):
     """Body of ``POST /twinkle/resume_from_checkpoint``."""
 
     name: str
@@ -305,6 +298,7 @@ class ResumeFromCheckpointRequest(StrictRequest):
 
 
 class AddAdapterRequest(StrictRequest):
+    client_create_id: str | None = None
     adapter_name: str
     # ``config`` is None for full-parameter training (no LoRA adapter) and a
     # serialized LoraConfig string for LoRA training.
@@ -418,6 +412,12 @@ AddMetricResponse = OkResponse
 # --- Other responses ---
 
 
+class TrainingHandleResponse(ResponseModel):
+    training_id: str
+    adapter_name: str
+
+
 class CreateResponse(ResponseModel):
     """Response for /create endpoint."""
     status: str = 'ok'
+    training_handles: bool = False

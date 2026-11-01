@@ -35,7 +35,7 @@ class TestPluginLoad:
 
     def test_load_plugin_safe_mode(self):
         """Test loading plugin when trust_remote_code is False."""
-        with patch('twinkle.utils.loader.MSHub.download_model', return_value='/tmp/fake'):
+        with patch('twinkle.hub.hub.MSHub.download_model', return_value='/tmp/fake'):
             with patch('twinkle.utils.loader.trust_remote_code', return_value=False):
                 with pytest.raises(ValueError, match='Twinkle does not support plugin in safe mode'):
                     Plugin.load_plugin('ms://test/plugin', BasePlugin)
@@ -43,7 +43,7 @@ class TestPluginLoad:
     def test_load_plugin_missing_init_file(self):
         """Test loading plugin when __init__.py is missing."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.MSHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with pytest.raises(AssertionError, match='does not exist'):
                         Plugin.load_plugin('ms://test/plugin', BasePlugin)
@@ -58,7 +58,7 @@ class TestPluginLoad:
             other_class = type('OtherClass', (), {})
             other_class.__module__ = str(init_file)
 
-            with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.MSHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with patch('twinkle.utils.loader.importlib.import_module') as mock_import:
                         mock_module = MagicMock()
@@ -87,7 +87,7 @@ class TestPluginLoad:
             test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
 
-            with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.MSHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with patch('twinkle.utils.loader.importlib.import_module', return_value=mock_module):
                         plugin_cls = Plugin.load_plugin('ms://test/plugin', BasePlugin)
@@ -111,7 +111,7 @@ class TestPluginLoad:
             test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
 
-            with patch('twinkle.utils.loader.HFHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.HFHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with patch('twinkle.utils.loader.importlib.import_module', return_value=mock_module):
                         plugin_cls = Plugin.load_plugin('hf://test/plugin', BasePlugin)
@@ -137,7 +137,7 @@ class TestPluginLoad:
 
             assert tmpdir not in sys.path
 
-            with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.MSHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with patch('twinkle.utils.loader.importlib.import_module', return_value=mock_module):
                         Plugin.load_plugin('ms://test/plugin', BasePlugin)
@@ -186,7 +186,7 @@ class TestConstructClass:
             test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
 
-            with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
+            with patch('twinkle.hub.hub.MSHub.download_model', return_value=tmpdir):
                 with patch('twinkle.utils.loader.trust_remote_code', return_value=True):
                     with patch('twinkle.utils.loader.importlib.import_module', return_value=mock_module):
                         result = construct_class('ms://test/plugin', BasePlugin, [], name='test')

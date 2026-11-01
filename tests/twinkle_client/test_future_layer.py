@@ -62,6 +62,15 @@ def test_terminal_submit_failure_raises_taskfailed_with_payload(monkeypatch):
     assert not isinstance(exc.value, requests.HTTPError)
 
 
+def test_terminal_failure_keeps_remote_traceback(monkeypatch):
+    """The client exception must carry the server diagnostic, not only the summary."""
+    monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: pytest.fail('no retrieve'))
+    diagnostic = 'Traceback (most recent call last):\nAssertionError: data/mask length mismatch at sample 0'
+    with pytest.raises(TaskFailedError) as exc:
+        _future.resolve(_failed(traceback=diagnostic), model_cls=_Model)
+    assert exc.value.traceback == diagnostic
+
+
 def test_model_cls_none_returns_none_result(monkeypatch):
     """A method that returned None before still returns None (not swallowed)."""
     monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: pytest.fail('no retrieve'))

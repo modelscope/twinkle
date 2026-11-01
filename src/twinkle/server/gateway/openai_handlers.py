@@ -8,7 +8,9 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import secrets
 import time
 import uuid
@@ -19,16 +21,16 @@ from typing import TYPE_CHECKING, Any
 
 from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 from twinkle.server.lifecycle.envelope import envelope_from_record
-from twinkle.server.lifecycle.poll_config import long_poll_window
 
 if TYPE_CHECKING:
     from .app import GatewayServer
 
 import httpx
 
+import twinkle.protocol.types as types
+
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from . import routes
 from .openai_bridge import (make_error, translate_chat_request, translate_completion_request,
                             translate_completion_response, translate_completion_stream_chunk,
                             translate_embedding_request, translate_embedding_response,
@@ -37,6 +39,59 @@ from .openai_bridge import (make_error, translate_chat_request, translate_comple
 from .use_cases import poll_future
 
 logger = get_logger()
+
+
+_OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
+_DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
+
+
+class SamplerWaitTimeoutError(TimeoutError):
+    """The sampler task did not reach a terminal state inside the gateway's budget."""
+
+
+def _sample_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_SAMPLE_TIMEOUT_ENV, str(_DEFAULT_OPENAI_SAMPLE_TIMEOUT)))
+
+
+async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any],
+                                    request: Request) -> types.TaskEnvelope | None:
+    """Resolve the sampler's TaskEnvelope to a terminal state.
+
+    ``/twinkle/sample`` always answers with a TaskEnvelope; a slow sample is
+    still ``queued``/``running`` when the proxy returns. Polling the shared
+    state backend is the only way to obtain its result without changing the
+    upstream wire contract. Returns ``None`` when the future record was lost.
+
+    ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` bounds the entire terminal-state wait,
+    including state reads. Client disconnection is checked between long polls.
+    """
+    envelope = types.TaskEnvelope.model_validate(sampler_data)
+    if envelope.status in types.TERMINAL_STATUSES:
+        return envelope
+
+    async def wait_for_terminal(envelope: types.TaskEnvelope) -> types.TaskEnvelope | None:
+        while envelope.status not in types.TERMINAL_STATUSES:
+            if await request.is_disconnected():
+                raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
+            # ``poll_future`` waits out its whole window before reporting a missing
+            # record, so check once here: a lost record is a terminal answer, not a
+            # reason to keep the coroutine alive.
+            if await gateway.state.get_future(envelope.request_id) is None:
+                return None
+            outcome = await poll_future(gateway.state, envelope.request_id)
+            if outcome.record is None:
+                return None
+            envelope = envelope_from_record(envelope.request_id, outcome.record)
+        return envelope
+
+    timeout = _sample_wait_timeout()
+    try:
+        return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
+    except SamplerWaitTimeoutError:
+        raise
+    except asyncio.TimeoutError:
+        raise SamplerWaitTimeoutError(
+            f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
 
 def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -293,30 +348,6 @@ def _deny_without_key(request: Request, api_key: str | None) -> JSONResponse | N
     return None
 
 
-async def _await_terminal_envelope(gateway: GatewayServer, request_id: str) -> dict[str, Any]:
-    """Long-poll one queued task's future record to a terminal state (or the window's end).
-
-    Uses the same future store, the same ``poll_future`` use case, and the same Long_Poll_Window
-    that the twinkle-native ``/twinkle/retrieve_future`` endpoint reads, so the OpenAI surface and
-    the native surface wait identically.
-    """
-    outcome = await poll_future(gateway.state, request_id)
-    if outcome.record is None:
-        return {'request_id': request_id, 'status': 'pending'}
-    return envelope_from_record(request_id, outcome.record).model_dump()
-
-
-def _task_failed(envelope: dict[str, Any]) -> JSONResponse:
-    """Map a failed/cancelled TaskEnvelope's ErrorPayload to an OpenAI-shaped error response."""
-    error = envelope.get('error') or {}
-    message = error.get('message') or envelope.get('status') or 'task failed'
-    error_code = error.get('error_code')
-    return JSONResponse(
-        status_code=error_code if isinstance(error_code, int) else 500,
-        content=make_error(message=f'Task failed: {message}', error_type='server_error'),
-    )
-
-
 async def _proxy_sample(
     gateway: GatewayServer,
     request: Request,
@@ -365,24 +396,31 @@ async def _proxy_sample(
             ),
         )
 
-    envelope = json.loads(response.body)
-    if envelope.get('status') != 'completed':
-        envelope = await _await_terminal_envelope(gateway, envelope.get('request_id', ''))
-        if envelope.get('status') == 'failed' or envelope.get('status') == 'cancelled':
-            return _task_failed(envelope)
-        if envelope.get('status') != 'completed':
-            return JSONResponse(
-                status_code=504,
-                content=make_error(
-                    message=(f'Task {envelope.get("request_id")} is still running after the '
-                             f'{long_poll_window():.0f}s long-poll window; poll /twinkle/retrieve_future '
-                             'with its request_id'),
-                    error_type='server_error',
-                    code='task_timeout',
-                ),
-            )
-
-    result = translate(envelope.get('result'), model)
+    sampler_data = json.loads(response.body)
+    try:
+        envelope = await _resolve_sampler_envelope(gateway, sampler_data, request)
+    except SamplerWaitTimeoutError as exc:
+        return JSONResponse(status_code=504, content=make_error(message=str(exc), error_type='timeout'))
+    if envelope is None:
+        return JSONResponse(
+            status_code=500,
+            content=make_error(
+                message=f"Sampling task {sampler_data.get('request_id')} was lost by the server",
+                error_type='server_error'))
+    if envelope.status != 'completed':
+        error = envelope.error
+        return JSONResponse(
+            status_code=error.error_code if error is not None else 500,
+            content=make_error(
+                message=error.error if error is not None else f'Sampling task {envelope.status}',
+                error_type=('invalid_request_error'
+                            if error is not None and error.category.value == 'user' else 'server_error')))
+    payload = envelope.result or {}
+    expected_key = 'data' if endpoint == 'twinkle/encode' else 'samples'
+    if not payload.get(expected_key):
+        return JSONResponse(status_code=502, content=make_error(
+            message=f'Sampler completed without returning any {expected_key}', error_type='server_error'))
+    result = translate(payload, model)
     resp_headers = {}
     replica_id = response.headers.get('x-twinkle-replica-id')
     if replica_id:
@@ -479,14 +517,13 @@ async def _ensure_template(
     template_cls = get_template_for_model(base_model)
     set_template_body = json.dumps({
         'template_cls': template_cls,
-        'model_id': base_model,
         'adapter_name': '',
     }).encode()
 
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint=routes.TWINKLE_SET_TEMPLATE,
+            endpoint='twinkle/set_template',
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,

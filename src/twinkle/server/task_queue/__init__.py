@@ -5,22 +5,20 @@ Task Queue package.
 Public exports:
 - TaskStatus      - task lifecycle enum
 - QueueState      - queue state enum for tinker client compatibility
-- TaskQueueConfig - queue and rate-limit configuration dataclass
 - TaskQueueMixin  - mixin with schedule_task / schedule_background_task
 - RateLimiter     - sliding-window rate limiter
 """
-from .config import TaskQueueConfig
+from twinkle.protocol.types.errors import QueueState
+from twinkle.protocol.types.lifecycle import TaskStatus
 from .mixin import TaskQueueMixin
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus, UserTaskError
+from .types import QueuedTask
 from .worker import ComputeWorker
 
 __all__ = [
     'TaskStatus',
     'QueueState',
-    'UserTaskError',
     'QueuedTask',
-    'TaskQueueConfig',
     'TaskQueueMixin',
     'ComputeWorker',
     'RateLimiter',

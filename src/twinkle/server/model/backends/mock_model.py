@@ -181,7 +181,7 @@ class TwinkleCompatMockModel:
 
         The real backend creates ``<output_dir>/<name>/`` on disk and returns its
         path. Tinker /asample later does ``os.path.exists(...)`` on a symlink
-        pointing here (see ``sampler/tinker_handlers.py:72``), so the directory
+        pointing here (see ``sampler/tinker_handlers.py``), so the directory
         has to really exist for the mock path to clear.
         """
         target = os.path.join(output_dir or '/tmp/twinkle_mock_ckpt', name)

@@ -117,7 +117,7 @@ def main() -> int:
         raise
     except Exception as e:  # noqa: BLE001
         msg = str(e)
-        assert 'full-parameter' in msg or 'lora_config' in msg, f'Phase B FAIL: unexpected error: {msg[:500]}'
+        assert 'lora' in msg.lower(), f'Phase B FAIL: unexpected error: {msg[:500]}'
         logger.info('Phase B OK: rejected with mode-mismatch error')
 
     # ── Phase C: second full tenant must be rejected (exclusive) ──
@@ -130,8 +130,8 @@ def main() -> int:
         raise
     except Exception as e:  # noqa: BLE001
         msg = str(e)
-        assert 'exclusive' in msg or 'already' in msg, f'Phase C FAIL: unexpected error: {msg[:500]}'
-        logger.info('Phase C OK: rejected with exclusive-busy error')
+        assert 'replica limit' in msg.lower() or 'allocation' in msg.lower(), f'Phase C FAIL: unexpected error: {msg[:500]}'
+        logger.info('Phase C OK: rejected at configured instance capacity')
 
     # ── Phase D: save full weights for sampler + sample ──
     logger.info('Phase D: save_weights_and_get_sampling_client + sample')
