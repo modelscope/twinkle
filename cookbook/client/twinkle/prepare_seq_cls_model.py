@@ -37,7 +37,7 @@ text_config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is n
 
 # The load report lists the vision weights as UNEXPECTED and score.weight as MISSING.
 model = AutoModelForSequenceClassification.from_pretrained(model_dir, config=text_config, torch_dtype='auto')
-# 显式初始化新分类头：不能依赖缺失权重加载时的隐式初始化。
+# Initialize the new head explicitly instead of relying on implicit missing-weight initialization.
 torch.manual_seed(42)
 torch.nn.init.normal_(model.score.weight, mean=0.0, std=text_config.initializer_range)
 model.save_pretrained(args.output_dir)

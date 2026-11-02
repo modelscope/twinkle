@@ -210,10 +210,10 @@ class ClientMultiTurnRollout:
                     call.future.result()
                 except (KeyboardInterrupt, SystemExit) as drain_error:
                     if call.future.done():
-                        # Future 已结束时，控制异常也可能是后台任务本身的结果。
+                        # A completed Future may contain a control exception raised by the worker itself.
                         cause = drain_error if drain_error is not control_error else None
                         raise control_error from cause
-                    # 重复控制中断不能丢弃仍在执行的 Future。
+                    # Repeated interrupts must not abandon a Future that is still running.
                     continue
                 except BaseException as drain_error:
                     raise control_error from drain_error

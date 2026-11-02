@@ -30,6 +30,7 @@ from .validation import (
     learning_gate,
     parameters_changed,
     pipeline_evidence_gate,
+    parse_args,
     result_payload,
     run_cancel_validation,
     run_validation,
@@ -413,6 +414,82 @@ def test_cancel_runner_drains_real_recipe_call_sites_without_a_provider(stage, t
     assert result['stage_reached'] is (stage != 'unreached')
     assert len(created) == 4 and all(env.closed for env in created)
     assert client.closed
+
+
+def test_openenv_cli_and_results_cannot_claim_agentenv_security(tmp_path):
+    config = parse_args([
+        '--backend', 'transformers', '--phase', 'pipeline', '--result-dir', str(tmp_path),
+        '--environment-backend', 'openenv', '--openenv-url', 'http://127.0.0.1:18762',
+    ])
+    assert config.environment_backend == 'openenv'
+    assert config.gradient_accumulation_steps == 2
+    payload = result_payload(config, pipeline_gate=True)
+    assert payload['acceptance_scope'] == 'openenv_functional'
+    assert payload['agentenv_security_gate'] is None
+    assert 'openenv_url' not in payload['config']
+
+
+def test_cancel_result_paths_keep_every_stage(tmp_path):
+    config = replace(_config(tmp_path), phase='cancel')
+    sample = write_result(replace(config, cancel_stage='sample'), pipeline_gate=False)
+    tool = write_result(replace(config, cancel_stage='tool'), pipeline_gate=False)
+    assert sample != tool and sample.exists() and tool.exists()
+
+
+@pytest.mark.parametrize('changed', [True, False])
+def test_update_gate_counts_only_complete_ga_cycles_with_probe_changes(changed, tmp_path, monkeypatch):
+    from . import validation
+
+    recipe = _load_recipe()
+    calls = []
+
+    class Model:
+        micro_steps = 0
+
+        def forward_backward(self, **kwargs):
+            calls.append('backward')
+
+        def clip_grad_and_step(self, **kwargs):
+            self.micro_steps += 1
+            calls.append('step')
+
+        def calculate_metric(self, **kwargs):
+            return {'result': {'grad_norm': 1.0}}
+
+        def forward_only(self, **kwargs):
+            assert kwargs['compute_loss'] is False
+            completed = self.micro_steps // 2 if changed else 0
+            return {'result': {'logps': [[-1.0 - completed * 0.1]]}}
+
+        def save(self, name, **kwargs):
+            calls.append(name)
+            return SimpleNamespace(twinkle_path='twinkle://' + name)
+
+    model = Model()
+    client = SimpleNamespace(close=lambda: None)
+    sampler = SimpleNamespace(sample=lambda *args, **kwargs: [])
+    rollout = SimpleNamespace(sampler=sampler, _core=SimpleNamespace(response_callback=SimpleNamespace()))
+
+    async def build(*args):
+        return [client], model, sampler, rollout, asyncio.Event()
+
+    async def groups(*args):
+        return [{'response_token_ids': [1], 'rollout_logprobs': [-0.1]}] * 4, [1.0, 0.0, 1.0, 0.0]
+
+    async def sync_async(*args):
+        return {'sync_async_equivalent': False, 'environment_isolation': False}
+
+    monkeypatch.setattr(recipe, '_rollout_group', groups)
+    monkeypatch.setattr(validation, '_load_recipe', lambda: recipe)
+    monkeypatch.setattr(validation, '_build_runtime', build)
+    monkeypatch.setattr(validation, '_sync_async_evidence', sync_async)
+    config = replace(_config(tmp_path), phase='pipeline', max_groups=2)
+    result = asyncio.run(run_validation(config))
+    assert calls.count('step') == 4
+    assert result['updates'] == (2 if changed else 0)
+    assert result['evidence']['two_updates'] is changed
+    assert [call for call in calls if call.startswith('policy')] == (
+        ['policy-0', 'policy-1', 'policy-2'] if changed else ['policy-0'])
 
 
 @pytest.mark.skipif(

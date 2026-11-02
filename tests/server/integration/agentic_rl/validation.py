@@ -1,4 +1,4 @@
-"""Controlled real AgentENV validation for client-orchestrated multi-turn GRPO."""
+"""Real multi-turn GRPO acceptance with AgentENV or explicitly scoped OpenEnv functional coverage."""
 from __future__ import annotations
 
 import argparse
@@ -61,6 +61,10 @@ class ValidationConfig:
     min_success_improvement: float | None = None
     cancel_stage: str = 'sample'
     slow_tool_seconds: float = 20.0
+    environment_backend: str = 'agentenv'
+    openenv_url: str | None = None
+    openenv_name: str = 'coding_env'
+    gradient_accumulation_steps: int = 2
 
 
 def _load_recipe():
@@ -70,6 +74,34 @@ def _load_recipe():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _prepare_recipe(config):
+    if config.environment_backend == 'agentenv':
+        os.environ['AGENTENV_TEMPLATE'] = config.agentenv_template
+    recipe = _load_recipe()
+    if config.environment_backend == 'openenv':
+        from tests.server.integration.agentic_rl.openenv_adapter import OpenEnvTaskEnv
+
+        def create(task, on_created):
+            env = OpenEnvTaskEnv(task, base_url=config.openenv_url, env_name=config.openenv_name)
+            on_created(env)
+            env.reset()
+            for path, content in [(task.filename, task.solution), ('smoke_test.py', task.smoke_test)]:
+                env.step('write_file', {'path': path, 'content': content})
+                env.ensure_idle()
+            manager = recipe.ToolManager([recipe.EnvTool(env, name) for name in
+                                          ('run_command', 'read_file', 'write_file')])
+            return recipe._Attempt(env, manager, {
+                'messages': [{'role': 'user', 'content': task.prompt +
+                              '\nThe workspace uses virtual files. Run scripts with python smoke_test.py; '
+                              'shell commands and OS imports are not available.'}],
+                'tools': manager.tool_infos(),
+            })
+
+        recipe._TaskAgentEnv = OpenEnvTaskEnv
+        recipe._create_attempt = create
+    return recipe
 
 
 def learning_gate(*, updates: int, baseline: float, final: float, minimum_improvement: float) -> bool:
@@ -99,10 +131,13 @@ def result_payload(config: ValidationConfig, *, mode: str = 'real', **values) ->
         'mode': mode,
         'backend': config.backend,
         'phase': config.phase,
+        'environment_backend': config.environment_backend,
+        'acceptance_scope': ('openenv_functional' if config.environment_backend == 'openenv' else 'agentenv'),
+        'agentenv_security_gate': None,
         'config': {
             key: value
             for key, value in asdict(config).items()
-            if key not in {'server_url', 'result_dir'}
+            if key not in {'server_url', 'result_dir', 'openenv_url'}
         },
         **values,
     }
@@ -111,7 +146,8 @@ def result_payload(config: ValidationConfig, *, mode: str = 'real', **values) ->
 def write_result(config: ValidationConfig, **values) -> Path:
     destination = Path(config.result_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    path = destination / f'{config.backend}-{config.phase}.json'
+    suffix = f'-{config.cancel_stage}' if config.phase == 'cancel' else ''
+    path = destination / f'{config.backend}-{config.environment_backend}-{config.phase}{suffix}.json'
     path.write_text(json.dumps(result_payload(config, **values), indent=2, sort_keys=True) + '\n', encoding='utf-8')
     return path
 
@@ -269,6 +305,7 @@ async def _build_runtime(config, recipe):
             model.add_adapter_to_model,
             recipe.ADAPTER_NAME,
             LoraConfig(target_modules='all-linear', r=8, lora_alpha=32),
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
             stop_event=stop_event,
         )
         await recipe._await_operation(model.set_loss, 'GRPOLoss', epsilon=0.2, beta=0.0, stop_event=stop_event)
@@ -385,8 +422,7 @@ async def _probe_logps(recipe, model, trajectory, stop_event) -> list[float]:
 async def run_validation(config: ValidationConfig) -> dict:
     if config.phase == 'learning' and config.min_success_improvement is None:
         raise ValueError('learning validation requires a frozen --min-success-improvement threshold')
-    os.environ['AGENTENV_TEMPLATE'] = config.agentenv_template
-    recipe = _load_recipe()
+    recipe = _prepare_recipe(config)
     timeline = _Timeline()
     recipe.ToolManager = _timed_tool_manager(recipe.ToolManager, timeline, config.slow_tool_seconds)
     clients, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
@@ -431,9 +467,22 @@ async def run_validation(config: ValidationConfig) -> dict:
                     if 'trajectory' not in probe:
                         probe['trajectory'] = rolled[0]
                         probe['before'] = await _probe_logps(recipe, model, rolled[0], stop_event)
-                    updated = await recipe._train_group(
-                        model, rolled, rewards, advantage_fn, stop_event, on_metrics=metrics.append)
+                        probe['latest'] = probe['before']
+                        probe['updates'] = []
+                    updated = False
+                    # Finish all accumulation micro-steps before counting an optimizer update and saving.
+                    for _ in range(config.gradient_accumulation_steps):
+                        updated = await recipe._train_group(
+                            model, rolled, rewards, advantage_fn, stop_event, on_metrics=metrics.append)
+                        if not updated:
+                            break
                     if updated:
+                        after = await _probe_logps(recipe, model, probe['trajectory'], stop_event)
+                        changed = parameters_changed(probe['latest'], after)
+                        probe['updates'].append({'changed': changed, 'before': probe['latest'], 'after': after})
+                        probe['latest'] = after
+                        if not changed:
+                            continue
                         updates += 1
                         saved = await recipe._await_operation(
                             model.save,
@@ -467,7 +516,9 @@ async def run_validation(config: ValidationConfig) -> dict:
             'snapshot_uris': sorted(snapshot_uris),
             'policy_requests': recording_sampler.uris,
             'metrics': metrics,
-            'parameter_probe': {'before': probe.get('before'), 'after': probe_after},
+            'parameter_probe': {
+                'before': probe.get('before'), 'after': probe_after, 'updates': probe.get('updates', [])
+            },
             'timeline': spans,
             'evidence': evidence,
         })
@@ -581,8 +632,7 @@ async def _wait_for_stage(recorder: _CancelRecorder, task: asyncio.Task, timeout
 
 
 async def run_cancel_validation(config: ValidationConfig) -> dict:
-    os.environ['AGENTENV_TEMPLATE'] = config.agentenv_template
-    recipe = _load_recipe()
+    recipe = _prepare_recipe(config)
     recorder = _CancelRecorder(config.cancel_stage)
     recipe.ToolManager = _cancel_tool_manager(recipe.ToolManager, recorder)
     clients, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
@@ -625,7 +675,7 @@ async def run_cancel_validation(config: ValidationConfig) -> dict:
         recorder.mark_cancelled()
         if not task.done():
             task.cancel()
-            # 先让调用处理取消，再允许已经开始的操作自然结束；不设置统计盲区。
+            # Deliver cancellation before releasing in-flight work, without a measurement blind spot.
             await asyncio.sleep(0)
         recorder.release.set()
         cancelled = False
@@ -656,7 +706,10 @@ def parse_args(argv=None) -> ValidationConfig:
     parser.add_argument('--server-url', default='http://127.0.0.1:8000')
     parser.add_argument('--model-id', default='ms://Qwen/Qwen3.5-4B')
     parser.add_argument('--template-model-id', default=None)
-    parser.add_argument('--agentenv-template', required=True)
+    parser.add_argument('--environment-backend', choices=['agentenv', 'openenv'], default='agentenv')
+    parser.add_argument('--agentenv-template', default=os.environ.get('AGENTENV_TEMPLATE'))
+    parser.add_argument('--openenv-url', default=os.environ.get('OPENENV_BASE_URL'))
+    parser.add_argument('--openenv-name', default='coding_env')
     parser.add_argument('--result-dir', required=True)
     parser.add_argument('--max-groups', type=int, default=4)
     parser.add_argument('--active-groups', type=int, default=2)
@@ -671,13 +724,17 @@ def parse_args(argv=None) -> ValidationConfig:
         parser.error('max-groups must be >=2 and active-groups/eval-repeats must be positive')
     if args.slow_tool_seconds <= 0:
         parser.error('slow-tool-seconds must be positive')
+    if args.environment_backend == 'agentenv' and not args.agentenv_template:
+        parser.error('AgentENV requires --agentenv-template')
+    if args.environment_backend == 'openenv' and not args.openenv_url:
+        parser.error('OpenEnv requires --openenv-url')
     return ValidationConfig(
         backend=args.backend,
         phase=args.phase,
         server_url=args.server_url,
         model_id=args.model_id,
         template_model_id=args.template_model_id or args.model_id,
-        agentenv_template=args.agentenv_template,
+        agentenv_template=args.agentenv_template or '',
         result_dir=args.result_dir,
         max_groups=args.max_groups,
         active_groups=args.active_groups,
@@ -686,6 +743,9 @@ def parse_args(argv=None) -> ValidationConfig:
         min_success_improvement=args.min_success_improvement,
         cancel_stage=args.cancel_stage,
         slow_tool_seconds=args.slow_tool_seconds,
+        environment_backend=args.environment_backend,
+        openenv_url=args.openenv_url,
+        openenv_name=args.openenv_name,
     )
 
 
