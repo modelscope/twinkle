@@ -169,6 +169,8 @@ class InfonceLoss(EmbeddingLoss):
     such group. Setting ``use_batch=True`` enables in-batch negatives and,
     when distributed is initialized, gathers embeddings from all DP ranks
     (only the local shard keeps gradients).
+    The negative pool covers the current micro-batch and its DP peers, not other
+    micro-batches in the gradient-accumulation window.
 
     Args:
         temperature: Logit scaling factor.
@@ -454,6 +456,7 @@ class OnlineContrastiveLoss(EmbeddingLoss):
     dropping them concentrates the gradient on the decision boundary. The single-element
     fallbacks (``negs.mean()`` / ``poss.mean()``) mirror legacy: with fewer than two pairs on a
     side there is no counterpart to compare against.
+    Hard-pair selection is performed independently within each micro-batch.
 
     Args:
         margin: Hinge for the selected negative pairs.
