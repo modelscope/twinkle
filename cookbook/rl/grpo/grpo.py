@@ -1,3 +1,4 @@
+import random
 import os
 from typing import List, Tuple, Dict, Any
 
@@ -18,6 +19,7 @@ from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 from twinkle.metric import CompletionRewardMetric
 from twinkle.preprocessor.llm import GSM8KProcessor
+from twinkle.utils.rl_checkpoint import load_rl_checkpoint, save_rl_checkpoint
 
 logger = get_logger()
 args = CLI.from_args()
@@ -69,7 +71,9 @@ def main():
     else:
         model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
-    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
+    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS,
+                       groups=device_groups, lazy_collect=False,
+                       seed=args.training.seed)
 
     # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
     # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
@@ -129,53 +133,117 @@ def main():
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
 
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
 
-    optim_step = 0
+    resume_config = {
+        'sampling_seed_strategy': 'driver_python_rng_n_samples_v1',
+        'model_id': MODEL_ID,
+        'use_megatron': USE_MEGATRON,
+        'model_gpus': MODEL_GPUS,
+        'sampler_gpus': SAMPLER_GPUS,
+        'global_batch_size': GLOBAL_BATCH_SIZE,
+        'mini_batch_size': MINI_BATCH_SIZE,
+        'micro_batch_size': MICRO_BATCH_SIZE,
+        'num_generations': NUM_GENERATIONS,
+        'max_new_tokens': MAX_NEW_TOKENS,
+        'max_steps': MAX_STEPS,
+        'learning_rate': LEARNING_RATE,
+        'seed': args.training.seed,
+        'adapter_name': ADAPTER_NAME,
+    }
+
+    optim_step, pending = 0, None
+    if args.training.resume_from_checkpoint:
+        if args.training.resume_only_model or args.training.ignore_data_skip:
+            raise ValueError(
+                'GRPO continuation requires full training and data state'
+            )
+        optim_step, pending = load_rl_checkpoint(
+            model, dataloader,
+            args.training.resume_from_checkpoint,
+            adapter_name=ADAPTER_NAME,
+            config=resume_config,
+        )
+        logger.info(f'Resumed GRPO at optimizer step {optim_step}')
+
+    if optim_step >= MAX_STEPS:
+        logger.info(f'Checkpoint already reached max_steps={MAX_STEPS}')
+        return
+
+    def save_checkpoint(name, remaining):
+        path = save_rl_checkpoint(
+            model, dataloader,
+            name=name,
+            output_dir=args.training.output_dir,
+            adapter_name=ADAPTER_NAME,
+            optim_step=optim_step,
+            pending=remaining,
+            config=resume_config,
+        )
+        logger.info(f'Saved complete RL checkpoint: {path}')
+
     logger.info(get_device_placement())
+    batches = iter(dataloader)
 
-    for batch in dataloader:
-        if optim_step >= MAX_STEPS:
-            break
-        metrics.reset()
-        global_prompts = batch if isinstance(batch, list) else [batch]
-        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
-        # meaning only sync lora weights, if merge_and_sync=True,
-        # lora will be merged into the base model and sync all weights to vLLM
-        ckpt_manager.sync_weights(merge_and_sync=False)
-        sampler.reset_prefix_cache()
-        expand_prompts = []
-        for prompt in global_prompts:
-            expand_prompts.extend([prompt] * NUM_GENERATIONS)
-        sample_responses = sampler.sample(
-            expand_prompts,
-            sampling_params,
-        )
+    while optim_step < MAX_STEPS:
+        if pending is None:
+            try:
+                batch = next(batches)
+            except StopIteration:
+                break
+            metrics.reset()
+            global_prompts = batch if isinstance(batch, list) else [batch]
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
+            ckpt_manager.sync_weights(merge_and_sync=False)
+            sampler.reset_prefix_cache()
+            # The driver Python RNG is saved in the RL checkpoint.
+            rollout_seed = random.getrandbits(63)
+            rollout_params = SamplingParams(
+                max_tokens=MAX_NEW_TOKENS,
+                num_samples=NUM_GENERATIONS,
+                logprobs=1,
+                seed=rollout_seed,
+            )
+            sample_responses = sampler.sample(
+                global_prompts,
+                rollout_params,
+            )
 
-        all_input_data: List[Dict[str, Any]] = []
-        all_old_logps: List[List[float]] = []
-        all_completion_lengths: List[int] = []
+            all_input_data: List[Dict[str, Any]] = []
+            all_old_logps: List[List[float]] = []
+            all_completion_lengths: List[int] = []
 
-        for sample_response in sample_responses:
-            for sequence in sample_response.sequences:
-                all_input_data.append(sequence.new_input_feature)
-                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
-                all_completion_lengths.append(len(sequence.tokens))
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
-            all_input_data
-        )
-        metrics.accumulate(
-            completion_lengths=all_completion_lengths,
-            rewards={
-                'total': total_rewards,
-                'format': format_rewards,
-                'accuracy': accuracy_rewards,
-            },
-        )
+            for sample_response in sample_responses:
+                for sequence in sample_response.sequences:
+                    all_input_data.append(sequence.new_input_feature)
+                    all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                    all_completion_lengths.append(len(sequence.tokens))
+            total_rewards, format_rewards, accuracy_rewards = compute_rewards(
+                all_input_data
+            )
+            metrics.accumulate(
+                completion_lengths=all_completion_lengths,
+                rewards={
+                    'total': total_rewards,
+                    'format': format_rewards,
+                    'accuracy': accuracy_rewards,
+                },
+            )
 
-        advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+            advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
 
-        # Split completions into mini-batches and run one optim step per mini-batch.
+            pending = {
+                'inputs': all_input_data,
+                'old_logps': all_old_logps,
+                'advantages': advantages,
+                'metrics': metrics.calculate(),
+            }
+
+        all_input_data = pending['inputs']
+        all_old_logps = pending['old_logps']
+        advantages = pending['advantages']
+
         total_completions = len(all_input_data)
         for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
             mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
@@ -188,21 +256,40 @@ def main():
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
                 micro_batch_size=MICRO_BATCH_SIZE,
+                adapter_name=ADAPTER_NAME,
             )
-            model.clip_grad_and_step()
+            model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
             optim_step += 1
 
-            if optim_step >= MAX_STEPS:
-                break
-            if optim_step % SAVE_STEPS == 0:
-                model.save(f'grpo-gsm8k-checkpoint-{optim_step}')
-            log_dict = metrics.calculate()
-            log_dict.update(model.calculate_metric(is_training=True))
-            metrics.reset()
+            remaining = None if mb_end == total_completions else {
+                'inputs': all_input_data[mb_end:],
+                'old_logps': all_old_logps[mb_end:],
+                'advantages': advantages[mb_end:],
+                'metrics': pending['metrics'],
+            }
+
+            log_dict = dict(pending['metrics'])
+            log_dict.update(model.calculate_metric(
+                is_training=True, adapter_name=ADAPTER_NAME,
+            ))
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
+            if optim_step % SAVE_STEPS == 0:
+                save_checkpoint(
+                    f'grpo-gsm8k-checkpoint-{optim_step}', remaining,
+                )
+
+            if optim_step >= MAX_STEPS:
+                pending = remaining
+                break
+        else:
+            pending = None
+
     logger.info(f'Training completed. optim_steps={optim_step}')
-    model.save('grpo-gsm8k-checkpoint')
+    save_checkpoint(
+        f'grpo-gsm8k-checkpoint-{optim_step}-final', pending,
+    )
+
 
 if __name__ == '__main__':
     main()

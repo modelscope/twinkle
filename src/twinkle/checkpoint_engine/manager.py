@@ -88,9 +88,9 @@ class CheckpointEngineManager:
             merge_and_sync (bool, optional): Whether to merge and sync the weights.
                 - If True: LoRA weights are merged into the base model, then the
                 combined weights are synchronized to the sampler on every call.
-                - If False: On the first call, base model weights are synced to the
-                sampler. On subsequent calls, only the LoRA adapter weights are
-                synced incrementally.
+                - If False: On the first call, base model weights and the current
+                LoRA adapter are synced to the sampler in separate phases.
+                Subsequent calls sync only the LoRA adapter weights.
                 Defaults to True.
 
         Returns:
@@ -113,7 +113,7 @@ class CheckpointEngineManager:
         sampler_init()  # wait for sampler init to complete
 
         peft_config = None
-        if self.base_sync_done and not merge_and_sync:
+        if not merge_and_sync:
             if self._peft_config is None:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
@@ -150,11 +150,25 @@ class CheckpointEngineManager:
             expanded = _expand_keys(expanded)
             self._model_keys = list(expanded)
 
-        model_result = self.model.send_weights(
-            base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
-        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
-        model_result()
-        sampler_result()
+        sync_phases = [self.base_sync_done]
+        if not self.base_sync_done and not merge_and_sync and peft_config:
+            # A fresh sampler needs both base weights and the current adapter,
+            # including when the training model was restored from a checkpoint.
+            sync_phases.append(True)
+
+        for base_sync_done in sync_phases:
+            phase_peft_config = peft_config if base_sync_done else None
+            model_result = self.model.send_weights(
+                base_sync_done=base_sync_done,
+                merge_and_sync=merge_and_sync,
+                model_keys=self._model_keys,
+            )
+            sampler_result = self.sampler.receive_weights(
+                base_sync_done=base_sync_done,
+                peft_config=phase_peft_config,
+            )
+            model_result()
+            sampler_result()
 
         self.model.finalize_checkpoint_engine()
         self.sampler.finalize_checkpoint_engine()

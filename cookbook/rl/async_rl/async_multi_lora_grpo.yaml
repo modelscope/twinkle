@@ -14,6 +14,8 @@ runtime:
   rollout_retry_delay_s: 0.5
   keep_adapter_versions: 2
   output_dir: output/async_multi_lora_grpo
+  # Set to the run output directory to resume the latest complete per-LoRA checkpoint.
+  resume_from_checkpoint: null
 
 metrics:
   enabled: true

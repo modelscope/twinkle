@@ -359,6 +359,7 @@ class TrainerWorker(_Worker):
                  train_batch_configs: dict[str, Any] | None = None,
                  keep_adapter_versions: int = 0,
                  initial_adapter_paths: dict[str, str] | None = None,
+                 initial_optimizer_steps: dict[str, int] | None = None,
                  remove_adapter: Callable[[str], None] | None = None,
                  evaluation_config: dict[str, dict[str, Any]] | None = None,
                  evaluate_batch: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any], dict[str, Any]]
@@ -391,6 +392,8 @@ class TrainerWorker(_Worker):
         self.evaluation_rewards = dict(evaluation_rewards or {})
         self._evaluation_batches: dict[str, list[Sequence[dict[str, Any]]]] = {}
         self._optimizer_steps: dict[str, int] = defaultdict(int)
+        for context_key, step in (initial_optimizer_steps or {}).items():
+            self._optimizer_steps[context_key] = int(step)
         self.persistent = persistent
 
     async def register_context(

@@ -462,14 +462,27 @@ class TwinkleWorkerExtension:
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 
             converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}
+            request_kwargs = {}
+            supports_inplace = 'load_inplace' in getattr(
+                TensorLoRARequest,
+                '__struct_fields__',
+                (),
+            )
+            if supports_inplace:
+                request_kwargs['load_inplace'] = True
+
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
                 lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=converted,
-                load_inplace=True,
+                **request_kwargs,
             )
+            if not supports_inplace:
+                # Older vLLM versions reuse cached adapters with the same ID.
+                # Synchronous rollout updates run without sampling in flight.
+                self.remove_lora(VLLM_LORA_INT_ID)
             self.add_lora(lora_request)
         else:
             # Base model mode — weights arrive in canonical HF format

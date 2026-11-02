@@ -1423,16 +1423,26 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
 
     def _save_training_state(self, output_dir, **kwargs):
+        # Each rank may reach training-state saving before the master.
+        os.makedirs(output_dir, exist_ok=True)
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
 
         optimizer_config = self.optimizer_group[adapter_name]
+
+        # Each distributed rank owns a distinct RNG stream.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        torch.save(
+            self._get_training_rng_state(),
+            os.path.join(output_dir, f'rng_state_rank_{rank}.pt'),
+        )
 
         if not Platform.is_master():
             return
 
         trainer_state = {
             'checkpoint_version': 1,
+            'rng_state_format': 'per_rank',
             'cur_step': optimizer_config.cur_step,
             'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
             'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
@@ -1448,8 +1458,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 },
                 os.path.join(output_dir, 'scaler.pt'),
             )
-
-        torch.save(self._get_training_rng_state(), os.path.join(output_dir, 'rng_state.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -1619,13 +1627,23 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        rank_rng_path = os.path.join(checkpoint_dir, f'rng_state_rank_{rank}.pt')
+        if trainer_state.get('rng_state_format') == 'per_rank':
+            if not os.path.isfile(rank_rng_path):
+                raise FileNotFoundError(f'Checkpoint is missing RNG state for rank {rank}: {rank_rng_path}')
+
         adapter_name = adapter_name or self._get_default_group()
         optimizer_config = self.optimizer_group[adapter_name]
         self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
         scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
         if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
             self._load_scaler_state(scaler_path, adapter_name=adapter_name)
-        rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        rng_path = os.path.join(checkpoint_dir, f'rng_state_rank_{rank}.pt')
+        if not os.path.exists(rng_path):
+            # Compatibility with legacy checkpoints containing one RNG file.
+            rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
         if os.path.exists(rng_path):
             self._load_rng_state(rng_path)
         optimizer_config.cur_step = trainer_state['cur_step']

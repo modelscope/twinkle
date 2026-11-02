@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import glob
+import json
+import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -156,6 +159,8 @@ class AsyncMultiLoraGRPOPipeline:
         evaluation_config: dict[str, dict[str, Any]] = {}
         evaluation_rewards: dict[str, Any] = {}
         initial_paths: dict[str, str] = {}
+        resume_samples: dict[str, int] = {}
+        resume_steps: dict[str, int] = {}
         global_evaluation = dict(raw_config.get('evaluation') or {})
         for item in raw_config['lora_contexts']:
             train = item['train']
@@ -221,14 +226,6 @@ class AsyncMultiLoraGRPOPipeline:
                 sampler_dp=sampler_dp,
                 model_dp=model_data_parallel_size,
             )
-            prompt_sources[context.key] = partial(
-                _prompt_batches,
-                item['dataset'],
-                model_id=runtime['model_id'],
-                batch_size=rollout_batch_size,
-                template_cls=template_cls,
-                enable_thinking=enable_thinking,
-            )
             rollout_config[context.key] = {
                 'context':
                 context,
@@ -289,13 +286,50 @@ class AsyncMultiLoraGRPOPipeline:
                     eval_dataset.get('reward'),
                     context_key=f'{context.key} evaluation',
                 )
-            initial_paths[context.key] = _collect_adapter_path(
-                model.save(
-                    f'async-{context.adapter_name}-initial',
-                    output_dir=runtime['output_dir'],
-                    adapter_name=context.adapter_name,
-                ),
-                operation=f'initial adapter save for {context.key}',
+            resume_root = runtime.get('resume_from_checkpoint')
+            checkpoint = (_find_latest_async_checkpoint(resume_root, context.adapter_name)
+                          if resume_root else None)
+            if resume_root and checkpoint is None:
+                raise FileNotFoundError(
+                    f'no complete async-RL checkpoint found for {context.key} under {resume_root}; '
+                    'refusing to silently start a fresh run')
+            if checkpoint is not None:
+                restored = model.resume_from_checkpoint(checkpoint, adapter_name=context.adapter_name)
+                if callable(restored) and getattr(restored, '_is_lazy_collect', False):
+                    restored = restored()
+                if not isinstance(restored, dict) or 'consumed_train_samples' not in restored:
+                    raise RuntimeError(f'invalid async-RL checkpoint state for {context.key}: {restored!r}')
+                consumed = int(restored['consumed_train_samples'])
+                if consumed < 0 or consumed % rollout_batch_size:
+                    raise ValueError(
+                        f'checkpoint consumed_train_samples={consumed} is not divisible by '
+                        f'rollout batch_size={rollout_batch_size} for {context.key}')
+                resume_samples[context.key] = consumed
+                resume_steps[context.key] = consumed // rollout_batch_size
+                if int(restored.get('cur_step', -1)) != resume_steps[context.key]:
+                    raise ValueError(
+                        f"checkpoint optimizer step {restored.get('cur_step')} does not match "
+                        f"consumed-data progress {resume_steps[context.key]} for {context.key}")
+                initial_paths[context.key] = checkpoint
+            else:
+                resume_samples[context.key] = 0
+                resume_steps[context.key] = 0
+                initial_paths[context.key] = _collect_adapter_path(
+                    model.save(
+                        f'async-{context.adapter_name}-initial',
+                        output_dir=runtime['output_dir'],
+                        adapter_name=context.adapter_name,
+                    ),
+                    operation=f'initial adapter save for {context.key}',
+                )
+            prompt_sources[context.key] = partial(
+                _prompt_batches,
+                item['dataset'],
+                consumed_train_samples=resume_samples[context.key],
+                model_id=runtime['model_id'],
+                batch_size=rollout_batch_size,
+                template_cls=template_cls,
+                enable_thinking=enable_thinking,
             )
 
         manager = create_cpu_actor(
@@ -304,7 +338,10 @@ class AsyncMultiLoraGRPOPipeline:
             max_steps=runtime['max_steps'],
         )
         for context in contexts:
-            ray.get(manager.register_context.remote(context, adapter_path=initial_paths[context.key]))
+            ray.get(manager.register_context.remote(
+                context, adapter_path=initial_paths[context.key],
+                policy_version=resume_steps[context.key], next_step=resume_steps[context.key],
+                completed_partitions=resume_steps[context.key]))
 
         from .vllm_sampler_tq import VLLMSamplerTQ
         sampler_engine_args = {
@@ -383,6 +420,7 @@ class AsyncMultiLoraGRPOPipeline:
             scheduler=_scheduler(raw_config['scheduler']['train']),
             keep_adapter_versions=runtime['keep_adapter_versions'],
             initial_adapter_paths=initial_paths,
+            initial_optimizer_steps=resume_steps,
             remove_adapter=partial(_remove_adapter_snapshot, sampler),
             evaluation_config=evaluation_config,
             evaluate_batch=partial(_evaluate_batch, sampler, evaluation_rewards) if evaluation_config else None,
@@ -489,6 +527,59 @@ def _scheduler(config: dict[str, Any]) -> SchedulerConfig:
     return SchedulerConfig(ContextSchedulePolicy(config['policy']), config.get('max_consecutive_units'))
 
 
+def _find_latest_async_checkpoint(checkpoint_root: str, adapter_name: str) -> str | None:
+    """Find the newest fully committed and resumable async-RL checkpoint."""
+    candidates = glob.glob(os.path.join(checkpoint_root, f'async-{adapter_name}-v*'))
+    complete = []
+
+    for checkpoint_dir in candidates:
+        marker_path = os.path.join(checkpoint_dir, 'async_checkpoint_complete.json')
+        state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+
+        try:
+            with open(marker_path, encoding='utf-8') as stream:
+                marker = json.load(stream)
+            with open(state_path, encoding='utf-8') as stream:
+                state = json.load(stream)
+
+            step = int(state['cur_step'])
+            consumed = int(state['consumed_train_samples'])
+
+            if marker.get('status') != 'complete':
+                continue
+            if int(marker['cur_step']) != step:
+                continue
+            if int(marker['consumed_train_samples']) != consumed:
+                continue
+            if step < 0 or consumed < 0:
+                continue
+
+            required_files = (
+                'adapter_model.safetensors',
+                'optimizer.pt',
+                'trainer_state.json',
+            )
+            if not all(
+                os.path.isfile(os.path.join(checkpoint_dir, name))
+                for name in required_files
+            ):
+                continue
+
+            rng_files = glob.glob(
+                os.path.join(checkpoint_dir, 'rng_state_rank_*.pt')
+            )
+            if not rng_files:
+                continue
+
+            complete.append((step, os.path.getmtime(marker_path), checkpoint_dir))
+
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+
+    return max(complete)[2] if complete else None
+
+
+
 def _prompt_batches(
     dataset_config: dict[str, Any],
     *,
@@ -497,6 +588,7 @@ def _prompt_batches(
     template_cls: str,
     enable_thinking: bool,
     full_batches_only: bool = True,
+    consumed_train_samples: int = 0,
 ):
     """Create a lazy, full-batch-only prompt source for one context."""
     from twinkle.dataloader import DataLoader
@@ -531,8 +623,10 @@ def _prompt_batches(
             batch_size=batch_size,
             min_batch_size=batch_size if full_batches_only else 1,
         )
+        if consumed_train_samples:
+            loader.skip_consumed_samples(int(consumed_train_samples))
         remaining = data_num
-        remaining = None if remaining is None else int(remaining)
+        remaining = None if remaining is None else max(int(remaining) - int(consumed_train_samples), 0)
         for batch in loader:
             if full_batches_only and (len(batch) != batch_size or (remaining is not None and remaining < batch_size)):
                 return
@@ -672,14 +766,74 @@ def _train_batch_with_config(
 
 
 def _save_adapter(model: Any, output_dir: str, admission: PartitionAdmission) -> str:
-    return _collect_adapter_path(
+    """Save a complete training checkpoint before marking it resumable."""
+    checkpoint_name = f'async-{admission.context.adapter_name}-v{admission.step + 1}'
+    consumed_samples = (admission.step + 1) * admission.target_groups
+
+    checkpoint_path = _collect_adapter_path(
         model.save(
-            f'async-{admission.context.adapter_name}-v{admission.step + 1}',
+            checkpoint_name,
             output_dir=output_dir,
             adapter_name=admission.context.adapter_name,
+            save_optimizer=True,
+            consumed_train_samples=consumed_samples,
         ),
-        operation=f'adapter save for {admission.partition_id}',
+        operation=f'checkpoint save for {admission.partition_id}',
     )
+
+    required_files = (
+        'adapter_model.safetensors',
+        'optimizer.pt',
+        'trainer_state.json',
+    )
+    missing = [
+        name for name in required_files
+        if not os.path.isfile(os.path.join(checkpoint_path, name))
+    ]
+    if missing:
+        raise RuntimeError(
+            f'Incomplete async checkpoint {checkpoint_path}; missing files: {missing}'
+        )
+
+    rng_files = glob.glob(
+        os.path.join(checkpoint_path, 'rng_state_rank_*.pt')
+    )
+    if not rng_files:
+        raise RuntimeError(
+            f'Incomplete async checkpoint {checkpoint_path}; missing per-rank RNG state'
+        )
+
+    with open(os.path.join(checkpoint_path, 'trainer_state.json'), encoding='utf-8') as stream:
+        state = json.load(stream)
+
+    if int(state['consumed_train_samples']) != consumed_samples:
+        raise RuntimeError(
+            f'Checkpoint data cursor mismatch: expected {consumed_samples}, '
+            f'got {state["consumed_train_samples"]}'
+        )
+
+    marker = {
+        'status': 'complete',
+        'checkpoint_version': 1,
+        'adapter_name': admission.context.adapter_name,
+        'partition_id': admission.partition_id,
+        'cur_step': int(state['cur_step']),
+        'consumed_train_samples': consumed_samples,
+        'rng_state_files': sorted(os.path.basename(name) for name in rng_files),
+    }
+
+    marker_path = os.path.join(checkpoint_path, 'async_checkpoint_complete.json')
+    temporary_path = marker_path + '.tmp'
+
+    with open(temporary_path, 'w', encoding='utf-8') as stream:
+        json.dump(marker, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    os.replace(temporary_path, marker_path)
+
+    return checkpoint_path
+
 
 
 def _collect_adapter_path(value: Any, *, operation: str) -> str:
