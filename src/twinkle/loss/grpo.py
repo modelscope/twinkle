@@ -117,10 +117,6 @@ class GRPOLoss(Loss):
         self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
         self.require_logits = self._distill_wrap
 
-    @property
-    def requires_full_batch(self):
-        return self.top_entropy_quantile < 1.0
-
     def micro_batch_scale(self, inputs, indices):
         return len(indices) / len(inputs)
 
@@ -637,6 +633,7 @@ class GRPOLoss(Loss):
                 channel_loss['entropy'] = torch.stack(
                     ((entropies * alignment_mask).sum().detach().float(), count))
             if self.top_entropy_quantile < 1.0 and alignment_mask.any():
+                # The entropy threshold is local to the current micro-batch.
                 threshold = torch.quantile(
                     entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
                 entropy_mask = entropies.ge(threshold)

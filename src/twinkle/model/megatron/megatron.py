@@ -509,9 +509,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             variable_seq_lengths=self.variable_seq_lengths,
             attention_mask_type=attention_mask_type,
         )
-        if compute_loss:
-            loss_instance.validate_micro_batching(len(inputs))
-
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
         # MoE routing replay orchestration of this call (a null object when disabled or mode-less);

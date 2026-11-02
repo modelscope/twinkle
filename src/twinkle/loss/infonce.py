@@ -169,6 +169,8 @@ class InfonceLoss(EmbeddingLoss):
     such group. Setting ``use_batch=True`` enables in-batch negatives and,
     when distributed is initialized, gathers embeddings from all DP ranks
     (only the local shard keeps gradients).
+    The negative pool covers the current micro-batch and its DP peers, not other
+    micro-batches in the gradient-accumulation window.
 
     Args:
         temperature: Logit scaling factor.
@@ -214,10 +216,6 @@ class InfonceLoss(EmbeddingLoss):
         self.include_qq = include_qq
         self.include_dd = include_dd
         self.process_group = process_group
-
-    @property
-    def requires_full_batch(self):
-        return self.use_batch
 
     def _gather_across_dp(self, sentences: torch.Tensor, labels: torch.Tensor):
         """All-gather embeddings & labels across DP ranks; only local shard keeps grad.
@@ -458,6 +456,7 @@ class OnlineContrastiveLoss(EmbeddingLoss):
     dropping them concentrates the gradient on the decision boundary. The single-element
     fallbacks (``negs.mean()`` / ``poss.mean()``) mirror legacy: with fewer than two pairs on a
     side there is no counterpart to compare against.
+    Hard-pair selection is performed independently within each micro-batch.
 
     Args:
         margin: Hinge for the selected negative pairs.
@@ -468,7 +467,6 @@ class OnlineContrastiveLoss(EmbeddingLoss):
     require_logits = True
     require_entropy = False
     require_logps = False
-    requires_full_batch = True
 
     def __init__(self, margin: float = 0.5, distance_metric='cosine', mrl_dims=None, **kwargs):
         super().__init__(mrl_dims=mrl_dims)
