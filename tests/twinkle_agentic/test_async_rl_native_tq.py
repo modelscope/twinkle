@@ -14,6 +14,8 @@ from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.native_tq import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (
     _collect_adapter_path,
+    _find_latest_async_checkpoint,
+    _save_adapter,
     _require_adapter_path,
     _train_batch,
     create_cpu_actor,
@@ -39,6 +41,118 @@ class LocalActorHandle:
                 return await result if inspect.isawaitable(result) else result
 
         return RemoteMethod()
+
+
+
+def test_context_manager_restores_completed_async_progress():
+    context = LoraContext('tenant', 'resume_run', 'model', 'adapter')
+    manager = LoraContextManager(max_staleness=1)
+    manager.register_context(
+        context,
+        adapter_path='/checkpoints/adapter-v3',
+        policy_version=3,
+        next_step=3,
+        completed_partitions=3,
+    )
+
+    snapshot = manager.context_snapshot(context)
+    assert snapshot['policy_version'] == 3
+    assert snapshot['next_step'] == 3
+    assert snapshot['completed_partitions'] == 3
+    admission = manager.request_rollout_partition(context, target_groups=2, num_generations=2)
+    assert admission is not None
+    assert admission.step == 3
+
+
+def test_async_checkpoint_discovery_ignores_adapter_only_snapshots(tmp_path):
+    import json
+
+    adapter_only = tmp_path / 'async-adapter-v4'
+    adapter_only.mkdir()
+
+    def create_complete_checkpoint(name, step, consumed):
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+
+        for filename in (
+            'adapter_model.safetensors',
+            'optimizer.pt',
+            'rng_state_rank_0.pt',
+        ):
+            (checkpoint / filename).touch()
+
+        state = {
+            'cur_step': step,
+            'consumed_train_samples': consumed,
+        }
+        (checkpoint / 'trainer_state.json').write_text(json.dumps(state))
+
+        marker = {
+            'status': 'complete',
+            'cur_step': step,
+            'consumed_train_samples': consumed,
+        }
+        (checkpoint / 'async_checkpoint_complete.json').write_text(
+            json.dumps(marker)
+        )
+        return checkpoint
+
+    create_complete_checkpoint('async-adapter-v2', 2, 32)
+    latest = create_complete_checkpoint('async-adapter-v3', 3, 48)
+
+    assert _find_latest_async_checkpoint(str(tmp_path), 'adapter') == str(latest)
+
+
+
+def test_async_adapter_checkpoint_saves_optimizer_and_consumed_cursor(tmp_path):
+    import json
+
+    context = LoraContext('tenant', 'run', 'model', 'adapter')
+    admission = PartitionAdmission(context, context.partition_id(4), 4, 8, 2, 0)
+
+    class Model:
+        def __init__(self):
+            self.kwargs = None
+
+        def save(self, name, **kwargs):
+            self.kwargs = (name, kwargs)
+            checkpoint = tmp_path / name
+            checkpoint.mkdir(parents=True)
+
+            for filename in (
+                'adapter_model.safetensors',
+                'optimizer.pt',
+                'rng_state_rank_0.pt',
+            ):
+                (checkpoint / filename).touch()
+
+            state = {
+                'cur_step': 5,
+                'consumed_train_samples': kwargs['consumed_train_samples'],
+            }
+            (checkpoint / 'trainer_state.json').write_text(json.dumps(state))
+            return str(checkpoint)
+
+    model = Model()
+    result = _save_adapter(model, str(tmp_path), admission)
+
+    assert result == str(tmp_path / 'async-adapter-v5')
+    assert model.kwargs[0] == 'async-adapter-v5'
+    assert model.kwargs[1]['save_optimizer'] is True
+    assert model.kwargs[1]['consumed_train_samples'] == 40
+
+    checkpoint = tmp_path / 'async-adapter-v5'
+    assert (checkpoint / 'async_checkpoint_complete.json').is_file()
+    assert (checkpoint / 'trainer_state.json').is_file()
+    assert (checkpoint / 'optimizer.pt').is_file()
+    assert (checkpoint / 'rng_state_rank_0.pt').is_file()
+
+    marker = json.loads(
+        (checkpoint / 'async_checkpoint_complete.json').read_text()
+    )
+    assert marker['status'] == 'complete'
+    assert marker['cur_step'] == 5
+    assert marker['consumed_train_samples'] == 40
 
 
 def test_cpu_service_actor_uses_twinkle_ray_mode(monkeypatch):

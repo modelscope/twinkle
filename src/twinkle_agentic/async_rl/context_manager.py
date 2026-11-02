@@ -54,15 +54,21 @@ class LoraContextManager:
                          adapter_path: str | None = None,
                          policy_version: int = 0,
                          max_steps: int | None = None,
-                         status: ContextStatus = ContextStatus.ACTIVE) -> None:
+                         status: ContextStatus = ContextStatus.ACTIVE,
+                         next_step: int = 0,
+                         completed_partitions: int = 0) -> None:
         if context.key in self._contexts:
             return
         if max_steps is not None and max_steps < 0:
             raise ValueError('max_steps must be non-negative')
+        if next_step < 0 or completed_partitions < 0:
+            raise ValueError('next_step and completed_partitions must be non-negative')
         self._contexts[context.key] = _ContextState(
             context=context,
             policy=RolloutPolicy(context.key, context.adapter_name, int(policy_version), adapter_path),
             policy_history=[RolloutPolicy(context.key, context.adapter_name, int(policy_version), adapter_path)],
+            next_step=int(next_step),
+            completed_partitions=int(completed_partitions),
             status=status,
             max_steps=max_steps,
         )
