@@ -4,7 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import replace
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,14 +16,25 @@ import pytest
 from twinkle.data_format import SamplingParams
 
 from .validation import (
+    _EVALUATION_TASKS,
     ValidationConfig,
+    _CancelRecorder,
+    _cancel_tool_manager,
+    _code_task,
     _evaluate,
+    _load_recipe,
+    _timed_tool_manager,
+    _Timeline,
+    _wait_for_stage,
     cancel_evidence_gate,
     learning_gate,
+    parameters_changed,
     pipeline_evidence_gate,
     result_payload,
     run_cancel_validation,
     run_validation,
+    slow_tool_isolated,
+    training_overlaps_rollout,
     write_result,
 )
 
@@ -70,7 +85,8 @@ def _pipeline_evidence():
         'distinct_snapshots': True,
         'new_policy_requests': True,
         'sync_async_equivalent': True,
-        'independent_episodes': True,
+        'slow_tool_isolated': True,
+        'training_overlap': True,
         'environment_isolation': True,
         'cleanup_confirmed': True,
     }
@@ -128,23 +144,275 @@ def test_cli_template_is_set_before_recipe_import(tmp_path, monkeypatch):
     assert seen == [config.agentenv_template, config.agentenv_template]
 
 
-def test_evaluation_uses_held_out_tasks_and_distinct_group_seeds(tmp_path):
+def test_evaluation_binds_held_out_tasks_and_distinct_attempt_seeds(tmp_path):
     config = _config(tmp_path)
-    seen = []
+    created = []
+    seeds = []
+
+    @dataclass(frozen=True)
+    class CodeTask:
+        filename: str
+        function: str
+        solution: str
+        smoke_test: str
+        prompt: str
+        hidden_cases: tuple
 
     class Recipe:
-        _create_attempt = None
+        NUM_GENERATIONS = 4
+        ADAPTER_NAME = 'adapter'
 
         @staticmethod
-        async def _rollout_group(rollout, policy_uri, environments, stop_event, sampling_params=None):
-            seen.append(sampling_params.seed)
-            return [], [0.0, 1.0, 0.0, 0.0]
+        def _ensure_running(stop_event):
+            return None
 
-    rollout = SimpleNamespace(sampling_params=SamplingParams())
-    _, evaluations = asyncio.run(_evaluate(Recipe(), rollout, 'policy-0', [], asyncio.Event(), config))
-    assert len(seen) == len(set(seen)) == 4
+        @staticmethod
+        async def _await_operation(operation, *args, stop_event, on_result=None, **kwargs):
+            result = operation(*args, **kwargs)
+            if on_result is not None:
+                on_result(result)
+            return result
+
+        @staticmethod
+        def _create_attempt(task, on_created):
+            created.append(task)
+            env = SimpleNamespace(verify=lambda: 1.0)
+            on_created(env)
+            return SimpleNamespace(env=env, manager=object(), trajectory={'messages': []})
+
+        @staticmethod
+        def _validate_training_rows(rows):
+            assert len(rows) == 4
+
+    class Rollout:
+        sampling_params = SamplingParams()
+
+        async def acall(self, trajectories, *, sampling_params, **kwargs):
+            assert len(trajectories) == 1
+            seeds.append(sampling_params.seed)
+            return [{}]
+
+    Recipe.CodeTask = CodeTask
+    rewards, evaluations = asyncio.run(_evaluate(Recipe(), Rollout(), 'policy-0', [], asyncio.Event(), config))
+    assert len(rewards) == 16
+    assert len(seeds) == len(set(seeds)) == 16
+    assert {task.filename for task in created} == {'count_even.py', 'last_negative.py'}
+    assert all(task.function == task.filename[:-3] for task in created)
     assert {item['task_id'] for item in evaluations} == {'count-even', 'last-negative'}
-    assert all(item['task_id'] != 'smallest-positive' for item in evaluations)
+
+
+_CORRECT_SOLUTIONS = {
+    'count-even': 'def count_even(values):\n    return sum(value % 2 == 0 for value in values)\n',
+    'last-negative': ('def last_negative(values):\n    negatives = [value for value in values if value < 0]\n'
+                      '    return negatives[-1] if negatives else None\n'),
+}
+
+
+def _verify_locally(recipe, task, source, tmp_path):
+    env = object.__new__(recipe._TaskAgentEnv)
+    env.task = task
+    env._workspace = '/workspace'
+    uploads = {}
+    env._sandbox = SimpleNamespace(
+        sandbox_id='sandbox-eval', files=SimpleNamespace(write=uploads.__setitem__), set_timeout=lambda timeout: None)
+    env._task_infrastructure_error = None
+    env._execution_lock = threading.RLock()
+    env._active_commands = 0
+    env._uncertain_execution = None
+    env._command_timeout = 30
+    env._refresh_timeout = False
+    (tmp_path / task.filename).write_text(source, encoding='utf-8')
+
+    def execute(command, cwd, timeout):
+        script = tmp_path / 'verify.py'
+        script.write_text(uploads.popitem()[1], encoding='utf-8')
+        result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True)
+        return result.returncode, result.stdout + result.stderr
+
+    env._execute = execute
+    return env.verify()
+
+
+@pytest.mark.parametrize('item', _EVALUATION_TASKS, ids=[item['id'] for item in _EVALUATION_TASKS])
+def test_held_out_verifier_scores_its_own_file_function_and_cases(item, tmp_path):
+    recipe = _load_recipe()
+    task = _code_task(recipe, item)
+    assert task.filename != recipe.TASK.filename
+    assert _verify_locally(recipe, task, _CORRECT_SOLUTIONS[item['id']], tmp_path) == 1.0
+    assert _verify_locally(recipe, task, task.solution, tmp_path) < 1.0
+
+
+def test_parameter_change_requires_aligned_finite_probe_shift():
+    assert parameters_changed([-1.0, -2.0], [-1.0, -2.1])
+    assert not parameters_changed([-1.0, -2.0], [-1.0, -2.0])
+    assert not parameters_changed([], [])
+    assert not parameters_changed(None, [-1.0])
+    assert not parameters_changed([-1.0], [-1.0, -2.0])
+    assert not parameters_changed([-1.0], [float('nan')])
+
+
+def test_timeline_evidence_requires_peer_progress_and_training_overlap():
+    slow = {'kind': 'tool', 'start': 1.0, 'end': 5.0, 'slow': True}
+    inside = {'kind': 'sample', 'start': 2.0, 'end': 3.0}
+    straddling = {'kind': 'sample', 'start': 4.0, 'end': 6.0}
+    assert slow_tool_isolated([slow, inside])
+    assert not slow_tool_isolated([slow, straddling])
+    assert not slow_tool_isolated([dict(slow, slow=False), inside])
+
+    train = {'kind': 'train', 'start': 10.0, 'end': 12.0}
+    assert training_overlaps_rollout([train, {'kind': 'tool', 'start': 11.0, 'end': 13.0}])
+    assert not training_overlaps_rollout([train, {'kind': 'sample', 'start': 12.0, 'end': 13.0}])
+
+
+def test_timed_tool_manager_slows_only_the_first_batch():
+    class Base:
+        def call_many(self, tool_calls):
+            return ['ok'] * len(tool_calls)
+
+    timeline = _Timeline()
+    manager = _timed_tool_manager(Base, timeline, 0.05)()
+    assert manager.call_many([{}]) == ['ok']
+    assert manager.call_many([{}, {}]) == ['ok', 'ok']
+    assert [span['slow'] for span in timeline.spans] == [True, False]
+    assert timeline.spans[0]['end'] - timeline.spans[0]['start'] >= 0.05
+
+
+def test_cancel_tool_stage_ignores_setup_writes_and_counts_batches_after_cancel():
+    class Env:
+        steps = 0
+
+        def step(self, tool_name, arguments=None):
+            type(self).steps += 1
+
+    class Base:
+        def call_many(self, tool_calls):
+            return ['ok'] * len(tool_calls)
+
+    recorder = _CancelRecorder('tool')
+    recorder.release.set()
+    manager = _cancel_tool_manager(Base, recorder)()
+    Env().step('write_file', {'path': 'solution.py'})
+    assert recorder.operations == []
+    manager.call_many([{}, {}])
+    assert recorder.started.is_set()
+    recorder.mark_cancelled()
+    manager.call_many([{}])
+    assert recorder.operations == ['tool', 'tool']
+    assert recorder.post_cancel_operations == ['tool']
+
+
+def test_wait_for_stage_returns_without_helper_threads():
+    recorder = _CancelRecorder('backward')
+
+    async def finished_early():
+        return None
+
+    async def never_reaches_stage():
+        await asyncio.sleep(10)
+
+    async def run():
+        early = asyncio.create_task(finished_early())
+        await asyncio.sleep(0)
+        assert not await _wait_for_stage(recorder, early, timeout=5)
+        slow = asyncio.create_task(never_reaches_stage())
+        started = time.monotonic()
+        assert not await _wait_for_stage(recorder, slow, timeout=0.2)
+        assert time.monotonic() - started < 2
+        slow.cancel()
+
+    threads = threading.active_count()
+    asyncio.run(run())
+    assert threading.active_count() <= threads
+
+
+@pytest.mark.parametrize('stage', ['sample', 'tool', 'verify', 'backward', 'step', 'save', 'unreached'])
+def test_cancel_runner_drains_real_recipe_call_sites_without_a_provider(stage, tmp_path, monkeypatch):
+    from . import validation
+
+    recipe = _load_recipe()
+    created = []
+
+    class Env:
+        def __init__(self, task, **kwargs):
+            self.task = task
+            self.sandbox_id = f'fake-{len(created)}'
+            self.reward = len(created) % 2 if stage != 'unreached' else 0.0
+            self.closed = False
+            created.append(self)
+
+        def reset(self):
+            return None
+
+        def step(self, *args, **kwargs):
+            return SimpleNamespace(info={})
+
+        def verify(self):
+            return float(self.reward)
+
+        def ensure_idle(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class Manager:
+        def __init__(self, tools):
+            self.env = tools[0].env
+
+        def tool_infos(self):
+            return []
+
+        def call_many(self, calls):
+            for _ in calls:
+                self.env.step('write_file', {'path': 'solution.py'})
+            return ['ok'] * len(calls)
+
+    class Model:
+        def forward_backward(self, **kwargs):
+            return None
+
+        def clip_grad_and_step(self, **kwargs):
+            return None
+
+        def calculate_metric(self, **kwargs):
+            return {'result': {}}
+
+        def save(self, name, **kwargs):
+            return SimpleNamespace(twinkle_path=f'twinkle://{name}')
+
+    sampler = SimpleNamespace(sample=lambda: None)
+    client = SimpleNamespace(closed=False)
+    client.close = lambda: setattr(client, 'closed', True)
+
+    class Rollout:
+        async def acall(self, trajectories, tool_manager, **kwargs):
+            stop_event = kwargs_stop_event
+            await recipe._await_operation(sampler.sample, stop_event=stop_event)
+            for manager in tool_manager:
+                recipe._ensure_running(stop_event)
+                await recipe._await_operation(manager.call_many, [{}, {}], stop_event=stop_event)
+            return [{
+                'response_token_ids': [1], 'rollout_logprobs': [-0.1], 'truncated': False, 'stop_reason': 'stop'
+            } for _ in trajectories]
+
+    kwargs_stop_event = asyncio.Event()
+
+    async def build(*args):
+        return [client], Model(), sampler, Rollout(), kwargs_stop_event
+
+    monkeypatch.setattr(recipe, '_TaskAgentEnv', Env)
+    monkeypatch.setattr(recipe, 'EnvTool', lambda env, name: SimpleNamespace(env=env))
+    monkeypatch.setattr(recipe, 'ToolManager', Manager)
+    monkeypatch.setattr(validation, '_load_recipe', lambda: recipe)
+    monkeypatch.setattr(validation, '_build_runtime', build)
+    monkeypatch.setattr(validation, '_STAGE_TIMEOUT', 2.0)
+    config = replace(_config(tmp_path), phase='cancel', cancel_stage='backward' if stage == 'unreached' else stage)
+    result = asyncio.run(run_cancel_validation(config))
+    assert result['pipeline_gate'] is (stage != 'unreached')
+    assert result['post_cancel_operations'] == []
+    assert result['stage_reached'] is (stage != 'unreached')
+    assert len(created) == 4 and all(env.closed for env in created)
+    assert client.closed
 
 
 @pytest.mark.skipif(

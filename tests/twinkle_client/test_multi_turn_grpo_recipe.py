@@ -108,7 +108,7 @@ def test_environment_creation_cancellation_preserves_handle_and_skips_rollout(re
     env = SimpleNamespace(sandbox_id='sandbox-1')
     attempt = SimpleNamespace(env=env)
 
-    def create(on_created):
+    def create(task, on_created):
         on_created(env)
         started.set()
         assert release.wait(timeout=5)
@@ -155,7 +155,7 @@ def test_verification_cancellation_stops_later_verify_calls(recipe, monkeypatch)
         env=Env(), manager=object(), trajectory={'messages': []}) for _ in range(recipe.NUM_GENERATIONS)]
     created = []
 
-    def create(on_created):
+    def create(task, on_created):
         attempt = attempts.pop(0)
         created.append(attempt)
         return attempt
@@ -206,7 +206,7 @@ def test_cleanup_repeated_cancellation_closes_environment_before_client(recipe):
 
     async def run():
         stop_event = asyncio.Event()
-        task = asyncio.create_task(recipe._drain_cleanup(Client(), [Env()], set(), stop_event))
+        task = asyncio.create_task(recipe._drain_cleanup([Client()], [Env()], set(), stop_event))
         await asyncio.to_thread(_cancel_and_release, task, started, release)
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -241,7 +241,7 @@ def test_cleanup_cancellation_does_not_replace_primary_error(recipe):
     async def run():
         stop_event = asyncio.Event()
         task = asyncio.create_task(
-            recipe._drain_cleanup(client, [Env()], set(), stop_event, propagate_cancel=False))
+            recipe._drain_cleanup([client], [Env()], set(), stop_event, propagate_cancel=False))
         await asyncio.to_thread(_cancel_and_release, task, started, release)
         return await task
 
@@ -317,6 +317,77 @@ def test_complete_recipe_train_runs_updates_and_closes_client(recipe, monkeypatc
     assert client.closed
 
 
+def test_client_connection_cancellation_registers_and_closes_client(recipe, monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    class Client:
+        closed = False
+
+        def model(self, model_id):
+            raise AssertionError('no model should be created after cancellation')
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+
+    def connect(**kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return client
+
+    monkeypatch.setattr(recipe, 'init_twinkle_client', connect)
+
+    async def run():
+        task = asyncio.create_task(recipe.train())
+        await asyncio.to_thread(_cancel_and_release, task, started, release)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert client.closed
+
+
+def test_template_is_built_off_the_event_loop_from_template_model_id(recipe, monkeypatch):
+    loop_threads = []
+    template_calls = []
+
+    class Client:
+        closed = False
+
+        def model(self, model_id):
+            return SimpleNamespace(
+                add_adapter_to_model=lambda *args, **kwargs: None,
+                set_loss=lambda *args, **kwargs: None,
+                set_optimizer=lambda *args, **kwargs: None,
+                set_processor=lambda *args, **kwargs: None,
+                set_template=lambda *args, **kwargs: template_calls.append(('model', kwargs['model_id'])),
+            )
+
+        def sampler(self, model_id):
+            return SimpleNamespace(
+                set_template=lambda *args, **kwargs: template_calls.append(('sampler', kwargs['model_id'])))
+
+        def close(self):
+            self.closed = True
+
+    def template(**kwargs):
+        template_calls.append(('local', kwargs['model_id']))
+        loop_threads.append(threading.current_thread() is threading.main_thread())
+        raise RuntimeError('stop after template')
+
+    client = Client()
+    monkeypatch.setattr(recipe, 'TEMPLATE_MODEL_ID', '/models/local-qwen')
+    monkeypatch.setattr(recipe, 'init_twinkle_client', lambda **kwargs: client)
+    monkeypatch.setattr(recipe, 'Qwen3_5Template', template)
+    with pytest.raises(RuntimeError, match='stop after template'):
+        asyncio.run(recipe.train())
+    assert template_calls == [
+        ('model', '/models/local-qwen'), ('sampler', '/models/local-qwen'), ('local', '/models/local-qwen')]
+    assert loop_threads == [False]
+    assert client.closed
+
+
 class _Files:
 
     def __init__(self):
@@ -351,6 +422,7 @@ def _make_env(recipe):
     env._custom_handlers = {}
     env._custom_tools = []
     env._include_default_tools = True
+    env.task = recipe.TASK
     return env
 
 
@@ -418,6 +490,39 @@ def test_candidate_exceptions_receive_low_reward_only_from_valid_verifier(recipe
 
     env._execute = execute
     assert env.verify() == 0.0
+
+
+def _run_verifier_locally(env, tmp_path):
+
+    def execute(command, cwd, timeout):
+        uploaded = next(path for path in env.sandbox.files.data if path.startswith('/tmp/twinkle_scripts/verify-'))
+        script = tmp_path / 'verify.py'
+        script.write_text(env.sandbox.files.data.pop(uploaded), encoding='utf-8')
+        result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True)
+        return result.returncode, result.stdout + result.stderr
+
+    env._execute = execute
+    return env.verify()
+
+
+def test_verifier_scores_the_attempt_task_file_function_and_cases(recipe, tmp_path):
+    task = recipe.CodeTask(
+        filename='count_even.py',
+        function='count_even',
+        solution='',
+        smoke_test='',
+        prompt='',
+        hidden_cases=(([], 0), ([2, 4], 2), ([1, 3], 0), ([-2, 0, 7], 2)),
+    )
+    env = _make_env(recipe)
+    env.task = task
+    (tmp_path / 'count_even.py').write_text(
+        'def count_even(values):\n    return sum(value % 2 == 0 for value in values)\n', encoding='utf-8')
+    assert _run_verifier_locally(env, tmp_path) == 1.0
+
+    (tmp_path / 'count_even.py').write_text(
+        'def count_even(values):\n    return sum(value % 2 == 1 for value in values)\n', encoding='utf-8')
+    assert _run_verifier_locally(env, tmp_path) == 0.25
 
 
 def test_verification_timeout_is_infrastructure_unknown(recipe):

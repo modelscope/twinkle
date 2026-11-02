@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib.util
 import json
 import math
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -23,21 +25,24 @@ from twinkle_client.rollout import ClientMultiTurnRollout
 _EVALUATION_TASKS = [
     {
         'id': 'count-even',
-        'solution': 'def count_even(values):\n    return sum(value % 2 == 1 for value in values)\n',
-        'smoke': 'from count_even import count_even\nassert count_even([1, 2, 4, 5]) == 2\n',
-        'prompt': 'The workspace has count_even.py and smoke_test.py. Run the test, fix the odd/even boundary bug, and rerun it.',
         'filename': 'count_even.py',
-        'cases': [([], 0), ([2, 4], 2), ([1, 3], 0), ([-2, 0, 7], 2)],
+        'function': 'count_even',
+        'solution': 'def count_even(values):\n    return sum(value % 2 == 1 for value in values)\n',
+        'smoke_test': 'from count_even import count_even\nassert count_even([1, 2, 4, 5]) == 2\n',
+        'prompt': 'The workspace has count_even.py and smoke_test.py. Run the test, fix the odd/even boundary bug, and rerun it.',
+        'hidden_cases': (([], 0), ([2, 4], 2), ([1, 3], 0), ([-2, 0, 7], 2)),
     },
     {
         'id': 'last-negative',
-        'solution': 'def last_negative(values):\n    negatives = [value for value in values if value < 0]\n    return negatives[0] if negatives else None\n',
-        'smoke': 'from last_negative import last_negative\nassert last_negative([-1, -2, 3]) == -2\n',
-        'prompt': 'The workspace has last_negative.py and smoke_test.py. Run the test, return the last negative correctly, and rerun it.',
         'filename': 'last_negative.py',
-        'cases': [([-1, -2, 3], -2), ([1, 2], None), ([-4], -4), ([0, -5, -6], -6)],
+        'function': 'last_negative',
+        'solution': 'def last_negative(values):\n    negatives = [value for value in values if value < 0]\n    return negatives[0] if negatives else None\n',
+        'smoke_test': 'from last_negative import last_negative\nassert last_negative([-1, -2, 3]) == -2\n',
+        'prompt': 'The workspace has last_negative.py and smoke_test.py. Run the test, return the last negative correctly, and rerun it.',
+        'hidden_cases': (([-1, -2, 3], -2), ([1, 2], None), ([-4], -4), ([0, -5, -6], -6)),
     },
 ]
+_STAGE_TIMEOUT = 300.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,7 @@ class ValidationConfig:
     eval_repeats: int = 2
     min_success_improvement: float | None = None
     cancel_stage: str = 'sample'
+    slow_tool_seconds: float = 20.0
 
 
 def _load_recipe():
@@ -73,8 +79,8 @@ def learning_gate(*, updates: int, baseline: float, final: float, minimum_improv
 def pipeline_evidence_gate(evidence: dict) -> bool:
     required = (
         'two_updates', 'parameter_change', 'multi_turn_feedback', 'token_alignment', 'distinct_snapshots',
-        'new_policy_requests', 'sync_async_equivalent', 'independent_episodes', 'environment_isolation',
-        'cleanup_confirmed',
+        'new_policy_requests', 'sync_async_equivalent', 'slow_tool_isolated', 'training_overlap',
+        'environment_isolation', 'cleanup_confirmed',
     )
     return all(evidence.get(key) is True for key in required)
 
@@ -110,44 +116,8 @@ def write_result(config: ValidationConfig, **values) -> Path:
     return path
 
 
-def _set_task(recipe, task: dict) -> None:
-    recipe._INITIAL_SOLUTION = task['solution']
-    recipe._SMOKE_TEST = task['smoke']
-    recipe._TASK_PROMPT = task['prompt']
-    recipe._HIDDEN_CASES = task['cases']
-    recipe._INITIAL_TASK_FILE = task['filename']
-
-
-def _create_task_attempt(recipe, task, on_created):
-    original_solution = recipe._INITIAL_SOLUTION
-    original_smoke = recipe._SMOKE_TEST
-    original_prompt = recipe._TASK_PROMPT
-    original_cases = recipe._HIDDEN_CASES
-    _set_task(recipe, task)
-    try:
-        env = recipe._TaskAgentEnv(
-            template=recipe.AGENTENV_TEMPLATE,
-            api_url=os.environ.get('AGENTENV_API_URL'),
-        )
-        on_created(env)
-        env.reset()
-        for path, content in [(task['filename'], task['solution']), ('smoke_test.py', task['smoke'])]:
-            result = env.step('write_file', {'path': path, 'content': content})
-            env.ensure_idle()
-            if result.info.get('error'):
-                raise recipe._TaskInfrastructureError('setup', env.sandbox_id, str(result.info['error']))
-        manager = recipe.ToolManager([
-            recipe.EnvTool(env, name) for name in ('run_command', 'read_file', 'write_file')
-        ])
-        return recipe._Attempt(env, manager, {
-            'messages': [{'role': 'user', 'content': task['prompt']}],
-            'tools': manager.tool_infos(),
-        })
-    finally:
-        recipe._INITIAL_SOLUTION = original_solution
-        recipe._SMOKE_TEST = original_smoke
-        recipe._TASK_PROMPT = original_prompt
-        recipe._HIDDEN_CASES = original_cases
+def _code_task(recipe, item: dict):
+    return recipe.CodeTask(**{key: value for key, value in item.items() if key != 'id'})
 
 
 def _training_evidence(rolled: list[dict]) -> dict[str, bool]:
@@ -174,22 +144,66 @@ def _training_evidence(rolled: list[dict]) -> dict[str, bool]:
     return {'multi_turn_feedback': multi_turn, 'token_alignment': aligned}
 
 
-def _metrics_prove_updates(metrics: list[dict]) -> bool:
-    nonzero = []
-    for metric in metrics:
-        for key, value in metric.items():
-            if 'grad_norm' in key and isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
-                nonzero.append(value)
-    return len(nonzero) >= 2
+def _numbers(value) -> list[float]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, dict):
+        return _numbers(value.get('logps'))
+    if isinstance(value, (list, tuple)):
+        return [number for item in value for number in _numbers(item)]
+    return []
+
+
+def parameters_changed(before: list[float] | None, after: list[float] | None, *, tolerance: float = 1e-6) -> bool:
+    """Same probe, same token positions: any log-prob shift beyond tolerance proves the adapter moved."""
+    if not before or not after or len(before) != len(after):
+        return False
+    if not all(math.isfinite(value) for value in before + after):
+        return False
+    return max(abs(left - right) for left, right in zip(before, after, strict=True)) > tolerance
+
+
+def slow_tool_isolated(spans: list[dict]) -> bool:
+    """A peer generation must start and finish while the injected slow tool batch is still running."""
+    for slow in (span for span in spans if span['kind'] == 'tool' and span.get('slow')):
+        if any(span['kind'] == 'sample' and span['start'] >= slow['start'] and span['end'] <= slow['end']
+               for span in spans):
+            return True
+    return False
+
+
+def training_overlaps_rollout(spans: list[dict]) -> bool:
+    training = [span for span in spans if span['kind'] == 'train']
+    rollout = [span for span in spans if span['kind'] in {'sample', 'tool'}]
+    return any(item['start'] < train['end'] and train['start'] < item['end'] for train in training for item in rollout)
+
+
+class _Timeline:
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._origin = time.monotonic()
+        self.spans: list[dict] = []
+
+    @contextlib.contextmanager
+    def span(self, kind: str, **labels):
+        start = time.monotonic() - self._origin
+        try:
+            yield
+        finally:
+            end = time.monotonic() - self._origin
+            with self._lock:
+                self.spans.append({'kind': kind, 'start': start, 'end': end, **labels})
 
 
 class _RecordingSampler:
 
-    def __init__(self, sampler):
+    def __init__(self, sampler, timeline: _Timeline):
         self._sampler = sampler
+        self._timeline = timeline
         self._lock = threading.Lock()
-        self._active = 0
-        self.max_active = 0
         self.uris = []
 
     def __getattr__(self, name):
@@ -197,25 +211,60 @@ class _RecordingSampler:
 
     def sample(self, *args, **kwargs):
         with self._lock:
-            self._active += 1
-            self.max_active = max(self.max_active, self._active)
             self.uris.append(kwargs.get('adapter_uri'))
-        try:
+        with self._timeline.span('sample'):
             return self._sampler.sample(*args, **kwargs)
-        finally:
-            with self._lock:
-                self._active -= 1
+
+
+class _TimedModel:
+
+    def __init__(self, model, timeline: _Timeline):
+        self._model = model
+        self._timeline = timeline
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def forward_backward(self, *args, **kwargs):
+        with self._timeline.span('train', operation='backward'):
+            return self._model.forward_backward(*args, **kwargs)
+
+    def clip_grad_and_step(self, *args, **kwargs):
+        with self._timeline.span('train', operation='step'):
+            return self._model.clip_grad_and_step(*args, **kwargs)
+
+
+def _timed_tool_manager(base, timeline: _Timeline, slow_seconds: float):
+    """Time every rollout tool batch and hold the first one for ``slow_seconds``."""
+    lock = threading.Lock()
+    pending = {'slow': slow_seconds > 0}
+
+    class TimedToolManager(base):
+
+        def call_many(self, tool_calls):
+            with lock:
+                slow, pending['slow'] = pending['slow'], False
+            with timeline.span('tool', manager=id(self), slow=slow):
+                if slow:
+                    time.sleep(slow_seconds)
+                return super().call_many(tool_calls)
+
+    return TimedToolManager
 
 
 async def _build_runtime(config, recipe):
-    client = init_twinkle_client(
-        base_url=config.server_url,
-        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
-    )
     stop_event = asyncio.Event()
+    clients = []
     try:
-        model = client.model(config.model_id)
-        sampler = client.sampler(config.model_id)
+        client = await recipe._await_operation(
+            init_twinkle_client,
+            base_url=config.server_url,
+            api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
+            stop_event=stop_event,
+            on_result=clients.append,
+        )
+        model = await recipe._await_operation(client.model, config.model_id, stop_event=stop_event)
+        sampler = await recipe._await_operation(client.sampler, config.model_id, stop_event=stop_event)
         await recipe._await_operation(
             model.add_adapter_to_model,
             recipe.ADAPTER_NAME,
@@ -229,7 +278,13 @@ async def _build_runtime(config, recipe):
             model.set_template, 'Qwen3_5Template', model_id=config.template_model_id, stop_event=stop_event)
         await recipe._await_operation(
             sampler.set_template, 'Qwen3_5Template', model_id=config.template_model_id, stop_event=stop_event)
-        template = Qwen3_5Template(model_id=config.template_model_id, max_length=8192, enable_thinking=False)
+        template = await recipe._await_operation(
+            Qwen3_5Template,
+            model_id=config.template_model_id,
+            max_length=8192,
+            enable_thinking=False,
+            stop_event=stop_event,
+        )
         template.truncation_strategy = 'delete'
         rollout = ClientMultiTurnRollout(
             sampler,
@@ -237,9 +292,9 @@ async def _build_runtime(config, recipe):
             sampling_params=SamplingParams(max_tokens=512, temperature=1.0, top_p=0.95, logprobs=1),
             max_turns=recipe.MAX_TURNS,
         )
-        return client, model, sampler, rollout, stop_event
+        return clients, model, sampler, rollout, stop_event
     except BaseException:
-        client.close()
+        await recipe._drain_cleanup(clients, [], set(), stop_event, propagate_cancel=False)
         raise
 
 
@@ -249,31 +304,57 @@ async def _initial_policy(recipe, model, stop_event, snapshots):
     return recipe._checkpoint_path(initial)
 
 
+async def _evaluate_group(recipe, rollout, policy_uri, environments, stop_event, task, seeds):
+    """Score one held-out task; each attempt gets its own seed so a group is not one sample repeated."""
+    attempts = []
+    for _ in seeds:
+        recipe._ensure_running(stop_event)
+        await recipe._await_operation(
+            recipe._create_attempt, task, environments.append, stop_event=stop_event, on_result=attempts.append)
+    results = await asyncio.gather(
+        *[
+            rollout.acall(
+                [attempt.trajectory],
+                tool_manager=[attempt.manager],
+                adapter_name=recipe.ADAPTER_NAME,
+                adapter_uri=policy_uri,
+                sampling_params=replace(rollout.sampling_params, seed=seed),
+            ) for attempt, seed in zip(attempts, seeds, strict=True)
+        ],
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    recipe._ensure_running(stop_event)
+    recipe._validate_training_rows([result[0] for result in results])
+    rewards = []
+    for attempt in attempts:
+        recipe._ensure_running(stop_event)
+        rewards.append(await recipe._await_operation(attempt.env.verify, stop_event=stop_event))
+    return rewards
+
+
 async def _evaluate(recipe, rollout, policy_uri, environments, stop_event, config):
     rewards = []
     evaluations = []
-    for task_index, task in enumerate(_EVALUATION_TASKS):
+    for task_index, item in enumerate(_EVALUATION_TASKS):
+        task = _code_task(recipe, item)
         for repeat in range(config.eval_repeats):
-            seed = config.seed + task_index * 1000 + repeat
-            original_create = recipe._create_attempt
-            recipe._create_attempt = lambda on_created, current=task: _create_task_attempt(recipe, current, on_created)
-            try:
-                params = replace(rollout.sampling_params, seed=seed)
-                _, group_rewards = await recipe._rollout_group(
-                    rollout, policy_uri, environments, stop_event, sampling_params=params)
-            finally:
-                recipe._create_attempt = original_create
+            first = config.seed + task_index * 1000 + repeat * recipe.NUM_GENERATIONS
+            seeds = list(range(first, first + recipe.NUM_GENERATIONS))
+            group_rewards = await _evaluate_group(recipe, rollout, policy_uri, environments, stop_event, task, seeds)
             rewards.extend(group_rewards)
-            evaluations.append({'task_id': task['id'], 'repeat': repeat, 'seed': seed, 'attempts': len(group_rewards)})
+            evaluations.append({'task_id': item['id'], 'repeat': repeat, 'seeds': seeds, 'attempts': len(group_rewards)})
     return rewards, evaluations
 
 
 async def _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_event, config):
-    task = _EVALUATION_TASKS[0]
+    task = _code_task(recipe, _EVALUATION_TASKS[0])
     attempts = []
     for _ in range(2):
-        attempts.append(await recipe._await_operation(
-            lambda: _create_task_attempt(recipe, task, environments.append), stop_event=stop_event))
+        await recipe._await_operation(
+            recipe._create_attempt, task, environments.append, stop_event=stop_event, on_result=attempts.append)
     params = replace(rollout.sampling_params, seed=config.seed + 50000)
     common = {
         'adapter_name': recipe.ADAPTER_NAME,
@@ -294,15 +375,25 @@ async def _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_e
     }
 
 
+async def _probe_logps(recipe, model, trajectory, stop_event) -> list[float]:
+    response = await recipe._await_operation(
+        model.forward_only, inputs=[trajectory], compute_loss=False, stop_event=stop_event)
+    result = response['result'] if isinstance(response, dict) else response.result
+    return _numbers(result)
+
+
 async def run_validation(config: ValidationConfig) -> dict:
     if config.phase == 'learning' and config.min_success_improvement is None:
         raise ValueError('learning validation requires a frozen --min-success-improvement threshold')
     os.environ['AGENTENV_TEMPLATE'] = config.agentenv_template
     recipe = _load_recipe()
-    client, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
-    recording_sampler = _RecordingSampler(sampler)
+    timeline = _Timeline()
+    recipe.ToolManager = _timed_tool_manager(recipe.ToolManager, timeline, config.slow_tool_seconds)
+    clients, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
+    recording_sampler = _RecordingSampler(sampler, timeline)
     rollout.sampler = recording_sampler
     rollout._core.response_callback._sampler = recording_sampler
+    model = _TimedModel(model, timeline)
     environments, snapshots = [], []
     active_tasks = set()
     values = {'learning_gate': None}
@@ -316,6 +407,7 @@ async def run_validation(config: ValidationConfig) -> dict:
         advantage_fn = GRPOAdvantage()
         metrics = []
         all_rolled = []
+        probe = {}
 
         async def train_groups():
             nonlocal policy_uri
@@ -336,6 +428,9 @@ async def run_validation(config: ValidationConfig) -> dict:
                     rolled, rewards = task.result()
                     all_rolled.extend(rolled)
                     recipe._ensure_running(stop_event)
+                    if 'trajectory' not in probe:
+                        probe['trajectory'] = rolled[0]
+                        probe['before'] = await _probe_logps(recipe, model, rolled[0], stop_event)
                     updated = await recipe._train_group(
                         model, rolled, rewards, advantage_fn, stop_event, on_metrics=metrics.append)
                     if updated:
@@ -351,16 +446,19 @@ async def run_validation(config: ValidationConfig) -> dict:
             return updates
 
         updates = await train_groups()
+        probe_after = await _probe_logps(recipe, model, probe['trajectory'], stop_event) if probe else None
         sync_async = await _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_event, config)
         trajectory = _training_evidence(all_rolled)
         snapshot_uris = {recipe._checkpoint_path(snapshot) for snapshot in snapshots}
+        spans = list(timeline.spans)
         evidence = {
             'two_updates': updates >= 2,
-            'parameter_change': _metrics_prove_updates(metrics),
+            'parameter_change': parameters_changed(probe.get('before'), probe_after),
             **trajectory,
             'distinct_snapshots': len(snapshot_uris) >= 3 and policy_uri != initial_uri,
             'new_policy_requests': policy_uri in recording_sampler.uris,
-            'independent_episodes': recording_sampler.max_active >= 2,
+            'slow_tool_isolated': slow_tool_isolated(spans),
+            'training_overlap': training_overlaps_rollout(spans),
             **sync_async,
         }
         values.update({
@@ -369,6 +467,8 @@ async def run_validation(config: ValidationConfig) -> dict:
             'snapshot_uris': sorted(snapshot_uris),
             'policy_requests': recording_sampler.uris,
             'metrics': metrics,
+            'parameter_probe': {'before': probe.get('before'), 'after': probe_after},
+            'timeline': spans,
             'evidence': evidence,
         })
         if config.phase == 'learning':
@@ -377,7 +477,7 @@ async def run_validation(config: ValidationConfig) -> dict:
             baseline = sum(reward == 1.0 for reward in baseline_rewards) / len(baseline_rewards)
             final = sum(reward == 1.0 for reward in final_rewards) / len(final_rewards)
             same_plan = baseline_evaluations == final_evaluations
-            held_out = all(item['task_id'] != 'smallest-positive' for item in final_evaluations)
+            held_out = all(item['filename'] != recipe.TASK.filename for item in _EVALUATION_TASKS)
             values.update({
                 'baseline_rewards': baseline_rewards,
                 'final_rewards': final_rewards,
@@ -396,7 +496,7 @@ async def run_validation(config: ValidationConfig) -> dict:
         stop_event.set()
         raise
     finally:
-        cleanup_issues = await recipe._drain_cleanup(client, environments, active_tasks, stop_event)
+        cleanup_issues = await recipe._drain_cleanup(clients, environments, active_tasks, stop_event)
         values['cleanup_issues'] = cleanup_issues
         evidence = values.get('evidence', {})
         evidence['cleanup_confirmed'] = not cleanup_issues
@@ -412,14 +512,26 @@ class _CancelRecorder:
         self.started = threading.Event()
         self.release = threading.Event()
         self.operations = []
+        self.post_cancel_operations = []
+        self._lock = threading.Lock()
+        self._cancelled = False
         self._triggered = False
 
+    def mark_cancelled(self):
+        with self._lock:
+            self._cancelled = True
+
     def block(self, operation):
-        self.operations.append(operation)
-        if operation == self.stage and not self._triggered:
-            self._triggered = True
+        with self._lock:
+            self.operations.append(operation)
+            if self._cancelled:
+                self.post_cancel_operations.append(operation)
+            trigger = operation == self.stage and not self._triggered
+            if trigger:
+                self._triggered = True
+        if trigger:
             self.started.set()
-            if not self.release.wait(timeout=300):
+            if not self.release.wait(timeout=_STAGE_TIMEOUT):
                 raise TimeoutError(f'cancel validation did not release {operation}')
 
 
@@ -446,32 +558,49 @@ class _CancelModel:
         return self._model.save(name, *args, **kwargs)
 
 
+def _cancel_tool_manager(base, recorder: _CancelRecorder):
+    """Record rollout tool batches only; environment setup writes go through ``Env.step`` directly."""
+
+    class CancelToolManager(base):
+
+        def call_many(self, tool_calls):
+            recorder.block('tool')
+            return super().call_many(tool_calls)
+
+    return CancelToolManager
+
+
+async def _wait_for_stage(recorder: _CancelRecorder, task: asyncio.Task, timeout: float) -> bool:
+    """Wait on the event loop (no helper thread) until the stage blocks, the task ends, or time runs out."""
+    deadline = time.monotonic() + timeout
+    while not recorder.started.is_set():
+        if task.done() or time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 async def run_cancel_validation(config: ValidationConfig) -> dict:
     os.environ['AGENTENV_TEMPLATE'] = config.agentenv_template
     recipe = _load_recipe()
-    client, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
     recorder = _CancelRecorder(config.cancel_stage)
+    recipe.ToolManager = _cancel_tool_manager(recipe.ToolManager, recorder)
+    clients, model, sampler, rollout, stop_event = await _build_runtime(config, recipe)
     environments, snapshots = [], []
     active_tasks = set()
     values = {}
     original_sample = sampler.sample
-    original_step = recipe._TaskAgentEnv.step
     original_verify = recipe._TaskAgentEnv.verify
 
     def sample(*args, **kwargs):
         recorder.block('sample')
         return original_sample(*args, **kwargs)
 
-    def step(self, tool_name, arguments=None):
-        recorder.block('tool')
-        return original_step(self, tool_name, arguments)
-
     def verify(self):
         recorder.block('verify')
         return original_verify(self)
 
     sampler.sample = sample
-    recipe._TaskAgentEnv.step = step
     recipe._TaskAgentEnv.verify = verify
     model = _CancelModel(model, recorder)
     try:
@@ -492,23 +621,28 @@ async def run_cancel_validation(config: ValidationConfig) -> dict:
 
         task = asyncio.create_task(operation())
         active_tasks.add(task)
-        await asyncio.wait_for(asyncio.to_thread(recorder.started.wait), timeout=300)
-        cancel_index = len(recorder.operations)
-        task.cancel()
+        stage_reached = await _wait_for_stage(recorder, task, _STAGE_TIMEOUT)
+        recorder.mark_cancelled()
+        if not task.done():
+            task.cancel()
+            # 先让调用处理取消，再允许已经开始的操作自然结束；不设置统计盲区。
+            await asyncio.sleep(0)
         recorder.release.set()
         cancelled = False
         try:
             await task
         except asyncio.CancelledError:
             cancelled = True
+        active_tasks.discard(task)
         values = {
-            'stage_reached': True,
+            'stage_reached': stage_reached,
             'cancelled': cancelled,
-            'post_cancel_operations': recorder.operations[cancel_index:],
-            'operations': recorder.operations,
+            'post_cancel_operations': list(recorder.post_cancel_operations),
+            'operations': list(recorder.operations),
         }
     finally:
-        cleanup_issues = await recipe._drain_cleanup(client, environments, active_tasks, stop_event)
+        recorder.release.set()
+        cleanup_issues = await recipe._drain_cleanup(clients, environments, active_tasks, stop_event)
         values['cleanup_issues'] = cleanup_issues
         values['pipeline_gate'] = cancel_evidence_gate(values)
         values['learning_gate'] = None
@@ -531,9 +665,12 @@ def parse_args(argv=None) -> ValidationConfig:
     parser.add_argument('--min-success-improvement', type=float, default=None)
     parser.add_argument(
         '--cancel-stage', choices=['sample', 'tool', 'verify', 'backward', 'step', 'save'], default='sample')
+    parser.add_argument('--slow-tool-seconds', type=float, default=20.0)
     args = parser.parse_args(argv)
     if args.max_groups < 2 or args.active_groups < 1 or args.eval_repeats < 1:
         parser.error('max-groups must be >=2 and active-groups/eval-repeats must be positive')
+    if args.slow_tool_seconds <= 0:
+        parser.error('slow-tool-seconds must be positive')
     return ValidationConfig(
         backend=args.backend,
         phase=args.phase,
@@ -548,6 +685,7 @@ def parse_args(argv=None) -> ValidationConfig:
         eval_repeats=args.eval_repeats,
         min_success_improvement=args.min_success_improvement,
         cancel_stage=args.cancel_stage,
+        slow_tool_seconds=args.slow_tool_seconds,
     )
 
 

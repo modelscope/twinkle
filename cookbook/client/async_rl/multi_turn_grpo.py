@@ -27,6 +27,8 @@ logger = get_logger()
 
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
+# Tokenizer/template source; point it at a local model directory when the client runs offline.
+TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
 ADAPTER_NAME = 'client-multiturn-grpo'
 AGENTENV_TEMPLATE = os.environ.get('AGENTENV_TEMPLATE', 'python:3.11')
 NUM_GENERATIONS = 4
@@ -34,28 +36,50 @@ ACTIVE_GROUPS = 2
 MAX_GROUPS = 4
 MAX_TURNS = 6
 
-_INITIAL_SOLUTION = '''def smallest_positive(values):
+
+@dataclass(frozen=True)
+class CodeTask:
+    """One small code-repair task: the buggy file, a visible smoke test and hidden scoring cases."""
+    filename: str
+    function: str
+    solution: str
+    smoke_test: str
+    prompt: str
+    hidden_cases: tuple
+
+
+TASK = CodeTask(
+    filename='solution.py',
+    function='smallest_positive',
+    solution='''def smallest_positive(values):
     positives = [value for value in values if value > 0]
     return max(positives) if positives else None
-'''
-_SMOKE_TEST = '''from solution import smallest_positive
+''',
+    smoke_test='''from solution import smallest_positive
 assert smallest_positive([3, 1, 2]) == 1
 assert smallest_positive([-1, 0]) is None
-'''
-_HIDDEN_CASES = [([3, 1, 2], 1), ([-2, 4, 1], 1), ([0, -1], None), ([7], 7), ([5, 3, 9], 3)]
-_VERIFIER = '''import importlib.util
-import json
+''',
+    prompt='''A small Python workspace contains solution.py and smoke_test.py.
+Read the files, run the smoke test, fix the boundary-condition bug, and rerun the test.
+Use the file and command tools, then give a short final answer. Do not edit the test to make it pass.
+''',
+    hidden_cases=(([3, 1, 2], 1), ([-2, 4, 1], 1), ([0, -1], None), ([7], 7), ([5, 3, 9], 3)),
+)
+
+_VERIFIER = '''import json
 
 call_id = __CALL_ID__
 cases = __CASES__
 payload = {"call_id": call_id, "completed": True, "passed": 0, "total": len(cases)}
 try:
-    spec = importlib.util.spec_from_file_location("candidate_solution", "solution.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Compile the current source directly: a stale __pycache__ from the smoke test must not be scored.
+    with open(__FILENAME__, encoding="utf-8") as handle:
+        namespace = {"__name__": "candidate_solution"}
+        exec(compile(handle.read(), __FILENAME__, "exec"), namespace)
+    function = namespace[__FUNCTION__]
     for values, expected in cases:
         try:
-            actual = module.smallest_positive(values)
+            actual = function(values)
         except Exception:
             continue
         if actual == expected:
@@ -63,10 +87,6 @@ try:
 except Exception as error:
     payload["candidate_error"] = type(error).__name__
 print("TWINKLE_VERIFY=" + json.dumps(payload, sort_keys=True))
-'''
-_TASK_PROMPT = '''A small Python workspace contains solution.py and smoke_test.py.
-Read the files, run the smoke test, fix the boundary-condition bug, and rerun the test.
-Use the file and command tools, then give a short final answer. Do not edit the test to make it pass.
 '''
 
 
@@ -84,8 +104,9 @@ class _TaskInfrastructureError(RuntimeError):
 class _TaskAgentEnv(AgentEnv):
     """Keep provider/verification failures distinct from candidate test failures."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, task: CodeTask, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.task = task
         self._task_infrastructure_error: _TaskInfrastructureError | None = None
 
     def _local_refusal(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
@@ -125,7 +146,9 @@ class _TaskAgentEnv(AgentEnv):
     def verify(self) -> float:
         """Run the trusted checker in the same workspace and require its own result marker."""
         call_id = uuid.uuid4().hex
-        source = _VERIFIER.replace('__CALL_ID__', repr(call_id)).replace('__CASES__', repr(_HIDDEN_CASES))
+        source = (
+            _VERIFIER.replace('__CALL_ID__', repr(call_id)).replace('__CASES__', repr(list(self.task.hidden_cases)))
+            .replace('__FILENAME__', repr(self.task.filename)).replace('__FUNCTION__', repr(self.task.function)))
         path = f'/tmp/twinkle_scripts/verify-{call_id}.py'
         try:
             self.sandbox.files.write(path, source)
@@ -150,7 +173,7 @@ class _TaskAgentEnv(AgentEnv):
             if result.get('call_id') != call_id or result.get('completed') is not True:
                 raise ValueError('verification result does not match this call')
             passed, total = result['passed'], result['total']
-            if total != len(_HIDDEN_CASES) or not isinstance(passed, int) or not 0 <= passed <= total:
+            if total != len(self.task.hidden_cases) or not isinstance(passed, int) or not 0 <= passed <= total:
                 raise ValueError('verification case statistics are invalid')
             return passed / total
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -212,18 +235,18 @@ def _ensure_running(stop_event: asyncio.Event) -> None:
         raise asyncio.CancelledError()
 
 
-def _create_attempt(on_created) -> _Attempt:
-    env = _TaskAgentEnv(template=AGENTENV_TEMPLATE, api_url=os.environ.get('AGENTENV_API_URL'))
+def _create_attempt(task: CodeTask, on_created) -> _Attempt:
+    env = _TaskAgentEnv(task, template=AGENTENV_TEMPLATE, api_url=os.environ.get('AGENTENV_API_URL'))
     on_created(env)
     env.reset()
-    for path, content in [('solution.py', _INITIAL_SOLUTION), ('smoke_test.py', _SMOKE_TEST)]:
+    for path, content in [(task.filename, task.solution), ('smoke_test.py', task.smoke_test)]:
         result = env.step('write_file', {'path': path, 'content': content})
         env.ensure_idle()
         if result.info.get('error'):
             raise _TaskInfrastructureError('setup', env.sandbox_id, str(result.info['error']))
     manager = ToolManager([EnvTool(env, name) for name in ('run_command', 'read_file', 'write_file')])
     trajectory = {
-        'messages': [{'role': 'user', 'content': _TASK_PROMPT}],
+        'messages': [{'role': 'user', 'content': task.prompt}],
         'tools': manager.tool_infos(),
     }
     return _Attempt(env, manager, trajectory)
@@ -240,25 +263,22 @@ def _validate_training_rows(rolled: list[dict[str, Any]]) -> None:
 
 
 async def _rollout_group(rollout, policy_uri: str, environments: list, stop_event: asyncio.Event,
-                         sampling_params: SamplingParams | None = None):
+                         task: CodeTask = TASK):
     attempts = []
     for _ in range(NUM_GENERATIONS):
         _ensure_running(stop_event)
-        attempt = await _await_operation(
+        await _await_operation(
             _create_attempt,
+            task,
             environments.append,
             stop_event=stop_event,
             on_result=attempts.append,
         )
-    call_kwargs = {}
-    if sampling_params is not None:
-        call_kwargs['sampling_params'] = sampling_params
     rolled = await rollout.acall(
         [attempt.trajectory for attempt in attempts],
         tool_manager=[attempt.manager for attempt in attempts],
         adapter_name=ADAPTER_NAME,
         adapter_uri=policy_uri,
-        **call_kwargs,
     )
     _ensure_running(stop_event)
     _validate_training_rows(rolled)
@@ -295,7 +315,7 @@ async def _train_group(model, rolled, rewards, advantage_fn, stop_event: asyncio
     return True
 
 
-async def _cleanup_resources(client, environments, active_tasks, stop_event) -> list[str]:
+async def _cleanup_resources(clients, environments, active_tasks, stop_event) -> list[str]:
     issues = []
     stop_event.set()
     for task in active_tasks:
@@ -314,16 +334,18 @@ async def _cleanup_resources(client, environments, active_tasks, stop_event) -> 
         except BaseException as error:
             issues.append(f'could not confirm environment close for {env.sandbox_id}: {error}')
             logger.warning(issues[-1])
-    try:
-        await _await_operation(client.close, stop_event=stop_event)
-    except BaseException as error:
-        issues.append(f'could not close client: {error}')
-        logger.warning(issues[-1])
+    for client in clients:
+        try:
+            await _await_operation(client.close, stop_event=stop_event)
+        except BaseException as error:
+            issues.append(f'could not close client: {error}')
+            logger.warning(issues[-1])
     return issues
 
 
-async def _drain_cleanup(client, environments, active_tasks, stop_event, *, propagate_cancel: bool = True) -> list[str]:
-    work = asyncio.create_task(_cleanup_resources(client, environments, active_tasks, stop_event))
+async def _drain_cleanup(clients, environments, active_tasks, stop_event, *,
+                         propagate_cancel: bool = True) -> list[str]:
+    work = asyncio.create_task(_cleanup_resources(clients, environments, active_tasks, stop_event))
     cancel_error = None
     while True:
         try:
@@ -342,18 +364,23 @@ async def _drain_cleanup(client, environments, active_tasks, stop_event, *, prop
 
 
 async def train() -> None:
-    client = init_twinkle_client(
-        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
-        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
-    )
     stop_event = asyncio.Event()
+    # Resources are registered as soon as they exist so cleanup can close them after any cancellation.
+    clients = []
     environments = []
     snapshots = []
     active_tasks = set()
     primary_error = None
     try:
-        model = client.model(MODEL_ID)
-        sampler = client.sampler(MODEL_ID)
+        client = await _await_operation(
+            init_twinkle_client,
+            base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
+            api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
+            stop_event=stop_event,
+            on_result=clients.append,
+        )
+        model = await _await_operation(client.model, MODEL_ID, stop_event=stop_event)
+        sampler = await _await_operation(client.sampler, MODEL_ID, stop_event=stop_event)
         await _await_operation(
             model.add_adapter_to_model,
             ADAPTER_NAME,
@@ -363,9 +390,17 @@ async def train() -> None:
         await _await_operation(model.set_loss, 'GRPOLoss', epsilon=0.2, beta=0.0, stop_event=stop_event)
         await _await_operation(model.set_optimizer, 'AdamW', lr=2e-5, stop_event=stop_event)
         await _await_operation(model.set_processor, 'InputProcessor', stop_event=stop_event)
-        await _await_operation(model.set_template, 'Qwen3_5Template', model_id=MODEL_ID, stop_event=stop_event)
-        await _await_operation(sampler.set_template, 'Qwen3_5Template', model_id=MODEL_ID, stop_event=stop_event)
-        template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
+        await _await_operation(
+            model.set_template, 'Qwen3_5Template', model_id=TEMPLATE_MODEL_ID, stop_event=stop_event)
+        await _await_operation(
+            sampler.set_template, 'Qwen3_5Template', model_id=TEMPLATE_MODEL_ID, stop_event=stop_event)
+        template = await _await_operation(
+            Qwen3_5Template,
+            model_id=TEMPLATE_MODEL_ID,
+            max_length=8192,
+            enable_thinking=False,
+            stop_event=stop_event,
+        )
         template.truncation_strategy = 'delete'
         rollout = ClientMultiTurnRollout(
             sampler,
@@ -420,7 +455,7 @@ async def train() -> None:
         raise
     finally:
         await _drain_cleanup(
-            client,
+            clients,
             environments,
             active_tasks,
             stop_event,

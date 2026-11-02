@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -371,6 +371,82 @@ def test_async_cancellation_drains_http_and_does_not_poison_later_calls():
     result = asyncio.run(run())
     assert result[0]['input_ids'] == [1, 20]
     assert len(sampler.calls) == 2
+
+
+def test_sync_repeated_interrupts_keep_draining_until_core_finishes():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    class InterruptingFuture:
+
+        def __init__(self, future, interrupts):
+            self._future = future
+            self._interrupts = interrupts
+
+        def done(self):
+            return self._future.done()
+
+        def result(self):
+            if self._interrupts:
+                self._interrupts -= 1
+                assert started.wait(timeout=5)
+                raise KeyboardInterrupt
+            return self._future.result()
+
+    sampler = BlockingSampler(((10, 'stop'), (20, 'stop')))
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+    calls = []
+    original_start = rollout._start
+
+    def start(trajectories, kwargs):
+        call = original_start(trajectories, kwargs)
+        calls.append(call)
+        call.future = InterruptingFuture(call.future, interrupts=2)
+        return call
+
+    rollout._start = start
+    outcome = {}
+
+    def run():
+        try:
+            rollout([_trajectory()])
+        except BaseException as error:
+            outcome['error'] = error
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(timeout=5)
+    worker.join(timeout=0.3)
+    assert worker.is_alive(), 'sync call returned before the in-flight sample finished'
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert isinstance(outcome['error'], KeyboardInterrupt)
+    assert calls[0].future._future.done()
+    assert len(sampler.calls) == 1
+
+
+@pytest.mark.parametrize('control_error', [KeyboardInterrupt(), SystemExit(2)])
+def test_sync_completed_future_control_error_is_not_retried_forever(control_error, monkeypatch):
+    from types import SimpleNamespace
+    from twinkle_agentic.rollout.base import _RolloutExecution
+
+    future = Future()
+    future.set_exception(control_error)
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    execution = _RolloutExecution()
+    monkeypatch.setattr(rollout, '_start', lambda *args: SimpleNamespace(future=future, execution=execution))
+    with pytest.raises(type(control_error)) as error:
+        rollout([_trajectory()])
+    assert error.value is control_error
+    assert execution.cancelled
 
 
 def test_duplicate_env_and_bare_harness_are_rejected_before_side_effects():

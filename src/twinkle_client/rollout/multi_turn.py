@@ -203,13 +203,21 @@ class ClientMultiTurnRollout:
         call = self._start(trajectories, kwargs)
         try:
             return call.future.result()
-        except (KeyboardInterrupt, SystemExit):
+        except (KeyboardInterrupt, SystemExit) as control_error:
             call.execution.cancel()
-            try:
-                call.future.result()
-            except BaseException:
-                pass
-            raise
+            while True:
+                try:
+                    call.future.result()
+                except (KeyboardInterrupt, SystemExit) as drain_error:
+                    if call.future.done():
+                        # Future 已结束时，控制异常也可能是后台任务本身的结果。
+                        cause = drain_error if drain_error is not control_error else None
+                        raise control_error from cause
+                    # 重复控制中断不能丢弃仍在执行的 Future。
+                    continue
+                except BaseException as drain_error:
+                    raise control_error from drain_error
+                raise control_error from None
 
     async def acall(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
         if isinstance(trajectories, dict):

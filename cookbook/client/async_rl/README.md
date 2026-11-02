@@ -155,8 +155,15 @@ Prerequisites beyond the server setup above:
 pip install 'e2b>=2.7'
 export AGENTENV_API_URL=http://your-agentenv-gateway:8080
 export AGENTENV_TEMPLATE=your-python-template
+export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B  # optional, for offline clients
 python cookbook/client/async_rl/multi_turn_grpo.py
 ```
+
+The recipe reads `TWINKLE_SERVER_URL`, `TWINKLE_SERVER_TOKEN` and
+`TWINKLE_TEMPLATE_MODEL_ID` the same way as `client_orchestrated_grpo.py`. The
+task (buggy file, smoke test, prompt and hidden scoring cases) is the `TASK`
+constant at the top of the script; every attempt gets its own copy in a fresh
+workspace and is scored by a trusted checker bound to that task.
 
 The user code creates, initializes, verifies, and closes environments. The
 rollout only borrows their `ToolManager` objects. Each group names one immutable
