@@ -441,6 +441,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 caller_line = _cl
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
+                # A class may refuse to leave this process: its constructor arguments can own
+                # state that serialization drops (a sampler's admission table).
+                coerce = getattr(cls, '_coerce_remote_group', None)
+                if coerce is not None:
+                    kwargs['remote_group'] = coerce(*args, **kwargs)
                 remote_group = kwargs.get('remote_group')
                 if os.environ.get('WORKER_NAME') is None and remote_group is None:
                     logger.info(f'⚠️ Using local initialization of class: {cls}, please make sure the class '
