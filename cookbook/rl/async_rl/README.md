@@ -6,8 +6,8 @@ training run as independent workers, while each tenant keeps its own dataset,
 reward, optimizer, scheduler, partitions, and policy versions.
 
 This directory contains the YAML-managed CLI workflow. For client-orchestrated
-GRPO over HTTP, see
-[`cookbook/client/async_rl`](../../client/async_rl/README.md).
+GRPO over HTTP, see the
+[Twinkle Client guide](../../../docs/source_en/Usage%20Guide/Server%20and%20Client/Twinkle-Client.md).
 
 ## Resources
 

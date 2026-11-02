@@ -206,96 +206,73 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 其余数据处理、训练循环、检查点保存等代码完全相同。
 
-## 可训练多轮 Rollout（ClientMultiTurnRollout）
+(client-async-grpo)=
+## 客户端异步 GRPO
 
-前面的示例都是单轮训练。如果你要做**带工具调用的多轮 agentic RL**（如 GRPO），并且需要产出可直接用于训练的 token 级对齐信息，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它在客户端侧驱动 “采样 → 调用工具 → 拼接上下文 → 再采样” 的多轮循环，每轮采样走 HTTP（`/twinkle/sample`），每条 trajectory 产出带 `logprobs` 的可训练结果，可直接用于 GRPO 等 RL 训练。
+客户端可以在采样的同时进行训练。完成 [Twinkle 安装](../安装.md) 后，选择一个示例，按下面的步骤启动即可：
 
-### 依赖与约束
+| 场景 | 示例 |
+|---|---|
+| 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
+| 带工具调用的多轮代码修复（纯文本） | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
 
-- **本地 Template**：bridge token 拼接（渲染工具轮 + 下一轮生成提示）需要在客户端本地持有一个 `Template` 实例。
-- **vLLMSampler**：指向服务端 Sampler 服务的客户端采样器。
-- **ToolManager**（可选）：注册你的工具；若某条 trajectory 产生了 tool_calls 但未提供 tool_manager，会在派发时抛 `ValueError`。
-- **`num_samples=1`**：当前每条 trajectory 只采样一次。做 GRPO group 时，把同一个 prompt 复制成 `NUM_GENERATIONS` 条独立 trajectory 即可。
-- **仅限可证明安全的纯文本轨迹**：客户端会逐轮验证 state 不含媒体且 `feature.input_ids == engine_input_ids`。模板可以具备多模态能力；只有当前轨迹实际携带媒体或两种编码不一致时才会抛 `NotImplementedError`，等待服务端 `state_id`。
+### 1. 启动服务端
 
-### 最小示例
+示例使用 Qwen3.5-4B，训练后端为 Transformers，采样后端为 vLLM，需要两张 GPU。准备好本地模型目录后，在仓库根目录执行：
 
-```python
-from peft import LoraConfig
-from twinkle import init_twinkle_client
-from twinkle.advantage import GRPOAdvantage
-from twinkle.data_format import SamplingParams
-from twinkle.template import Qwen3_5Template
-from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.rollout import ClientMultiTurnRollout
-from twinkle_client.sampler import vLLMSampler
-
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-NUM_GENERATIONS = 2   # GRPO group size（rollout 每条采样 num_samples=1）
-
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
-
-# 训练模型（GRPO）：通过当前 client 显式绑定 transport、会话与认证上下文
-model = client.model(MODEL_ID)
-model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
-model.set_loss('GRPOLoss', epsilon=0.2)
-model.set_optimizer('Adam', lr=1e-5)
-model.set_processor('InputProcessor')
-model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# 客户端采样器（HTTP）
-sampler = vLLMSampler(model_id=MODEL_ID)
-sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# 多轮 rollout：需要本地 Template（bridge 拼接）与 ToolManager
-rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
-rollout_template.truncation_strategy = 'delete'
-tool_manager = ToolManager([MyCalculatorTool()])   # 你的工具
-
-rollout = ClientMultiTurnRollout(
-    sampler=sampler,
-    template=rollout_template,
-    tool_manager=tool_manager,
-    sampling_params=SamplingParams(max_tokens=512, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
-    max_turns=4,
-)
-advantage_fn = GRPOAdvantage()
-
-for step in range(3):
-    # 1. 批量多轮 rollout：每个 prompt 复制成 NUM_GENERATIONS 条 trajectory
-    trajectories = build_trajectories(tool_manager.tool_infos())  # 见 cookbook
-    rolled = rollout(trajectories, tool_manager=tool_manager)
-
-    # 2. 读回 token 级 logprobs（top-1）与 reward
-    all_inputs, all_old_logps = [], []
-    for traj in rolled:
-        all_old_logps.append([lp[0][1] for lp in (traj.get('logprobs') or [])])
-        all_inputs.append(traj)
-    rewards = compute_rewards(rolled)   # 见 cookbook
-
-    # 3. GRPO 优势（组内相对）
-    advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-    # 4. 策略更新
-    model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
-    model.clip_grad_and_step()
+```bash
+pip install -e '.[async-rl,client,server]'
+export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+export CUDA_VISIBLE_DEVICES=0,1
+bash cookbook/client/async_rl/run_server.sh
 ```
 
-### 输出字段
+服务默认监听 `http://127.0.0.1:8000`。如果已有可用的服务端，可以跳过启动步骤；服务配置见 [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)。
 
-每条返回的 trajectory 在原 dict 基础上追加以下顶层字段：
+### 2. 运行单轮数学任务
 
-| 字段 | 含义 |
-|:----|:-----|
-| `messages` | 完整多轮对话（含 assistant 的 tool_calls 与 tool 响应轮） |
-| `logprobs` | 各可训练 token 的 top-1 logprob；本轮未采样 logprobs 时为 `None` |
-| `turns` | 实际经历的轮数（`<= max_turns`） |
-| `stop_reason` | `'stop'` / `'length'` / `'max_turns'` 之一 |
-| `truncated` | 是否因 `max_turns` 或长度上限被截断 |
+保持服务端运行，在另一个终端中从仓库根目录执行：
 
-### 常见错误
+```bash
+export TWINKLE_SERVER_URL=http://127.0.0.1:8000
+export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+python cookbook/client/async_rl/client_orchestrated_grpo.py
+```
 
-- 某条 trajectory 触发了工具调用，但没有提供 `tool_manager` → 抛 `ValueError`。构造时或按调用传入 `tool_manager` 即可。
-- 采样器的网络 / 超时错误会**原样抛出**（不被吞掉），重试、退避请在你的循环外层处理。
+示例默认下载 GSM8K 数据集。离线运行时，额外设置 `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`；连接已有服务端时，将地址和令牌换成对应配置。模板目录应与服务端模型匹配。
 
-完整可运行示例见 `cookbook/client/twinkle/multi_turn_rollout.py`。
+### 3. 运行多轮代码任务（可选）
+
+多轮示例需要已有的 AgentENV 服务和可用的 Python 环境模板。沿用上面的客户端配置，执行：
+
+```bash
+pip install 'e2b>=2.7'
+export AGENTENV_API_URL=http://your-agentenv-gateway:8080
+export AGENTENV_TEMPLATE=your-python-template
+python cookbook/client/async_rl/multi_turn_grpo.py
+```
+
+示例会让模型读取文件、运行测试并修复代码，再根据测试结果训练。每次尝试使用独立的工作区，初始化、评分和关闭环境都已在示例中处理；环境准备见 [Agentic RL 部署与训练](../Agentic%20RL部署与训练.md)。
+
+### 修改为自己的任务
+
+- 数学任务：修改脚本中的数据集和奖励函数。
+- 代码任务：修改 `multi_turn_grpo.py` 顶部的 `TASK`，包括待修复文件、测试和提示词。
+- 先使用示例默认训练参数；需要调整时，再修改脚本顶部的配置。训练日志会输出奖励和指标，并保存 LoRA 检查点。
+
+## 可训练多轮 Rollout（ClientMultiTurnRollout）
+
+需要自行编写多轮训练循环时，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它支持纯文本工具调用，返回可直接用于训练的完整轨迹。
+
+在已创建 rollout、轨迹、工具和策略检查点的异步训练循环中：
+
+```python
+rolled = await rollout.acall(
+    trajectories,
+    tool_manager=tool_managers,
+    adapter_uri=policy_uri,
+)
+```
+
+同步调用使用 `rollout(...)`，参数和结果相同。每条轨迹使用独立环境对应的 `ToolManager`；rollout 不会关闭你传入的环境。完整同步示例见 [multi_turn_rollout.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/multi_turn_rollout.py)。
