@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from twinkle.advantage import GAEAdvantage
@@ -27,6 +28,30 @@ def test_ppo_loss_aggregation_modes():
     torch.testing.assert_close(token_mean, torch.tensor(3.2))
     # seq-mean-token-mean: ((1 + 3) / 2 + (2 + 4 + 6) / 3) / 2
     torch.testing.assert_close(sequence_mean, torch.tensor(3.0))
+
+
+def test_ppo_micro_batch_scale_follows_each_loss_denominator():
+    rows = [
+        {'labels': [-100, 1, 2, 3], 'completion_mask': [0, 1, 0, 0]},
+        {'labels': [-100, 1, 2, 3], 'completion_mask': [0, 1, 1, 1]},
+    ]
+    assert PPOLoss().micro_batch_scale(rows, [0]) == pytest.approx(1 / 4)
+    assert PPOLoss(loss_agg_mode='seq-mean-token-mean').micro_batch_scale(rows, [0]) == pytest.approx(1 / 2)
+    # The critic scores all trainable labels, independently of the policy's completion_mask.
+    assert PPOValueLoss().micro_batch_scale(rows, [0]) == pytest.approx(1 / 2)
+    # Advanced GRPO/PPO controls use labels alone, matching _configured_grpo.
+    assert PPOLoss(log_entropy=True).micro_batch_scale(rows, [0]) == pytest.approx(1 / 2)
+
+
+@pytest.mark.parametrize('factory', [PPOLoss, PPOValueLoss])
+def test_ppo_micro_batch_scale_counts_packing_units_and_custom_ignore_index(factory):
+    rows = [[{'labels': [0, 1]}, {'labels': [2, 3]}], [{'labels': [0, 4]}]]
+    assert factory(ignore_index=0).micro_batch_scale(rows, [0]) == pytest.approx(3 / 4)
+
+
+@pytest.mark.parametrize('factory', [PPOLoss, PPOValueLoss])
+def test_ppo_micro_batch_scale_handles_no_scored_tokens(factory):
+    assert factory().micro_batch_scale([{'labels': [-100]}, {'labels': [-100]}], [0]) == 0.
 
 
 def test_value_loss_without_clipping():
