@@ -378,7 +378,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
         init_method = cls.__init__
 
-        @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
             _caller = _capture_caller()
             _ctx = f'{cls.__name__}.__init__'
@@ -392,9 +391,23 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 notify_exception(_infra()._notifier, _ctx, _e, _infra()._name)
                 raise
 
+        # Only a class with its own __init__ (a plain function) is metadata-
+        # copyable: a class that inherits object.__init__ carries the slot
+        # wrapper instead, and functools.wraps would pin __wrapped__ onto it.
+        # Ray's tracing injector unwraps every method to its original before
+        # setting __signature__, which then dies on the wrapper descriptor.
+        if inspect.isfunction(init_method):
+            new_init = functools.wraps(init_method)(new_init)
+
         def _new_init_body(self, _caller, *args, **kwargs):
             infra = _infra()
             if infra._mode == 'local':
+                # remote_group names the ray device group (the ray branch below
+                # consumes then pops it). Local mode never dispatches, so it is
+                # dropped here too: a component constructor must not receive it
+                # -- plain HF classes reject the unknown keyword inside
+                # from_pretrained kwargs.
+                kwargs.pop('remote_group', None)
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name and infra._device_group is not None:

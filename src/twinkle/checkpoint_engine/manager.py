@@ -615,4 +615,8 @@ class CheckpointEngineManager:
         with torch.no_grad():
             for name, policy_param in policy_state.items():
                 ref_param = ref_state[name]
-                ref_param.data.mul_(alpha).add_(policy_param.data, alpha=1.0 - alpha)
+                # A local pair may straddle devices (a policy on the GPU, a frozen
+                # reference kept on CPU): blend on the reference's device. A
+                # same-device pair pays only a no-op ``to``.
+                policy_data = policy_param.data.to(ref_param.device)
+                ref_param.data.mul_(alpha).add_(policy_data, alpha=1.0 - alpha)
