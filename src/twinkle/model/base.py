@@ -474,10 +474,18 @@ class TrainableModel(ABC):
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         return backend in ('nccl', 'hccl')
 
-    def _try_init_process_group(self):
+    def _try_init_process_group(self, force: bool = False):
+        """Initialise the default process group if nothing has yet.
+
+        ``force`` serves the Megatron backends: mcore's
+        ``initialize_model_parallel`` asserts an initialised group even at
+        world_size==1, so a single-rank MegatronModel must init unconditionally
+        (the ray worker env carries MASTER_ADDR/PORT/RANK/WORLD_SIZE for every
+        group size; torchrun does the same locally).
+        """
         import torch
         import torch.distributed as dist
-        if not dist.is_initialized() and Platform.get_world_size() > 1:
+        if not dist.is_initialized() and (force or Platform.get_world_size() > 1):
             torch_util.set_device()
             backend = Platform.device_backend()
             if backend == 'hccl':

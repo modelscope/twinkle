@@ -116,7 +116,8 @@ class MultiLoraMegatronModel(MegatronModel):
         if MegatronStrategy.uses_fsdp(ddp_config):
             os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
-        self._try_init_process_group()
+        # mcore requires an initialised process group even at world_size==1.
+        self._try_init_process_group(force=True)
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
 
