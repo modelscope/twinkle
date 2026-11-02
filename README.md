@@ -130,7 +130,7 @@ our [documentation](https://modelscope.github.io/twinkle-web/docs/usage-guide/tr
 | Hardware Environment | Notes                                                            |
 | -------------------- | ---------------------------------------------------------------- |
 | Nvidia GPUs          | ✅ Support for BF16/Flash-Attn may be incomplete in earlier GPUs |
-| Ascend NPU           | ✅ FP8 is not supported on A2 and A3 due to hardware limitations |
+| Huawei Ascend NPU    | ✅ FP8 is not supported on A2 and A3 due to hardware limitations |
 | PPU                  | ✅                                                               |
 | CPU                  | Supports partial components like dataset, dataloader             |
 
