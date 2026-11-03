@@ -426,6 +426,21 @@ def _make_env(recipe):
     return env
 
 
+def test_attempt_advertises_required_tool_arguments(recipe, monkeypatch):
+    env = _make_env(recipe)
+    env.reset = lambda: None
+    monkeypatch.setattr(recipe, '_TaskAgentEnv', lambda *args, **kwargs: env)
+    created = []
+    attempt = recipe._create_attempt(recipe.TASK, created.append)
+    assert created == [env]
+    functions = {info['function']['name']: info['function'] for info in attempt.trajectory['tools']}
+    assert set(functions) == {'read_file', 'write_file', 'run_command'}
+    assert functions['read_file']['parameters']['required'] == ['path']
+    assert functions['write_file']['parameters']['required'] == ['path', 'content']
+    assert functions['run_command']['parameters']['required'] == ['command']
+    assert all(fn['parameters']['properties'] for fn in functions.values())
+
+
 def test_file_side_effect_response_loss_is_unknown_and_not_retried(recipe):
     env = _make_env(recipe)
     env.sandbox.files.write_error = ConnectionError('response lost')

@@ -18,7 +18,7 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.envs import AgentEnv, EnvTool
-from twinkle_agentic.envs.base import StepResult
+from twinkle_agentic.envs.base import DEFAULT_TOOLS, StepResult
 from twinkle_agentic.tools.tool_manager import ToolManager
 from twinkle_client.rollout import ClientMultiTurnRollout
 
@@ -244,7 +244,7 @@ def _create_attempt(task: CodeTask, on_created) -> _Attempt:
         env.ensure_idle()
         if result.info.get('error'):
             raise _TaskInfrastructureError('setup', env.sandbox_id, str(result.info['error']))
-    manager = ToolManager([EnvTool(env, name) for name in ('run_command', 'read_file', 'write_file')])
+    manager = ToolManager(EnvTool.from_schemas(env, DEFAULT_TOOLS))
     trajectory = {
         'messages': [{'role': 'user', 'content': task.prompt}],
         'tools': manager.tool_infos(),

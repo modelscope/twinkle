@@ -90,8 +90,7 @@ def _prepare_recipe(config):
             for path, content in [(task.filename, task.solution), ('smoke_test.py', task.smoke_test)]:
                 env.step('write_file', {'path': path, 'content': content})
                 env.ensure_idle()
-            manager = recipe.ToolManager([recipe.EnvTool(env, name) for name in
-                                          ('run_command', 'read_file', 'write_file')])
+            manager = recipe.ToolManager(recipe.EnvTool.from_schemas(env, env.tools()))
             return recipe._Attempt(env, manager, {
                 'messages': [{'role': 'user', 'content': task.prompt +
                               '\nThe workspace uses virtual files. Run scripts with python smoke_test.py; '

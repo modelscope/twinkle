@@ -402,7 +402,8 @@ def test_cancel_runner_drains_real_recipe_call_sites_without_a_provider(stage, t
         return [client], Model(), sampler, Rollout(), kwargs_stop_event
 
     monkeypatch.setattr(recipe, '_TaskAgentEnv', Env)
-    monkeypatch.setattr(recipe, 'EnvTool', lambda env, name: SimpleNamespace(env=env))
+    monkeypatch.setattr(recipe, 'EnvTool', SimpleNamespace(
+        from_schemas=lambda env, schemas: [SimpleNamespace(env=env) for _ in schemas]))
     monkeypatch.setattr(recipe, 'ToolManager', Manager)
     monkeypatch.setattr(validation, '_load_recipe', lambda: recipe)
     monkeypatch.setattr(validation, '_build_runtime', build)
@@ -414,6 +415,39 @@ def test_cancel_runner_drains_real_recipe_call_sites_without_a_provider(stage, t
     assert result['stage_reached'] is (stage != 'unreached')
     assert len(created) == 4 and all(env.closed for env in created)
     assert client.closed
+
+
+def test_openenv_attempt_keeps_virtual_workspace_tool_schemas(tmp_path, monkeypatch):
+    from . import validation
+    from . import openenv_adapter
+
+    recipe = _load_recipe()
+
+    class Env:
+        def __init__(self, task, **kwargs):
+            self.task = task
+
+        def reset(self):
+            return None
+
+        def ensure_idle(self):
+            return None
+
+        def step(self, *args, **kwargs):
+            return None
+
+        def tools(self):
+            return recipe.DEFAULT_TOOLS
+
+    monkeypatch.setattr(validation, '_load_recipe', lambda: recipe)
+    monkeypatch.setattr(openenv_adapter, 'OpenEnvTaskEnv', Env)
+    config = replace(_config(tmp_path), environment_backend='openenv', openenv_url='http://not-used')
+    prepared = validation._prepare_recipe(config)
+    attempt = prepared._create_attempt(prepared.TASK, lambda env: None)
+    functions = {info['function']['name']: info['function'] for info in attempt.trajectory['tools']}
+    assert functions['write_file']['parameters']['required'] == ['path', 'content']
+    assert functions['run_command']['parameters']['required'] == ['command']
+    assert functions['read_file']['parameters']['properties']['path']['type'] == 'string'
 
 
 def test_openenv_cli_and_results_cannot_claim_agentenv_security(tmp_path):
