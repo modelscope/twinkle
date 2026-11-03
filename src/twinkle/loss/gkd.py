@@ -219,7 +219,8 @@ class GKDLoss(Loss):
             num_valid = student_logits.size(0)
 
         if num_valid == 0:
-            return student_logits.new_zeros(())
+            # Keep the empty partition connected to the graph so its backward is a no-op, not an error.
+            return student_logits.sum()
 
         num_valid_int = int(num_valid) if isinstance(num_valid, int) else num_valid.item()
         total_loss = student_logits.new_zeros(())

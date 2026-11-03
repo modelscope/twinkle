@@ -49,6 +49,12 @@ from .strategy import MegatronStrategy
 logger = get_logger()
 
 
+def _first_optimizer_lr(optimizer) -> float:
+    """The learning rate of any megatron optimizer: a ChainedOptimizer fans out per model chunk."""
+    chained = getattr(optimizer, 'chained_optimizers', None) or [optimizer]
+    return chained[0].config.lr
+
+
 def _resolve_task_context(model, task):
     """The per-forward Patch for ``task``: 'embedding' swaps the output_layer for identity
     (with TP/SP gather) and pools to ``[n_seqs, hidden]``; causal_lm/seq_cls/reranker/value
@@ -90,7 +96,7 @@ class MegatronOptimizerGroup(BaseOptimizerGroup):
         _lrs = []
         if self.optimizer is None:
             return _lrs
-        _default_lr = self.optimizer.chained_optimizers[0].config.lr
+        _default_lr = _first_optimizer_lr(self.optimizer)
         for param_group in self.optimizer.param_groups:
             _lrs.append(param_group.get('lr', _default_lr))
         return _lrs
@@ -2050,7 +2056,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         if optimizer_config.optimizer:
             expr += f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
-            expr += f'Learning rate: {optimizer_config.optimizer.chained_optimizers[0].config.lr}\n'
+            expr += f'Learning rate: {_first_optimizer_lr(optimizer_config.optimizer)}\n'
         if optimizer_config.lr_scheduler:
             expr += f'LR scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'

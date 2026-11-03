@@ -2530,8 +2530,25 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+        self._patch_frozen_towers(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _patch_frozen_towers(self, model) -> None:
+        """Run a fully frozen vision tower without autograd (legacy swift #10214)."""
+        prefixes = list(self.model_arch.get('vision_tower') or [])
+        if not prefixes:
+            return
+        from twinkle.model.transformers.frozen_tower import patch_frozen_module
+        from twinkle.utils import deep_getattr
+
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        for prefix in prefixes:
+            tower = deep_getattr(base_model, prefix)
+            if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
+                patch_frozen_module(tower)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:

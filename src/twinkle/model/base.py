@@ -470,6 +470,11 @@ class TrainableModel(ABC):
             freeze_regex=freeze_regex,
             trainable_names=trainable_names,
             trainable_regex=trainable_regex)
+        # A just-frozen tower must stop building a graph (legacy #10214); backends without the helper skip it.
+        patch_frozen_towers = getattr(self, '_patch_frozen_towers', None)
+        if patch_frozen_towers is not None:
+            for module in modules:
+                patch_frozen_towers(module)
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         return backend in ('nccl', 'hccl')

@@ -293,13 +293,28 @@ class MegatronStrategy:
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
-        from megatron.core.distributed import FullyShardedDataParallel as MegatronFSDP
         from megatron.core.transformer.module import Float16Module
         from torch.nn.parallel import DistributedDataParallel as TorchDDP
+        # The distributed wrapper is a factory function here, so isinstance() needs the real classes.
+        try:
+            from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (FullyShardedDataParallelV1,
+                                                                          FullyShardedDataParallelV2)
+            fsdp_wrappers: tuple = (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        except ImportError:  # pragma: no cover - depends on the installed megatron-core version
+            from megatron.core.distributed import FullyShardedDataParallel
+            fsdp_wrappers = (FullyShardedDataParallel, )
+        try:
+            # V1 delegates to this inner module; the chunk carrying vp_stage is one `.module` further down.
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP as MegatronFSDPInner
+            fsdp_wrappers = (*fsdp_wrappers, MegatronFSDPInner)
+        except ImportError:  # pragma: no cover
+            pass
         _models = []
+        wrapper_types = tuple(
+            wrapper for wrapper in (MegatronDDP, *fsdp_wrappers, TorchDDP, Float16Module) if isinstance(wrapper, type))
         for _model in model:
             # Unwrap DDP first
-            while isinstance(_model, (MegatronDDP, MegatronFSDP, TorchDDP, Float16Module)):
+            while isinstance(_model, wrapper_types):
                 _model = _model.module
             _models.append(_model)
         return _models
@@ -381,9 +396,9 @@ class MegatronStrategy:
                 module=_model,
             )
 
-            # Broadcast params from data parallel src rank
-            # In torchrun mode, all ranks enter here simultaneously, so this works
-            wrapped_model.broadcast_params()
+            # DDP only: FSDP shards the parameters, so a DP-rank broadcast is meaningless (and unsupported).
+            if not MegatronStrategy.uses_fsdp(ddp_config):
+                wrapped_model.broadcast_params()
             wrapped_models.append(wrapped_model)
 
         return wrapped_models
