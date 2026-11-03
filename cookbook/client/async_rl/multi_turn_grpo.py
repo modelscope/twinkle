@@ -388,7 +388,8 @@ async def train() -> None:
             stop_event=stop_event,
         )
         await _await_operation(model.set_loss, 'GRPOLoss', epsilon=0.2, beta=0.0, stop_event=stop_event)
-        await _await_operation(model.set_optimizer, 'AdamW', lr=2e-5, stop_event=stop_event)
+        # Adam works with both the Transformers and Megatron training backends.
+        await _await_operation(model.set_optimizer, 'Adam', lr=2e-5, stop_event=stop_event)
         await _await_operation(model.set_processor, 'InputProcessor', stop_event=stop_event)
         await _await_operation(
             model.set_template, 'Qwen3_5Template', model_id=TEMPLATE_MODEL_ID, stop_event=stop_event)

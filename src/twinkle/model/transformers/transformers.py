@@ -1934,8 +1934,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
         # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
-        # parameters to be missed by the optimizer.
-        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
+        # parameters to be missed by the optimizer. The trailing boundary keeps lora_2 from
+        # also selecting lora_20..lora_29 when many adapter slots are resident.
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}(?:\.|$)')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():

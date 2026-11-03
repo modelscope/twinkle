@@ -309,7 +309,8 @@ async def _build_runtime(config, recipe):
             stop_event=stop_event,
         )
         await recipe._await_operation(model.set_loss, 'GRPOLoss', epsilon=0.2, beta=0.0, stop_event=stop_event)
-        await recipe._await_operation(model.set_optimizer, 'AdamW', lr=2e-5, stop_event=stop_event)
+        # Adam is accepted by both Transformers and Megatron training backends.
+        await recipe._await_operation(model.set_optimizer, 'Adam', lr=2e-5, stop_event=stop_event)
         await recipe._await_operation(model.set_processor, 'InputProcessor', stop_event=stop_event)
         await recipe._await_operation(
             model.set_template, 'Qwen3_5Template', model_id=config.template_model_id, stop_event=stop_event)
