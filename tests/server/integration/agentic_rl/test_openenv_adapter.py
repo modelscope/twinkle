@@ -116,15 +116,15 @@ def test_confirmed_command_failure_keeps_exception_without_host_traceback():
     env.close()
 
 
-def test_remote_interpreter_timeout_is_not_a_candidate_low_reward():
+def test_remote_interpreter_timeout_observation_is_a_confirmed_candidate_failure():
     env, client = environment()
     client.execute = lambda action: SimpleNamespace(
         observation=SimpleNamespace(exit_code=1, stdout="", stderr="TimeoutError: evaluation timed out")
     )
-    with pytest.raises(OpenEnvTaskError, match="execution_timeout"):
-        env.step("run_command", {"command": 'python -c "while True: pass"'})
-    with pytest.raises(OpenEnvTaskError):
-        env.ensure_idle()
+    result = env.step("run_command", {"command": 'python -c "while True: pass"'})
+    assert result.observation.startswith('[exit code: 1]')
+    env.ensure_idle()
+    env.close()
 
 
 def test_verifier_uses_fresh_callable_names_without_poisoning_smoke_state():

@@ -68,11 +68,9 @@ class OpenEnvTaskEnv(Env):
                 observation = result.observation
                 if type(observation.exit_code) is not int:
                     self._fail(stage)
-                # A remote interpreter timeout may leave its evaluation thread running.
-                if observation.exit_code and (
-                    "TimeoutError" in observation.stderr or "timed out" in observation.stderr.lower()
-                ):
-                    self._fail(stage + "_execution_timeout")
+                # The pinned smolagents timeout wrapper exits its executor context before
+                # returning, so a received observation is a confirmed candidate failure.
+                # Transport exceptions below remain unconfirmed and prevent session reuse.
                 return observation
             except OpenEnvTaskError:
                 raise
