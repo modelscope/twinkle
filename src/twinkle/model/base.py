@@ -23,8 +23,6 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import LRScheduler
     from transformers import PreTrainedModel, PretrainedConfig
 
-    from .micro_batch import MicroBatchConfig
-
 
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
     """Copy the run-level CLI metadata into a completed checkpoint on the master rank."""
@@ -350,11 +348,6 @@ class TrainableModel(ABC):
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
 
-    def _dp_balance_micro_batch_config(self, kwargs: Dict[str, Any]) -> Optional['MicroBatchConfig']:
-        """The micro-batch layout the workers will plan for a call with these keyword arguments."""
-        from .micro_batch import MicroBatchConfig
-        return MicroBatchConfig.from_kwargs(dict(kwargs))
-
     def _dp_balance_call(self, method: str, args: tuple, kwargs: Dict[str, Any]):
         """Driver side of ``remote_function(dp_balance=True)``.
 
@@ -363,6 +356,9 @@ class TrainableModel(ABC):
         batch keeps its order, so the result needs no restoring.
         """
         from .dp_balance import batch_aligned, estimate_workload, plan_dp_balance
+        from .micro_batch import MicroBatchConfig
+        if getattr(self, '_dp_balance_off', False):
+            return None
         mesh = getattr(self, 'device_mesh', None)
         inputs = kwargs.get('inputs')
         if mesh is None or mesh.data_world_size <= 1 or kwargs.get('return_logits'):
@@ -376,16 +372,23 @@ class TrainableModel(ABC):
             # slice_dp also slices this list on its own, so its entries cannot be matched to samples.
             return None
         spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
-        if not spec['enabled'] or spec['group_size'] is None:
+        if not spec['enabled']:
+            # Fixed at construction, so later calls skip the blocking spec round trip.
+            self._dp_balance_off = True
             return None
+        if spec['group_size'] is None:
+            return None
+        workload_fn = estimate_workload
+        if spec['hidden_size'] is not None:
+            workload_fn = functools.partial(estimate_workload, hidden_size=spec['hidden_size'])
         try:
             plan = plan_dp_balance(
                 inputs,
                 mesh.data_world_size,
                 padding_free=spec['padding_free'],
-                micro_batch_config=self._dp_balance_micro_batch_config(kwargs),
+                micro_batch_config=MicroBatchConfig.from_kwargs(dict(kwargs)),
                 group_size=spec['group_size'],
-                workload_fn=functools.partial(estimate_workload, hidden_size=spec['hidden_size']),
+                workload_fn=workload_fn,
             )
         except ValueError:
             # Options or batch shapes the model itself rejects; let it report them.

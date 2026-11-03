@@ -1165,7 +1165,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._control = control
         wrapper._replay = replay
         wrapper._worker_selector = worker_selector
-        wrapper._dp_balance = dp_balance
         if enable_continous_work:
             # Attached to the class by remote_class, and called instead of this
             # method when the driver routes requests worker by worker.
