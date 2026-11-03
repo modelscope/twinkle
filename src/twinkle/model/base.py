@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import functools
 import os
 import re
 import shutil
@@ -355,21 +354,14 @@ class TrainableModel(ABC):
         keyword for the workers, or ``None`` to dispatch the call unchanged. ``plan`` is ``None`` when the
         batch keeps its order, so the result needs no restoring.
         """
-        from .dp_balance import batch_aligned, estimate_workload, plan_dp_balance
-        from .micro_batch import MicroBatchConfig
+        from .dp_balance import call_lengths, plan_call
         if getattr(self, '_dp_balance_off', False):
             return None
         mesh = getattr(self, 'device_mesh', None)
-        inputs = kwargs.get('inputs')
-        if mesh is None or mesh.data_world_size <= 1 or kwargs.get('return_logits'):
-            # Raw logits of packed inputs are laid out per rank, so they cannot be put back in order.
+        if mesh is None or mesh.data_world_size <= 1:
             return None
-        if not isinstance(inputs, list) or not inputs or not all(
-                isinstance(model_input, dict) and 'input_ids' in model_input for model_input in inputs):
-            # Trajectories, packed rows and group rows: their lengths are only known after encoding.
-            return None
-        if not batch_aligned(args, kwargs, len(inputs)):
-            # slice_dp also slices this list on its own, so its entries cannot be matched to samples.
+        lengths = call_lengths(args, kwargs)
+        if lengths is None:
             return None
         spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
         if not spec['enabled']:
@@ -378,28 +370,59 @@ class TrainableModel(ABC):
             return None
         if spec['group_size'] is None:
             return None
-        workload_fn = estimate_workload
-        if spec['hidden_size'] is not None:
-            workload_fn = functools.partial(estimate_workload, hidden_size=spec['hidden_size'])
-        try:
-            plan = plan_dp_balance(
-                inputs,
-                mesh.data_world_size,
-                padding_free=spec['padding_free'],
-                micro_batch_config=MicroBatchConfig.from_kwargs(dict(kwargs)),
-                group_size=spec['group_size'],
-                workload_fn=workload_fn,
-            )
-        except ValueError:
-            # Options or batch shapes the model itself rejects; let it report them.
-            return None
-        if not plan.metrics:
+        plan = plan_call(lengths, mesh.data_world_size, spec, kwargs)
+        if plan is None:
             return None
         if plan.reorders:
             args, kwargs = plan.reorder_call(args, kwargs)
         kwargs = dict(kwargs, _dp_balance={'reordered': plan.reorders, 'metrics': plan.metrics})
         return (plan if plan.reorders else None), args, kwargs
 
+    def _dp_balance_local(self, run: Callable, args: tuple, kwargs: Dict[str, Any]):
+        """Local-mode side of ``remote_function(dp_balance=True)``, where each rank holds only its own slice.
+
+        The ranks gather their sequence lengths and plan the joined batch exactly as the Ray driver would.
+        When the plan reorders, they swap samples so each rank runs its share of the reordered batch, then
+        send every per-sample output back to the rank that holds its input. Each decision below is made
+        alike on all ranks, from configuration or gathered data, so the collectives never diverge.
+        """
+        import torch.distributed as dist
+        from .dp_balance import call_leaves, call_lengths, exchange_call, leaf_layout, plan_call, restore_rank_outputs
+        from .dp_balance import to_cpu
+        mesh = getattr(self, 'device_mesh', None)
+        if (getattr(self, '_dp_balance_off', False) or mesh is None or mesh.data_world_size <= 1
+                or not dist.is_initialized()
+                or sorted(mesh.mesh.flatten().tolist()) != list(range(dist.get_world_size()))):
+            return run(*args, **kwargs)
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled']:
+            self._dp_balance_off = True
+            return run(*args, **kwargs)
+        if spec['group_size'] is None:
+            return run(*args, **kwargs)
+
+        def all_gather(value):
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, value)
+            # One rank per data rank, in data-rank order; TP / SP peers hold the same slice.
+            return [gathered[rank] for rank in mesh.get_collect_ranks()]
+
+        lengths = call_lengths(args, kwargs)
+        summaries = all_gather(None if lengths is None else (lengths, leaf_layout(call_leaves(args, kwargs))))
+        if (any(summary is None for summary in summaries) or len({len(summary[0]) for summary in summaries}) != 1
+                or any(summary[1] != summaries[0][1] for summary in summaries)):
+            # Joining the slices back into the batch get_slice cut needs equal slices with the same fields.
+            return run(*args, **kwargs)
+        plan = plan_call([length for summary in summaries for length in summary[0]], len(summaries), spec, kwargs)
+        if plan is None:
+            return run(*args, **kwargs)
+        balance = {'reordered': plan.reorders, 'metrics': plan.metrics}
+        if not plan.reorders:
+            return run(*args, **dict(kwargs, _dp_balance=balance))
+        rank_leaves = all_gather(to_cpu(call_leaves(args, kwargs)))
+        args, kwargs = exchange_call(plan, rank_leaves, mesh.data_rank, args, kwargs)
+        output = run(*args, **dict(kwargs, _dp_balance=balance))
+        return restore_rank_outputs(output, all_gather(to_cpu(output)), plan, mesh.data_rank)
     def upload_to_hub(self,
                       checkpoint_dir: str,
                       hub_model_id: str,

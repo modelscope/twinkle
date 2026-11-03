@@ -359,7 +359,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
         self.device_mesh = device_mesh
-        # Read by the driver through _dp_balance_spec: reorder slice_dp batches to even out DP workloads.
+        # Read through _dp_balance_spec: reorder slice_dp batches to even out DP workloads.
         self._dp_balance_enabled = dp_balance
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
