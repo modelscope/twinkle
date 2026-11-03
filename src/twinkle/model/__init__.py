@@ -5,6 +5,7 @@ from twinkle._lazy_module import _LazyModule
 
 if TYPE_CHECKING:
     from .base import ModelLoaderProtocol, TrainableModel
+    from .dp_balance import DPBalancePlan, plan_dp_balance
     from .megatron import MegatronModel, MultiLoraMegatronModel
     from .micro_batch import MicroBatchConfig
     from .state_dict_utils import (MODULES_TO_SAVE_SEGMENT, collect_local_state, is_lora_state_key,
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 else:
     _import_structure = {
         'base': ['ModelLoaderProtocol', 'TrainableModel'],
+        'dp_balance': ['DPBalancePlan', 'plan_dp_balance'],
         'micro_batch': ['MicroBatchConfig'],
         'state_dict_utils': [
             'MODULES_TO_SAVE_SEGMENT', 'collect_local_state', 'is_lora_state_key', 'is_saveable_adapter_key',
