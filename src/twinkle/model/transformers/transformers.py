@@ -35,6 +35,7 @@ from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, Sampl
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
+from twinkle.loss.base import dp_balance_group_size
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.state_dict_utils import normalize_adapter_keys
@@ -345,6 +346,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             init_strategy: Optional[str] = None,
             use_liger_kernel: bool = False,
             liger_kernel_config: Optional[Dict[str, Any]] = None,
+            dp_balance: bool = True,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
@@ -357,6 +359,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
         self.device_mesh = device_mesh
+        # Read by the driver through _dp_balance_spec: reorder slice_dp batches to even out DP workloads.
+        self._dp_balance_enabled = dp_balance
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
@@ -904,6 +908,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.dp_balance_reordered = False
         self._lazy_wrap_model()
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
@@ -1010,7 +1015,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
     # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
     # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, dp_balance=True)
     @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
@@ -1030,6 +1035,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         config = MicroBatchConfig.from_kwargs(kwargs)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        balance = kwargs.pop('_dp_balance', None)
+        optimizer_config.dp_balance_reordered = bool(balance and balance['reordered'])
         inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
         if config is None:
             return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
@@ -1333,6 +1340,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """Calculate one selected loss, optionally pre-normalized for a multi-RPC transaction."""
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.dp_balance_reordered and any(isinstance(value, list) for value in kwargs.values()):
+            raise ValueError(
+                'forward_only reordered this batch across DP ranks to balance their workload, so per-sample '
+                'lists passed to calculate_loss would no longer line up with it. Pass them to forward_only, or '
+                'build the model with dp_balance=False.')
         loss_instance: Loss = optimizer_config.get_loss(loss_key)
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
         status = optimizer_config.train_status if self.model.training else optimizer_config.eval_status
@@ -1599,7 +1611,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             **kwargs,
         )
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, dp_balance=True)
     @timed
     def forward_backward(
         self,
@@ -1613,6 +1625,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        balance = kwargs.pop('_dp_balance', None)
+        optimizer_config.dp_balance_reordered = False
+        if balance is not None:
+            optimizer_config.record_dp_balance(balance['metrics'])
         completing_pending = optimizer_config.prepare_backward_transaction(finalize_gradients, loss_weight)
         transactional = not finalize_gradients or completing_pending
         requested_sync = kwargs.pop('sync_gradients', None)
@@ -2481,6 +2497,22 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.require_finalized('calculate metrics')
         return optimizer_config.calculate_metrics(is_training)
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def _dp_balance_spec(self, adapter_name: Optional[str] = None, loss_key: Optional[str] = None) -> Dict[str, Any]:
+        """What the driver needs to plan a DP-balanced order for ``forward_backward`` / ``forward_only``."""
+        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
+        try:
+            loss = optimizer_config.get_loss(loss_key)
+        except ValueError:
+            loss = None
+        text_config = self.hf_config.get_text_config() if hasattr(self.hf_config, 'get_text_config') else self.hf_config
+        return {
+            'enabled': getattr(self, '_dp_balance_enabled', False),
+            'padding_free': bool(getattr(optimizer_config.processor, 'padding_free', False)),
+            'hidden_size': getattr(text_config, 'hidden_size', None) or 4096,
+            'group_size': dp_balance_group_size(loss),
+        }
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'

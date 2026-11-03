@@ -742,6 +742,15 @@ def _stash_channels(result: Any, channels: Sequence[Union[int, str]]) -> Any:
     raise TypeError(f'stash requires a tuple or dict return value, got {type(result).__name__}')
 
 
+def _collect_in_input_order(collect, plan):
+    """Collect as ``collect`` does, then undo the DP-balance reordering of the call's batch."""
+
+    def collect_func(result, device_mesh=None):
+        return plan.restore_outputs(_collect_func(collect, result, device_mesh))
+
+    return collect_func
+
+
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
@@ -755,7 +764,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     control: bool = False,
                     replay: bool = False,
                     worker_selector: Optional[str] = None,
-                    stash: Optional[Sequence[Union[int, str]]] = None):
+                    stash: Optional[Sequence[Union[int, str]]] = None,
+                    dp_balance: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -820,6 +830,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             whole. The caller's collect then materialises only the rest of the container, and the
             next remote call dereferences the stashed references at its worker. Local mode has no
             remote path, so the natural value passes through untouched.
+        dp_balance: Only with ``dispatch='slice_dp'``. Before slicing, the driver asks the instance's
+            ``_dp_balance_call(name, args, kwargs)`` for a ``DPBalancePlan`` that evens out the
+            per-rank workload, reorders the batch-aligned arguments with it, and puts the
+            batch-aligned fields of the collected result back in the caller's order. Calls whose
+            arguments hold object refs are dispatched unchanged.
 
     Wrapped continuous-work calls also accept ``_session_ids``, a list or tuple of
     non-empty session strings (or ``None`` for ordinary load balancing), aligned
@@ -995,6 +1010,15 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                                            _batch_len,
                                                            _rgt,
                                                            on_dispatched=_finish_dispatch, session_ids=session_ids)
+                        _call_collect = collect
+                        if (dp_balance and _dispatch == 'slice_dp' and not _subset
+                                and not RayHelper.has_ref(args, kwargs)):
+                            balance_call = getattr(self, '_dp_balance_call', None)
+                            balanced = balance_call(func.__name__, args, kwargs) if balance_call else None
+                            if balanced is not None:
+                                _plan, args, kwargs = balanced
+                                if _plan is not None:
+                                    _call_collect = _collect_in_input_order(collect, _plan)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -1028,7 +1052,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             result = ray.get(result)
                         # This is a result future, call it to get the actual result
                         result_func = RayHelper.do_get_and_collect_func(
-                            _collect_func, collect, result, device_mesh, timeout=_rgt)
+                            _collect_func, _call_collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = infra._lazy_collect
                         recorder = getattr(self, '_record_worker_configuration', None)
                         if func.__name__ == '__iter__':
@@ -1141,6 +1165,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._control = control
         wrapper._replay = replay
         wrapper._worker_selector = worker_selector
+        wrapper._dp_balance = dp_balance
         if enable_continous_work:
             # Attached to the class by remote_class, and called instead of this
             # method when the driver routes requests worker by worker.

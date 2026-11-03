@@ -123,6 +123,36 @@ def _imbalance(values: Sequence[int]) -> float:
     return max(values) / mean if mean else 1.0
 
 
+def _reorder(value: Any, order: list[int], batch_size: int) -> Any:
+    # Mirrors what slice_dp slices: lists and tensors along dim 0, and dicts of them, key by key.
+    import torch
+
+    if isinstance(value, dict):
+        return {key: _reorder(item, order, batch_size) for key, item in value.items()}
+    if isinstance(value, list) and len(value) == batch_size:
+        return [value[index] for index in order]
+    if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
+        return value[order]
+    return value
+
+
+def _sliced_with_other_size(value: Any, batch_size: int) -> bool:
+    import torch
+
+    if isinstance(value, dict):
+        return any(_sliced_with_other_size(item, batch_size) for item in value.values())
+    if isinstance(value, list):
+        return len(value) != batch_size
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        return value.shape[0] != batch_size
+    return False
+
+
+def batch_aligned(args: tuple, kwargs: dict[str, Any], batch_size: int) -> bool:
+    """Whether every argument ``slice_dp`` slices has one entry per sample, so a reorder keeps them aligned."""
+    return not any(_sliced_with_other_size(value, batch_size) for value in (*args, *kwargs.values()))
+
+
 @dataclass(frozen=True)
 class DPBalancePlan:
     """A batch permutation for ``slice_dp`` dispatch plus before/after balance metrics."""
@@ -142,6 +172,25 @@ class DPBalancePlan:
         if hasattr(values, "shape"):
             return values[self.order]
         raise TypeError(f"cannot reorder a field of type {type(values).__name__}")
+
+    @property
+    def reorders(self) -> bool:
+        return self.order != list(range(len(self.order)))
+
+    def reorder_call(self, args: tuple, kwargs: dict[str, Any]) -> tuple[tuple, dict[str, Any]]:
+        """Reorder every batch-aligned argument of a ``slice_dp`` call, the way ``slice_dp`` would slice it."""
+        size = len(self.order)
+        return (
+            tuple(_reorder(arg, self.order, size) for arg in args),
+            {key: _reorder(value, self.order, size) for key, value in kwargs.items()},
+        )
+
+    def restore_outputs(self, outputs: Any) -> Any:
+        """Put the batch-aligned fields of a collected result back in the caller's order."""
+        inverse = [0] * len(self.order)
+        for position, index in enumerate(self.order):
+            inverse[index] = position
+        return _reorder(outputs, inverse, len(self.order))
 
 
 def plan_dp_balance_for_lengths(

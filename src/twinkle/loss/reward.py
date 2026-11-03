@@ -34,6 +34,7 @@ class RewardLoss(Loss):
     # Reads outputs['logits'] (the [B, 1] score head), not per-token logps.
     require_logits = True
     require_logps = False
+    dp_balance_group_size = 2
 
     def __init__(self, center_rewards_coefficient: float = 0.0, **kwargs):
         super().__init__()

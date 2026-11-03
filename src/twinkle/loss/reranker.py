@@ -73,6 +73,8 @@ class ListwiseRerankerLoss(Loss):
     require_logits = True
     require_entropy = False
     require_logps = False
+    # A query's candidates form a group of varying size, opened by its positive.
+    dp_balance_group_size = None
 
     def __init__(self, temperature: float = 1.0, min_group_size: int = 2, **kwargs):
         if temperature <= 0:
