@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import functools
 import os
 import re
 import shutil
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
     from transformers import PreTrainedModel, PretrainedConfig
+
+    from .micro_batch import MicroBatchConfig
 
 
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
@@ -477,6 +480,53 @@ class TrainableModel(ABC):
         return not any(
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
+
+    def _dp_balance_micro_batch_config(self, kwargs: Dict[str, Any]) -> Optional['MicroBatchConfig']:
+        """The micro-batch layout the workers will plan for a call with these keyword arguments."""
+        from .micro_batch import MicroBatchConfig
+        return MicroBatchConfig.from_kwargs(dict(kwargs))
+
+    def _dp_balance_call(self, method: str, args: tuple, kwargs: Dict[str, Any]):
+        """Driver side of ``remote_function(dp_balance=True)``.
+
+        Returns ``(plan, args, kwargs)`` with the batch-aligned arguments reordered and a ``_dp_balance``
+        keyword for the workers, or ``None`` to dispatch the call unchanged. ``plan`` is ``None`` when the
+        batch keeps its order, so the result needs no restoring.
+        """
+        from .dp_balance import batch_aligned, estimate_workload, plan_dp_balance
+        mesh = getattr(self, 'device_mesh', None)
+        inputs = kwargs.get('inputs')
+        if mesh is None or mesh.data_world_size <= 1 or kwargs.get('return_logits'):
+            # Raw logits of packed inputs are laid out per rank, so they cannot be put back in order.
+            return None
+        if not isinstance(inputs, list) or not inputs or not all(
+                isinstance(model_input, dict) and 'input_ids' in model_input for model_input in inputs):
+            # Trajectories, packed rows and group rows: their lengths are only known after encoding.
+            return None
+        if not batch_aligned(args, kwargs, len(inputs)):
+            # slice_dp also slices this list on its own, so its entries cannot be matched to samples.
+            return None
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled'] or spec['group_size'] is None:
+            return None
+        try:
+            plan = plan_dp_balance(
+                inputs,
+                mesh.data_world_size,
+                padding_free=spec['padding_free'],
+                micro_batch_config=self._dp_balance_micro_batch_config(kwargs),
+                group_size=spec['group_size'],
+                workload_fn=functools.partial(estimate_workload, hidden_size=spec['hidden_size']),
+            )
+        except ValueError:
+            # Options or batch shapes the model itself rejects; let it report them.
+            return None
+        if not plan.metrics:
+            return None
+        if plan.reorders:
+            args, kwargs = plan.reorder_call(args, kwargs)
+        kwargs = dict(kwargs, _dp_balance={'reordered': plan.reorders, 'metrics': plan.metrics})
+        return (plan if plan.reorders else None), args, kwargs
 
     def upload_to_hub(self,
                       checkpoint_dir: str,

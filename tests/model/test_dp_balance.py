@@ -1,6 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
+
+from twinkle.model.base import TrainableModel
 
 from twinkle.model.dp_balance import (
     DPBalancePlan,
@@ -151,3 +155,105 @@ def test_plan_reads_encoded_inputs_and_reorders_aligned_fields():
     assert plan.apply(torch.arange(4)).tolist() == plan.order
     with pytest.raises(ValueError, match="cannot reorder"):
         plan.apply([1, 2])
+
+
+def test_reorder_call_moves_every_batch_aligned_argument_together():
+    plan = DPBalancePlan(order=[2, 0, 3, 1], strategy="kk", metrics={})
+    inputs = [{"input_ids": [index] * (index + 1)} for index in range(4)]
+    old_logps = [[float(index)] for index in range(4)]
+
+    args, kwargs = plan.reorder_call(
+        (inputs,),
+        {
+            "old_logps": old_logps,
+            "advantages": torch.arange(4.0),
+            "extra": {"ref_logps": torch.arange(8).view(4, 2)},
+            "micro_batch_size": 2,
+            "short": [1, 2],
+        },
+    )
+
+    assert args[0] == [inputs[index] for index in plan.order]
+    assert kwargs["old_logps"] == [old_logps[index] for index in plan.order]
+    assert kwargs["advantages"].tolist() == [2.0, 0.0, 3.0, 1.0]
+    assert kwargs["extra"]["ref_logps"][:, 0].tolist() == [4, 0, 6, 2]
+    assert kwargs["micro_batch_size"] == 2
+    assert kwargs["short"] == [1, 2]
+
+
+def test_restore_outputs_undoes_the_reorder():
+    plan = DPBalancePlan(order=[2, 0, 3, 1], strategy="kk", metrics={})
+    outputs = {"logps": torch.arange(12).view(4, 3), "loss": 1.5, "sequences": list("abcd")}
+
+    _, shuffled = plan.reorder_call((), {"outputs": outputs})
+    restored = plan.restore_outputs(shuffled["outputs"])
+
+    assert torch.equal(restored["logps"], outputs["logps"])
+    assert restored["sequences"] == outputs["sequences"]
+    assert restored["loss"] == 1.5
+
+
+class _FakeModel:
+    _dp_balance_call = TrainableModel._dp_balance_call
+    _dp_balance_micro_batch_config = TrainableModel._dp_balance_micro_batch_config
+
+    def __init__(self, enabled=True, group_size=1, data_world_size=2):
+        self.device_mesh = SimpleNamespace(data_world_size=data_world_size)
+        self.spec = {"enabled": enabled, "padding_free": True, "hidden_size": 1024, "group_size": group_size}
+
+    def _dp_balance_spec(self, adapter_name=None, loss_key=None):
+        return self.spec
+
+
+def _call_inputs(lengths):
+    return [{"input_ids": torch.ones(length, dtype=torch.long)} for length in lengths]
+
+
+def test_model_reorders_the_call_and_tells_the_workers():
+    inputs = _call_inputs([900, 800, 700, 600, 50, 40, 30, 20])
+    advantages = list(range(8))
+
+    plan, args, kwargs = _FakeModel()._dp_balance_call(
+        "forward_backward", (), {"inputs": inputs, "advantages": advantages}
+    )
+
+    assert plan is not None and plan.reorders
+    assert [len(item["input_ids"]) for item in kwargs["inputs"]] == [len(inputs[i]["input_ids"]) for i in plan.order]
+    assert kwargs["advantages"] == plan.order
+    assert kwargs["_dp_balance"]["reordered"] is True
+    assert "dp_balance/workload_imbalance_after" in kwargs["_dp_balance"]["metrics"]
+
+
+def test_model_keeps_preference_pairs_together():
+    inputs = _call_inputs([900, 900, 800, 800, 50, 50, 30, 30])
+
+    plan, _, _ = _FakeModel(group_size=2)._dp_balance_call("forward_backward", (), {"inputs": inputs})
+
+    pairs = [plan.order[index : index + 2] for index in range(0, 8, 2)]
+    assert all(first % 2 == 0 and second == first + 1 for first, second in pairs)
+
+
+@pytest.mark.parametrize(
+    "model, extra",
+    [
+        (_FakeModel(enabled=False), {}),
+        (_FakeModel(group_size=None), {}),
+        (_FakeModel(data_world_size=1), {}),
+        (_FakeModel(), {"return_logits": True}),
+        (_FakeModel(), {"group_scores": [0.5, 0.25]}),
+    ],
+)
+def test_model_leaves_the_call_alone(model, extra):
+    kwargs = {"inputs": _call_inputs([900, 800, 700, 600, 50, 40, 30, 20]), **extra}
+
+    assert model._dp_balance_call("forward_backward", (), kwargs) is None
+
+
+def test_group_size_follows_the_loss():
+    from twinkle.loss import CrossEntropyLoss, DPOLoss
+    from twinkle.loss.base import dp_balance_group_size
+
+    assert dp_balance_group_size(None) == 1
+    assert dp_balance_group_size(CrossEntropyLoss()) == 1
+    assert dp_balance_group_size(DPOLoss()) == 2
+    assert dp_balance_group_size(lambda inputs, outputs: 0) is None
