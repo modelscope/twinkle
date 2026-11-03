@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from twinkle import remote_function
+from twinkle.infra.collectors import collect_tensor_dict
 from twinkle.model.base import TrainableModel
 
 from twinkle.model.dp_balance import (
@@ -267,3 +269,67 @@ def test_group_size_follows_the_loss():
     assert dp_balance_group_size(CrossEntropyLoss()) == 1
     assert dp_balance_group_size(DPOLoss()) == 2
     assert dp_balance_group_size(lambda inputs, outputs: 0) is None
+
+
+class _LocalModel:
+    _dp_balance_local = TrainableModel._dp_balance_local
+
+    def __init__(self, mesh):
+        self.device_mesh = mesh
+        self.seen = None
+
+    def _dp_balance_spec(self, adapter_name=None, loss_key=None):
+        return {"enabled": True, "padding_free": True, "hidden_size": 1024, "group_size": 1}
+
+    @remote_function(dispatch="slice_dp", collect=collect_tensor_dict, dp_balance=True)
+    def forward_backward(self, *, inputs, advantages, _dp_balance=None):
+        lengths = [len(model_input["input_ids"]) for model_input in inputs]
+        self.seen = (lengths, advantages.tolist(), _dp_balance)
+        return {
+            "loss": torch.tensor(float(sum(lengths))),
+            "lengths": torch.tensor(lengths),
+            "logps": [torch.full((length,), float(length)) for length in lengths],
+        }
+
+
+def _local_worker(rank, rendezvous, result_dir):
+    import os
+
+    import torch.distributed as dist
+
+    from twinkle import infra
+    from twinkle.utils import DeviceMesh
+
+    os.environ.update(RANK=str(rank), WORLD_SIZE="2")
+    infra._mode = "local"
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        lengths = [900, 800, 700, 600, 50, 40, 30, 20][rank * 4 : (rank + 1) * 4]
+        model = _LocalModel(DeviceMesh.from_sizes(world_size=2, dp_size=2, device_type="cpu"))
+        output = model.forward_backward(
+            inputs=_call_inputs(lengths), advantages=torch.tensor(lengths, dtype=torch.float)
+        )
+        seen_lengths, seen_advantages, balance = model.seen
+        torch.save(
+            {
+                "seen": seen_lengths,
+                "advantages_aligned": seen_advantages == [float(length) for length in seen_lengths],
+                "reordered": balance["reordered"],
+                "restored": output["lengths"].tolist() == lengths
+                and [len(logps) for logps in output["logps"]] == lengths,
+                "own_loss": float(output["loss"]) == float(sum(seen_lengths)),
+            },
+            f"{result_dir}/{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_local_mode_swaps_samples_and_returns_outputs_to_their_rank(tmp_path):
+    torch.multiprocessing.spawn(_local_worker, args=(str(tmp_path / "gloo"), str(tmp_path)), nprocs=2, join=True)
+    results = [torch.load(tmp_path / f"{rank}.pt") for rank in range(2)]
+
+    assert all(result["reordered"] and result["advantages_aligned"] for result in results)
+    assert all(result["restored"] and result["own_loss"] for result in results)
+    assert sorted(results[0]["seen"] + results[1]["seen"]) == [20, 30, 40, 50, 600, 700, 800, 900]
+    assert max(sum(result["seen"]) for result in results) < 900 + 800 + 700 + 600

@@ -838,7 +838,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             ``_dp_balance_call(name, args, kwargs)`` for a ``DPBalancePlan`` that evens out the
             per-rank workload, reorders the batch-aligned arguments with it, and puts the
             batch-aligned fields of the collected result back in the caller's order. Calls whose
-            arguments hold object refs are dispatched unchanged.
+            arguments hold object refs are dispatched unchanged. In local mode, where each rank holds
+            only its own slice, the instance's ``_dp_balance_local(run, args, kwargs)`` runs the call
+            instead and swaps samples between the ranks.
 
     Wrapped continuous-work calls also accept ``_session_ids``, a list or tuple of
     non-empty session strings (or ``None`` for ordinary load balancing), aligned
@@ -906,6 +908,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         raise ValueError(f'{func.__name__}: no in-flight request for sticky key '
                                          f'{_sticky_key_value!r}')
                 if infra._mode == 'local':
+                    balance_local = getattr(self, '_dp_balance_local', None) if dp_balance else None
+                    if balance_local is not None and dispatch == 'slice_dp':
+                        return balance_local(functools.partial(func, self), args, kwargs)
                     return func(self, *args, **kwargs)
                 elif infra._mode == 'ray':
                     check_unsafe(*args, **kwargs)
