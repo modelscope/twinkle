@@ -247,7 +247,12 @@ class CheckpointEngineMixin:
         async def _receive_and_ema():
             async for name, tensor in engine.receive_weights():
                 param = local_state[name]
-                param.data.mul_(alpha).add_(tensor, alpha=1.0 - alpha)
+                # A received bucket rides the transport the pair negotiated --
+                # device-to-device on a shared NCCL channel, the ray object
+                # store (CPU tensors) across disjoint device groups. The EMA
+                # math runs on the parameter's device either way; ``.to`` is a
+                # no-op when the tensor already sits there.
+                param.data.mul_(alpha).add_(tensor.to(param.device), alpha=1.0 - alpha)
 
         result_container = {'error': None}
 

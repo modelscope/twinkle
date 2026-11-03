@@ -151,7 +151,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if MegatronStrategy.uses_fsdp(ddp_config):
             os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
-        self._try_init_process_group()
+        # mcore requires an initialised process group even at world_size==1.
+        self._try_init_process_group(force=True)
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
         # mcore_bridge pulls in megatron.core/TE too early on NPU.
         ensure_mindspeed_adaptor_patched()
@@ -515,7 +516,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             variable_seq_lengths=self.variable_seq_lengths,
             attention_mask_type=attention_mask_type,
         )
-
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
         # MoE routing replay orchestration of this call (a null object when disabled or mode-less);

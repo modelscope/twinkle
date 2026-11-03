@@ -135,7 +135,14 @@ class _SideEffectLazyCollect:
         return key in self._get_result()
 
     def __getattr__(self, name):
-        # Only reached for attrs not modelled above; ``_base`` is set first in __init__, so no recursion.
+        # Only reached for attrs not modelled above. ``_base`` itself must FAIL
+        # loudly instead of recursing: an unpickled instance starts with an
+        # empty ``__dict__`` (pickle restores state only after probing hooks
+        # like ``__setstate__``), so a bare ``self._base`` inside this method
+        # would re-enter ``__getattr__`` forever -- every handle that crosses
+        # Ray then dies in ``pickle.loads`` with a RecursionError.
+        if name == '_base':
+            raise AttributeError(name)
         return getattr(self._base, name)
 
 

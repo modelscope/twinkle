@@ -1132,12 +1132,30 @@ class StreamingDriver:
         and race the recipe's sampler shutdown. This releases the ack wait, asks the run loop to
         break at the next pass boundary (its finally then stops and unpins everything), and joins
         the background thread. Safe when not iterating and safe to call repeatedly.
+
+        The join is kept drain-fed: a batch the consumer never took (or the terminal sentinel
+        the runner's finally puts) can leave the run thread blocked on the single-slot queue's
+        put, so the queue is emptied non-blockingly while waiting. An EMPTY queue never blocks
+        here -- the flags above release the thread's other waits and it exits on its own.
         """
         self._aborted = True
         self._ack_event.set()
         thread = self._iter_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join()
+            while thread.is_alive():
+                self._drain_batch_queue()
+                thread.join(timeout=1.0)
+
+    def _drain_batch_queue(self) -> None:
+        """Empty the single-slot delivery queue without blocking (teardown only)."""
+        batch_queue = self._batch_queue
+        if batch_queue is None:
+            return
+        while True:
+            try:
+                batch_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def __next__(self) -> Any:
         """The next assembled batch, blocking until the driver thread produces one or the run ends.
