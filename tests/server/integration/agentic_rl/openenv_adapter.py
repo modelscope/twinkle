@@ -173,7 +173,13 @@ class OpenEnvTaskEnv(Env):
                 result = self._run_command(arguments.get("command", ""))
             else:
                 raise ValueError(f"unsupported task tool {tool_name!r}")
-            output = (result.stdout + "\n" + result.stderr).strip()
+            stderr = result.stderr
+            if result.exit_code and stderr:
+                # Keep the confirmed exception, not interpreter host paths that mislead virtual-file tools.
+                stderr = stderr.strip().splitlines()[-1]
+            output = (result.stdout + "\n" + stderr).strip()
+            if result.exit_code:
+                output = f"[exit code: {result.exit_code}]\n{output}"
             return StepResult(observation=output[-4096:], done=False)
         except ValueError as error:
             # Deterministic refusals and confirmed missing files are recoverable model errors.

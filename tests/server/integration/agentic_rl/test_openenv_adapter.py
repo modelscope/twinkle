@@ -101,6 +101,21 @@ def test_transport_timeout_preserves_unknown_state_and_prevents_reuse():
     assert len(client.calls) == count and not client.closed
 
 
+def test_confirmed_command_failure_keeps_exception_without_host_traceback():
+    env, client = environment()
+    stderr = 'Traceback (most recent call last):\n  File "/host/deps/interpreter.py", line 1\nAssertionError: boundary case failed'
+    observation = SimpleNamespace(exit_code=1, stdout='before failure', stderr=stderr)
+    client.execute = lambda action: SimpleNamespace(observation=observation)
+    result = env.step('run_command', {'command': 'python -c "assert False"'})
+    assert result.observation.startswith('[exit code: 1]')
+    assert 'AssertionError: boundary case failed' in result.observation
+    assert 'before failure' in result.observation
+    assert '/host/deps' not in result.observation
+    assert observation.stderr == stderr
+    env.ensure_idle()
+    env.close()
+
+
 def test_remote_interpreter_timeout_is_not_a_candidate_low_reward():
     env, client = environment()
     client.execute = lambda action: SimpleNamespace(

@@ -93,8 +93,11 @@ def _prepare_recipe(config):
             manager = recipe.ToolManager(recipe.EnvTool.from_schemas(env, env.tools()))
             return recipe._Attempt(env, manager, {
                 'messages': [{'role': 'user', 'content': task.prompt +
-                              '\nThe workspace uses virtual files. Run scripts with python smoke_test.py; '
-                              'shell commands and OS imports are not available.'}],
+                              '\nAll task files are virtual files under /workspace. Use read_file/write_file with '
+                              'relative file names or /workspace paths. Run tests with python smoke_test.py, '
+                              'which loads the current task source automatically. Shell commands, OS imports, '
+                              'and importing workspace modules with python -c are not available. '
+                              'After the test passes, give a short final answer without repeated reruns.'}],
                 'tools': manager.tool_infos(),
             })
 
@@ -401,6 +404,7 @@ async def _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_e
     sync = rollout([attempts[0].trajectory], tool_manager=[attempts[0].manager], **common)[0]
     async_result = await rollout.acall([attempts[1].trajectory], tool_manager=[attempts[1].manager], **common)
     async_result = async_result[0]
+    recipe._validate_training_rows([sync, async_result])
     keys = ('input_ids', 'labels', 'completion_mask', 'rollout_logprobs', 'messages')
     equivalent = all(sync.get(key) == async_result.get(key) for key in keys)
     sandbox_ids = {attempt.env.sandbox_id for attempt in attempts}

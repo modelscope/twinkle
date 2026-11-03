@@ -448,6 +448,44 @@ def test_openenv_attempt_keeps_virtual_workspace_tool_schemas(tmp_path, monkeypa
     assert functions['write_file']['parameters']['required'] == ['path', 'content']
     assert functions['run_command']['parameters']['required'] == ['command']
     assert functions['read_file']['parameters']['properties']['path']['type'] == 'string'
+    prompt = attempt.trajectory['messages'][0]['content']
+    assert '/workspace' in prompt and 'python smoke_test.py' in prompt
+    assert 'workspace modules' in prompt and 'without repeated reruns' in prompt
+
+
+@pytest.mark.parametrize('invalid', [None, {'truncated': True}, {'stop_reason': 'abort'}, {'rollout_logprobs': []}])
+def test_sync_async_parity_requires_valid_complete_rollouts(tmp_path, monkeypatch, invalid):
+    from . import validation
+    recipe = _load_recipe()
+    created = []
+
+    def create(task, on_created):
+        env = SimpleNamespace(sandbox_id=f'session-{len(created)}')
+        created.append(env)
+        on_created(env)
+        return SimpleNamespace(env=env, manager=None, trajectory={})
+
+    monkeypatch.setattr(recipe, '_create_attempt', create)
+    row = {'response_token_ids': [1], 'rollout_logprobs': [-0.1], 'stop_reason': 'stop', 'truncated': False}
+    if invalid:
+        row.update(invalid)
+
+    class Rollout:
+        sampling_params = validation.SamplingParams(max_tokens=32)
+
+        def __call__(self, *args, **kwargs):
+            return [dict(row)]
+
+        async def acall(self, *args, **kwargs):
+            return [dict(row)]
+
+    operation = validation._sync_async_evidence(recipe, Rollout(), 'policy', [], asyncio.Event(), _config(tmp_path))
+    if invalid:
+        with pytest.raises(RuntimeError):
+            asyncio.run(operation)
+    else:
+        result = asyncio.run(operation)
+        assert result['sync_async_equivalent'] and result['environment_isolation']
 
 
 def test_openenv_cli_and_results_cannot_claim_agentenv_security(tmp_path):
