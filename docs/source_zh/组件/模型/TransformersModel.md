@@ -29,7 +29,24 @@ class TransformersModel:
 - mixed_precision: 混合精度信息，默认`bf16`，如果有30系以上显卡建议维持不变
 - strategy: 如何封装模型使用多卡训练，默认使用`accelerate`框架。
 - ddp_config: strategy为`accelerate`时的DDP配置，参见：[DDPKwargs](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L155)
-- fsdp_config: strategy为`accelerate`时的FSDP配置，参见：[FSDPConfig](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L1566)
+- fsdp_config: strategy为`accelerate`时的FSDP配置，参见：[FSDPConfig](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L1566)。strategy为`native_fsdp`时额外支持`mixed_precision`子配置（独立精度配置，字段对应FSDP2的[MixedPrecisionPolicy](https://docs.pytorch.org/docs/stable/distributed.fsdp.html#torch.distributed.fsdp.MixedPrecisionPolicy)）：
+  - `param_dtype`: 计算精度。前向/反向前，FSDP将all-gather出的完整参数cast到该精度参与计算；
+  - `reduce_dtype`: 梯度归约精度。跨卡reduce-scatter累加在该精度下进行，设为`fp32`可降低多卡累加误差，代价是归约通信量翻倍（即"BF16计算、FP32归约"）；
+  - `output_dtype`: 每个FSDP包装单元forward输出cast到的精度。
+
+  三个字段均可缺省，取值支持`'bf16'` / `'fp16'` / `'fp32'`（或对应的`torch.dtype`）；缺省字段回落到顶层`mixed_precision`字符串定出的基准精度，完全不配置时行为与旧版本一致。例如：
+
+  ```python
+  TransformersModel(
+      ...,
+      strategy='native_fsdp',
+      fsdp_config={'mixed_precision': {'reduce_dtype': 'fp32'}},  # BF16计算、FP32梯度归约
+  )
+  ```
+
+  注意：该子配置仅对`native_fsdp`生效；启用专家并行（EP）时，因NCCL约束专家组的梯度归约恒在`fp32`下进行。
+
+  约束：生效的`output_dtype`必须与`param_dtype`一致（或缺省），否则构造时抛出`ValueError`——两者不一致会在FSDP单元边界引入dtype转换，梯度检查点重算时张量dtype不一致会导致训练报错；`reduce_dtype`只作用于梯度归约，不受该约束。
 - grad_scaler_config: PyTorch的grad_scaler初始化配置，参见：[PyTorch的GradScaler构造](https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/grad_scaler.py#L25)
 - memory_efficient_init: 是否启用FSDP内存高效初始化。启用后仅rank 0加载完整权重，其余rank通过广播获取分片参数，降低初始化阶段的内存和显存峰值。默认`False`。注意：该优化目前仅适用于 transformers <= 4.57.6；对于 transformers >= 5.0.0，可能会导致负面性能影响。
 - kwargs:
