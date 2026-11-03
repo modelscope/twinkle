@@ -45,12 +45,10 @@ def find_free_port(address: str = '', start_port: Optional[int] = None, retry: i
         start_port = 0
     for port in range(start_port, start_port + retry):
         with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            # A probe must not join an existing listener via socket reuse.
             try:
                 sock.bind(('', port))
-                port = sock.getsockname()[1]
-                break
+                return sock.getsockname()[1]
             except OSError:
                 pass
-    return port
+    raise RuntimeError(f'No free port found in [{start_port}, {start_port + retry})')
