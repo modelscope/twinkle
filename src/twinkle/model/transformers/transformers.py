@@ -2646,15 +2646,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """What the driver needs to plan a DP-balanced order for ``forward_backward`` / ``forward_only``."""
         optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
         try:
-            loss = optimizer_config.get_loss(loss_key)
+            group_size = dp_balance_group_size(optimizer_config.get_loss(loss_key))
         except ValueError:
-            loss = None
+            # The call itself will fail on this loss_key; nothing tells which samples belong together.
+            group_size = None
         text_config = self.hf_config.get_text_config() if hasattr(self.hf_config, 'get_text_config') else self.hf_config
         return {
             'enabled': getattr(self, '_dp_balance_enabled', False),
             'padding_free': bool(getattr(optimizer_config.processor, 'padding_free', False)),
-            'hidden_size': getattr(text_config, 'hidden_size', None) or 4096,
-            'group_size': dp_balance_group_size(loss),
+            'hidden_size': getattr(text_config, 'hidden_size', None),
+            'group_size': group_size,
         }
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):

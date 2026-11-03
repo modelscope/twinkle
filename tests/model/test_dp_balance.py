@@ -195,13 +195,14 @@ def test_restore_outputs_undoes_the_reorder():
 
 class _FakeModel:
     _dp_balance_call = TrainableModel._dp_balance_call
-    _dp_balance_micro_batch_config = TrainableModel._dp_balance_micro_batch_config
 
     def __init__(self, enabled=True, group_size=1, data_world_size=2):
         self.device_mesh = SimpleNamespace(data_world_size=data_world_size)
         self.spec = {"enabled": enabled, "padding_free": True, "hidden_size": 1024, "group_size": group_size}
+        self.spec_calls = 0
 
     def _dp_balance_spec(self, adapter_name=None, loss_key=None):
+        self.spec_calls += 1
         return self.spec
 
 
@@ -247,6 +248,15 @@ def test_model_leaves_the_call_alone(model, extra):
     kwargs = {"inputs": _call_inputs([900, 800, 700, 600, 50, 40, 30, 20]), **extra}
 
     assert model._dp_balance_call("forward_backward", (), kwargs) is None
+
+
+def test_disabled_model_is_asked_once():
+    model = _FakeModel(enabled=False)
+    kwargs = {"inputs": _call_inputs([900, 800, 700, 600, 50, 40, 30, 20])}
+
+    assert model._dp_balance_call("forward_backward", (), kwargs) is None
+    assert model._dp_balance_call("forward_backward", (), kwargs) is None
+    assert model.spec_calls == 1
 
 
 def test_group_size_follows_the_loss():
