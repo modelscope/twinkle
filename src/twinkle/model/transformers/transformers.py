@@ -2328,19 +2328,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
-        is_npu_device = Platform.device_prefix() == 'npu'
+        # Platforms answering aligns_param_dtype_to_base() walk all parameters to
+        # find the base dtype (NPU: FSDP2 requires every parameter to match);
+        # elsewhere the first hit suffices because only LoRA params get aligned.
+        align_all = Platform.get_platform().aligns_param_dtype_to_base()
         for param in model.parameters():
             if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
-            if base_dtype is not None and is_npu_device:
+            if base_dtype is not None and align_all:
                 break
         if base_dtype is None:
             return
 
-        # Temporary workaround: NPU requires all parameters to align with the base dtype.
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if (is_npu_device or 'lora_' in name.lower()) and param.dtype != base_dtype:
+                if (align_all or 'lora_' in name.lower()) and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
 
     def _load_scaler_state(self, scaler_path, **kwargs):

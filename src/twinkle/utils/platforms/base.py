@@ -203,6 +203,79 @@ class Platform(ABC):
         """Platform no-op hook; overridden by platforms whose vLLM needs explicit fixes."""
 
     @staticmethod
+    def device_module():
+        """The ``torch.<x>`` namespace of this platform's accelerator, or ``None``.
+
+        The device-API family (``current_device`` / ``set_device`` / ``empty_cache`` /
+        ``synchronize`` / ``ipc_collect`` / ``manual_seed_all``) dispatches through this
+        so generic components never branch on hardware names. ``None`` (the base and
+        MPS default) means "no accelerator" and callers fall back to CPU / no-op.
+        """
+        return None
+
+    @staticmethod
+    def apply_determinism() -> None:
+        """Platform env/backend switches set when deterministic training is requested."""
+
+    @staticmethod
+    def supports_device_ipc() -> bool:
+        """Whether this platform's accelerator supports device-IPC weight transfer.
+
+        False makes the IPC engines fall back to shared-memory buckets.
+        """
+        return True
+
+    @staticmethod
+    def ensure_ipc_reducer() -> None:
+        """Register the tensor reducer ``reduce_tensor`` needs before IPC use."""
+
+    @staticmethod
+    def requires_gloo_subgroups() -> bool:
+        """Whether Megatron must create Gloo process groups alongside its device groups."""
+        return False
+
+    @staticmethod
+    def synthesizes_causal_mask() -> bool:
+        """Whether the platform's attention backend builds the causal mask itself.
+
+        True lets the processor drop the dense 4D mask it would otherwise send.
+        """
+        return False
+
+    @staticmethod
+    def packs_padded_cu_seqlens() -> bool:
+        """Whether the backend's PackedSeqParams consumer requires the padded cu_seqlens fields."""
+        return False
+
+    @staticmethod
+    def aligns_param_dtype_to_base() -> bool:
+        """Whether every model parameter must share the base dtype.
+
+        True forces the load-time dtype alignment walk (FSDP2 requires matching
+        dtypes on NPU); False keeps only LoRA parameters aligned, which is the
+        backend-agnostic requirement.
+        """
+        return False
+
+    @staticmethod
+    def configure_model_config(config: Any) -> None:
+        """Mutate a Megatron ``ModelConfig`` in place before model construction.
+
+        Platforms whose mcore stack needs specific flags (e.g. MindSpeed's patched
+        TE attention) apply them here; the default is no-op.
+        """
+
+    @staticmethod
+    def resolve_object_collective_group(device_mesh: Any):
+        """The process group Python object collectives should use, or ``None``.
+
+        ``None`` (the default) keeps the group the caller passed in; platforms
+        whose device backend cannot carry ``all_gather_object`` (HCCL) return a
+        Gloo group instead. Only consulted when torch.distributed is initialized.
+        """
+        return None
+
+    @staticmethod
     def apply_vllm_patch(platform: str = None) -> None:
         """Apply the current platform's explicit vLLM fixes, once per process.
 

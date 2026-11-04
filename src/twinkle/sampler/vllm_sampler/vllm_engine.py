@@ -996,9 +996,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         use_device_ipc = first_tensor.is_cuda
         if first_tensor.device.type == 'npu':
-            from twinkle.utils.platforms import NPU
-
-            use_device_ipc = NPU.is_ipc_supported()
+            use_device_ipc = Platform.get_platform().supports_device_ipc()
         use_shm = not use_device_ipc
 
         # Use a per-sync unique IPC endpoint to avoid cross-actor collisions
@@ -1021,9 +1019,8 @@ class VLLMEngine(BaseSamplerEngine):
         shm = None
 
         if use_device_ipc:
-            if first_tensor.device.type == 'npu':
-                # torch_npu registers the NPU reducer used by reduce_tensor.
-                import torch_npu  # noqa: F401
+            # Register the platform's tensor reducer (no-op where the CUDA one is builtin).
+            Platform.get_platform().ensure_ipc_reducer()
             from torch.multiprocessing.reductions import reduce_tensor
 
             # Reuse a long-lived IPC bucket whenever the requested size

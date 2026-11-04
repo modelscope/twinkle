@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
+from .framework import Torch
 from .network import is_valid_ipv6_address
 from .utils import has_signature_parameter
 
@@ -424,7 +425,7 @@ def stateless_init_process_group(
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator as Communicator
 
     if device is None:
-        device = torch.cuda.current_device() if backend == 'nccl' else torch.npu.current_device()
+        device = Torch.get_current_device()
 
     # Create the stateless process group
     launch_server = rank == 0

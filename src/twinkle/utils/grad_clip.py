@@ -174,7 +174,7 @@ def _resolve_reduce_device(grads: list[torch.Tensor]):
 
     for grad in grads:
         local = grad.to_local() if hasattr(grad, 'to_local') else grad
-        if local.is_cuda or getattr(local, 'is_npu', False):
+        if torch_util.is_accelerator_tensor(local):
             return local.device
 
     backend = dist.get_backend() if dist.is_initialized() else None
@@ -316,7 +316,7 @@ def _collect_local_grads(params) -> tuple[list, torch.device]:
         if p.grad is None:
             continue
         g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-        if default_device is None and (g.is_cuda or getattr(g, 'is_npu', False)):
+        if default_device is None and torch_util.is_accelerator_tensor(g):
             default_device = g.device
         grads_local.append(g.detach().to(torch.float32))
 

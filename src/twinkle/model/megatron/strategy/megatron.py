@@ -180,7 +180,7 @@ class MegatronStrategy:
             'order': self.device_mesh.order,
             **parallel_kwargs,
         }
-        if Platform.device_prefix() == 'npu':
+        if Platform.get_platform().requires_gloo_subgroups():
             init_kwargs['create_gloo_process_groups'] = True
         # Clear the default PG's device binding immediately before the
         # model-parallel ``new_group`` calls, regardless of who initialized the

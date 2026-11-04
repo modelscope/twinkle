@@ -8,6 +8,8 @@ actually differs.
 """
 import pytest
 
+from types import SimpleNamespace
+
 from twinkle.checkpoint_engine import (CheckpointEngineManager, HCCLCheckpointEngine, NCCLCheckpointEngine,
                                        XCCLCheckpointEngine)
 from twinkle.utils.platforms import GPU, Metax, MPS, NPU, Platform, XPU
@@ -20,6 +22,56 @@ def test_gpu_uses_base_defaults():
     assert GPU.requires_unbound_pg_for_subgroups() is False
     assert GPU.ray_resources() == {}
     assert GPU.bootstrap() is None
+
+
+def test_npu_overrides_device_capability_hooks():
+    """The B-class NPU branches now live on the platform, not in components."""
+    assert NPU.requires_gloo_subgroups() is True
+    assert NPU.synthesizes_causal_mask() is True
+    assert NPU.packs_padded_cu_seqlens() is True
+    # GPU keeps CUDA defaults for the same hooks.
+    assert GPU.requires_gloo_subgroups() is False
+    assert GPU.synthesizes_causal_mask() is False
+    assert GPU.packs_padded_cu_seqlens() is False
+
+
+def test_npu_overrides_c_class_workarounds():
+    """The C-class NPU workarounds (dtype walk, mcore flags, object-collective
+    group) also route through platform hooks; base defaults keep GPU behaviour."""
+    assert NPU.aligns_param_dtype_to_base() is True
+    assert GPU.aligns_param_dtype_to_base() is False
+    # resolve_object_collective_group must respect the #185 FSDP guard.
+    fsdp_mesh = SimpleNamespace(has_dim=lambda dim: dim == 'fsdp')
+    assert NPU.resolve_object_collective_group(fsdp_mesh) is None
+    assert GPU.resolve_object_collective_group(SimpleNamespace()) is None
+
+
+class _RecordingConfig:
+
+    def __init__(self):
+        self.use_flash_attn = False
+
+
+def test_configure_model_config_default_noop(monkeypatch):
+    """GPU must not touch a Megatron ModelConfig; NPU cannot be exercised without
+    MindSpeed, so only the default side is asserted here."""
+    config = _RecordingConfig()
+    GPU.configure_model_config(config)
+    assert config.use_flash_attn is False
+
+
+def test_device_module_dispatch():
+    """The torch.<x> namespace used by the Torch API chain comes from the platform."""
+    import torch
+
+    assert GPU.device_module() is torch.cuda
+    assert GPU.supports_device_ipc() is True
+    # NPU cannot be probed on this host (npu-smi absent); pin that the hooks are
+    # explicit overrides so the delegating implementations cannot be lost silently.
+    for capability in ('device_module', 'supports_device_ipc', 'ensure_ipc_reducer', 'apply_determinism'):
+        assert capability in NPU.__dict__, f'NPU must override {capability} explicitly'
+    # CPU-only fakes cannot be constructed here; None is the base default.
+    assert MPS.device_module() is None
 
 
 @pytest.mark.parametrize('platform_cls', [NPU, XPU])

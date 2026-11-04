@@ -279,9 +279,10 @@ class TwinkleWorkerExtension:
         # ── Step 2: Receive and broadcast IPC/SHM handle ──
         buffer, shm = None, None
 
-        if not use_shm and self.device.type == 'npu':
-            # Register the NPU reducer before recv_pyobj() unpickles its callable.
-            import torch_npu  # noqa: F401
+        if not use_shm:
+            # Register the platform's tensor reducer before recv_pyobj() unpickles
+            # its callable (e.g. torch_npu registers the NPU reducer).
+            Platform.get_platform().ensure_ipc_reducer()
 
         if is_driver:
             try:

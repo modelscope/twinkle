@@ -253,3 +253,72 @@ class NPU(Platform):
         # Reusing the HCCL communicator across sync steps avoids frequent
         # stream/channel allocation and reduces resource exhaustion risk.
         return HCCLCheckpointEngine, {'rebuild_group': False}
+
+    @staticmethod
+    def device_module():
+        # Importing torch_npu registers torch.npu and its reducers.
+        import torch
+        import torch_npu  # noqa: F401
+        return torch.npu if torch.npu.is_available() else None
+
+    @staticmethod
+    def apply_determinism() -> None:
+        os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+        os.environ['HCCL_DETERMINISTIC'] = '1'
+
+    @staticmethod
+    def supports_device_ipc() -> bool:
+        # HDK and CANN must meet a version floor before device IPC can be used.
+        return NPU.is_ipc_supported()
+
+    @staticmethod
+    def ensure_ipc_reducer() -> None:
+        # torch_npu registers the NPU reducer used by reduce_tensor.
+        import torch_npu  # noqa: F401
+
+    @staticmethod
+    def requires_gloo_subgroups() -> bool:
+        # HCCL-backed object collectives hang; Megatron needs Gloo groups for those.
+        return True
+
+    @staticmethod
+    def synthesizes_causal_mask() -> bool:
+        # MindSpeed's flash-attention kernels synthesize their own causal mask.
+        return True
+
+    @staticmethod
+    def packs_padded_cu_seqlens() -> bool:
+        # MindSpeed's PackedSeqParams consumer reads the padded cu_seqlens fields.
+        return True
+
+    @staticmethod
+    def aligns_param_dtype_to_base() -> bool:
+        # FSDP2 on Ascend requires every parameter to share the base dtype.
+        return True
+
+    @staticmethod
+    def configure_model_config(config) -> None:
+        # MindSpeed's patched TE attention needs use_flash_attn to synthesize its own
+        # compressed causal mask; unset aborts the first 8-card forward.
+        config.use_flash_attn = True
+        from twinkle.model.megatron.utils import _mindspeed_runtime
+        _mindspeed_runtime.configure_mindspeed_runtime_args(config)
+
+    @staticmethod
+    def resolve_object_collective_group(device_mesh):
+        # Object collectives over the default HCCL group hang; reuse Megatron's
+        # dedicated Gloo DP group instead. When CP is enabled we must pick the
+        # DP+CP variant, otherwise the rank span for metric aggregation is wrong.
+        # FSDP meshes have no Megatron mpu to borrow from (#185): keep the caller's
+        # group there.
+        if getattr(device_mesh, 'has_dim', None) and device_mesh.has_dim('fsdp'):
+            return None
+        # find_spec for a submodule imports its parent, which is optional.
+        import importlib.util
+        if (importlib.util.find_spec('megatron') is not None
+                and importlib.util.find_spec('megatron.core') is not None):
+            from megatron.core import parallel_state as mpu
+            if mpu.model_parallel_is_initialized():
+                return mpu.get_data_parallel_group_gloo(
+                    with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
+        return None

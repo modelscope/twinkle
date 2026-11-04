@@ -521,7 +521,7 @@ class InputProcessor:
 
     @staticmethod
     def _backend_builds_causal_mask(attention_mask_type: str | None) -> bool:
-        return attention_mask_type == "causal" and Platform.device_prefix() == "npu"
+        return attention_mask_type == "causal" and Platform.get_platform().synthesizes_causal_mask()
 
     def drop_causal_4d_mask(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         """Drop a dense mask when the accelerator synthesizes its causal mask."""
@@ -589,7 +589,7 @@ class InputProcessor:
             max_seqlen_kv=max_length,
             qkv_format="thd",
         )
-        if torch_util.is_torch_npu_available():
+        if Platform.get_platform().packs_padded_cu_seqlens():
             packed.cu_seqlens_q_padded = cu_seqlens
             packed.cu_seqlens_kv_padded = cu_seqlens
 
