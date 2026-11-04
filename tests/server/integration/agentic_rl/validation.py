@@ -416,9 +416,9 @@ async def _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_e
     }
 
 
-async def _probe_logps(recipe, model, trajectory, stop_event) -> list[float]:
+async def _probe_logps(recipe, model, trajectories, stop_event) -> list[float]:
     response = await recipe._await_operation(
-        model.forward_only, inputs=[trajectory], compute_loss=False, stop_event=stop_event)
+        model.forward_only, inputs=trajectories, compute_loss=False, stop_event=stop_event)
     result = response['result'] if isinstance(response, dict) else response.result
     return _numbers(result)
 
@@ -468,9 +468,9 @@ async def run_validation(config: ValidationConfig) -> dict:
                     rolled, rewards = task.result()
                     all_rolled.extend(rolled)
                     recipe._ensure_running(stop_event)
-                    if 'trajectory' not in probe:
-                        probe['trajectory'] = rolled[0]
-                        probe['before'] = await _probe_logps(recipe, model, rolled[0], stop_event)
+                    if 'trajectories' not in probe:
+                        probe['trajectories'] = rolled
+                        probe['before'] = await _probe_logps(recipe, model, rolled, stop_event)
                         probe['latest'] = probe['before']
                         probe['updates'] = []
                     updated = False
@@ -481,7 +481,7 @@ async def run_validation(config: ValidationConfig) -> dict:
                         if not updated:
                             break
                     if updated:
-                        after = await _probe_logps(recipe, model, probe['trajectory'], stop_event)
+                        after = await _probe_logps(recipe, model, probe['trajectories'], stop_event)
                         changed = parameters_changed(probe['latest'], after)
                         probe['updates'].append({'changed': changed, 'before': probe['latest'], 'after': after})
                         probe['latest'] = after
@@ -499,7 +499,7 @@ async def run_validation(config: ValidationConfig) -> dict:
             return updates
 
         updates = await train_groups()
-        probe_after = await _probe_logps(recipe, model, probe['trajectory'], stop_event) if probe else None
+        probe_after = await _probe_logps(recipe, model, probe['trajectories'], stop_event) if probe else None
         sync_async = await _sync_async_evidence(recipe, rollout, policy_uri, environments, stop_event, config)
         trajectory = _training_evidence(all_rolled)
         snapshot_uris = {recipe._checkpoint_path(snapshot) for snapshot in snapshots}

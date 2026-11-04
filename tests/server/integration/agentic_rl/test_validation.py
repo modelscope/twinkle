@@ -23,6 +23,7 @@ from .validation import (
     _code_task,
     _evaluate,
     _load_recipe,
+    _probe_logps,
     _timed_tool_manager,
     _Timeline,
     _wait_for_stage,
@@ -57,6 +58,22 @@ def test_learning_gate_requires_updates_and_independent_improvement():
     assert not learning_gate(updates=1, baseline=0.25, final=0.5, minimum_improvement=0.0)
     assert not learning_gate(updates=2, baseline=0.25, final=0.25, minimum_improvement=0.0)
     assert not learning_gate(updates=2, baseline=0.25, final=0.3, minimum_improvement=0.1)
+
+
+def test_probe_logps_uses_the_full_rollout_group_for_dp():
+    recipe = _load_recipe()
+    calls = {}
+
+    def forward_only(**kwargs):
+        calls.update(kwargs)
+        return SimpleNamespace(result=[-0.25, -0.5])
+
+    model = SimpleNamespace(forward_only=forward_only)
+    trajectories = [{'input_ids': [1, 2]}, {'input_ids': [3, 4]}]
+    result = asyncio.run(_probe_logps(recipe, model, trajectories, asyncio.Event()))
+    assert calls['inputs'] is trajectories
+    assert len(calls['inputs']) == 2
+    assert result == [-0.25, -0.5]
 
 
 def test_fake_and_real_result_modes_are_explicit(tmp_path):
