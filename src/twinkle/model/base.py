@@ -297,6 +297,13 @@ class TrainableModel(ABC):
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs) -> None:
         ...
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def performance_memory(self) -> dict[str, float]:
+        """Per-rank allocator lifetime peaks; call after the actor update."""
+        from twinkle.perf.rl_metrics import accelerator_memory_metrics
+
+        return accelerator_memory_metrics()
+
     @abstractmethod
     def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:
         ...

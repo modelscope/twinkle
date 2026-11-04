@@ -68,6 +68,21 @@ class LazyCollect:
         """Whether every referenced task has finished (Future protocol alias of :meth:`ready`)."""
         return self.ready()
 
+    def wait(self):
+        """Wait for worker completion without pulling tensor payloads to the driver.
+
+        Downstream consumers still resolve the original references and propagate
+        worker exceptions. This is a measurement barrier, not result collection.
+        """
+        import ray
+
+        refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+        if refs:
+            _, pending = ray.wait(refs, num_returns=len(refs), timeout=self._timeout, fetch_local=False)
+            if pending:
+                raise TimeoutError(f'{self._method} did not complete within {self._timeout} seconds')
+        return self
+
     def ready(self) -> bool:
         """Whether every referenced task has finished, WITHOUT fetching any payload.
 
