@@ -321,6 +321,9 @@ class VLLMEngine(BaseSamplerEngine):
         os.environ['VLLM_USE_V1'] = '1'
         if self.enable_sampling_replay:
             os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '1'
+        # Platform hook: apply hardware vLLM fixes (e.g. vllm_metax) before any vllm
+        # import in this process; no-op on platforms without explicit patches.
+        Platform.apply_vllm_patch()
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM

@@ -26,6 +26,10 @@ from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
+# This module is imported by vLLM inside every worker process; apply the platform's
+# vLLM fixes there too (each worker imports vllm on its own).
+Platform.apply_vllm_patch()
+
 if TYPE_CHECKING:
     from twinkle.checkpoint_engine.delta.config import DeltaWorkerCapabilities, DeltaWorkerMetadata
 

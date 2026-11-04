@@ -17,7 +17,7 @@ class Platform(ABC):
 
     @staticmethod
     def get_platform_names() -> List[str]:
-        return ['GPU', 'NPU', 'MPS']
+        return ['GPU', 'NPU', 'MXC', 'MPS']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
@@ -27,6 +27,9 @@ class Platform(ABC):
                 from .npu import NPU, ensure_npu_backend
                 ensure_npu_backend()
                 return NPU
+            elif shutil.which('mx-smi'):
+                from .metax import Metax
+                return Metax
             elif shutil.which('nvidia-smi'):
                 from .gpu import GPU
                 return GPU
@@ -39,6 +42,9 @@ class Platform(ABC):
         elif platform.upper() in ('GPU', 'CUDA'):
             from .gpu import GPU
             return GPU
+        elif platform.upper() in ('MXC', 'METAX'):
+            from .metax import Metax
+            return Metax
         elif platform.upper() == 'NPU':
             from .npu import NPU, ensure_npu_backend
             ensure_npu_backend()
@@ -136,6 +142,21 @@ class Platform(ABC):
     def get_vllm_device_uuid(device_id: int = 0, platform=None) -> str:
         platform = Platform.get_platform(platform)
         return platform.get_vllm_device_uuid(device_id)
+
+    @staticmethod
+    def ensure_vllm_patch() -> None:
+        """Platform no-op hook; overridden by platforms whose vLLM needs explicit fixes."""
+
+    @staticmethod
+    def apply_vllm_patch(platform: str = None) -> None:
+        """Apply the current platform's explicit vLLM fixes, once per process.
+
+        Call this before the first ``vllm`` import in a process. Platforms whose vLLM
+        support ships inside a companion wheel (``vllm_metax``, ...) apply their patch
+        here; platforms that register through vLLM's plugin mechanism (``vllm_ascend``)
+        need nothing and stay no-op.
+        """
+        Platform.get_platform(platform).ensure_vllm_patch()
 
     @staticmethod
     def get_device_rng_state(platform: str = None):

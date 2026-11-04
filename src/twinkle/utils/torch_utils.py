@@ -407,6 +407,12 @@ def stateless_init_process_group(
     """
     import torch
     from torch.distributed import TCPStore
+
+    # Platform hook: apply hardware vLLM fixes (e.g. vllm_metax) before any vllm
+    # import in this process; no-op on platforms without explicit patches.
+    from .platforms import Platform
+    Platform.apply_vllm_patch()
+
     from vllm.distributed.utils import StatelessProcessGroup
 
     if backend == 'hccl':
