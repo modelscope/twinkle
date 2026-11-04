@@ -8,7 +8,7 @@ from .loader import Plugin, construct_class, load_module
 from .logger import get_logger
 from .network import find_free_port, find_node_ip, is_valid_ipv6_address
 from .parallel import processing_lock
-from .platforms import GPU, is_metax_available, Metax, NPU, Platform, ensure_hccl_socket_env, ensure_npu_backend
+from .platforms import GPU, is_metax_available, Metax, NPU, Platform, ensure_hccl_socket_env, ensure_npu_backend, XPU
 from .safetensors import LazyTensor, SafetensorLazyLoader, StreamingSafetensorSaver
 from .torch_utils import (clone_state_dict_to_cpu, pad_and_stack_tensors, pad_sequence_to_length,
                           prepare_replayed_selective_log_softmax, replayed_selective_log_softmax, selective_log_softmax,

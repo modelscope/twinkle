@@ -48,7 +48,7 @@ class CheckpointEngine(ABC):
 
 ## Available Checkpoint Engines
 
-Twinkle provides three cross-process checkpoint engine implementations. `naive` mode bypasses them.
+Twinkle provides four cross-process checkpoint engine implementations. `naive` mode bypasses them.
 
 ### NCCLCheckpointEngine
 
@@ -76,10 +76,21 @@ A CUDA IPC engine for model and sampler Ray actors placed on the same physical G
 used for this topology because it rejects multiple ranks bound to one GPU. Weight buckets are mapped
 between the actor processes rather than broadcast between devices.
 
+### XCCLCheckpointEngine
+
+A checkpoint engine that transfers weights over BKCL (XCCL) on Kunlunxin XPU.
+
+- XPU Support: Drop-in for NCCLCheckpointEngine on the cuda-alike XPU route
+- Relay Fallback: Handles duplicate local device indices via a stateless `ProcessGroupXCCL` plus a socket relay
+- Compatible Interface: Inherits `NCCLCheckpointEngine`, reusing bucketing and metadata handshake
+
+See: [XCCLCheckpointEngine](XCCLCheckpointEngine.md)
+
 ## How to Choose
 
 - **NCCLCheckpointEngine**: Suitable for GPU environments, provides the highest transfer performance
 - **HCCLCheckpointEngine**: Suitable for Ascend NPU environments
+- **XCCLCheckpointEngine**: Suitable for Kunlunxin XPU environments (selected automatically)
 - **IPCCheckpointEngine**: Required for colocated Ray actors sharing physical GPUs
 - **No engine (`naive`)**: Local model and sampler objects in the same process
 

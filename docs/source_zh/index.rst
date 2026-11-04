@@ -13,6 +13,7 @@ Twinkle DOCUMENTATION
    使用指引/安装.md
    使用指引/服务端和客户端/index.rst
    使用指引/NPU的支持.md
+   使用指引/XPU的支持.md
    使用指引/训练服务.md
    使用指引/Agentic RL部署与训练.md
    使用指引/Agentic评测.md
