@@ -2,7 +2,7 @@
 import os
 import shutil
 from abc import ABC
-from typing import List, Type
+from typing import Any, Dict, List, Tuple, Type
 
 
 class Platform(ABC):
@@ -17,7 +17,7 @@ class Platform(ABC):
 
     @staticmethod
     def get_platform_names() -> List[str]:
-        return ['GPU', 'NPU', 'MPS']
+        return ['GPU', 'NPU', 'XPU', 'MXC', 'MPS']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
@@ -27,6 +27,13 @@ class Platform(ABC):
                 from .npu import NPU, ensure_npu_backend
                 ensure_npu_backend()
                 return NPU
+            elif shutil.which('xpu-smi'):
+                from .xpu import XPU, ensure_xpu_compat
+                ensure_xpu_compat()
+                return XPU
+            elif shutil.which('mx-smi'):
+                from .metax import Metax
+                return Metax
             elif shutil.which('nvidia-smi'):
                 from .gpu import GPU
                 return GPU
@@ -39,6 +46,13 @@ class Platform(ABC):
         elif platform.upper() in ('GPU', 'CUDA'):
             from .gpu import GPU
             return GPU
+        elif platform.upper() in ('MXC', 'METAX'):
+            from .metax import Metax
+            return Metax
+        elif platform.upper() == 'XPU':
+            from .xpu import XPU, ensure_xpu_compat
+            ensure_xpu_compat()
+            return XPU
         elif platform.upper() == 'NPU':
             from .npu import NPU, ensure_npu_backend
             ensure_npu_backend()
@@ -136,6 +150,141 @@ class Platform(ABC):
     def get_vllm_device_uuid(device_id: int = 0, platform=None) -> str:
         platform = Platform.get_platform(platform)
         return platform.get_vllm_device_uuid(device_id)
+
+    # ── Backend capability queries ────────────────────────────────────────
+
+    @staticmethod
+    def bootstrap() -> None:
+        """One-shot runtime fixups, run when ``twinkle.utils.platforms`` is imported."""
+
+    @staticmethod
+    def requires_unbound_default_pg() -> bool:
+        """Whether the default process group's ``bound_device_id`` must be cleared.
+
+        Queried once right after ``init_process_group``.  ``True`` for backends
+        that cannot carry a device binding into later subgroup creation (see the
+        NPU/XPU overrides for the concrete failure modes).
+        """
+        return False
+
+    @staticmethod
+    def requires_unbound_pg_for_subgroups() -> bool:
+        """Whether the binding must be cleared again right before ``new_group``.
+
+        Deliberately separate from ``requires_unbound_default_pg``: that one is
+        about the state left behind by ``init_process_group``, this one is about
+        a default PG created by someone else (eager init outside twinkle) that
+        is about to be split into model-parallel subgroups.  ``False`` means
+        "no extra guard needed here" and asserts nothing about the backend.
+        """
+        return False
+
+    @staticmethod
+    def ray_resources() -> Dict[str, float]:
+        """Accelerator resources that must be registered with ``ray.init`` explicitly.
+
+        Empty when Ray can autodetect the devices itself, which is the case
+        for CUDA GPUs.
+        """
+        return {}
+
+    @staticmethod
+    def checkpoint_engine() -> Tuple[Type[Any], Dict[str, Any]]:
+        """The weight-sync engine class for this platform plus its default kwargs.
+
+        Returning the kwargs here keeps platform-specific engine options (such
+        as NPU's communicator reuse) in a single place instead of duplicating
+        them in every construction site.
+        """
+        raise NotImplementedError('This platform has no checkpoint engine implementation')
+
+    @staticmethod
+    def ensure_vllm_patch() -> None:
+        """Platform no-op hook; overridden by platforms whose vLLM needs explicit fixes."""
+
+    @staticmethod
+    def device_module():
+        """The ``torch.<x>`` namespace of this platform's accelerator, or ``None``.
+
+        The device-API family (``current_device`` / ``set_device`` / ``empty_cache`` /
+        ``synchronize`` / ``ipc_collect`` / ``manual_seed_all``) dispatches through this
+        so generic components never branch on hardware names. ``None`` (the base and
+        MPS default) means "no accelerator" and callers fall back to CPU / no-op.
+        """
+        return None
+
+    @staticmethod
+    def apply_determinism() -> None:
+        """Platform env/backend switches set when deterministic training is requested."""
+
+    @staticmethod
+    def supports_device_ipc() -> bool:
+        """Whether this platform's accelerator supports device-IPC weight transfer.
+
+        False makes the IPC engines fall back to shared-memory buckets.
+        """
+        return True
+
+    @staticmethod
+    def ensure_ipc_reducer() -> None:
+        """Register the tensor reducer ``reduce_tensor`` needs before IPC use."""
+
+    @staticmethod
+    def requires_gloo_subgroups() -> bool:
+        """Whether Megatron must create Gloo process groups alongside its device groups."""
+        return False
+
+    @staticmethod
+    def synthesizes_causal_mask() -> bool:
+        """Whether the platform's attention backend builds the causal mask itself.
+
+        True lets the processor drop the dense 4D mask it would otherwise send.
+        """
+        return False
+
+    @staticmethod
+    def packs_padded_cu_seqlens() -> bool:
+        """Whether the backend's PackedSeqParams consumer requires the padded cu_seqlens fields."""
+        return False
+
+    @staticmethod
+    def aligns_param_dtype_to_base() -> bool:
+        """Whether every model parameter must share the base dtype.
+
+        True forces the load-time dtype alignment walk (FSDP2 requires matching
+        dtypes on NPU); False keeps only LoRA parameters aligned, which is the
+        backend-agnostic requirement.
+        """
+        return False
+
+    @staticmethod
+    def configure_model_config(config: Any) -> None:
+        """Mutate a Megatron ``ModelConfig`` in place before model construction.
+
+        Platforms whose mcore stack needs specific flags (e.g. MindSpeed's patched
+        TE attention) apply them here; the default is no-op.
+        """
+
+    @staticmethod
+    def resolve_object_collective_group(device_mesh: Any):
+        """The process group Python object collectives should use, or ``None``.
+
+        ``None`` (the default) keeps the group the caller passed in; platforms
+        whose device backend cannot carry ``all_gather_object`` (HCCL) return a
+        Gloo group instead. Only consulted when torch.distributed is initialized.
+        """
+        return None
+
+    @staticmethod
+    def apply_vllm_patch(platform: str = None) -> None:
+        """Apply the current platform's explicit vLLM fixes, once per process.
+
+        Call this before the first ``vllm`` import in a process. Platforms whose vLLM
+        support ships inside a companion wheel (``vllm_metax``, ...) apply their patch
+        here; platforms that register through vLLM's plugin mechanism (``vllm_ascend``)
+        need nothing and stay no-op.
+        """
+        Platform.get_platform(platform).ensure_vllm_patch()
 
     @staticmethod
     def get_device_rng_state(platform: str = None):

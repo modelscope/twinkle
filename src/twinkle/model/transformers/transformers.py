@@ -975,7 +975,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                outputs = self.model(**inputs)
+                # Without gradient checkpointing use_cache stays True, and Transformers skips
+                # detecting padding-free packed sequences whenever a KV cache exists.
+                outputs = self.model(**inputs, use_cache=False)
 
         recorded_routing = rr.finish()
 
@@ -1147,7 +1149,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
             with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                    outputs = self.model(**inputs)
+                    # In eval mode use_cache defaults to True, and Transformers skips detecting
+                    # padding-free packed sequences whenever a KV cache exists.
+                    outputs = self.model(**inputs, use_cache=False)
 
             recorded_routing = rr.finish()
 
@@ -2325,19 +2329,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
-        is_npu_device = Platform.device_prefix() == 'npu'
+        # Platforms answering aligns_param_dtype_to_base() walk all parameters to
+        # find the base dtype (NPU: FSDP2 requires every parameter to match);
+        # elsewhere the first hit suffices because only LoRA params get aligned.
+        align_all = Platform.get_platform().aligns_param_dtype_to_base()
         for param in model.parameters():
             if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
-            if base_dtype is not None and is_npu_device:
+            if base_dtype is not None and align_all:
                 break
         if base_dtype is None:
             return
 
-        # Temporary workaround: NPU requires all parameters to align with the base dtype.
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if (is_npu_device or 'lora_' in name.lower()) and param.dtype != base_dtype:
+                if (align_all or 'lora_' in name.lower()) and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
 
     def _load_scaler_state(self, scaler_path, **kwargs):
@@ -2531,8 +2537,25 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+        self._patch_frozen_towers(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _patch_frozen_towers(self, model) -> None:
+        """Run a fully frozen vision tower without autograd (legacy swift #10214)."""
+        prefixes = list(self.model_arch.get('vision_tower') or [])
+        if not prefixes:
+            return
+        from twinkle.model.transformers.frozen_tower import patch_frozen_module
+        from twinkle.utils import deep_getattr
+
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        for prefix in prefixes:
+            tower = deep_getattr(base_model, prefix)
+            if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
+                patch_frozen_module(tower)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:

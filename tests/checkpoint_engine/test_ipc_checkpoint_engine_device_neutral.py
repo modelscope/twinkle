@@ -62,6 +62,15 @@ def test_buffer_and_flush_use_framework_device_and_sync_helpers(monkeypatch):
         def device_prefix():
             return 'cpu'
 
+        @staticmethod
+        def supports_device_ipc():
+            # CPU has no device IPC, so this platform exercises the SHM path.
+            return False
+
+        @staticmethod
+        def ensure_ipc_reducer():
+            pass
+
     monkeypatch.setattr(ipc_module.Platform, 'get_platform', staticmethod(lambda platform=None: CPU))
     monkeypatch.setattr(ipc_module.Torch, 'get_current_device', lambda: 0)
 
@@ -96,6 +105,14 @@ def test_npu_without_device_ipc_uses_shared_memory_and_closes_it(monkeypatch):
         def is_ipc_supported():
             return False
 
+        @staticmethod
+        def supports_device_ipc():
+            return False
+
+        @staticmethod
+        def ensure_ipc_reducer():
+            pass
+
     monkeypatch.setattr(ipc_module.Platform, 'get_platform', staticmethod(lambda platform=None: NPU))
     monkeypatch.setattr(ipc_module.Torch, 'get_current_device', lambda: 0)
 
@@ -129,6 +146,14 @@ def test_shared_memory_growth_keeps_the_previous_receiver_mapping_alive(monkeypa
         @staticmethod
         def is_ipc_supported():
             return False
+
+        @staticmethod
+        def supports_device_ipc():
+            return False
+
+        @staticmethod
+        def ensure_ipc_reducer():
+            pass
 
     monkeypatch.setattr(ipc_module.Platform, 'get_platform', staticmethod(lambda platform=None: NPU))
 

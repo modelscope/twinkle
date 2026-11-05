@@ -22,7 +22,20 @@ NOT_IMPLEMENTED = 'not implemented yet'
 
 
 def fake_platform(monkeypatch, name):
-    cls = type(name, (), {})
+    """Fake platform class exposing the checkpoint-engine hook the manager now queries."""
+    from twinkle.checkpoint_engine import HCCLCheckpointEngine, NCCLCheckpointEngine
+
+    engines = {
+        'GPU': (NCCLCheckpointEngine, {}),
+        'NPU': (HCCLCheckpointEngine, {}),
+    }
+
+    def checkpoint_engine():
+        if name not in engines:
+            raise NotImplementedError(f'No checkpoint engine for {name}')
+        return engines[name]
+
+    cls = type(name, (), {'checkpoint_engine': staticmethod(checkpoint_engine)})
     monkeypatch.setattr(Platform, 'get_platform', staticmethod(lambda platform=None: cls))
     return cls
 

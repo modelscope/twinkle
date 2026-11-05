@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
+
 from .base import Platform
 
 
@@ -37,3 +39,22 @@ class GPU(Platform):
         import torch
         if torch.cuda.is_available():
             torch.cuda.set_rng_state(state)
+
+    @staticmethod
+    def checkpoint_engine():
+        from twinkle.checkpoint_engine import NCCLCheckpointEngine
+        return NCCLCheckpointEngine, {}
+
+    @staticmethod
+    def device_module():
+        import torch
+        return torch.cuda if torch.cuda.is_available() else None
+
+    @staticmethod
+    def apply_determinism() -> None:
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+        os.environ['FLASH_ATTENTION_DETERMINISTIC'] = '1'
+        import torch
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False

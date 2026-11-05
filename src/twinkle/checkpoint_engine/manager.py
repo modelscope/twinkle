@@ -80,7 +80,7 @@ class CheckpointEngineManager:
         self,
         model: 'CheckpointEngineMixin',
         sampler: 'CheckpointEngineMixin',
-        platform: str = 'GPU',
+        platform: Optional[str] = None,
         mode: CheckpointEngineMode = 'auto',
         sync_backend: Literal['full', 'delta_sharded'] = 'full',
         delta_config: Optional[DeltaSyncConfig] = None,
@@ -184,20 +184,16 @@ class CheckpointEngineManager:
         if mode == 'naive':
             return None
 
-        platform_name = Platform.get_platform(platform).__name__
         if mode == 'colocate':
             from twinkle.checkpoint_engine import IPCCheckpointEngine
             return IPCCheckpointEngine
         if mode != 'standalone':
             raise ValueError(f'Cannot select a backend for unresolved mode {mode!r}.')
-        if platform_name == 'GPU':
-            from twinkle.checkpoint_engine import NCCLCheckpointEngine
-            return NCCLCheckpointEngine
-        elif platform_name == 'NPU':
-            from twinkle.checkpoint_engine import HCCLCheckpointEngine
-            return HCCLCheckpointEngine
-        else:
-            raise NotImplementedError
+        # The platform decides its own engine; a literal 'GPU' would mask NPU/XPU
+        # because ``Platform.get_platform('GPU')`` always resolves to the NVIDIA
+        # platform, so the driver would build an NCCL topology while the workers
+        # instantiate the HCCL/XCCL engine.
+        return Platform.get_platform(platform).checkpoint_engine()[0]
 
     def _validate_receiver_ids(self, worker_ids):
         if worker_ids is None:

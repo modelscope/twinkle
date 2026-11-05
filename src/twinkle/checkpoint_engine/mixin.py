@@ -51,7 +51,9 @@ class CheckpointEngineMixin:
         """Get or create the engine for the currently active transport channel."""
         backend = self._checkpoint_engine_backend
         if backend is None:
-            backend = 'nccl' if Platform.get_platform().__name__ == 'GPU' else 'hccl'
+            # The platform picks its default transport (NCCL / HCCL / XCCL); the
+            # string keys the persistent channel, the class resolves below.
+            backend = Platform.get_platform().checkpoint_engine()[0].backend_name
         key = self._checkpoint_engine_key or (backend, 'default')
         engines = getattr(self, '_checkpoint_engines', None)
         if engines is None:
@@ -72,6 +74,9 @@ class CheckpointEngineMixin:
             elif backend == 'nccl':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
                 engine = NCCLCheckpointEngine(self._bucket_size)
+            elif backend == 'xccl':
+                from twinkle.checkpoint_engine import XCCLCheckpointEngine
+                engine = XCCLCheckpointEngine(self._bucket_size)
             elif backend == 'hccl':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
 
@@ -247,7 +252,12 @@ class CheckpointEngineMixin:
         async def _receive_and_ema():
             async for name, tensor in engine.receive_weights():
                 param = local_state[name]
-                param.data.mul_(alpha).add_(tensor, alpha=1.0 - alpha)
+                # A received bucket rides the transport the pair negotiated --
+                # device-to-device on a shared NCCL channel, the ray object
+                # store (CPU tensors) across disjoint device groups. The EMA
+                # math runs on the parameter's device either way; ``.to`` is a
+                # no-op when the tensor already sits there.
+                param.data.mul_(alpha).add_(tensor.to(param.device), alpha=1.0 - alpha)
 
         result_container = {'error': None}
 

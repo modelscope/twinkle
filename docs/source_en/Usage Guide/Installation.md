@@ -53,5 +53,6 @@ sh INSTALL_MEGATRON.sh
 | GPU A10/A100/H100/RTX series |                                        |
 | GPU T4/V100                 | Does not support bfloat16, Flash-Attention |
 | Ascend NPU                  | Some operators not supported            |
+| Kunlunxin XPU (P800)        | Supported via the cuda-alike route; some operators fp16-only, see [XPU Support](XPU-Support.md) |
 | PPU                         | Supported                              |
 | CPU                         | Supports partial components like dataset, dataloader |

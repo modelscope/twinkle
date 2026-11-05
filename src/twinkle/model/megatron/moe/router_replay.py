@@ -21,6 +21,23 @@ except ImportError:  # pragma: no cover - depends on the installed megatron-core
     ROUTER_REPLAY_AVAILABLE = False
 
 
+def replay_index_dtype(num_experts: Optional[int]) -> torch.dtype:
+    """Record dtype for expert indices: uint8 halves the footprint only when it can hold every id."""
+    if isinstance(num_experts, int) and 0 < num_experts <= 256:
+        return torch.uint8
+    return torch.int32
+
+
+def check_replay_indices(recorded: torch.Tensor, num_experts: Optional[int]) -> None:
+    """Reject a record whose expert ids would be reinterpreted as a different expert on replay."""
+    if not isinstance(num_experts, int) or recorded.numel() == 0:
+        return
+    low, high = int(recorded.min()), int(recorded.max())
+    if low < 0 or high >= num_experts:
+        raise RuntimeError(f'router replay RECORD captured expert indices in [{low}, {high}], outside '
+                           f'[0, {num_experts}); replaying them would route tokens to the wrong experts.')
+
+
 class RouterReplay:
     """Megatron routing replay: per-``forward_backward`` orchestration plus the backend
     capability surface (mode resolution, cp/sp slicing, whole-model injection, RECORD
@@ -212,13 +229,16 @@ corrupt an MoE policy's importance ratio."""
 
         num_layers = tf_config.num_layers
         topk = getattr(tf_config, 'moe_router_topk', None)
+        # Same dtype in every chunk: the PP merge all-reduces them.
+        num_experts = getattr(tf_config, 'num_moe_experts', None)
+        index_dtype = replay_index_dtype(num_experts)
         routers = sorted(RouterReplay.iter_model_routers(model), key=lambda item: item[0])
         if not routers:
             # Zero-MoE chunk: contribute zeros so schedule alignment and the PP all-reduce stay intact.
             if full_seq is None or not isinstance(topk, int) or topk <= 0:
                 return None
             from twinkle import Platform
-            return torch.zeros((batch_size, full_seq, num_layers, topk), dtype=torch.uint8,
+            return torch.zeros((batch_size, full_seq, num_layers, topk), dtype=index_dtype,
                                device=Platform.get_local_device())
         # Distinct layer_numbers required: the scatter writes slots by assignment, so a
         # duplicate would silently overwrite and corrupt the record.
@@ -232,7 +252,8 @@ corrupt an MoE policy's importance ratio."""
                 raise RuntimeError(
                     'router replay RECORD did not capture every local MoE router (one has no recorded_topk_idx); '
                     'the record forward is incomplete.')
-            local_layers.append(router.recorded_topk_idx.to(torch.uint8))
+            local_layers.append(router.recorded_topk_idx.to(index_dtype))
+            check_replay_indices(local_layers[-1], num_experts)
         num_local_moe = len(local_layers)
         local_tokens, topk = local_layers[0].shape[0], local_layers[0].shape[-1]
         assert local_tokens % batch_size == 0, (

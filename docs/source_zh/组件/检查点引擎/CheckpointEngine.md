@@ -48,7 +48,7 @@ class CheckpointEngine(ABC):
 
 ## 可用的检查点引擎
 
-Twinkle 提供三种跨进程检查点引擎实现；`naive` 模式会绕过这些引擎。
+Twinkle 提供四种跨进程检查点引擎实现；`naive` 模式会绕过这些引擎。
 
 ### NCCLCheckpointEngine
 
@@ -75,10 +75,21 @@ Twinkle 提供三种跨进程检查点引擎实现；`naive` 模式会绕过这�
 适用于模型和 sampler Ray actors 被放置在同一组物理 GPU 上的 CUDA IPC 引擎。NCCL 会拒绝多个
 rank 绑定同一张 GPU，因此该拓扑必须通过 CUDA IPC 在进程间映射权重 bucket，而不是跨设备广播。
 
+### XCCLCheckpointEngine
+
+使用 BKCL（XCCL）在昆仑芯 XPU 上进行权重传输的检查点引擎。
+
+- XPU 支持: 在 cuda-alike XPU 路线上作为 NCCLCheckpointEngine 的直替
+- relay 兜底: 通过 stateless `ProcessGroupXCCL` 加 socket 中继处理重复的 local device index
+- 兼容接口: 继承 `NCCLCheckpointEngine`，复用分桶与元数据握手
+
+详见: [XCCLCheckpointEngine](XCCLCheckpointEngine.md)
+
 ## 如何选择
 
 - **NCCLCheckpointEngine**: 适用于 GPU 环境,提供最高的传输性能
 - **HCCLCheckpointEngine**: 适用于昇腾 NPU 环境
+- **XCCLCheckpointEngine**: 适用于昆仑芯 XPU 环境（自动选择）
 - **IPCCheckpointEngine**: 适用于共享物理 GPU 的 colocated Ray actors
 - **不创建引擎 (`naive`)**: 适用于同一进程内的本地 model 和 sampler
 

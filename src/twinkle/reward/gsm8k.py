@@ -80,10 +80,29 @@ class MathVerifyAccuracyReward(Reward):
     """Use the same math-verify parsing and equivalence check as AReaL."""
 
     def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True,
-                 ground_truth_key: str = 'ground_truth'):
+                 ground_truth_key: str = 'ground_truth', tail_chars: int = 600):
         self.precision = precision
         self.try_extract_without_anchor = try_extract_without_anchor
         self.ground_truth_key = ground_truth_key
+        # Final answers live at the END of a natural-language completion.
+        # Anchor-less extraction returns the FIRST expression it finds, which
+        # on outputs without \boxed{} grabs an intermediate quantity from the
+        # reasoning body. Parsing a tail window first is model-agnostic: any
+        # model that states its answer last is extracted correctly, while
+        # anchored (\boxed{}/$...$) completions are unaffected.
+        self.tail_chars = tail_chars
+
+    def _parse_completion(self, completion: str, extraction_config):
+        from math_verify.parser import parse
+
+        tail = completion[-self.tail_chars:] if self.tail_chars > 0 else completion
+        if tail != completion:
+            tail_answer = parse(tail, extraction_config=extraction_config,
+                                parsing_timeout=None)
+            if tail_answer:
+                return tail_answer
+        return parse(completion, extraction_config=extraction_config,
+                     parsing_timeout=None)
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         from math_verify.grader import verify
@@ -107,11 +126,7 @@ class MathVerifyAccuracyReward(Reward):
                     extraction_config=extraction_config,
                     parsing_timeout=None,
                 )
-                answer = parse(
-                    completion,
-                    extraction_config=extraction_config,
-                    parsing_timeout=None,
-                )
+                answer = self._parse_completion(completion, extraction_config)
                 if not gold or not answer:
                     rewards.append(0.0)
                     continue

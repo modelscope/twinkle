@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
 import numpy as np
-import os
 import random
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -43,19 +42,10 @@ class Framework(ABC):
         output_objects = [object]
         group_size = 1
         if dist.is_available() and dist.is_initialized():
-            if Platform.device_prefix() == 'npu' and not device_mesh.has_dim('fsdp'):
-                # On NPU, letting Python object collectives use the default HCCL
-                # group previously hung in 8-card metric collection at
-                # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
-                # DP group instead. When CP is enabled we must pick the DP+CP
-                # variant, otherwise the rank span for metric aggregation is wrong.
-                # find_spec for a submodule imports its parent, which is optional.
-                if (importlib.util.find_spec('megatron') is not None
-                        and importlib.util.find_spec('megatron.core') is not None):
-                    from megatron.core import parallel_state as mpu
-                    if mpu.model_parallel_is_initialized():
-                        process_group = mpu.get_data_parallel_group_gloo(
-                            with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
+            # Platforms whose device backend cannot carry object collectives (e.g.
+            # HCCL) answer with a Gloo group; None keeps the caller's group.
+            process_group = Platform.get_platform().resolve_object_collective_group(
+                device_mesh) or process_group
             group_size = dist.get_world_size(group=process_group)
         if group_size > 1:
             output_objects = [None for _ in range(group_size)]
@@ -72,6 +62,16 @@ class Framework(ABC):
 
 
 class Torch(Framework):
+
+    @staticmethod
+    @lru_cache
+    def _device_module():
+        """The current platform's torch.<x> device namespace, or ``None`` on CPU.
+
+        Cached like the old availability probes: the platform is resolved once per
+        process and device hot paths (``synchronize`` etc.) must not re-detect it.
+        """
+        return Platform.get_platform().device_module()
 
     @staticmethod
     @lru_cache
@@ -114,52 +114,35 @@ class Torch(Framework):
 
     @staticmethod
     def empty_cache():
-        if Torch.is_gpu_available():
-            import torch
-            torch.cuda.empty_cache()
-        elif Torch.is_npu_available():
-            import torch
-            import torch_npu
-            torch.npu.empty_cache()
+        device_module = Torch._device_module()
+        if device_module is not None:
+            device_module.empty_cache()
 
     @staticmethod
     @lru_cache
     def get_current_device() -> 'Union[int, str, "torch.device"]':
-        import torch
-        if Torch.is_gpu_available():
-            return torch.cuda.current_device()
-        elif Torch.is_npu_available():
-            import torch_npu
-            return torch.npu.current_device()
-        else:
+        device_module = Torch._device_module()
+        if device_module is None:
             return 'cpu'
+        return device_module.current_device()
 
     @staticmethod
     @lru_cache
     def get_device(local_rank) -> str:
         if local_rank is None:
             local_rank = max(0, Platform.get_local_rank())
-        local_rank = str(local_rank)
-        if Torch.is_gpu_available():
-            from .platforms import GPU
-            device = f'{GPU.device_prefix()}:{local_rank}'
-        elif Torch.is_npu_available():
-            from .platforms import NPU
-            device = f'{NPU.device_prefix()}:{local_rank}'
-        else:
-            device = 'cpu'
-        return device
+        if Torch._device_module() is None:
+            return 'cpu'
+        return f'{Platform.device_prefix()}:{local_rank}'
 
     @staticmethod
     def set_device(local_rank: Union[int, str] = None) -> None:
-        import torch
+        device_module = Torch._device_module()
+        if device_module is None:
+            return
         if local_rank is None:
             local_rank = max(0, Platform.get_local_rank())
-        if Torch.is_gpu_available():
-            torch.cuda.set_device(local_rank)
-        elif Torch.is_npu_available():
-            import torch_npu
-            torch.npu.set_device(local_rank)
+        device_module.set_device(local_rank)
 
     @staticmethod
     def seed_everything(seed: Optional[int] = 42, deterministic: bool = False):
@@ -168,24 +151,14 @@ class Torch(Framework):
         import torch
         torch.manual_seed(seed)
 
-        if Torch.is_gpu_available():
-            torch.cuda.manual_seed_all(seed)
-
-        if Torch.is_npu_available():
-            import torch_npu
-            torch.npu.manual_seed_all(seed)
+        device_module = Torch._device_module()
+        if device_module is not None:
+            device_module.manual_seed_all(seed)
 
         if deterministic:
             torch.use_deterministic_algorithms(True, warn_only=True)
-            if Torch.is_gpu_available():
-                os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-                os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
-                os.environ['FLASH_ATTENTION_DETERMINISTIC'] = '1'
-                torch.backends.cudnn.deterministic = True
-                torch.backends.cudnn.benchmark = False
-            if Torch.is_npu_available():
-                os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
-                os.environ['HCCL_DETERMINISTIC'] = '1'
+            if device_module is not None:
+                Platform.get_platform().apply_determinism()
 
     @staticmethod
     def to_local_tensor(tensor: 'torch.Tensor') -> 'torch.Tensor':
@@ -212,14 +185,12 @@ class Torch(Framework):
         Pass ``device`` explicitly in subprocesses (e.g. vLLM TP workers) that inherit the
         parent's LOCAL_RANK but are bound to a different device.
         """
-        import torch
+        device_module = Torch._device_module()
+        if device_module is None:
+            return
         if device is None:
             device = Platform.get_local_device()
-        if Torch.is_gpu_available():
-            torch.cuda.synchronize(device)
-        elif Torch.is_npu_available():
-            import torch_npu
-            torch.npu.synchronize(device)
+        device_module.synchronize(device)
 
     @staticmethod
     def contains_nan(*args, **kwargs) -> bool:
@@ -248,11 +219,12 @@ class Torch(Framework):
         return False
 
     @staticmethod
+    def is_accelerator_tensor(tensor) -> bool:
+        """True for tensors living on an accelerator (cuda-like or npu)."""
+        return tensor.is_cuda or getattr(tensor, 'is_npu', False)
+
+    @staticmethod
     def ipc_collect():
-        if Torch.is_gpu_available():
-            import torch
-            torch.cuda.ipc_collect()
-        elif Torch.is_npu_available():
-            import torch
-            import torch_npu
-            torch.npu.ipc_collect()
+        device_module = Torch._device_module()
+        if device_module is not None:
+            device_module.ipc_collect()

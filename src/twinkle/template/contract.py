@@ -40,7 +40,6 @@ try:
         TemplateProtocol,
         TemplateSpec,
         Tool,
-        append_and_finalize as _swift_append_and_finalize,
         append_input_order,
         coerce_tool_call_arguments,
         feature_has_media,
@@ -56,6 +55,7 @@ try:
         unshift,
         unshift_values,
     )
+    from swift.dev.template_contract import append_and_finalize as _swift_append_and_finalize
 except ImportError as error:
     raise ImportError(
         "twinkle requires a matching swift.dev.template_contract; install the pinned Swift revision before importing "
@@ -63,18 +63,22 @@ except ImportError as error:
     ) from error
 
 
-def append_and_finalize(row, tokens, *, scored, sampled, finalize):
-    """Append through Swift after restoring token-aligned arrays lost to JSON serialization.
-
-    HTTP samplers represent a batched token-type field such as Qwen's ``[1, T]``
-    ``mm_token_type_ids`` as nested Python lists. Swift appends ndarray/tensor
-    fields on their token axis, but would append scalars to the outer list and
-    produce ``[[...], 0, 0]``. Normalize at this shared boundary so both the
-    server-side sampler and client-side multi-turn ledger use the same layout.
-    """
-    normalized = dict(row)
+def _batched_token_fields_as_arrays(row):
+    # swift extends numpy/torch token fields on their last axis but extends a Python list flat. A prompt that went
+    # through a dataset stores the processor's batched [1, L] mm_token_type_ids as a nested list, which a flat extend
+    # turns into the ragged [[0] * L, 0, 0, ...]; as an array it is extended to [1, L + n].
+    converted = None
     for key in TOKEN_FILL:
-        value = normalized.get(key)
-        if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
-            normalized[key] = np.asarray(value)
-    return _swift_append_and_finalize(normalized, tokens, scored=scored, sampled=sampled, finalize=finalize)
+        value = row.get(key)
+        if isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], (list, tuple)):
+            if converted is None:
+                converted = dict(row)
+            converted[key] = np.asarray(value)
+    return row if converted is None else converted
+
+
+def append_and_finalize(row, tokens, *, scored, sampled, finalize):
+    """``swift.dev.template_contract.append_and_finalize``, extending batched list token fields on their last axis."""
+    return _swift_append_and_finalize(
+        _batched_token_fields_as_arrays(row), tokens, scored=scored, sampled=sampled, finalize=finalize
+    )

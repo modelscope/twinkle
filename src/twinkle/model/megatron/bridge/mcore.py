@@ -19,7 +19,6 @@ class MCoreBridgeBackend:
     def build_model_config(self, hf_config: Any, parallel_kwargs: Dict[str, Any], strategy: Any, **kwargs) -> Any:
         from mcore_bridge import ModelConfig, hf_to_mcore_config
         from twinkle import Platform
-        from twinkle.model.megatron.utils._mindspeed_runtime import configure_mindspeed_runtime_args
         from twinkle.model.megatron.strategy.megatron import finalize_model_grads_for_lora
 
         # Internal provenance used by MegatronBridgeBackend to distinguish an explicit user option
@@ -50,11 +49,9 @@ class MCoreBridgeBackend:
             **parallel_kwargs,
             **config_kwargs,
         )
-        # NPU: MindSpeed's patched TE attention needs use_flash_attn to synthesize its own
-        # compressed causal mask; unset aborts the first 8-card forward (NPU-only, no GPU effect).
-        if Platform.device_prefix() == 'npu':
-            model_config.use_flash_attn = True
-        configure_mindspeed_runtime_args(model_config)
+        # Platform hook: NPU's MindSpeed stack sets use_flash_attn and applies its
+        # runtime args here; no-op on every other platform.
+        Platform.get_platform().configure_model_config(model_config)
         return model_config
 
     def create_model(self, config: Any, model_dir: str, *, load_weights: bool, move_to_gpu) -> List[Any]:

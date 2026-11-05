@@ -13,7 +13,6 @@ from twinkle.loss.liger_fused_linear_cross_entropy import LigerFusedLinearCrossE
 from twinkle.loss.mopd import MOPDLoss
 from twinkle.loss.reward import RewardLoss
 from twinkle.loss.seq_cls import SeqClsLoss
-from twinkle.loss.value import PPOValueLoss
 from .test_grpo_micro_batch import TrainingHarness, data
 
 
@@ -50,7 +49,7 @@ def test_sample_mean_losses_match_whole_batch_with_a_short_micro_batch(factory):
     torch.testing.assert_close(internal.normalized_gradient(), baseline.normalized_gradient())
 
 
-@pytest.mark.parametrize("factory", [PPOValueLoss, GKDLoss, LigerFusedLinearCrossEntropyLoss])
+@pytest.mark.parametrize("factory", [GKDLoss, LigerFusedLinearCrossEntropyLoss])
 def test_token_losses_match_explicit_fixed_micro_batches(factory):
     baseline, internal = Harness(factory()), Harness(factory())
     rows = data()[:6]

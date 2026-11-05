@@ -166,7 +166,7 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
         out['lm_head'] = None
         return out
 
-    def _fused_call(self, inputs, outputs, lm_head, *, old_logps, ref_logps, advantages, **kwargs):
+    def _fused_call(self, inputs, outputs, lm_head, *, old_logps, ref_logps, advantages, truncated=None, **kwargs):
         import torch
         labels = inputs['labels']
         if not torch.is_tensor(labels):
@@ -182,6 +182,12 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
         labels = labels.to(device)
 
         loss_mask = (labels != self.ignore_index)
+        if self.overlong_filter and truncated is not None:
+            # Overlong completions are excluded from the objective entirely, not just from the logps frame:
+            # masking them here (before the advantage reduction and the kernel call) keeps the loss, the
+            # per-sequence advantage and the kernel's own token normalizer on the same token set.
+            truncated_mask = torch.as_tensor(truncated, dtype=torch.bool, device=device).reshape(-1, 1)
+            loss_mask = loss_mask & ~truncated_mask
         # -100 is not a valid vocab id; map masked positions to 0 (excluded by mask).
         selected_token_ids = labels.clamp(min=0)
         attention_mask = loss_mask.to(torch.int32)
@@ -222,6 +228,7 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
         old_logps: Optional[Union['np.ndarray', List]] = None,
         ref_logps=None,
         advantages=None,
+        truncated: Optional[List[bool]] = None,
         **kwargs,
     ):
         lm_head = outputs.get('lm_head')
@@ -230,7 +237,14 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
         if have_head and not self._fused_broken and advantages is not None:
             try:
                 return self._fused_call(
-                    inputs, outputs, lm_head, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
+                    inputs,
+                    outputs,
+                    lm_head,
+                    old_logps=old_logps,
+                    ref_logps=ref_logps,
+                    advantages=advantages,
+                    truncated=truncated,
+                    **kwargs)
             except Exception as e:  # defensive, device-agnostic
                 if not self._warned:
                     self._warned = True
@@ -247,4 +261,5 @@ class LigerFusedLinearGRPOLoss(GRPOLoss):
         if have_head:
             outputs = self._materialise_logits(outputs, lm_head)
         return super().__call__(
-            inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
+            inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, truncated=truncated,
+            **kwargs)

@@ -49,6 +49,12 @@ from .strategy import MegatronStrategy
 logger = get_logger()
 
 
+def _first_optimizer_lr(optimizer) -> float:
+    """The learning rate of any megatron optimizer: a ChainedOptimizer fans out per model chunk."""
+    chained = getattr(optimizer, 'chained_optimizers', None) or [optimizer]
+    return chained[0].config.lr
+
+
 def _resolve_task_context(model, task):
     """The per-forward Patch for ``task``: 'embedding' swaps the output_layer for identity
     (with TP/SP gather) and pools to ``[n_seqs, hidden]``; causal_lm/seq_cls/reranker/value
@@ -90,7 +96,7 @@ class MegatronOptimizerGroup(BaseOptimizerGroup):
         _lrs = []
         if self.optimizer is None:
             return _lrs
-        _default_lr = self.optimizer.chained_optimizers[0].config.lr
+        _default_lr = _first_optimizer_lr(self.optimizer)
         for param_group in self.optimizer.param_groups:
             _lrs.append(param_group.get('lr', _default_lr))
         return _lrs
@@ -145,7 +151,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if MegatronStrategy.uses_fsdp(ddp_config):
             os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
-        self._try_init_process_group()
+        # mcore requires an initialised process group even at world_size==1.
+        self._try_init_process_group(force=True)
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
         # mcore_bridge pulls in megatron.core/TE too early on NPU.
         ensure_mindspeed_adaptor_patched()
@@ -509,7 +516,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             variable_seq_lengths=self.variable_seq_lengths,
             attention_mask_type=attention_mask_type,
         )
-
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
         # MoE routing replay orchestration of this call (a null object when disabled or mode-less);
@@ -2051,7 +2057,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         if optimizer_config.optimizer:
             expr += f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
-            expr += f'Learning rate: {optimizer_config.optimizer.chained_optimizers[0].config.lr}\n'
+            expr += f'Learning rate: {_first_optimizer_lr(optimizer_config.optimizer)}\n'
         if optimizer_config.lr_scheduler:
             expr += f'LR scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
