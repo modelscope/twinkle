@@ -219,6 +219,14 @@ class MegatronStrategy:
             # config-build time rather than part-way through wrapping on every rank.
             raise ValueError('Megatron-FSDP does not support context parallelism '
                              f'(cp_world_size={self.device_mesh.cp_world_size}). Use DDP for a CP run.')
+        if self.device_mesh is not None:
+            tp = getattr(self.device_mesh, 'tp_world_size', 1) or 1
+            pp = getattr(self.device_mesh, 'pp_world_size', 1) or 1
+            if tp > 1 or pp > 1:
+                raise ValueError(f'Megatron-FSDP (mcore 0.20) supports neither tensor parallelism '
+                                 f'(tp_world_size={tp}) nor pipeline parallelism (pp_world_size={pp}): '
+                                 'its distributed index assumes world = dp*cp*ep*tp with no pipeline '
+                                 'axis. Use the default DDP wrapper for a tp>1 or pp>1 run.')
 
     def _finalize_quantized_param_config(self):
         """Derive the DDP ``fp8/fp4_param_gather`` flags from ``fp8/fp4_param``.

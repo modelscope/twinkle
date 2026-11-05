@@ -178,7 +178,9 @@ def _resolve_reduce_device(grads: list[torch.Tensor]):
             return local.device
 
     backend = dist.get_backend() if dist.is_initialized() else None
-    if backend in ('nccl', 'hccl'):
+    # The accelerators whose collectives only run on-device (hook: the platform
+    # binds its PG to the device). Gloo-led backends reduce fine on CPU.
+    if backend and Platform.get_platform().binds_device_id_to_process_group():
         return torch.device(Platform.get_local_device())
     return torch.device('cpu')
 

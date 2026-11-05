@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import sys
 from copy import copy
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
@@ -16,6 +17,14 @@ from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 @dataclass
 class PackedSeqParams:
+    """Local fallback of megatron's PackedSeqParams, field-compatible with megatron-core 0.20.
+
+    Only used when megatron-core is NOT already imported in this process (the transformers
+    backend): there the packed params never reach a megatron consumer, so the field set only
+    needs to cover twinkle's own readers. A megatron process must NOT get this class -- mcore's
+    TE attention derives its getattr list from ITS PackedSeqParams version, and a missing field
+    (e.g. pad_between_seqs) crashes it. See _get_packed_seq_params for the switch.
+    """
     qkv_format: str = None
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_kv: torch.Tensor = None
@@ -26,6 +35,16 @@ class PackedSeqParams:
     # Fields required by newer megatron-core TE attention (dynamic CP)
     cp_group: object = None
     local_cp_size: int = None
+    cp_singleton_group: object = None
+    # Remaining megatron-core 0.20 fields (kept so an accidental megatron consumer in a
+    # mixed setup still finds every attribute, mirroring the 0.20 dataclass).
+    total_tokens: int = None
+    seq_idx: torch.Tensor = None
+    pad_between_seqs: bool = False
+    cp_partition_mode: str = None
+    tokens_per_sample: torch.Tensor = None
+    cp_partition_route: torch.Tensor = None
+    cp_scatter_cache: object = None
 
 
 @remote_class()
@@ -582,7 +601,11 @@ class InputProcessor:
         )
 
         max_length = cu_seqlens.diff().max()  # position_ids_f.max() + 1
-        packed = PackedSeqParams(
+        if 'megatron.core' in sys.modules:
+            from megatron.core.packed_seq_params import PackedSeqParams as _PackedSeqParams
+        else:
+            _PackedSeqParams = PackedSeqParams
+        packed = _PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_length,

@@ -416,7 +416,9 @@ def stateless_init_process_group(
 
     from vllm.distributed.utils import StatelessProcessGroup
 
-    if backend == 'hccl':
+    # The platform hook decides both branches: socket-env injection (HCCL's fixed
+    # base port collides across jobs) and the py communicator class to hand vLLM.
+    if Platform.get_platform().ensures_socket_env():
         # fix: Stateless PG + HCCL path needs the same port policy, otherwise workers can still collide.
         from .platforms import ensure_hccl_socket_env
         ensure_hccl_socket_env(master_port)

@@ -148,6 +148,11 @@ class XPU(GPU):
         return True
 
     @staticmethod
+    def binds_device_id_to_process_group() -> bool:
+        # Same crash as requires_unbound_default_pg: never let the binding in.
+        return False
+
+    @staticmethod
     def requires_unbound_pg_for_subgroups() -> bool:
         # Same root cause as above, but Megatron may run on a default PG that
         # twinkle did not initialize, so the binding has to be cleared again

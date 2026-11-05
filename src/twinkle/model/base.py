@@ -477,7 +477,9 @@ class TrainableModel(ABC):
                 patch_frozen_towers(module)
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
-        return backend in ('nccl', 'hccl')
+        # Platform hook: CUDA/NPU bind lazily-built communicators to the device;
+        # XPU's BKCL crashes on a bound id in later subgroup splits.
+        return Platform.get_platform().binds_device_id_to_process_group()
 
     def _try_init_process_group(self, force: bool = False):
         """Initialise the default process group if nothing has yet.
@@ -493,7 +495,7 @@ class TrainableModel(ABC):
         if not dist.is_initialized() and (force or Platform.get_world_size() > 1):
             torch_util.set_device()
             backend = Platform.device_backend()
-            if backend == 'hccl':
+            if Platform.get_platform().ensures_socket_env():
                 # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
                 # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
                 # Keep training-side HCCL sockets on a per-job port layout to

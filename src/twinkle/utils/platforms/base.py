@@ -180,6 +180,27 @@ class Platform(ABC):
         return False
 
     @staticmethod
+    def binds_device_id_to_process_group() -> bool:
+        """Whether ``init_process_group`` should receive ``device_id=``.
+
+        True where the device backend builds its communicator lazily on the
+        bound device (CUDA/NCCL and NPU/HCCL both benefit); False where the
+        bound id propagates into subgroup creation and breaks it (see
+        ``requires_unbound_default_pg`` and its platform overrides).
+        """
+        return True
+
+    @staticmethod
+    def ensures_socket_env() -> bool:
+        """Whether the platform's communication library needs deterministic
+        socket-port env injected before a process group (or a stateless vLLM PG)
+        is created on this host -- multi-job collisions otherwise fail the bind
+        (e.g. HCCL's fixed base port).  The injection itself lives next to the
+        platform (``ensure_hccl_socket_env``); the flag only decides whether to run it.
+        """
+        return False
+
+    @staticmethod
     def ray_resources() -> Dict[str, float]:
         """Accelerator resources that must be registered with ``ray.init`` explicitly.
 

@@ -234,6 +234,12 @@ class NPU(Platform):
         return True
 
     @staticmethod
+    def ensures_socket_env() -> bool:
+        # HCCL's fixed base port collides across concurrent jobs on one host;
+        # ensure_hccl_socket_env (above) derives a per-job layout from master_port.
+        return True
+
+    @staticmethod
     def ray_resources():
         # Ray cannot autodetect Ascend NPUs; register them as a custom
         # resource so placement groups can request them.
