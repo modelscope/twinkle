@@ -24,6 +24,7 @@ from .validation import (
     _evaluate,
     _load_recipe,
     _probe_logps,
+    _rollout_batch_evidence,
     _timed_tool_manager,
     _Timeline,
     _wait_for_stage,
@@ -74,6 +75,18 @@ def test_probe_logps_uses_the_full_rollout_group_for_dp():
     assert calls['inputs'] is trajectories
     assert len(calls['inputs']) == 2
     assert result == [-0.25, -0.5]
+
+
+def test_rollout_batch_evidence_counts_supervised_tokens():
+    rows = [{
+        'completion_mask': [0, 1, 1],
+        'labels': [-100, 5, 6],
+        'rollout_logprobs': [-0.1, -0.2],
+    }]
+    evidence = _rollout_batch_evidence(rows, [0.5])
+    assert evidence['completion_tokens'] == [2.0]
+    assert evidence['supervised_labels'] == [2]
+    assert evidence['rollout_logprobs'] == [2]
 
 
 def test_fake_and_real_result_modes_are_explicit(tmp_path):
