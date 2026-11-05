@@ -158,6 +158,23 @@ def _code_task(recipe, item: dict):
     return recipe.CodeTask(**{key: value for key, value in item.items() if key != 'id'})
 
 
+def _supervised_label_count(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_supervised_label_count(item) for item in value)
+    return int(value != -100)
+
+
+def _rollout_batch_evidence(rolled: list[dict], rewards: list[float]) -> dict:
+    return {
+        'rewards': rewards,
+        'completion_tokens': [sum(_numbers(row.get('completion_mask'))) for row in rolled],
+        'supervised_labels': [_supervised_label_count(row.get('labels')) for row in rolled],
+        'rollout_logprobs': [len(row.get('rollout_logprobs') or []) for row in rolled],
+    }
+
+
 def _training_evidence(rolled: list[dict]) -> dict[str, bool]:
     multi_turn = False
     aligned = True
@@ -462,6 +479,7 @@ async def run_validation(config: ValidationConfig) -> dict:
         all_rolled = []
         probe = {}
         incomplete_rollout_groups = 0
+        rollout_batches = []
 
         async def train_groups():
             nonlocal policy_uri, incomplete_rollout_groups
@@ -486,6 +504,7 @@ async def run_validation(config: ValidationConfig) -> dict:
                         incomplete_rollout_groups += 1
                         continue
                     all_rolled.extend(rolled)
+                    rollout_batches.append(_rollout_batch_evidence(rolled, rewards))
                     recipe._ensure_running(stop_event)
                     if 'trajectories' not in probe:
                         probe['trajectories'] = rolled
@@ -538,6 +557,7 @@ async def run_validation(config: ValidationConfig) -> dict:
         values.update({
             'updates': updates,
             'incomplete_rollout_groups': incomplete_rollout_groups,
+            'rollout_batches': rollout_batches,
             'final_policy_uri': policy_uri,
             'snapshot_uris': sorted(snapshot_uris),
             'policy_requests': recording_sampler.uris,
