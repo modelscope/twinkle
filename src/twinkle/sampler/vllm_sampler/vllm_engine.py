@@ -14,7 +14,6 @@ from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, Sample
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
-from twinkle.utils.parallel import PosixFileLock
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
@@ -321,6 +320,9 @@ class VLLMEngine(BaseSamplerEngine):
         os.environ['VLLM_USE_V1'] = '1'
         if self.enable_sampling_replay:
             os.environ['VLLM_USE_V2_MODEL_RUNNER'] = '1'
+        # Platform hook: apply hardware vLLM fixes (e.g. vllm_metax) before any vllm
+        # import in this process; no-op on platforms without explicit patches.
+        Platform.apply_vllm_patch()
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -403,11 +405,10 @@ class VLLMEngine(BaseSamplerEngine):
         engine_args = AsyncEngineArgs(**filtered_engine_config)
         vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
 
-        with PosixFileLock('/tmp/twinkle-vllm-engine-init.lock'):
-            engine = AsyncLLM.from_vllm_config(
-                vllm_config=vllm_config,
-                usage_context=UsageContext.OPENAI_API_SERVER,
-            )
+        engine = AsyncLLM.from_vllm_config(
+            vllm_config=vllm_config,
+            usage_context=UsageContext.OPENAI_API_SERVER,
+        )
 
         logger.info(f'VLLMEngine initialized: model={self.model_id}')
         return engine
@@ -993,9 +994,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         use_device_ipc = first_tensor.is_cuda
         if first_tensor.device.type == 'npu':
-            from twinkle.utils.platforms import NPU
-
-            use_device_ipc = NPU.is_ipc_supported()
+            use_device_ipc = Platform.get_platform().supports_device_ipc()
         use_shm = not use_device_ipc
 
         # Use a per-sync unique IPC endpoint to avoid cross-actor collisions
@@ -1018,9 +1017,8 @@ class VLLMEngine(BaseSamplerEngine):
         shm = None
 
         if use_device_ipc:
-            if first_tensor.device.type == 'npu':
-                # torch_npu registers the NPU reducer used by reduce_tensor.
-                import torch_npu  # noqa: F401
+            # Register the platform's tensor reducer (no-op where the CUDA one is builtin).
+            Platform.get_platform().ensure_ipc_reducer()
             from torch.multiprocessing.reductions import reduce_tensor
 
             # Reuse a long-lived IPC bucket whenever the requested size

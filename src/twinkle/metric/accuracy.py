@@ -34,6 +34,10 @@ class Accuracy(Metric):
             # carry no per-token labels, so there is no token accuracy to accumulate. A fused-linear-CE
             # forward also lands here: it never materializes the full logits, so there is nothing to argmax.
             return
+        if labels.dim() and labels.dtype.is_floating_point:
+            # Float labels are regression / value targets, not token ids: the value task's readout
+            # surfaces per-token scores as 'logits', and argmax against a float target is meaningless.
+            return
         output_token_ids = logits.argmax(dim=-1)
         mask = inputs.get('completion_mask')
         if mask is not None:

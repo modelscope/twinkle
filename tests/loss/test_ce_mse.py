@@ -154,6 +154,36 @@ class TestChunkedCrossEntropyLoss:
         assert logits.grad is not None
         assert logits.grad.shape == logits.shape
 
+    def test_chunked_repeated_backward_preserves_logits(self):
+        raw = torch.randn(7, 11, dtype=torch.float64, requires_grad=True)
+        logits = raw.tanh()
+        original = logits.detach().clone()
+        labels = torch.tensor([1, -100, 3, 5, 0, -100, 8])
+        loss = ChunkedCrossEntropyLoss(chunk_size=3)({'labels': labels}, {'logits': logits})['loss']
+        grad_output = torch.tensor(0.5, dtype=torch.float64)
+
+        first = torch.autograd.grad(loss, raw, grad_output, retain_graph=True)[0]
+        second = torch.autograd.grad(loss, raw, grad_output)[0]
+
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(logits, original, rtol=0, atol=0)
+
+    def test_chunked_shared_logits_with_auxiliary_loss(self):
+        model = torch.nn.Linear(5, 11, dtype=torch.float64)
+        x = torch.randn(7, 5, dtype=torch.float64)
+        labels = torch.arange(7)
+        logits = model(x)
+        baseline = F.cross_entropy(logits, labels) + 0.1 * logits.square().mean()
+        expected = torch.autograd.grad(baseline, tuple(model.parameters()))
+
+        logits = model(x)
+        ce = ChunkedCrossEntropyLoss(chunk_size=3)({'labels': labels}, {'logits': logits})['loss']
+        actual = 0.1 * logits.square().mean() + ce
+        grads = torch.autograd.grad(actual, tuple(model.parameters()))
+
+        for grad, reference in zip(grads, expected):
+            torch.testing.assert_close(grad, reference)
+
 
 class TestMSELoss:
 

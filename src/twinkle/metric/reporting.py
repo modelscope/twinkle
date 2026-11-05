@@ -2,8 +2,6 @@
 """Asynchronous JSONL and SwanLab metric reporting."""
 
 from __future__ import annotations
-
-import json
 import logging
 import math
 import os
@@ -15,6 +13,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import json
 
 from .types import MetricRecord
 
@@ -119,6 +119,16 @@ class _SummaryReducer:
         if record.stage == 'run':
             self.run_status = record.status
             self.result = {**record.values, **record.attributes}
+            # A producer may report terminal totals instead of individual sample/group events.
+            if record.context_key:
+                for name, counter in (
+                    ('rollout_groups', self.context_rollout_groups),
+                    ('rollout_samples', self.context_rollout_samples),
+                    ('trained_samples', self.context_trained_samples),
+                ):
+                    total = _finite_number(record.values.get(name))
+                    if total is not None:
+                        counter[record.context_key] = int(total)
 
     def as_dict(self, backend_health: Mapping[str, Any]) -> dict[str, Any]:
         wall_time = _finite_number(self.result.get('wall_time_s'))
@@ -325,10 +335,10 @@ class _QueuedBackend:
 
 class _JSONLBackend(_QueuedBackend):
 
-    def __init__(self, path: str | Path, **kwargs: Any):
+    def __init__(self, path: str | Path, *, append: bool = False, **kwargs: Any):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._stream = self.path.open('w', encoding='utf-8')
+        self._stream = self.path.open('a' if append else 'w', encoding='utf-8')
         super().__init__('jsonl', **kwargs)
 
     def _write_batch(self, batch: Sequence[dict[str, Any]]) -> None:
@@ -465,7 +475,7 @@ class MetricsReporter:
         for name, value in record.values.items():
             number = _finite_number(value)
             if number is None:
-                non_numeric[name] = value
+                non_numeric[name] = None if isinstance(value, float) and not math.isfinite(value) else value
             else:
                 values[name] = number
         attributes = dict(record.attributes)
@@ -523,7 +533,8 @@ def create_metrics_reporter(config: Mapping[str, Any] | None, *, run_id: str) ->
     }
     if bool(jsonl_config.get('enabled', True)):
         try:
-            backends.append(_JSONLBackend(jsonl_config['path'], **backend_defaults))
+            backends.append(_JSONLBackend(
+                jsonl_config['path'], append=bool(jsonl_config.get('append', False)), **backend_defaults))
         except Exception as exc:
             backend_errors['jsonl'] = exc
             logger.warning('JSONL metrics backend could not start: %s', exc)

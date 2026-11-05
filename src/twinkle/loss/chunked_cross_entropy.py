@@ -27,8 +27,10 @@ def _get_chunked_ce_func():
 
         @staticmethod
         def forward(ctx, logits, labels, chunk_size, ignore_index, reduction, dft):
-            ctx.save_for_backward(labels)
-            ctx._logits = logits
+            # Both tensors go through save_for_backward so their lifetime follows the graph: a backward
+            # that keeps the graph alive (retain_graph=True, or two losses sharing this output) can run
+            # again, and the buffers are released exactly when the graph is.
+            ctx.save_for_backward(labels, logits)
             ctx.chunk_size = chunk_size
             ctx.ignore_index = ignore_index
             ctx.reduction = reduction
@@ -61,9 +63,7 @@ def _get_chunked_ce_func():
 
         @staticmethod
         def backward(ctx, grad_output):
-            labels, = ctx.saved_tensors
-            logits = ctx._logits
-            ctx._logits = None
+            labels, logits = ctx.saved_tensors
             chunk_size = ctx.chunk_size
             ignore_index = ctx.ignore_index
             reduction = ctx.reduction
@@ -75,8 +75,9 @@ def _get_chunked_ce_func():
                 scale = grad_output
 
             n = logits.shape[0]
-            # Write gradients in-place into logits to avoid allocating a
-            # second [N, V] tensor (halves peak backward memory).
+            # Write gradients to a new buffer: an in-place write would corrupt the saved forward tensor for
+            # any other consumer of the same logits (auxiliary loss, retained-graph second backward).
+            grad_logits = torch.empty_like(logits)
             for start in range(0, n, chunk_size):
                 end = min(start + chunk_size, n)
                 logits_chunk = logits[start:end].detach().requires_grad_(True)
@@ -91,10 +92,10 @@ def _get_chunked_ce_func():
                     loss_chunk = (per_token * mask).sum()
 
                 grad_chunk = torch.autograd.grad(loss_chunk, logits_chunk, retain_graph=False)[0]
-                logits.data[start:end] = grad_chunk * scale
+                grad_logits[start:end] = grad_chunk * scale
 
             # logits, labels, chunk_size, ignore_index, reduction, dft
-            return logits, None, None, None, None, None
+            return grad_logits, None, None, None, None, None
 
     _CHUNKED_CE_FUNC = _ChunkedCrossEntropyFunc
     return _CHUNKED_CE_FUNC

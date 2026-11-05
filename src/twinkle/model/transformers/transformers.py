@@ -40,6 +40,7 @@ from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpo
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
@@ -47,6 +48,7 @@ from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_grou
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
+from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
@@ -103,58 +105,6 @@ def _prepare_sampling_replay(
     return loss_mask, masked_labels, metadata
 
 
-#: Tasks whose forward output is NOT a vocab log-softmax distribution, so ``selective_log_softmax`` logps
-#: must be skipped: classification/score heads (``seq_cls``/``reranker``/``generative_reranker`` emit
-#: ``[B, num_labels]``), the PPO ``value`` head (per-token ``V``), and pooled ``embedding`` features. Only a
-#: causal-LM head has a vocab axis to gather label logps from. The megatron backend dispatches exactly these
-#: tasks away from its logps branch (see megatron.py ``forward`` -- ``task in ('seq_cls', 'reranker', ...)``),
-#: so excluding them here keeps the two backends equivalent. This matters for a FROZEN seq_cls reward/value
-#: model: it carries no loss, ``require_logps`` defaults True, so without this guard its ``forward_only``
-#: would try to gather vocab logps out of a ``[B, 1]`` score and raise a shape error.
-_NON_LOGPS_TASKS = frozenset({'embedding', 'seq_cls', 'reranker', 'generative_reranker', 'value'})
-
-
-def _resolve_task_context(model, task, template=None):
-    """Return a context manager that applies the right per-forward Patch for ``task``.
-
-    'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
-    'embedding' swaps lm_head for identity + installs a feature-extraction hook so
-    downstream pooling can run inside
-    ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
-    'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_outputs`` too.
-    'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
-    ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
-    """
-    if task in (None, 'causal_lm'):
-        return contextlib.nullcontext()
-    if task in ('seq_cls', 'reranker'):
-        # Skip HF's internal pooling; surface per-token [B, T, num_labels] so the processor's
-        # _pool_last_valid_token handles packed/non-packed uniformly.
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        return apply_context(model, TransformersValuePatch(squeeze_single=False))
-    if task == 'embedding':
-        from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
-        return apply_context(model, TransformersEmbeddingPatch())
-    if task == 'generative_reranker':
-        from twinkle.patch.transformers_reranker import TransformersGenerativeRerankerPatch
-        pos_id, neg_id = _resolve_generative_reranker_token_ids(template)
-        return apply_context(model, TransformersGenerativeRerankerPatch(pos_id, neg_id))
-    if task == 'fused_lm_ce':
-        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
-        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
-        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
-        return apply_context(model, TransformersFusedCEPatch())
-    if task == 'value':
-        # PPO critic: reuse the num_labels=1 seq_cls ``score`` head but expose its PER-TOKEN output
-        # (skip the last-token pooling ``*ForSequenceClassification`` does), so forward returns a value
-        # V(s_t) at every token in ``logits`` [B, T]. Symmetric with Megatron's task='value'.
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        return apply_context(model, TransformersValuePatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, reranker, seq_cls, '
-                     'generative_reranker, fused_lm_ce, value.')
-
-
 def _resolve_mm_graph_context(model, template):
     """Return a context manager that patches the model for multimodal uneven-graph protection.
 
@@ -166,22 +116,6 @@ def _resolve_mm_graph_context(model, template):
         from twinkle.patch.transformers_uneven_mm_graph import MultimodalUnevenGraphPatch
         return apply_context(model, MultimodalUnevenGraphPatch(template))
     return contextlib.nullcontext()
-
-
-def _resolve_generative_reranker_token_ids(template):
-    """Resolve the positive/negative token ids for a generative reranker from the template tokenizer.
-
-    Token strings default to ``yes`` / ``no`` and are overridable via the same env vars legacy swift
-    uses (``GENERATIVE_RERANKER_POSITIVE_TOKEN`` / ``_NEGATIVE_TOKEN``), so a checkpoint trained here
-    scores identically under legacy inference.
-    """
-    import os
-    assert template is not None and getattr(template, 'processor', None) is not None, (
-        'generative_reranker needs a template with a tokenizer; call set_template before forwarding.')
-    tokenizer = template.processor
-    pos_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
-    neg_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
-    return tokenizer.convert_tokens_to_ids(pos_token), tokenizer.convert_tokens_to_ids(neg_token)
 
 
 @dataclass
@@ -836,7 +770,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
-        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+        if get_task_spec(task).requires_logps and labels is not None and loss_require_logps:
             if replay is not None:
                 loss_mask, masked_labels, replay_metadata = replay
                 outputs['logps'] = replayed_selective_log_softmax(
@@ -885,6 +819,60 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if recorded_routing is not None:
             return_outputs['routed_experts'] = recorded_routing
         return return_outputs
+
+    def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
+        """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
+
+        A model with a load-time custom execution (``task_forward``: the decision branch/
+        direct-backbone families whose loader replaced the module forward) just takes the
+        normal call -- the installed forward consumes the batch's decision meta itself. A
+        model with an attachable head (``task_head``) gets the head fed the hidden states /
+        lm logits of one normal forward by a ONE-SHOT forward hook: the hook fires inside
+        the module call, i.e. inside the strategy wrap, so DDP's reducer sees the head
+        parameters used in the wrapped forward (a head invoked outside the wrapper would be
+        silently dropped from gradient reduction). The head resolves PER CALL: an
+        adapter-specific head first (``head_for``), the single attached head as fallback.
+        The seq_cls-family rows are dual-path: a model that does NOT carry an attached head
+        (its variant builds the head itself, e.g. ``*ForSequenceClassification``) takes the
+        normal call too -- the task's context patch above surfaces that built head.
+        """
+        spec = get_task_spec(task)
+        if not spec.readout:
+            return self.model(**inputs, use_cache=False)
+        spec_obj = get_task_spec_obj(task)
+        if getattr(unwrapped_model, 'task_forward', None) is not None:
+            return self.model(**inputs, use_cache=False)
+        if not spec_obj.carries_task_head(unwrapped_model):
+            # A readout row without an attached head: decision has no other readout kind on
+            # this backend, so this is the loud failure; the seq_cls family falls back to
+            # its legacy in-model head (the context patch above already surfaces it).
+            if task == 'decision':
+                spec_obj.head_for(unwrapped_model, adapter_name)  # raises: neither kind present
+            return self.model(**inputs, use_cache=False)
+        head = spec_obj.head_for(unwrapped_model, adapter_name)
+        meta = inputs.pop('decision_meta', None)
+        if meta is None and task == 'decision':
+            raise ValueError(
+                f'task {task!r} requires decision_meta in the batch (staged by its template _encode / '
+                'collate); got none.')
+        inputs['return_dict'] = True
+        if not head.encoder_backbone:
+            inputs['output_hidden_states'] = True
+
+        def _readout(module, args, kwargs, output):
+            hidden_states = output.last_hidden_state if head.encoder_backbone else output.hidden_states[-1]
+            lm_logits = output.logits if head.needs_lm_logits else None
+            out = head(hidden_states, lm_logits, meta)
+            # Decision heads return their own ModelOutput; the seq_cls family's standard
+            # head returns a plain tensor -- surface it as the logits dict the legacy
+            # per-token patch path produces.
+            return {'logits': out} if torch.is_tensor(out) else out
+
+        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
+        try:
+            return self.model(**inputs, use_cache=False)
+        finally:
+            handle.remove()
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -972,10 +960,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # unwrapped module. Hooks registered there still fire: the wrapper's forward calls
         # the inner module's __call__.
         unwrapped_model = self.strategy.unwrap_model(self.model)
-        with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
+        with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                outputs = self.model(**inputs)
+                # Without gradient checkpointing use_cache stays True, and Transformers skips
+                # detecting padding-free packed sequences whenever a KV cache exists.
+                outputs = self._forward_with_task_readout(unwrapped_model, task, inputs, adapter_name)
 
         recorded_routing = rr.finish()
 
@@ -1026,8 +1016,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             The output of the model forward.
         """
         config = MicroBatchConfig.from_kwargs(kwargs)
-        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
-        optimizer_config = self.optimizer_group[adapter_name]
+        # Kept IN kwargs on purpose: the single-batch / micro-batch callees below pop it
+        # themselves, and the per-adapter head resolution (head_for) needs the CALL's adapter,
+        # not the default group.
+        optimizer_config = self.optimizer_group[kwargs.get('adapter_name', self._get_default_group())]
         inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
         if config is None:
             return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
@@ -1057,6 +1049,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
+        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
+            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+            # sample-level split here would desynchronize them from the micro-batch logits.
+            # Decision always reads out (its task_forward families included); the seq_cls
+            # family only when the model carries an attached head -- its legacy in-model
+            # head path merges per sample just fine and must keep micro-batching.
+            _task = kwargs.get('task', 'causal_lm')
+            if _task == 'decision' or get_task_spec_obj(_task).carries_task_head(
+                    self.strategy.unwrap_model(self.model)):
+                raise NotImplementedError(
+                    'micro-batching (micro_batch_size / max_tokens_per_micro_batch) is not yet supported for '
+                    'readout tasks (decision): their labels and decision_meta are organized per RECORD, not per '
+                    'sample, so the sample-level split here would desynchronize them from the micro-batch '
+                    'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
+                    'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
         batches = []
         for indices in plan:
@@ -1076,6 +1083,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
         """Run one evaluation micro-batch (or, without micro-batching, the whole batch)."""
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
@@ -1145,9 +1153,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
-            with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
+            with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), lora_ctx:
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
-                    outputs = self.model(**inputs)
+                    # In eval mode use_cache defaults to True, and Transformers skips detecting
+                    # padding-free packed sequences whenever a KV cache exists.
+                    outputs = self._forward_with_task_readout(unwrapped_model, task, inputs, adapter_name)
 
             recorded_routing = rr.finish()
 
@@ -1353,7 +1363,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if counts is not None:
             counts = counts / raw_dp_fsdp_world_size
             status.num_tokens += counts.item()
-        status.loss_value = (status.loss_value + main_loss) * objective_scale
+        # Scale the incoming loss BEFORE adding it to the running total: a second
+        # calculate_loss on the same status (a future recipe stacking two objectives on
+        # one forward) must not rescale the already-scaled accumulator. Single-call
+        # behaviour is unchanged (loss_value starts at 0 each forward).
+        status.loss_value = status.loss_value + main_loss * objective_scale
         outputs['loss'] = status.loss_value
         outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
         status.loss_reduction = 'mean' if global_normalizer is not None else getattr(loss_instance, 'reduction', 'mean')
@@ -1691,7 +1705,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.train_status.num_tokens = 0
             return grad_norm
 
-    @remote_function(dispatch='all')
+    # sync=True: an optimizer step is a barrier in the training loop's semantics -- the very next
+    # remote call (weight sync, eval, save) must observe the stepped parameters. Making it declared-
+    # sync (rather than each recipe wrapping its call in collect()) also materializes worker
+    # exceptions at the call site in ray mode: a failed step surfaces immediately instead of parking
+    # inside the discarded LazyCollect and logging "Unhandled error" per rank.
+    @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
@@ -1942,6 +1961,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         for name, param in model.named_parameters():
             if param.requires_grad and (pattern.search(name) or is_default):
                 params[name] = param
+        # The single-model attached readout head: heads live in the ``task_heads`` dict on
+        # the unwrapped model -- dict-held modules never show up in named_parameters, and
+        # the LoRA pattern would miss them anyway, so without this merge the head computed
+        # gradients the optimizer never updated. The multi-LoRA host is exempt: its heads
+        # ride pre-allocated slots and the MultiLora override merges them itself.
+        if getattr(self, 'task_head_slots', None) is None:
+            head = (getattr(model, 'task_heads', None) or {}).get(adapter_name)
+            if head is not None:
+                for name, param in head.named_parameters():
+                    if param.requires_grad:
+                        params[f'task_head.{name}'] = param
         return params
 
     @remote_function()
@@ -2127,6 +2157,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             def _write_tail() -> None:
                 _write_weights()
                 self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
                 copy_checkpoint_args(output_dir, checkpoint_dir)
                 for write in deferred:
                     write()
@@ -2136,6 +2167,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         else:
             _write_weights()
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
             copy_checkpoint_args(output_dir, checkpoint_dir)
             rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         return checkpoint_dir
@@ -2258,6 +2290,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # Full-parameter model: load a plain HF checkpoint in-place.
             state_dict = _read_hf_state_dict(checkpoint_dir)
             self.strategy.load_full_state_dict(self.model, state_dict)
+        self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
@@ -2325,19 +2358,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
-        is_npu_device = Platform.device_prefix() == 'npu'
+        # Platforms answering aligns_param_dtype_to_base() walk all parameters to
+        # find the base dtype (NPU: FSDP2 requires every parameter to match);
+        # elsewhere the first hit suffices because only LoRA params get aligned.
+        align_all = Platform.get_platform().aligns_param_dtype_to_base()
         for param in model.parameters():
             if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
-            if base_dtype is not None and is_npu_device:
+            if base_dtype is not None and align_all:
                 break
         if base_dtype is None:
             return
 
-        # Temporary workaround: NPU requires all parameters to align with the base dtype.
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if (is_npu_device or 'lora_' in name.lower()) and param.dtype != base_dtype:
+                if (align_all or 'lora_' in name.lower()) and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
 
     def _load_scaler_state(self, scaler_path, **kwargs):
@@ -2531,8 +2566,79 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+        self._patch_frozen_towers(self.model)
+        # A per-adapter readout head (multi-head form): the decision families ship the dev
+        # loader's (module, class) NAME -- a built nn.Module cannot cross the Ray boundary --
+        # and the worker replays the build here; the seq_cls family's standard head is built
+        # by the task's spec from the config. The FIRST head also lands on the single
+        # task_head / scoring_head names (single-head compatibility); later adapters only
+        # enter the per-adapter dictionary.
+        task_head_loader = kwargs.pop('task_head_loader', None)
+        task = kwargs.pop('task', None)
+        num_labels = kwargs.pop('num_labels', None)
+        if task_head_loader is not None or task is not None:
+            self._add_task_head(adapter_name, task or 'decision', task_head_loader, num_labels)
+        # A task readout head is not a LoRA target, so peft's mark-only-adapters sweep just
+        # froze one attached before the wrap; re-activation rules live on the task's spec
+        # (a no-op for models without that task's component).
+        get_task_spec_obj(task or 'decision').reactivate(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _head_model_path(self) -> str:
+        """Where the decision families' loader replays its build from."""
+        return self.model_id
+
+    def _task_head_host(self):
+        """The module the heads hang on: the unwrapped model -- the same object
+        ``head_for`` resolves heads on at forward time."""
+        return self.strategy.unwrap_model(self.model)
+
+    def _task_head_is_master(self) -> bool:
+        return Platform.is_master()
+
+    def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
+        """Build one task head worker-side and register it per adapter.
+
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); placement is backend-specific and stays here. The
+        dictionary lives on the UNWRAPPED model -- the same object ``head_for`` reads
+        at forward time (the wrapper object is not reachable from the readout path).
+        The FIRST head also lands on the single task_head / scoring_head names
+        (single-head compatibility); later adapters only enter the dictionary."""
+        if self._model_wrapped:
+            # Reducers discover parameters once at wrap time; a head attached afterwards
+            # would sit outside the DDP/FSDP gradient sync -- the multi-LoRA hosts
+            # pre-allocate their head slots BEFORE the wrap for exactly this reason.
+            raise RuntimeError(
+                'cannot attach a task head after the model is wrapped; call '
+                'add_adapter_to_model(task=...) before the first forward / save / '
+                'set_optimizer.')
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        spec = get_task_spec_obj(task)
+        head = self._build_task_head(task, task_head_loader, num_labels)
+        heads = getattr(unwrapped_model, 'task_heads', None)
+        if heads is None:
+            spec.attach_transformers(unwrapped_model, head)  # aligns internally + dual names
+            unwrapped_model.task_heads = {adapter_name: head}
+        else:
+            heads[adapter_name] = spec.align_head(unwrapped_model, head)
+
+    def _patch_frozen_towers(self, model) -> None:
+        """Run a fully frozen vision tower without autograd (legacy swift #10214)."""
+        prefixes = list(self.model_arch.get('vision_tower') or [])
+        if not prefixes:
+            return
+        from twinkle.model.transformers.frozen_tower import patch_frozen_module
+        from twinkle.utils import deep_getattr
+
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        for prefix in prefixes:
+            tower = deep_getattr(base_model, prefix)
+            if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
+                patch_frozen_module(tower)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:

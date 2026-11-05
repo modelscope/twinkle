@@ -9,6 +9,11 @@ place with the sampler-side default.
 """
 from twinkle import remote_class
 from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY, vLLMSampler
+from twinkle.utils import Platform
+
+# The server actor process builds the vLLM engine on its own; apply the platform's
+# vLLM fixes there before any vllm import.
+Platform.apply_vllm_patch()
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)

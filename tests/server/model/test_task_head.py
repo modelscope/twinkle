@@ -58,7 +58,9 @@ def test_mcore_native_weights_keep_the_language_model_prefix():
 @pytest.mark.parametrize('task,width,architecture,actual,success', [
     ('seq_cls', 3, 'Qwen2ForSequenceClassification', 3, True),
     ('seq_cls', 1, 'Qwen2ForSequenceClassification', 3, False),
-    ('seq_cls', 3, 'Qwen2ForCausalLM', 3, False),
+    # A causal backbone with a matching num_labels is the attached-head deployment: the
+    # task rides the constructor (task='seq_cls'), no persisted head to validate.
+    ('seq_cls', 3, 'Qwen2ForCausalLM', 3, True),
     ('causal_lm', None, 'Qwen2ForSequenceClassification', 3, False),
     ('causal_lm', None, 'Qwen2ForCausalLM', None, True),
 ])

@@ -216,7 +216,7 @@ class IPCCheckpointEngine(CheckpointEngine):
             return
         size = max(self.bucket_size, min_size)
         platform = Platform.get_platform()
-        if platform.device_prefix() == 'npu' and not platform.is_ipc_supported():
+        if not platform.supports_device_ipc():
             from multiprocessing import shared_memory
 
             if self._shm is not None:
@@ -236,8 +236,7 @@ class IPCCheckpointEngine(CheckpointEngine):
         )
         # One handle per buffer, reused for every bucket: the buffer is refilled, not reallocated, so
         # the mapping stays valid and the receiver can keep it.
-        if platform.device_prefix() == 'npu':
-            import torch_npu  # noqa: F401
+        platform.ensure_ipc_reducer()
         from torch.multiprocessing.reductions import reduce_tensor
         self._handle = reduce_tensor(self.send_buf)
 
@@ -353,8 +352,8 @@ class IPCCheckpointEngine(CheckpointEngine):
 
         func, args = handle
         args = list(args)
-        if Platform.device_prefix() == 'npu':
-            import torch_npu  # noqa: F401
+        # Register the platform's tensor reducer (no-op where the CUDA one is builtin).
+        Platform.get_platform().ensure_ipc_reducer()
         args[6] = Torch.get_current_device()
         self._mapped = func(*args)
         self._mapped_signature = signature

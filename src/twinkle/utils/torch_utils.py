@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
+from .framework import Torch
 from .network import is_valid_ipv6_address
 from .utils import has_signature_parameter
 
@@ -407,9 +408,17 @@ def stateless_init_process_group(
     """
     import torch
     from torch.distributed import TCPStore
+
+    # Platform hook: apply hardware vLLM fixes (e.g. vllm_metax) before any vllm
+    # import in this process; no-op on platforms without explicit patches.
+    from .platforms import Platform
+    Platform.apply_vllm_patch()
+
     from vllm.distributed.utils import StatelessProcessGroup
 
-    if backend == 'hccl':
+    # The platform hook decides both branches: socket-env injection (HCCL's fixed
+    # base port collides across jobs) and the py communicator class to hand vLLM.
+    if Platform.get_platform().ensures_socket_env():
         # fix: Stateless PG + HCCL path needs the same port policy, otherwise workers can still collide.
         from .platforms import ensure_hccl_socket_env
         ensure_hccl_socket_env(master_port)
@@ -418,7 +427,7 @@ def stateless_init_process_group(
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator as Communicator
 
     if device is None:
-        device = torch.cuda.current_device() if backend == 'nccl' else torch.npu.current_device()
+        device = Torch.get_current_device()
 
     # Create the stateless process group
     launch_server = rank == 0

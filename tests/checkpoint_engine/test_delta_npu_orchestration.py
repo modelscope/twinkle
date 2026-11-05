@@ -18,7 +18,20 @@ MASTER = MasterMetadata(zmq_ip='10.0.0.1', zmq_port=6000, dist_ip='10.0.0.1', di
 @pytest.fixture(autouse=True)
 def fake_npu_platform(monkeypatch):
     """No torch_npu here: resolve the platform names without importing the NPU backend."""
-    classes = {'NPU': type('NPU', (), {}), 'GPU': type('GPU', (), {})}
+    from twinkle.checkpoint_engine import HCCLCheckpointEngine, NCCLCheckpointEngine
+
+    classes = {
+        'NPU': type(
+            'NPU', (), {
+                'checkpoint_engine': staticmethod(lambda: (HCCLCheckpointEngine, {})),
+                'ensure_vllm_patch': staticmethod(lambda: None),
+            }),
+        'GPU': type(
+            'GPU', (), {
+                'checkpoint_engine': staticmethod(lambda: (NCCLCheckpointEngine, {})),
+                'ensure_vllm_patch': staticmethod(lambda: None),
+            }),
+    }
     monkeypatch.setattr(Platform, 'get_platform', staticmethod(lambda platform=None: classes[platform or 'GPU']))
 
 

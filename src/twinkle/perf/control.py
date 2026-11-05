@@ -167,11 +167,14 @@ class Perf:
         one: the recorder (stage timings) and the profiler (module stats + overhead accounts) advance in lockstep.
         Without the profiler reset ``overhead_s`` would grow cumulatively while ``wall_s`` stays per-window,
         driving ``_net_wall_s`` to zero after a few windows and reporting lifetime means instead of the window's.
+        The recorder reset keeps the raw event stream (bounded), because windowed consumers reduce explicit
+        windows that straddle dumps -- e.g. a rollout iteration folding ``phase_totals`` over its own span while
+        the step-cadence logging dumps the aggregates in the middle of it.
         """
         out = default_recorder.flat_summary(prefix=f'{_PREFIX}stage/')
         wall_s = out.get(f'{_PREFIX}stage/wall_s', 0.0)
         out[f'{_PREFIX}stage/_bubble_s'] = default_recorder.bubble_s()
-        default_recorder.reset()
+        default_recorder.reset(keep_events=True)
         if profiler is not None:
             overhead_s = profiler.overhead_s()
             out.update(profiler.flat_summary(prefix=f'{_PREFIX}module/'))

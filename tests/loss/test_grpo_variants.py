@@ -434,3 +434,33 @@ class TestThinVariantCoverage:
 
         # Two tokens at -1.0 each -> -2.0 / (batch 1 * max_completion_length 4) = -0.5.
         assert result['loss'].item() == pytest.approx(-0.5)
+
+
+class TestAdvancedControlsWithoutAdvantages:
+    """The advanced GRPO controls must mirror _base_grpo's zero-loss contract.
+
+    A loss-side probe without advantages (eval/validation, ref-only forward) used to
+    crash the advanced pipeline with TypeError on None."""
+
+    def test_advanced_controls_zero_loss_without_advantages(self):
+        torch.manual_seed(0)
+        loss = GRPOLoss(log_entropy=True)
+        inputs = {'labels': torch.tensor([[0, 1, 1, 0]])}
+        outputs = {'logps': torch.randn(1, 4, requires_grad=True)}
+        result = loss(inputs, outputs)
+        assert result['loss'].item() == 0.0
+        result['loss'].backward()  # stays autograd-connected
+        assert outputs['logps'].grad is not None
+
+    def test_base_grpo_zero_loss_without_advantages(self):
+        loss = GRPOLoss()
+        inputs = {'labels': torch.tensor([[0, 1, 1, 0]])}
+        outputs = {'logps': torch.randn(1, 4, requires_grad=True)}
+        result = loss(inputs, outputs)
+        assert result['loss'].item() == 0.0
+
+    def test_2d_alignment_row_count_mismatch_raises(self):
+        loss = GRPOLoss()
+        mask = torch.ones(2, 4, dtype=torch.bool)
+        with pytest.raises(AssertionError, match='rows but the mask batch'):
+            loss._pad_and_align_to_batch(torch.randn(3, 4), mask, mask.device, torch.float32)

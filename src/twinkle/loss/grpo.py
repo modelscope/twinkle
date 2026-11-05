@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
+from twinkle.loss.utils import count_loss_tokens
 from twinkle.utils.torch_utils import selective_log_softmax
 
 if TYPE_CHECKING:
@@ -260,6 +261,11 @@ class GRPOLoss(Loss):
                 fill = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
                 expanded = data.expand(batch_size, seq_len)
                 return torch.where(mask, expanded, fill)
+            # A 2D tensor must carry exactly this batch's rows: extra rows used to be
+            # silently dropped (misaligned loss) and missing rows raised a bare IndexError.
+            assert data.shape[0] == batch_size, (
+                f'2D alignment input has {data.shape[0]} rows but the mask batch is '
+                f'{batch_size}: {tuple(data.shape)} vs mask {tuple(mask.shape)}')
             data = [data[i] for i in range(batch_size)]  # To list
 
         # Handle list (scalars or sequences)
@@ -618,6 +624,11 @@ class GRPOLoss(Loss):
         device, dtype = logps.device, logps.dtype
         old = (logps.detach() if old_logps is None else self._pad_and_align_to_batch(
             old_logps, alignment_mask, device, dtype))
+        if advantages is None:
+            # Mirror _base_grpo's zero-loss contract: a loss-side probe without
+            # advantages (eval/validation, ref-only forward) stays autograd-connected
+            # instead of crashing the advanced controls.
+            return LossOutput(loss=logps.sum() * 0.0, num_tokens=0)
         advantages = self._pad_and_align_to_batch(advantages, alignment_mask, device, dtype)
         mask = alignment_mask.clone()
 
@@ -632,6 +643,7 @@ class GRPOLoss(Loss):
                 channel_loss['entropy'] = torch.stack(
                     ((entropies * alignment_mask).sum().detach().float(), count))
             if self.top_entropy_quantile < 1.0 and alignment_mask.any():
+                # The entropy threshold is local to the current micro-batch.
                 threshold = torch.quantile(
                     entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
                 entropy_mask = entropies.ge(threshold)
@@ -792,6 +804,17 @@ class PPOLoss(GRPOLoss):
             raise ValueError(f'Unsupported PPO loss_agg_mode: {loss_agg_mode}. '
                              f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
         self.loss_agg_mode = loss_agg_mode
+
+    def micro_batch_scale(self, inputs, indices):
+        if self.loss_agg_mode != 'token-mean':
+            return super().micro_batch_scale(inputs, indices)
+        # The configured path scores labels alone; the base path also intersects completion_mask.
+        loss_mask_fn = None if self._advanced else self._resolve_loss_mask
+        token_counts = [
+            count_loss_tokens(row, self.ignore_index, loss_mask_fn=loss_mask_fn) for row in inputs
+        ]
+        total_tokens = sum(token_counts)
+        return sum(token_counts[index] for index in indices) / total_tokens if total_tokens else 0.0
 
     def _aggregate_loss(
         self,

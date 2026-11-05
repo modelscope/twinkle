@@ -40,8 +40,17 @@ _LORA_ONLY_CTOR_KWARGS = ('max_loras', 'max_r', 'max_length', 'target_modules', 
 
 
 def _validate_model_task(kw: dict[str, Any]) -> None:
-    """Check the persisted head once, before choosing a CS backend."""
-    task_type = kw.get('task_type')
+    """Resolve the declared ``task_type`` once, before choosing a backend.
+
+    The readout family (seq_cls / reranker / value) is dual-path, like the model layer:
+    a checkpoint that persists its own classification head (``*ForSequenceClassification``
+    architectures) keeps the legacy path -- the head lives in the base and LoRA targets it
+    (``score`` in ``target_modules``). Any other checkpoint gets the ATTACHED standard head
+    instead: ``task=`` reaches the model constructor, which builds one head slot per LoRA
+    slot (see ``MultiLoraTaskHeadSlots``). Either way ``task_type`` never leaks into the
+    model's own construction kwargs.
+    """
+    task_type = kw.pop('task_type', None)
     if task_type is None:
         return
     from transformers import AutoConfig
@@ -54,23 +63,25 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
     architectures = getattr(config, 'architectures', None) or []
     classification = any(name.endswith('ForSequenceClassification') for name in architectures)
     num_labels = kw.get('num_labels')
-    if task_type == 'seq_cls':
-        if not classification:
-            raise ValueError('seq_cls requires a persisted ForSequenceClassification checkpoint')
-        if num_labels is None or getattr(config, 'num_labels', None) != num_labels:
-            raise ValueError('num_labels does not match the persisted classification head')
-        from pathlib import Path
-        from safetensors import safe_open
-        head_found = False
-        for file in Path(path).glob('model*.safetensors'):
-            with safe_open(str(file), framework='pt', device='cpu') as weights:
-                for key in weights.keys():
-                    if key.endswith(('score.weight', 'classifier.weight')):
-                        if weights.get_slice(key).get_shape()[0] != num_labels:
-                            raise ValueError('Persisted head weight shape does not match num_labels')
-                        head_found = True
-        if not head_found:
-            raise ValueError('seq_cls requires persisted score/classifier weights in safetensors format')
+    if task_type in ('seq_cls', 'reranker', 'value'):
+        if classification:
+            if num_labels is None or getattr(config, 'num_labels', None) != num_labels:
+                raise ValueError('num_labels does not match the persisted classification head')
+            from pathlib import Path
+            from safetensors import safe_open
+            head_found = False
+            for file in Path(path).glob('model*.safetensors'):
+                with safe_open(str(file), framework='pt', device='cpu') as weights:
+                    for key in weights.keys():
+                        if key.endswith(('score.weight', 'classifier.weight')):
+                            if weights.get_slice(key).get_shape()[0] != num_labels:
+                                raise ValueError('Persisted head weight shape does not match num_labels')
+                            head_found = True
+            if not head_found:
+                raise ValueError('seq_cls requires persisted score/classifier weights in safetensors format')
+        else:
+            # Attached standard head: the model constructor validates num_labels / builds slots.
+            kw['task'] = task_type
     elif classification:
         raise ValueError('causal_lm cannot use a classification checkpoint')
 
@@ -114,6 +125,10 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
+        # The plain TransformersModel attaches heads at add_adapter time -- a full-mode
+        # deployment has no adapter, so an attached-head task_type has nothing to ride on.
+        if kw.pop('task', None) is not None:
+            raise ValueError('the transformers full-mode backend serves no task head; use train_mode: lora')
         return TwinkleCompatFullTransformersModel(**kw)
     from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
                                               TwinkleCompatTransformersModel)

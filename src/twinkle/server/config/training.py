@@ -58,7 +58,9 @@ class TrainingArguments(BaseModel):
     model_loader: str | None = None
     gradient_checkpointing: bool | None = Field(default=None, strict=True)
     mixed_precision: Literal["no", "fp8", "fp16", "bf16"] | None = None
-    task_type: Literal["causal_lm", "seq_cls"] | None = None
+    # The readout family names the head task this deployment serves (see
+    # ``twinkle/model/tasks.py``); ``causal_lm`` carries no head.
+    task_type: Literal["causal_lm", "seq_cls", "reranker", "value"] | None = None
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
 
@@ -66,8 +68,8 @@ class TrainingArguments(BaseModel):
     def _validate_head(self):
         if self.task_type == "seq_cls" and self.num_labels is None:
             raise ValueError('task_type="seq_cls" requires num_labels')
-        if self.num_labels is not None and self.task_type != "seq_cls":
-            raise ValueError('num_labels requires task_type="seq_cls"')
+        if self.num_labels is not None and self.task_type not in ("seq_cls", "reranker", "value"):
+            raise ValueError('num_labels requires a readout task_type (seq_cls / reranker / value)')
         return self
 
     @model_validator(mode="after")

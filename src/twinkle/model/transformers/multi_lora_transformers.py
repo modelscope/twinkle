@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
-from twinkle import DeviceMesh, remote_class, remote_function, template, torch_util
+from twinkle import DeviceMesh, Platform, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
@@ -18,12 +18,18 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..base import ModelLoaderProtocol
-from ..multi_lora import MultiLora
-from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
+from ..multi_lora import MultiLora, MultiLoraTaskHeadSlots
+from ..tasks import get_task_spec_obj
+from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel, \
+    _default_adapter_name
 
 
 @remote_class()
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
+    # Class-level defaults: a subclass that overrides __init__ wholesale (ms-swift's sentence-
+    # transformer host builds its own state without super()) still reads as a slot-less host
+    # instead of hitting AttributeError on the head-slot machinery. Inherited from
+    # TrainableModel -- see the attached-head lifecycle there.
 
     def __init__(
             self,  # noqa
@@ -42,6 +48,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_r: int = 32,
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
+            task: Optional[str] = None,
+            task_head_loader: Optional[tuple] = None,
+            num_labels: Optional[int] = None,
             model_loader: Optional[ModelLoaderProtocol] = None,
             gradient_checkpointing: bool = True,
             gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
@@ -133,6 +142,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # lower-precision dtype. Align the preallocated slots before FSDP2
         # records their parameter and gradient dtypes.
         self._ensure_lora_dtype(self.model)
+        # Head slots -- the same pre-allocation the megatron multi-LoRA host does: one task
+        # head per LoRA slot on the (still unwrapped) model, so every slot's parameters
+        # enter the DDP/FSDP wrap (the lazy wrap below fires on the first forward / optimizer
+        # setup, and a tenant added AFTER that could never join the reducer). A multi-tenant
+        # host serves ONE head task (fixed here); None = this host serves no head-task
+        # tenant: no slots, no memory.
+        self._head_task = task or ('decision' if task_head_loader is not None else None)
+        self._task_head_loader = task_head_loader
+        self._num_labels = num_labels
+        self.task_head_slots = MultiLoraTaskHeadSlots(max_loras) if self._head_task is not None else None
+        if self.task_head_slots is not None:
+            self._validate_task_head_config()
+            self._build_task_head_slots()
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -172,6 +194,53 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # Reset must restore the synchronized (and possibly sharded) basis,
             # not the rank-local initialization captured before model wrapping.
             self.multi_adapter.save_initial_weights()
+
+    def _validate_task_head_config(self) -> None:
+        """Fail at construction, before any slot or memory is spent."""
+        task = self._head_task
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to pre-allocate.')
+        if task == 'decision':
+            if self._task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+        elif self._task_head_loader is not None:
+            raise ValueError(
+                'task_head_loader is the decision families\' head replay; '
+                f'task={task!r} builds its standard head from the config instead.')
+        elif self._num_labels is None:
+            # Validates num_labels / hidden_size now (the actual build happens per slot).
+            spec_obj.build_head(self.hf_config, None)
+
+    def _build_task_head_slots(self) -> None:
+        """Pre-allocate the head slots on the unwrapped model (see ``MultiLoraTaskHeadSlots``).
+
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); only the transformers placement (align to the host's
+        device/dtype policy) is backend-specific and stays here."""
+        spec_obj = get_task_spec_obj(self._head_task)
+        host = self._task_head_host()
+
+        def build_head():
+            head = self._build_task_head(self._head_task, self._task_head_loader, self._num_labels)
+            return spec_obj.align_head(host, head)
+        self.task_head_slots.build(host, build_head)
+
+    def _bind_task_head_slot(self, adapter_name: str) -> None:
+        """Bind the lowest free head slot to a tenant (see ``MultiLoraTaskHeadSlots.bind``)."""
+        if self.task_head_slots is None:
+            raise RuntimeError(
+                'this model was built without a head task (task= / task_head_loader=), so it carries '
+                'no task head slots; construct it with task= to serve head-task tenants.')
+        self.task_head_slots.bind(adapter_name, self._task_head_host())
+
+    def _release_task_head_slot(self, adapter_name: str) -> None:
+        """Unbind a tenant's head slot and restore its build-time weights in place."""
+        if self.task_head_slots is None:
+            return
+        self.task_head_slots.release(adapter_name, self._task_head_host(),
+                                     self.multi_adapter._write_param_tensor)
 
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
@@ -305,6 +374,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _register_adapter(self, adapter_name: str, config: LoraConfig, **kwargs) -> None:
         """Register an already validated LoRA configuration in a free slot."""
+        # ``task`` is an optional cross-check: the construction ``task=`` already declared this
+        # host's head, so EVERY tenant carries it (a deployment names its task once -- the
+        # yaml's ``task_type``); the forward task stays a per-call argument.
+        task = kwargs.pop('task', None)
+        if task is not None and task != self._head_task:
+            raise ValueError(
+                f'this host was built for task={self._head_task!r} head slots; '
+                f'add_adapter_to_model(task={task!r}) does not match. Construct the host with '
+                'the matching task to serve that head task.')
+        if self._head_task is not None:
+            # Bind BEFORE any state mutation below, so binding errors surface first; the
+            # failure path below rolls everything back.
+            self._bind_task_head_slot(adapter_name)
         config = self.strategy.prepare_adapter_config(
             config,
             enable_ep=getattr(self, '_enable_expert_parallel', False),
@@ -313,17 +395,18 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config.bias = 'none'
         config.init_lora_weights = False
         config.trainable_token_indices = None
-        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
-        self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config
-        _gas_default = kwargs.get('gradient_accumulation_steps', 1)
-        self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
-        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
-        self._ensure_target_parameter_lora_installed(config)
         try:
+            self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+            self.optimizer_group[adapter_name].adapter_name = adapter_name
+            self.optimizer_group[adapter_name].adapter_config = config
+            _gas_default = kwargs.get('gradient_accumulation_steps', 1)
+            self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+            self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+            self._ensure_target_parameter_lora_installed(config)
             self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config)
         except Exception:
             self.optimizer_group.pop(adapter_name, None)
+            self._release_task_head_slot(adapter_name)
             raise
 
     @remote_function()
@@ -363,6 +446,36 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                     mapping[name] = checkpoint_name
         return mapping
 
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Slot-pool form of the shared head checkpoint (see TrainableModel)."""
+        if self.task_head_slots is None:
+            return
+        super()._save_task_head_checkpoint(checkpoint_dir, adapter_name)
+
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The bound tenant's head weights out of its slot, under slot-independent
+        'task_head.' keys; the LoRA base writes through the peft path and never sees
+        the head."""
+        if self.task_head_slots is None:
+            return {}
+        return self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Restore a ``_task_head_state`` snapshot into the tenant's currently bound
+        slot, in place. An empty snapshot passes (a rank without slots, a head-less
+        checkpoint); a non-empty snapshot on a slot-less host is a mismatched deployment
+        that would silently lose the trained head -- fail loudly instead."""
+        if not state:
+            return
+        if self.task_head_slots is None:
+            raise ValueError(
+                'task_head.safetensors exists but this model was built without task-head slots '
+                '(task= / task_head_loader=); it cannot serve the checkpoint\'s head task. Load it '
+                'on a model constructed with the same task.')
+        self.task_head_slots.import_state(
+            adapter_name, self._task_head_host(), state, self.multi_adapter._write_param_tensor)
+
     # lazy_collect=False: see TransformersModel.save -- a checkpoint write the caller acts on immediately
     # must block until it lands, or the run's final save is torn down with the actor before writing.
     @remote_function(collect='first', lazy_collect=False)
@@ -372,6 +485,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._lazy_wrap_model()
         with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
+            if checkpoint_dir is not None:
+                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
         if dist.is_initialized():
             dist.barrier()
         return checkpoint_dir
@@ -398,6 +513,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 # Load to CPU to avoid safetensors device issues in Ray environment
                 adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
                 self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
+            self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
             if load_optimizer:
                 self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
@@ -424,6 +540,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
+        self._release_task_head_slot(adapter_name)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         with self._adapter_context(adapter_name):
@@ -435,4 +552,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
-            return super()._get_trainable_parameters(real_adapter_name)
+            params = super()._get_trainable_parameters(real_adapter_name)
+        # The base pattern only matches ``.lora_<x>.<adapter>.`` names, so a bound
+        # ``task_head_slot_<i>`` would silently miss the optimizer -- the head computes
+        # gradients that never update, and every "training moved the output" signal
+        # comes from the LoRA alone. Slot names stay slot-physical on purpose (the optimizer
+        # references the wrapped parameter objects); checkpoints translate them back with
+        # the slot-independent ``task_head.`` keys.
+        if self.task_head_slots is not None:
+            slot = self.task_head_slots.bindings.get(adapter_name)
+            head = getattr(self._task_head_host(), f'task_head_slot_{slot}', None) \
+                if slot is not None else None
+            if head is not None:
+                for name, param in head.named_parameters():
+                    if param.requires_grad:
+                        params[f'task_head_slot_{slot}.{name}'] = param
+        return params

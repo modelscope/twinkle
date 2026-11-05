@@ -121,28 +121,20 @@ class RayHelper:
 
     @staticmethod
     def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
-        """Return custom accelerator resources needed for local Ray startup.
+        """Return accelerator resources needed for local Ray startup.
 
-        Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
-        NPUs, need to be registered as Ray custom resources so that placement
-        groups can request them.
+        Ray discovers CUDA GPUs itself.  Other accelerators -- Ascend NPUs, and
+        Kunlunxin XPUs whose runtime ships no nvidia-smi -- must be registered
+        explicitly so that placement groups can request them.  Each platform
+        answers for itself via ``Platform.ray_resources()``; the detected
+        platform is authoritative because XPU runs declare their device type as
+        the cuda-alike 'GPU'.
         """
+        # ResourceManager supports one accelerator type per run.
         device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
-
-        # ResourceManager supports one accelerator type per run.  Only NPU
-        # currently needs an explicit Ray custom-resource registration.
-        if device_types != {'NPU'}:
+        if not device_types:
             return {}
-
-        try:
-            import torch
-
-            npu = getattr(torch, 'npu', None)
-            npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
-        except (ImportError, AttributeError, RuntimeError):
-            return {}
-
-        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+        return Platform.get_platform().ray_resources()
 
     @staticmethod
     def init_registry():
@@ -210,7 +202,13 @@ class RayHelper:
             # resources are declared at ``ray start`` time, and Ray rejects ``resources`` on connect.
             connecting = bool(os.environ.get('RAY_ADDRESS'))
             resources = None if connecting else RayHelper._get_ray_custom_resources(device_groups)
-            ray.init(ignore_reinit_error=True, resources=resources or None)
+            # XPU registers the cuda-alike 'GPU' count, but 'GPU' is one of Ray's
+            # default resources and ray.init() rejects it via `resources=`; route
+            # it through `num_gpus` instead.
+            num_gpus = None
+            if resources:
+                num_gpus = int(resources.pop('GPU')) if 'GPU' in resources else None
+            ray.init(ignore_reinit_error=True, resources=resources or None, num_gpus=num_gpus)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.

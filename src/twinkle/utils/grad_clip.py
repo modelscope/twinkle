@@ -107,7 +107,13 @@ def _standard_clip_grad_norm(
     import torch
 
     topology = _detect_grad_topology(grads)
-    can_use_builtin = (not topology.has_mixed_mesh and (topology.all_dtensor or (topology.all_local and group is None)))
+    # Plain local grads + a dp group means DDP: the backward allreduce already replicated
+    # the gradients, so every rank holds the SAME grads and the local norm IS the global
+    # norm -- the torch builtin computes exactly that. The manual SUM-reduce path below
+    # would add the identical per-rank square sums dp_world_size times and inflate the
+    # norm (and over-clip) by sqrt(dp_world_size). Strategies whose local grads genuinely
+    # differ across ranks (FSDP2/EP) keep DTensor/sharded params and never hit this branch.
+    can_use_builtin = (not topology.has_mixed_mesh and (topology.all_dtensor or topology.all_local))
 
     if can_use_builtin:
         # PyTorch built-in handles DTensor reduce via mesh ops and works for
@@ -116,7 +122,7 @@ def _standard_clip_grad_norm(
         grad_norm = torch_util.to_local_tensor(grad_norm)
         return float(grad_norm.item())
 
-    # Manual path for mixed DTensor+local or explicit group reduce.
+    # Manual path for mixed DTensor+local or mixed-mesh topology.
     norm_type = float(norm_type)
     if norm_type not in (2.0, float('inf')):
         raise ValueError('Mixed DTensor/Tensor clip_grad_norm only supports norm_type=2 or inf.')
@@ -174,11 +180,13 @@ def _resolve_reduce_device(grads: list[torch.Tensor]):
 
     for grad in grads:
         local = grad.to_local() if hasattr(grad, 'to_local') else grad
-        if local.is_cuda or getattr(local, 'is_npu', False):
+        if torch_util.is_accelerator_tensor(local):
             return local.device
 
     backend = dist.get_backend() if dist.is_initialized() else None
-    if backend in ('nccl', 'hccl'):
+    # The accelerators whose collectives only run on-device (hook: the platform
+    # binds its PG to the device). Gloo-led backends reduce fine on CPU.
+    if backend and Platform.get_platform().binds_device_id_to_process_group():
         return torch.device(Platform.get_local_device())
     return torch.device('cpu')
 
@@ -316,7 +324,7 @@ def _collect_local_grads(params) -> tuple[list, torch.device]:
         if p.grad is None:
             continue
         g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-        if default_device is None and (g.is_cuda or getattr(g, 'is_npu', False)):
+        if default_device is None and torch_util.is_accelerator_tensor(g):
             default_device = g.device
         grads_local.append(g.detach().to(torch.float32))
 

@@ -26,6 +26,10 @@ from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
+# This module is imported by vLLM inside every worker process; apply the platform's
+# vLLM fixes there too (each worker imports vllm on its own).
+Platform.apply_vllm_patch()
+
 if TYPE_CHECKING:
     from twinkle.checkpoint_engine.delta.config import DeltaWorkerCapabilities, DeltaWorkerMetadata
 
@@ -275,9 +279,10 @@ class TwinkleWorkerExtension:
         # ── Step 2: Receive and broadcast IPC/SHM handle ──
         buffer, shm = None, None
 
-        if not use_shm and self.device.type == 'npu':
-            # Register the NPU reducer before recv_pyobj() unpickles its callable.
-            import torch_npu  # noqa: F401
+        if not use_shm:
+            # Register the platform's tensor reducer before recv_pyobj() unpickles
+            # its callable (e.g. torch_npu registers the NPU reducer).
+            Platform.get_platform().ensure_ipc_reducer()
 
         if is_driver:
             try:

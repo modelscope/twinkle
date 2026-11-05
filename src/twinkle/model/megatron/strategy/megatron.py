@@ -180,8 +180,20 @@ class MegatronStrategy:
             'order': self.device_mesh.order,
             **parallel_kwargs,
         }
-        if Platform.device_prefix() == 'npu':
+        if Platform.get_platform().requires_gloo_subgroups():
             init_kwargs['create_gloo_process_groups'] = True
+        # Clear the default PG's device binding immediately before the
+        # model-parallel ``new_group`` calls, regardless of who initialized the
+        # default PG (eager init can happen outside twinkle). On backends that
+        # answer ``requires_unbound_pg_for_subgroups`` a leftover
+        # ``bound_device_id`` makes ``new_group`` take the comm-split path,
+        # which XPU's ``ProcessGroupXCCL`` cannot perform.
+        if Platform.get_platform().requires_unbound_pg_for_subgroups():
+            import torch.distributed as _dist
+            if _dist.is_initialized():
+                _default_pg = _dist.distributed_c10d._get_default_group()
+                if getattr(_default_pg, 'bound_device_id', None) is not None:
+                    _default_pg.bound_device_id = None
         mpu.initialize_model_parallel(**init_kwargs)
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(self.seed)
@@ -207,6 +219,14 @@ class MegatronStrategy:
             # config-build time rather than part-way through wrapping on every rank.
             raise ValueError('Megatron-FSDP does not support context parallelism '
                              f'(cp_world_size={self.device_mesh.cp_world_size}). Use DDP for a CP run.')
+        if self.device_mesh is not None:
+            tp = getattr(self.device_mesh, 'tp_world_size', 1) or 1
+            pp = getattr(self.device_mesh, 'pp_world_size', 1) or 1
+            if tp > 1 or pp > 1:
+                raise ValueError(f'Megatron-FSDP (mcore 0.20) supports neither tensor parallelism '
+                                 f'(tp_world_size={tp}) nor pipeline parallelism (pp_world_size={pp}): '
+                                 'its distributed index assumes world = dp*cp*ep*tp with no pipeline '
+                                 'axis. Use the default DDP wrapper for a tp>1 or pp>1 run.')
 
     def _finalize_quantized_param_config(self):
         """Derive the DDP ``fp8/fp4_param_gather`` flags from ``fp8/fp4_param``.
@@ -293,13 +313,28 @@ class MegatronStrategy:
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
-        from megatron.core.distributed import FullyShardedDataParallel as MegatronFSDP
         from megatron.core.transformer.module import Float16Module
         from torch.nn.parallel import DistributedDataParallel as TorchDDP
+        # The distributed wrapper is a factory function here, so isinstance() needs the real classes.
+        try:
+            from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (FullyShardedDataParallelV1,
+                                                                          FullyShardedDataParallelV2)
+            fsdp_wrappers: tuple = (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        except ImportError:  # pragma: no cover - depends on the installed megatron-core version
+            from megatron.core.distributed import FullyShardedDataParallel
+            fsdp_wrappers = (FullyShardedDataParallel, )
+        try:
+            # V1 delegates to this inner module; the chunk carrying vp_stage is one `.module` further down.
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP as MegatronFSDPInner
+            fsdp_wrappers = (*fsdp_wrappers, MegatronFSDPInner)
+        except ImportError:  # pragma: no cover
+            pass
         _models = []
+        wrapper_types = tuple(
+            wrapper for wrapper in (MegatronDDP, *fsdp_wrappers, TorchDDP, Float16Module) if isinstance(wrapper, type))
         for _model in model:
             # Unwrap DDP first
-            while isinstance(_model, (MegatronDDP, MegatronFSDP, TorchDDP, Float16Module)):
+            while isinstance(_model, wrapper_types):
                 _model = _model.module
             _models.append(_model)
         return _models
@@ -381,9 +416,9 @@ class MegatronStrategy:
                 module=_model,
             )
 
-            # Broadcast params from data parallel src rank
-            # In torchrun mode, all ranks enter here simultaneously, so this works
-            wrapped_model.broadcast_params()
+            # DDP only: FSDP shards the parameters, so a DP-rank broadcast is meaningless (and unsupported).
+            if not MegatronStrategy.uses_fsdp(ddp_config):
+                wrapped_model.broadcast_params()
             wrapped_models.append(wrapped_model)
 
         return wrapped_models

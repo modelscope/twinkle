@@ -2,6 +2,7 @@
 """Unit tests for InputProcessor: normal, padding_free, micro_batch, multimodal, GRPO."""
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import twinkle
@@ -143,8 +144,8 @@ class TestMicroBatchMode:
 class TestMegatronCausalMask:
     """The dense 4D mask must not be built when the backend derives its own."""
 
-    def _collate(self, monkeypatch, device_prefix, attention_mask_type):
-        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: device_prefix))
+    def _collate(self, monkeypatch, synthesizes, attention_mask_type):
+        monkeypatch.setattr(Platform, 'synthesizes_causal_mask', staticmethod(lambda: synthesizes))
         proc = InputProcessor(padding_free=False, framework='megatron')
         proc._create_4d_attention_mask = lambda _: pytest.fail('dense 4D mask allocated')
         return proc.collate_fn(
@@ -155,12 +156,13 @@ class TestMegatronCausalMask:
         )
 
     def test_causal_npu_omits_dense_mask(self, monkeypatch):
-        outputs = self._collate(monkeypatch, 'npu', 'causal')
+        # NPU answers synthesizes_causal_mask() True (MindSpeed builds its own mask).
+        outputs = self._collate(monkeypatch, True, 'causal')
         assert len(outputs) == 2
         assert all(output['attention_mask'] is None for output in outputs)
 
     def test_non_causal_still_builds_dense_mask(self, monkeypatch):
-        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: 'npu'))
+        monkeypatch.setattr(Platform, 'synthesizes_causal_mask', staticmethod(lambda: True))
         proc = InputProcessor(padding_free=False, framework='megatron')
         outputs = proc.collate_fn(
             _make_text_batch(4, seq_len=8),
@@ -171,7 +173,7 @@ class TestMegatronCausalMask:
         assert all(output['attention_mask'].dim() == 4 for output in outputs)
 
     def test_other_backends_still_build_dense_mask(self, monkeypatch):
-        monkeypatch.setattr(Platform, 'device_prefix', staticmethod(lambda: 'cuda'))
+        monkeypatch.setattr(Platform, 'synthesizes_causal_mask', staticmethod(lambda: False))
         proc = InputProcessor(padding_free=False, framework='megatron')
         outputs = proc.collate_fn(
             _make_text_batch(4, seq_len=8),
@@ -260,3 +262,54 @@ def test_prepooled_score_head_keeps_local_path_but_rejects_sequence_shards():
     with pytest.raises(NotImplementedError, match='per-token score head'):
         processor.postprocess_outputs({'_sequence_layout': {}}, outputs, task='seq_cls',
                                       reduce_fn=lambda value, op: value)
+
+
+class TestCpSplitsDense4DMask:
+    """CP>1 must zigzag-cut the dense [B, 1, S, S] mask with the inputs.
+
+    Before the fix the mask's split line was commented out: every CP rank received a
+    full-length mask over half-length sequences (CUDA builds no causal mask of its own,
+    so the dense mask survives the collator). pad_cp has the twin gap: it only padded
+    the key axis of the 4D mask."""
+
+    def test_4d_mask_rides_the_zigzag_cut(self):
+        mesh = SimpleNamespace(cp_world_size=2, cp_rank=1, tp_world_size=1, sequence_parallel=False)
+        proc = InputProcessor(device_mesh=mesh, framework='megatron')
+        proc.device_mesh = mesh
+        inputs = [{
+            'input_ids': torch.arange(1, 7).unsqueeze(0),
+            'attention_mask': torch.ones(1, 1, 6, 6, dtype=torch.bool),
+            'position_ids': torch.arange(6).unsqueeze(0),
+            'labels': torch.arange(1, 7).unsqueeze(0),
+        }]
+        padded = proc.pad_cp(inputs)[0]
+        # 6 -> 8 (divisor 2*cp=4), BOTH mask axes padded.
+        assert padded['attention_mask'].shape == (1, 1, 8, 8)
+        # split_cp rewrites its input dict in place; snapshot the source first.
+        source = padded['attention_mask'][0, 0].clone()
+        split = proc.split_cp([padded])[0]
+        # rank 1 of cp=2 keeps zigzag segments [1] and [2] of the 4-way cut: length 4.
+        assert split['input_ids'].shape == (1, 4)
+        assert split['attention_mask'].shape == (1, 1, 4, 4)
+        # The kept mask must be exactly the source mask's block over the kept positions:
+        # the same zigzag cut the inputs took, on both axes.
+        # zigzag rank 1 of cp=2 keeps source positions [2,3,4,5] (segments 1 and 2).
+        assert split['input_ids'][0].tolist() == [3, 4, 5, 6]
+        positions = [2, 3, 4, 5]
+        expected = source[positions][:, positions]
+        assert torch.equal(split['attention_mask'][0, 0], expected)
+
+    def test_4d_mask_with_packed_batch_fails_loudly(self):
+        mesh = SimpleNamespace(cp_world_size=2, cp_rank=0, tp_world_size=1, sequence_parallel=False)
+        proc = InputProcessor(device_mesh=mesh, framework='megatron')
+        proc.device_mesh = mesh
+        inputs = [{
+            'input_ids': torch.arange(1, 9).unsqueeze(0),
+            'attention_mask': torch.ones(1, 1, 8, 8, dtype=torch.bool),
+            'position_ids': torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+            'labels': torch.arange(1, 9).unsqueeze(0),
+            'packed_seq_params': SimpleNamespace(cu_seqlens_q=torch.tensor([0, 4, 8], dtype=torch.int32)),
+        }]
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match='packed CP split'):
+            proc.split_cp(inputs)

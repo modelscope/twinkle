@@ -123,8 +123,15 @@ def _find_post_process_owner(chunk: torch.nn.Module) -> Optional[torch.nn.Module
     return None
 
 
-class MegatronEmbeddingPatch(Patch):
-    """Convert a Megatron causal LM into a sentence-embedding model. Reversible via ``unpatch``."""
+class MegatronHiddenPassthroughPatch(Patch):
+    """Replace the last-PP chunk's ``output_layer`` with an identity, leaving the chunk's
+    forward output as the last hidden states ``[b, s, h]`` (full length: the identity
+    mirrors ColumnParallelLinear's seq-parallel gather).
+
+    The hidden-readout head tasks (seq_cls / reranker / value over an attached head) use
+    this per forward; the sentence-embedding task composes it with its pooling hook below.
+    Reversible via ``unpatch``.
+    """
 
     def __call__(self, module, *args, **kwargs):
         self._patched = []
@@ -135,13 +142,34 @@ class MegatronEmbeddingPatch(Patch):
             output_layer = owner.output_layer
             origin_forward = output_layer.forward
             output_layer.forward = MethodType(_identity_output_layer, output_layer)
-            hook_handle = owner.register_forward_hook(_output_embedding_hook, with_kwargs=True)
-            self._patched.append((output_layer, origin_forward, hook_handle))
+            self._patched.append((output_layer, origin_forward))
         return module
 
     def unpatch(self, module, *args, **kwargs):
-        for output_layer, origin_forward, hook_handle in self._patched:
-            hook_handle.remove()
+        for output_layer, origin_forward in self._patched:
             output_layer.forward = origin_forward
         self._patched = []
+        return module
+
+
+class MegatronEmbeddingPatch(Patch):
+    """Convert a Megatron causal LM into a sentence-embedding model. Reversible via ``unpatch``."""
+
+    def __call__(self, module, *args, **kwargs):
+        self._passthrough = MegatronHiddenPassthroughPatch()
+        self._passthrough(module)
+        self._hooks = []
+        for chunk in _iter_chunks(module):
+            owner = _find_post_process_owner(chunk)
+            if owner is None:
+                continue
+            hook_handle = owner.register_forward_hook(_output_embedding_hook, with_kwargs=True)
+            self._hooks.append((owner, hook_handle))
+        return module
+
+    def unpatch(self, module, *args, **kwargs):
+        for owner, hook_handle in self._hooks:
+            hook_handle.remove()
+        self._hooks = []
+        self._passthrough.unpatch(module)
         return module

@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import sys
 from copy import copy
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
@@ -13,9 +14,19 @@ from twinkle.data_format import InputFeature
 from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
+from .tasks import get_task_spec
+
 
 @dataclass
 class PackedSeqParams:
+    """Local fallback of megatron's PackedSeqParams, field-compatible with megatron-core 0.20.
+
+    Only used when megatron-core is NOT already imported in this process (the transformers
+    backend): there the packed params never reach a megatron consumer, so the field set only
+    needs to cover twinkle's own readers. A megatron process must NOT get this class -- mcore's
+    TE attention derives its getattr list from ITS PackedSeqParams version, and a missing field
+    (e.g. pad_between_seqs) crashes it. See _get_packed_seq_params for the switch.
+    """
     qkv_format: str = None
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_kv: torch.Tensor = None
@@ -26,6 +37,16 @@ class PackedSeqParams:
     # Fields required by newer megatron-core TE attention (dynamic CP)
     cp_group: object = None
     local_cp_size: int = None
+    cp_singleton_group: object = None
+    # Remaining megatron-core 0.20 fields (kept so an accidental megatron consumer in a
+    # mixed setup still finds every attribute, mirroring the 0.20 dataclass).
+    total_tokens: int = None
+    seq_idx: torch.Tensor = None
+    pad_between_seqs: bool = False
+    cp_partition_mode: str = None
+    tokens_per_sample: torch.Tensor = None
+    cp_partition_route: torch.Tensor = None
+    cp_scatter_cache: object = None
 
 
 @remote_class()
@@ -149,20 +170,19 @@ class InputProcessor:
 
     @staticmethod
     def token_level_labels(task):
-        return task not in ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
+        """Whether this task's labels are token-level (task registry: ``TaskSpec``)."""
+        return get_task_spec(task).token_level_labels
 
     def postprocess_outputs(self, inputs, outputs, *, task='causal_lm', gather_fn=None, reduce_fn=None):
         """Task reduction, loss-tensor collection and packed layout restoration.
 
         Callbacks contain only communication; token selection and task semantics
         stay here. Without callbacks, both training backends keep their local path.
+        The task's reduction method comes from the task registry (``TaskSpec.postprocess``).
         """
-        if task == 'embedding':
-            inputs, outputs = self._postprocess_embedding(inputs, outputs, reduce_fn=reduce_fn)
-        elif task == 'generative_reranker':
-            inputs, outputs = self._postprocess_generative_reranker(inputs, outputs, reduce_fn=reduce_fn)
-        elif task in ('seq_cls', 'reranker'):
-            inputs, outputs = self._postprocess_seq_cls(inputs, outputs, reduce_fn=reduce_fn)
+        spec = get_task_spec(task)
+        if spec.postprocess is not None:
+            inputs, outputs = getattr(self, spec.postprocess)(inputs, outputs, reduce_fn=reduce_fn)
         elif gather_fn is not None:
             inputs, outputs = gather_fn(inputs, outputs)
         return self.unpack_packed_sequences(inputs, outputs, task=task)
@@ -384,6 +404,26 @@ class InputProcessor:
                     value = _input.get(key)
                     if value is None:
                         continue
+                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
+                        # The dense [B, 1, S, S] mask pads on BOTH the query and the key
+                        # axis (the generic helper only pads the last one). The packed
+                        # path never carries a 4D mask -- the collator drops it -- so the
+                        # per-segment cu_seqlens slicing cannot apply; fail loudly on
+                        # that invariant, same as split_cp does.
+                        if cp_size > 1 and cu_seqlens.shape[0] > 2:
+                            raise ValueError(
+                                'a 4D attention_mask cannot ride the packed CP padding; '
+                                'the collator should have dropped it for the packed batch.')
+                        divisor = (2 * cp_size if cp_size > 1
+                                   else (tp_size if self.device_mesh.sequence_parallel and tp_size > 1 else 1))
+                        seq_len = value.shape[-1]
+                        if divisor > 1 and seq_len % divisor != 0:
+                            pad_len = divisor - (seq_len % divisor)
+                            value = torch.nn.functional.pad(
+                                value, (0, pad_len, 0, pad_len),
+                                value=self.padding_map.get(key, 0))
+                        _input[key] = value
+                        continue
                     result = []
                     for i in range(cu_seqlens.shape[0]):
                         if i == cu_seqlens.shape[0] - 1:
@@ -404,8 +444,20 @@ class InputProcessor:
                     "mm_token_type_ids",
                 ]:
                     value = _input.get(key)
-                    if value is not None:
-                        _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
+                    if value is None:
+                        continue
+                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
+                        # Both sequence axes of the dense mask must reach the TP divisor;
+                        # the generic helper only pads the key axis.
+                        seq_len = value.shape[-1]
+                        if seq_len % tp_size != 0:
+                            pad_len = tp_size - (seq_len % tp_size)
+                            value = torch.nn.functional.pad(
+                                value, (0, pad_len, 0, pad_len),
+                                value=self.padding_map.get(key, 0))
+                        _input[key] = value
+                        continue
+                    _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
             return _input
 
         return [_pad_cp(_inp) for _inp in inputs]
@@ -462,7 +514,18 @@ class InputProcessor:
             if cp_size > 1:
                 input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
                 position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=-1)
-                # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
+                if attention_mask is not None and attention_mask.dim() == 4:
+                    # The dense [B, 1, S, S] mask must ride the SAME zigzag cut as the
+                    # inputs on both the query and the key axis, or every CP rank sees a
+                    # full-length mask over half-length sequences. Packed batches never
+                    # carry a 4D mask (the collator drops it there), so the per-segment
+                    # cu_seqlens path cannot apply -- fail loudly if that invariant breaks.
+                    if cu_seqlens_q is not None:
+                        raise ValueError(
+                            'a 4D attention_mask cannot ride the packed CP split; the '
+                            'collator should have dropped it for the packed batch.')
+                    attention_mask = split_cp_inputs(attention_mask, None, dim=2)
+                    attention_mask = split_cp_inputs(attention_mask, None, dim=3)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
                 completion_mask = inputs.get("completion_mask")
@@ -521,7 +584,7 @@ class InputProcessor:
 
     @staticmethod
     def _backend_builds_causal_mask(attention_mask_type: str | None) -> bool:
-        return attention_mask_type == "causal" and Platform.device_prefix() == "npu"
+        return attention_mask_type == "causal" and Platform.get_platform().synthesizes_causal_mask()
 
     def drop_causal_4d_mask(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
         """Drop a dense mask when the accelerator synthesizes its causal mask."""
@@ -582,14 +645,18 @@ class InputProcessor:
         )
 
         max_length = cu_seqlens.diff().max()  # position_ids_f.max() + 1
-        packed = PackedSeqParams(
+        if 'megatron.core' in sys.modules:
+            from megatron.core.packed_seq_params import PackedSeqParams as _PackedSeqParams
+        else:
+            _PackedSeqParams = PackedSeqParams
+        packed = _PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_length,
             max_seqlen_kv=max_length,
             qkv_format="thd",
         )
-        if torch_util.is_torch_npu_available():
+        if Platform.get_platform().packs_padded_cu_seqlens():
             packed.cu_seqlens_q_padded = cu_seqlens
             packed.cu_seqlens_kv_padded = cu_seqlens
 
@@ -684,9 +751,11 @@ class InputProcessor:
         by ``postprocess_outputs``, so this is a no-op. Same for
         ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``,
         and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
-        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
+        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``. In general every task whose
+        registry spec has ``token_level_labels=False`` (outputs already reduced per sample)
+        returns unchanged, decision included.
         """
-        if task in ("embedding", "generative_reranker", "seq_cls", "reranker"):
+        if not get_task_spec(task).token_level_labels:
             return inputs, outputs
         labels = inputs.get("labels")
         position_ids = inputs.get("position_ids")

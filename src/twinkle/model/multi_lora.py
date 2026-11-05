@@ -28,6 +28,133 @@ class LoraTenant:
     lora_A_weights: Dict[str, torch.Tensor] = field(default_factory=lambda: {})
 
 
+class MultiLoraTaskHeadSlots:
+    """The head-side twin of :class:`MultiLora`'s LoRA slot pool, shared by both multi-LoRA
+    backends: ``n_slots`` task heads pre-allocated on the host module BEFORE the DDP/FSDP
+    wrap (reducers only discover parameters at wrap time), bound per tenant when the
+    adapter is added, and restored in place on release -- a reused slot must not start a
+    fresh tenant from the previous tenant's trained weights.
+
+    The two backends supply their own ``host`` (the unwrapped transformers model / the
+    last-PP megatron chunk) and their own head build; everything else -- slot naming
+    (``task_head_slot_{i}``), the per-adapter routing dictionary (``task_heads``, read
+    strictly by ``TaskSpec.head_for``), the deterministic lowest-free-slot choice and the
+    in-place weight restore -- lives here once.
+    """
+
+    def __init__(self, n_slots: int):
+        self.n_slots = n_slots
+        #: tenant -> slot index; kept on every rank (deterministic choice), even where the
+        #: host carries no slots (non-last-PP megatron stages).
+        self.bindings: Dict[str, int] = {}
+        self._initial_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    def build(self, host: torch.nn.Module, build_head: Callable[[], torch.nn.Module]) -> None:
+        """Pre-allocate the heads on ``host``; call BEFORE the wrap. ``build_head`` returns
+        one aligned, on-device head per call."""
+        for slot in range(self.n_slots):
+            head = build_head()
+            setattr(host, f'task_head_slot_{slot}', head)
+            self._initial_weights[slot] = {
+                name: parameter.detach().clone().cpu() for name, parameter in head.named_parameters()}
+        host.task_heads = {}
+
+    def bind(self, adapter_name: str, host: torch.nn.Module) -> None:
+        """Bind the lowest free slot to a tenant and route it in ``task_heads``.
+
+        The chunk attach runs only where the slots live (a host without ``task_heads`` --
+        a non-last-PP megatron stage -- only keeps the bookkeeping, so every rank binds
+        the same slot and the optimizer-side filter matches everywhere)."""
+        if adapter_name in self.bindings:
+            raise ValueError(f'adapter {adapter_name!r} already binds a task head slot.')
+        slot = next((s for s in range(self.n_slots) if s not in self.bindings.values()), None)
+        if slot is None:
+            raise RuntimeError(
+                f'no free task head slot for tenant {adapter_name!r}: all {self.n_slots} are bound; '
+                'raise max_loras or remove_adapter a tenant first.')
+        self.bindings[adapter_name] = slot
+        heads = getattr(host, 'task_heads', None)
+        if heads is not None:
+            heads[adapter_name] = getattr(host, f'task_head_slot_{slot}')
+
+    def release(self, adapter_name: str, host: torch.nn.Module,
+                write_param: Callable[[torch.nn.Parameter, torch.Tensor], None]) -> None:
+        """Unbind a tenant's slot and restore its build-time weights IN PLACE -- the
+        wrapped parameter tensors (DDP buffers, optimizer references) must stay the same
+        objects. ``write_param`` handles the sharded (DTensor) parameter case the same way
+        the LoRA release does (``MultiLora._write_param_tensor``)."""
+        slot = self.bindings.pop(adapter_name, None)
+        if slot is None:
+            return
+        heads = getattr(host, 'task_heads', None)
+        if heads is not None:
+            heads.pop(adapter_name, None)
+        head = getattr(host, f'task_head_slot_{slot}', None)
+        if head is None:
+            return
+        with torch.no_grad():
+            for name, parameter in head.named_parameters():
+                saved = self._initial_weights.get(slot, {}).get(name)
+                if saved is not None:
+                    write_param(parameter, saved)
+
+    def optimizer_pattern(self, adapter_name: str) -> Optional['re.Pattern']:
+        """The name filter admitting a tenant's bound head into its optimizer parameter
+        view (the megatron backend's ``optimizer_context``); None when the tenant binds none."""
+        slot = self.bindings.get(adapter_name)
+        return re.compile(rf'task_head_slot_{slot}\.') if slot is not None else None
+
+    def export_state(self, adapter_name: str, host: torch.nn.Module,
+                     read_param: Callable) -> Dict[str, torch.Tensor]:
+        """The bound tenant's head weights under slot-independent ``task_head.`` keys.
+
+        Checkpoints must not encode which physical slot a tenant happened to bind, or a
+        re-add after remove() (deterministic lowest-free choice may differ) could not
+        restore the saved head. ``read_param`` is the backend's shard-aware reader
+        (``MultiLora._read_param_tensor``)."""
+        slot = self.bindings.get(adapter_name)
+        head = getattr(host, f'task_head_slot_{slot}', None) if slot is not None else None
+        if head is None:
+            return {}
+        return {
+            f'task_head.{name}': read_param(parameter).detach().clone().cpu()
+            for name, parameter in head.named_parameters()
+        }
+
+    def import_state(self, adapter_name: str, host: torch.nn.Module, state: Dict[str, torch.Tensor],
+                     write_param: Callable) -> None:
+        """Restore ``task_head.`` checkpoint keys into the tenant's CURRENT bound slot, in
+        place (the wrapped parameter objects and optimizer references must not change).
+        ``write_param`` is the backend's shard-aware writer (``MultiLora._write_param_tensor``)."""
+        prefix = 'task_head.'
+        head_keys = [key for key in state if key.startswith(prefix)]
+        if not head_keys:
+            return
+        slot = self.bindings.get(adapter_name)
+        if slot is None:
+            raise ValueError(
+                f'checkpoint contains task-head weights ({sorted(head_keys)[:3]}...) but adapter '
+                f'{adapter_name!r} binds no task-head slot; the model and the checkpoint disagree '
+                'on the head task (task= / task_head_loader=).')
+        head = getattr(host, f'task_head_slot_{slot}', None)
+        if head is None:
+            # Bookkeeping-only rank (a non-last-PP megatron stage): the slot physically
+            # lives on the last stage; every rank binds the same slot index.
+            return
+        parameters = dict(head.named_parameters())
+        covered = {key[len(prefix):] for key in head_keys}
+        if covered != set(parameters):
+            raise ValueError(
+                f'checkpoint task-head keys {sorted(covered)} do not match the bound head\'s '
+                f'parameters {sorted(parameters)}: the head architecture changed since the '
+                'checkpoint was written.')
+        with torch.no_grad():
+            for key in head_keys:
+                name = key[len(prefix):]
+                parameter = parameters[name]
+                write_param(parameter, state[key])
+
+
 class MultiLora:
 
     def __init__(self, max_loras=5, max_r=32, max_length: int = 8192):

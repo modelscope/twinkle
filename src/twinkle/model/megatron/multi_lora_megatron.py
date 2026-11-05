@@ -27,7 +27,8 @@ from twinkle.processor import InputProcessor
 from twinkle.utils import get_logger
 from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..base import ModelLoaderProtocol
-from ..multi_lora import MultiLora
+from ..multi_lora import MultiLora, MultiLoraTaskHeadSlots
+from ..tasks import get_task_spec_obj
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .mtp.mtp import MtpTrainingState
@@ -68,6 +69,8 @@ def _seq_cls_head_lora_load_gate(bridge):
 
 @remote_class(execute='all')
 class MultiLoraMegatronModel(MegatronModel):
+    # Class-level defaults (_head_task / task_head_slots) are inherited from TrainableModel
+    # -- see the attached-head lifecycle there; a slot-less host reads as None either way.
 
     def __init__(
         self,
@@ -85,6 +88,9 @@ class MultiLoraMegatronModel(MegatronModel):
         max_r: int = 32,
         max_length: int = 8192,
         target_modules: Union[List[str], str] = 'all-linear',
+        task: Optional[str] = None,
+        task_head_loader: Optional[tuple] = None,
+        num_labels: Optional[int] = None,
         **kwargs,
     ):
         requires('megatron_core')
@@ -116,7 +122,8 @@ class MultiLoraMegatronModel(MegatronModel):
         if MegatronStrategy.uses_fsdp(ddp_config):
             os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
-        self._try_init_process_group()
+        # mcore requires an initialised process group even at world_size==1.
+        self._try_init_process_group(force=True)
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
 
@@ -150,6 +157,20 @@ class MultiLoraMegatronModel(MegatronModel):
         MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
+        # Head slots -- the head-side mirror of the LoRA slot pre-allocation above: one task
+        # head per LoRA slot, built BEFORE the wrap below so every slot's parameters enter
+        # the DDP / mcore machinery (reducers only discover parameters at wrap time). A
+        # multi-tenant host serves ONE head task (the slot's head type is fixed here);
+        # ``task`` names it ('decision' rebuilds the family loader's head from the shipped
+        # NAME, the seq_cls family builds its standard head from the config). None = this
+        # host serves no head-task tenant: no slots, no memory.
+        self._head_task = task or ('decision' if task_head_loader is not None else None)
+        self._task_head_loader = task_head_loader
+        self._num_labels = num_labels
+        self.task_head_slots = MultiLoraTaskHeadSlots(max_loras) if self._head_task is not None else None
+        if self.task_head_slots is not None:
+            self._validate_task_head_config()
+            self._build_task_head_slots()
         self.model = self.strategy.wrap_model(self.model)
         self.strategy.finish_param_config(self.model, None)
         self.multi_adapter.save_initial_weights()
@@ -170,6 +191,58 @@ class MultiLoraMegatronModel(MegatronModel):
 
     def _lazy_finish_param_config(self):
         pass
+
+    def _build_task_head_slots(self) -> None:
+        """Pre-allocate the head slots on the last-PP chunk (see ``MultiLoraTaskHeadSlots``).
+
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); only the megatron placement (place onto the last-PP
+        chunk) is backend-specific and stays here. Only the last pipeline stage
+        builds -- the other stages carry no heads, so their bind/release calls keep
+        the bookkeeping only and the optimizer-side filter matches nothing there."""
+        from megatron.core import mpu
+        if not mpu.is_pipeline_last_stage():
+            return
+        spec_obj = get_task_spec_obj(self._head_task)
+
+        def build_head():
+            head = self._build_task_head(self._head_task, self._task_head_loader, self._num_labels)
+            return spec_obj.place_megatron_head(head, self.model[-1])
+        self.task_head_slots.build(self._task_head_host(), build_head)
+
+    def _validate_task_head_config(self) -> None:
+        """Fail at construction, on every rank, before any slot or memory is spent."""
+        task = self._head_task
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to pre-allocate.')
+        if task == 'decision':
+            if self._task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+        elif self._task_head_loader is not None:
+            raise ValueError(
+                'task_head_loader is the decision families\' head replay; '
+                f'task={task!r} builds its standard head from the config instead.')
+        elif self._num_labels is None:
+            # Validates num_labels / hidden_size now (the actual build happens per slot).
+            spec_obj.build_head(self.hf_config, None)
+
+    def _bind_task_head_slot(self, adapter_name: str) -> None:
+        """Bind the lowest free head slot to a tenant (see ``MultiLoraTaskHeadSlots.bind``)."""
+        if self.task_head_slots is None:
+            raise RuntimeError(
+                'this MultiLoraMegatronModel was built without a head task (task= / task_head_loader=), '
+                'so it carries no task head slots; construct it with task= to serve head-task '
+                'tenants.')
+        self.task_head_slots.bind(adapter_name, self._task_head_host())
+
+    def _release_task_head_slot(self, adapter_name: str) -> None:
+        """Unbind a tenant's head slot and restore its build-time weights in place."""
+        if self.task_head_slots is None:
+            return
+        self.task_head_slots.release(adapter_name, self._task_head_host(),
+                                     self.multi_adapter._write_param_tensor)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -221,10 +294,20 @@ class MultiLoraMegatronModel(MegatronModel):
         return super().set_loss(loss_cls, **kwargs)
 
     @contextmanager
-    def optimizer_context(self, adapter_name: str):
+    def optimizer_context(self, tenant_adapter_name: str):
         """Temporarily replace named_parameters on each module in self.model
-        so that only parameters belonging to ``adapter_name`` are visible."""
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        so that only parameters belonging to the tenant are visible: its LoRA slot
+        parameters plus its bound task head slot (a head-task tenant trains both).
+
+        Takes the TENANT name. The LoRA pattern needs the physical slot name, the head
+        pattern keys on the tenant (``MultiLoraTaskHeadSlots.bindings``); passing the
+        physical name -- the value ``multi_adapter.adapter()`` yields -- silently dropped
+        the head from every optimizer build: the head trained gradients that never
+        updated."""
+        physical = self.multi_adapter.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(physical)}\.')
+        head_pattern = (self.task_head_slots.optimizer_pattern(tenant_adapter_name)
+                        if self.task_head_slots is not None else None)
         originals = []
         for module in self.model:
             orig = module.named_parameters
@@ -233,7 +316,8 @@ class MultiLoraMegatronModel(MegatronModel):
 
                 def filtered(prefix: str = '', recurse: bool = True, **kwargs):
                     for name, param in orig_fn(prefix=prefix, recurse=recurse, **kwargs):
-                        if param.requires_grad and pattern.search(name):
+                        if param.requires_grad and (pattern.search(name)
+                                                    or (head_pattern is not None and head_pattern.search(name))):
                             yield name, param
 
                 return filtered
@@ -249,8 +333,8 @@ class MultiLoraMegatronModel(MegatronModel):
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')) as adapter_name:
-            with self.optimizer_context(adapter_name):
+        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+            with self.optimizer_context(kwargs.get('adapter_name')):
                 # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
                 kwargs.pop('use_distributed_optimizer', None)
                 kwargs.pop('loss_scale', None)
@@ -342,7 +426,39 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Slot-pool form of the shared head checkpoint (see TrainableModel)."""
+        if self.task_head_slots is None:
+            return
+        super()._save_task_head_checkpoint(checkpoint_dir, adapter_name)
+
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The bound tenant's head weights out of its slot, under slot-independent
+        'task_head.' keys; the LoRA base writes through the bridge and never sees the head."""
+        if self.task_head_slots is None:
+            return {}
+        return self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Restore a ``_task_head_state`` snapshot into the tenant's currently bound
+        slot, in place. An empty snapshot passes (a rank without slots, a head-less
+        checkpoint); a non-empty snapshot on a slot-less host is a mismatched deployment
+        that would silently lose the trained head -- fail loudly instead."""
+        if not state:
+            return
+        if self.task_head_slots is None:
+            raise ValueError(
+                'task_head.safetensors exists but this model was built without task-head slots '
+                '(task= / task_head_loader=); it cannot serve the checkpoint\'s head task. Load it '
+                'on a model constructed with the same task.')
+        self.task_head_slots.import_state(
+            adapter_name, self._task_head_host(), state, self.multi_adapter._write_param_tensor)
+
+    # lazy_collect=False: a checkpoint write the caller acts on immediately (asserting the
+    # directory, uploading it, loading it back) must block until it lands; the lazy default
+    # would return the path while the actors are still inside _save_hf_format.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -368,10 +484,11 @@ class MultiLoraMegatronModel(MegatronModel):
                     self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
                 else:
                     self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
             if save_optimizer:
-                with self.optimizer_context(real_adapter_name):
+                with self.optimizer_context(adapter_name):
                     self._save_multi_lora_optimizer(
                         checkpoint_dir,
                         optimizer_config=optimizer_config,
@@ -416,12 +533,13 @@ class MultiLoraMegatronModel(MegatronModel):
                 peft_format=True,
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
+        self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
         optimizer_config = self.optimizer_group.get(adapter_name)
         if optimizer_config is not None and optimizer_config.optimizer is not None:
             optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
-            with self.optimizer_context(real_adapter_name):
+            with self.optimizer_context(adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)
 
         if dist.is_initialized():
@@ -494,12 +612,31 @@ class MultiLoraMegatronModel(MegatronModel):
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
         config_or_dir.trainable_token_indices = None
+        # ``task`` is an optional cross-check: the construction ``task=`` already declared this
+        # host's head, so EVERY tenant carries it (a deployment names its task once -- the
+        # yaml's ``task_type``); the forward task stays a per-call argument. Checked BEFORE
+        # any state mutation so a mismatched add leaves no half-initialized tenant behind.
+        task = kwargs.pop('task', None)
+        if task is not None and task != self._head_task:
+            raise ValueError(
+                f'this host was built for task={self._head_task!r} head slots; '
+                f'add_adapter_to_model(task={task!r}) does not match. Construct the host with '
+                'the matching task to serve that head task.')
+        if self._head_task is not None:
+            # Bind BEFORE acquire so a host that cannot serve this tenant fails before any
+            # state mutation; roll the binding back if the LoRA acquire fails.
+            self._bind_task_head_slot(adapter_name)
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config_or_dir
         self.optimizer_group[adapter_name].gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
-        self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
+        try:
+            self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
+        except Exception:
+            self._release_task_head_slot(adapter_name)
+            self.optimizer_group.pop(adapter_name, None)
+            raise
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
@@ -521,3 +658,4 @@ class MultiLoraMegatronModel(MegatronModel):
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
+        self._release_task_head_slot(adapter_name)

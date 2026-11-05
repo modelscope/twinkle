@@ -11,6 +11,7 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -297,6 +298,13 @@ class TrainableModel(ABC):
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs) -> None:
         ...
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def memory_stats(self, *, synchronize: bool = False) -> dict[str, int]:
+        """Raw per-rank allocator peaks and host RAM in bytes; no cross-rank reduction."""
+        from twinkle.perf.stats import memory_stats
+
+        return memory_stats(synchronize=synchronize)
+
     @abstractmethod
     def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:
         ...
@@ -308,6 +316,122 @@ class TrainableModel(ABC):
     @abstractmethod
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
         ...
+
+    # -- attached readout heads: one lifecycle, backend hooks -----------------------
+    _head_task: Optional[str] = None
+    task_head_slots: Optional[Any] = None  # MultiLora hosts only
+
+    def _head_model_path(self) -> str:
+        """Where the decision families' loader replays its build from."""
+        raise NotImplementedError
+
+    def _task_head_host(self):
+        """The module the head hangs off; the single-model state hooks read it."""
+        raise NotImplementedError
+
+    def _task_head_is_master(self) -> bool:
+        """Which rank writes the head file."""
+        raise NotImplementedError
+
+    def _build_task_head(self, task, task_head_loader=None, num_labels=None):
+        """Build the readout task's head, the two flavours at twinkle.module.head.
+
+        decision heads are family artifacts -- the loader's (module, class) NAME ships
+        from the driver and replays the build here; the seq_cls family builds its
+        standard head from the config (+ num_labels). Placement (device / dtype /
+        attachment names) stays with the caller -- backend-specific by design."""
+        import importlib
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
+        if task == 'decision':
+            if task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+            module_name, loader_name = task_head_loader
+            loader_cls = getattr(importlib.import_module(module_name), loader_name)
+            processor = self._default_tokenizer
+            if processor is None:
+                from transformers import AutoTokenizer
+                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+                self._default_tokenizer = processor
+            return loader_cls.build_task_head(self._head_model_path(), self.hf_config, processor)
+        if task_head_loader is not None:
+            raise ValueError(
+                'task_head_loader is the decision families\' head replay; '
+                f'task={task!r} builds its standard head from the config instead.')
+        return spec_obj.build_head(self.hf_config, num_labels)
+
+    def _attached_head(self, adapter_name):
+        """The adapter's head on the host: the task_heads dict when the host keeps one,
+        else the single task_head attribute (megatron single-model form)."""
+        host = self._task_head_host()
+        heads = getattr(host, 'task_heads', None)
+        if heads is None:
+            return getattr(host, 'task_head', None)
+        return heads.get(adapter_name)
+
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The adapter's head weights under slot-independent 'task_head.' keys.
+
+        Default (single-model) form reads the head hanging on the host; MultiLora
+        hosts override this with their slot-pool export."""
+        head = self._attached_head(adapter_name)
+        if head is None:
+            return {}
+        return {f'task_head.{name}': p.detach().clone().cpu() for name, p in head.named_parameters()}
+
+    def _task_head_carries_on_this_rank(self) -> bool:
+        """Whether THIS rank is expected to hold the head at all. True by default;
+        the megatron backend overrides it -- only the last pipeline stage carries
+        heads, so their absence on earlier stages is the layout, not a mismatch."""
+        return True
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Write a ``_task_head_state`` snapshot back in place; MultiLora hosts override
+        this with their slot-pool import. An empty snapshot passes -- every host checks
+        the OTHER side's emptiness, never its own (a rank without slots skips, a
+        checkpoint written head-less stays head-less)."""
+        import torch
+        head = self._attached_head(adapter_name)
+        if head is None:
+            if state and self._task_head_carries_on_this_rank():
+                raise ValueError(
+                    f'task_head checkpoint has keys {sorted(state)} but adapter {adapter_name!r} '
+                    'carries no head to restore them into.')
+            return
+        params = dict(head.named_parameters())
+        expected = {f'task_head.{name}' for name in params}
+        if set(state) != expected:
+            raise ValueError(
+                f'task_head checkpoint keys {sorted(state)} do not match the head it '
+                f'restores: expected {sorted(expected)}.')
+        with torch.no_grad():
+            for name, param in params.items():
+                value = state[f'task_head.{name}'].to(device=param.device, dtype=param.dtype)
+                param.data.copy_(value)
+
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Write the adapter's attached head to its own task_head.safetensors.
+
+        Keyed 'task_head.<param>' -- slot-independent, so a re-added adapter may land
+        on a different slot and still restore. Runs on the master rank only; the head
+        file is tiny, so it writes synchronously alongside the (async) weights."""
+        state = self._task_head_state(adapter_name)
+        if state and self._task_head_is_master():
+            from safetensors.torch import save_file
+            save_file({key: value.contiguous() for key, value in state.items()},
+                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+
+    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Restore the attached head from task_head.safetensors; head-less legacy
+        checkpoints (no file) load unchanged, a head checkpoint on a host without the
+        head fails loudly rather than training a random-init one."""
+        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
+        if not os.path.exists(path):
+            return
+        from safetensors.torch import load_file
+        self._restore_task_head_state(adapter_name, load_file(path))
 
     @abstractmethod
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs) -> None:
@@ -470,17 +594,32 @@ class TrainableModel(ABC):
             freeze_regex=freeze_regex,
             trainable_names=trainable_names,
             trainable_regex=trainable_regex)
+        # A just-frozen tower must stop building a graph (legacy #10214); backends without the helper skip it.
+        patch_frozen_towers = getattr(self, '_patch_frozen_towers', None)
+        if patch_frozen_towers is not None:
+            for module in modules:
+                patch_frozen_towers(module)
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
-        return backend in ('nccl', 'hccl')
+        # Platform hook: CUDA/NPU bind lazily-built communicators to the device;
+        # XPU's BKCL crashes on a bound id in later subgroup splits.
+        return Platform.get_platform().binds_device_id_to_process_group()
 
-    def _try_init_process_group(self):
+    def _try_init_process_group(self, force: bool = False):
+        """Initialise the default process group if nothing has yet.
+
+        ``force`` serves the Megatron backends: mcore's
+        ``initialize_model_parallel`` asserts an initialised group even at
+        world_size==1, so a single-rank MegatronModel must init unconditionally
+        (the ray worker env carries MASTER_ADDR/PORT/RANK/WORLD_SIZE for every
+        group size; torchrun does the same locally).
+        """
         import torch
         import torch.distributed as dist
-        if not dist.is_initialized() and Platform.get_world_size() > 1:
+        if not dist.is_initialized() and (force or Platform.get_world_size() > 1):
             torch_util.set_device()
             backend = Platform.device_backend()
-            if backend == 'hccl':
+            if Platform.get_platform().ensures_socket_env():
                 # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
                 # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
                 # Keep training-side HCCL sockets on a per-job port layout to
@@ -497,11 +636,11 @@ class TrainableModel(ABC):
             if self._should_bind_device_id_for_process_group(backend):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
-            if backend == 'hccl':
+            if Platform.get_platform().requires_unbound_default_pg():
                 default_pg = dist.distributed_c10d._get_default_group()
                 if getattr(default_pg, 'bound_device_id', None) is not None:
-                    # If the default HCCL PG keeps a bound device id, PyTorch may
-                    # propagate that binding into later Gloo subgroup creation. That
-                    # breaks the metrics/object-gather path on NPU, so clear it
-                    # before Megatron creates its Gloo DP groups.
+                    # A bound device id propagates into later subgroup creation
+                    # (Gloo DP groups on NPU) or triggers a communicator split
+                    # the backend cannot perform (XPU). Clear it before
+                    # Megatron creates its subgroups.
                     default_pg.bound_device_id = None

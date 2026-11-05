@@ -207,6 +207,8 @@ class DPOLoss(PreferenceLossBase):
         policy_rejected_logps: 'torch.Tensor',
         reference_chosen_logps: 'torch.Tensor',
         reference_rejected_logps: 'torch.Tensor',
+        chosen_token_counts: Optional['torch.Tensor'] = None,
+        rejected_token_counts: Optional['torch.Tensor'] = None,
     ) -> 'torch.Tensor':
         """Compute the DPO loss, summing every configured variant weighted by ``loss_weights`` (MPO).
 
@@ -215,10 +217,14 @@ class DPOLoss(PreferenceLossBase):
             policy_rejected_logps: [batch/2] log probs of rejected under current policy
             reference_chosen_logps: [batch/2] log probs of chosen under reference policy
             reference_rejected_logps: [batch/2] log probs of rejected under reference policy
+            chosen_token_counts: [batch/2] supervised token counts of the chosen rows; only read by ``ipo``,
+                which is defined on the length-normalized (average) log probs.
+            rejected_token_counts: [batch/2] supervised token counts of the rejected rows.
 
         Returns:
             loss: Scalar DPO loss
         """
+        import torch
         import torch.nn.functional as F
 
         # Compute log ratios
@@ -246,13 +252,26 @@ class DPOLoss(PreferenceLossBase):
                 divergence_margin = divergence_margin - (
                     F.softplus(chosen_logratios) - F.softplus(rejected_logratios))
 
+        # ipo is the one variant defined on the LENGTH-NORMALIZED sequence log probs, so it needs its own
+        # margin built from the per-token averages of the policy AND the reference sums (same token counts).
+        ipo_margin = None
+        if 'ipo' in self.loss_types and chosen_token_counts is not None and rejected_token_counts is not None:
+            chosen_counts = chosen_token_counts.to(policy_chosen_logps).clamp_min(1)
+            rejected_counts = rejected_token_counts.to(policy_rejected_logps).clamp_min(1)
+
+            def _avg(logps, counts):
+                return logps / counts
+
+            ipo_margin = (_avg(policy_chosen_logps, chosen_counts) - _avg(policy_rejected_logps, rejected_counts)) - (
+                _avg(reference_chosen_logps, chosen_counts) - _avg(reference_rejected_logps, rejected_counts))
+
         # Sum the per-variant, per-sample losses weighted by loss_weights (each 1.0 when unset), then mean.
         # The margin / divergence terms are computed once and shared by every variant.
         weights = self.loss_weights
         total = None
         for idx, loss_type in enumerate(self.loss_types):
             variant = self._variant_losses(loss_type, divergence_margin, plain_margin, chosen_logratios,
-                                           rejected_logratios)
+                                           rejected_logratios, ipo_margin)
             weight = weights[idx] if weights is not None else 1.0
             total = variant * weight if total is None else total + variant * weight
         return total.mean()
@@ -264,11 +283,13 @@ class DPOLoss(PreferenceLossBase):
         plain_margin: 'torch.Tensor',
         chosen_logratios: 'torch.Tensor',
         rejected_logratios: 'torch.Tensor',
+        ipo_margin: Optional['torch.Tensor'] = None,
     ) -> 'torch.Tensor':
         """Per-sample losses for a single DPO variant (element-wise faithful to the legacy branch).
 
-        sigmoid/hinge/ipo consume the divergence-aware margin; kto_pair uses the raw log-ratios; discopop
-        recomputes from the plain margin because the legacy discopop branch ignores f_divergence.
+        sigmoid/hinge consume the divergence-aware margin; kto_pair uses the raw log-ratios; discopop
+        recomputes from the plain margin because the legacy discopop branch ignores f_divergence; ipo uses
+        the length-normalized margin when the token counts are available.
         """
         import torch
         import torch.nn.functional as F
@@ -289,10 +310,12 @@ class DPOLoss(PreferenceLossBase):
         if loss_type == 'ipo':
             # IPO (Identity Preference Optimization) loss
             # Reference: "A General Theoretical Paradigm to Understand Learning from Human Feedback"
-            # eq 17: (h - 1/(2*beta))**2 on the raw margin h (NOT beta-scaled).
-            return (divergence_margin - 1 / (2 * self.beta))**2
+            # eq 17: (h - 1/(2*beta))**2 on the raw margin h (NOT beta-scaled). h is built from the
+            # length-normalized log probs: the same reason the legacy trainer divides the sequence logps by
+            # the completion token count for ipo only, so a short and a long pair weigh the same.
+            margin = divergence_margin if ipo_margin is None else ipo_margin
+            return (margin - 1 / (2 * self.beta))**2
         if loss_type == 'kto_pair':
-            # KTO pair loss (simplified version)
             chosen_losses = 1 - F.sigmoid(self.beta * chosen_logratios)
             rejected_losses = F.sigmoid(self.beta * rejected_logratios)
             return chosen_losses + rejected_losses
@@ -301,8 +324,10 @@ class DPOLoss(PreferenceLossBase):
             logits = self.beta * plain_margin
             log_ratio_modulation = torch.sigmoid(logits / self.discopop_tau)
             logistic_component = -F.logsigmoid(logits)
-            exp_component = torch.exp(-logits)
-            return logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
+            # Fold the modulation into the exponent: exp(-logits) overflows for large negative margins while
+            # its modulation factor goes to 0, and inf * 0 poisons the loss with NaN.
+            modulated_exp_component = torch.exp(F.logsigmoid(logits / self.discopop_tau) - logits)
+            return logistic_component * (1 - log_ratio_modulation) + modulated_exp_component
         raise ValueError(f'Unknown loss_type: {loss_type}')
 
     def _compute_sequence_logps_ld(
@@ -427,11 +452,15 @@ class DPOLoss(PreferenceLossBase):
             raise ValueError('DPO requires ref_logps unless reference_free=True')
 
         # Compute DPO loss
+        chosen_token_counts = (chosen_labels != self.ignore_index).sum(dim=-1)
+        rejected_token_counts = (rejected_labels != self.ignore_index).sum(dim=-1)
         dpo_loss = self._compute_dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
+            chosen_token_counts=chosen_token_counts,
+            rejected_token_counts=rejected_token_counts,
         )
 
         # Add SFT loss on chosen responses to prevent likelihood displacement
