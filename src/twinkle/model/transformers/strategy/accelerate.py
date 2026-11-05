@@ -218,8 +218,8 @@ class AccelerateStrategy(TransformerStrategyBase):
         if optimizer is not None:
             move_optimizer_state(optimizer, torch.device('cpu'))
         record_offload(self, model=offload_model, optimizer=optimizer is not None)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Release reserved blocks on every backend before the colocated sampler wakes.
+        release_caching_allocator()
 
     def reload_to_gpu(self, model, optimizer=None) -> None:
         """Bring back what :meth:`offload_to_cpu` handed over, to the device it was moved off."""
