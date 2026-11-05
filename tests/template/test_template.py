@@ -67,6 +67,23 @@ def test_reasoning_state_comes_from_tokens_not_enable_flag():
     assert not template._reasoning_started(template.tokenizer.encode('plain prompt'))
 
 
+def test_append_feature_accepts_wire_shaped_batched_token_type_ids():
+    """The server-side append must preserve [1, T] after an HTTP sampler round trip."""
+    template = object.__new__(Template)
+    template.finalize_appended_features = lambda features: features
+    feature = {
+        'input_ids': [1, 2, 3],
+        'labels': [-100, -100, -100],
+        'completion_mask': [0, 0, 0],
+        'mm_token_type_ids': [[0, 0, 0]],
+    }
+
+    result = template._append_feature(feature, [4, 5])
+
+    assert result['mm_token_type_ids'].tolist() == [[0, 0, 0, 0, 0]]
+    assert feature['mm_token_type_ids'] == [[0, 0, 0]]
+
+
 def test_generic_template_infers_media_types_from_config_and_processor():
     template = object.__new__(Template)
     template.config = type('Config', (), {'image_token_id': 1, 'video_token_id': 2})()

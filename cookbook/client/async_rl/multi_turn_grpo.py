@@ -252,14 +252,24 @@ def _create_attempt(task: CodeTask, on_created) -> _Attempt:
     return _Attempt(env, manager, trajectory)
 
 
+class _IncompleteRolloutError(RuntimeError):
+    """A model exhausted its rollout budget; resample the group instead of training on it."""
+
+
 def _validate_training_rows(rolled: list[dict[str, Any]]) -> None:
+    first_truncated = None
     for index, trajectory in enumerate(rolled):
-        if trajectory.get('stop_reason') in {'error', 'abort'} or trajectory.get('truncated'):
-            raise RuntimeError(f'attempt {index} is not a complete valid rollout')
+        if trajectory.get('stop_reason') in {'error', 'abort', 'generation_error'}:
+            raise RuntimeError(f"attempt {index} failed with stop_reason={trajectory.get('stop_reason')!r}")
         tokens = list(trajectory.get('response_token_ids') or [])
         logprobs = list(trajectory.get('rollout_logprobs') or [])
         if not tokens or len(tokens) != len(logprobs) or not all(math.isfinite(value) for value in logprobs):
             raise RuntimeError(f'attempt {index} has missing or misaligned rollout logprobs')
+        if trajectory.get('truncated') and first_truncated is None:
+            first_truncated = index
+    # Never let a skippable model truncation hide a hard failure in another row or in its own training data.
+    if first_truncated is not None:
+        raise _IncompleteRolloutError(f'attempt {first_truncated} was truncated before completing the rollout')
 
 
 async def _rollout_group(rollout, policy_uri: str, environments: list, stop_event: asyncio.Event,
@@ -436,7 +446,11 @@ async def train() -> None:
             done, _ = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 active_tasks.remove(task)
-                rolled, rewards = task.result()
+                try:
+                    rolled, rewards = task.result()
+                except _IncompleteRolloutError as error:
+                    logger.warning(f'skipping incomplete rollout group within the attempt budget: {error}')
+                    continue
                 _ensure_running(stop_event)
                 updated = await _train_group(model, rolled, rewards, advantage_fn, stop_event)
                 if updated:

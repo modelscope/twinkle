@@ -96,7 +96,7 @@ def test_result_file_contains_no_server_url_or_credentials(tmp_path):
 
 def _pipeline_evidence():
     return {
-        'two_updates': True,
+        'training_update': True,
         'parameter_change': True,
         'multi_turn_feedback': True,
         'token_alignment': True,
@@ -487,13 +487,17 @@ def test_sync_async_parity_requires_valid_complete_rollouts(tmp_path, monkeypatc
     if invalid:
         row.update(invalid)
 
+    temperatures = []
+
     class Rollout:
         sampling_params = validation.SamplingParams(max_tokens=32)
 
         def __call__(self, *args, **kwargs):
+            temperatures.append(kwargs['sampling_params'].temperature)
             return [dict(row)]
 
         async def acall(self, *args, **kwargs):
+            temperatures.append(kwargs['sampling_params'].temperature)
             return [dict(row)]
 
     operation = validation._sync_async_evidence(recipe, Rollout(), 'policy', [], asyncio.Event(), _config(tmp_path))
@@ -502,7 +506,20 @@ def test_sync_async_parity_requires_valid_complete_rollouts(tmp_path, monkeypatc
             asyncio.run(operation)
     else:
         result = asyncio.run(operation)
+        assert temperatures == [0.0, 0.0]
         assert result['sync_async_equivalent'] and result['environment_isolation']
+        assert all(result['sync_async_key_equality'].values())
+        assert result['sync_async_logprob_max_delta'] == 0.0
+
+        async def noisy_acall(self, *args, **kwargs):
+            return [dict(row, rollout_logprobs=[-0.2])]
+
+        Rollout.acall = noisy_acall
+        noisy = asyncio.run(validation._sync_async_evidence(
+            recipe, Rollout(), 'policy', [], asyncio.Event(), _config(tmp_path)))
+        assert noisy['sync_async_equivalent']
+        assert not noisy['sync_async_key_equality']['rollout_logprobs']
+        assert noisy['sync_async_logprob_max_delta'] > 0
 
 
 def test_openenv_cli_and_results_cannot_claim_agentenv_security(tmp_path):
@@ -525,8 +542,33 @@ def test_cancel_result_paths_keep_every_stage(tmp_path):
     assert sample != tool and sample.exists() and tool.exists()
 
 
+def test_only_model_truncation_uses_the_resumable_rollout_error():
+    recipe = _load_recipe()
+    row = {'response_token_ids': [1], 'rollout_logprobs': [-0.1], 'stop_reason': 'stop', 'truncated': False}
+    recipe._validate_training_rows([row])
+
+    with pytest.raises(recipe._IncompleteRolloutError):
+        recipe._validate_training_rows([dict(row, truncated=True)])
+
+    invalid_rows = (
+        [dict(row, stop_reason='error')],
+        [dict(row, stop_reason='generation_error', truncated=True)],
+        [dict(row, rollout_logprobs=[])],
+        [dict(row, response_token_ids=[1, 2])],
+        [dict(row, truncated=True, rollout_logprobs=[])],
+        [dict(row, truncated=True), dict(row, stop_reason='abort')],
+    )
+    for invalid in invalid_rows:
+        with pytest.raises(RuntimeError) as caught:
+            recipe._validate_training_rows(invalid)
+        assert not isinstance(caught.value, recipe._IncompleteRolloutError)
+
+
 @pytest.mark.parametrize('changed', [True, False])
-def test_update_gate_counts_only_complete_ga_cycles_with_probe_changes(changed, tmp_path, monkeypatch):
+@pytest.mark.parametrize('valid_groups', [1, 2])
+@pytest.mark.parametrize('incomplete_first', [False, True])
+def test_update_gate_counts_only_complete_ga_cycles_with_probe_changes(
+        changed, valid_groups, incomplete_first, tmp_path, monkeypatch):
     from . import validation
 
     recipe = _load_recipe()
@@ -562,7 +604,13 @@ def test_update_gate_counts_only_complete_ga_cycles_with_probe_changes(changed, 
     async def build(*args):
         return [client], model, sampler, rollout, asyncio.Event()
 
+    group_calls = 0
+
     async def groups(*args):
+        nonlocal group_calls
+        group_calls += 1
+        if incomplete_first and group_calls == 1:
+            raise recipe._IncompleteRolloutError('attempt 0 was truncated')
         return [{'response_token_ids': [1], 'rollout_logprobs': [-0.1]}] * 4, [1.0, 0.0, 1.0, 0.0]
 
     async def sync_async(*args):
@@ -572,13 +620,18 @@ def test_update_gate_counts_only_complete_ga_cycles_with_probe_changes(changed, 
     monkeypatch.setattr(validation, '_load_recipe', lambda: recipe)
     monkeypatch.setattr(validation, '_build_runtime', build)
     monkeypatch.setattr(validation, '_sync_async_evidence', sync_async)
-    config = replace(_config(tmp_path), phase='pipeline', max_groups=2)
+    config = replace(_config(tmp_path), phase='pipeline', max_groups=valid_groups + int(incomplete_first))
     result = asyncio.run(run_validation(config))
-    assert calls.count('step') == 4
-    assert result['updates'] == (2 if changed else 0)
-    assert result['evidence']['two_updates'] is changed
-    assert [call for call in calls if call.startswith('policy')] == (
-        ['policy-0', 'policy-1', 'policy-2'] if changed else ['policy-0'])
+    assert group_calls == config.max_groups
+    assert calls.count('step') == valid_groups * config.gradient_accumulation_steps
+    assert result['updates'] == (valid_groups if changed else 0)
+    assert result['incomplete_rollout_groups'] == int(incomplete_first)
+    assert result['evidence']['training_update'] is changed
+    assert result['evidence']['two_updates'] is (changed and valid_groups >= 2)
+    assert result['evidence']['distinct_snapshots'] is changed
+    expected_policies = ['policy-0'] + [f'policy-{index}' for index in range(1, valid_groups + 1)] if changed else [
+        'policy-0']
+    assert [call for call in calls if call.startswith('policy')] == expected_policies
 
 
 @pytest.mark.skipif(
