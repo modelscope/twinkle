@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import torch
 from dataclasses import dataclass, field
+from typing import Any
+
+import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from typing import Any, Dict, List, Optional
 
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature, ModelOutput
@@ -20,13 +21,14 @@ class TrainStatus:
 
     Encapsulates inputs, outputs, loss, tokens count and metrics for a training/eval step.
     """
-    inputs: List[InputFeature] = None
+
+    inputs: list[InputFeature] = None
     outputs: ModelOutput = None
     loss_value: Any = None
     num_tokens: int = 0
-    metrics: List[Metric] = field(default_factory=list)
-    forward_kwargs: Dict[str, Any] = field(default_factory=dict)
-    loss_reduction: Optional[str] = None
+    metrics: list[Metric] = field(default_factory=list)
+    forward_kwargs: dict[str, Any] = field(default_factory=dict)
+    loss_reduction: str | None = None
 
 
 @dataclass
@@ -35,12 +37,13 @@ class BaseOptimizerGroup:
 
     Subclasses: OptimizerGroup (Transformers), MegatronOptimizerGroup (Megatron)
     """
+
     adapter_name: str = None
     adapter_config: Any = None
     optimizer: Optimizer = None
     lr_scheduler: LRScheduler = None
     loss_instance: Loss = None
-    loss_registry: Dict[str, Loss] = field(default_factory=dict)
+    loss_registry: dict[str, Loss] = field(default_factory=dict)
     train_status: TrainStatus = None
     eval_status: TrainStatus = None
     template: Template = None
@@ -54,22 +57,23 @@ class BaseOptimizerGroup:
     pending_failed: bool = False
     pending_loss: float = 0.0
 
-    def set_loss(self, loss: Loss, loss_key: Optional[str] = None) -> None:
+    def set_loss(self, loss: Loss, loss_key: str | None = None) -> None:
         if loss_key is None:
             self.loss_registry.clear()
             self.loss_instance = loss
             return
         if not isinstance(loss_key, str) or not loss_key:
-            raise ValueError('loss_key must be a non-empty string')
+            raise ValueError("loss_key must be a non-empty string")
         self.loss_registry[loss_key] = loss
 
-    def get_loss(self, loss_key: Optional[str] = None) -> Loss:
+    def get_loss(self, loss_key: str | None = None) -> Loss:
         if loss_key is not None:
             try:
                 return self.loss_registry[loss_key]
             except KeyError as exc:
                 raise ValueError(
-                    f'Unknown loss_key={loss_key!r}; registered keys are {list(self.loss_registry)}') from exc
+                    f"Unknown loss_key={loss_key!r}; registered keys are {list(self.loss_registry)}"
+                ) from exc
         if len(self.loss_registry) == 1:
             return next(iter(self.loss_registry.values()))
         if len(self.loss_registry) > 1:
@@ -78,7 +82,7 @@ class BaseOptimizerGroup:
             # carry a key must keep working when CHORD registers its second, keyed loss.
             if self.loss_instance is not None:
                 return self.loss_instance
-            raise ValueError(f'loss_key is required when multiple losses are registered: {list(self.loss_registry)}')
+            raise ValueError(f"loss_key is required when multiple losses are registered: {list(self.loss_registry)}")
         return self.loss_instance
 
     def prepare_backward_transaction(self, finalize_gradients: bool, loss_weight: float) -> bool:
@@ -87,15 +91,16 @@ class BaseOptimizerGroup:
         Returns whether this call completes an already pending backward.
         """
         if not math.isfinite(loss_weight) or loss_weight < 0:
-            raise ValueError(f'loss_weight must be finite and non-negative, got {loss_weight}')
+            raise ValueError(f"loss_weight must be finite and non-negative, got {loss_weight}")
         if self.pending_failed:
             raise RuntimeError(
-                'The deferred backward transaction was interrupted; its gradients cannot be reused safely. '
-                'Reinitialize the model/optimizer state before continuing.')
+                "The deferred backward transaction was interrupted; its gradients cannot be reused safely. "
+                "Reinitialize the model/optimizer state before continuing."
+            )
         completing_pending = self.pending_backward
         if not finalize_gradients:
             if completing_pending:
-                raise RuntimeError('A deferred backward is already pending; finalize it before starting another one.')
+                raise RuntimeError("A deferred backward is already pending; finalize it before starting another one.")
             self.pending_backward = True
             self.pending_failed = True
         elif completing_pending:
@@ -116,47 +121,50 @@ class BaseOptimizerGroup:
     def require_finalized(self, operation: str) -> None:
         if self.pending_failed:
             raise RuntimeError(
-                f'Cannot {operation}: the deferred backward transaction was interrupted and its gradients '
-                'cannot be reused safely. Reinitialize the model/optimizer state before continuing.')
+                f"Cannot {operation}: the deferred backward transaction was interrupted and its gradients "
+                "cannot be reused safely. Reinitialize the model/optimizer state before continuing."
+            )
         if self.pending_backward:
             raise RuntimeError(
-                f'Cannot {operation} while a deferred backward is pending; call forward_backward with '
-                'finalize_gradients=True first.')
+                f"Cannot {operation} while a deferred backward is pending; call forward_backward with "
+                "finalize_gradients=True first."
+            )
 
-    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
+    def do_grad_sync(self, gradient_accumulation_steps: int | None = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
         else:
             self.gradient_accumulation_steps = gradient_accumulation_steps
-        return gradient_accumulation_steps == 1 or ((self.cur_step - 1) % gradient_accumulation_steps == 0
-                                                    and self.cur_step > 1)
+        return gradient_accumulation_steps == 1 or (
+            self.cur_step > 0 and self.cur_step % gradient_accumulation_steps == 0
+        )
 
     def _get_lr(self):
         """Get learning rates from optimizer. Override in subclass."""
         return []
 
-    def _metric_kwargs(self, status: TrainStatus, metric_step: Optional[int] = None) -> Dict[str, Any]:
+    def _metric_kwargs(self, status: TrainStatus, metric_step: int | None = None) -> dict[str, Any]:
         """Use actual optimizer state while retaining the selected loss's reduction."""
         forward_kwargs = dict(status.forward_kwargs)
-        loss_key = forward_kwargs.pop('_metric_loss_key', None)
+        loss_key = forward_kwargs.pop("_metric_loss_key", None)
         return {
             **forward_kwargs,
-            'lr': self._get_lr(),
-            'step': self.cur_step - 1 if metric_step is None else metric_step,
-            'gradient_accumulation_steps': self.gradient_accumulation_steps,
-            'grad_norm': self._last_grad_norm,
-            'loss_reduction': status.loss_reduction or getattr(self.get_loss(loss_key), 'reduction', 'mean'),
+            "lr": self._get_lr(),
+            "step": self.cur_step - 1 if metric_step is None else metric_step,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "grad_norm": self._last_grad_norm,
+            "loss_reduction": status.loss_reduction or getattr(self.get_loss(loss_key), "reduction", "mean"),
         }
 
-    def accumulate_metrics(self, is_training, include_default: bool = True, metric_step: Optional[int] = None):
+    def accumulate_metrics(self, is_training, include_default: bool = True, metric_step: int | None = None):
         """Accumulate metrics through one argument merge and keyed-loss dispatch."""
         status = self.train_status if is_training else self.eval_status
         if not status.metrics or status.inputs is None or status.outputs is None:
             return
-        loss_key = status.forward_kwargs.get('_metric_loss_key')
+        loss_key = status.forward_kwargs.get("_metric_loss_key")
         metric_kwargs = self._metric_kwargs(status, metric_step)
         for metric in status.metrics:
-            metric_loss_key = getattr(metric, '_twinkle_loss_key', None)
+            metric_loss_key = getattr(metric, "_twinkle_loss_key", None)
             if metric_loss_key != loss_key or (metric_loss_key is None and not include_default):
                 continue
             metric.accumulate(status.inputs, status.outputs, **metric_kwargs)

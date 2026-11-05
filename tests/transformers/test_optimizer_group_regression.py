@@ -10,6 +10,16 @@ from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.transformers import OptimizerGroup, TransformersModel
 
 
+def test_grad_sync_uses_the_completed_backward_count():
+    group = BaseOptimizerGroup(gradient_accumulation_steps=2)
+    assert not group.do_grad_sync()
+    for step, expected in [(1, False), (2, True), (3, False), (4, True)]:
+        group.cur_step = step
+        assert group.do_grad_sync() is expected
+    group.cur_step = 0
+    assert group.do_grad_sync(gradient_accumulation_steps=1)
+
+
 @pytest.mark.parametrize('group_cls', [BaseOptimizerGroup, OptimizerGroup])
 @pytest.mark.parametrize('is_training', [True, False])
 def test_forward_kwargs_do_not_duplicate_metric_control_parameters(group_cls, is_training):
