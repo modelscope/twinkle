@@ -187,6 +187,13 @@ class TestMegatronCausalMask:
 class TestMultimodalMode:
     """Multimodal: pixel_values, image_grid_thw."""
 
+    def test_none_multimodal_fields_are_preserved(self):
+        proc = InputProcessor()
+        rows = [{'input_ids': [1, 2], 'pixel_values': None, 'image_grid_thw': None}]
+        result = proc.prepare_inputs(rows)
+        assert result[0]['pixel_values'] is None
+        assert result[0]['image_grid_thw'] is None
+
     def test_multimodal_collate(self):
         proc = InputProcessor()
         batch = [
