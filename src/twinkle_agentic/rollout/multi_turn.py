@@ -378,6 +378,19 @@ class MultiTurnRollout(Rollout):
           also enables sticky routing. Requires a continuous-work sampler.
     """
 
+    @staticmethod
+    def _coerce_remote_group(*args, **kwargs):
+        """Keep the episode on the process that owns sampler admission.
+
+        ``configure_workers`` records which replicas are ACTIVE on the driver handler.
+        Serialization drops that table and marks the copy so it cannot admit. ``sample()``
+        therefore has to run here; a payload actor would be holding a handler that refuses.
+        """
+        sampler = kwargs.get('sampler', args[0] if args else None)
+        if getattr(sampler, '_sampler_workers', None) is None:
+            return kwargs.get('remote_group')
+        return None
+
     def __init__(
         self,
         sampler=None,
