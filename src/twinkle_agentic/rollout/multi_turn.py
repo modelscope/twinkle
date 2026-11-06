@@ -89,6 +89,10 @@ class RolloutSample:
     # A group-level baseline (e.g. ReMax's greedy reward), written by the group-completion hook;
     # one value shared by every sibling of the group.
     baseline: float | None = None
+    # Whether ``encoded`` carries the sampler-exported MoE routing. Set at construction so the
+    # R3 replay gate can read it driver-side, where a streaming sample's ``encoded`` is only a
+    # reference (see :meth:`generate`).
+    routing_exported: bool = False
 
     @property
     def input_feature(self) -> dict:
@@ -179,6 +183,7 @@ def trajectory_to_rollout_sample(traj: dict[str, Any], prompt_id: str, extra: di
         messages=messages,
         rollout_infos=rollout_infos,
         sampling_mask=traj.get("sampling_mask"),
+        routing_exported=encoded.get("routed_experts") is not None,
     )
 
 
@@ -665,9 +670,15 @@ class MultiTurnRollout(Rollout):
     # The batch and streaming faces over the same engine: ``generate`` is the blocking
     # (locally) / lazy (over Ray) batch entry, and admit/poll/collect/cancel is the
     # four-call protocol the streaming driver's engine seams default-bind to. Both
-    # translate each episode's ledger-merged trajectory into a RolloutSample.
+    # translate each episode's ledger-merged trajectory into a RolloutSample whose training
+    # feature rides generate's stash channel, so a driver-side collect materialises only
+    # the light half and re-attaches the feature references in :meth:`collect`.
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=True)
+    # Position 1 of the return is a declared ``stash`` channel: the per-sample encoded features
+    # are lifted to references HERE, where the episodes ran, so a caller that materialises the
+    # pair in the driver resolves only the light half and re-attaches the references (the dicts
+    # themselves, locally) onto the samples.
+    @remote_function(dispatch="all", collect="none", lazy_collect=True, stash=(1,))
     def generate(
         self,
         prompts: list[list[dict]],
@@ -677,13 +688,18 @@ class MultiTurnRollout(Rollout):
         force_logprobs: bool = True,
         adapter_path: str | None = None,
         allow_partial_rollout: bool | None = None,
-    ) -> list[RolloutSample]:
-        """Run one episode per (prompt, sample) pair and translate each output.
+    ) -> tuple[list[RolloutSample], list[dict]]:
+        """Run one episode per (prompt, sample) pair; the light samples and the features apart.
 
         ``num_samples`` completions per prompt, grouped by prompt -- a GRPO group is one
-        prompt's slice of the returned list. ``lazy_collect=True`` makes a REMOTE call
-        return a LazyCollect handle immediately (what :meth:`admit` parks on its
-        payload); a local call still blocks.
+        prompt's slice of the returned samples. The returned pair is (samples, encoded
+        features): each sample's ``encoded`` field is emptied here and the features ride the
+        stash channel as per-sample references, so materialising the pair -- the streaming
+        collect, or any batch consumer unpacking it -- moves only the light fields; the caller
+        re-attaches each feature onto its sample (``sample.encoded = encoded``), and a remote
+        reader of ``sample.encoded`` then sees the resolved dict. Locally the features are the
+        dicts themselves. A REMOTE call still returns one lazy handle over the whole pair
+        (what :meth:`admit` parks on its payload); a local call still blocks.
         """
         if num_samples < 1:
             raise ValueError("num_samples must be >= 1.")
@@ -716,10 +732,14 @@ class MultiTurnRollout(Rollout):
         outputs = self(trajectories, **kwargs)
         if len(outputs) != len(metadata):
             raise RuntimeError(f"multi-turn rollout returned {len(outputs)} trajectories for {len(metadata)} inputs.")
-        return [
+        samples = [
             trajectory_to_rollout_sample(output, prompt_id, extra)
             for output, (prompt_id, extra) in zip(outputs, metadata, strict=False)
         ]
+        encodings = [sample.encoded for sample in samples]
+        for sample in samples:
+            sample.encoded = None
+        return samples, encodings
 
     def _rl_sampling_params(self, sampling_params: Any, force_logprobs: bool) -> SamplingParams:
         """The one SamplingParams every RL entry samples under (contract 15).
@@ -770,7 +790,9 @@ class MultiTurnRollout(Rollout):
         )
         if hasattr(self, "_actors"):
             # The remote episode runs on the actor: the generate call itself returns a
-            # LazyCollect immediately, so admission never blocks the driver thread.
+            # LazyCollect immediately, so admission never blocks the driver thread -- and the
+            # feature lift already happened inside generate, so the parked ref carries only
+            # light fields.
             handle.payload = self.generate([prompt], **generate_kwargs)
             return handle
         return self._admit_local(handle, lambda: self.generate([prompt], **generate_kwargs))
@@ -790,16 +812,24 @@ class MultiTurnRollout(Rollout):
         return completed
 
     def collect(self, handle: SampleHandle) -> RolloutSample:
-        """Collect ONE completed trajectory, stamped with its group id / pin version / prompt."""
+        """Collect ONE completed trajectory, stamped with its group id / pin version / prompt.
+
+        The re-attachment point of the streaming split: each sample's ``encoded`` field gets its
+        stashed reference (the dict itself locally) back before the sample travels on, so every
+        consumer keeps reading ``sample.encoded`` -- remotely that is a reference Ray
+        dereferences at the consuming worker, never the driver.
+        """
         if handle.payload is not None:
-            samples = handle.payload()
+            samples, encodings = handle.payload()
         else:
-            samples = self._pop_episode_future(handle).result()
+            samples, encodings = self._pop_episode_future(handle).result()
         if len(samples) != 1:
             raise RuntimeError(
                 f"episode collect expected exactly 1 sample (submission {handle.submission_id}), got {len(samples)}."
             )
-        return self._stamp_admission(samples[0], handle)
+        sample = samples[0]
+        sample.encoded = encodings[0]
+        return self._stamp_admission(sample, handle)
 
     def cancel(self, handle: SampleHandle | None) -> None:
         """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
