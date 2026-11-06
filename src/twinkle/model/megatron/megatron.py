@@ -413,7 +413,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(collect='mean')
     @timed
     def calculate_loss(self, **kwargs):
-        raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
+        return float('inf')
 
     @remote_function()
     def backward(self, **kwargs):
