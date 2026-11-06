@@ -827,13 +827,18 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             channel_loss[channel] = stats
                 elif isinstance(loss_dict, torch.Tensor):
                     raise ValueError('Expected loss dict, got tensor')
-        if n_loss_entries > 1:
-            # Backend equivalence: the transformers backend reports ONE mean loss for the whole batch, so
-            # a run split into several microbatches must average the per-microbatch losses, not SUM them
-            # (a sum scales the reported loss with num_microbatches -- e.g. DPO at an identity adapter
-            # reports 2*ln2 instead of ln2 with two microbatches -- while the gradient is unaffected:
-            # mcore already normalizes the backward tensor in place). Tokens/logps stay lists (they carry
+        if n_loss_entries > 1 and not count:
+            # Backend equivalence for MEAN-contract losses only (no num_tokens): the transformers
+            # backend reports ONE mean loss for the whole batch, so a run split into several
+            # microbatches must average the per-microbatch losses, not SUM them (a sum scales the
+            # reported loss with num_microbatches -- e.g. DPO at an identity adapter reports 2*ln2
+            # instead of ln2 with two microbatches -- while the gradient is unaffected: mcore
+            # already normalizes the backward tensor in place). Tokens/logps stay lists (they carry
             # per-row payloads), only the scalar telemetry is averaged.
+            # SUM-contract losses ('num_tokens' present) must NOT be averaged: loss is already a
+            # token sum and count the token count, and LossMetric divides the sum by the summed
+            # count exactly once -- averaging here would deflate the reported loss by GA.
+            # channel_loss above sums for the same reason.
             loss = loss / n_loss_entries
 
         # Report the LOCAL token-sum and its denominator (transformers contract): LossMetric's

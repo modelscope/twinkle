@@ -107,7 +107,13 @@ def _standard_clip_grad_norm(
     import torch
 
     topology = _detect_grad_topology(grads)
-    can_use_builtin = (not topology.has_mixed_mesh and (topology.all_dtensor or (topology.all_local and group is None)))
+    # Plain local grads + a dp group means DDP: the backward allreduce already replicated
+    # the gradients, so every rank holds the SAME grads and the local norm IS the global
+    # norm -- the torch builtin computes exactly that. The manual SUM-reduce path below
+    # would add the identical per-rank square sums dp_world_size times and inflate the
+    # norm (and over-clip) by sqrt(dp_world_size). Strategies whose local grads genuinely
+    # differ across ranks (FSDP2/EP) keep DTensor/sharded params and never hit this branch.
+    can_use_builtin = (not topology.has_mixed_mesh and (topology.all_dtensor or topology.all_local))
 
     if can_use_builtin:
         # PyTorch built-in handles DTensor reduce via mesh ops and works for
@@ -116,7 +122,7 @@ def _standard_clip_grad_norm(
         grad_norm = torch_util.to_local_tensor(grad_norm)
         return float(grad_norm.item())
 
-    # Manual path for mixed DTensor+local or explicit group reduce.
+    # Manual path for mixed DTensor+local or mixed-mesh topology.
     norm_type = float(norm_type)
     if norm_type not in (2.0, float('inf')):
         raise ValueError('Mixed DTensor/Tensor clip_grad_norm only supports norm_type=2 or inf.')
