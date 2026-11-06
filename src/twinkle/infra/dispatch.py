@@ -835,7 +835,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
 
         @functools.wraps(func)
-        def wrapper(self, *args, **kwargs) -> T1:
+        def _call_impl(self, *args, **kwargs) -> T1:
             infra = _infra()
             _ctx = f'{type(self).__name__}.{func.__name__}'
             # Only capture caller on driver side; worker frames are Ray internals
@@ -1128,6 +1128,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 finally:
                     if _configuration_lock is not None and not _lock_release_deferred:
                         _configuration_lock.release()
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs) -> T1:
+            if hasattr(self, '_actors'):
+                from twinkle.perf import default_recorder
+                with default_recorder.span(func.__qualname__):
+                    return _call_impl(self, *args, **kwargs)
+            return _call_impl(self, *args, **kwargs)
 
         wrapper._execute = execute
         wrapper._collect = collect

@@ -1227,7 +1227,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             raise NotImplementedError(
                 f'Unsupported scheduler: {scheduler_cls}, only support OptimizerParamScheduler currently.')
 
-    @remote_function(dispatch='all')
+    # sync=True: an optimizer step is a barrier in the training loop's semantics -- the very next
+    # remote call (weight sync, eval, save) must observe the stepped parameters. Making it declared-
+    # sync (rather than each recipe wrapping its call in collect()) also materializes worker
+    # exceptions at the call site in ray mode: a failed step surfaces immediately instead of parking
+    # inside the discarded LazyCollect and logging "Unhandled error" per rank.
+    @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self.step(**kwargs)

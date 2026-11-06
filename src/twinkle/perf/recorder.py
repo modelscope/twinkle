@@ -22,6 +22,12 @@ __all__ = ['TimeRecorder', 'default_recorder', 'timed', 'span', 'enable_perf', '
 
 _NS_PER_SEC = 1e9
 
+#: Cap on the raw event stream retained across ``reset(keep_events=True)`` calls. Windowed
+#: consumers (``phase_totals`` with an explicit window) need the events since their window
+#: opened -- one rollout iteration -- while the logging-cadence dumps keep flowing forever,
+#: so the stream is trimmed to this many most-recent events instead of growing unboundedly.
+_EVENT_STREAM_RETENTION = 100_000
+
 #: Source of ``_Span.sid``. Allocation happens at span construction, so a parent's
 #: sid is always SMALLER than its children's -- the ordering offline timeline
 #: analysis relies on when folding subtree self-times (see :mod:`.timeline`).
@@ -77,8 +83,9 @@ class TimeRecorder:
         self._first_start_ns: Optional[int] = None
         self._last_end_ns: Optional[int] = None
         # Append-only event stream for offline timeline analysis (see timeline.py):
-        # one 8-tuple per CLOSED span, in close order. Shares the aggregate's window
-        # semantics -- cleared by reset(), snapshotted (not consumed) by trace_events().
+        # one 8-tuple per CLOSED span, in close order. Cleared by reset() except in
+        # the keep_events mode the windowed consumers need (see reset); snapshotted
+        # (not consumed) by trace_events().
         self._events: List[Tuple[Optional[int], Optional[int], str, int, int, int, int, int]] = []
 
     # ------------------------------------------------------------------ control
@@ -105,14 +112,37 @@ class TimeRecorder:
     def enabled(self) -> bool:
         return self._enabled
 
-    def reset(self) -> None:
-        """Drop all accumulated timings (e.g. between logging windows)."""
+    def now_ns(self) -> int:
+        """Read the recorder's own clock (the same clock spans are stamped with).
+
+        Windowed consumers (e.g. ``phase_totals``) must stamp their window bounds with
+        THIS clock, not a second ``time.perf_counter_ns`` call site: the two would drift
+        apart under the test fake-clock and (worse) under any future clock swap, quietly
+        producing windows that select the wrong spans. Works whether the recorder is
+        enabled or not -- the clock is independent of the recording gate.
+        """
+        return self._clock_ns()
+
+    def reset(self, *, keep_events: bool = False) -> None:
+        """Drop the accumulated aggregates and window bounds (e.g. between logging windows).
+
+        ``keep_events`` retains the raw event stream (bounded to the most recent
+        :data:`_EVENT_STREAM_RETENTION` events) so windowed consumers can still reduce
+        windows that straddle this reset -- the logging-cadence dump resets the
+        per-window aggregates while an outer consumer (a rollout iteration reading
+        ``phase_totals`` over its own explicit window) still needs the events recorded
+        before the dump. The aggregates and window bounds are always dropped: a dump
+        must report exactly the window since the last one.
+        """
         with self._lock:
             self._stats.clear()
             self._edges.clear()
-            self._events.clear()
             self._first_start_ns = None
             self._last_end_ns = None
+            if not keep_events:
+                self._events.clear()
+            elif len(self._events) > _EVENT_STREAM_RETENTION:
+                del self._events[:len(self._events) - _EVENT_STREAM_RETENTION]
 
     # ------------------------------------------------------------------ recording
 
@@ -300,6 +330,70 @@ class TimeRecorder:
             out[f'{prefix}{name}/mean_s'] = (total / count / _NS_PER_SEC) if count else 0.0
             out[f'{prefix}{name}/self_s'] = self_ns / _NS_PER_SEC
         return out
+
+    def phase_totals(self, *, exclude: Tuple[str, ...] = (), window: Optional[Tuple[int, int]] = None) -> Dict[str, float]:
+        """Per-name union-of-intervals totals in seconds, minus the excluded spans' union.
+
+        Unlike ``_stats`` (which SUMS durations, so nested spans double-count against
+        their parents), this reduces the closed event stream by name: each name's total
+        is the union of its intervals, so overlaps fold and nesting is not counted
+        twice. ``exclude`` names form a merged exclusion band (their union, merged
+        across overlapping/adjacent intervals) subtracted from every other name AND
+        from the window -- the caller's "this time was logging, not work" carve-out.
+
+        ``window`` (start_ns, end_ns) bounds the reduction; defaults to the recorded
+        window (first start .. last end). Returns ``{'<name>': seconds}`` plus
+        ``{'window': seconds}`` for the bounded wall time.
+
+        Training-agnostic on purpose: the recorder knows intervals and names, never
+        what a "batch" or "rollout" is -- recipes phase-name freely and consume the
+        dict (e.g. folded into a ThroughputMetric via its ``timings=`` input).
+        """
+        with self._lock:
+            events = list(self._events)
+            if window is None:
+                window = (self._first_start_ns, self._last_end_ns)
+        if window[0] is None or window[1] is None:
+            return {}
+        lo_ns, hi_ns = window
+
+        def _merge(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+            merged: List[Tuple[int, int]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        def _clamp(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+            """Clip intervals to the window, dropping empty ones."""
+            return [(max(lo, lo_ns), min(hi, hi_ns)) for lo, hi in intervals if max(lo, lo_ns) < min(hi, hi_ns)]
+
+        def _ns(intervals: List[Tuple[int, int]]) -> int:
+            return sum(hi - lo for lo, hi in intervals)
+
+        def _overlap_ns(a: List[Tuple[int, int]], b: List[Tuple[int, int]]) -> int:
+            return sum(
+                max(0, min(hi_a, hi_b) - max(lo_a, lo_b))
+                for lo_a, hi_a in a
+                for lo_b, hi_b in b)
+
+        by_name: Dict[str, List[Tuple[int, int]]] = {}
+        for event in events:
+            by_name.setdefault(event[2], []).append((event[4], event[5]))
+        # Clamp to the window FIRST so a span straddling the boundary contributes only
+        # its in-window part, and an excluded band outside the window subtracts nothing.
+        by_name = {name: _clamp(_merge(intervals)) for name, intervals in by_name.items()}
+        excluded = _merge([iv for name in exclude for iv in by_name.get(name, ())])
+        excl_ns = _ns(excluded)
+        totals: Dict[str, float] = {}
+        for name, intervals in by_name.items():
+            if name in exclude:
+                continue
+            totals[name] = max(0.0, (_ns(intervals) - _overlap_ns(intervals, excluded)) / _NS_PER_SEC)
+        totals['window'] = max(0.0, (hi_ns - lo_ns - excl_ns) / _NS_PER_SEC)
+        return totals
 
     def print_summary(self, *, sort: str = 'total', top: Optional[int] = None) -> None:
         """Print a human-readable table plus the nesting tree."""
