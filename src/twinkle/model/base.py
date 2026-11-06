@@ -109,8 +109,10 @@ class ModelLoaderProtocol(Protocol):
     """The construction hooks twinkle's model backends call on a caller-supplied ``model_loader``.
 
     A backend hands checkpoint construction back to the caller by accepting a ``model_loader``. The
-    transformers backend calls all six hooks (build config -> processor -> model, each paired with a
-    ``process_*`` post-hook); the megatron backend calls only ``build_config`` / ``process_config``
+    transformers backend calls config -> processor -> model, each paired with a ``process_*`` post-hook.
+    Non-source native FSDP ranks use ``build_model_from_config`` instead of loading the checkpoint
+    when memory-efficient initialization is enabled. The megatron backend calls only
+    ``build_config`` / ``process_config``
     (mcore builds the module itself and the bridge loads the weights). This Protocol names exactly that
     consumer-defined surface -- and nothing more -- so the seam is type-checked instead of duck-typed
     ``Any``, and a misspelled hook is caught statically rather than at load time.
@@ -136,6 +138,11 @@ class ModelLoaderProtocol(Protocol):
 
     def build_model(self, model_dir: str, config: 'PretrainedConfig', processor: Any,
                     **kwargs) -> 'PreTrainedModel':
+        ...
+
+    def build_model_from_config(self, config: 'PretrainedConfig', processor: Any,
+                                **kwargs) -> 'PreTrainedModel':
+        """Construct without checkpoint I/O, inside the backend's empty-weight context."""
         ...
 
     def process_model(self, model: 'PreTrainedModel') -> 'PreTrainedModel':
