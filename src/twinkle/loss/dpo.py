@@ -151,6 +151,8 @@ class DPOLoss(PreferenceLossBase):
         policy_rejected_logps: 'torch.Tensor',
         reference_chosen_logps: 'torch.Tensor',
         reference_rejected_logps: 'torch.Tensor',
+        chosen_lengths: Optional['torch.Tensor'] = None,
+        rejected_lengths: Optional['torch.Tensor'] = None,
     ) -> 'torch.Tensor':
         """Compute the DPO loss.
 
@@ -159,6 +161,8 @@ class DPOLoss(PreferenceLossBase):
             policy_rejected_logps: [batch/2] log probs of rejected under current policy
             reference_chosen_logps: [batch/2] log probs of chosen under reference policy
             reference_rejected_logps: [batch/2] log probs of rejected under reference policy
+            chosen_lengths: [batch/2] number of completion tokens of chosen (used by IPO)
+            rejected_lengths: [batch/2] number of completion tokens of rejected (used by IPO)
 
         Returns:
             loss: Scalar DPO loss
@@ -190,9 +194,14 @@ class DPOLoss(PreferenceLossBase):
             # Hinge loss variant
             losses = torch.relu(1 - logits)
         elif self.loss_type == 'ipo':
-            # IPO (Identity Preference Optimization) loss
-            # Reference: "A General Theoretical Paradigm to Understand Learning from Human Feedback"
-            losses = (logits - 1 / (2 * self.beta))**2
+            # IPO (Identity Preference Optimization) loss, Eq. 17 of
+            # "A General Theoretical Paradigm to Understand Learning from Human Feedback":
+            # (h - 1 / (2 * tau))**2 with tau = beta. h is not scaled by beta, and the log ratios are
+            # averaged per token so the target margin does not depend on completion length (as in TRL).
+            if chosen_lengths is not None:
+                chosen_logratios = chosen_logratios / chosen_lengths.clamp(min=1)
+                rejected_logratios = rejected_logratios / rejected_lengths.clamp(min=1)
+            losses = (chosen_logratios - rejected_logratios - 1 / (2 * self.beta))**2
         elif self.loss_type == 'kto_pair':
             # KTO pair loss (simplified version)
             chosen_logratios_scaled = self.beta * chosen_logratios
@@ -298,6 +307,8 @@ class DPOLoss(PreferenceLossBase):
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
+            chosen_lengths=(chosen_labels != self.ignore_index).sum(dim=-1),
+            rejected_lengths=(rejected_labels != self.ignore_index).sum(dim=-1),
         )
 
         # Add SFT loss on chosen responses to prevent likelihood displacement

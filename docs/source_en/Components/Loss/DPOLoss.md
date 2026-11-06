@@ -10,7 +10,7 @@ The standard DPO loss supports multiple loss types and optional reference-free m
 from twinkle.loss import DPOLoss
 
 loss_fn = DPOLoss(
-    loss_type='sigmoid',  # 'sigmoid', 'hinge', 'ipo', 'kto'
+    loss_type='sigmoid',  # 'sigmoid', 'hinge', 'ipo', 'kto_pair'
     beta=0.1,
     sft_weight=0.0,       # optional SFT regularization weight
     reference_free=False,
@@ -20,7 +20,7 @@ model.set_loss(loss_fn)
 ```
 
 **Parameters:**
-- `loss_type`: DPO variant — `sigmoid` (default), `hinge`, `ipo`, or `kto`
+- `loss_type`: DPO variant — `sigmoid` (default), `hinge`, `ipo`, or `kto_pair`
 - `beta`: Temperature parameter controlling preference strength
 - `sft_weight`: Weight for an additional SFT loss term on chosen responses
 - `reference_free`: If `True`, skips reference model log-probabilities

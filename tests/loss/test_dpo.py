@@ -63,6 +63,29 @@ class TestDPOLoss:
         result = loss_fn(inputs, outputs, ref_logps=ref_logps)
         assert result['loss'].dim() == 0
 
+    def test_dpo_ipo_matches_eq17(self):
+        """IPO is (h - 1/(2*beta))**2 on per-token-averaged log ratios, h not scaled by beta."""
+        beta = 0.1
+        loss_fn = DPOLoss(beta=beta, loss_type='ipo')
+        inputs, outputs, ref_logps = _make_preference_batch()
+        labels = inputs['labels']
+        mask = (labels != -100).float()
+        avg_logratios = ((outputs['logps'] - ref_logps) * mask).sum(-1) / mask.sum(-1)
+        h = avg_logratios[0::2] - avg_logratios[1::2]
+        expected = ((h - 1 / (2 * beta))**2).mean()
+        result = loss_fn(inputs, outputs, ref_logps=ref_logps)
+        torch.testing.assert_close(result['loss'], expected)
+
+    def test_dpo_ipo_minimized_at_target_margin(self):
+        """The IPO loss is zero when the averaged log-ratio margin equals 1/(2*beta)."""
+        beta = 0.1
+        loss_fn = DPOLoss(beta=beta, loss_type='ipo')
+        labels = torch.tensor([[1, 2, 3, -100], [1, 2, -100, -100]])
+        policy = torch.zeros(2, 4)
+        policy[0, :3] = 1 / (2 * beta)  # chosen: avg log ratio 5, rejected: 0
+        result = loss_fn({'labels': labels}, {'logps': policy}, ref_logps=torch.zeros(2, 4))
+        assert result['loss'].item() == pytest.approx(0.0, abs=1e-6)
+
     def test_dpo_kto_pair(self):
         loss_fn = DPOLoss(beta=0.1, loss_type='kto_pair')
         inputs, outputs, ref_logps = _make_preference_batch()
