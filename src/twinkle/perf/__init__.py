@@ -37,7 +37,7 @@ from .control import Perf
 from .counters import CounterRegistry, default_counters
 from .module_profiler import ModuleProfiler, activation_stats, build_module_profiler, param_stats
 from .recorder import TimeRecorder, default_recorder, disable_perf, enable_perf, span, timed
-from .stats import describe_shape, primary_tensor, tensor_moments, tensor_numel
+from .stats import describe_shape, memory_stats, primary_tensor, tensor_moments, tensor_numel
 from .timeline import chrome_trace, dag_report
 
 __all__ = [
@@ -60,4 +60,5 @@ __all__ = [
     'tensor_moments',
     'tensor_numel',
     'describe_shape',
+    'memory_stats',
 ]

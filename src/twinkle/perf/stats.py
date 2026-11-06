@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tensor statistics helpers for the module profiler.
+"""Raw tensor and process observations for performance instrumentation.
 
-These are plain functions over ``torch.Tensor`` (and the nested containers a
+Tensor helpers are plain functions over ``torch.Tensor`` (and nested containers a
 forward may return) so both the built-in :func:`activation_stats` /
 :func:`param_stats` collectors and user collectors can reuse them. Every
 reduction ends in ``.item()``, which forces a device sync -- that is
@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterator, Optional
 
 import torch
 
-__all__ = ['iter_tensors', 'primary_tensor', 'tensor_moments', 'tensor_numel', 'describe_shape']
+__all__ = ['iter_tensors', 'primary_tensor', 'tensor_moments', 'tensor_numel', 'describe_shape', 'memory_stats']
 
 
 def iter_tensors(obj: Any) -> Iterator[torch.Tensor]:
@@ -84,3 +84,27 @@ def describe_shape(obj: Any) -> str:
     if len(tensors) == 1:
         return 'x'.join(str(dim) for dim in tensors[0].shape)
     return '(' + ', '.join('x'.join(str(dim) for dim in t.shape) for t in tensors) + ')'
+
+
+def memory_stats(*, synchronize: bool = False) -> dict[str, int]:
+    """Raw per-process allocator peaks and host-wide used RAM, in bytes.
+
+    Counters are lifetime peaks, not step peaks. Host usage is not process RSS.
+    Reading never resets counters. Device synchronization is an explicit opt-in
+    measurement barrier, disabled by default.
+    Unsupported counters are absent rather than invented zeroes.
+    """
+    import psutil
+
+    from twinkle import Platform
+
+    result = {"cpu_memory_used_bytes": psutil.virtual_memory().used}
+    device = getattr(torch, Platform.device_prefix(), None)
+    if device is not None and getattr(device, "is_available", lambda: False)():
+        if synchronize:
+            device.synchronize()
+        for name in ("max_memory_allocated", "max_memory_reserved"):
+            counter = getattr(device, name, None)
+            if counter is not None:
+                result[name + "_bytes"] = counter()
+    return result

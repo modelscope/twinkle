@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from .types import PartitionAdmission, RolloutPolicy
@@ -186,7 +186,13 @@ class StreamingDriver:
                  adapter_name: Optional[str] = None,
                  max_steps: Optional[int] = None,
                  resource_adapter: Optional[ClusterAdapter] = None,
+                 on_iteration_start: Optional[Callable[[], None]] = None,
+                 on_iteration_end: Optional[Callable[[bool], None]] = None,
                  sleep: Optional[Callable[[float], None]] = None) -> None:
+        # Observers run on the driver thread. End follows ACTUAL publication,
+        # including the terminal case where the budget deliberately skips it.
+        self.on_iteration_start = on_iteration_start
+        self.on_iteration_end = on_iteration_end
         # Fail loudly on a mis-wired seam: a non-callable injected here would otherwise surface deep
         # inside the run loop (or silently skip a lifecycle step), far from the construction that caused it.
         # The group-barrier algorithm hooks: PRM scoring is the remote ``score`` shape's own channel,
@@ -499,6 +505,8 @@ class StreamingDriver:
         # and the sampler generates from it, never an unpinned base model (None for in-place; a no-op
         # without version control, where the version is pinned at 0 and nothing publishes).
         self._register_initial_policy()
+        if self.on_iteration_start is not None:
+            self.on_iteration_start()
         # A second run() on the same driver must not inherit the previous run's fold snapshots.
         self.stats.last_pull_idle_ratio = 0.0
         self._train_at_pull = 0.0
@@ -534,9 +542,12 @@ class StreamingDriver:
         resolved_groups: set = set()
         regen_queue: List[Tuple[Any, str]] = []
         regen_counts: Dict[str, int] = {}
+        iteration_pending = False
         try:
             while True:
                 if exhausted or self._aborted or self._default_reached_max():
+                    if iteration_pending and self.on_iteration_end is not None:
+                        self.on_iteration_end(True)
                     break
 
                 # (1) Publish phase: run an EXTERNALLY-requested publication (see request_publish). The driver
@@ -568,6 +579,13 @@ class StreamingDriver:
                         # Drop published artifacts no live version, in-flight pin or buffered sample still
                         # references (runs AFTER the stale scan, which released the dropped pins).
                         self._prune()
+
+                if iteration_pending:
+                    iteration_pending = False
+                    if self.on_iteration_end is not None:
+                        self.on_iteration_end(False)
+                    if self.on_iteration_start is not None:
+                        self.on_iteration_start()
 
                 # (2) Admission: open a fresh window while the staleness gate is open, then admit
                 #     per-sample until the stream ends or the backpressure cap is reached.
@@ -716,6 +734,7 @@ class StreamingDriver:
                         self._reap_scores(records, blocking=True)
                     _t = time.perf_counter()
                     self._train_pull(records, ready, group_counts)
+                    iteration_pending = not self._iterating or self._iteration_committed
                     train_now = time.perf_counter()
                     # Fold the bubble ratio at the pull boundary, where the pairing is exact: the
                     # train delta is the PREVIOUS pull's training (already accumulated into the
@@ -1077,6 +1096,7 @@ class StreamingDriver:
         """
         batch = [record.sample for record in records]
         self._committed_steps = 0
+        self._iteration_committed = False
         self._ack_event.clear()
         self._batch_queue.put(batch)
         # A single wait() would deadlock against abort(): abort's lone set() can land before this
@@ -1089,6 +1109,14 @@ class StreamingDriver:
         return self._committed_steps
 
     # --- iterator regime (``for batch in driver:``) ------------------------------------------------------
+
+    def performance_snapshot(self) -> dict:
+        """Export plain observations without exposing driver internals to recorders."""
+        adapter = self._resource_adapter
+        return {
+            'stream_stats': asdict(self.stats),
+            'resource_metrics': adapter.performance_snapshot() if adapter is not None else {},
+        }
 
     def __iter__(self) -> 'StreamingDriver':
         """Drive the blocking :meth:`run` on a background thread and yield assembled, scored batches.
@@ -1184,6 +1212,7 @@ class StreamingDriver:
         """
         # None means the caller omitted the count. An explicit 0 does not consume budget.
         self._committed_steps = 1 if optimizer_steps is None else int(optimizer_steps)
+        self._iteration_committed = True
         self._budget_steps += self._committed_steps
         self._ack_event.set()
 

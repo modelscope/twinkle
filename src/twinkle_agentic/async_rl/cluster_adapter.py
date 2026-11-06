@@ -967,6 +967,18 @@ class ClusterAdapter:
 
     # --- observation / decision ------------------------------------------------------------------------
 
+    def performance_snapshot(self) -> dict[str, float]:
+        """Commit-boundary resource counters; allocated GPU budget stays fixed."""
+        return {
+            'resource/shared_enabled': int(self._shared_enabled),
+            'resource/in_generation': int(self.in_generation),
+            'resource/flex_sampler_replicas': len(self._flex_workers),
+            'resource/free_flex_groups': len(self._free_flex_groups),
+            'resource/change_pending': int(self.change_pending),
+            'resource/last_change_step': self._last_change_step,
+            'resource/handover_seconds_total': self._counters.get('handover'),
+        }
+
     def observe(self, *, step: int, driver_stats: DriverStats) -> ResourceWindow:
         """Fold one batch boundary's stat deltas into the decision window (the commit boundary).
 

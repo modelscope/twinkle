@@ -57,13 +57,16 @@ class _Span:
 class TimeRecorder:
     """Aggregate per-name span timings into a summary and a metric-ready dict.
 
+    ``clock_ns`` optionally supplies a monotonic nanosecond clock for replay/tests.
+
     Enable/disable is checked at CALL time (not decoration time), so decorating a
     function once and toggling the recorder later behaves correctly, and a disabled
     recorder takes a no-op fast path with no timing or allocation.
     """
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(self, *, enabled: bool = True, clock_ns: Callable[[], int] | None = None) -> None:
         self._enabled = enabled
+        self._clock_ns = clock_ns or time.perf_counter_ns
         self._lock = threading.Lock()
         # name -> [count, total_ns, self_ns]
         self._stats: Dict[str, list] = {}
@@ -133,7 +136,7 @@ class TimeRecorder:
         partial duration); the exception is NOT suppressed.
         """
         parent = self._current.get()
-        current = _Span(name, parent, time.perf_counter_ns(), threading.get_ident())
+        current = _Span(name, parent, self._clock_ns(), threading.get_ident())
         token = self._current.set(current)
         try:
             yield
@@ -141,7 +144,7 @@ class TimeRecorder:
             # Reset BEFORE recording so a raising body cannot leave a stale span on
             # the chain for subsequent code in this context.
             self._current.reset(token)
-            self._record(current, time.perf_counter_ns())
+            self._record(current, self._clock_ns())
 
     def _record(self, current: _Span, end_ns: int) -> None:
         total_ns = end_ns - current.start_ns
