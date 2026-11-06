@@ -89,6 +89,12 @@ class RolloutSample:
     # A group-level baseline (e.g. ReMax's greedy reward), written by the group-completion hook;
     # one value shared by every sibling of the group.
     baseline: float | None = None
+    # (prompt_tokens, response_tokens) counted where the feature was built. A driver-side
+    # consumer (the rollout statistics) reads THIS instead of ``encoded``: under ray mode a
+    # materialised sample carries ``encoded`` only as an ObjectRef, so deriving lengths from
+    # the feature would drag the heavy dict back to the driver. ``None`` on synthesised
+    # samples; consumers fall back to reading the feature locally.
+    token_lengths: tuple[int, int] | None = None
     # Whether ``encoded`` carries the sampler-exported MoE routing. Set at construction so the
     # R3 replay gate can read it driver-side, where a streaming sample's ``encoded`` is only a
     # reference (see :meth:`generate`).
@@ -159,11 +165,17 @@ def trajectory_to_rollout_sample(traj: dict[str, Any], prompt_id: str, extra: di
     encoded: dict[str, Any] = {}
     response_token_ids: list[int] = []
     rollout_logprobs: list[float] = []
+    token_lengths = None
     if input_ids and labels:
         keys = set(_TRAIN_FEATURE_KEYS) | _vision_feature_keys()
         encoded = {key: traj[key] for key in keys if key in traj}
         response_token_ids = list(traj.get("response_token_ids") or [])
         rollout_logprobs = list(traj.get("rollout_logprobs") or [])
+        # Same frame as the ledger's response_token_ids (trainable positions, tool
+        # observations included): response = len(response_token_ids), prompt = the
+        # rest. Counted HERE, before generate stashes the feature -- a driver-side
+        # statistics read of ``encoded`` would be an ObjectRef under ray.
+        token_lengths = (len(input_ids) - len(response_token_ids), len(response_token_ids))
     rollout_infos = {
         key: traj[key]
         for key in ("turns", "stop_reason", "truncated", "stuck_stop", "tool_stop", "followups")
@@ -183,6 +195,7 @@ def trajectory_to_rollout_sample(traj: dict[str, Any], prompt_id: str, extra: di
         messages=messages,
         rollout_infos=rollout_infos,
         sampling_mask=traj.get("sampling_mask"),
+        token_lengths=token_lengths,
         routing_exported=encoded.get("routed_experts") is not None,
     )
 
