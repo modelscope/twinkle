@@ -469,6 +469,21 @@ All subsequent Ray calls and data distribution are performed implicitly. Running
 python train.py
 ```
 
+#### Local Async Multi-LoRA GRPO
+
+The example uses Qwen3.5-4B and GSM8K and requires three GPUs by default (two for training, one for vLLM sampling). Prepare local model and dataset directories, then run from the repository root:
+
+```bash
+pip install -e '.[async-rl]'
+export MODEL_ID=/absolute/path/to/Qwen3.5-4B
+export TENANT_A_DATASET_ID=/absolute/path/to/gsm8k
+export TENANT_B_DATASET_ID=/absolute/path/to/gsm8k
+export CUDA_VISIBLE_DEVICES=0,1,2
+bash cookbook/rl/async_rl/run_async_multi_lora_grpo.sh
+```
+
+Model and dataset paths must be accessible to all Ray workers. The script starts local Ray if needed; see [async_multi_lora_grpo.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/async_rl/async_multi_lora_grpo.yaml) for training settings.
+
 ### Remote Training
 
 A major feature of Twinkle is support for multi-tenant mixed training. Specifically, multiple users can use a single base model for LoRA training, which can greatly reduce server-side deployment costs.
