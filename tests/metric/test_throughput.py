@@ -1,17 +1,29 @@
 """Numerical contracts for rollout accounting, padding and durable records."""
 
-import json
 import math
 
 import pytest
+from twinkle.metric import ThroughputMetric, memory_metrics
 
-from twinkle.perf import JsonlMetricWriter, compute_rl_performance_metrics
+
+def compute_performance_metrics(prompts, responses, timings, devices, **widths):
+    metric = ThroughputMetric()
+    metric.accumulate(prompt_lengths=prompts, response_lengths=responses, timings=timings, num_devices=devices)
+    return metric.calculate(**widths)
 
 
 @pytest.mark.parametrize("widths,clip,non_aborted_clip", [((None, None), 1 / 3, 0.5), ((12, 8), 0.0, 0.0)])
 def test_variable_lengths_and_explicit_padded_width(widths, clip, non_aborted_clip):
-    timings = dict(step=7.25, gen=3.5, ref=0.25, old_log_prob=0.4, adv=0.01, update_actor=2, update_weights=0.5)
-    actual = compute_rl_performance_metrics(
+    timings = {
+        "step": 7.25,
+        "gen": 3.5,
+        "ref": 0.25,
+        "old_log_prob": 0.4,
+        "adv": 0.01,
+        "update_actor": 2,
+        "update_weights": 0.5,
+    }
+    actual = compute_performance_metrics(
         [3, 6, 4], [0, 2, 5], timings, 8, prompt_width=widths[0], response_width=widths[1]
     )
     expected = {
@@ -46,7 +58,7 @@ def test_variable_lengths_and_explicit_padded_width(widths, clip, non_aborted_cl
 
 
 def test_all_empty_responses_have_no_non_aborted_population():
-    actual = compute_rl_performance_metrics([2, 3], [0, 0], {"step": 7.25, "gen": 3.5, "update_actor": 2}, 8)
+    actual = compute_performance_metrics([2, 3], [0, 0], {"step": 7.25, "gen": 3.5, "update_actor": 2}, 8)
     assert actual["perf/total_num_tokens"] == 5
     assert actual["perf/throughput"] == pytest.approx(0.08620689655172414)
     assert actual["response/aborted_ratio"] == 1
@@ -59,11 +71,22 @@ def test_all_empty_responses_have_no_non_aborted_population():
 def test_invalid_allocation_or_timing_fails_instead_of_faking_throughput():
     for n_gpus, seconds in [(0, 1), (2, 0), (2, float("nan"))]:
         with pytest.raises(ValueError):
-            compute_rl_performance_metrics([3], [2], {"step": seconds}, n_gpus)
+            compute_performance_metrics([3], [2], {"step": seconds}, n_gpus)
 
 
-def test_jsonl_flush_and_nonfinite(tmp_path):
-    writer = JsonlMetricWriter(tmp_path / "metrics.jsonl")
-    writer.write(1, {"good": 1.5, "nan": float("nan")})
-    assert json.loads(writer.path.read_text())["data"] == {"good": 1.5, "nan": None}
-    writer.close()
+def test_window_throughput_uses_sum_tokens_over_sum_seconds():
+    metric = ThroughputMetric()
+    metric.accumulate(prompt_lengths=[2], response_lengths=[8], timings={"step": 1}, num_devices=2)
+    metric.accumulate(prompt_lengths=[2], response_lengths=[18], timings={"step": 4}, num_devices=2)
+    assert metric.calculate()["perf/throughput"] == 3  # 30 / 5 / 2, not mean(5, 2.5)
+    metric.reset()
+    assert metric.calculate() == {}
+
+
+def test_memory_reduction_uses_rank_max_for_peaks_and_mean_for_host_ram():
+    assert memory_metrics(
+        [
+            {"max_memory_allocated_bytes": 3 * 1024**3, "cpu_memory_used_bytes": 8 * 1024**3},
+            {"max_memory_allocated_bytes": 5 * 1024**3, "cpu_memory_used_bytes": 10 * 1024**3},
+        ]
+    ) == {"perf/max_memory_allocated_gb": 5, "perf/cpu_memory_used_gb": 9}

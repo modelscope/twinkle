@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """twinkle.perf -- a general-purpose performance observability component.
 
-Five independent, low-intrusion parts:
+Four independent, low-intrusion parts:
 
 * :class:`TimeRecorder` / :func:`timed` / :func:`span` -- a synchronous- and
   async-agnostic wall-clock span recorder that nests into an overall timing tree
@@ -21,10 +21,6 @@ Five independent, low-intrusion parts:
   Chrome Trace rendering and a text DAG / lane report. Consumed by whoever holds
   the window's events; the recorder itself only appends.
 
-* :class:`RLPerformanceRecorder` -- explicit rollout-batch accounting, phase timing,
-  durable JSONL records and final summaries. Accepts lengths, integer update counts
-  and plain observation dictionaries, independently of any training recipe.
-
 The recorder and profiler are disabled/no-op by default, so importing perf never
 changes existing behaviour; the counter registry is always live by design (a few
 float additions per step). None of the parts imports twinkle/swift business
@@ -41,18 +37,11 @@ from .control import Perf
 from .counters import CounterRegistry, default_counters
 from .module_profiler import ModuleProfiler, activation_stats, build_module_profiler, param_stats
 from .recorder import TimeRecorder, default_recorder, disable_perf, enable_perf, span, timed
-from .rl import RLPerformanceRecorder, reduce_memory, sample_lengths
-from .rl_metrics import JsonlMetricWriter, compute_rl_performance_metrics
-from .stats import describe_shape, primary_tensor, tensor_moments, tensor_numel
+from .stats import describe_shape, memory_stats, primary_tensor, tensor_moments, tensor_numel
 from .timeline import chrome_trace, dag_report
 
 __all__ = [
     'Perf',
-    'RLPerformanceRecorder',
-    'JsonlMetricWriter',
-    'compute_rl_performance_metrics',
-    'reduce_memory',
-    'sample_lengths',
     'TimeRecorder',
     'default_recorder',
     'timed',
@@ -71,4 +60,5 @@ __all__ = [
     'tensor_moments',
     'tensor_numel',
     'describe_shape',
+    'memory_stats',
 ]

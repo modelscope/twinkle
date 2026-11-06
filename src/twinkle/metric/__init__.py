@@ -10,5 +10,5 @@ from .grpo import CISPOMetric, GRPOMetric, GSPOMetric, PPOMetric
 from .loss import LossMetric
 from .ppo import PPOValueMetric
 from .reporting import MetricsReporter, create_metrics_reporter
-from .train_metric import TrainMetric
+from .train_metric import ThroughputMetric, TrainMetric, memory_metrics
 from .types import MetricRecord

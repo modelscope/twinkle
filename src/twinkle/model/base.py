@@ -298,11 +298,11 @@ class TrainableModel(ABC):
         ...
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def performance_memory(self) -> dict[str, float]:
-        """Per-rank allocator lifetime peaks; call after the actor update."""
-        from twinkle.perf.rl_metrics import accelerator_memory_metrics
+    def memory_stats(self, *, synchronize: bool = False) -> dict[str, int]:
+        """Raw per-rank allocator peaks and host RAM in bytes; no cross-rank reduction."""
+        from twinkle.perf.stats import memory_stats
 
-        return accelerator_memory_metrics()
+        return memory_stats(synchronize=synchronize)
 
     @abstractmethod
     def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:
