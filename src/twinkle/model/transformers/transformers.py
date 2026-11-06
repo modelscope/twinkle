@@ -533,15 +533,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
         if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
             return False
-        local_rank = Platform.get_local_rank()
-        if local_rank < 0:
-            raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')
-        return local_rank != 0
+        return not self.strategy.is_pretrained_loading_source()
 
     def _init_empty_model_from_config(self, model_cls, *, model_loader=None, processor=None, **kwargs):
         from accelerate import init_empty_weights
 
-        logger.info('Initializing model on meta; native FSDP will load parameter shards from local rank 0.')
+        logger.info('Initializing model on meta; native FSDP will load parameter shards from the node-local source.')
         config_kwargs = filter_from_config_kwargs(kwargs)
         with init_empty_weights(include_buffers=False):
             if model_loader is not None:

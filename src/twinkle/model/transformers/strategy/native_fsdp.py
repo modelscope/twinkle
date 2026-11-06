@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import socket
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -59,15 +60,16 @@ class NativeFSDPStrategy(TransformerStrategyBase):
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
 
+    def is_pretrained_loading_source(self) -> bool:
+        rank, _, source_rank, _ = _get_local_rank_info()
+        return rank == source_rank
+
     def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
         if self._pre_ep_state_captured:
             return
         if not (enable_ep and self.use_rank0_pretrained_broadcast()):
             return
-        local_rank = Platform.get_local_rank()
-        if local_rank < 0:
-            raise RuntimeError('Native FSDP node-local pre-EP state capture requires LOCAL_RANK.')
-        is_source_rank = dist.is_available() and dist.is_initialized() and local_rank == 0
+        is_source_rank = self.is_pretrained_loading_source()
         self.set_rank0_pre_ep_full_state_dict(clone_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
         self._pre_ep_state_captured = True
 
@@ -147,10 +149,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             adapter_source_sd = {}
             adapter_full_sd = {}
             if use_meta:
-                local_rank = Platform.get_local_rank()
-                if local_rank < 0:
-                    raise RuntimeError('Native FSDP node-local state loading requires LOCAL_RANK.')
-                is_source_rank = local_rank == 0
+                is_source_rank = self.is_pretrained_loading_source()
                 if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
                     original_sd = self._rank0_pre_ep_full_state_dict if is_source_rank else {}
                 else:
@@ -719,6 +718,14 @@ def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
     """Return local-rank topology for node-local state-dict fanout."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    if os.environ.get('TWINKLE_MODE') == 'ray':
+        # Ray isolates each actor's visible devices, so LOCAL_RANK=0 is a
+        # device index in every actor, not its ordinal among ranks on this node.
+        host = socket.gethostname()
+        hosts = [None] * world_size
+        dist.all_gather_object(hosts, host)
+        node_ranks = [index for index, value in enumerate(hosts) if value == host]
+        return rank, world_size, node_ranks[0], node_ranks
     local_rank = Platform.get_local_rank()
     if 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
         raise RuntimeError('Native FSDP node-local state loading requires LOCAL_WORLD_SIZE or LOCAL_SIZE.')
