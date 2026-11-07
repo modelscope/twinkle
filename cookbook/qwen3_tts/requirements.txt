@@ -1,0 +1,8 @@
+accelerate==1.12.0
+numpy>=2.0,<2.3
+peft==0.17.1
+qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git@022e286b98fbec7e1e916cb940cdf532cd9f488e
+safetensors
+scipy
+soundfile
+transformers==4.57.3
