@@ -221,7 +221,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _build_task_head_slots(self) -> None:
         """Pre-allocate the head slots on the unwrapped model (see ``MultiLoraTaskHeadSlots``).
 
-        Two head flavours (see ``twinkle.model.head``): 'decision' replays the dev family
+        Two head flavours (see ``twinkle.module.head``): 'decision' replays the dev family
         loader's build from the shipped ``(module, class)`` NAME; the seq_cls family builds
         its standard head from the config (+ ``num_labels``), aligned to the model's
         device/dtype policy."""
@@ -393,16 +393,16 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _register_adapter(self, adapter_name: str, config: LoraConfig, **kwargs) -> None:
         """Register an already validated LoRA configuration in a free slot."""
-        # ``task`` is head-resource preparation only: it must match the task this host was
-        # built for (the slot's head type is fixed at construction); the forward task stays
-        # a per-call argument.
+        # ``task`` is an optional cross-check: the construction ``task=`` already declared this
+        # host's head, so EVERY tenant carries it (a deployment names its task once -- the
+        # yaml's ``task_type``); the forward task stays a per-call argument.
         task = kwargs.pop('task', None)
         if task is not None and task != self._head_task:
             raise ValueError(
                 f'this host was built for task={self._head_task!r} head slots; '
                 f'add_adapter_to_model(task={task!r}) does not match. Construct the host with '
                 'the matching task to serve that head task.')
-        if task is not None:  # equal to the construction task (validated above)
+        if self._head_task is not None:
             # Bind BEFORE any state mutation below, so binding errors surface first; the
             # acquire failure path rolls it back.
             self._bind_task_head_slot(adapter_name)

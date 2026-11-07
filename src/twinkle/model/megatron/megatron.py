@@ -270,7 +270,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     def _attach_task_head(self, task, task_head_loader=None, num_labels=None) -> None:
         """Build the readout task's head worker-side and attach it to the last-PP chunk.
 
-        Two head flavours (see ``twinkle.model.head``): the decision families' heads are
+        Two head flavours (see ``twinkle.module.head``): the decision families' heads are
         family artifacts -- the driver ships the loader's ``(module, class)`` NAME and this
         worker replays the build; the seq_cls family's standard head is built by the task's
         spec from the config (+ ``num_labels``). Attachment rules (which module, which

@@ -2569,7 +2569,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 
-        Two head flavours (see ``twinkle.model.head``): the decision families' heads are
+        Two head flavours (see ``twinkle.module.head``): the decision families' heads are
         family artifacts rebuilt from the shipped loader NAME; the seq_cls family's standard
         head is built by the task's spec from the config (+ ``num_labels``). The dictionary
         lives on the UNWRAPPED model -- the same object ``head_for`` reads at forward time

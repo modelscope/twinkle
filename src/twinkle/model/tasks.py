@@ -19,7 +19,7 @@ Readout tasks come in two head flavours, split by WHO can build the head:
 the decision families' heads are model-family artifacts (weights and calibration state
 shipped in the model directory, rebuilt worker-side from a shipped loader NAME), while
 the seq_cls family's head is a standard Linear any causal base can carry
-(``twinkle.model.head.SeqClsHead``, built by ``build_head``). The head LIFECYCLE rules
+(``twinkle.module.head.SeqClsHead``, built by ``build_head``). The head LIFECYCLE rules
 (where a head lives, how it routes per adapter, how peft's freeze sweep is undone) are
 task-independent and live once on the base class below.
 """
@@ -194,7 +194,7 @@ class SeqCls(TaskSpec):
     _squeeze_single: ClassVar[bool] = False
 
     def build_head(self, config, num_labels=None):
-        from .head import SeqClsHead
+        from twinkle.module.head import SeqClsHead
         if num_labels is None:
             num_labels = self.default_num_labels
         if num_labels is None:
@@ -289,7 +289,7 @@ class Decision(TaskSpec):
     loader installed a load-time custom forward (``task_forward``: the transformers-only
     branch families) or an attachable head (``task_head``), and the forward-layer readout
     (the one-shot hook / the forward_step readout branch) drives it. Its heads are family
-    artifacts rebuilt from the dev family loader's NAME (see ``model/head.py``'s docstring
+    artifacts rebuilt from the dev family loader's NAME (see ``twinkle/module/head.py``'s docstring
     for the split against the standard heads), so this class adds nothing over the base
     head lifecycle."""
 
