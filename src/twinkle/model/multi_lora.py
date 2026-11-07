@@ -142,16 +142,17 @@ class MultiLoraTaskHeadSlots:
             # lives on the last stage; every rank binds the same slot index.
             return
         parameters = dict(head.named_parameters())
+        covered = {key[len(prefix):] for key in head_keys}
+        if covered != set(parameters):
+            raise ValueError(
+                f'checkpoint task-head keys {sorted(covered)} do not match the bound head\'s '
+                f'parameters {sorted(parameters)}: the head architecture changed since the '
+                'checkpoint was written.')
         with torch.no_grad():
             for key in head_keys:
                 name = key[len(prefix):]
-                parameter = parameters.get(name)
-                if parameter is None:
-                    raise ValueError(
-                        f'checkpoint task-head key {key!r} matches no parameter of the bound head; '
-                        'the head architecture changed since the checkpoint was written.')
-                saved = state[key]
-                write_param(parameter, saved)
+                parameter = parameters[name]
+                write_param(parameter, state[key])
 
 
 class MultiLora:

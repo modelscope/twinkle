@@ -209,6 +209,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if not mpu.is_pipeline_last_stage():
             return
         task = self._head_task
+        spec_obj = get_task_spec_obj(task)
         if task == 'decision':
             module_name, loader_name = self._task_head_loader
             loader_cls = getattr(importlib.import_module(module_name), loader_name)
@@ -222,7 +223,6 @@ class MultiLoraMegatronModel(MegatronModel):
                 head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
                 return spec_obj.place_megatron_head(head, self.model[-1])
         else:
-            spec_obj = get_task_spec_obj(task)
 
             def build_head():
                 return spec_obj.place_megatron_head(spec_obj.build_head(self.hf_config, self._num_labels),
@@ -318,12 +318,19 @@ class MultiLoraMegatronModel(MegatronModel):
         return super().set_loss(loss_cls, **kwargs)
 
     @contextmanager
-    def optimizer_context(self, adapter_name: str):
+    def optimizer_context(self, tenant_adapter_name: str):
         """Temporarily replace named_parameters on each module in self.model
-        so that only parameters belonging to ``adapter_name`` are visible: the tenant's LoRA
-        slot parameters plus its bound task head slot (a head-task tenant trains both)."""
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
-        head_pattern = (self.task_head_slots.optimizer_pattern(adapter_name)
+        so that only parameters belonging to the tenant are visible: its LoRA slot
+        parameters plus its bound task head slot (a head-task tenant trains both).
+
+        Takes the TENANT name. The LoRA pattern needs the physical slot name, the head
+        pattern keys on the tenant (``MultiLoraTaskHeadSlots.bindings``); passing the
+        physical name -- the value ``multi_adapter.adapter()`` yields -- silently dropped
+        the head from every optimizer build: the head trained gradients that never
+        updated."""
+        physical = self.multi_adapter.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(physical)}\.')
+        head_pattern = (self.task_head_slots.optimizer_pattern(tenant_adapter_name)
                         if self.task_head_slots is not None else None)
         originals = []
         for module in self.model:
@@ -350,8 +357,8 @@ class MultiLoraMegatronModel(MegatronModel):
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')) as adapter_name:
-            with self.optimizer_context(adapter_name):
+        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+            with self.optimizer_context(kwargs.get('adapter_name')):
                 # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
                 kwargs.pop('use_distributed_optimizer', None)
                 kwargs.pop('loss_scale', None)
@@ -507,7 +514,7 @@ class MultiLoraMegatronModel(MegatronModel):
 
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
             if save_optimizer:
-                with self.optimizer_context(real_adapter_name):
+                with self.optimizer_context(adapter_name):
                     self._save_multi_lora_optimizer(
                         checkpoint_dir,
                         optimizer_config=optimizer_config,
@@ -558,7 +565,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and optimizer_config.optimizer is not None:
             optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
-            with self.optimizer_context(real_adapter_name):
+            with self.optimizer_context(adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)
 
         if dist.is_initialized():
@@ -631,14 +638,10 @@ class MultiLoraMegatronModel(MegatronModel):
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
         config_or_dir.trainable_token_indices = None
-        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
-        self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config_or_dir
-        self.optimizer_group[adapter_name].gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
-        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         # ``task`` is an optional cross-check: the construction ``task=`` already declared this
         # host's head, so EVERY tenant carries it (a deployment names its task once -- the
-        # yaml's ``task_type``); the forward task stays a per-call argument.
+        # yaml's ``task_type``); the forward task stays a per-call argument. Checked BEFORE
+        # any state mutation so a mismatched add leaves no half-initialized tenant behind.
         task = kwargs.pop('task', None)
         if task is not None and task != self._head_task:
             raise ValueError(
@@ -649,10 +652,16 @@ class MultiLoraMegatronModel(MegatronModel):
             # Bind BEFORE acquire so a host that cannot serve this tenant fails before any
             # state mutation; roll the binding back if the LoRA acquire fails.
             self._bind_task_head_slot(adapter_name)
+        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+        self.optimizer_group[adapter_name].adapter_name = adapter_name
+        self.optimizer_group[adapter_name].adapter_config = config_or_dir
+        self.optimizer_group[adapter_name].gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
+        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         try:
             self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
         except Exception:
             self._release_task_head_slot(adapter_name)
+            self.optimizer_group.pop(adapter_name, None)
             raise
 
     @remote_function()

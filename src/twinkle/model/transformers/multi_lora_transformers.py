@@ -406,7 +406,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 'the matching task to serve that head task.')
         if self._head_task is not None:
             # Bind BEFORE any state mutation below, so binding errors surface first; the
-            # acquire failure path rolls it back.
+            # failure path below rolls everything back.
             self._bind_task_head_slot(adapter_name)
         config = self.strategy.prepare_adapter_config(
             config,
@@ -416,14 +416,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config.bias = 'none'
         config.init_lora_weights = False
         config.trainable_token_indices = None
-        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
-        self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config
-        _gas_default = kwargs.get('gradient_accumulation_steps', 1)
-        self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
-        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
-        self._ensure_target_parameter_lora_installed(config)
         try:
+            self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+            self.optimizer_group[adapter_name].adapter_name = adapter_name
+            self.optimizer_group[adapter_name].adapter_config = config
+            _gas_default = kwargs.get('gradient_accumulation_steps', 1)
+            self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+            self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+            self._ensure_target_parameter_lora_installed(config)
             self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config)
         except Exception:
             self.optimizer_group.pop(adapter_name, None)

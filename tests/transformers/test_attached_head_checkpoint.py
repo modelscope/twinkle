@@ -8,6 +8,7 @@ full roundtrip: save writes the slot-independent ``task_head.`` keys, a re-bound
 loadable, and a head file that lands on a slot-less host fails loudly.
 """
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -189,3 +190,91 @@ def _head_state(saved):
     state = load_file(f'{saved}/task_head.safetensors')
     assert {'task_head.classifier.weight', 'task_head.classifier.bias'} <= set(state)
     return state
+
+
+def test_megatron_optimizer_context_keeps_the_bound_head(tmp_path):
+    """The tenant name reaches the head pattern; the physical slot name must not.
+
+    Regression: optimizer_context used to receive the PHYSICAL LoRA slot name (the value
+    multi_adapter.adapter() yields). The LoRA pattern wanted exactly that, but the head
+    pattern keys on the tenant -- so the head silently missed every optimizer build and
+    trained gradients that never updated."""
+    import torch.nn as nn
+    from twinkle.model.megatron.multi_lora_megatron import MultiLoraMegatronModel
+    from twinkle.model.multi_lora import MultiLoraTaskHeadSlots
+
+    lora_a = nn.Parameter(torch.zeros(2, 2))
+    lora_b = nn.Parameter(torch.zeros(2, 2))
+    head_w = nn.Parameter(torch.zeros(3, 2))
+    head_b = nn.Parameter(torch.zeros(3))
+    other_head_w = nn.Parameter(torch.zeros(3, 2))
+    base_w = nn.Parameter(torch.zeros(2, 2))
+    for parameter in (lora_a, lora_b, head_w, head_b, other_head_w, base_w):
+        parameter.requires_grad_(True)
+
+    # named_parameters as the wrapped megatron module reports them: slot-physical LoRA
+    # names, slot-named heads, and the frozen base.
+    module = SimpleNamespace(named_parameters=lambda prefix='', recurse=True, **kw: iter([
+        ('model.0.lora_A.lora_0.weight', lora_a),
+        ('model.0.lora_B.lora_0.weight', lora_b),
+        ('model.0.task_head_slot_0.classifier.weight', head_w),
+        ('model.0.task_head_slot_0.classifier.bias', head_b),
+        ('model.0.task_head_slot_1.classifier.weight', other_head_w),
+        ('model.0.self_attention.linear_qkv.weight', base_w),
+    ]))
+    slots = MultiLoraTaskHeadSlots(2)
+    slots.bindings['tenant_a'] = 0  # the tenant binds slot 0; LoRA lives in physical lora_0
+
+    class FakeLora:
+        adapter_name = 'lora_0'
+
+    wrapper = SimpleNamespace(
+        model=[module],
+        task_head_slots=slots,
+        multi_adapter=SimpleNamespace(find_lora_by_tenant=lambda tenant: FakeLora()),
+    )
+    with MultiLoraMegatronModel.optimizer_context(wrapper, 'tenant_a'):
+        seen = dict(module.named_parameters())
+    assert set(seen) == {'model.0.lora_A.lora_0.weight', 'model.0.lora_B.lora_0.weight',
+                         'model.0.task_head_slot_0.classifier.weight',
+                         'model.0.task_head_slot_0.classifier.bias'}, sorted(seen)
+
+
+def test_single_model_attached_head_trains(tmp_path, monkeypatch):
+    """The single-model (non-multi-LoRA) attached head must reach the optimizer too.
+
+    Regression: heads ride the task_heads dict on the unwrapped model; dict-held modules
+    never appear in named_parameters and the LoRA pattern misses them, so the head
+    computed gradients the optimizer never updated."""
+    from peft import LoraConfig
+    from transformers import AutoTokenizer
+    from tests.server.integration.cs_tasks.task_models import encoded_batch, prepare_models, \
+        tiny_backbone
+    from twinkle import Platform, initialize
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
+    monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: 'cpu')
+    initialize(mode='local')
+    paths = prepare_models(tiny_backbone(tmp_path / 'source'), tmp_path / 'bases')
+    batch = encoded_batch('seq_cls', AutoTokenizer.from_pretrained(paths['embedding']))
+    model = TransformersModel(model_id=paths['embedding'], mixed_precision='no',
+                              gradient_checkpointing=False)
+    model.add_adapter_to_model('a', LoraConfig(r=4, lora_alpha=8, target_modules=['q_proj', 'v_proj']),
+                               task='seq_cls', num_labels=3)
+    model.set_processor('InputProcessor', padding_side='right', adapter_name='a')
+    model.set_loss('SeqClsLoss', problem_type='single_label_classification', num_labels=3,
+                   adapter_name='a')
+    model.set_optimizer('Adam', lr=1e-3, adapter_name='a')
+    names = []
+    for group in model.optimizer_group['a'].optimizer.param_groups:
+        names += group.get('param_names', [])
+    assert any(name.startswith('task_head.') for name in names), sorted(names)[:8]
+    host = model.strategy.unwrap_model(model.model)
+    head = host.task_heads['a']
+    before = {k: p.detach().clone() for k, p in head.named_parameters()}
+    for _ in range(3):
+        model.forward_backward(inputs=copy.deepcopy(batch), task='seq_cls', adapter_name='a')
+        model.clip_grad_and_step(adapter_name='a')
+    after = {k: p.detach().clone() for k, p in head.named_parameters()}
+    assert any(not torch.equal(before[k], after[k]) for k in before)

@@ -1956,6 +1956,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         for name, param in model.named_parameters():
             if param.requires_grad and (pattern.search(name) or is_default):
                 params[name] = param
+        # The single-model attached readout head: heads live in the ``task_heads`` dict on
+        # the unwrapped model -- dict-held modules never show up in named_parameters, and
+        # the LoRA pattern would miss them anyway, so without this merge the head computed
+        # gradients the optimizer never updated. The multi-LoRA host is exempt: its heads
+        # ride pre-allocated slots and the MultiLora override merges them itself.
+        if getattr(self, 'task_head_slots', None) is None:
+            head = (getattr(model, 'task_heads', None) or {}).get(adapter_name)
+            if head is not None:
+                for name, param in head.named_parameters():
+                    if param.requires_grad:
+                        params[f'task_head.{name}'] = param
         return params
 
     @remote_function()
@@ -2577,6 +2588,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         lands on the single task_head / scoring_head names (single-head compatibility);
         later adapters only enter the dictionary."""
         import importlib
+        if self._model_wrapped:
+            # Reducers discover parameters once at wrap time; a head attached afterwards
+            # would sit outside the DDP/FSDP gradient sync -- the multi-LoRA hosts
+            # pre-allocate their head slots BEFORE the wrap for exactly this reason.
+            raise RuntimeError(
+                'cannot attach a task head after the model is wrapped; call '
+                'add_adapter_to_model(task=...) before the first forward / save / '
+                'set_optimizer.')
         unwrapped_model = self.strategy.unwrap_model(self.model)
         spec = get_task_spec_obj(task)
         if not spec.row().readout:
