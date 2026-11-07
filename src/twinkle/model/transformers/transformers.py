@@ -879,6 +879,48 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
+    def _forward_with_task_readout(self, unwrapped_model, task, inputs):
+        """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
+
+        A model with a load-time custom execution (``task_forward``: the decision branch/
+        direct-backbone families whose loader replaced the module forward) just takes the
+        normal call -- the installed forward consumes the batch's decision meta itself. A
+        model with an attachable head (``task_head``) gets the head fed the hidden states /
+        lm logits of one normal forward by a ONE-SHOT forward hook: the hook fires inside
+        the module call, i.e. inside the strategy wrap, so DDP's reducer sees the head
+        parameters used in the wrapped forward (a head invoked outside the wrapper would be
+        silently dropped from gradient reduction).
+        """
+        spec = get_task_spec(task)
+        if not spec.readout:
+            return self.model(**inputs, use_cache=False)
+        if getattr(unwrapped_model, 'task_forward', None) is not None:
+            return self.model(**inputs, use_cache=False)
+        head = getattr(unwrapped_model, 'task_head', None)
+        if head is None:
+            raise ValueError(
+                f'task {task!r} declares readout kinds {list(spec.readout)} but the model carries neither '
+                'a task_forward nor a task_head; its loader must attach one at build time.')
+        meta = inputs.pop('decision_meta', None)
+        if meta is None:
+            raise ValueError(
+                f'task {task!r} requires decision_meta in the batch (staged by its template _encode / '
+                'collate); got none.')
+        inputs['return_dict'] = True
+        if not head.encoder_backbone:
+            inputs['output_hidden_states'] = True
+
+        def _readout(module, args, kwargs, output):
+            hidden_states = output.last_hidden_state if head.encoder_backbone else output.hidden_states[-1]
+            lm_logits = output.logits if head.needs_lm_logits else None
+            return head(hidden_states, lm_logits, meta)
+
+        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
+        try:
+            return self.model(**inputs, use_cache=False)
+        finally:
+            handle.remove()
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
@@ -970,7 +1012,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
-                outputs = self.model(**inputs, use_cache=False)
+                outputs = self._forward_with_task_readout(unwrapped_model, task, inputs)
 
         recorded_routing = rr.finish()
 
@@ -1144,7 +1186,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.
-                    outputs = self.model(**inputs, use_cache=False)
+                    outputs = self._forward_with_task_readout(unwrapped_model, task, inputs)
 
             recorded_routing = rr.finish()
 

@@ -16,7 +16,7 @@ constructor arguments.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,13 @@ class TaskSpec:
     token_level_labels: bool = True
     #: ``InputProcessor`` method name for the task's post-forward reduction; None = none.
     postprocess: Optional[str] = None
+    #: Readout hooks this task's models carry, so the forward never goes through the legacy
+    #: per-forward patch dispatch: 'task_head' = an attachable head the backend feeds the
+    #: hidden states / lm logits of one normal forward (via a one-shot hook, inside the
+    #: strategy wrap so DDP's reducer sees the head parameters); 'task_forward' = a load-time
+    #: custom execution that replaced the module forward. Which one a MODEL carries is a
+    #: model (family) property -- the row lists the kinds the task allows. Empty = legacy path.
+    readout: Tuple[str, ...] = ()
 
 
 TASKS = {
@@ -43,9 +50,11 @@ TASKS = {
     'generative_reranker': TaskSpec(
         requires_logps=False, token_level_labels=False, postprocess='_postprocess_generative_reranker'
     ),
-    # The decision scoring loaders replace the model's own forward at load time, so the
-    # backends must not install any per-forward head patch; only the flags above matter.
-    'decision': TaskSpec(requires_logps=False, token_level_labels=False),
+    # The decision scoring loaders attach either a plain head ('task_head': Jev / Clef /
+    # StartLux / generic / Laya) or a load-time custom forward ('task_forward': the
+    # branch-isolation families OmniJev / Kev, plus Thx02 which reads the backbone directly).
+    # Both are dispatched by the backends via this row's readout kinds, never by task name.
+    'decision': TaskSpec(requires_logps=False, token_level_labels=False, readout=('task_head', 'task_forward')),
 }
 
 
