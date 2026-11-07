@@ -820,7 +820,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
-    def _forward_with_task_readout(self, unwrapped_model, task, inputs):
+    def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
         """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
 
         A model with a load-time custom execution (``task_forward``: the decision branch/
@@ -830,14 +830,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         lm logits of one normal forward by a ONE-SHOT forward hook: the hook fires inside
         the module call, i.e. inside the strategy wrap, so DDP's reducer sees the head
         parameters used in the wrapped forward (a head invoked outside the wrapper would be
-        silently dropped from gradient reduction).
+        silently dropped from gradient reduction). The head resolves PER CALL: an
+        adapter-specific head first (``head_for``), the single attached head as fallback.
         """
         spec = get_task_spec(task)
         if not spec.readout:
             return self.model(**inputs, use_cache=False)
         if getattr(unwrapped_model, 'task_forward', None) is not None:
             return self.model(**inputs, use_cache=False)
-        head = get_task_spec_obj(task).head_of(unwrapped_model)
+        head = get_task_spec_obj(task).head_for(unwrapped_model, adapter_name)
         meta = inputs.pop('decision_meta', None)
         if meta is None:
             raise ValueError(
@@ -949,7 +950,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
-                outputs = self._forward_with_task_readout(unwrapped_model, task, inputs)
+                outputs = self._forward_with_task_readout(unwrapped_model, task, inputs, adapter_name)
 
         recorded_routing = rr.finish()
 
@@ -1000,8 +1001,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             The output of the model forward.
         """
         config = MicroBatchConfig.from_kwargs(kwargs)
-        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
-        optimizer_config = self.optimizer_group[adapter_name]
+        # Kept IN kwargs on purpose: the single-batch / micro-batch callees below pop it
+        # themselves, and the per-adapter head resolution (head_for) needs the CALL's adapter,
+        # not the default group.
+        optimizer_config = self.optimizer_group[kwargs.get('adapter_name', self._get_default_group())]
         inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
         if config is None:
             return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
@@ -1057,6 +1060,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
         """Run one evaluation micro-batch (or, without micro-batching, the whole batch)."""
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
@@ -1130,7 +1134,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.
-                    outputs = self._forward_with_task_readout(unwrapped_model, task, inputs)
+                    outputs = self._forward_with_task_readout(unwrapped_model, task, inputs, adapter_name)
 
             recorded_routing = rr.finish()
 
@@ -2521,12 +2525,45 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._patch_frozen_towers(self.model)
+        # A per-adapter decision head (multi-head form): the caller ships the dev family
+        # loader's (module, class) NAME -- a built nn.Module cannot cross the Ray boundary --
+        # and the worker replays the build here. The FIRST head also lands on the single
+        # task_head / scoring_head names (single-head compatibility); later adapters only
+        # enter the per-adapter dictionary.
+        task_head_loader = kwargs.pop('task_head_loader', None)
+        if task_head_loader is not None:
+            self._add_task_head(adapter_name, task_head_loader)
         # A task readout head (decision families) is not a LoRA target, so peft's
         # mark-only-adapters sweep just froze it; re-activation rules live on the task's spec
         # (a no-op for models without that task's component).
         get_task_spec_obj('decision').reactivate(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _add_task_head(self, adapter_name: str, task_head_loader) -> None:
+        """Replay the dev family loader's head build worker-side and register it per adapter.
+
+        The dictionary lives on the UNWRAPPED model -- the same object ``head_for`` reads at
+        forward time (the wrapper object is not reachable from the readout path). The FIRST
+        head also lands on the single task_head / scoring_head names (single-head
+        compatibility); later adapters only enter the dictionary."""
+        import importlib
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        module_name, loader_name = task_head_loader
+        loader_cls = getattr(importlib.import_module(module_name), loader_name)
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
+        spec = get_task_spec_obj('decision')
+        heads = getattr(unwrapped_model, 'task_heads', None)
+        if not heads:
+            spec.attach_transformers(unwrapped_model, head)  # aligns internally + dual names
+            unwrapped_model.task_heads = {adapter_name: head}
+        else:
+            heads[adapter_name] = spec.align_head(unwrapped_model, head)
 
     def _patch_frozen_towers(self, model) -> None:
         """Run a fully frozen vision tower without autograd (legacy swift #10214)."""

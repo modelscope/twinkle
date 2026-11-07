@@ -284,7 +284,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             from transformers import AutoTokenizer
             processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
             self._default_tokenizer = processor
-        head = loader_cls.build_megatron_head(self._model_path, self.hf_config, processor)
+        head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
         head = head.to(Platform.get_local_device())
         get_task_spec_obj('decision').attach_megatron(self.model[-1], head)
 
@@ -771,7 +771,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     # normalization), and hand the head pre-read rows. The head call stays inside
                     # forward_step_func so mcore's backward covers its parameters.
                     if is_last_pp:
-                        head = spec.head_of(unwrapped_model)
+                        # Per-adapter resolution: a multi-tenant model carries one head per
+                        # decision adapter (task_heads); a single-head model falls back to its
+                        # attached task_head. ``adapter_name`` is the forward_backward local the
+                        # closure captures (the kwargs pop above).
+                        head = get_task_spec_obj(task).head_for(unwrapped_model, adapter_name)
                         if decision_meta is None:
                             raise ValueError(
                                 f'task {task!r} requires decision_meta in the batch (staged by its template '

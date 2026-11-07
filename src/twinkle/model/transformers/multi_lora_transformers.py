@@ -305,6 +305,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _register_adapter(self, adapter_name: str, config: LoraConfig, **kwargs) -> None:
         """Register an already validated LoRA configuration in a free slot."""
+        # A decision tenant's per-adapter head: the driver ships the dev family loader's
+        # (module, class) NAME and this worker replays the build into the per-adapter
+        # dictionary. The head must join the model before the lazy wrap -- the DDP/FSDP
+        # reducer only discovers parameters at wrap time -- so refuse BEFORE any state
+        # mutation below when the wrap already happened.
+        task_head_loader = kwargs.pop('task_head_loader', None)
+        if task_head_loader is not None and self._model_wrapped:
+            raise RuntimeError(
+                'a decision task_head cannot be added after the DDP/FSDP wrap: the reducer '
+                'only discovers parameters at wrap time. Add the adapter before the first '
+                'forward / optimizer setup.')
         config = self.strategy.prepare_adapter_config(
             config,
             enable_ep=getattr(self, '_enable_expert_parallel', False),
@@ -325,6 +336,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         except Exception:
             self.optimizer_group.pop(adapter_name, None)
             raise
+        if task_head_loader is not None:
+            self._add_task_head(adapter_name, task_head_loader)
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
@@ -424,6 +437,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
+        heads = getattr(self.strategy.unwrap_model(self.model), 'task_heads', None)
+        if heads is not None:
+            heads.pop(adapter_name, None)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         with self._adapter_context(adapter_name):

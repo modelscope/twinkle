@@ -179,6 +179,22 @@ class Decision(TaskSpec):
                 'be attached by the decision loader at build time.')
         return head
 
+    def head_for(self, model, adapter_name=None):
+        """The head for ONE call: the per-adapter dictionary first (multi-head models), the
+        single attached head as fallback. A model carrying per-adapter heads resolves them
+        STRICTLY -- an adapter without its own head raises instead of silently borrowing one
+        (two decision adapters would otherwise pollute each other's gradients through a
+        shared head)."""
+        heads = getattr(model, 'task_heads', None)
+        if heads:
+            if adapter_name not in heads:
+                raise ValueError(
+                    f'adapter {adapter_name!r} carries no decision task_head; bind one when the '
+                    'adapter is added (task_head_loader, or task="decision" on the megatron '
+                    'multi-tenant host) or train it as a non-decision adapter.')
+            return heads[adapter_name]
+        return self.head_of(model)
+
     @staticmethod
     def align_head(model, head):
         """Move the head onto the model's device and dtype policy: heads declaring
