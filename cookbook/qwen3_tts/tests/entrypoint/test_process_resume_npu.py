@@ -1,0 +1,112 @@
+"""Actual CLI in three sequential processes, two public samples, epoch tails."""
+import gc
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'tests/training'))
+import test_resume_npu as previous
+import numpy as np
+import torch
+from safetensors.torch import load_file
+from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTokenizer
+from tts.qwen3.manifest import sample_plan, planned_windows
+from speech_fixture import load_speech_fixture
+from tts.qwen3.runtime import DEFAULT_MODEL_PATH
+
+
+def compare(test, a, b, exact=False):
+    if isinstance(a, np.ndarray):
+        np.testing.assert_array_equal(a, b)
+    elif isinstance(a, dict):
+        test.assertEqual(a.keys(), b.keys())
+        for key in a:
+            compare(test, a[key], b[key], exact)
+    elif isinstance(a, (list, tuple)):
+        test.assertEqual(len(a), len(b))
+        for x, y in zip(a, b):
+            compare(test, x, y, exact)
+    else:
+        previous.assert_tree_equal(test, a, b, rtol=0 if exact else 1e-3,
+                                   atol=0 if exact else 1e-5)
+
+
+class ProcessResume(unittest.TestCase):
+    def test_cli_multi_sample_shuffle_and_restart(self):
+        path = Path(os.environ.get('MODEL_PATH', DEFAULT_MODEL_PATH)).resolve(strict=True)
+        outputs = ROOT / 'outputs'
+        outputs.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='process-resume-', dir=outputs) as folder:
+            root = Path(folder)
+            codec = Qwen3TTSTokenizer.from_pretrained(str(path / 'speech_tokenizer'),
+                local_files_only=True, device_map='cpu', torch_dtype=torch.float32)
+            codec.model.float().eval()
+            rows = []
+            for index, fixture in enumerate(('tests/fixtures/librispeech', 'tests/fixtures/librispeech/second')):
+                wave, text, meta = load_speech_fixture(ROOT / fixture)
+                with torch.no_grad():
+                    codes = previous.baseline.prepare.encode_audio_codes(wave, codec)
+                np.save(root / f'mel-{index}.npy', previous.baseline.prepare.extract_mel(wave))
+                rows.append(dict(id=meta['id'], text=text, audio_codes=codes.tolist(),
+                                 ref_mel_path=f'mel-{index}.npy'))
+            del codec
+            gc.collect()
+            manifest = root / 'train.jsonl'
+            manifest.write_text('\n'.join(json.dumps(r) for r in rows), encoding='utf-8')
+            common = [sys.executable, '-u', str(ROOT / 'scripts/train_qwen3_tts_lora.py'),
+                      '--model_path', str(path), '--train_jsonl', str(manifest),
+                      '--lr_decay', '0.8', '--epochs', '3', '--grad_accum', '3', '--shuffle', '--seed', '42']
+
+            def run(name, extra=()):
+                output = root / name
+                print(f'启动独立进程 / Starting independent process: {name}', flush=True)
+                subprocess.run([*common, '--output_dir', str(output), *extra], check=True, timeout=1800)
+                return output, json.loads((output / 'result.json').read_text())
+
+            continuous, a = run('continuous')
+            interrupted, b = run('interrupted', ['--stop_after_updates', '1'])
+            resumed, c = run('resumed', ['--resume_from', b['checkpoint']])
+            self.assertEqual(len({a['pid'], b['pid'], c['pid']}), 3)
+            self.assertTrue(a['complete'] and c['complete'])
+            self.assertFalse(b['complete'])
+            self.assertEqual((b['micro_steps'], b['optimizer_steps']), (2, 1))
+            self.assertEqual((c['micro_steps'], c['optimizer_steps'], c['consumed_samples']), (6, 3, 6))
+
+            def trace(path):
+                return [json.loads(line) for line in (path / 'trace.jsonl').read_text().splitlines()]
+
+            full, split = trace(continuous), trace(interrupted) + trace(resumed)
+            expected = [[rows[i]['id'] for i in w] for w in planned_windows(sample_plan(2, 3, 42, True), 3)]
+            self.assertEqual([r['sample_ids'] for r in full], expected)
+            self.assertEqual(len(full), len(split))
+            for x, y in zip(full, split):
+                np.testing.assert_allclose(x['losses'], y['losses'], rtol=1e-3, atol=1e-5)
+                self.assertEqual({k: v for k, v in x.items() if k != 'losses'},
+                                 {k: v for k, v in y.items() if k != 'losses'})
+            ac, cc = Path(a['checkpoint']), Path(c['checkpoint'])
+            wa, wc = load_file(str(ac / 'adapter_model.safetensors')), load_file(str(cc / 'adapter_model.safetensors'))
+            compare(self, wa, wc)
+            for filename in ('optimizer.pt', 'scheduler.pt', 'rng_state.pt'):
+                # Only checkpoint files generated by these child processes are loaded.
+                compare(self, torch.load(ac / filename, map_location='cpu', weights_only=False),
+                        torch.load(cc / filename, map_location='cpu', weights_only=False),
+                        exact=filename != 'optimizer.pt')
+            for filename in ('cookbook_progress.json', 'trainer_state.json'):
+                self.assertEqual(json.loads((ac / filename).read_text()), json.loads((cc / filename).read_text()))
+            previous.baseline.report('独立进程续训通过 / Independent process resume passed',
+                pids=[a['pid'], b['pid'], c['pid']], sample_order=expected,
+                micro_steps=6, optimizer_steps=3, epoch_window_sizes=[2, 2, 2],
+                max_weight_difference=max((wa[k].float() - wc[k].float()).abs().max().item() for k in wa),
+                random_states_equal=True, rtol=1e-3, atol=1e-5,
+                visible_devices=os.environ.get('ASCEND_RT_VISIBLE_DEVICES'))
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
