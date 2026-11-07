@@ -115,10 +115,10 @@ Auto 的核心是一个 **LLM 驱动的工具调用代理**（`AgentLoop`），�
 
 `start_server` 工具自动化一个多步骤流程：
 
-1. **GPU 检测** — `nvidia-smi` 硬件扫描
-2. **GPU 分配** — 在训练模型和采样器之间分配 GPU
-3. **配置生成** — 自动创建 `server_config.yaml`
-4. **Ray 集群启动** — 多节点 GPU 分区，隔离 `CUDA_VISIBLE_DEVICES`
+1. **加速器检测** — `twinkle.Platform`（CUDA 或昇腾 NPU），`nvidia-smi` 作兜底
+2. **设备分配** — 在训练模型和采样器之间分配设备
+3. **配置生成** — 自动生成 `server_config.yaml`
+4. **Ray 集群启动** — 多节点分区，隔离 `CUDA_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES`
 5. **服务器启动** — 作为后台进程启动 Twinkle Server
 6. **健康检查** — 轮询 `/api/v1/healthz` 直到就绪
 

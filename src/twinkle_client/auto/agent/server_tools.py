@@ -55,12 +55,12 @@ class _ServerTools:
         def _start():
             sampler_list = samplers or []
 
-            # Step 1: Detect hardware & compute GPU partition
-            total_hw_gpus = self._detect_gpu_count()
-            if total_hw_gpus == 0:
-                return {'status': 'error', 'error': 'No GPUs detected. Cannot start training server.'}
+            # Step 1: Detect hardware & compute device partition
+            device_type, total_hw_devices = self._detect_accelerators()
+            if total_hw_devices == 0:
+                return {'status': 'error', 'error': 'No accelerators detected. Cannot start training server.'}
 
-            alloc = self._compute_gpu_allocation(sampler_list, train_gpus, total_hw_gpus)
+            alloc = self._compute_gpu_allocation(sampler_list, train_gpus, total_hw_devices)
             if 'error' in alloc:
                 return {'status': 'error', 'error': alloc['error']}
             t_gpus, sampler_gpu_total = alloc['train_gpus'], alloc['sampler_gpus']
@@ -72,10 +72,11 @@ class _ServerTools:
                 port=port,
                 backend=backend,
                 samplers=sampler_list,
+                device_type=device_type,
             )
 
-            # Step 3: Start Ray cluster (multi-node GPU partitioning)
-            ray_err = self._start_ray_cluster(t_gpus, sampler_gpu_total)
+            # Step 3: Start Ray cluster (multi-node device partitioning)
+            ray_err = self._start_ray_cluster(t_gpus, sampler_gpu_total, device_type)
             if ray_err:
                 return {'status': 'error', 'error': ray_err}
 
@@ -100,6 +101,32 @@ class _ServerTools:
         if result.get('status') in ('started', 'already_running'):
             self._server_url = server_url
         return result
+
+    @classmethod
+    def _detect_accelerators(cls) -> tuple[str, int]:
+        """Return ``(device_type, count)`` for the accelerator this host exposes.
+
+        Ascend NPUs do not answer ``nvidia-smi``: on an NPU machine that probe
+        returned zero devices and ``start_server`` failed with "No GPUs
+        detected" before it ever read a config. Twinkle already abstracts the
+        accelerator behind ``twinkle.Platform`` / ``twinkle.torch_util``, so ask
+        that first and keep ``nvidia-smi`` as the fallback for CUDA hosts where
+        torch cannot see the devices.
+        """
+        try:
+            from twinkle import torch_util
+        except ImportError:
+            torch_util = None
+        if torch_util is not None:
+            try:
+                import torch
+                if torch_util.is_gpu_available():
+                    return 'cuda', int(torch.cuda.device_count())
+                if torch_util.is_npu_available():
+                    return 'npu', int(torch.npu.device_count())
+            except Exception:  # noqa: BLE001 - a broken probe must fall through to nvidia-smi
+                pass
+        return 'cuda', cls._detect_gpu_count()
 
     @staticmethod
     def _detect_gpu_count() -> int:
@@ -146,12 +173,17 @@ class _ServerTools:
         return {'train_gpus': t_gpus, 'sampler_gpus': sampler_gpu_total}
 
     @staticmethod
-    def _start_ray_cluster(train_gpus: int, sampler_gpus: int) -> str | None:
-        """Start Ray multi-node cluster with GPU partitioning.
+    def _start_ray_cluster(train_gpus: int, sampler_gpus: int, device_type: str = 'cuda') -> str | None:
+        """Start Ray multi-node cluster with accelerator partitioning.
 
-        Each role gets its own Ray node with dedicated CUDA_VISIBLE_DEVICES
-        so GPUs are indexed from 0 within each node. This prevents the
-        GPU ID mapping issues that occur with a single-node setup.
+        Each role gets its own Ray node with dedicated visible-device env
+        (``CUDA_VISIBLE_DEVICES`` / ``ASCEND_RT_VISIBLE_DEVICES``) so devices are
+        indexed from 0 within each node. This prevents the device ID mapping
+        issues that occur with a single-node setup.
+
+        Non-CUDA accelerators (Ascend NPU) are registered as a Ray custom
+        resource instead of ``--num-gpus``: Ray only discovers CUDA itself, and
+        ``twinkle.infra`` requests NPUs through ``resources={'NPU': n}``.
 
         On a single machine, multiple raylets need separate --temp-dir to
         avoid being detected as "already running".
@@ -170,40 +202,52 @@ class _ServerTools:
 
         def _ray_node(
             devices: str,
-            num_gpus: int,
+            num_devices: int,
             *,
             head: bool = False,
             node_name: str = 'worker',
+            cpu_only: bool = False,
         ) -> str | None:
             env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = devices
+            # Ray only discovers CUDA devices on its own; for every other
+            # accelerator the visible-device env is the only handle twinkle's
+            # workers get, and the count is registered as a custom resource.
+            if device_type == 'npu':
+                env['ASCEND_RT_VISIBLE_DEVICES'] = devices
+            else:
+                env['CUDA_VISIBLE_DEVICES'] = devices
             temp_dir = str(ray_base / node_name)
             cmd = ['ray', 'start', f'--temp-dir={temp_dir}']
             if head:
                 cmd += ['--head', '--port=6379', '--disable-usage-stats', '--include-dashboard=false']
             else:
                 cmd += ['--address=127.0.0.1:6379']
-            cmd.append(f'--num-gpus={num_gpus}')
+            if cpu_only:
+                cmd.append('--num-gpus=0')
+            elif device_type == 'npu':
+                cmd.append(f'--resources={{"NPU": {num_devices}}}')
+            elif num_devices > 0:
+                cmd.append(f'--num-gpus={num_devices}')
             r = _sp.run(cmd, capture_output=True, text=True, timeout=30, env=env)
             if r.returncode != 0 and 'already' not in r.stderr.lower():
                 return r.stderr.strip()
             return None
 
-        # Head node — training model GPUs
+        # Head node — training model devices
         model_devices = ','.join(str(i) for i in range(train_gpus))
         err = _ray_node(model_devices, train_gpus, head=True, node_name='head')
         if err:
             return f'Ray head start failed: {err}'
 
-        # GPU Worker node — sampler GPUs
+        # Worker node — sampler devices
         if sampler_gpus > 0:
             sampler_devices = ','.join(str(i) for i in range(train_gpus, train_gpus + sampler_gpus))
-            err = _ray_node(sampler_devices, sampler_gpus, node_name='gpu_worker')
+            err = _ray_node(sampler_devices, sampler_gpus, node_name='device_worker')
             if err:
-                return f'Ray GPU worker start failed: {err}'
+                return f'Ray sampler worker start failed: {err}'
 
-        # CPU Worker node — processor (no GPU)
-        _ray_node('', 0, node_name='cpu_worker')
+        # CPU Worker node — processor (no accelerator)
+        _ray_node('', 0, node_name='cpu_worker', cpu_only=True)
         return None
 
     @staticmethod
@@ -354,6 +398,7 @@ class _ServerTools:
         port: int = 8000,
         backend: str = 'transformers',
         samplers: list[dict] | None = None,
+        device_type: str = 'cuda',
     ) -> str:
         """Generate a server_config.yaml from template and return its path.
 
@@ -361,6 +406,10 @@ class _ServerTools:
           - 1 training model (student)
           - N sampler/teacher models (for RL/OPD)
           - 1 processor service
+
+        ``device_type`` is the accelerator the trainings/samplers run on
+        (``cuda`` / ``npu``); every device group and mesh it writes carries it,
+        so the generated config matches the hardware that was detected.
         """
         import yaml
         from pathlib import Path
@@ -438,10 +487,10 @@ class _ServerTools:
                     'device_group': {
                         'name': 'model',
                         'ranks': train_gpus,
-                        'device_type': 'cuda',
+                        'device_type': device_type,
                     },
                     'device_mesh': {
-                        'device_type': 'cuda',
+                        'device_type': device_type,
                         'dp_size': train_gpus,
                     },
                     'queue_config': {
@@ -516,7 +565,7 @@ class _ServerTools:
             # Build device_mesh: include tp_size when tp>1 so that
             # world_size = tp*dp and slice_dp dispatch computes correct
             # rank_stride for DP data sharding.
-            mesh_config: dict = {'device_type': 'cuda', 'dp_size': s_dp}
+            mesh_config: dict = {'device_type': device_type, 'dp_size': s_dp}
             if s_tp > 1:
                 mesh_config['tp_size'] = s_tp
 
@@ -534,7 +583,7 @@ class _ServerTools:
                     'device_group': {
                         'name': s_name,
                         'ranks': s_total_gpus,
-                        'device_type': 'cuda',
+                        'device_type': device_type,
                         'gpus_per_worker': s_tp,
                     },
                     'device_mesh': mesh_config,

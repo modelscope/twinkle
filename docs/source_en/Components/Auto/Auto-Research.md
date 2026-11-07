@@ -115,10 +115,10 @@ The agent has access to 13 built-in tools:
 
 The `start_server` tool automates a multi-step pipeline:
 
-1. **GPU detection** — `nvidia-smi` hardware scan
-2. **GPU allocation** — partition GPUs between training model and samplers
+1. **Accelerator detection** — `twinkle.Platform` (CUDA or Ascend NPU), `nvidia-smi` as fallback
+2. **Device allocation** — partition devices between training model and samplers
 3. **Config generation** — auto-create `server_config.yaml`
-4. **Ray cluster startup** — multi-node GPU partitioning with isolated `CUDA_VISIBLE_DEVICES`
+4. **Ray cluster startup** — multi-node partitioning with isolated `CUDA_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES`
 5. **Server launch** — start Twinkle Server as background process
 6. **Health check** — poll `/api/v1/healthz` until ready
 
