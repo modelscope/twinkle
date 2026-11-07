@@ -55,6 +55,11 @@ class TaskSpec:
 
     # --- component (head) lifecycle; readout tasks override --------------------------------
 
+    def head_of(self, model):
+        """The task's attached component (head). Only tasks whose registry row declares a
+        'task_head' readout kind override this; the base raise means the task carries none."""
+        raise NotImplementedError(f'{type(self).__name__} carries no attachable component.')
+
     def attach(self, model, head, **kwargs) -> None:
         """Install this task's model-side component (head). Default: this task has none."""
 
@@ -151,14 +156,77 @@ class Value(TaskSpec):
 
 
 class Decision(TaskSpec):
-    """Readout task: no patch on either backend -- the loader installed a load-time custom
-    forward (``task_forward``: the transformers-only branch families) or an attachable head
-    (``task_head``), and the forward-layer readout (one-shot hook / forward_step readout
-    branch) drives it. attach/reactivate land in the head-lifecycle stage."""
+    """The decision (System-1 scoring) readout task: no patch on either backend -- the
+    loader installed a load-time custom forward (``task_forward``: the transformers-only
+    branch families) or an attachable head (``task_head``), and the forward-layer readout
+    (the one-shot hook / the forward_step readout branch) drives it. This class owns that
+    head's lifecycle: alignment, attachment (per backend), and re-activation after a peft
+    wrap. The head OBJECT stays owned by the model family's dev loader (framework-agnostic
+    nn.Module, often rebuilt worker-side from a shipped loader name); only its placement
+    rules live here."""
 
     task_name = 'decision'
     transformers_context = _no_patch
     megatron_context = _no_patch
+
+    def head_of(self, model):
+        head = getattr(model, 'task_head', None)
+        if head is None:
+            raise ValueError(
+                "task 'decision' declares readout kinds ['task_head', 'task_forward'] but the model "
+                'carries neither: the transformers-only task_forward families (branch isolation / '
+                'direct backbone) are rejected by their loader at build time, and a task_head must '
+                'be attached by the decision loader at build time.')
+        return head
+
+    @staticmethod
+    def align_head(model, head):
+        """Move the head onto the model's device and dtype policy: heads declaring
+        ``keep_fp32`` stay fp32 (their readout upcasts anyway), the rest follow the output
+        embeddings' dtype."""
+        output_embeddings = model.get_output_embeddings() if hasattr(model, 'get_output_embeddings') else None
+        ref_weight = getattr(output_embeddings, 'weight', None)
+        if ref_weight is None:
+            ref_weight = next((p for p in model.parameters()), None)
+        if ref_weight is not None:
+            if getattr(head, 'keep_fp32', False):
+                head = head.to(device=ref_weight.device)
+            else:
+                head = head.to(device=ref_weight.device, dtype=ref_weight.dtype)
+        return head
+
+    def attach_transformers(self, model, head) -> None:
+        """Attach the head for the forward-layer readout dispatch -- no forward patching.
+        Dual names: ``task_head`` drives the readout; ``scoring_head`` is the legacy attribute
+        the checkpoint / callback / metrics ecosystem reads."""
+        head = self.align_head(model, head)
+        model.task_head = head
+        model.scoring_head = head
+        if getattr(head, 'needs_output_embeddings', False):
+            head.set_output_embeddings(model.get_output_embeddings())
+
+    def attach_megatron(self, chunk, head) -> None:
+        """Attach to the mcore model itself, not the MegatronModel wrapper: only parameters
+        living on the model chunks enter the mcore optimizer and ride the DDP /
+        mixed-precision wrap."""
+        core = chunk
+        while hasattr(core, 'module'):  # down to the mcore model, past DDP / Float16Module
+            core = core.module
+        core.task_head = head
+        core.scoring_head = head
+
+    def reactivate(self, model) -> None:
+        """Re-enable the head after a peft wrap froze it: peft's mark-only-adapters sweep
+        covers the module the head rides on, so an adapter run would otherwise train around
+        a frozen head. fp16 storage upcasts to fp32 (bf16 rides -- the readout upcasts)."""
+        import torch
+        for name, param in model.named_parameters():
+            if 'scoring_head' not in name:
+                continue
+            if not param.requires_grad:
+                param.requires_grad_(True)
+            if param.dtype == torch.float16:
+                param.data = param.data.to(torch.float32)
 
 
 def _resolve_generative_reranker_token_ids(template):

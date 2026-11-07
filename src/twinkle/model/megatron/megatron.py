@@ -268,11 +268,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         The head is a plain nn.Module owned by the model family's loader (framework-agnostic by
         design), so the megatron builder ships only the loader's ``(module, class)`` name; this
-        worker rebuilds it from the local model path, config and tokenizer. It is attached
-        BEFORE the strategy wraps the chunks, and to the mcore model itself -- not to this
-        wrapper: only parameters living on the model chunks enter the mcore optimizer and ride
-        the DDP / mixed-precision wrap, and only the last pipeline stage produces the lm logits
-        the head reads (``forward_step`` resolves ``task_head`` on exactly that chunk).
+        worker rebuilds it from the local model path, config and tokenizer. Attachment rules
+        (which module, which names) live on the task's spec (``twinkle.model.tasks``); placement
+        here stays BEFORE the strategy wraps the chunks, and only the last pipeline stage
+        produces the lm logits the head reads.
         """
         import importlib
         from megatron.core import mpu
@@ -287,13 +286,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             self._default_tokenizer = processor
         head = loader_cls.build_megatron_head(self._model_path, self.hf_config, processor)
         head = head.to(Platform.get_local_device())
-        core = self.model[-1]
-        while hasattr(core, 'module'):  # down to the mcore model, past DDP / Float16Module
-            core = core.module
-        # Dual names: ``task_head`` drives the readout dispatch; ``scoring_head`` is the legacy
-        # attribute name the checkpoint / callback / metrics ecosystem reads.
-        core.task_head = head
-        core.scoring_head = head
+        get_task_spec_obj('decision').attach_megatron(self.model[-1], head)
 
     def _apply_vit_gradient_checkpointing(self, enabled: bool, gc_kwargs: Optional[Dict[str, Any]]) -> None:
         """Checkpoint each HF vision tower of a multimodal mcore model.
@@ -778,13 +771,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     # normalization), and hand the head pre-read rows. The head call stays inside
                     # forward_step_func so mcore's backward covers its parameters.
                     if is_last_pp:
-                        head = getattr(unwrapped_model, 'task_head', None)
-                        if head is None:
-                            raise ValueError(
-                                f'task {task!r} declares readout kinds {list(spec.readout)} but the megatron '
-                                'model carries no task_head: the transformers-only task_forward families '
-                                '(branch isolation / direct backbone) are rejected by their loader at build '
-                                'time, and hidden-state heads are not supported here yet.')
+                        head = spec.head_of(unwrapped_model)
                         if decision_meta is None:
                             raise ValueError(
                                 f'task {task!r} requires decision_meta in the batch (staged by its template '
@@ -2111,15 +2098,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             _models.append(_model)
         self.model = _models
 
-        # A task readout head attached to the mcore model (decision families, by its legacy
-        # attribute name) is not a LoRA target, so peft's mark-only-adapters-as-trainable sweep
-        # just froze it. The transformers backend re-activates its head from the dev recipe
-        # (reactivate_scoring_head), but the driver cannot reach into worker-side chunks -- do
-        # the mirror here, on every chunk, right after the peft wrap.
+        # A task readout head attached to the mcore model (decision families) is not a LoRA
+        # target, so peft's mark-only-adapters-as-trainable sweep just froze it; re-activation
+        # rules live on the task's spec (a no-op for models without that task's component).
+        decision_spec = get_task_spec_obj('decision')
         for chunk in self.model:
-            for name, param in chunk.named_parameters():
-                if 'scoring_head' in name and not param.requires_grad:
-                    param.requires_grad_(True)
+            decision_spec.reactivate(chunk)
 
         # Create optimizer group for adapter
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()

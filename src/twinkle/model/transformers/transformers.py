@@ -837,11 +837,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return self.model(**inputs, use_cache=False)
         if getattr(unwrapped_model, 'task_forward', None) is not None:
             return self.model(**inputs, use_cache=False)
-        head = getattr(unwrapped_model, 'task_head', None)
-        if head is None:
-            raise ValueError(
-                f'task {task!r} declares readout kinds {list(spec.readout)} but the model carries neither '
-                'a task_forward nor a task_head; its loader must attach one at build time.')
+        head = get_task_spec_obj(task).head_of(unwrapped_model)
         meta = inputs.pop('decision_meta', None)
         if meta is None:
             raise ValueError(
@@ -2525,6 +2521,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._patch_frozen_towers(self.model)
+        # A task readout head (decision families) is not a LoRA target, so peft's
+        # mark-only-adapters sweep just froze it; re-activation rules live on the task's spec
+        # (a no-op for models without that task's component).
+        get_task_spec_obj('decision').reactivate(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
 
