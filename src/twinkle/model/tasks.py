@@ -130,10 +130,27 @@ class TaskSpec:
         if getattr(head, 'needs_output_embeddings', False):
             head.set_output_embeddings(model.get_output_embeddings())
 
+    def place_megatron_head(self, head, chunk):
+        """Move a freshly built head onto the device of the mcore chunk it rides, matching
+        the backbone's dtype unless the head declares ``keep_fp32`` (a plain fp32 Linear over
+        bf16 hidden states raises on the readout matmul; the keep_fp32 heads upcast inputs
+        themselves)."""
+        from twinkle import Platform
+        core = chunk
+        while hasattr(core, 'module'):  # down past DDP / Float16Module, same as attach
+            core = core.module
+        if getattr(head, 'keep_fp32', False):
+            return head.to(Platform.get_local_device())
+        backbone_dtype = next((p.dtype for p in core.parameters()), None)
+        if backbone_dtype is None:
+            return head.to(Platform.get_local_device())
+        return head.to(device=Platform.get_local_device(), dtype=backbone_dtype)
+
     def attach_megatron(self, chunk, head) -> None:
         """Attach to the mcore model itself, not the MegatronModel wrapper: only parameters
         living on the model chunks enter the mcore optimizer and ride the DDP /
         mixed-precision wrap."""
+        head = self.place_megatron_head(head, chunk)
         core = chunk
         while hasattr(core, 'module'):  # down to the mcore model, past DDP / Float16Module
             core = core.module
@@ -202,6 +219,11 @@ class SeqCls(TaskSpec):
                 f'task {self.task_name!r} needs num_labels= to build its head (the config carries '
                 'no label count).')
         hidden_size = getattr(config, 'hidden_size', None)
+        if hidden_size is None:
+            # Composite checkpoints (Qwen3.5 and other hybrid / VL families) keep the language
+            # backbone's width on the nested text_config; the head rides that backbone.
+            text_config = getattr(config, 'text_config', None)
+            hidden_size = getattr(text_config, 'hidden_size', None) if text_config is not None else None
         if hidden_size is None:
             raise ValueError(f'cannot build a {self.task_name} head: the config has no hidden_size.')
         return SeqClsHead(hidden_size, num_labels, squeeze_single=self._squeeze_single)

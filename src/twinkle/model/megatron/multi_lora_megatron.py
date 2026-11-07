@@ -220,12 +220,13 @@ class MultiLoraMegatronModel(MegatronModel):
 
             def build_head():
                 head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
-                return head.to(Platform.get_local_device())
+                return spec_obj.place_megatron_head(head, self.model[-1])
         else:
             spec_obj = get_task_spec_obj(task)
 
             def build_head():
-                return spec_obj.build_head(self.hf_config, self._num_labels).to(Platform.get_local_device())
+                return spec_obj.place_megatron_head(spec_obj.build_head(self.hf_config, self._num_labels),
+                                                    self.model[-1])
         self.task_head_slots.build(self._task_head_host(), build_head)
 
     def _validate_task_head_config(self) -> None:

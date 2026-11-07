@@ -303,7 +303,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     'task_head_loader is the decision families\' head replay; '
                     f'task={task!r} builds its standard head from the config instead.')
             head = spec_obj.build_head(self.hf_config, num_labels)
-        head = head.to(Platform.get_local_device())
         spec_obj.attach_megatron(self.model[-1], head)
 
     def _apply_vit_gradient_checkpointing(self, enabled: bool, gc_kwargs: Optional[Dict[str, Any]]) -> None:
@@ -666,7 +665,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 outputs = ModelOutput(embeddings=embeddings)
             else:
                 logits = unpacked_logits if unpacked_logits is not None else output_tensor
-                outputs = ModelOutput(logits=logits, logps=logps)
+                if getattr(loss_instance, 'require_values', False):
+                    # The value task: the per-token V(s_t) rides the logits channel internally,
+                    # but its loss reads it as 'values' (same key mapping the transformers
+                    # backend's _postprocess_forward_outputs applies).
+                    outputs = ModelOutput(values=logits, logps=logps)
+                else:
+                    outputs = ModelOutput(logits=logits, logps=logps)
                 if entropies is not None:
                     outputs['entropies'] = entropies
             if not compute_loss:
@@ -675,9 +680,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 result = {'loss': zero, 'num_tokens': zero.clone()}
             else:
                 result = loss_instance(inputs, outputs, **current_kwargs)
-            reported_logits = outputs.get('logits') if return_logits else None
+            # The value task's readout rides 'values' (see above); report it on the logits
+            # channel so callers keep one key for "the model's per-position scores".
+            reported_logits = (outputs.get('logits', outputs.get('values')) if return_logits else None)
             if unpacked_logits is not None:
                 outputs.pop('logits', None)
+                if 'values' in outputs:
+                    outputs.pop('values', None)
                 del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
@@ -945,7 +954,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 completing_pending=completing_pending,
                 global_normalizer=global_normalizer,
                 **kwargs):
-            with get_task_spec_obj(task).megatron_context(self.model):
+            with get_task_spec_obj(task).megatron_context(self.strategy.unwrap_model(self.model)):
                 losses = forward_backward_func(
                     forward_step_func=forward_step_func,
                     data_iterator=data_iter,
