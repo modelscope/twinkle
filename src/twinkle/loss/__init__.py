@@ -2,6 +2,7 @@
 from .base import Loss
 from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
+from .decision import DecisionLoss
 from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, SAPOLoss
@@ -13,6 +14,7 @@ from .value import PPOValueLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
+    'decision': DecisionLoss,
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
     'cross_entropy': CrossEntropyLoss,
     'liger_fused_linear_cross_entropy': LigerFusedLinearCrossEntropyLoss,
