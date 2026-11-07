@@ -119,6 +119,12 @@ def _resolve_task_context(model, task, template=None):
     last-valid-token reduction is deferred to ``postprocess_outputs`` too.
     'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
     ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
+
+    Maintenance rule: a registry row with ``readout`` set needs no edit here (the check above
+    admits it automatically, and the forward-layer readout takes over). A row with an EMPTY
+    readout that this backend newly supports MUST land either in the nullcontext set above or
+    in a patch branch below -- the trailing raise is the gate forcing that explicit decision,
+    not an oversight; admitting it nowhere would run it down the causal path silently.
     """
     if task in (None, 'causal_lm') or get_task_spec(task).readout:
         return contextlib.nullcontext()

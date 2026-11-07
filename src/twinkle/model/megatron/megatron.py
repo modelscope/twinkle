@@ -108,6 +108,11 @@ def _resolve_task_context(model, task):
     future readout task) need none either -- their readout runs in forward_step via a load-time
     custom forward or an attached task_head, never a patch. The nullcontext set is therefore
     read off the registry, NOT hand-listed: a new readout task must not have to touch this.
+
+    Maintenance rule: a registry row with an EMPTY readout that this backend newly supports
+    MUST land in the nullcontext set above or in a patch branch below -- the trailing raise is
+    the gate forcing that explicit decision, not an oversight; admitting it nowhere would run
+    it down the causal path silently.
     """
     if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker', 'value') \
             or get_task_spec(task).readout:
