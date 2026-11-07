@@ -207,96 +207,73 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 The rest of the data processing, training loop, checkpoint saving, and other code remains exactly the same.
 
-## Trainable Multi-turn Rollout (ClientMultiTurnRollout)
+(client-async-grpo)=
+## Client-side Async GRPO
 
-The examples above are all single-turn training. If you want to do **multi-turn agentic RL with tool use** (e.g. GRPO) and need training-ready token-level alignment info, use `twinkle_client.rollout.ClientMultiTurnRollout`. It drives the "sample → call tool → stitch context → sample again" multi-turn loop on the client side, samples over HTTP each round (`/twinkle/sample`), and produces a trainable result with `logprobs` per trajectory that can be fed directly into GRPO and other RL training.
+The client can train while sampling continues. After [installing Twinkle](../Installation.md), choose an example and follow the steps below:
 
-### Dependencies and Constraints
+| Task | Example |
+|---|---|
+| Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
+| Multi-turn code repair with tools (text only) | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
 
-- **Local Template**: bridge-token stitching (rendering tool turns + the next generation prompt) requires a local `Template` instance on the client.
-- **vLLMSampler**: the client sampler pointing at the server's Sampler service.
-- **ToolManager** (optional): register your tools; if a trajectory produces tool_calls but no tool_manager is provided, a `ValueError` is raised at dispatch.
-- **`num_samples=1`**: each trajectory is sampled once. For a GRPO group, replicate the same prompt into `NUM_GENERATIONS` independent trajectories.
-- **Safe text-only trajectories**: after every turn, the client verifies that state has no media and `feature.input_ids == engine_input_ids`. The template may support multimodality; only trajectories carrying media or divergent dual encodings raise `NotImplementedError` until the server exposes a `state_id`.
+### 1. Start the Server
 
-### Minimal Example
+The example uses Qwen3.5-4B with Transformers for training and vLLM for sampling, requiring two GPUs. Prepare a local model directory, then run these commands from the repository root:
 
-```python
-from peft import LoraConfig
-from twinkle import init_twinkle_client
-from twinkle.advantage import GRPOAdvantage
-from twinkle.data_format import SamplingParams
-from twinkle.template import Qwen3_5Template
-from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.rollout import ClientMultiTurnRollout
-from twinkle_client.sampler import vLLMSampler
-
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-NUM_GENERATIONS = 2   # GRPO group size (rollout samples num_samples=1 per trajectory)
-
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
-
-# Training model (GRPO): bind the current transport, session, and authentication context
-model = client.model(MODEL_ID)
-model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
-model.set_loss('GRPOLoss', epsilon=0.2)
-model.set_optimizer('Adam', lr=1e-5)
-model.set_processor('InputProcessor')
-model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# Client sampler (HTTP)
-sampler = vLLMSampler(model_id=MODEL_ID)
-sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# Multi-turn rollout: needs a local Template (bridge stitching) and a ToolManager
-rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
-rollout_template.truncation_strategy = 'delete'
-tool_manager = ToolManager([MyCalculatorTool()])   # your tools
-
-rollout = ClientMultiTurnRollout(
-    sampler=sampler,
-    template=rollout_template,
-    tool_manager=tool_manager,
-    sampling_params=SamplingParams(max_tokens=512, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
-    max_turns=4,
-)
-advantage_fn = GRPOAdvantage()
-
-for step in range(3):
-    # 1. Batched multi-turn rollout: replicate each prompt into NUM_GENERATIONS trajectories
-    trajectories = build_trajectories(tool_manager.tool_infos())  # see cookbook
-    rolled = rollout(trajectories, tool_manager=tool_manager)
-
-    # 2. Read back token-level logprobs (top-1) and rewards
-    all_inputs, all_old_logps = [], []
-    for traj in rolled:
-        all_old_logps.append([lp[0][1] for lp in (traj.get('logprobs') or [])])
-        all_inputs.append(traj)
-    rewards = compute_rewards(rolled)   # see cookbook
-
-    # 3. GRPO advantages (group-relative)
-    advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-    # 4. Policy update
-    model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
-    model.clip_grad_and_step()
+```bash
+pip install -e '.[async-rl,client,server]'
+export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+export CUDA_VISIBLE_DEVICES=0,1
+bash cookbook/client/async_rl/run_server.sh
 ```
 
-### Output Fields
+The server listens on `http://127.0.0.1:8000` by default. Skip this step if you already have a suitable server; see [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml) for its configuration.
 
-Each returned trajectory has the following top-level fields appended to the original dict:
+### 2. Run the Math Example
 
-| Field | Meaning |
-|:------|:--------|
-| `messages` | Full multi-turn conversation (including assistant tool_calls and tool-response turns) |
-| `logprobs` | Top-1 logprob per trainable token; `None` if the round sampled no logprobs |
-| `turns` | Number of turns actually taken (`<= max_turns`) |
-| `stop_reason` | One of `'stop'` / `'length'` / `'max_turns'` |
-| `truncated` | Whether truncated due to `max_turns` or the length cap |
+Keep the server running and use another terminal, also at the repository root:
 
-### Common Errors
+```bash
+export TWINKLE_SERVER_URL=http://127.0.0.1:8000
+export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+python cookbook/client/async_rl/client_orchestrated_grpo.py
+```
 
-- A trajectory triggered a tool call but no `tool_manager` was provided → raises `ValueError`. Pass `tool_manager` at construction or per call.
-- The sampler's network / timeout errors are **raised as-is** (not swallowed); handle retry/backoff outside your loop.
+The example downloads GSM8K by default. For offline use, also set `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`. When connecting to an existing server, use its address and authentication token. The template directory must match the server's model.
 
-See `cookbook/client/twinkle/multi_turn_rollout.py` for a full runnable example.
+### 3. Run the Code Repair Example (Optional)
+
+The multi-turn example requires an accessible AgentENV service and a working Python environment template. Keep the client settings above and run:
+
+```bash
+pip install 'e2b>=2.7'
+export AGENTENV_API_URL=http://your-agentenv-gateway:8080
+export AGENTENV_TEMPLATE=your-python-template
+python cookbook/client/async_rl/multi_turn_grpo.py
+```
+
+The model reads files, runs tests and repairs code, then trains on the test results. Each attempt uses an independent workspace; the example handles initialization, scoring and cleanup. For environment setup, see [Agentic RL Deployment and Training](../Agentic-RL-Deployment-and-Training.md).
+
+### Use Your Own Task
+
+- Math tasks: change the dataset and reward function in the script.
+- Code tasks: edit `TASK` at the top of `multi_turn_grpo.py`, including the candidate file, tests and prompt.
+- Start with the default training settings; edit the constants at the top of the script when needed. Training logs show rewards and metrics, and LoRA checkpoints are saved.
+
+## Trainable Multi-turn Rollout (ClientMultiTurnRollout)
+
+For a custom multi-turn training loop, use `twinkle_client.rollout.ClientMultiTurnRollout`. It supports text-only tool use and returns complete trajectories ready for training.
+
+Inside an async training loop where the rollout, trajectories, tools and policy checkpoint are already initialized:
+
+```python
+rolled = await rollout.acall(
+    trajectories,
+    tool_manager=tool_managers,
+    adapter_uri=policy_uri,
+)
+```
+
+For synchronous use, call `rollout(...)` with the same arguments and result format. Give each trajectory the `ToolManager` for its independent environment; rollout does not close environments you pass in. See [multi_turn_rollout.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/multi_turn_rollout.py) for the full synchronous example.

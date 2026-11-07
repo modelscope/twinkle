@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
-import json
 import subprocess
 import sys
+
+import json
 
 
 def _run_import_probe(source: str) -> dict[str, object]:
@@ -57,3 +57,10 @@ def test_import_twinkle_client_does_not_load_heavy_data_dependencies() -> None:
         "import json, sys, twinkle_client; "
         "print(json.dumps({name: name in sys.modules for name in ('torch', 'datasets', 'pandas')}))")
     assert result == {'torch': False, 'datasets': False, 'pandas': False}
+
+
+def test_multi_turn_import_does_not_start_ray_or_load_optional_sandbox_engine() -> None:
+    result = _run_import_probe(
+        "import json, sys; from twinkle_client.rollout import ClientMultiTurnRollout; "
+        "print(json.dumps({name: name in sys.modules for name in ('ray', 'e2b', 'vllm.engine', 'transfer_queue')}))")
+    assert result == {'ray': False, 'e2b': False, 'vllm.engine': False, 'transfer_queue': False}

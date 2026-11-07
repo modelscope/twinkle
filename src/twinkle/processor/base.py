@@ -154,6 +154,8 @@ class InputProcessor:
                 elif (isinstance(value, list)) and key in ("completion_mask", "mm_token_type_ids", "routed_experts"):
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
+                    if value is None:
+                        continue
                     if not isinstance(value[0], torch.Tensor):
                         value = [torch.tensor(v) for v in value]
                         value = torch.cat(value, dim=0)
@@ -168,19 +170,19 @@ class InputProcessor:
 
     @staticmethod
     def token_level_labels(task):
-        return task not in ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
+        return task not in ("embedding", "generative_reranker", "seq_cls", "reranker")
 
-    def postprocess_outputs(self, inputs, outputs, *, task='causal_lm', gather_fn=None, reduce_fn=None):
+    def postprocess_outputs(self, inputs, outputs, *, task="causal_lm", gather_fn=None, reduce_fn=None):
         """Task reduction, loss-tensor collection and packed layout restoration.
 
         Callbacks contain only communication; token selection and task semantics
         stay here. Without callbacks, both training backends keep their local path.
         """
-        if task == 'embedding':
+        if task == "embedding":
             inputs, outputs = self._postprocess_embedding(inputs, outputs, reduce_fn=reduce_fn)
-        elif task == 'generative_reranker':
+        elif task == "generative_reranker":
             inputs, outputs = self._postprocess_generative_reranker(inputs, outputs, reduce_fn=reduce_fn)
-        elif task in ('seq_cls', 'reranker'):
+        elif task in ("seq_cls", "reranker"):
             inputs, outputs = self._postprocess_seq_cls(inputs, outputs, reduce_fn=reduce_fn)
         elif gather_fn is not None:
             inputs, outputs = gather_fn(inputs, outputs)
@@ -255,8 +257,8 @@ class InputProcessor:
             "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'."
         )
         if logits.dim() == 2:
-            if reduce_fn is not None and inputs.get('_sequence_layout') is not None:
-                raise NotImplementedError('Sequence-parallel scoring requires a per-token score head')
+            if reduce_fn is not None and inputs.get("_sequence_layout") is not None:
+                raise NotImplementedError("Sequence-parallel scoring requires a per-token score head")
             # A pre-pooled head (XLM-R-style ``*ForSequenceClassification`` pools the last valid
             # token INSIDE forward, before the score head) already answered one score per sequence;
             # the patch captured ``[n_seqs, num_labels]`` and there is nothing left to reduce.
@@ -276,9 +278,9 @@ class InputProcessor:
         callback reduces only the pooled tensor; this method does not own any
         process groups or sequence-splitting logic.
         """
-        layout = inputs.get('_sequence_layout')
+        layout = inputs.get("_sequence_layout")
         if layout is not None:
-            ref_pos = layout['position_ids']
+            ref_pos = layout["position_ids"]
         elif inputs.get("position_ids") is not None:
             ref_pos = inputs["position_ids"]
         else:
@@ -297,7 +299,7 @@ class InputProcessor:
                 ref_pos = torch.where(am.bool(), arange, arange.new_tensor(-1))
         if ref_pos.dim() == 3:
             ref_pos = ref_pos[0]
-        attention_mask = inputs.get('attention_mask')
+        attention_mask = inputs.get("attention_mask")
         if torch.is_tensor(attention_mask) and attention_mask.shape == ref_pos.shape:
             ref_pos = ref_pos.masked_fill(~attention_mask.bool(), -1)
         # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
@@ -330,7 +332,7 @@ class InputProcessor:
         mask[batch_idx, end_idx, target_idx] = 1.0
 
         if layout is not None:
-            indices = layout['indices']
+            indices = layout["indices"]
             mask = mask.gather(1, indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, n_targets))
             mask = mask * (indices >= 0).unsqueeze(-1)
 
@@ -974,8 +976,8 @@ class InputProcessor:
     ) -> list[InputFeature]:
         if len(inputs) == 1 and self.framework != "megatron":
             return inputs
-        omit_megatron_attention_mask = (
-            self.framework == "megatron" and self._backend_builds_causal_mask(kwargs.get("attention_mask_type"))
+        omit_megatron_attention_mask = self.framework == "megatron" and self._backend_builds_causal_mask(
+            kwargs.get("attention_mask_type")
         )
         if micro_batch_size is None:
             # normal collate

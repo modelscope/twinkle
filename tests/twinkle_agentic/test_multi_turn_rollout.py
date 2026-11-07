@@ -18,20 +18,23 @@ fake Template that replays the real ``concat_input_feature`` and post
 pipeline semantics, and a fake Sampler that queues scripted responses.
 """
 from __future__ import annotations
-
 import copy
-import json
-import pytest
 import re
 import threading
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from typing import Any
+
+import json
+import pytest
 
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.template.base import Template
-from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
+from twinkle_agentic.rollout.base import _RolloutExecution
+from twinkle_agentic.rollout.multi_turn import MultiTurnRollout, default_response_callback
 from twinkle_agentic.rollout.trace import TraceWriter
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.utils.leases import Leases
 
 
 # =============================================================================
@@ -1481,3 +1484,212 @@ def test_a_stage_reply_that_looks_like_a_tool_call_is_kept_whole(sampler, templa
     assert '<|im_end|>' not in last['content']
     # And it was not dispatched: a dispatch appends a tool message.
     assert [m['role'] for m in out['messages'] if m['role'] == 'tool'] == []
+
+
+def test_call_sampling_params_dict_is_normalized_without_mutating_input(sampler, template):
+    params = {'temperature': 0.25, 'max_tokens': 32}
+    sampler.queue('done')
+    rollout = MultiTurnRollout(sampler=sampler, template=template)
+
+    rollout([_user_traj()], sampling_params=params)
+
+    assert params == {'temperature': 0.25, 'max_tokens': 32}
+    assert isinstance(sampler.params_seen[0], SamplingParams)
+    assert sampler.params_seen[0].temperature == 0.25
+    assert sampler.params_seen[0].max_tokens == 32
+    assert sampler.params_seen[0].num_samples == 1
+
+
+def test_transport_state_validation_covers_every_append(sampler, template, tool_manager):
+    class ValidatingCallback:
+        def __init__(self):
+            self.validations = []
+
+        def __call__(self, *args, **kwargs):
+            return default_response_callback(*args, **kwargs)
+
+        def _validate_state(self, state, feature, index):
+            self.validations.append((index, len(feature['input_ids'])))
+
+    callback = ValidatingCallback()
+    followups = iter(('summarize', None))
+    rollout = MultiTurnRollout(
+        sampler=sampler,
+        template=template,
+        tool_manager=tool_manager,
+        response_callback=callback,
+        followup_fn=lambda *_: next(followups),
+        max_turns=3,
+    )
+    sampler.queue(_tool_call_text('search', {'q': 'x'}))
+    sampler.queue('finished tools')
+    sampler.queue('summary')
+
+    result = rollout([_user_traj()])[0]
+
+    assert result['followups'] == 1
+    assert len(callback.validations) == 6
+
+
+def test_transport_state_validation_covers_malformed_feedback(sampler, template, tool_manager):
+    class ValidatingCallback:
+        def __init__(self):
+            self.count = 0
+
+        def __call__(self, *args, **kwargs):
+            return default_response_callback(*args, **kwargs)
+
+        def _validate_state(self, state, feature, index):
+            self.count += 1
+
+    callback = ValidatingCallback()
+    rollout = MultiTurnRollout(
+        sampler=sampler,
+        template=template,
+        tool_manager=tool_manager,
+        response_callback=callback,
+        max_malformed_retries=1,
+    )
+    sampler.queue('<tool_call>{bad json}</tool_call>')
+    sampler.queue('done')
+
+    rollout([_user_traj()])
+
+    assert callback.count == 4
+
+
+def test_cancellation_drains_inflight_generation_without_starting_tools(template, tool_manager):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(FakeSampler):
+        def sample(self, pifs, sampling_params=None):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(pifs, sampling_params)
+
+        sample._enable_continous_work = True
+
+    sampler = BlockingSampler(template)
+    sampler.queue(_tool_call_text('search', {'q': 'x'}))
+    sampler.queue('must not run')
+    rollout = MultiTurnRollout(sampler=sampler, template=template, tool_manager=tool_manager)
+    execution = _RolloutExecution()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rollout, [_user_traj()], _execution=execution)
+        assert started.wait(timeout=5)
+        execution.cancel()
+        release.set()
+        with pytest.raises(CancelledError):
+            future.result(timeout=5)
+
+    assert sampler.sample_calls == 1
+
+
+def test_cancellation_drains_tool_batch_without_next_generation(template):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingTools(ToolManager):
+        def __init__(self):
+            super().__init__({})
+            self.register(EchoTool('search'))
+            self.calls = 0
+
+        def call_many(self, tool_calls, max_workers=None):
+            self.calls += 1
+            started.set()
+            assert release.wait(timeout=5)
+            return super().call_many(tool_calls, max_workers)
+
+    sampler = FakeSampler(template)
+    sampler.queue(_tool_call_text('search', {'q': 'x'}))
+    sampler.queue('must not run')
+    tools = BlockingTools()
+    rollout = MultiTurnRollout(sampler=sampler, template=template, tool_manager=tools)
+    execution = _RolloutExecution()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rollout, [_user_traj()], _execution=execution)
+        assert started.wait(timeout=5)
+        execution.cancel()
+        release.set()
+        with pytest.raises(CancelledError):
+            future.result(timeout=5)
+
+    assert tools.calls == 1
+    assert sampler.sample_calls == 1
+
+
+def test_cancellation_interrupts_known_harness_lease_wait_without_closing_pool(template):
+    started = threading.Event()
+    release = threading.Event()
+    sampled = []
+
+    class BlockingSampler(FakeSampler):
+        def sample(self, pifs, sampling_params=None):
+            key = self._key_of(pifs[0])
+            sampled.append(key)
+            if key == 'A':
+                started.set()
+                assert release.wait(timeout=5)
+            return super().sample(pifs, sampling_params)
+
+        sample._enable_continous_work = True
+
+    class Harness:
+        def before_generate(self, trajectory):
+            return trajectory
+
+    sampler = BlockingSampler(template)
+    sampler.queue_for('A', 'done A')
+    sampler.queue_for('B', 'done B')
+    pool = Leases([Harness()])
+    rollout = MultiTurnRollout(sampler=sampler, template=template, harness=pool, concurrency=2)
+    execution = _RolloutExecution()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(rollout, [_user_traj('A'), _user_traj('B')], _execution=execution)
+        assert started.wait(timeout=5)
+        execution.cancel()
+        release.set()
+        with pytest.raises(CancelledError):
+            future.result(timeout=5)
+
+    assert sampled == ['A']
+    assert pool._closing is False
+
+
+def test_failure_during_future_submission_preserves_original_error(template, monkeypatch):
+    sentinel = RuntimeError('first submission failed')
+
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            future = Future()
+            try:
+                future.set_result(function(*args))
+            except BaseException as error:
+                future.set_exception(error)
+            return future
+
+        @staticmethod
+        def shutdown(wait=True):
+            return None
+
+    class FailingSampler(FakeSampler):
+        def sample(self, pifs, sampling_params=None):
+            self.sample_calls += 1
+            raise sentinel
+
+        sample._enable_continous_work = True
+
+    monkeypatch.setattr('twinkle_agentic.rollout.base.ThreadPoolExecutor', lambda max_workers: ImmediateExecutor())
+    sampler = FailingSampler(template)
+    rollout = MultiTurnRollout(sampler=sampler, template=template, concurrency=3)
+
+    with pytest.raises(RuntimeError) as error:
+        rollout([_user_traj('A'), _user_traj('B'), _user_traj('C')])
+
+    assert error.value is sentinel
+    assert sampler.sample_calls == 1

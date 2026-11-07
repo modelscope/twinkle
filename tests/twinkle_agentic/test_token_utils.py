@@ -30,7 +30,7 @@ from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.template.base import Template
 from twinkle.template.contract import MediaBundle, RolloutState
 from twinkle_agentic.rollout.ledger import TurnLedger
-from twinkle_agentic.utils.token_utils import extend_with_bridge
+from twinkle_agentic.utils.token_utils import append_ids, extend_with_bridge
 
 
 # =============================================================================
@@ -225,6 +225,25 @@ def test_normal_bridge_append():
         messages + tool_messages, tokenize=False, add_generation_prompt=True)
     expected_bridge_ids = tokenizer.encode(s_after[len(s_before):], add_special_tokens=False)
     assert new_pif['input_ids'][len(before_ids):] == expected_bridge_ids
+
+
+def test_append_ids_extends_batched_token_type_ids_on_token_axis():
+    """HTTP nested lists must not turn [1, T] into [[...], 0, 0] after a tool turn."""
+    template = FakeTemplate(FakeTokenizer())
+    pif = {
+        'input_ids': [1, 2, 3],
+        'labels': [-100, -100, -100],
+        'completion_mask': [0, 0, 0],
+        'mm_token_type_ids': [[0, 0, 0]],
+    }
+
+    result = append_ids(pif, [4, 5], template, trainable=False)
+
+    assert result is not None
+    assert result['mm_token_type_ids'] == [[0, 0, 0, 0, 0]]
+    assert len(result['mm_token_type_ids'][0]) == len(result['input_ids'])
+    # The caller's wire-shaped feature remains untouched.
+    assert pif['mm_token_type_ids'] == [[0, 0, 0]]
 
 
 def test_non_prefix_extension_raises():

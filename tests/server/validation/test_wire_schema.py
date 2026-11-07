@@ -6,10 +6,10 @@ mock accepts ``**kwargs`` without inspecting anything, so "the mock did not comp
 is evidence of nothing about validation.
 """
 from __future__ import annotations
+from typing import Union, get_args, get_origin
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
-from typing import Union, get_args, get_origin
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS, is_encoded
 from twinkle.processor.base import InputProcessor
@@ -138,6 +138,22 @@ def test_unknown_json_fields_survive_a_round_trip():
     payload = {'input_ids': [1, 2], 'source_id': 'row-7', 'score': 0.5}
     exported = wire.export(_parse([payload])[0])
     assert exported == payload
+
+
+def test_complete_multi_turn_trajectory_metadata_survives_a_round_trip():
+    payload = {
+        'input_ids': [1, 10, 90, 20],
+        'labels': [10, -100, 20, -100],
+        'completion_mask': [1, 0, 1, 0],
+        'messages': [{'role': 'user', 'content': 'question'}, {'role': 'assistant', 'content': 'answer'}],
+        'tools': [{'type': 'function', 'function': {'name': 'tool', 'parameters': {}}}],
+        'turns': 2,
+        'stop_reason': 'stop',
+        'tool_stop': 'max_turns',
+        'truncated': False,
+        'rollout_logprobs': [-0.1, -0.2],
+    }
+    assert wire.export(_parse([payload])[0]) == payload
 
 
 def test_export_omits_unset_optional_fields():
