@@ -1047,6 +1047,11 @@ class REALLoss(GRPOLoss):
         self.real_tau = real_tau
         self.num_generations = num_generations
 
+    @property
+    def dp_balance_group_size(self) -> int:
+        # Each generation group is read off consecutive rows of the local batch.
+        return self.num_generations
+
     def _reduce_loss(
         self,
         logps: 'torch.Tensor',

@@ -117,6 +117,8 @@ class EmbeddingLoss(Loss):
     """
 
     supports_mrl = True
+    # Anchors, positives and negatives are laid out by position in groups of varying size.
+    dp_balance_group_size = None
 
     def __init__(self, mrl_dims: Optional[Dict[int, float]] = None, **kwargs):
         if mrl_dims and not self.supports_mrl:

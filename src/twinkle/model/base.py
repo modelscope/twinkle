@@ -354,6 +354,82 @@ class TrainableModel(ABC):
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
 
+    def _dp_balance_call(self, method: str, args: tuple, kwargs: Dict[str, Any]):
+        """Driver side of ``remote_function(dp_balance=True)``.
+
+        Returns ``(plan, args, kwargs)`` with the batch-aligned arguments reordered and a ``_dp_balance``
+        keyword for the workers, or ``None`` to dispatch the call unchanged. ``plan`` is ``None`` when the
+        batch keeps its order, so the result needs no restoring.
+        """
+        from .dp_balance import call_lengths, plan_call
+        if getattr(self, '_dp_balance_off', False):
+            return None
+        mesh = getattr(self, 'device_mesh', None)
+        if mesh is None or mesh.data_world_size <= 1:
+            return None
+        lengths = call_lengths(args, kwargs)
+        if lengths is None:
+            return None
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled']:
+            # Fixed at construction, so later calls skip the blocking spec round trip.
+            self._dp_balance_off = True
+            return None
+        if spec['group_size'] is None:
+            return None
+        plan = plan_call(lengths, mesh.data_world_size, spec, kwargs)
+        if plan is None:
+            return None
+        if plan.reorders:
+            args, kwargs = plan.reorder_call(args, kwargs)
+        kwargs = dict(kwargs, _dp_balance={'reordered': plan.reorders, 'metrics': plan.metrics})
+        return (plan if plan.reorders else None), args, kwargs
+
+    def _dp_balance_local(self, run: Callable, args: tuple, kwargs: Dict[str, Any]):
+        """Local-mode side of ``remote_function(dp_balance=True)``, where each rank holds only its own slice.
+
+        The ranks gather their sequence lengths and plan the joined batch exactly as the Ray driver would.
+        When the plan reorders, they swap samples so each rank runs its share of the reordered batch, then
+        send every per-sample output back to the rank that holds its input. Each decision below is made
+        alike on all ranks, from configuration or gathered data, so the collectives never diverge.
+        """
+        import torch.distributed as dist
+        from .dp_balance import call_leaves, call_lengths, exchange_call, leaf_layout, plan_call, restore_rank_outputs
+        from .dp_balance import to_cpu
+        mesh = getattr(self, 'device_mesh', None)
+        if (getattr(self, '_dp_balance_off', False) or mesh is None or mesh.data_world_size <= 1
+                or not dist.is_initialized()
+                or sorted(mesh.mesh.flatten().tolist()) != list(range(dist.get_world_size()))):
+            return run(*args, **kwargs)
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled']:
+            self._dp_balance_off = True
+            return run(*args, **kwargs)
+        if spec['group_size'] is None:
+            return run(*args, **kwargs)
+
+        def all_gather(value):
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, value)
+            # One rank per data rank, in data-rank order; TP / SP peers hold the same slice.
+            return [gathered[rank] for rank in mesh.get_collect_ranks()]
+
+        lengths = call_lengths(args, kwargs)
+        summaries = all_gather(None if lengths is None else (lengths, leaf_layout(call_leaves(args, kwargs))))
+        if (any(summary is None for summary in summaries) or len({len(summary[0]) for summary in summaries}) != 1
+                or any(summary[1] != summaries[0][1] for summary in summaries)):
+            # Joining the slices back into the batch get_slice cut needs equal slices with the same fields.
+            return run(*args, **kwargs)
+        plan = plan_call([length for summary in summaries for length in summary[0]], len(summaries), spec, kwargs)
+        if plan is None:
+            return run(*args, **kwargs)
+        balance = {'reordered': plan.reorders, 'metrics': plan.metrics}
+        if not plan.reorders:
+            return run(*args, **dict(kwargs, _dp_balance=balance))
+        rank_leaves = all_gather(to_cpu(call_leaves(args, kwargs)))
+        args, kwargs = exchange_call(plan, rank_leaves, mesh.data_rank, args, kwargs)
+        output = run(*args, **dict(kwargs, _dp_balance=balance))
+        return restore_rank_outputs(output, all_gather(to_cpu(output)), plan, mesh.data_rank)
     def upload_to_hub(self,
                       checkpoint_dir: str,
                       hub_model_id: str,

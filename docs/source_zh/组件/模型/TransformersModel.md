@@ -16,6 +16,7 @@ class TransformersModel:
                  fsdp_config: Dict[str, Any] = None,
                  grad_scaler_config: Dict[str, Any] = None,
                  memory_efficient_init: bool = False,
+                 dp_balance: bool = True,
                  **kwargs):
         ...
 
@@ -49,6 +50,7 @@ class TransformersModel:
   约束：生效的`output_dtype`必须与`param_dtype`一致（或缺省），否则构造时抛出`ValueError`——两者不一致会在FSDP单元边界引入dtype转换，梯度检查点重算时张量dtype不一致会导致训练报错；`reduce_dtype`只作用于梯度归约，不受该约束。
 - grad_scaler_config: PyTorch的grad_scaler初始化配置，参见：[PyTorch的GradScaler构造](https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/grad_scaler.py#L25)
 - memory_efficient_init: 是否启用FSDP内存高效初始化。启用后仅rank 0加载完整权重，其余rank通过广播获取分片参数，降低初始化阶段的内存和显存峰值。默认`False`。注意：该优化目前仅适用于 transformers <= 4.57.6；对于 transformers >= 5.0.0，可能会导致负面性能影响。
+- dp_balance: 是否均衡各DP rank的计算量，默认`True`。Ray模式下，`forward_backward` / `forward_only`把batch切给各DP rank之前，driver会重排batch，使每个rank样本数不变、计算量接近（用与worker相同的micro-batch规划来估算）。每个样本对应的参数（`old_logps`、`advantages`等）随之一起重排，返回的输出会还原为调用方的顺序。local（torchrun）模式下每个rank只持有自己那份数据，各rank会先汇总序列长度、用同样的方法规划，再互换样本，算完把每个样本的输出送回持有它的rank。对按样本求均值的loss，参数更新不变，只是缩短了等最慢rank的时间。训练指标会多出`dp_balance/*`（均衡前后的负载不均衡度、各rank token数、micro-batch数和padding比例）。成对的loss会让每对样本留在一起（`dp_balance_group_size`：DPO类和reward loss为2，REAL为`num_generations`）；embedding、listwise reranker loss以及普通函数形式的loss不会重排。`forward_only`重排后，`calculate_loss`会拒绝按样本的list参数（顺序已对不上），请改为传给`forward_only`。设为`False`则保持原始切分。
 - kwargs:
   - 如果你不希望传递模型config字段，可以把零星的配置从这里放置进去。后续这些参数会传递到`from_pretrained`或者`from_config`中。
 
