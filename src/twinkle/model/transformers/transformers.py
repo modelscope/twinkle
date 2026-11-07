@@ -40,6 +40,7 @@ from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpo
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
@@ -47,7 +48,7 @@ from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_grou
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
-from twinkle.processor.tasks import TASKS, get_task_spec
+from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
@@ -104,56 +105,6 @@ def _prepare_sampling_replay(
     return loss_mask, masked_labels, metadata
 
 
-def _resolve_task_context(model, task, template=None):
-    """Return a context manager that applies the right per-forward Patch for ``task``.
-
-    'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
-    Tasks whose registry row carries readout kinds (``TaskSpec.readout``: decision and any
-    future readout task) are the same: their loader installed a load-time custom forward or an
-    attachable head, so no per-forward context (no lm_head swap, no pooling patch) may
-    interfere -- the nullcontext set is read off the registry, NOT hand-listed.
-    'embedding' swaps lm_head for identity + installs a feature-extraction hook so
-    downstream pooling can run inside
-    ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
-    'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_outputs`` too.
-    'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
-    ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
-
-    Maintenance rule: a registry row with ``readout`` set needs no edit here (the check above
-    admits it automatically, and the forward-layer readout takes over). A row with an EMPTY
-    readout that this backend newly supports MUST land either in the nullcontext set above or
-    in a patch branch below -- the trailing raise is the gate forcing that explicit decision,
-    not an oversight; admitting it nowhere would run it down the causal path silently.
-    """
-    if task in (None, 'causal_lm') or get_task_spec(task).readout:
-        return contextlib.nullcontext()
-    if task in ('seq_cls', 'reranker'):
-        # Skip HF's internal pooling; surface per-token [B, T, num_labels] so the processor's
-        # _pool_last_valid_token handles packed/non-packed uniformly.
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        return apply_context(model, TransformersValuePatch(squeeze_single=False))
-    if task == 'embedding':
-        from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
-        return apply_context(model, TransformersEmbeddingPatch())
-    if task == 'generative_reranker':
-        from twinkle.patch.transformers_reranker import TransformersGenerativeRerankerPatch
-        pos_id, neg_id = _resolve_generative_reranker_token_ids(template)
-        return apply_context(model, TransformersGenerativeRerankerPatch(pos_id, neg_id))
-    if task == 'fused_lm_ce':
-        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
-        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
-        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
-        return apply_context(model, TransformersFusedCEPatch())
-    if task == 'value':
-        # PPO critic: reuse the num_labels=1 seq_cls ``score`` head but expose its PER-TOKEN output
-        # (skip the last-token pooling ``*ForSequenceClassification`` does), so forward returns a value
-        # V(s_t) at every token in ``logits`` [B, T]. Symmetric with Megatron's task='value'.
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        return apply_context(model, TransformersValuePatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: {", ".join(sorted(TASKS))}.')
-
-
 def _resolve_mm_graph_context(model, template):
     """Return a context manager that patches the model for multimodal uneven-graph protection.
 
@@ -165,22 +116,6 @@ def _resolve_mm_graph_context(model, template):
         from twinkle.patch.transformers_uneven_mm_graph import MultimodalUnevenGraphPatch
         return apply_context(model, MultimodalUnevenGraphPatch(template))
     return contextlib.nullcontext()
-
-
-def _resolve_generative_reranker_token_ids(template):
-    """Resolve the positive/negative token ids for a generative reranker from the template tokenizer.
-
-    Token strings default to ``yes`` / ``no`` and are overridable via the same env vars legacy swift
-    uses (``GENERATIVE_RERANKER_POSITIVE_TOKEN`` / ``_NEGATIVE_TOKEN``), so a checkpoint trained here
-    scores identically under legacy inference.
-    """
-    import os
-    assert template is not None and getattr(template, 'processor', None) is not None, (
-        'generative_reranker needs a template with a tokenizer; call set_template before forwarding.')
-    tokenizer = template.processor
-    pos_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
-    neg_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
-    return tokenizer.convert_tokens_to_ids(pos_token), tokenizer.convert_tokens_to_ids(neg_token)
 
 
 @dataclass
@@ -1013,7 +948,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # unwrapped module. Hooks registered there still fire: the wrapper's forward calls
         # the inner module's __call__.
         unwrapped_model = self.strategy.unwrap_model(self.model)
-        with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
+        with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
@@ -1195,7 +1130,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
-            with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
+            with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), lora_ctx:
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.

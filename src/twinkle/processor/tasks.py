@@ -10,9 +10,10 @@ packing/unpacking and sequence-shaped merging do not apply), and the optional
 The former per-task string sets scattered across ``_NON_LOGPS_TASKS``,
 ``InputProcessor.token_level_labels``, ``unpack_packed_sequences`` and
 ``merge_micro_batch_outputs`` were hand-synced copies of these two booleans; they all read
-this table now. Backend-specific per-forward patches (``_resolve_task_context`` in both
-backends) stay hand-written: each branch is private to its backend and carries its own
-constructor arguments.
+this table now. This table is the task's DATA contract only (it must stay importable from
+the processor layer); the model-layer BEHAVIOUR -- each backend's per-forward patch context
+and the readout tasks' head lifecycle -- lives in ``twinkle.model.tasks`` (one TaskSpec
+behaviour class per row; the two registries cover the same task set and check so at lookup).
 """
 
 from dataclasses import dataclass

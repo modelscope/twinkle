@@ -34,10 +34,11 @@ from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
-from twinkle.processor.tasks import TASKS, get_task_spec
+from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import construct_class, get_logger, pad_and_stack_tensors, selective_log_softmax
@@ -98,29 +99,6 @@ def _last_valid_positions(processor, batch, output_tensor):
         return tensor, last_idx, False
     _n = _packed.seq_lens.shape[0]
     return tensor, _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1, True
-
-
-def _resolve_task_context(model, task):
-    """The per-forward Patch for ``task``: 'embedding' swaps the output_layer for identity
-    (with TP/SP gather) and pools to ``[n_seqs, hidden]``; causal_lm/seq_cls/reranker/value
-    need no patch (mcore-bridge already builds the right head; pooling happens in forward_step).
-    Tasks whose registry row carries readout kinds (``TaskSpec.readout``: decision and any
-    future readout task) need none either -- their readout runs in forward_step via a load-time
-    custom forward or an attached task_head, never a patch. The nullcontext set is therefore
-    read off the registry, NOT hand-listed: a new readout task must not have to touch this.
-
-    Maintenance rule: a registry row with an EMPTY readout that this backend newly supports
-    MUST land in the nullcontext set above or in a patch branch below -- the trailing raise is
-    the gate forcing that explicit decision, not an oversight; admitting it nowhere would run
-    it down the causal path silently.
-    """
-    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker', 'value') \
-            or get_task_spec(task).readout:
-        return contextlib.nullcontext()
-    if task == 'embedding':
-        from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
-        return apply_context(model, MegatronEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: {", ".join(sorted(TASKS))}.')
 
 
 @dataclass
@@ -923,7 +901,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 completing_pending=completing_pending,
                 global_normalizer=global_normalizer,
                 **kwargs):
-            with _resolve_task_context(self.model, task):
+            with get_task_spec_obj(task).megatron_context(self.model):
                 losses = forward_backward_func(
                     forward_step_func=forward_step_func,
                     data_iterator=data_iter,
