@@ -832,15 +832,26 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         parameters used in the wrapped forward (a head invoked outside the wrapper would be
         silently dropped from gradient reduction). The head resolves PER CALL: an
         adapter-specific head first (``head_for``), the single attached head as fallback.
+        The seq_cls-family rows are dual-path: a model that does NOT carry an attached head
+        (its variant builds the head itself, e.g. ``*ForSequenceClassification``) takes the
+        normal call too -- the task's context patch above surfaces that built head.
         """
         spec = get_task_spec(task)
         if not spec.readout:
             return self.model(**inputs, use_cache=False)
+        spec_obj = get_task_spec_obj(task)
         if getattr(unwrapped_model, 'task_forward', None) is not None:
             return self.model(**inputs, use_cache=False)
-        head = get_task_spec_obj(task).head_for(unwrapped_model, adapter_name)
+        if not spec_obj.carries_task_head(unwrapped_model):
+            # A readout row without an attached head: decision has no other readout kind on
+            # this backend, so this is the loud failure; the seq_cls family falls back to
+            # its legacy in-model head (the context patch above already surfaces it).
+            if task == 'decision':
+                spec_obj.head_for(unwrapped_model, adapter_name)  # raises: neither kind present
+            return self.model(**inputs, use_cache=False)
+        head = spec_obj.head_for(unwrapped_model, adapter_name)
         meta = inputs.pop('decision_meta', None)
-        if meta is None:
+        if meta is None and task == 'decision':
             raise ValueError(
                 f'task {task!r} requires decision_meta in the batch (staged by its template _encode / '
                 'collate); got none.')
@@ -851,7 +862,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         def _readout(module, args, kwargs, output):
             hidden_states = output.last_hidden_state if head.encoder_backbone else output.hidden_states[-1]
             lm_logits = output.logits if head.needs_lm_logits else None
-            return head(hidden_states, lm_logits, meta)
+            out = head(hidden_states, lm_logits, meta)
+            # Decision heads return their own ModelOutput; the seq_cls family's standard
+            # head returns a plain tensor -- surface it as the logits dict the legacy
+            # per-token patch path produces.
+            return {'logits': out} if torch.is_tensor(out) else out
 
         handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
         try:
@@ -1035,12 +1050,20 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
         if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
-            raise NotImplementedError(
-                'micro-batching (micro_batch_size / max_tokens_per_micro_batch) is not yet supported for '
-                'readout tasks (decision): their labels and decision_meta are organized per RECORD, not per '
-                'sample, so the sample-level split here would desynchronize them from the micro-batch '
-                'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
-                'whose collate splits at record level.')
+            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+            # sample-level split here would desynchronize them from the micro-batch logits.
+            # Decision always reads out (its task_forward families included); the seq_cls
+            # family only when the model carries an attached head -- its legacy in-model
+            # head path merges per sample just fine and must keep micro-batching.
+            _task = kwargs.get('task', 'causal_lm')
+            if _task == 'decision' or get_task_spec_obj(_task).carries_task_head(
+                    self.strategy.unwrap_model(self.model)):
+                raise NotImplementedError(
+                    'micro-batching (micro_batch_size / max_tokens_per_micro_batch) is not yet supported for '
+                    'readout tasks (decision): their labels and decision_meta are organized per RECORD, not per '
+                    'sample, so the sample-level split here would desynchronize them from the micro-batch '
+                    'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
+                    'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
         batches = []
         for indices in plan:
@@ -2525,41 +2548,59 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._patch_frozen_towers(self.model)
-        # A per-adapter decision head (multi-head form): the caller ships the dev family
+        # A per-adapter readout head (multi-head form): the decision families ship the dev
         # loader's (module, class) NAME -- a built nn.Module cannot cross the Ray boundary --
-        # and the worker replays the build here. The FIRST head also lands on the single
+        # and the worker replays the build here; the seq_cls family's standard head is built
+        # by the task's spec from the config. The FIRST head also lands on the single
         # task_head / scoring_head names (single-head compatibility); later adapters only
         # enter the per-adapter dictionary.
         task_head_loader = kwargs.pop('task_head_loader', None)
-        if task_head_loader is not None:
-            self._add_task_head(adapter_name, task_head_loader)
-        # A task readout head (decision families) is not a LoRA target, so peft's
-        # mark-only-adapters sweep just froze it; re-activation rules live on the task's spec
+        task = kwargs.pop('task', None)
+        num_labels = kwargs.pop('num_labels', None)
+        if task_head_loader is not None or task is not None:
+            self._add_task_head(adapter_name, task or 'decision', task_head_loader, num_labels)
+        # A task readout head is not a LoRA target, so peft's mark-only-adapters sweep just
+        # froze one attached before the wrap; re-activation rules live on the task's spec
         # (a no-op for models without that task's component).
-        get_task_spec_obj('decision').reactivate(self.model)
+        get_task_spec_obj(task or 'decision').reactivate(self.model)
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
 
-    def _add_task_head(self, adapter_name: str, task_head_loader) -> None:
-        """Replay the dev family loader's head build worker-side and register it per adapter.
+    def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
+        """Build one task head worker-side and register it per adapter.
 
-        The dictionary lives on the UNWRAPPED model -- the same object ``head_for`` reads at
-        forward time (the wrapper object is not reachable from the readout path). The FIRST
-        head also lands on the single task_head / scoring_head names (single-head
-        compatibility); later adapters only enter the dictionary."""
+        Two head flavours (see ``twinkle.model.head``): the decision families' heads are
+        family artifacts rebuilt from the shipped loader NAME; the seq_cls family's standard
+        head is built by the task's spec from the config (+ ``num_labels``). The dictionary
+        lives on the UNWRAPPED model -- the same object ``head_for`` reads at forward time
+        (the wrapper object is not reachable from the readout path). The FIRST head also
+        lands on the single task_head / scoring_head names (single-head compatibility);
+        later adapters only enter the dictionary."""
         import importlib
         unwrapped_model = self.strategy.unwrap_model(self.model)
-        module_name, loader_name = task_head_loader
-        loader_cls = getattr(importlib.import_module(module_name), loader_name)
-        processor = self._default_tokenizer
-        if processor is None:
-            from transformers import AutoTokenizer
-            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-            self._default_tokenizer = processor
-        head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
-        spec = get_task_spec_obj('decision')
+        spec = get_task_spec_obj(task)
+        if not spec.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
+        if task == 'decision':
+            if task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+            module_name, loader_name = task_head_loader
+            loader_cls = getattr(importlib.import_module(module_name), loader_name)
+            processor = self._default_tokenizer
+            if processor is None:
+                from transformers import AutoTokenizer
+                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+                self._default_tokenizer = processor
+            head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
+        else:
+            if task_head_loader is not None:
+                raise ValueError(
+                    'task_head_loader is the decision families\' head replay; '
+                    f'task={task!r} builds its standard head from the config instead.')
+            head = spec.build_head(self.hf_config, num_labels)
         heads = getattr(unwrapped_model, 'task_heads', None)
-        if not heads:
+        if heads is None:
             spec.attach_transformers(unwrapped_model, head)  # aligns internally + dual names
             unwrapped_model.task_heads = {adapter_name: head}
         else:

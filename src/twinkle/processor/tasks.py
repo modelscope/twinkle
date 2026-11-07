@@ -44,10 +44,17 @@ class TaskSpec:
 TASKS = {
     'causal_lm': TaskSpec(),
     'fused_lm_ce': TaskSpec(),
-    'value': TaskSpec(requires_logps=False),
+    # value / seq_cls / reranker are dual-path: a model variant that builds the head itself
+    # (HF *ForSequenceClassification / mcore-bridge task_type) runs the legacy path; a model
+    # carrying an ATTACHED head (built by the task spec, bound per adapter on multi-LoRA)
+    # runs the forward-layer readout. Which one a model takes is decided at forward time
+    # by whether it carries the head (TaskSpec.carries_task_head).
+    'value': TaskSpec(requires_logps=False, readout=('task_head',)),
     'embedding': TaskSpec(requires_logps=False, token_level_labels=False, postprocess='_postprocess_embedding'),
-    'seq_cls': TaskSpec(requires_logps=False, token_level_labels=False, postprocess='_postprocess_seq_cls'),
-    'reranker': TaskSpec(requires_logps=False, token_level_labels=False, postprocess='_postprocess_seq_cls'),
+    'seq_cls': TaskSpec(
+        requires_logps=False, token_level_labels=False, postprocess='_postprocess_seq_cls', readout=('task_head',)),
+    'reranker': TaskSpec(
+        requires_logps=False, token_level_labels=False, postprocess='_postprocess_seq_cls', readout=('task_head',)),
     'generative_reranker': TaskSpec(
         requires_logps=False, token_level_labels=False, postprocess='_postprocess_generative_reranker'
     ),

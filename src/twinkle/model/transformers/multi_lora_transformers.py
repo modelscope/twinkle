@@ -18,12 +18,18 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..base import ModelLoaderProtocol
-from ..multi_lora import MultiLora
+from ..multi_lora import MultiLora, MultiLoraTaskHeadSlots
+from ..tasks import get_task_spec_obj
 from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
 
 
 @remote_class()
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
+    # Class-level defaults: a subclass that overrides __init__ wholesale (ms-swift's sentence-
+    # transformer host builds its own state without super()) still reads as a slot-less host
+    # instead of hitting AttributeError on the head-slot machinery.
+    _head_task: Optional[str] = None
+    task_head_slots: Optional[MultiLoraTaskHeadSlots] = None
 
     def __init__(
             self,  # noqa
@@ -42,6 +48,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_r: int = 32,
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
+            task: Optional[str] = None,
+            task_head_loader: Optional[tuple] = None,
+            num_labels: Optional[int] = None,
             model_loader: Optional[ModelLoaderProtocol] = None,
             gradient_checkpointing: bool = True,
             gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
@@ -133,6 +142,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # lower-precision dtype. Align the preallocated slots before FSDP2
         # records their parameter and gradient dtypes.
         self._ensure_lora_dtype(self.model)
+        # Head slots -- the same pre-allocation the megatron multi-LoRA host does: one task
+        # head per LoRA slot on the (still unwrapped) model, so every slot's parameters
+        # enter the DDP/FSDP wrap (the lazy wrap below fires on the first forward / optimizer
+        # setup, and a tenant added AFTER that could never join the reducer). A multi-tenant
+        # host serves ONE head task (fixed here); None = this host serves no head-task
+        # tenant: no slots, no memory.
+        self._head_task = task or ('decision' if task_head_loader is not None else None)
+        self._task_head_loader = task_head_loader
+        self._num_labels = num_labels
+        self.task_head_slots = MultiLoraTaskHeadSlots(max_loras) if self._head_task is not None else None
+        if self.task_head_slots is not None:
+            self._validate_task_head_config()
+            self._build_task_head_slots()
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -172,6 +194,72 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # Reset must restore the synchronized (and possibly sharded) basis,
             # not the rank-local initialization captured before model wrapping.
             self.multi_adapter.save_initial_weights()
+
+    def _task_head_host(self):
+        """The module the head slots hang on: the unwrapped model -- the same object the
+        forward-layer readout hook resolves heads on."""
+        return self.strategy.unwrap_model(self.model)
+
+    def _validate_task_head_config(self) -> None:
+        """Fail at construction, before any slot or memory is spent."""
+        task = self._head_task
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to pre-allocate.')
+        if task == 'decision':
+            if self._task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+        elif self._task_head_loader is not None:
+            raise ValueError(
+                'task_head_loader is the decision families\' head replay; '
+                f'task={task!r} builds its standard head from the config instead.')
+        elif self._num_labels is None:
+            # Validates num_labels / hidden_size now (the actual build happens per slot).
+            spec_obj.build_head(self.hf_config, None)
+
+    def _build_task_head_slots(self) -> None:
+        """Pre-allocate the head slots on the unwrapped model (see ``MultiLoraTaskHeadSlots``).
+
+        Two head flavours (see ``twinkle.model.head``): 'decision' replays the dev family
+        loader's build from the shipped ``(module, class)`` NAME; the seq_cls family builds
+        its standard head from the config (+ ``num_labels``), aligned to the model's
+        device/dtype policy."""
+        import importlib
+        spec_obj = get_task_spec_obj(self._head_task)
+        host = self._task_head_host()
+        if self._head_task == 'decision':
+            module_name, loader_name = self._task_head_loader
+            loader_cls = getattr(importlib.import_module(module_name), loader_name)
+            processor = self._default_tokenizer
+            if processor is None:
+                from transformers import AutoTokenizer
+                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+                self._default_tokenizer = processor
+
+            def build_head():
+                head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
+                return spec_obj.align_head(host, head)
+        else:
+
+            def build_head():
+                return spec_obj.align_head(host, spec_obj.build_head(self.hf_config, self._num_labels))
+        self.task_head_slots.build(host, build_head)
+
+    def _bind_task_head_slot(self, adapter_name: str) -> None:
+        """Bind the lowest free head slot to a tenant (see ``MultiLoraTaskHeadSlots.bind``)."""
+        if self.task_head_slots is None:
+            raise RuntimeError(
+                'this model was built without a head task (task= / task_head_loader=), so it carries '
+                'no task head slots; construct it with task= to serve head-task tenants.')
+        self.task_head_slots.bind(adapter_name, self._task_head_host())
+
+    def _release_task_head_slot(self, adapter_name: str) -> None:
+        """Unbind a tenant's head slot and restore its build-time weights in place."""
+        if self.task_head_slots is None:
+            return
+        self.task_head_slots.release(adapter_name, self._task_head_host(),
+                                     self.multi_adapter._write_param_tensor)
 
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
@@ -305,17 +393,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _register_adapter(self, adapter_name: str, config: LoraConfig, **kwargs) -> None:
         """Register an already validated LoRA configuration in a free slot."""
-        # A decision tenant's per-adapter head: the driver ships the dev family loader's
-        # (module, class) NAME and this worker replays the build into the per-adapter
-        # dictionary. The head must join the model before the lazy wrap -- the DDP/FSDP
-        # reducer only discovers parameters at wrap time -- so refuse BEFORE any state
-        # mutation below when the wrap already happened.
-        task_head_loader = kwargs.pop('task_head_loader', None)
-        if task_head_loader is not None and self._model_wrapped:
-            raise RuntimeError(
-                'a decision task_head cannot be added after the DDP/FSDP wrap: the reducer '
-                'only discovers parameters at wrap time. Add the adapter before the first '
-                'forward / optimizer setup.')
+        # ``task`` is head-resource preparation only: it must match the task this host was
+        # built for (the slot's head type is fixed at construction); the forward task stays
+        # a per-call argument.
+        task = kwargs.pop('task', None)
+        if task is not None and task != self._head_task:
+            raise ValueError(
+                f'this host was built for task={self._head_task!r} head slots; '
+                f'add_adapter_to_model(task={task!r}) does not match. Construct the host with '
+                'the matching task to serve that head task.')
+        if task is not None:  # equal to the construction task (validated above)
+            # Bind BEFORE any state mutation below, so binding errors surface first; the
+            # acquire failure path rolls it back.
+            self._bind_task_head_slot(adapter_name)
         config = self.strategy.prepare_adapter_config(
             config,
             enable_ep=getattr(self, '_enable_expert_parallel', False),
@@ -335,9 +425,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config)
         except Exception:
             self.optimizer_group.pop(adapter_name, None)
+            self._release_task_head_slot(adapter_name)
             raise
-        if task_head_loader is not None:
-            self._add_task_head(adapter_name, task_head_loader)
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
@@ -437,9 +526,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
-        heads = getattr(self.strategy.unwrap_model(self.model), 'task_heads', None)
-        if heads is not None:
-            heads.pop(adapter_name, None)
+        self._release_task_head_slot(adapter_name)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         with self._adapter_context(adapter_name):

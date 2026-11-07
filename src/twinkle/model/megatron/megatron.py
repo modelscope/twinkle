@@ -209,10 +209,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         })
         seed = kwargs.pop('seed', None) or seed_from_env(42)
         model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
-        # A decision-family readout head is owned by the model family's dev loader; a built
-        # nn.Module cannot cross the Ray worker boundary, so the driver ships the loader's
-        # (module, class) NAME and this worker replays the build -- see ``_attach_task_head``.
+        # A readout task head is owned either by the model family's dev loader (decision) or
+        # built by the task spec itself (the seq_cls family's standard head); a built
+        # nn.Module cannot cross the Ray worker boundary, so the driver ships the decision
+        # loader's (module, class) NAME and this worker replays the build -- see
+        # ``_attach_task_head``.
         task_head_loader = kwargs.pop('task_head_loader', None)
+        task = kwargs.pop('task', None)
+        num_labels = kwargs.pop('num_labels', None)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None:
@@ -241,8 +245,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             attn_impl=attn_impl,
             **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
-        if task_head_loader is not None:
-            self._attach_task_head(task_head_loader)
+        if task_head_loader is not None or task is not None:
+            self._attach_task_head(task or 'decision', task_head_loader, num_labels)
         if vit_gradient_checkpointing is not None:
             self._apply_vit_gradient_checkpointing(vit_gradient_checkpointing, vit_gradient_checkpointing_kwargs)
         if new_special_tokens:
@@ -263,30 +267,44 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
 
-    def _attach_task_head(self, task_head_loader) -> None:
-        """Replay the dev family loader's head build worker-side and attach it to the last-PP chunk.
+    def _attach_task_head(self, task, task_head_loader=None, num_labels=None) -> None:
+        """Build the readout task's head worker-side and attach it to the last-PP chunk.
 
-        The head is a plain nn.Module owned by the model family's loader (framework-agnostic by
-        design), so the megatron builder ships only the loader's ``(module, class)`` name; this
-        worker rebuilds it from the local model path, config and tokenizer. Attachment rules
-        (which module, which names) live on the task's spec (``twinkle.model.tasks``); placement
-        here stays BEFORE the strategy wraps the chunks, and only the last pipeline stage
-        produces the lm logits the head reads.
+        Two head flavours (see ``twinkle.model.head``): the decision families' heads are
+        family artifacts -- the driver ships the loader's ``(module, class)`` NAME and this
+        worker replays the build; the seq_cls family's standard head is built by the task's
+        spec from the config (+ ``num_labels``). Attachment rules (which module, which
+        names) live on the task's spec (``twinkle.model.tasks``); placement here stays
+        BEFORE the strategy wraps the chunks, and only the last pipeline stage produces the
+        output the head reads.
         """
         import importlib
         from megatron.core import mpu
         if not mpu.is_pipeline_last_stage():
             return
-        module_name, loader_name = task_head_loader
-        loader_cls = getattr(importlib.import_module(module_name), loader_name)
-        processor = self._default_tokenizer
-        if processor is None:
-            from transformers import AutoTokenizer
-            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-            self._default_tokenizer = processor
-        head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
+        if task == 'decision':
+            if task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+            module_name, loader_name = task_head_loader
+            loader_cls = getattr(importlib.import_module(module_name), loader_name)
+            processor = self._default_tokenizer
+            if processor is None:
+                from transformers import AutoTokenizer
+                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+                self._default_tokenizer = processor
+            head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
+        else:
+            if task_head_loader is not None:
+                raise ValueError(
+                    'task_head_loader is the decision families\' head replay; '
+                    f'task={task!r} builds its standard head from the config instead.')
+            head = spec_obj.build_head(self.hf_config, num_labels)
         head = head.to(Platform.get_local_device())
-        get_task_spec_obj('decision').attach_megatron(self.model[-1], head)
+        spec_obj.attach_megatron(self.model[-1], head)
 
     def _apply_vit_gradient_checkpointing(self, enabled: bool, gc_kwargs: Optional[Dict[str, Any]]) -> None:
         """Checkpoint each HF vision tower of a multimodal mcore model.
@@ -734,16 +752,93 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             _loss_instance = loss_instance
             is_last_pp = mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage)
             spec = get_task_spec(task)
+            # Readout-family dispatch runs ahead of the legacy per-task branches: the row's
+            # readout kinds + the model's own components decide, never the task name alone.
+            spec_obj = get_task_spec_obj(task) if spec.readout else None
             try:
                 if task == 'embedding':
                     # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
                     if is_last_pp:
                         embeddings = output_tensor
+                elif spec_obj is not None and spec_obj.carries_task_head(unwrapped_model):
+                    # The model carries an ATTACHED head (single, per-adapter, or a multi-LoRA
+                    # slot): the forward-layer readout drives it. The head resolves PER CALL
+                    # (adapter_name is the forward_backward local the closure captures;
+                    # strictly on multi-head models). The head call stays inside
+                    # forward_step_func so mcore's backward covers its parameters.
+                    if is_last_pp:
+                        head = spec_obj.head_for(unwrapped_model, adapter_name)
+                        if head.needs_lm_logits:
+                            # Decision verbalizer heads: the last-PP output tensor is the
+                            # vocab-parallel lm logits; slice each readout record's last valid
+                            # token (same position machinery as the bridge-head pool below),
+                            # all-gather the vocab axis (verbalizer heads log-softmax over the
+                            # WHOLE vocab -- a shard would change the normalization), and hand
+                            # the head pre-read rows.
+                            if decision_meta is None:
+                                raise ValueError(
+                                    f'task {task!r} requires decision_meta in the batch (staged by its template '
+                                    '_encode / collate); got none.')
+                            output_tensor, _last_idx, _is_packed = _last_valid_positions(
+                                processor, batch, output_tensor)
+                            _record_index = torch.as_tensor(
+                                [int(r) for r in decision_meta['record_index']], dtype=torch.long,
+                                device=output_tensor.device)
+                            _cols = _last_idx[_record_index]
+                            readout = (output_tensor[0, _cols] if _is_packed
+                                        else output_tensor[_record_index, _cols])  # [total_q, V/TP]
+                            readout_logits = _gather_vocab_parallel(readout)  # [total_q, V]
+                            scoring = head.forward_readout(readout_logits, decision_meta)
+                            # The readout replaces the whole output: per-question logits plus the
+                            # option_mask / kinds / counts fields its loss and metric consume;
+                            # post_loss_function picks them up off the batch.
+                            batch['decision_outputs'] = {
+                                'logits': scoring.logits,
+                                'option_mask': scoring.option_mask,
+                                'kinds': scoring.kinds,
+                                'counts': scoring.counts,
+                            }
+                            output_tensor = scoring.logits
+                        elif task == 'decision':
+                            # Hidden-state decision families (Clef / Laya ...): transformers-only
+                            # loaders; no megatron readout for them.
+                            raise NotImplementedError(
+                                f'task {task!r} on the megatron backend only supports lm-logits heads '
+                                '(needs_lm_logits); hidden-state readout awaits hidden-state exposure.')
+                        elif task == 'value':
+                            # The standard hidden heads below: their context swapped the output
+                            # layer for an identity, so the tensor is the last hidden states
+                            # [b, s, h]. value: per-token V(s_t) ([b, s]; the head squeezes its
+                            # single label); PPOValueLoss masks to response tokens.
+                            if labels is not None:
+                                _packed = batch.get('packed_seq_params')
+                                cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                                per_token = head(output_tensor, None, None)
+                                per_token = processor.postprocess_tensor_cp(per_token, cu_seqlens=cu_seqlens_q)
+                                unpacked_logits = per_token
+                        else:
+                            # seq_cls / reranker: pool the last valid token per sequence (same
+                            # position machinery as the bridge-head path below) and let the head
+                            # score those rows -> [n_seqs, num_labels]. These losses read
+                            # logits (require_logps=False); the pool runs regardless of labels
+                            # because a preference row carries no next-token labels at all.
+                            output_tensor, _last_idx, _is_packed = _last_valid_positions(
+                                processor, batch, output_tensor)
+                            if not _is_packed:
+                                rows = output_tensor[
+                                    torch.arange(output_tensor.shape[0], device=output_tensor.device), _last_idx]
+                            else:
+                                # Packed: one row [1, total, h]; each segment ends at its last token.
+                                rows = output_tensor[0, _last_idx]
+                            unpacked_logits = head(rows, None, None)
+                elif task == 'decision' and is_last_pp:
+                    # A decision model without any head: the task_forward families are
+                    # transformers-only, so this has exactly one resolution -- the loud raise.
+                    spec_obj.head_for(unwrapped_model, adapter_name)
                 elif task in ('seq_cls', 'reranker', 'generative_reranker'):
-                    # mcore-bridge emits per-token head output; pool the last valid token per sequence
-                    # here (transformers does this inside *ForSequenceClassification). These losses read
-                    # logits (require_logps=False); the pool runs regardless of labels because a
-                    # preference row carries no next-token labels at all.
+                    # Legacy path: mcore-bridge emits per-token head output from the model's own
+                    # built head; pool the last valid token per sequence here (transformers does
+                    # this inside *ForSequenceClassification).
                     if is_last_pp:
                         output_tensor, _last_idx, _is_packed = _last_valid_positions(processor, batch, output_tensor)
                         if not _is_packed:
@@ -753,58 +848,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             # Packed: one row [1, total, C]; each segment ends at its last token.
                             unpacked_logits = output_tensor[0, _last_idx]
                 elif task == 'value':
-                    # PPO critic: the same num_labels=1 seq_cls head, but keep its per-token V(s_t)
-                    # riding the logits channel ([b, s]); PPOValueLoss masks to response tokens.
-                    # Non-packed / non-SP only, mirroring the transformers TransformersValuePatch scope.
+                    # Legacy path -- PPO critic over the bridge-built head: keep its per-token
+                    # V(s_t) riding the logits channel ([b, s]); PPOValueLoss masks to response
+                    # tokens. Non-packed / non-SP only, mirroring the transformers
+                    # TransformersValuePatch scope.
                     if is_last_pp and labels is not None:
                         _packed = batch.get('packed_seq_params')
                         cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                         output_tensor = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
                         # [b, s, 1] -> [b, s] (num_labels=1); already per-token, no pooling.
                         unpacked_logits = output_tensor.squeeze(-1) if output_tensor.dim() == 3 else output_tensor
-                elif spec.readout:
-                    # Decision-family readout: dispatched by the registry row's readout kinds,
-                    # never by task name. The last-PP output tensor is the vocab-parallel lm
-                    # logits; slice each readout record's last valid token (same position
-                    # machinery as the seq_cls pool above), all-gather the vocab axis (verbalizer
-                    # heads log-softmax over the WHOLE vocab -- a shard would change the
-                    # normalization), and hand the head pre-read rows. The head call stays inside
-                    # forward_step_func so mcore's backward covers its parameters.
-                    if is_last_pp:
-                        # Per-adapter resolution: a multi-tenant model carries one head per
-                        # decision adapter (task_heads); a single-head model falls back to its
-                        # attached task_head. ``adapter_name`` is the forward_backward local the
-                        # closure captures (the kwargs pop above).
-                        head = get_task_spec_obj(task).head_for(unwrapped_model, adapter_name)
-                        if decision_meta is None:
-                            raise ValueError(
-                                f'task {task!r} requires decision_meta in the batch (staged by its template '
-                                '_encode / collate); got none.')
-                        if not head.needs_lm_logits:
-                            # Hidden-state families (Clef / Laya ...): deferred until mcore-bridge
-                            # exposes hidden states from the last PP stage.
-                            raise NotImplementedError(
-                                f'task {task!r} on the megatron backend only supports lm-logits heads '
-                                '(needs_lm_logits); hidden-state readout awaits hidden-state exposure.')
-                        output_tensor, _last_idx, _is_packed = _last_valid_positions(processor, batch, output_tensor)
-                        _record_index = torch.as_tensor(
-                            [int(r) for r in decision_meta['record_index']], dtype=torch.long,
-                            device=output_tensor.device)
-                        _cols = _last_idx[_record_index]
-                        readout = (output_tensor[0, _cols] if _is_packed
-                                    else output_tensor[_record_index, _cols])  # [total_q, V/TP]
-                        readout_logits = _gather_vocab_parallel(readout)  # [total_q, V]
-                        scoring = head.forward_readout(readout_logits, decision_meta)
-                        # The readout replaces the whole output: per-question logits plus the
-                        # option_mask / kinds / counts fields its loss and metric consume;
-                        # post_loss_function picks them up off the batch.
-                        batch['decision_outputs'] = {
-                            'logits': scoring.logits,
-                            'option_mask': scoring.option_mask,
-                            'kinds': scoring.kinds,
-                            'counts': scoring.counts,
-                        }
-                        output_tensor = scoring.logits
                 elif labels is not None and is_last_pp:
                     _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
                     _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)

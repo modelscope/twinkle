@@ -14,10 +14,18 @@ explicit decision (admitting a task nowhere would run it down the causal path si
 Tasks whose registry row carries readout kinds state no patch at all: their loader
 installed a load-time custom forward or an attachable head, and the forward-layer
 readout (a one-shot hook / the forward_step readout branch) takes over.
+
+Readout tasks come in two head flavours, split by WHO can build the head:
+the decision families' heads are model-family artifacts (weights and calibration state
+shipped in the model directory, rebuilt worker-side from a shipped loader NAME), while
+the seq_cls family's head is a standard Linear any causal base can carry
+(``twinkle.model.head.SeqClsHead``, built by ``build_head``). The head LIFECYCLE rules
+(where a head lives, how it routes per adapter, how peft's freeze sweep is undone) are
+task-independent and live once on the base class below.
 """
 
 import contextlib
-from typing import Any, ClassVar, Optional
+from typing import ClassVar, Optional
 
 from twinkle.processor.tasks import TASKS, TaskSpec as TaskRow
 
@@ -53,147 +61,48 @@ class TaskSpec:
             f'{type(self).__name__}.megatron_context is not implemented: a task newly supported by '
             'this backend must state its context here explicitly (a patch, or nullcontext).')
 
-    # --- component (head) lifecycle; readout tasks override --------------------------------
+    # --- component (head) lifecycle; readout tasks carry one ------------------------------
+    # Task-independent rules, inherited as-is by every readout task: only WHICH head a
+    # task builds differs (``build_head`` / the decision families' loader replay).
 
     def head_of(self, model):
-        """The task's attached component (head). Only tasks whose registry row declares a
-        'task_head' readout kind override this; the base raise means the task carries none."""
-        raise NotImplementedError(f'{type(self).__name__} carries no attachable component.')
-
-    def attach(self, model, head, **kwargs) -> None:
-        """Install this task's model-side component (head). Default: this task has none."""
-
-    def reactivate(self, model) -> None:
-        """Re-enable this task's component for adapter training (peft froze it). Default: no-op."""
-
-
-def _nullcontext(model, template=None):
-    return contextlib.nullcontext()
-
-
-#: The no-patch context, shared as a staticmethod so subclasses can state it declaratively:
-#: ``transformers_context = _no_patch`` / ``megatron_context = _no_patch``.
-_no_patch = staticmethod(_nullcontext)
-
-
-class CausalLM(TaskSpec):
-    task_name = 'causal_lm'
-    transformers_context = _no_patch
-    megatron_context = _no_patch
-
-
-class SeqCls(TaskSpec):
-    task_name = 'seq_cls'
-
-    def transformers_context(self, model, template=None):
-        # Skip HF's internal pooling; surface per-token [B, T, num_labels] so the processor's
-        # _pool_last_valid_token handles packed/non-packed uniformly.
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        from twinkle.patch import apply_context
-        return apply_context(model, TransformersValuePatch(squeeze_single=False))
-
-    megatron_context = _no_patch  # mcore-bridge already builds the head; pooling in forward_step
-
-
-class Reranker(SeqCls):
-    task_name = 'reranker'
-
-
-class Embedding(TaskSpec):
-    task_name = 'embedding'
-
-    def transformers_context(self, model, template=None):
-        # lm_head -> identity + a feature-extraction hook, so downstream pooling can run inside
-        # InputProcessor.postprocess_outputs(task='embedding', ...).
-        from twinkle.patch import apply_context
-        from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
-        return apply_context(model, TransformersEmbeddingPatch())
-
-    def megatron_context(self, model):
-        # The output_layer -> identity swap (with TP/SP gather), pooling to [n_seqs, hidden].
-        from twinkle.patch import apply_context
-        from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
-        return apply_context(model, MegatronEmbeddingPatch())
-
-
-class GenerativeReranker(TaskSpec):
-    task_name = 'generative_reranker'
-
-    def transformers_context(self, model, template=None):
-        from twinkle.patch import apply_context
-        from twinkle.patch.transformers_reranker import TransformersGenerativeRerankerPatch
-        pos_id, neg_id = _resolve_generative_reranker_token_ids(template)
-        return apply_context(model, TransformersGenerativeRerankerPatch(pos_id, neg_id))
-
-    megatron_context = _no_patch  # mcore-bridge already builds the head; pooling in forward_step
-
-
-class FusedCE(TaskSpec):
-    task_name = 'fused_lm_ce'
-
-    def transformers_context(self, model, template=None):
-        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
-        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
-        from twinkle.patch import apply_context
-        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
-        return apply_context(model, TransformersFusedCEPatch())
-
-    # megatron_context stays the base raise: this task is transformers-only.
-
-
-class Value(TaskSpec):
-    task_name = 'value'
-
-    def transformers_context(self, model, template=None):
-        # PPO critic: reuse the num_labels=1 seq_cls ``score`` head but expose its PER-TOKEN
-        # output (skip the last-token pooling ``*ForSequenceClassification`` does), so forward
-        # returns a value V(s_t) at every token in ``logits`` [B, T].
-        from twinkle.patch import apply_context
-        from twinkle.patch.transformers_value import TransformersValuePatch
-        return apply_context(model, TransformersValuePatch())
-
-    megatron_context = _no_patch  # mcore-bridge already builds the head; per-token via logits
-
-
-class Decision(TaskSpec):
-    """The decision (System-1 scoring) readout task: no patch on either backend -- the
-    loader installed a load-time custom forward (``task_forward``: the transformers-only
-    branch families) or an attachable head (``task_head``), and the forward-layer readout
-    (the one-shot hook / the forward_step readout branch) drives it. This class owns that
-    head's lifecycle: alignment, attachment (per backend), and re-activation after a peft
-    wrap. The head OBJECT stays owned by the model family's dev loader (framework-agnostic
-    nn.Module, often rebuilt worker-side from a shipped loader name); only its placement
-    rules live here."""
-
-    task_name = 'decision'
-    transformers_context = _no_patch
-    megatron_context = _no_patch
-
-    def head_of(self, model):
+        """The model's single attached head for this task. Readout-task models resolve
+        (their loader or adapter attached one); the raise below is the loud failure when
+        a readout task runs on a model that carries neither readout kind."""
         head = getattr(model, 'task_head', None)
         if head is None:
             raise ValueError(
-                "task 'decision' declares readout kinds ['task_head', 'task_forward'] but the model "
-                'carries neither: the transformers-only task_forward families (branch isolation / '
-                'direct backbone) are rejected by their loader at build time, and a task_head must '
-                'be attached by the decision loader at build time.')
+                f"task {self.task_name!r} declares readout kinds {list(self.row().readout)} but the "
+                'model carries no task_head: attach one (the task loader at build time, '
+                'task_head_loader, or a multi-LoRA head slot); the transformers-only '
+                'task_forward families are rejected by their loader at build time.')
         return head
 
     def head_for(self, model, adapter_name=None):
         """The head for ONE call: the per-adapter dictionary first (multi-head models), the
         single attached head as fallback. A model carrying per-adapter heads resolves them
-        STRICTLY -- an adapter without its own head raises instead of silently borrowing one
-        (two decision adapters would otherwise pollute each other's gradients through a
-        shared head)."""
+        STRICTLY -- the dictionary counts even when empty, and an adapter without its own
+        head raises instead of silently borrowing one (two adapters of the same head task
+        would otherwise pollute each other's gradients through a shared head)."""
         heads = getattr(model, 'task_heads', None)
-        if heads:
+        if heads is not None:
             if adapter_name not in heads:
                 raise ValueError(
-                    f'adapter {adapter_name!r} carries no decision task_head; bind one when the '
-                    'adapter is added (task_head_loader, or task="decision" on the megatron '
-                    'multi-tenant host) or train it as a non-decision adapter.')
+                    f'adapter {adapter_name!r} carries no {self.task_name} task_head; bind one when '
+                    'the adapter is added (task= on add_adapter_to_model, or task_head_loader) or '
+                    'train it as an adapter of another task.')
             return heads[adapter_name]
         return self.head_of(model)
+
+    def carries_task_head(self, model) -> bool:
+        """Whether THIS model carries the task's attachable head (per-adapter dictionary
+        or single head). The dictionary counts even when empty: a multi-LoRA host built
+        for a head task has no in-model fallback, so its readout must resolve through it
+        and fail loudly instead of silently running a legacy path."""
+        if isinstance(model, (list, tuple)):  # megatron chunks
+            return any(self.carries_task_head(chunk) for chunk in model)
+        return (getattr(model, 'task_heads', None) is not None
+                or getattr(model, 'task_head', None) is not None)
 
     @staticmethod
     def align_head(model, head):
@@ -243,6 +152,150 @@ class Decision(TaskSpec):
                 param.requires_grad_(True)
             if param.dtype == torch.float16:
                 param.data = param.data.to(torch.float32)
+
+    def build_head(self, config, num_labels=None):
+        """Build this task's STANDARD head. Overridden by the seq_cls family; the decision
+        families' heads are family artifacts rebuilt from a shipped loader NAME, so this
+        base raises for them."""
+        raise NotImplementedError(
+            f'{type(self).__name__} has no standard head; the decision families build theirs from '
+            'the family loader (task_head_loader).')
+
+
+def _nullcontext(model, template=None):
+    return contextlib.nullcontext()
+
+
+#: The no-patch context, shared as a staticmethod so subclasses can state it declaratively:
+#: ``transformers_context = _no_patch`` / ``megatron_context = _no_patch``.
+_no_patch = staticmethod(_nullcontext)
+
+
+class CausalLM(TaskSpec):
+    task_name = 'causal_lm'
+    transformers_context = _no_patch
+    megatron_context = _no_patch
+
+
+class SeqCls(TaskSpec):
+    """The classification-head tasks (seq_cls / reranker / value), dual-path per backend:
+    a model carrying an ATTACHED head (single, per-adapter, or a multi-LoRA slot) reads it
+    out through the forward-layer readout (no patch on transformers; an identity output
+    layer on megatron so the readout branch sees the last hidden states); a model variant
+    that BUILDS the head itself (HF ``*ForSequenceClassification`` / mcore-bridge task_type)
+    keeps its legacy path -- per-token surfacing on transformers, bridge-head pooling in
+    forward_step."""
+
+    task_name = 'seq_cls'
+    #: labels the head defaults to when the caller passes none (seq_cls demands an explicit
+    #: count; reranker / value are single-score heads).
+    default_num_labels: ClassVar[Optional[int]] = None
+    #: mirrors ``TransformersValuePatch``: value squeezes per-token [B, T]; seq_cls keeps 3D.
+    _squeeze_single: ClassVar[bool] = False
+
+    def build_head(self, config, num_labels=None):
+        from .head import SeqClsHead
+        if num_labels is None:
+            num_labels = self.default_num_labels
+        if num_labels is None:
+            raise ValueError(
+                f'task {self.task_name!r} needs num_labels= to build its head (the config carries '
+                'no label count).')
+        hidden_size = getattr(config, 'hidden_size', None)
+        if hidden_size is None:
+            raise ValueError(f'cannot build a {self.task_name} head: the config has no hidden_size.')
+        return SeqClsHead(hidden_size, num_labels, squeeze_single=self._squeeze_single)
+
+    def transformers_context(self, model, template=None):
+        if self.carries_task_head(model):
+            # The readout hook drives the attached head; no patch.
+            return contextlib.nullcontext()
+        # Legacy path: the model's own *ForSequenceClassification score head -- skip HF's
+        # internal pooling; surface per-token [B, T, num_labels] so the processor's
+        # _pool_last_valid_token handles packed/non-packed uniformly.
+        from twinkle.patch import apply_context
+        from twinkle.patch.transformers_value import TransformersValuePatch
+        return apply_context(model, TransformersValuePatch(squeeze_single=self._squeeze_single))
+
+    def megatron_context(self, model):
+        if self.carries_task_head(model):
+            # Swap the output layer for an identity so the forward_step readout branch sees
+            # the last hidden states [b, s, h] instead of vocab logits.
+            from twinkle.patch import apply_context
+            from twinkle.patch.megatron_emb import MegatronHiddenPassthroughPatch
+            return apply_context(model, MegatronHiddenPassthroughPatch())
+        # Legacy: mcore-bridge already built the head into the forward; pooling in forward_step.
+        return contextlib.nullcontext()
+
+
+class Reranker(SeqCls):
+    task_name = 'reranker'
+    default_num_labels = 1
+
+
+class Embedding(TaskSpec):
+    task_name = 'embedding'
+
+    def transformers_context(self, model, template=None):
+        # lm_head -> identity + a feature-extraction hook, so downstream pooling can run inside
+        # InputProcessor.postprocess_outputs(task='embedding', ...).
+        from twinkle.patch import apply_context
+        from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
+        return apply_context(model, TransformersEmbeddingPatch())
+
+    def megatron_context(self, model):
+        # The output_layer -> identity swap (with TP/SP gather), pooling to [n_seqs, hidden].
+        from twinkle.patch import apply_context
+        from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
+        return apply_context(model, MegatronEmbeddingPatch())
+
+
+class GenerativeReranker(TaskSpec):
+    task_name = 'generative_reranker'
+
+    def transformers_context(self, model, template=None):
+        from twinkle.patch import apply_context
+        from twinkle.patch.transformers_reranker import TransformersGenerativeRerankerPatch
+        pos_id, neg_id = _resolve_generative_reranker_token_ids(template)
+        return apply_context(model, TransformersGenerativeRerankerPatch(pos_id, neg_id))
+
+    megatron_context = _no_patch  # mcore-bridge already builds the head; pooling in forward_step
+
+
+class FusedCE(TaskSpec):
+    task_name = 'fused_lm_ce'
+
+    def transformers_context(self, model, template=None):
+        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
+        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
+        from twinkle.patch import apply_context
+        from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
+        return apply_context(model, TransformersFusedCEPatch())
+
+    # megatron_context stays the base raise: this task is transformers-only.
+
+
+class Value(SeqCls):
+    """PPO critic: a num_labels=1 head whose PER-TOKEN output rides the logits channel
+    ([b, s]; PPOValueLoss masks to response tokens)."""
+
+    task_name = 'value'
+    default_num_labels = 1
+    _squeeze_single = True
+
+
+class Decision(TaskSpec):
+    """The decision (System-1 scoring) readout task: no patch on either backend -- the
+    loader installed a load-time custom forward (``task_forward``: the transformers-only
+    branch families) or an attachable head (``task_head``), and the forward-layer readout
+    (the one-shot hook / the forward_step readout branch) drives it. Its heads are family
+    artifacts rebuilt from the dev family loader's NAME (see ``model/head.py``'s docstring
+    for the split against the standard heads), so this class adds nothing over the base
+    head lifecycle."""
+
+    task_name = 'decision'
+    transformers_context = _no_patch
+    megatron_context = _no_patch
 
 
 def _resolve_generative_reranker_token_ids(template):
