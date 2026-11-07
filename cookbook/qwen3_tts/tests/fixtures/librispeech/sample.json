@@ -1,0 +1,15 @@
+{
+  "id": "1272-128104-0000",
+  "text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+  "audio": "1272-128104-0000.flac",
+  "sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+  "source": "https://huggingface.co/datasets/hf-internal-testing/librispeech_asr_dummy",
+  "source_revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+  "source_split": "clean/validation",
+  "source_row": 0,
+  "corpus": "LibriSpeech dev-clean",
+  "license": "CC-BY-4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "corpus_url": "https://www.openslr.org/12",
+  "changes": "HF viewer audio export; no local trimming or text edits. Runtime resamples 16 kHz to 24 kHz."
+}

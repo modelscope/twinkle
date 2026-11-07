@@ -405,6 +405,7 @@ foundation for building customizable, enterprise-grade training services.
 
 | Component Type | Component Link                                                                                           | Component Function                                                                      | Author              |
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
+| Cookbook | [Qwen3-TTS LoRA](cookbook/qwen3_tts/README.md) | Single Ascend NPU training, explicit data splits and update-boundary resume | [Wallbreazzz](https://github.com/Wallbreazzz) |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
 
 ## Contributions
