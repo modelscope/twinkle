@@ -37,10 +37,10 @@ from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
-from twinkle.processor.tasks import get_task_spec
+from twinkle.processor.tasks import TASKS, get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
-from twinkle.utils import construct_class, get_logger, selective_log_softmax
+from twinkle.utils import construct_class, get_logger, pad_and_stack_tensors, selective_log_softmax
 from .moe.router_replay import RouterReplay
 from .mtp.mtp import MtpTrainingState
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
@@ -70,19 +70,52 @@ def _gather_vocab_parallel(tensor):
     return gather_from_tensor_model_parallel_region(tensor)
 
 
+def _last_valid_positions(processor, batch, output_tensor):
+    """CP-reassembled output plus each record's last-valid-token position (shared machinery
+    for the seq_cls pool and the decision readout).
+
+    Returns ``(tensor, last_idx, packed)``: non-packed gives positions inside each ``[b, s]``
+    row; packed gives flat positions into the single ``[1, total]`` row (each segment ends at
+    ``cu_seqlens_q[i] + seq_lens[i] - 1``).
+    """
+    _packed = batch.get('packed_seq_params')
+    cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+    tensor = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
+    if _packed is None:
+        _am = batch.get('attention_mask')
+        if _am is None:
+            _am = batch.get('attention_mask_2d')
+        if _am is None:
+            # No mask in the batch (the collator right-pads without emitting one): the final
+            # position, exactly what transformers does when handed no mask.
+            last_idx = torch.full((tensor.shape[0], ), tensor.shape[1] - 1,
+                                  dtype=torch.long, device=tensor.device)
+        else:
+            # attention_mask_2d compatibility: a 4D mask collapses to per-row validity.
+            if _am.dim() > 2:
+                _am = (~_am).sum(dim=(1, 2)) > 0
+            last_idx = processor._last_valid_indices(_am.long())
+        return tensor, last_idx, False
+    _n = _packed.seq_lens.shape[0]
+    return tensor, _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1, True
+
+
 def _resolve_task_context(model, task):
     """The per-forward Patch for ``task``: 'embedding' swaps the output_layer for identity
     (with TP/SP gather) and pools to ``[n_seqs, hidden]``; causal_lm/seq_cls/reranker/value
     need no patch (mcore-bridge already builds the right head; pooling happens in forward_step).
-    'decision' needs none either: its readout runs in forward_step via the registry's readout
-    kinds -- a load-time custom forward or an attached task_head, never a patch."""
-    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker', 'value', 'decision'):
+    Tasks whose registry row carries readout kinds (``TaskSpec.readout``: decision and any
+    future readout task) need none either -- their readout runs in forward_step via a load-time
+    custom forward or an attached task_head, never a patch. The nullcontext set is therefore
+    read off the registry, NOT hand-listed: a new readout task must not have to touch this.
+    """
+    if task in (None, 'causal_lm', 'seq_cls', 'reranker', 'generative_reranker', 'value') \
+            or get_task_spec(task).readout:
         return contextlib.nullcontext()
     if task == 'embedding':
         from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
         return apply_context(model, MegatronEmbeddingPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, seq_cls, reranker, '
-                     'generative_reranker, value, decision.')
+    raise ValueError(f'Unknown task={task!r}; expected one of: {", ".join(sorted(TASKS))}.')
 
 
 @dataclass
@@ -665,6 +698,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
             reduced = self.strategy.reduce_loss(losses, counts, reported_logits, logps)
+            if decision_outputs is not None:
+                # The decision metric reads the readout's non-logits fields (option_mask / kinds /
+                # counts) off the returned outputs, mirroring the transformers backend where the
+                # whole ScoringOutput rides the return; channel them through the extras dict.
+                for key in ('option_mask', 'kinds', 'counts'):
+                    value = outputs.get(key)
+                    if value is not None:
+                        reduced[2][key] = value.detach()
             if embeddings is not None:
                 reduced[2]['embeddings'] = embeddings.detach()
             if result.get('channel_loss') is not None:
@@ -728,32 +769,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     # logits (require_logps=False); the pool runs regardless of labels because a
                     # preference row carries no next-token labels at all.
                     if is_last_pp:
-                        _packed = batch.get('packed_seq_params')
-                        # CP reconstruct first (like the causal_lm branch), then take the last token.
-                        cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
-                        output_tensor = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
-                        if _packed is None:
-                            _am = batch.get('attention_mask')
-                            if _am is None:
-                                _am = batch.get('attention_mask_2d')
-                            if _am is None:
-                                # No mask in the batch (the collator right-pads without emitting one): pool
-                                # the final position, exactly what transformers does when handed no mask.
-                                _last_idx = torch.full((output_tensor.shape[0], ),
-                                                       output_tensor.shape[1] - 1,
-                                                       dtype=torch.long,
-                                                       device=output_tensor.device)
-                            else:
-                                # attention_mask_2d compatibility: a 4D mask collapses to per-row validity.
-                                if _am.dim() > 2:
-                                    _am = (~_am).sum(dim=(1, 2)) > 0
-                                _last_idx = processor._last_valid_indices(_am.long())
+                        output_tensor, _last_idx, _is_packed = _last_valid_positions(processor, batch, output_tensor)
+                        if not _is_packed:
                             unpacked_logits = output_tensor[
                                 torch.arange(output_tensor.shape[0], device=output_tensor.device), _last_idx]
                         else:
-                            # Packed: one row [1, total, C]; each segment ends at cu_seqlens_q[i]+seq_lens[i]-1.
-                            _n = _packed.seq_lens.shape[0]
-                            _last_idx = _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1
+                            # Packed: one row [1, total, C]; each segment ends at its last token.
                             unpacked_logits = output_tensor[0, _last_idx]
                 elif task == 'value':
                     # PPO critic: the same num_labels=1 seq_cls head, but keep its per-token V(s_t)
@@ -791,35 +812,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             raise NotImplementedError(
                                 f'task {task!r} on the megatron backend only supports lm-logits heads '
                                 '(needs_lm_logits); hidden-state readout awaits hidden-state exposure.')
-                        _packed = batch.get('packed_seq_params')
-                        cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
-                        output_tensor = processor.postprocess_tensor_cp(
-                            output_tensor, cu_seqlens=cu_seqlens_q)
+                        output_tensor, _last_idx, _is_packed = _last_valid_positions(processor, batch, output_tensor)
                         _record_index = torch.as_tensor(
                             [int(r) for r in decision_meta['record_index']], dtype=torch.long,
                             device=output_tensor.device)
-                        if _packed is None:
-                            _am = batch.get('attention_mask')
-                            if _am is None:
-                                _am = batch.get('attention_mask_2d')
-                            if _am is None:
-                                # No mask in the batch (the collator right-pads without emitting one):
-                                # read at the final position, exactly what transformers does.
-                                _last_idx = torch.full(
-                                    (output_tensor.shape[0], ), output_tensor.shape[1] - 1,
-                                    dtype=torch.long, device=output_tensor.device)
-                            else:
-                                if _am.dim() > 2:
-                                    _am = (~_am).sum(dim=(1, 2)) > 0
-                                _last_idx = processor._last_valid_indices(_am.long())
-                            _cols = _last_idx[_record_index]
-                            readout = output_tensor[_record_index, _cols]  # [total_q, V/TP]
-                        else:
-                            # Packed: one row [1, total, V/TP]; each record ends at
-                            # cu_seqlens_q[i] + seq_lens[i] - 1, same as the seq_cls pool.
-                            _n = _packed.seq_lens.shape[0]
-                            _last_idx = _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1
-                            readout = output_tensor[0, _last_idx[_record_index]]
+                        _cols = _last_idx[_record_index]
+                        readout = (output_tensor[0, _cols] if _is_packed
+                                    else output_tensor[_record_index, _cols])  # [total_q, V/TP]
                         readout_logits = _gather_vocab_parallel(readout)  # [total_q, V]
                         scoring = head.forward_readout(readout_logits, decision_meta)
                         # The readout replaces the whole output: per-question logits plus the
@@ -935,6 +934,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         logits = []
         logps = []
         embedding_batches = []
+        option_masks = []
+        decision_kinds = []
+        decision_counts = []
         channel_loss = {}
         count = 0
         n_loss_entries = 0
@@ -950,6 +952,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         logps.append(loss_dict['logps'])
                     if loss_dict.get('embeddings') is not None:
                         embedding_batches.append(loss_dict['embeddings'])
+                    if loss_dict.get('option_mask') is not None:
+                        option_masks.append(loss_dict['option_mask'])
+                    if loss_dict.get('kinds') is not None:
+                        decision_kinds.append(loss_dict['kinds'])
+                    if loss_dict.get('counts') is not None:
+                        decision_counts.append(loss_dict['counts'])
                     if 'num_tokens' in loss_dict:
                         count += loss_dict['num_tokens']
                     for channel, stats in loss_dict.get('channel_loss', {}).items():
@@ -999,8 +1007,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             logps = torch.cat(logps, dim=0)
         elif not logps:
             logps = None
-        if logits and (not self.variable_seq_lengths or task in ('seq_cls', 'reranker', 'generative_reranker')):
-            logits = torch.cat(logits, dim=0)
+        if logits:
+            if not self.variable_seq_lengths:
+                logits = torch.cat(logits, dim=0)
+            elif not get_task_spec(task).token_level_labels:
+                # Pooled tasks (seq_cls / decision ...): variable lengths split the batch, but the
+                # per-sample outputs carry no sequence axis -- pad-and-stack instead of cat
+                # (decision's option width differs per micro-batch; constant widths pad no-op).
+                logits = pad_and_stack_tensors(logits, pad_value=0)
         if transactional:
             dp_world_size = self.device_mesh._get_dp_fsdp_world_size()
             loss = loss * (float(loss_weight) * dp_world_size / global_normalizer.clamp(min=1))
@@ -1017,6 +1031,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         model_output = ModelOutput(logits=logits, loss=loss, logps=logps, num_tokens=num_tokens)
         if embedding_batches:
             model_output['embeddings'] = torch.cat(embedding_batches, dim=0)
+        if option_masks:
+            # Pad to the logits' option width: False (=0) marks the padded non-options, exactly
+            # the mask semantics the decision metric applies.
+            model_output['option_mask'] = pad_and_stack_tensors(option_masks, pad_value=0)
+        if decision_kinds:
+            model_output['kinds'] = torch.cat(decision_kinds, dim=0)
+        if decision_counts:
+            model_output['counts'] = torch.cat(decision_counts, dim=0)
         if channel_loss:
             model_output['channel_loss'] = channel_loss
         # R2 RECORD: hand the captured whole-model routing back to the driver (symmetric with
@@ -2105,6 +2127,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 _model = get_peft_model(_model, config, adapter_name=adapter_name)  # noqa
             _models.append(_model)
         self.model = _models
+
+        # A task readout head attached to the mcore model (decision families, by its legacy
+        # attribute name) is not a LoRA target, so peft's mark-only-adapters-as-trainable sweep
+        # just froze it. The transformers backend re-activates its head from the dev recipe
+        # (reactivate_scoring_head), but the driver cannot reach into worker-side chunks -- do
+        # the mirror here, on every chunk, right after the peft wrap.
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                if 'scoring_head' in name and not param.requires_grad:
+                    param.requires_grad_(True)
 
         # Create optimizer group for adapter
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()

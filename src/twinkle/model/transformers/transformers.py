@@ -47,7 +47,7 @@ from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_grou
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
-from twinkle.processor.tasks import get_task_spec
+from twinkle.processor.tasks import TASKS, get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
@@ -108,9 +108,10 @@ def _resolve_task_context(model, task, template=None):
     """Return a context manager that applies the right per-forward Patch for ``task``.
 
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
-    'decision' is the same: its scoring loader already replaced the model's own forward at
-    load time, so no per-forward context (no lm_head swap, no pooling patch) may interfere
-    with it -- only the task-registry flags (``twinkle.processor.tasks``) describe it.
+    Tasks whose registry row carries readout kinds (``TaskSpec.readout``: decision and any
+    future readout task) are the same: their loader installed a load-time custom forward or an
+    attachable head, so no per-forward context (no lm_head swap, no pooling patch) may
+    interfere -- the nullcontext set is read off the registry, NOT hand-listed.
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
     ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
@@ -119,7 +120,7 @@ def _resolve_task_context(model, task, template=None):
     'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
     ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
     """
-    if task in (None, 'causal_lm', 'decision'):
+    if task in (None, 'causal_lm') or get_task_spec(task).readout:
         return contextlib.nullcontext()
     if task in ('seq_cls', 'reranker'):
         # Skip HF's internal pooling; surface per-token [B, T, num_labels] so the processor's
@@ -144,8 +145,7 @@ def _resolve_task_context(model, task, template=None):
         # V(s_t) at every token in ``logits`` [B, T]. Symmetric with Megatron's task='value'.
         from twinkle.patch.transformers_value import TransformersValuePatch
         return apply_context(model, TransformersValuePatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, reranker, seq_cls, '
-                     'generative_reranker, fused_lm_ce, value, decision.')
+    raise ValueError(f'Unknown task={task!r}; expected one of: {", ".join(sorted(TASKS))}.')
 
 
 def _resolve_mm_graph_context(model, template):
@@ -1094,6 +1094,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
+        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
+            raise NotImplementedError(
+                'micro-batching (micro_batch_size / max_tokens_per_micro_batch) is not yet supported for '
+                'readout tasks (decision): their labels and decision_meta are organized per RECORD, not per '
+                'sample, so the sample-level split here would desynchronize them from the micro-batch '
+                'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
+                'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
         batches = []
         for indices in plan:
