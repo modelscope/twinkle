@@ -14,6 +14,8 @@ from twinkle.data_format import InputFeature
 from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
+from .tasks import get_task_spec
+
 
 @dataclass
 class PackedSeqParams:
@@ -168,20 +170,19 @@ class InputProcessor:
 
     @staticmethod
     def token_level_labels(task):
-        return task not in ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
+        """Whether this task's labels are token-level (task registry: ``TaskSpec``)."""
+        return get_task_spec(task).token_level_labels
 
     def postprocess_outputs(self, inputs, outputs, *, task='causal_lm', gather_fn=None, reduce_fn=None):
         """Task reduction, loss-tensor collection and packed layout restoration.
 
         Callbacks contain only communication; token selection and task semantics
         stay here. Without callbacks, both training backends keep their local path.
+        The task's reduction method comes from the task registry (``TaskSpec.postprocess``).
         """
-        if task == 'embedding':
-            inputs, outputs = self._postprocess_embedding(inputs, outputs, reduce_fn=reduce_fn)
-        elif task == 'generative_reranker':
-            inputs, outputs = self._postprocess_generative_reranker(inputs, outputs, reduce_fn=reduce_fn)
-        elif task in ('seq_cls', 'reranker'):
-            inputs, outputs = self._postprocess_seq_cls(inputs, outputs, reduce_fn=reduce_fn)
+        spec = get_task_spec(task)
+        if spec.postprocess is not None:
+            inputs, outputs = getattr(self, spec.postprocess)(inputs, outputs, reduce_fn=reduce_fn)
         elif gather_fn is not None:
             inputs, outputs = gather_fn(inputs, outputs)
         return self.unpack_packed_sequences(inputs, outputs, task=task)
@@ -707,9 +708,11 @@ class InputProcessor:
         by ``postprocess_outputs``, so this is a no-op. Same for
         ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``,
         and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
-        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
+        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``. In general every task whose
+        registry spec has ``token_level_labels=False`` (outputs already reduced per sample)
+        returns unchanged, decision included.
         """
-        if task in ("embedding", "generative_reranker", "seq_cls", "reranker"):
+        if not get_task_spec(task).token_level_labels:
             return inputs, outputs
         labels = inputs.get("labels")
         position_ids = inputs.get("position_ids")

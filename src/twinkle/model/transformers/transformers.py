@@ -47,6 +47,7 @@ from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_grou
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
+from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
@@ -103,21 +104,13 @@ def _prepare_sampling_replay(
     return loss_mask, masked_labels, metadata
 
 
-#: Tasks whose forward output is NOT a vocab log-softmax distribution, so ``selective_log_softmax`` logps
-#: must be skipped: classification/score heads (``seq_cls``/``reranker``/``generative_reranker`` emit
-#: ``[B, num_labels]``), the PPO ``value`` head (per-token ``V``), and pooled ``embedding`` features. Only a
-#: causal-LM head has a vocab axis to gather label logps from. The megatron backend dispatches exactly these
-#: tasks away from its logps branch (see megatron.py ``forward`` -- ``task in ('seq_cls', 'reranker', ...)``),
-#: so excluding them here keeps the two backends equivalent. This matters for a FROZEN seq_cls reward/value
-#: model: it carries no loss, ``require_logps`` defaults True, so without this guard its ``forward_only``
-#: would try to gather vocab logps out of a ``[B, 1]`` score and raise a shape error.
-_NON_LOGPS_TASKS = frozenset({'embedding', 'seq_cls', 'reranker', 'generative_reranker', 'value'})
-
-
 def _resolve_task_context(model, task, template=None):
     """Return a context manager that applies the right per-forward Patch for ``task``.
 
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
+    'decision' is the same: its scoring loader already replaced the model's own forward at
+    load time, so no per-forward context (no lm_head swap, no pooling patch) may interfere
+    with it -- only the task-registry flags (``twinkle.processor.tasks``) describe it.
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
     ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
@@ -126,7 +119,7 @@ def _resolve_task_context(model, task, template=None):
     'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
     ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
     """
-    if task in (None, 'causal_lm'):
+    if task in (None, 'causal_lm', 'decision'):
         return contextlib.nullcontext()
     if task in ('seq_cls', 'reranker'):
         # Skip HF's internal pooling; surface per-token [B, T, num_labels] so the processor's
@@ -152,7 +145,7 @@ def _resolve_task_context(model, task, template=None):
         from twinkle.patch.transformers_value import TransformersValuePatch
         return apply_context(model, TransformersValuePatch())
     raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, reranker, seq_cls, '
-                     'generative_reranker, fused_lm_ce, value.')
+                     'generative_reranker, fused_lm_ce, value, decision.')
 
 
 def _resolve_mm_graph_context(model, template):
@@ -836,7 +829,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         loss_require_logits = getattr(loss_instance, 'require_logits', False)
         loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
-        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+        if get_task_spec(task).requires_logps and labels is not None and loss_require_logps:
             if replay is not None:
                 loss_mask, masked_labels, replay_metadata = replay
                 outputs['logps'] = replayed_selective_log_softmax(

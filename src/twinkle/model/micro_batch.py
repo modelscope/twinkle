@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from twinkle.processor.tasks import get_task_spec
+
 
 @dataclass(frozen=True)
 class MicroBatchConfig:
@@ -256,12 +258,15 @@ class _MicroBatchOutputMerger:
             raise ValueError("outputs must match a non-empty micro-batch plan")
         if any(set(output) != set(outputs[0]) for output in outputs):
             self._invalid("outputs", "inconsistent output keys across micro-batches")
-        pooled_tasks = ("embedding", "generative_reranker", "seq_cls", "reranker")
+        # Tasks whose forward output is already reduced per sample carry no sequence axis to
+        # merge along (the registry's ``token_level_labels=False`` set: pooled heads plus the
+        # per-question decision scores).
+        pooled = not get_task_spec(task).token_level_labels
         known_sequence_dims = {
             "logps": (1,),
             "values": (1,),
             "entropies": (1,),
-            "logits": () if task in pooled_tasks else (1,),
+            "logits": () if pooled else (1,),
             "embeddings": (),
             "routed_experts": (1,),
         }
