@@ -1363,7 +1363,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if counts is not None:
             counts = counts / raw_dp_fsdp_world_size
             status.num_tokens += counts.item()
-        status.loss_value = (status.loss_value + main_loss) * objective_scale
+        # Scale the incoming loss BEFORE adding it to the running total: a second
+        # calculate_loss on the same status (a future recipe stacking two objectives on
+        # one forward) must not rescale the already-scaled accumulator. Single-call
+        # behaviour is unchanged (loss_value starts at 0 each forward).
+        status.loss_value = status.loss_value + main_loss * objective_scale
         outputs['loss'] = status.loss_value
         outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
         status.loss_reduction = 'mean' if global_normalizer is not None else getattr(loss_instance, 'reduction', 'mean')

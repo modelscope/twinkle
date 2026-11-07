@@ -261,6 +261,11 @@ class GRPOLoss(Loss):
                 fill = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
                 expanded = data.expand(batch_size, seq_len)
                 return torch.where(mask, expanded, fill)
+            # A 2D tensor must carry exactly this batch's rows: extra rows used to be
+            # silently dropped (misaligned loss) and missing rows raised a bare IndexError.
+            assert data.shape[0] == batch_size, (
+                f'2D alignment input has {data.shape[0]} rows but the mask batch is '
+                f'{batch_size}: {tuple(data.shape)} vs mask {tuple(mask.shape)}')
             data = [data[i] for i in range(batch_size)]  # To list
 
         # Handle list (scalars or sequences)
@@ -619,6 +624,11 @@ class GRPOLoss(Loss):
         device, dtype = logps.device, logps.dtype
         old = (logps.detach() if old_logps is None else self._pad_and_align_to_batch(
             old_logps, alignment_mask, device, dtype))
+        if advantages is None:
+            # Mirror _base_grpo's zero-loss contract: a loss-side probe without
+            # advantages (eval/validation, ref-only forward) stays autograd-connected
+            # instead of crashing the advanced controls.
+            return LossOutput(loss=logps.sum() * 0.0, num_tokens=0)
         advantages = self._pad_and_align_to_batch(advantages, alignment_mask, device, dtype)
         mask = alignment_mask.clone()
 

@@ -34,7 +34,12 @@ def align_logps_to_mask(
         before the dp split, so it is routinely LONGER than the local ``logps``
         (which is padded only to the local rank's max).  Taking ``vals[:n_pos]``
         instead would read prompt positions and silently misalign every ratio.
-    Anything shorter than both is unusable and returns None rather than guessing.
+      * Unpadded full-sequence form (``last masked position < len < seq_len``): the
+        masked positions are gathered directly -- the same contract the loss side
+        (``GRPOLoss._pad_and_align_to_batch``) enforces for per-sample RL fields
+        that arrive un-padded while the batch is right-padded.
+    Anything shorter than its farthest masked position is unusable; that row stays
+    zero rather than guessing a truncation scatter.
     """
     import torch
 
@@ -45,6 +50,12 @@ def align_logps_to_mask(
         t = ragged.to(device=device, dtype=dtype)
         if t.shape == (batch_size, seq_len):
             return t
+        if t.dim() == 2 and t.shape[0] != batch_size:
+            # Extra rows would be silently dropped and missing rows would raise a bare
+            # IndexError below -- both are caller contract errors.
+            raise ValueError(
+                f'2D alignment input has {t.shape[0]} rows but the mask batch is '
+                f'{batch_size}: {tuple(t.shape)} vs mask {tuple(mask.shape)}')
         # Fall through to the list path (row-wise scatter).
         ragged = [t[i] for i in range(min(batch_size, t.shape[0]))]
 
@@ -63,12 +74,21 @@ def align_logps_to_mask(
             continue
         vals = torch.as_tensor(sample, dtype=dtype, device=device).flatten()
         n = int(vals.numel())
-        if n == len(pos):
+        n_pos = len(pos)
+        last_pos = int(pos[-1].item())
+        if n == n_pos:
+            # Response-only form (e.g. old_logps from vLLM).
             result[i, pos] = vals
         elif n >= seq_len:
+            # Padded full-sequence form: select the masked positions.
             result[i, pos] = vals[:seq_len][mask[i]]
-        elif n > 0:
-            result[i, pos[:n]] = vals[:n]
+        elif n > 0 and last_pos < n:
+            # Unpadded full-sequence form -- the same contract the loss side enforces
+            # (GRPOLoss._pad_and_align_to_batch): per-sample RL fields may arrive
+            # un-padded while the batch is right-padded; select the masked positions.
+            result[i, pos] = vals[pos]
+        # else: the row is shorter than its farthest masked position -- malformed for
+        # every consumer; leave zeros instead of guessing a truncation scatter.
     return result
 
 

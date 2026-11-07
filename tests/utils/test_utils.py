@@ -499,6 +499,36 @@ class TestAlignLogpsToMask:
         want = GRPOLoss()._pad_and_align_to_batch(full, mask, mask.device, torch.float32)
         assert torch.equal(got, want)
 
+    def test_unpadded_full_sequence_matches_grpo_loss_alignment(self):
+        """未右 pad 的全序列行（last_pos < n < seq_len）两侧同样必须一致。
+
+        修复前 metric 侧走截断散射：n > n_pos 时 advanced indexing 直接 shape
+        mismatch 崩溃，n < n_pos 时静默把前 n 个值散到前 n 个可训练位。"""
+        from twinkle.loss.grpo import GRPOLoss
+        mask = torch.tensor([[False, True, True, False],
+                            [False, True, True, True]])
+        unpadded = [torch.randn(3), torch.randn(4)]  # shorter than seq_len=4 on row 0
+        got = align_logps_to_mask(unpadded, mask, torch.float32)
+        want = GRPOLoss()._pad_and_align_to_batch(unpadded, mask, mask.device, torch.float32)
+        assert torch.equal(got, want)
+        assert got[0, 1].item() == pytest.approx(unpadded[0][1].item())
+        assert got[0, 3].item() == 0.0  # row 0's 4th position is unmasked anyway
+
+    def test_row_shorter_than_farthest_masked_position_stays_zero(self):
+        """比最远 mask 位置还短的行：两侧都不猜测，metric 侧保持零。"""
+        mask = torch.tensor([[True, True, True, True]])
+        short = [torch.tensor([1.0, 2.0])]  # needs positions up to 3
+        result = align_logps_to_mask(short, mask, torch.float32)
+        assert result.abs().sum().item() == 0.0
+
+    def test_2d_row_count_mismatch_raises(self):
+        """2D 张量行数必须等于 batch：多行静默截取=错位损失，少行裸 IndexError。"""
+        mask = torch.ones(2, 4, dtype=torch.bool)
+        with pytest.raises(ValueError, match='rows but the mask batch'):
+            align_logps_to_mask(torch.randn(3, 4), mask, torch.float32)
+        with pytest.raises(ValueError, match='rows but the mask batch'):
+            align_logps_to_mask(torch.randn(1, 4), mask, torch.float32)
+
 
 class TestFilterFromConfigKwargs:
 

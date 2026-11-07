@@ -404,6 +404,26 @@ class InputProcessor:
                     value = _input.get(key)
                     if value is None:
                         continue
+                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
+                        # The dense [B, 1, S, S] mask pads on BOTH the query and the key
+                        # axis (the generic helper only pads the last one). The packed
+                        # path never carries a 4D mask -- the collator drops it -- so the
+                        # per-segment cu_seqlens slicing cannot apply; fail loudly on
+                        # that invariant, same as split_cp does.
+                        if cp_size > 1 and cu_seqlens.shape[0] > 2:
+                            raise ValueError(
+                                'a 4D attention_mask cannot ride the packed CP padding; '
+                                'the collator should have dropped it for the packed batch.')
+                        divisor = (2 * cp_size if cp_size > 1
+                                   else (tp_size if self.device_mesh.sequence_parallel and tp_size > 1 else 1))
+                        seq_len = value.shape[-1]
+                        if divisor > 1 and seq_len % divisor != 0:
+                            pad_len = divisor - (seq_len % divisor)
+                            value = torch.nn.functional.pad(
+                                value, (0, pad_len, 0, pad_len),
+                                value=self.padding_map.get(key, 0))
+                        _input[key] = value
+                        continue
                     result = []
                     for i in range(cu_seqlens.shape[0]):
                         if i == cu_seqlens.shape[0] - 1:
@@ -424,8 +444,20 @@ class InputProcessor:
                     "mm_token_type_ids",
                 ]:
                     value = _input.get(key)
-                    if value is not None:
-                        _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
+                    if value is None:
+                        continue
+                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
+                        # Both sequence axes of the dense mask must reach the TP divisor;
+                        # the generic helper only pads the key axis.
+                        seq_len = value.shape[-1]
+                        if seq_len % tp_size != 0:
+                            pad_len = tp_size - (seq_len % tp_size)
+                            value = torch.nn.functional.pad(
+                                value, (0, pad_len, 0, pad_len),
+                                value=self.padding_map.get(key, 0))
+                        _input[key] = value
+                        continue
+                    _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
             return _input
 
         return [_pad_cp(_inp) for _inp in inputs]
@@ -482,7 +514,18 @@ class InputProcessor:
             if cp_size > 1:
                 input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
                 position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=-1)
-                # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
+                if attention_mask is not None and attention_mask.dim() == 4:
+                    # The dense [B, 1, S, S] mask must ride the SAME zigzag cut as the
+                    # inputs on both the query and the key axis, or every CP rank sees a
+                    # full-length mask over half-length sequences. Packed batches never
+                    # carry a 4D mask (the collator drops it there), so the per-segment
+                    # cu_seqlens path cannot apply -- fail loudly if that invariant breaks.
+                    if cu_seqlens_q is not None:
+                        raise ValueError(
+                            'a 4D attention_mask cannot ride the packed CP split; the '
+                            'collator should have dropped it for the packed batch.')
+                    attention_mask = split_cp_inputs(attention_mask, None, dim=2)
+                    attention_mask = split_cp_inputs(attention_mask, None, dim=3)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
                 completion_mask = inputs.get("completion_mask")
