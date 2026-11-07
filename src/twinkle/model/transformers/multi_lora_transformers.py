@@ -10,7 +10,8 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
-from twinkle import DeviceMesh, remote_class, remote_function, template, torch_util
+from safetensors.torch import load_file, save_file
+from twinkle import DeviceMesh, Platform, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
@@ -20,7 +21,8 @@ from twinkle.processor import InputProcessor
 from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora, MultiLoraTaskHeadSlots
 from ..tasks import get_task_spec_obj
-from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
+from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel, \
+    _default_adapter_name
 
 
 @remote_class()
@@ -465,6 +467,34 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                     mapping[name] = checkpoint_name
         return mapping
 
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Write the bound tenant's head weights to ``task_head.safetensors`` next to the LoRA
+        adapter files; the LoRA base writes through the peft path and never sees the head."""
+        if self.task_head_slots is None:
+            return
+        head_state = self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+        if head_state and Platform.is_master():
+            save_file({key: value.contiguous() for key, value in head_state.items()},
+                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+
+    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Restore ``task_head.safetensors`` into the tenant's currently bound slot, in place.
+        Absent file = a legacy checkpoint saved before heads were checkpointed: keep the
+        slot's current weights. Present file on a slot-less host = a mismatched deployment
+        that would silently lose the trained head -- fail loudly instead."""
+        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
+        if not os.path.exists(path):
+            return
+        if self.task_head_slots is None:
+            raise ValueError(
+                f'{path} exists but this model was built without task-head slots (task= / '
+                'task_head_loader=); it cannot serve the checkpoint\'s head task. Load it on a '
+                'model constructed with the same task.')
+        self.task_head_slots.import_state(
+            adapter_name, self._task_head_host(), load_file(path),
+            self.multi_adapter._write_param_tensor)
+
     # lazy_collect=False: see TransformersModel.save -- a checkpoint write the caller acts on immediately
     # must block until it lands, or the run's final save is torn down with the actor before writing.
     @remote_function(collect='first', lazy_collect=False)
@@ -474,6 +504,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._lazy_wrap_model()
         with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
+            if checkpoint_dir is not None:
+                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
         if dist.is_initialized():
             dist.barrier()
         return checkpoint_dir
@@ -500,6 +532,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 # Load to CPU to avoid safetensors device issues in Ray environment
                 adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
                 self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
+            self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
             if load_optimizer:
                 self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
@@ -538,4 +571,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
-            return super()._get_trainable_parameters(real_adapter_name)
+            params = super()._get_trainable_parameters(real_adapter_name)
+        # The base pattern only matches ``.lora_<x>.<adapter>.`` names, so a bound
+        # ``task_head_slot_<i>`` would silently miss the optimizer -- the head computes
+        # gradients that never update, and every "training moved the output" signal
+        # comes from the LoRA alone. Slot names stay slot-physical on purpose (the optimizer
+        # references the wrapped parameter objects); checkpoints translate them back with
+        # the slot-independent ``task_head.`` keys.
+        if self.task_head_slots is not None:
+            slot = self.task_head_slots.bindings.get(adapter_name)
+            head = getattr(self._task_head_host(), f'task_head_slot_{slot}', None) \
+                if slot is not None else None
+            if head is not None:
+                for name, param in head.named_parameters():
+                    if param.requires_grad:
+                        params[f'task_head_slot_{slot}.{name}'] = param
+        return params

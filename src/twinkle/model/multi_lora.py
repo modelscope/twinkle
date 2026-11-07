@@ -104,6 +104,55 @@ class MultiLoraTaskHeadSlots:
         slot = self.bindings.get(adapter_name)
         return re.compile(rf'task_head_slot_{slot}\.') if slot is not None else None
 
+    def export_state(self, adapter_name: str, host: torch.nn.Module,
+                     read_param: Callable) -> Dict[str, torch.Tensor]:
+        """The bound tenant's head weights under slot-independent ``task_head.`` keys.
+
+        Checkpoints must not encode which physical slot a tenant happened to bind, or a
+        re-add after remove() (deterministic lowest-free choice may differ) could not
+        restore the saved head. ``read_param`` is the backend's shard-aware reader
+        (``MultiLora._read_param_tensor``)."""
+        slot = self.bindings.get(adapter_name)
+        head = getattr(host, f'task_head_slot_{slot}', None) if slot is not None else None
+        if head is None:
+            return {}
+        return {
+            f'task_head.{name}': read_param(parameter).detach().clone().cpu()
+            for name, parameter in head.named_parameters()
+        }
+
+    def import_state(self, adapter_name: str, host: torch.nn.Module, state: Dict[str, torch.Tensor],
+                     write_param: Callable) -> None:
+        """Restore ``task_head.`` checkpoint keys into the tenant's CURRENT bound slot, in
+        place (the wrapped parameter objects and optimizer references must not change).
+        ``write_param`` is the backend's shard-aware writer (``MultiLora._write_param_tensor``)."""
+        prefix = 'task_head.'
+        head_keys = [key for key in state if key.startswith(prefix)]
+        if not head_keys:
+            return
+        slot = self.bindings.get(adapter_name)
+        if slot is None:
+            raise ValueError(
+                f'checkpoint contains task-head weights ({sorted(head_keys)[:3]}...) but adapter '
+                f'{adapter_name!r} binds no task-head slot; the model and the checkpoint disagree '
+                'on the head task (task= / task_head_loader=).')
+        head = getattr(host, f'task_head_slot_{slot}', None)
+        if head is None:
+            # Bookkeeping-only rank (a non-last-PP megatron stage): the slot physically
+            # lives on the last stage; every rank binds the same slot index.
+            return
+        parameters = dict(head.named_parameters())
+        with torch.no_grad():
+            for key in head_keys:
+                name = key[len(prefix):]
+                parameter = parameters.get(name)
+                if parameter is None:
+                    raise ValueError(
+                        f'checkpoint task-head key {key!r} matches no parameter of the bound head; '
+                        'the head architecture changed since the checkpoint was written.')
+                saved = state[key]
+                write_param(parameter, saved)
+
 
 class MultiLora:
 

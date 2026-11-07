@@ -23,7 +23,7 @@ Liger per-layer impls under ``twinkle.kernel.ops`` are emitted bare (no
 device-conditional wrapping).
 
 The patch is applied per-forward via ``apply_context`` (see
-``FusedCE.transformers_context`` in ``twinkle.model.tasks``), so it composes with
+``_resolve_task_context`` with ``task='fused_lm_ce'``), so it composes with
 Twinkle's SP / routing-replay / FSDP2 / processor-postprocess orchestration
 without touching the forward body. Under FSDP2 the lm_head params are unsharded
 by FSDP's pre-forward hook before the (identity) forward runs, so

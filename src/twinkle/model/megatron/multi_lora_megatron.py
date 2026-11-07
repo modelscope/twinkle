@@ -443,7 +443,41 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Write the bound tenant's head weights to ``task_head.safetensors`` next to the LoRA
+        adapter files; the LoRA base writes through the bridge and never sees the head."""
+        if self.task_head_slots is None:
+            return
+        head_state = self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+        is_global_zero = (not dist.is_initialized()) or dist.get_rank() == 0
+        if head_state and is_global_zero:
+            from safetensors.torch import save_file
+            save_file({key: value.contiguous() for key, value in head_state.items()},
+                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+
+    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Restore ``task_head.safetensors`` into the tenant's currently bound slot, in place.
+        Absent file = a legacy checkpoint saved before heads were checkpointed: keep the
+        slot's current weights. Present file on a slot-less host = a mismatched deployment
+        that would silently lose the trained head -- fail loudly instead."""
+        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
+        if not os.path.exists(path):
+            return
+        if self.task_head_slots is None:
+            raise ValueError(
+                f'{path} exists but this model was built without task-head slots (task= / '
+                'task_head_loader=); it cannot serve the checkpoint\'s head task. Load it on a '
+                'model constructed with the same task.')
+        from safetensors.torch import load_file
+        self.task_head_slots.import_state(
+            adapter_name, self._task_head_host(), load_file(path),
+            self.multi_adapter._write_param_tensor)
+
+    # lazy_collect=False: a checkpoint write the caller acts on immediately (asserting the
+    # directory, uploading it, loading it back) must block until it lands; the lazy default
+    # would return the path while the actors are still inside _save_hf_format.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -469,6 +503,7 @@ class MultiLoraMegatronModel(MegatronModel):
                     self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
                 else:
                     self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
             if save_optimizer:
@@ -517,6 +552,7 @@ class MultiLoraMegatronModel(MegatronModel):
                 peft_format=True,
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
+        self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
         optimizer_config = self.optimizer_group.get(adapter_name)
         if optimizer_config is not None and optimizer_config.optimizer is not None:
