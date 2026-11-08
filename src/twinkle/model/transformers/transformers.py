@@ -624,6 +624,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # into the exception string and that dump swallows the real traceback.
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
+    def _fill_deepspeed_auto(self, kwargs: Dict[str, Any]) -> None:
+        """Give a DeepSpeed strategy the call's batch geometry before the first wrap.
+
+        The forward kwargs carry micro_batch_size (default: the whole submitted unit) and the
+        optimizer group holds the configured gradient_accumulation_steps; the strategy needs
+        both to resolve its config's "auto" placeholders before zero.Init / prepare run.
+        """
+        fill = getattr(self.strategy, 'fill_auto', None)
+        if fill is None:
+            return
+        micro_batch_size = kwargs.get('micro_batch_size')
+        if micro_batch_size is None:
+            inputs = kwargs.get('inputs')
+            micro_batch_size = len(inputs) if isinstance(inputs, (list, tuple)) else 1
+        ga = None
+        for group in self.optimizer_group.values():
+            ga = getattr(group, 'gradient_accumulation_steps', None)
+            if ga:
+                break
+        fill(int(micro_batch_size), int(ga or 1))
+
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
@@ -892,6 +913,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
+        self._fill_deepspeed_auto(kwargs)
         self._lazy_wrap_model()
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
@@ -1094,6 +1116,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
         kwargs.pop('compute_loss', None)
+        self._fill_deepspeed_auto(kwargs)
         self._lazy_wrap_model()
         self.model.eval()
         with torch.no_grad():

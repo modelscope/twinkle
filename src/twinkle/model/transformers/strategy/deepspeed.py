@@ -220,6 +220,31 @@ class DeepSpeedStrategy(TransformerStrategyBase):
 
     # -- plugin construction ------------------------------------------------
 
+    def fill_auto(self, micro_batch_size: int, gradient_accumulation_steps: int) -> None:
+        """Resolve the config's ``"auto"`` placeholders with the caller's real batch geometry.
+
+        HF Trainer fills these via ``HfTrainerDeepSpeedConfig.trainer_config_process`` and
+        accelerate's ``prepare`` via the dataloader's ``batch_size``; twinkle runs neither (no
+        TrainingArguments, and ``prepare`` gets the model + optimizers, no dataloader), so the
+        placeholders would reach DeepSpeed as raw strings and crash its batch assertion
+        (``'auto' > 0``) -- in ``deepspeed.zero.Init`` (ZeRO-3) or at ``Accelerator.prepare``.
+        Idempotent: a later call with the same geometry is a no-op.
+        """
+        import torch.distributed as dist
+
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        cfg = self._deepspeed_plugin.deepspeed_config
+        if not isinstance(cfg, dict):
+            cfg = getattr(cfg, 'config', cfg)
+        replacements = {
+            'train_micro_batch_size_per_gpu': micro_batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+            'train_batch_size': world_size * micro_batch_size * gradient_accumulation_steps,
+        }
+        for key, value in replacements.items():
+            if cfg.get(key) == 'auto':
+                cfg[key] = value
+
     @staticmethod
     def _build_plugin(config: Dict[str, Any]):
         """Build a ``DeepSpeedPlugin`` from a raw config dict.
