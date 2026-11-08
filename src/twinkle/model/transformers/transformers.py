@@ -167,7 +167,15 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _get_lr(self):
         if self.optimizer is not None:
             _lrs = []
-            _default_lr = self.optimizer.defaults.get('lr')
+            # DeepSpeed's engine optimizer (and accelerate's wrapper around it) exposes the
+            # learning rate through get_lr(), not torch's `defaults` dict.
+            _default_lr = None
+            defaults = getattr(self.optimizer, 'defaults', None)
+            if isinstance(defaults, dict):
+                _default_lr = defaults.get('lr')
+            if _default_lr is None and hasattr(self.optimizer, 'get_lr'):
+                _lrs = list(self.optimizer.get_lr())
+                return _lrs
             for param_group in self.optimizer.param_groups:
                 _lrs.append(param_group.get('lr', _default_lr))
             return _lrs
