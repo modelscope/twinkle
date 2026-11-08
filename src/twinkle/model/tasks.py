@@ -330,7 +330,9 @@ def _resolve_generative_reranker_token_ids(template):
     import os
     assert template is not None and getattr(template, 'processor', None) is not None, (
         'generative_reranker needs a template with a tokenizer; call set_template before forwarding.')
-    tokenizer = template.processor
+    # A multimodal processor wraps its tokenizer (``processor.tokenizer``); the dev Template's
+    # ``tokenizer`` property already performs that unwrap, and convert_tokens_to_ids lives on it.
+    tokenizer = template.tokenizer if hasattr(template, 'tokenizer') else template.processor
     pos_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
     neg_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
     return tokenizer.convert_tokens_to_ids(pos_token), tokenizer.convert_tokens_to_ids(neg_token)
