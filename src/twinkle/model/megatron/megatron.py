@@ -277,7 +277,24 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         return self.strategy.unwrap_model([self.model[-1]])[0]
 
     def _task_head_is_master(self) -> bool:
-        return (not dist.is_initialized()) or dist.get_rank() == 0
+        """Exactly one rank writes the head file: the last pipeline stage owns the head,
+        so the writer is its DP-replicate-0 / TP-replicate-0 member. The old global
+        rank-0 test never fired under PP>1 -- rank 0 sits on the FIRST stage there and
+        holds no head, so every save silently dropped task_head.safetensors."""
+        if not dist.is_initialized():
+            return True
+        from megatron.core import mpu
+        return (mpu.is_pipeline_last_stage()
+                and mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_data_parallel_rank() == 0)
+
+    def _task_head_carries_on_this_rank(self) -> bool:
+        """Only the last pipeline stage carries heads; a missing head elsewhere is the
+        PP layout, not a deployment mismatch, so load must not fail there."""
+        if not dist.is_initialized():
+            return True
+        from megatron.core import mpu
+        return mpu.is_pipeline_last_stage()
 
     def _attach_task_head(self, task, task_head_loader=None, num_labels=None) -> None:
         """Build the readout task's head worker-side and attach it to the last-PP chunk.

@@ -278,3 +278,81 @@ def test_single_model_attached_head_trains(tmp_path, monkeypatch):
         model.clip_grad_and_step(adapter_name='a')
     after = {k: p.detach().clone() for k, p in head.named_parameters()}
     assert any(not torch.equal(before[k], after[k]) for k in before)
+
+
+def _megatron_head_wrapper(chunk):
+    """A minimal MegatronModel-shaped object carrying one chunk, with the head-checkpoint
+    lifecycle methods bound from the real class (SimpleNamespace cannot take a __class__
+    swap; unbound methods bind to any object)."""
+    from twinkle.model.megatron.megatron import MegatronModel
+    wrapper = SimpleNamespace(
+        model=[chunk],
+        strategy=SimpleNamespace(unwrap_model=lambda chunks: list(chunks)),
+    )
+    for name in ('_save_task_head_checkpoint', '_load_task_head_checkpoint',
+                 '_task_head_state', '_restore_task_head_state', '_attached_head',
+                 '_task_head_host', '_task_head_is_master', '_task_head_carries_on_this_rank'):
+        setattr(wrapper, name, getattr(MegatronModel, name).__get__(wrapper))
+    return wrapper
+
+
+def test_head_checkpoint_writer_is_the_last_pp_stage(tmp_path, monkeypatch):
+    """PP>1: rank 0 sits on the FIRST stage and holds no head, so the old global rank-0
+    writer test never fired -- every save silently dropped task_head.safetensors.
+
+    The writer must instead be the head-owning stage's DP-replicate-0 / TP-replicate-0
+    member; and a rank with no head because of the PP layout (not a deployment
+    mismatch) must restore without raising."""
+    import torch.nn as nn
+    import torch.distributed as dist
+    from safetensors.torch import load_file
+
+    monkeypatch.setattr(dist, 'is_initialized', lambda: True)
+    monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: 0)
+    monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: 0)
+
+    # The writer matrix: only the last stage's DP-0/TP-0 member writes.
+    for last, tp, dp, expected in [(True, 0, 0, True), (True, 1, 0, False),
+                                   (True, 0, 1, False), (False, 0, 0, False)]:
+        monkeypatch.setattr('megatron.core.parallel_state.is_pipeline_last_stage', lambda: last)
+        monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: tp)
+        monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: dp)
+        wrapper = _megatron_head_wrapper(SimpleNamespace())
+        assert wrapper._task_head_is_master() is expected, (last, tp, dp)
+
+    # A rank-0-on-first-stage save still lands the file: the last-stage rank exports.
+    monkeypatch.setattr('megatron.core.parallel_state.is_pipeline_last_stage', lambda: True)
+    monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: 0)
+    monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: 0)
+    head = nn.Linear(4, 3)
+    with torch.no_grad():
+        for p in head.parameters():
+            p.add_(1.0)
+    saved_weights = {k: v.detach().clone() for k, v in head.named_parameters()}
+    checkpoint_dir = tmp_path / 'ckpt'
+    checkpoint_dir.mkdir()
+    last_stage = _megatron_head_wrapper(SimpleNamespace(task_head=head))
+    last_stage._save_task_head_checkpoint(str(checkpoint_dir), 'a')
+    state = load_file(str(checkpoint_dir / 'task_head.safetensors'))
+    assert set(state) == {f'task_head.{k}' for k in saved_weights}
+    for key, tensor in state.items():
+        torch.testing.assert_close(tensor, saved_weights[key[len('task_head.'):]], rtol=0, atol=0)
+
+    # Restore: the first-stage rank has no head BY LAYOUT and must not raise; the
+    # last-stage rank restores in place. A no-head rank OUTSIDE the layout (single
+    # process, no PP split) still fails loudly -- that part is pinned below.
+    monkeypatch.setattr('megatron.core.parallel_state.is_pipeline_last_stage', lambda: False)
+    first_stage = _megatron_head_wrapper(SimpleNamespace())
+    first_stage._load_task_head_checkpoint(str(checkpoint_dir), 'a')  # no raise
+    assert first_stage._task_head_carries_on_this_rank() is False
+
+    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
+    fresh = nn.Linear(4, 3)
+    cold = _megatron_head_wrapper(SimpleNamespace(task_head=fresh))
+    cold._load_task_head_checkpoint(str(checkpoint_dir), 'a')
+    for k, v in fresh.named_parameters():
+        torch.testing.assert_close(v.detach(), saved_weights[k], rtol=0, atol=0)
+
+    plain = _megatron_head_wrapper(SimpleNamespace())
+    with pytest.raises(ValueError, match='no head to restore'):
+        plain._load_task_head_checkpoint(str(checkpoint_dir), 'a')

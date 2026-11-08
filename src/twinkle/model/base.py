@@ -381,6 +381,12 @@ class TrainableModel(ABC):
             return {}
         return {f'task_head.{name}': p.detach().clone().cpu() for name, p in head.named_parameters()}
 
+    def _task_head_carries_on_this_rank(self) -> bool:
+        """Whether THIS rank is expected to hold the head at all. True by default;
+        the megatron backend overrides it -- only the last pipeline stage carries
+        heads, so their absence on earlier stages is the layout, not a mismatch."""
+        return True
+
     def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
         """Write a ``_task_head_state`` snapshot back in place; MultiLora hosts override
         this with their slot-pool import. An empty snapshot passes -- every host checks
@@ -389,7 +395,7 @@ class TrainableModel(ABC):
         import torch
         head = self._attached_head(adapter_name)
         if head is None:
-            if state:
+            if state and self._task_head_carries_on_this_rank():
                 raise ValueError(
                     f'task_head checkpoint has keys {sorted(state)} but adapter {adapter_name!r} '
                     'carries no head to restore them into.')
