@@ -308,22 +308,27 @@ def test_head_checkpoint_writer_is_the_last_pp_stage(tmp_path, monkeypatch):
     from safetensors.torch import load_file
 
     monkeypatch.setattr(dist, 'is_initialized', lambda: True)
-    monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: 0)
-    monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: 0)
 
-    # The writer matrix: only the last stage's DP-0/TP-0 member writes.
-    for last, tp, dp, expected in [(True, 0, 0, True), (True, 1, 0, False),
-                                   (True, 0, 1, False), (False, 0, 0, False)]:
+    # The writer matrix: only the last stage's DP-0/TP-0 member writes. The DP test must
+    # use the dp-WITH-cp group -- each CP rank heads its own plain DP group, so a plain
+    # dp-rank test would pass on every CP rank and race cp_size writers on one file.
+    for last, tp, dp_cp, expected in [(True, 0, 0, True), (True, 1, 0, False),
+                                      (True, 0, 1, False), (False, 0, 0, False)]:
         monkeypatch.setattr('megatron.core.parallel_state.is_pipeline_last_stage', lambda: last)
         monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: tp)
-        monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: dp)
+        # Plain-dp rank stays 0 on every CP rank; the with-cp rank separates them.
+        monkeypatch.setattr(
+            'megatron.core.parallel_state.get_data_parallel_rank',
+            lambda with_context_parallel=False, **kw: (dp_cp if with_context_parallel else 0))
         wrapper = _megatron_head_wrapper(SimpleNamespace())
-        assert wrapper._task_head_is_master() is expected, (last, tp, dp)
+        assert wrapper._task_head_is_master() is expected, (last, tp, dp_cp)
 
     # A rank-0-on-first-stage save still lands the file: the last-stage rank exports.
     monkeypatch.setattr('megatron.core.parallel_state.is_pipeline_last_stage', lambda: True)
     monkeypatch.setattr('megatron.core.parallel_state.get_tensor_model_parallel_rank', lambda: 0)
-    monkeypatch.setattr('megatron.core.parallel_state.get_data_parallel_rank', lambda: 0)
+    monkeypatch.setattr(
+        'megatron.core.parallel_state.get_data_parallel_rank',
+        lambda with_context_parallel=False, **kw: (0 if with_context_parallel else 0))
     head = nn.Linear(4, 3)
     with torch.no_grad():
         for p in head.parameters():
