@@ -77,7 +77,7 @@ def _last_valid_positions(processor, batch, output_tensor):
 
     Returns ``(tensor, last_idx, packed)``: non-packed gives positions inside each ``[b, s]``
     row; packed gives flat positions into the single ``[1, total]`` row (each segment ends at
-    ``cu_seqlens_q[i] + seq_lens[i] - 1``).
+    ``cu_seqlens_q[i + 1] - 1``).
     """
     _packed = batch.get('packed_seq_params')
     cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
@@ -97,8 +97,13 @@ def _last_valid_positions(processor, batch, output_tensor):
                 _am = (~_am).sum(dim=(1, 2)) > 0
             last_idx = processor._last_valid_indices(_am.long())
         return tensor, last_idx, False
-    _n = _packed.seq_lens.shape[0]
-    return tensor, _packed.cu_seqlens_q[:_n] + _packed.seq_lens - 1, True
+    # Neither megatron's nor twinkle's local fallback PackedSeqParams carries per-sequence
+    # ``seq_lens``: derive each segment's last position from the cumulative boundaries --
+    # segment i ends at ``cu_seqlens_q[i + 1] - 1`` (flat index into the single packed row).
+    # Also align device/dtype: the collator stages cu_seqlens on CPU while the readout indexes
+    # a CUDA tensor (int32/CPU indices are rejected there).
+    last_idx = (_packed.cu_seqlens_q[1:] - 1).to(device=tensor.device, dtype=torch.long)
+    return tensor, last_idx, True
 
 
 @dataclass
@@ -947,7 +952,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if vpp_size is None:
             data_iter = iter(inputs)
         else:
-            data_iter = [iter(inputs) for _ in range(0, vpp_size)]
+            # mcore's interleaved schedule hands every virtual chunk its OWN iterator and advances
+            # it once per (chunk, micro-batch) pair, in micro-batch order: every chunk must see
+            # every micro-batch, and the batch handed to chunk k must be the SAME micro-batch whose
+            # activations reach it (data-derived kwargs such as cu_seqlens ride model_kwargs on
+            # non-first chunks too). The dicts must be INDEPENDENT per chunk, though:
+            # forward_step_func pops fields (decision_meta, routed_experts, replay_mask ...)
+            # destructively, so iterators over the SAME dict objects let an earlier chunk's pops
+            # strip fields a later chunk in this process still needs.
+            data_iter = [iter([dict(b) for b in inputs]) for _ in range(vpp_size)]
 
         optimizer_config.accumulate_metrics(is_training=not forward_only)
 
@@ -1322,7 +1335,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
-        self.use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
+        requested = kwargs.pop('use_distributed_optimizer', None)
+        attached = bool(getattr(self.model[0].ddp_config, 'use_distributed_optimizer',
+                                self.use_distributed_optimizer))
+        if requested is not None and bool(requested) != attached:
+            raise ValueError(
+                f'use_distributed_optimizer={requested!r} conflicts with the model wrapper '
+                f'(ddp_config.use_distributed_optimizer={attached}): the wrapper already laid out '
+                'gradient buffers for that choice. Pass the flag to the model constructor so the '
+                'DDP wrapper and the optimizer agree.')
+        self.use_distributed_optimizer = attached
         # Pop before building OptimizerConfig: these are get_megatron_optimizer args, not config fields.
         config_overrides = kwargs.pop('config_overrides', None)
         param_groups_spec = kwargs.pop('param_groups_spec', None)
@@ -1807,6 +1829,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             iter_dir,
             save_strategy,
             async_sharded_save=async_save,
+            # mcore's default 'nvrx' strategy needs the nvidia-resiliency-ext package, which is
+            # not a twinkle dependency; the built-in 'mcore' strategy drives the SAME
+            # AsyncCallsQueue the consumption path below schedules into.
+            async_strategy='mcore',
             validate_access_integrity=True,
             content_metadata=sharded_sd_metadata,
         )
