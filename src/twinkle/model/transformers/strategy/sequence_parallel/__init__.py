@@ -694,7 +694,11 @@ class SequenceParallel:
         if self.attn_implementation in FLASH_ATTENTION_IMPLS:
             from transformers.modeling_flash_attention_utils import is_flash_attn_available
             from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
-            device = next(model.parameters()).device.type
+            from twinkle import Platform
+            # The model may still sit on CPU (or meta, under rank0-broadcast loading) here: strategy
+            # placement (Accelerator.prepare / FSDP) runs AFTER this init. Judge the kernel by the
+            # TARGET accelerator, not the pre-placement one.
+            device = Platform.get_platform().device_prefix()
             available = device in ('cuda', 'npu') and (
                 is_flash_attn_2_available() if device == 'cuda' else is_flash_attn_available())
             if self.attn_implementation == 'flash_attention_3':
