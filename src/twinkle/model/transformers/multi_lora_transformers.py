@@ -10,7 +10,6 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
-from safetensors.torch import load_file, save_file
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
@@ -29,9 +28,8 @@ from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersM
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     # Class-level defaults: a subclass that overrides __init__ wholesale (ms-swift's sentence-
     # transformer host builds its own state without super()) still reads as a slot-less host
-    # instead of hitting AttributeError on the head-slot machinery.
-    _head_task: Optional[str] = None
-    task_head_slots: Optional[MultiLoraTaskHeadSlots] = None
+    # instead of hitting AttributeError on the head-slot machinery. Inherited from
+    # TrainableModel -- see the attached-head lifecycle there.
 
     def __init__(
             self,  # noqa
@@ -197,11 +195,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # not the rank-local initialization captured before model wrapping.
             self.multi_adapter.save_initial_weights()
 
-    def _task_head_host(self):
-        """The module the head slots hang on: the unwrapped model -- the same object the
-        forward-layer readout hook resolves heads on."""
-        return self.strategy.unwrap_model(self.model)
-
     def _validate_task_head_config(self) -> None:
         """Fail at construction, before any slot or memory is spent."""
         task = self._head_task
@@ -223,29 +216,15 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _build_task_head_slots(self) -> None:
         """Pre-allocate the head slots on the unwrapped model (see ``MultiLoraTaskHeadSlots``).
 
-        Two head flavours (see ``twinkle.module.head``): 'decision' replays the dev family
-        loader's build from the shipped ``(module, class)`` NAME; the seq_cls family builds
-        its standard head from the config (+ ``num_labels``), aligned to the model's
-        device/dtype policy."""
-        import importlib
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); only the transformers placement (align to the host's
+        device/dtype policy) is backend-specific and stays here."""
         spec_obj = get_task_spec_obj(self._head_task)
         host = self._task_head_host()
-        if self._head_task == 'decision':
-            module_name, loader_name = self._task_head_loader
-            loader_cls = getattr(importlib.import_module(module_name), loader_name)
-            processor = self._default_tokenizer
-            if processor is None:
-                from transformers import AutoTokenizer
-                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-                self._default_tokenizer = processor
 
-            def build_head():
-                head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
-                return spec_obj.align_head(host, head)
-        else:
-
-            def build_head():
-                return spec_obj.align_head(host, spec_obj.build_head(self.hf_config, self._num_labels))
+        def build_head():
+            head = self._build_task_head(self._head_task, self._task_head_loader, self._num_labels)
+            return spec_obj.align_head(host, head)
         self.task_head_slots.build(host, build_head)
 
     def _bind_task_head_slot(self, adapter_name: str) -> None:
@@ -468,32 +447,34 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return mapping
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Write the bound tenant's head weights to ``task_head.safetensors`` next to the LoRA
-        adapter files; the LoRA base writes through the peft path and never sees the head."""
+        """Slot-pool form of the shared head checkpoint (see TrainableModel)."""
         if self.task_head_slots is None:
             return
-        head_state = self.task_head_slots.export_state(
-            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
-        if head_state and Platform.is_master():
-            save_file({key: value.contiguous() for key, value in head_state.items()},
-                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+        super()._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
-    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Restore ``task_head.safetensors`` into the tenant's currently bound slot, in place.
-        Absent file = a legacy checkpoint saved before heads were checkpointed: keep the
-        slot's current weights. Present file on a slot-less host = a mismatched deployment
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The bound tenant's head weights out of its slot, under slot-independent
+        'task_head.' keys; the LoRA base writes through the peft path and never sees
+        the head."""
+        if self.task_head_slots is None:
+            return {}
+        return self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Restore a ``_task_head_state`` snapshot into the tenant's currently bound
+        slot, in place. An empty snapshot passes (a rank without slots, a head-less
+        checkpoint); a non-empty snapshot on a slot-less host is a mismatched deployment
         that would silently lose the trained head -- fail loudly instead."""
-        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
-        if not os.path.exists(path):
+        if not state:
             return
         if self.task_head_slots is None:
             raise ValueError(
-                f'{path} exists but this model was built without task-head slots (task= / '
-                'task_head_loader=); it cannot serve the checkpoint\'s head task. Load it on a '
-                'model constructed with the same task.')
+                'task_head.safetensors exists but this model was built without task-head slots '
+                '(task= / task_head_loader=); it cannot serve the checkpoint\'s head task. Load it '
+                'on a model constructed with the same task.')
         self.task_head_slots.import_state(
-            adapter_name, self._task_head_host(), load_file(path),
-            self.multi_adapter._write_param_tensor)
+            adapter_name, self._task_head_host(), state, self.multi_adapter._write_param_tensor)
 
     # lazy_collect=False: see TransformersModel.save -- a checkpoint write the caller acts on immediately
     # must block until it lands, or the run's final save is torn down with the actor before writing.

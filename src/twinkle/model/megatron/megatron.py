@@ -267,42 +267,32 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
 
+    def _head_model_path(self) -> str:
+        """Where the decision families' loader replays its build from."""
+        return self._model_path
+
+    def _task_head_host(self) -> nn.Module:
+        """The module the heads hang on: the last-PP chunk, unwrapped -- the same
+        object the forward_step readout resolves heads on."""
+        return self.strategy.unwrap_model([self.model[-1]])[0]
+
+    def _task_head_is_master(self) -> bool:
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+
     def _attach_task_head(self, task, task_head_loader=None, num_labels=None) -> None:
         """Build the readout task's head worker-side and attach it to the last-PP chunk.
 
-        Two head flavours (see ``twinkle.module.head``): the decision families' heads are
-        family artifacts -- the driver ships the loader's ``(module, class)`` NAME and this
-        worker replays the build; the seq_cls family's standard head is built by the task's
-        spec from the config (+ ``num_labels``). Attachment rules (which module, which
-        names) live on the task's spec (``twinkle.model.tasks``); placement here stays
-        BEFORE the strategy wraps the chunks, and only the last pipeline stage produces the
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); attachment rules (which module, which names) live on
+        the task's spec (``twinkle.model.tasks``); placement here stays BEFORE the
+        strategy wraps the chunks, and only the last pipeline stage produces the
         output the head reads.
         """
-        import importlib
         from megatron.core import mpu
         if not mpu.is_pipeline_last_stage():
             return
         spec_obj = get_task_spec_obj(task)
-        if not spec_obj.row().readout:
-            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
-        if task == 'decision':
-            if task_head_loader is None:
-                raise ValueError(
-                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
-            module_name, loader_name = task_head_loader
-            loader_cls = getattr(importlib.import_module(module_name), loader_name)
-            processor = self._default_tokenizer
-            if processor is None:
-                from transformers import AutoTokenizer
-                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-                self._default_tokenizer = processor
-            head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
-        else:
-            if task_head_loader is not None:
-                raise ValueError(
-                    'task_head_loader is the decision families\' head replay; '
-                    f'task={task!r} builds its standard head from the config instead.')
-            head = spec_obj.build_head(self.hf_config, num_labels)
+        head = self._build_task_head(task, task_head_loader, num_labels)
         spec_obj.attach_megatron(self.model[-1], head)
 
     def _apply_vit_gradient_checkpointing(self, enabled: bool, gc_kwargs: Optional[Dict[str, Any]]) -> None:
@@ -1429,7 +1419,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
+    # lazy_collect=False: a checkpoint write the caller acts on immediately (asserting the
+    # directory, uploading it, loading it back) must block until it lands; the lazy default
+    # would return the path while the actors are still inside _save_hf_format. This does not
+    # touch async_save: that offload lives inside the mcore write itself.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     @timed
     def save(self,
              name: Optional[str] = None,
@@ -1484,10 +1478,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             self._merge_lora_adapters(optimizer_config.adapter_name)
             self._save_hf_format(checkpoint_dir, _default_adapter_name, max_shard_size=max_shard_size)
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
             self._unmerge_lora_adapters()
         else:
             self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name, max_shard_size=max_shard_size)
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
         # Optionally save mcore optimizer state (for training resumption).
         async_request = None
@@ -1579,6 +1575,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 checkpoint_dir,
                 peft_format=(adapter_name != _default_adapter_name),
             )
+            self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
             optimizer_config = self.optimizer_group.get(adapter_name)
             if optimizer_config is not None and optimizer_config.optimizer is not None:
                 optimizer_config.optimizer.reload_model_params()

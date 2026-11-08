@@ -11,6 +11,7 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -315,6 +316,116 @@ class TrainableModel(ABC):
     @abstractmethod
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
         ...
+
+    # -- attached readout heads: one lifecycle, backend hooks -----------------------
+    _head_task: Optional[str] = None
+    task_head_slots: Optional[Any] = None  # MultiLora hosts only
+
+    def _head_model_path(self) -> str:
+        """Where the decision families' loader replays its build from."""
+        raise NotImplementedError
+
+    def _task_head_host(self):
+        """The module the head hangs off; the single-model state hooks read it."""
+        raise NotImplementedError
+
+    def _task_head_is_master(self) -> bool:
+        """Which rank writes the head file."""
+        raise NotImplementedError
+
+    def _build_task_head(self, task, task_head_loader=None, num_labels=None):
+        """Build the readout task's head, the two flavours at twinkle.module.head.
+
+        decision heads are family artifacts -- the loader's (module, class) NAME ships
+        from the driver and replays the build here; the seq_cls family builds its
+        standard head from the config (+ num_labels). Placement (device / dtype /
+        attachment names) stays with the caller -- backend-specific by design."""
+        import importlib
+        spec_obj = get_task_spec_obj(task)
+        if not spec_obj.row().readout:
+            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
+        if task == 'decision':
+            if task_head_loader is None:
+                raise ValueError(
+                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
+            module_name, loader_name = task_head_loader
+            loader_cls = getattr(importlib.import_module(module_name), loader_name)
+            processor = self._default_tokenizer
+            if processor is None:
+                from transformers import AutoTokenizer
+                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+                self._default_tokenizer = processor
+            return loader_cls.build_task_head(self._head_model_path(), self.hf_config, processor)
+        if task_head_loader is not None:
+            raise ValueError(
+                'task_head_loader is the decision families\' head replay; '
+                f'task={task!r} builds its standard head from the config instead.')
+        return spec_obj.build_head(self.hf_config, num_labels)
+
+    def _attached_head(self, adapter_name):
+        """The adapter's head on the host: the task_heads dict when the host keeps one,
+        else the single task_head attribute (megatron single-model form)."""
+        host = self._task_head_host()
+        heads = getattr(host, 'task_heads', None)
+        if heads is None:
+            return getattr(host, 'task_head', None)
+        return heads.get(adapter_name)
+
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The adapter's head weights under slot-independent 'task_head.' keys.
+
+        Default (single-model) form reads the head hanging on the host; MultiLora
+        hosts override this with their slot-pool export."""
+        head = self._attached_head(adapter_name)
+        if head is None:
+            return {}
+        return {f'task_head.{name}': p.detach().clone().cpu() for name, p in head.named_parameters()}
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Write a ``_task_head_state`` snapshot back in place; MultiLora hosts override
+        this with their slot-pool import. An empty snapshot passes -- every host checks
+        the OTHER side's emptiness, never its own (a rank without slots skips, a
+        checkpoint written head-less stays head-less)."""
+        import torch
+        head = self._attached_head(adapter_name)
+        if head is None:
+            if state:
+                raise ValueError(
+                    f'task_head checkpoint has keys {sorted(state)} but adapter {adapter_name!r} '
+                    'carries no head to restore them into.')
+            return
+        params = dict(head.named_parameters())
+        expected = {f'task_head.{name}' for name in params}
+        if set(state) != expected:
+            raise ValueError(
+                f'task_head checkpoint keys {sorted(state)} do not match the head it '
+                f'restores: expected {sorted(expected)}.')
+        with torch.no_grad():
+            for name, param in params.items():
+                value = state[f'task_head.{name}'].to(device=param.device, dtype=param.dtype)
+                param.data.copy_(value)
+
+    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Write the adapter's attached head to its own task_head.safetensors.
+
+        Keyed 'task_head.<param>' -- slot-independent, so a re-added adapter may land
+        on a different slot and still restore. Runs on the master rank only; the head
+        file is tiny, so it writes synchronously alongside the (async) weights."""
+        state = self._task_head_state(adapter_name)
+        if state and self._task_head_is_master():
+            from safetensors.torch import save_file
+            save_file({key: value.contiguous() for key, value in state.items()},
+                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+
+    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
+        """Restore the attached head from task_head.safetensors; head-less legacy
+        checkpoints (no file) load unchanged, a head checkpoint on a host without the
+        head fails loudly rather than training a random-init one."""
+        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
+        if not os.path.exists(path):
+            return
+        from safetensors.torch import load_file
+        self._restore_task_head_state(adapter_name, load_file(path))
 
     @abstractmethod
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs) -> None:

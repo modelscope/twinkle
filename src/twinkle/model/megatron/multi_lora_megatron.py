@@ -69,11 +69,8 @@ def _seq_cls_head_lora_load_gate(bridge):
 
 @remote_class(execute='all')
 class MultiLoraMegatronModel(MegatronModel):
-    # Class-level defaults: a subclass that overrides __init__ wholesale (without super())
-    # still reads as a slot-less host instead of hitting AttributeError on the head-slot
-    # machinery.
-    _head_task: Optional[str] = None
-    task_head_slots: Optional[MultiLoraTaskHeadSlots] = None
+    # Class-level defaults (_head_task / task_head_slots) are inherited from TrainableModel
+    # -- see the attached-head lifecycle there; a slot-less host reads as None either way.
 
     def __init__(
         self,
@@ -198,35 +195,19 @@ class MultiLoraMegatronModel(MegatronModel):
     def _build_task_head_slots(self) -> None:
         """Pre-allocate the head slots on the last-PP chunk (see ``MultiLoraTaskHeadSlots``).
 
-        Two head flavours (see ``twinkle.module.head``): 'decision' replays the dev family
-        loader's build from the shipped ``(module, class)`` NAME; the seq_cls family builds
-        its standard head from the config (+ ``num_labels``). Only the last pipeline stage
-        builds -- the other stages carry no heads, so their bind/release calls keep the
-        bookkeeping only and the optimizer-side filter matches nothing there.
-        """
-        import importlib
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); only the megatron placement (place onto the last-PP
+        chunk) is backend-specific and stays here. Only the last pipeline stage
+        builds -- the other stages carry no heads, so their bind/release calls keep
+        the bookkeeping only and the optimizer-side filter matches nothing there."""
         from megatron.core import mpu
         if not mpu.is_pipeline_last_stage():
             return
-        task = self._head_task
-        spec_obj = get_task_spec_obj(task)
-        if task == 'decision':
-            module_name, loader_name = self._task_head_loader
-            loader_cls = getattr(importlib.import_module(module_name), loader_name)
-            processor = self._default_tokenizer
-            if processor is None:
-                from transformers import AutoTokenizer
-                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-                self._default_tokenizer = processor
+        spec_obj = get_task_spec_obj(self._head_task)
 
-            def build_head():
-                head = loader_cls.build_task_head(self._model_path, self.hf_config, processor)
-                return spec_obj.place_megatron_head(head, self.model[-1])
-        else:
-
-            def build_head():
-                return spec_obj.place_megatron_head(spec_obj.build_head(self.hf_config, self._num_labels),
-                                                    self.model[-1])
+        def build_head():
+            head = self._build_task_head(self._head_task, self._task_head_loader, self._num_labels)
+            return spec_obj.place_megatron_head(head, self.model[-1])
         self.task_head_slots.build(self._task_head_host(), build_head)
 
     def _validate_task_head_config(self) -> None:
@@ -246,11 +227,6 @@ class MultiLoraMegatronModel(MegatronModel):
         elif self._num_labels is None:
             # Validates num_labels / hidden_size now (the actual build happens per slot).
             spec_obj.build_head(self.hf_config, None)
-
-    def _task_head_host(self) -> nn.Module:
-        """The module the head slots hang on: the last-PP chunk, unwrapped -- the same
-        object the forward_step readout resolves heads on."""
-        return self.strategy.unwrap_model([self.model[-1]])[0]
 
     def _bind_task_head_slot(self, adapter_name: str) -> None:
         """Bind the lowest free head slot to a tenant (see ``MultiLoraTaskHeadSlots.bind``)."""
@@ -451,35 +427,33 @@ class MultiLoraMegatronModel(MegatronModel):
             optimizer_config.cur_step = state_dict['iteration']
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Write the bound tenant's head weights to ``task_head.safetensors`` next to the LoRA
-        adapter files; the LoRA base writes through the bridge and never sees the head."""
+        """Slot-pool form of the shared head checkpoint (see TrainableModel)."""
         if self.task_head_slots is None:
             return
-        head_state = self.task_head_slots.export_state(
-            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
-        is_global_zero = (not dist.is_initialized()) or dist.get_rank() == 0
-        if head_state and is_global_zero:
-            from safetensors.torch import save_file
-            save_file({key: value.contiguous() for key, value in head_state.items()},
-                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+        super()._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
-    def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Restore ``task_head.safetensors`` into the tenant's currently bound slot, in place.
-        Absent file = a legacy checkpoint saved before heads were checkpointed: keep the
-        slot's current weights. Present file on a slot-less host = a mismatched deployment
+    def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
+        """The bound tenant's head weights out of its slot, under slot-independent
+        'task_head.' keys; the LoRA base writes through the bridge and never sees the head."""
+        if self.task_head_slots is None:
+            return {}
+        return self.task_head_slots.export_state(
+            adapter_name, self._task_head_host(), self.multi_adapter._read_param_tensor)
+
+    def _restore_task_head_state(self, adapter_name: Optional[str], state: Dict[str, Any]) -> None:
+        """Restore a ``_task_head_state`` snapshot into the tenant's currently bound
+        slot, in place. An empty snapshot passes (a rank without slots, a head-less
+        checkpoint); a non-empty snapshot on a slot-less host is a mismatched deployment
         that would silently lose the trained head -- fail loudly instead."""
-        path = os.path.join(checkpoint_dir, 'task_head.safetensors')
-        if not os.path.exists(path):
+        if not state:
             return
         if self.task_head_slots is None:
             raise ValueError(
-                f'{path} exists but this model was built without task-head slots (task= / '
-                'task_head_loader=); it cannot serve the checkpoint\'s head task. Load it on a '
-                'model constructed with the same task.')
-        from safetensors.torch import load_file
+                'task_head.safetensors exists but this model was built without task-head slots '
+                '(task= / task_head_loader=); it cannot serve the checkpoint\'s head task. Load it '
+                'on a model constructed with the same task.')
         self.task_head_slots.import_state(
-            adapter_name, self._task_head_host(), load_file(path),
-            self.multi_adapter._write_param_tensor)
+            adapter_name, self._task_head_host(), state, self.multi_adapter._write_param_tensor)
 
     # lazy_collect=False: a checkpoint write the caller acts on immediately (asserting the
     # directory, uploading it, loading it back) must block until it lands; the lazy default

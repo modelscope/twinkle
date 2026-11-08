@@ -2156,6 +2156,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             def _write_tail() -> None:
                 _write_weights()
                 self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
                 copy_checkpoint_args(output_dir, checkpoint_dir)
                 for write in deferred:
                     write()
@@ -2165,6 +2166,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         else:
             _write_weights()
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
             copy_checkpoint_args(output_dir, checkpoint_dir)
             rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         return checkpoint_dir
@@ -2287,6 +2289,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # Full-parameter model: load a plain HF checkpoint in-place.
             state_dict = _read_hf_state_dict(checkpoint_dir)
             self.strategy.load_full_state_dict(self.model, state_dict)
+        self._load_task_head_checkpoint(checkpoint_dir, adapter_name)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
@@ -2581,17 +2584,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
 
+    def _head_model_path(self) -> str:
+        """Where the decision families' loader replays its build from."""
+        return self.model_id
+
+    def _task_head_host(self):
+        """The module the heads hang on: the unwrapped model -- the same object
+        ``head_for`` resolves heads on at forward time."""
+        return self.strategy.unwrap_model(self.model)
+
+    def _task_head_is_master(self) -> bool:
+        return Platform.is_master()
+
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 
-        Two head flavours (see ``twinkle.module.head``): the decision families' heads are
-        family artifacts rebuilt from the shipped loader NAME; the seq_cls family's standard
-        head is built by the task's spec from the config (+ ``num_labels``). The dictionary
-        lives on the UNWRAPPED model -- the same object ``head_for`` reads at forward time
-        (the wrapper object is not reachable from the readout path). The FIRST head also
-        lands on the single task_head / scoring_head names (single-head compatibility);
-        later adapters only enter the dictionary."""
-        import importlib
+        Building and its validation live on the shared TrainableModel lifecycle
+        (``_build_task_head``); placement is backend-specific and stays here. The
+        dictionary lives on the UNWRAPPED model -- the same object ``head_for`` reads
+        at forward time (the wrapper object is not reachable from the readout path).
+        The FIRST head also lands on the single task_head / scoring_head names
+        (single-head compatibility); later adapters only enter the dictionary."""
         if self._model_wrapped:
             # Reducers discover parameters once at wrap time; a head attached afterwards
             # would sit outside the DDP/FSDP gradient sync -- the multi-LoRA hosts
@@ -2602,26 +2615,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 'set_optimizer.')
         unwrapped_model = self.strategy.unwrap_model(self.model)
         spec = get_task_spec_obj(task)
-        if not spec.row().readout:
-            raise ValueError(f'task={task!r} carries no readout head; nothing to attach.')
-        if task == 'decision':
-            if task_head_loader is None:
-                raise ValueError(
-                    "task='decision' needs task_head_loader=(module, class) to rebuild its family head.")
-            module_name, loader_name = task_head_loader
-            loader_cls = getattr(importlib.import_module(module_name), loader_name)
-            processor = self._default_tokenizer
-            if processor is None:
-                from transformers import AutoTokenizer
-                processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
-                self._default_tokenizer = processor
-            head = loader_cls.build_task_head(self.model_id, self.hf_config, processor)
-        else:
-            if task_head_loader is not None:
-                raise ValueError(
-                    'task_head_loader is the decision families\' head replay; '
-                    f'task={task!r} builds its standard head from the config instead.')
-            head = spec.build_head(self.hf_config, num_labels)
+        head = self._build_task_head(task, task_head_loader, num_labels)
         heads = getattr(unwrapped_model, 'task_heads', None)
         if heads is None:
             spec.attach_transformers(unwrapped_model, head)  # aligns internally + dual names
