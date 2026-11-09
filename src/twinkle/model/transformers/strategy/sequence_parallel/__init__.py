@@ -707,8 +707,11 @@ class SequenceParallel:
                 raise NotImplementedError(f'SP {self.attn_implementation} kernel unavailable on {device}')
         if self.rp_world_size > 1 and self.attn_implementation == 'sdpa':
             raise NotImplementedError('SDPA does not support derived ring attention')
-        if self.rp_world_size > 1 and next(model.parameters()).device.type != 'cuda':
-            raise NotImplementedError('Derived ring attention requires CUDA FlashAttention kernels')
+        if self.rp_world_size > 1:
+            from twinkle import Platform
+            # Target accelerator, not the pre-placement device the model still sits on here.
+            if Platform.get_platform().device_prefix() != 'cuda':
+                raise NotImplementedError('Derived ring attention requires CUDA FlashAttention kernels')
         self._init_device_mesh(device_mesh)
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
