@@ -12,13 +12,6 @@ from twinkle import remote_class, remote_function
 REF_ONLY_REMOTE_GROUP = 'rl_payload'
 
 
-def _resolve(ref: Any) -> Any:
-    """Resolve a LazyCollect / ObjectRef in THIS actor, never in the driver."""
-    if callable(ref) and getattr(ref, '_is_lazy_collect', False):
-        return ref()
-    return ref
-
-
 def _score_rows(samples: Sequence[Any]) -> List[dict]:
     """The trajectory row a scorer sees: the recorded conversation, else prompt + own completion.
 
@@ -74,9 +67,9 @@ def _run_grouped(tasks: Sequence[Tuple[Any, Callable[[], Any]]]) -> List[Any]:
 class ScoreWorker:
     """Score rollout samples where the data lives: one remote boundary for the ORM channel.
 
-    The driver (or the caller's group-completion hook) hands samples -- the payloads may be
-    LazyCollect / ObjectRef refs under a remote rollout -- and this actor resolves them, rebuilds
-    the scoring rows, runs every scorer (duck-typed: ``scorer(rows)`` for rules and twinkle
+    The driver (or the caller's group-completion hook) hands samples over; any stashed
+    references they carry are materialised by remote-function's worker-side unpacking before the
+    method body runs, so this actor rebuilds the scoring rows runs every scorer (duck-typed: ``scorer(rows)`` for rules and twinkle
     ``Reward`` classes, ``scorer.score`` for model handles; scorers on disjoint device groups
     overlap as threads, one group strictly serial), and returns the ``[N][n_scorers]``
     sample-major matrix with ``None`` for
@@ -114,8 +107,7 @@ class ScoreWorker:
         all see the same view. The matrix is already transposed sample-major with ``None`` /
         NaN normalized to ``None`` -- the caller writes rows straight onto the samples.
         """
-        resolved = [_resolve(sample) for sample in samples]
-        rows = _score_rows(resolved)
+        rows = _score_rows(samples)
         matrix = _run_grouped([
             (getattr(scorer, 'placement_key', None),
              lambda scorer=scorer: self._one_reward(scorer, rows))
@@ -127,7 +119,7 @@ class ScoreWorker:
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
         """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
 
-        Samples resolve and rows rebuild once, then each ORM scorer and each PRM sample's step
+        Rows rebuild once from the samples, then each ORM scorer and each PRM sample's step
         batch is a task keyed by its scorer's placement: the ORM channel's device groups overlap
         the PRM channel's forwards, each group strictly serial. The PRM channel is a declared
         ``stash`` channel, so the process vectors ride out as per-sample references the training
@@ -136,14 +128,13 @@ class ScoreWorker:
         """
         if self.prm_step_scorer is None or not self.prm_scorers:
             raise RuntimeError('score_group_prm was called without a wired PRM channel.')
-        resolved = [_resolve(sample) for sample in samples]
-        rows = _score_rows(resolved)
+        rows = _score_rows(samples)
         tasks = [(getattr(scorer, 'placement_key', None),
                   lambda scorer=scorer: self._one_reward(scorer, rows))
                  for scorer in self.orm_scorers]
         prm_key = next((key for key in (getattr(scorer, 'placement_key', None)
                                         for scorer in self.prm_scorers) if key is not None), None)
-        for sample, row in zip(resolved, rows):
+        for sample, row in zip(samples, rows):
             columns = {key: value for key, value in row.items() if key != 'messages'}
             tasks.append((prm_key, lambda sample=sample, columns=columns: self.prm_step_scorer(
                 sample, self.template.decode, self._weighted_step_score, columns=columns)))
@@ -179,24 +170,23 @@ class ScoreWorker:
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def log_completions(self, samples: List[Any], rewards: List[List[float]], step: int,
                         path: str) -> None:
-        """Append one group's completions + rewards to ``completions.jsonl`` (resolved here)."""
+        """Append one group's completions + rewards to ``completions.jsonl``."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'a', encoding='utf-8') as stream:
             for sample, per_func in zip(samples, rewards):
-                resolved = _resolve(sample)
-                messages = list(getattr(resolved, 'messages', None) or [])
+                messages = list(getattr(sample, 'messages', None) or [])
                 assistant = next((m for m in reversed(messages) if m.get('role') == 'assistant'), {})
-                prompt = getattr(resolved, 'prompt', None)
+                prompt = getattr(sample, 'prompt', None)
                 if prompt is None and messages:
                     prompt = messages[:next((i for i, m in enumerate(messages) if m.get('role') == 'assistant'),
                                             len(messages))]
                 stream.write(json.dumps({
                     'step': step,
                     'prompt': prompt,
-                    'completion': resolved.decoded,
+                    'completion': sample.decoded,
                     'reasoning_content': assistant.get('reasoning_content'),
                     'messages': messages,
-                    'completion_length': len(getattr(resolved, 'response_token_ids', None) or []),
-                    'truncated': bool(getattr(resolved, 'truncated', False)),
+                    'completion_length': len(getattr(sample, 'response_token_ids', None) or []),
+                    'truncated': bool(getattr(sample, 'truncated', False)),
                     'rewards': per_func,
                 }, ensure_ascii=False) + '\n')
