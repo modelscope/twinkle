@@ -103,11 +103,19 @@ def test_task_batches_match_the_wire_contract(task):
     assert all(type(label) is int for row in parsed for label in row.labels)
 
 
-def test_transformers_backend_does_not_forward_head_keys(monkeypatch):
+@pytest.mark.parametrize('task,width', [('seq_cls', 3), ('reranker', 1), ('value', 1)])
+def test_transformers_backend_preserves_validated_head_contract(monkeypatch, task, width):
+    from transformers import AutoConfig
+    from twinkle.hub import HubOperation
     from twinkle.server.model import app
     from twinkle.server.model.backends import transformers_model
 
+    monkeypatch.setattr(HubOperation, 'download_model', lambda path: path)
+    monkeypatch.setattr(AutoConfig, 'from_pretrained', lambda *a, **kw: SimpleNamespace(
+        architectures=['Qwen2ForCausalLM']))
     received = {}
     monkeypatch.setattr(transformers_model, 'TwinkleCompatTransformersModel', lambda **kwargs: received.update(kwargs))
-    app._make_transformers_model({'model_id': 'unused', 'task_type': 'seq_cls', 'num_labels': 3})
-    assert received == {'model_id': 'unused'}
+    kwargs = {'model_id': 'unused', 'task_type': task, 'num_labels': width}
+    app._validate_model_task(kwargs)
+    app._make_transformers_model(kwargs)
+    assert received == {'model_id': 'unused', 'task': task, 'num_labels': width}

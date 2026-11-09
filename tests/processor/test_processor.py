@@ -187,7 +187,8 @@ class TestMegatronCausalMask:
 class TestMultimodalMode:
     """Multimodal: pixel_values, image_grid_thw."""
 
-    def test_none_multimodal_fields_are_preserved(self):
+    def test_none_multimodal_fields_are_preserved(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
         proc = InputProcessor()
         rows = [{'input_ids': [1, 2], 'pixel_values': None, 'image_grid_thw': None}]
         result = proc.prepare_inputs(rows)
