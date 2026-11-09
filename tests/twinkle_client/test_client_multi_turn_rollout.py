@@ -1119,7 +1119,6 @@ def test_drain_waits_for_admission_already_in_progress(monkeypatch):
 def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger():
     import importlib.util
     from pathlib import Path
-    from twinkle_agentic.envs import EnvTool
     from twinkle_agentic.tools.tool_manager import ToolManager
 
     path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
@@ -1138,7 +1137,7 @@ def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger():
         raise AssertionError('no nonterminal hit hand found')
     env = recipe.BlackjackEnv(seed)
     initial = env.reset()
-    tool = EnvTool(env, tool_name='play', parameters=recipe.PLAY_SCHEMA['function']['parameters'])
+    tool = env.play_tool()
     manager = ToolManager([tool])
 
     class Template(_Template):

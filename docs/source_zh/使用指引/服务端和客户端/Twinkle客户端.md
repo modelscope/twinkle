@@ -214,7 +214,6 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 | 场景 | 示例 |
 |---|---|
 | 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| 带工具调用的多轮代码修复（纯文本，asyncio 编排） | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
 | 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. 启动服务端
@@ -243,22 +242,11 @@ python cookbook/client/async_rl/client_orchestrated_grpo.py
 
 示例默认下载 GSM8K 数据集。离线运行时，额外设置 `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`；连接已有服务端时，将地址和令牌换成对应配置。模板目录应与服务端模型匹配。
 
-### 3. 运行多轮代码任务（可选）
-
-多轮示例需要已有的 AgentENV 服务和可用的 Python 环境模板。沿用上面的客户端配置，执行：
-
-```bash
-pip install 'e2b>=2.7'
-export AGENTENV_API_URL=http://your-agentenv-gateway:8080
-export AGENTENV_TEMPLATE=your-python-template
-python cookbook/client/async_rl/multi_turn_grpo.py
-```
-
-示例会让模型读取文件、运行测试并修复代码，再根据测试结果训练。每次尝试使用独立的工作区，初始化、评分和关闭环境都已在示例中处理；环境准备见 [Agentic RL 部署与训练](../Agentic%20RL部署与训练.md)。
-
-### 4. 运行 Blackjack 流式多轮示例（可选）
+### 3. 运行 Blackjack 流式多轮示例（可选）
 
 `streaming_multi_turn_grpo.py` 复用已有多轮示例的 Blackjack（21 点）任务：模型调用 `play(hit/stand)`，环境返回手牌和最终奖励，再按完整组计算 GRPO 优势、训练并发布新策略。OpenEnv/OpenSpiel 在客户端进程中运行，无需启动环境服务，也不执行模型生成的代码。
+
+`ClientMultiTurnRollout` 控制每条任务的模型/工具对话，`StreamingDriver` 调度并发任务并收集完整训练组；本例没有额外的 Agent harness。进程内 OpenEnv、远程 OpenEnvClient 和 AgentENV 都适配统一的 `Env` 接口，进程/OS 隔离能力取决于具体环境后端及其部署。
 
 安装客户端环境依赖后，沿用上面的 Twinkle 服务和客户端配置：
 
@@ -277,7 +265,6 @@ python cookbook/client/async_rl/streaming_multi_turn_grpo.py
 ### 修改为自己的任务
 
 - 数学任务：修改脚本中的数据集和奖励函数。
-- 代码任务：修改 `multi_turn_grpo.py` 顶部的 `TASK`。
 - 流式工具任务：从 Blackjack 示例的环境、工具和环境 reward 接缝替换任务，保留完整组、优势、训练和发布流程。
 - 先使用示例默认训练参数；需要调整时，再修改脚本顶部的配置。训练日志会输出奖励和指标，并保存 LoRA 检查点。
 

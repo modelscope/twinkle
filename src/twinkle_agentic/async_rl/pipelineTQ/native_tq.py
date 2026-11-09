@@ -3,9 +3,7 @@
 
 The async RL data path deliberately uses ``BatchMeta`` as its descriptor.  A
 ``kv_list`` result is a diagnostic snapshot, not a queue cursor, and therefore
-must not be used to drive the hot path. This paper-experiment entry remains
-preserved in ``pipelineTQ/``; its runnability is not asserted and the independent
-CS streaming path does not import it.
+must not be used to drive the hot path.
 """
 
 from __future__ import annotations

@@ -140,7 +140,7 @@ def test_blackjack_same_seed_same_initial_state_and_independent_progress(recipe)
 def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, monkeypatch):
     seeds, calls = [], []
 
-    class Env:
+    class Env(recipe.BlackjackEnv):
         def __init__(self, seed):
             seeds.append(seed)
 

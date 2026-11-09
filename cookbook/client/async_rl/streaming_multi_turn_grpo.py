@@ -3,6 +3,7 @@
 
 Reuses the embedded OpenEnv/OpenSpiel game from client/twinkle/multi_turn_rollout.py.
 No environment server, generated-code execution or custom verifier is needed.
+MultiTurnRollout owns the model/tool loop; no external Agent harness is used.
 """
 from __future__ import annotations
 
@@ -43,18 +44,6 @@ SYSTEM_PROMPT = (
     'Play Blackjack. Use play(action="hit") to draw or play(action="stand") to stop. '
     'Try to get close to 21 without going over; an ace counts as 1 or 11. '
     'After the game ends, give a short final answer without more tool calls.')
-PLAY_SCHEMA = {
-    'type': 'function',
-    'function': {
-        'name': 'play', 'description': 'Take the next Blackjack action.',
-        'parameters': {'type': 'object', 'properties': {
-            'action': {'type': 'string', 'enum': ['hit', 'stand']}}, 'required': ['action']},
-    },
-}
-
-
-def blackjack_action_mapper(tool_name, arguments):
-    return {'action_id': {'hit': 0, 'stand': 1}[arguments['action']], 'game_name': 'blackjack'}
 
 
 class BlackjackEnv(OpenEnv):
@@ -65,7 +54,18 @@ class BlackjackEnv(OpenEnv):
 
         super().__init__(env_name='openspiel_env', env_kwargs={
             'game_name': 'blackjack', 'game_params': {'chance_event_sampler': ChanceEventSampler(seed)}},
-            action_mapper=blackjack_action_mapper)
+            action_mapper=self._action)
+
+    @staticmethod
+    def _action(tool_name, arguments):
+        return {'action_id': {'hit': 0, 'stand': 1}[arguments['action']], 'game_name': 'blackjack'}
+
+    def play_tool(self):
+        return EnvTool(self, tool_name='play', description='Take the next Blackjack action.', parameters={
+            'type': 'object',
+            'properties': {'action': {'type': 'string', 'enum': ['hit', 'stand']}},
+            'required': ['action'],
+        })
 
     @staticmethod
     def _describe(result):
@@ -99,8 +99,7 @@ def _build_driver(rollout, initial_uri):
         # Equal chance seeds within a group; separate model seeds allow exploration.
         env = BlackjackEnv(ref.row['seed'])
         initial = env.reset()
-        tool = EnvTool(env, tool_name='play', description=PLAY_SCHEMA['function']['description'],
-                       parameters=PLAY_SCHEMA['function']['parameters'])
+        tool = env.play_tool()
         manager = ToolManager([tool])
         handle = rollout.admit(
             [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': initial.observation}],
@@ -121,13 +120,13 @@ def _build_driver(rollout, initial_uri):
 
     return StreamingDriver(
         prompt_stream=[{'seed': BASE_SEED + index} for index in range(MAX_GROUPS)],
-        num_train_epochs=1, num_generations=NUM_GENERATIONS,
+        num_generations=NUM_GENERATIONS,
         group_pull=True, need_rows=TRAIN_BATCH_GROUPS * NUM_GENERATIONS,
         groups_per_partition=TRAIN_BATCH_GROUPS, buffer_depth=BUFFER_GROUPS * NUM_GENERATIONS,
-        submit=submit, poll=rollout.poll, collect=collect, rollout=rollout,
+        rollout=rollout, submit=submit, collect=collect,
         version_control=True, initial_adapter_path=lambda: initial_uri, max_staleness=MAX_STALENESS,
-        max_steps=MAX_STEPS, max_group_regenerations=0, consume=None,
-        prune=lambda: None, snapshot_model=None, score=None, resource_adapter=None)
+        # No snapshot_model: the driver leaves server checkpoints untouched.
+        max_steps=MAX_STEPS)
 
 
 def _validate_group(group):
@@ -170,6 +169,7 @@ def _training_groups(samples, advantage_fn):
 
 def _train_loop(driver, model, operations):
     confirmed_steps = 0
+    advantage_fn = GRPOAdvantage()
 
     def updated(_result):
         nonlocal confirmed_steps
@@ -184,7 +184,7 @@ def _train_loop(driver, model, operations):
     try:
         for samples in driver:
             steps = 0
-            for group, advantages in _training_groups(samples, GRPOAdvantage()):
+            for group, advantages in _training_groups(samples, advantage_fn):
                 if confirmed_steps >= MAX_STEPS:
                     logger.info('remaining groups dropped: update budget reached')
                     break

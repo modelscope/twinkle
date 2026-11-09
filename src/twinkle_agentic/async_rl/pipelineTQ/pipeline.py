@@ -1,9 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Preserved paper-experiment driver for independent async-RL Ray workers.
-
-The historical ``legacy`` imports and entry types are not restored here. The independent CS
-streaming path uses ``StreamingDriver`` and does not depend on this module.
-"""
+"""Driver for the independent async-RL Ray workers."""
 
 from __future__ import annotations
 

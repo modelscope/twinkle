@@ -215,7 +215,6 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 | Task | Example |
 |---|---|
 | Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| Multi-turn code repair with tools (text only, asyncio orchestration) | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
 | Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. Start the Server
@@ -244,22 +243,11 @@ python cookbook/client/async_rl/client_orchestrated_grpo.py
 
 The example downloads GSM8K by default. For offline use, also set `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`. When connecting to an existing server, use its address and authentication token. The template directory must match the server's model.
 
-### 3. Run the Code Repair Example (Optional)
-
-The multi-turn example requires an accessible AgentENV service and a working Python environment template. Keep the client settings above and run:
-
-```bash
-pip install 'e2b>=2.7'
-export AGENTENV_API_URL=http://your-agentenv-gateway:8080
-export AGENTENV_TEMPLATE=your-python-template
-python cookbook/client/async_rl/multi_turn_grpo.py
-```
-
-The model reads files, runs tests and repairs code, then trains on the test results. Each attempt uses an independent workspace; the example handles initialization, scoring and cleanup. For environment setup, see [Agentic RL Deployment and Training](../Agentic-RL-Deployment-and-Training.md).
-
-### 4. Run the Streaming Blackjack Example (Optional)
+### 3. Run the Streaming Blackjack Example (Optional)
 
 `streaming_multi_turn_grpo.py` reuses Blackjack from the existing multi-turn examples: the model calls `play(hit/stand)`, the environment returns observations and terminal rewards, and complete groups feed GRPO training and policy publication. OpenEnv/OpenSpiel runs inside the client process; no environment server or generated-code execution is needed.
+
+`ClientMultiTurnRollout` controls each model/tool conversation; `StreamingDriver` schedules concurrent conversations and complete training groups. This example uses no external Agent harness. Embedded OpenEnv, remote OpenEnvClient and AgentENV share the `Env` interface, but process/OS isolation depends on the environment backend and deployment.
 
 Install the client environment dependencies, then use the Twinkle server and client settings above:
 
@@ -278,7 +266,6 @@ Sampling stays at `temperature=1`, `top_p=1`, `top_k=-1` and `repetition_penalty
 ### Use Your Own Task
 
 - Math tasks: change the dataset and reward function in the script.
-- Code tasks: edit `TASK` at the top of `multi_turn_grpo.py`.
 - Streaming tool tasks: replace the Blackjack environment, tools and environment reward seam while keeping complete groups, advantages, training and publication.
 - Start with the default training settings; edit the constants at the top of the script when needed. Training logs show rewards and metrics, and LoRA checkpoints are saved.
 
