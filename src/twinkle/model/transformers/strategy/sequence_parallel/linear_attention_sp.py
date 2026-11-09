@@ -196,7 +196,13 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
                 hidden_states.shape[1],
                 sequence_parallel_context,
             )
-        hidden_states = apply_mask_to_padding_states(hidden_states, local_attention_mask)
+            # Ulysses alignment padding can put zeroed padding rows in any local shard,
+            # including batch==1 shards that apply_mask_to_padding_states skips. Mask the
+            # padding rows explicitly so they stay zero in forward AND backward, matching
+            # the FA2 varlen unpad semantics for sequence-parallel padding rows.
+            hidden_states = hidden_states * local_attention_mask.to(hidden_states.dtype)[:, :, None]
+        else:
+            hidden_states = apply_mask_to_padding_states(hidden_states, local_attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
 
         has_previous_state = bool(cache_params is not None and getattr(cache_params, 'has_previous_state', False))
