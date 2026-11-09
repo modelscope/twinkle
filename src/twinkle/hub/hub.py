@@ -212,6 +212,13 @@ class HubOperation:
             ignore_patterns = set(ignore_patterns or []) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
             return model_id_or_path
+        if os.path.isabs(model_id_or_path) or model_id_or_path.startswith(('./', '../')):
+            # A LOCAL path shape that does not exist is never a hub repo id: falling through would
+            # send the whole path to the hub (a 404 from modelscope.cn instead of the real
+            # diagnosis -- an adapter snapshot read before its directory lands hits exactly this).
+            raise FileNotFoundError(
+                f'Local model path does not exist: {model_id_or_path}. The path is misspelled, or '
+                'the artifact is not written yet (an adapter snapshot still being saved).')
         hub = cls._get_hub_class(model_id_or_path)
         # Every rank of a group reaches this on its own, so without ordering they would all pull the
         # same repo into the same cache dir at once. The key covers the patterns too, so a partial
