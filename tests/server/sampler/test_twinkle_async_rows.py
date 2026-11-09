@@ -67,6 +67,9 @@ class _SamplerManagement:
     def __init__(self):
         from twinkle.server.sampler.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
+        # sample_to_data_plane admits only the *_async sampler types (the deployment contract
+        # its guard enforces); this fake stands in for one.
+        self.sampler_type = 'vllm_async'
         self.sampler = self
         self.data_plane = self
         self.enabled = True
