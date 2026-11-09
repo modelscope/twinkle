@@ -2404,10 +2404,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
         if strict and not os.path.exists(optimizer_path):
-            raise FileNotFoundError(optimizer_path)
+            raise FileNotFoundError(
+                f'{optimizer_path} is missing although trainer_state.json marks a full checkpoint: '
+                'resuming would silently train on with a fresh optimizer. Restore the file from a '
+                'healthy copy, or start a new run from the weights with the model-only load path '
+                '(e.g. --resume_only_model true).')
         if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
-            logger.warning(
-                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
+            raise FileNotFoundError(
+                f'{scheduler_path} is missing although trainer_state.json marks a full checkpoint: '
+                'resuming would silently apply a fresh lr schedule. Restore the file from a healthy '
+                'copy, or start a new run from the weights with the model-only load path '
+                '(e.g. --resume_only_model true).')
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
@@ -2508,7 +2515,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         adapter_name = adapter_name or self._get_default_group()
         optimizer_config = self.optimizer_group[adapter_name]
-        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+        # A full resume promised by trainer_state.json must really restore the optimizer and lr
+        # schedule: a checkpoint missing those would otherwise train on with silently reset state
+        # while reporting the saved step counter. strict raises on each missing piece; the lenient
+        # ``load(load_optimizer=...)`` path keeps its skip-if-missing contract.
+        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name, strict=True)
         scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
         if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
             self._load_scaler_state(scaler_path, adapter_name=adapter_name)
