@@ -216,7 +216,7 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 |---|---|
 | Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
 | Multi-turn code repair with tools (text only, asyncio orchestration) | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
-| Complete-episode ready streaming with an explicit synchronous training loop (StreamingDriver) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
+| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. Start the Server
 
@@ -257,7 +257,7 @@ python cookbook/client/async_rl/multi_turn_grpo.py
 
 The model reads files, runs tests and repairs code, then trains on the test results. Each attempt uses an independent workspace; the example handles initialization, scoring and cleanup. For environment setup, see [Agentic RL Deployment and Training](../Agentic-RL-Deployment-and-Training.md).
 
-### 4. Run the Episode-streaming Code Example (Optional)
+### 4. Run the Streaming Blackjack Example (Optional)
 
 `streaming_multi_turn_grpo.py` reuses Blackjack from the existing multi-turn examples: the model calls `play(hit/stand)`, the environment returns observations and terminal rewards, and complete groups feed GRPO training and policy publication. OpenEnv/OpenSpiel runs inside the client process; no environment server or generated-code execution is needed.
 

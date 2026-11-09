@@ -215,7 +215,7 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 |---|---|
 | 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
 | 带工具调用的多轮代码修复（纯文本，asyncio 编排） | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
-| 完整 episode 就绪流与显式同步训练（StreamingDriver） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
+| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. 启动服务端
 
@@ -256,7 +256,7 @@ python cookbook/client/async_rl/multi_turn_grpo.py
 
 示例会让模型读取文件、运行测试并修复代码，再根据测试结果训练。每次尝试使用独立的工作区，初始化、评分和关闭环境都已在示例中处理；环境准备见 [Agentic RL 部署与训练](../Agentic%20RL部署与训练.md)。
 
-### 4. 运行 episode streaming 多轮任务（可选）
+### 4. 运行 Blackjack 流式多轮示例（可选）
 
 `streaming_multi_turn_grpo.py` 复用已有多轮示例的 Blackjack（21 点）任务：模型调用 `play(hit/stand)`，环境返回手牌和最终奖励，再按完整组计算 GRPO 优势、训练并发布新策略。OpenEnv/OpenSpiel 在客户端进程中运行，无需启动环境服务，也不执行模型生成的代码。
 
