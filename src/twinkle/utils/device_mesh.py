@@ -95,6 +95,12 @@ class DeviceMesh:
         """
 
         origin_world_size = world_size
+        # world_size-only callers (the launcher's rank count, no declared split) leave every axis
+        # at its default; dp is then the residual axis -- the default dp of 1 would try to
+        # reshape N ranks into a 1-slot mesh and crash.
+        other_axes = (fsdp_size, pp_size, cp_size, tp_size, ep_size, etp_size)
+        if dp_size == 1 and origin_world_size > 1 and all(size is None or size == 1 for size in other_axes):
+            dp_size = origin_world_size
         mesh_dim_names = []
         mesh_dim_sizes = []
         if fsdp_size is not None:
