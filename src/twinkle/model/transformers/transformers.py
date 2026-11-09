@@ -668,6 +668,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 self.model = result[0]
                 for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
                     optimizer_group.optimizer = optimizer
+                    self._rebind_lr_scheduler(optimizer_group, optimizer)
                     self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
@@ -677,6 +678,43 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 else:
                     self.model = result
             self._model_wrapped = True
+
+    @staticmethod
+    def _rebind_lr_scheduler(optimizer_group: OptimizerGroup, optimizer: Optimizer) -> None:
+        """Put a group's LR scheduler onto the optimizer the wrap actually installed.
+
+        ``set_lr_scheduler`` builds the scheduler on the pre-wrap optimizer, but a strategy may hand
+        back one whose param groups differ: DeepSpeed's engine drops groups with no parameters (a
+        LoRA run's all-frozen weight-decay group). This is the accelerate-prepare contract: once the
+        model/optimizer pair is prepared, the scheduler follows the optimizer that actually steps --
+        REBUILT from its construction spec when the group count changed (a LambdaLR-style scheduler
+        keeps one lambda per original group, so rebinding ``base_lrs`` alone still misaligns), and
+        merely re-bound when the wrapped optimizer kept the same groups. A wrap that returns the
+        same optimizer object (DDP and friends) is a no-op; the rebuild happens before any step, so
+        a fresh scheduler state is exactly the state the run starts from anyway.
+        """
+        scheduler = getattr(optimizer_group, 'lr_scheduler', None)
+        if scheduler is None or scheduler.optimizer is optimizer:
+            return
+        spec = getattr(optimizer_group, '_scheduler_spec', None)
+        if spec is not None and len(optimizer.param_groups) != len(scheduler.base_lrs):
+            scheduler_cls, spec_kwargs = spec
+            rebuilt = construct_class(
+                scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler],
+                optimizer=optimizer, **spec_kwargs)
+            optimizer_group.lr_scheduler = rebuilt
+            logger.info('rebuilt the lr scheduler on the wrapped optimizer: %s param group(s) survived '
+                        'the wrap (the scheduler was built on %s).', len(optimizer.param_groups),
+                        len(scheduler.base_lrs))
+            return
+        scheduler.optimizer = optimizer
+        # ``initial_lr`` is set by LRScheduler.__init__ on the ORIGINAL groups and carried into the
+        # rebuilt ones where the strategy kept the extra keys; the current lr is the pre-step value,
+        # so it is the correct fallback for a group that lost the annotation.
+        scheduler.base_lrs = [
+            group['initial_lr'] if 'initial_lr' in group else group['lr']
+            for group in optimizer.param_groups
+        ]
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
@@ -2022,6 +2060,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler],
                                     **kwargs)
         optimizer_config.lr_scheduler = scheduler
+        # The wrap may need to rebuild the scheduler on the optimizer a strategy installs (see
+        # _rebind_lr_scheduler): remember the spec exactly as it was constructed.
+        optimizer_config._scheduler_spec = (
+            scheduler_cls, {key: value for key, value in kwargs.items() if key != 'optimizer'})
 
     @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):

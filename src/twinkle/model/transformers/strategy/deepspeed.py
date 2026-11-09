@@ -35,6 +35,25 @@ def _resolve_zero(model, optimizer):
     return None
 
 
+def _resolve_engine(model):
+    """The DeepSpeedEngine to checkpoint through: the prepared model itself, or behind a wrapper.
+
+    ``unwrap_model`` peels the engine OFF (it returns the underlying nn.Module), so calling
+    ``engine.save_checkpoint`` on its result reaches the base model and raises. The prepared model
+    IS the engine in the common case; walk the shallow ``.module`` chain otherwise.
+    """
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    candidate = model
+    while candidate is not None:
+        if isinstance(candidate, DeepSpeedEngine):
+            return candidate
+        candidate = getattr(candidate, 'module', None)
+    raise ValueError(
+        f'DeepSpeed engine checkpointing needs the DeepSpeedEngine, got {type(model).__name__} -- the '
+        'model was not prepared by the DeepSpeed strategy.')
+
+
 def _resident_device(module):
     import torch
 
@@ -307,12 +326,38 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         Steps 3-4 are active only during ``accelerator.prepare``; the wrapper
         restores originals on exit.
         """
+        if self.is_zero_stage(3):
+            self._force_reentrant_gradient_checkpointing(model)
         apply_patch(model, DeepSpeedLeafModulesPatch)
         apply_patch(model, DeepSpeedModulesToSavePatch)
 
         with apply_context(model, DeepSpeedHookReorderPatch):
             with apply_context(model, DeepSpeedParamWrapperPatch):
                 return self.accelerator.prepare(model, *args)
+
+    def _force_reentrant_gradient_checkpointing(self, model) -> None:
+        """Under ZeRO-3, switch an enabled gradient checkpointing to ``use_reentrant=True``.
+
+        The non-reentrant variant (transformers' default) validates recomputed saved-tensor
+        metadata; deepspeed's zero-stage-3 ``LinearFunctionForZeroStage3`` saves the gathered
+        (full-shaped) weight, and the recompute finds the released, partitioned ``[0]``-shaped
+        parameter, so the check raises and the backward dies. The reentrant variant carries no
+        such hooks, and the deepspeed engine explicitly tracks its backward phases
+        (``clear_backward_seen_flag``), making it the supported mode under ZeRO-3. Other kwargs the
+        caller enabled are preserved; an already-reentrant model is left alone (idempotent).
+        """
+        if not getattr(model, 'is_gradient_checkpointing', False):
+            return
+        module = next((m for m in model.modules() if getattr(m, 'gradient_checkpointing', False)), None)
+        keywords = dict(getattr(getattr(module, '_gradient_checkpointing_func', None), 'keywords', None) or {})
+        if keywords.get('use_reentrant'):
+            return
+        keywords['use_reentrant'] = True
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=keywords)
+        from twinkle.utils import get_logger
+
+        get_logger().info('ZeRO-3: switched gradient checkpointing to use_reentrant=True '
+                          '(non-reentrant recompute sees partitioned parameters).')
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
@@ -448,7 +493,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         # parameter names, so a caller-side renaming map has no meaning here.
         if param_name_mapping:
             raise ValueError('DeepSpeed engine checkpoints do not support param_name_mapping.')
-        engine = self.unwrap_model(model)
+        engine = _resolve_engine(model)
         save_dir = os.path.dirname(output_path)
         engine.save_checkpoint(save_dir)
 
@@ -466,7 +511,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         logger = get_logger()
         if param_name_mapping:
             raise ValueError('DeepSpeed engine checkpoints do not support param_name_mapping.')
-        engine = self.unwrap_model(model)
+        engine = _resolve_engine(model)
         load_dir = os.path.dirname(input_path)
         try:
             engine.load_checkpoint(load_dir)
@@ -478,11 +523,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         unwrapped = self.unwrap_model(model)
         state = collect_local_state(unwrapped, include_buffers=True)
         if self.is_zero_stage(3):
-            from deepspeed.runtime.zero import GatheredParameters
-
             params = [t for t in state.values() if isinstance(t, nn.Parameter)]
-            with GatheredParameters(params):
-                return {name: tensor.cpu() for name, tensor in state.items()}
+            self._gather_zero3_params_for_snapshot(model, params)
         return {name: tensor.cpu() for name, tensor in state.items()}
 
     def load_full_state_dict(self, model, state_dict) -> None:
@@ -497,6 +539,37 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         else:
             unwrapped.load_state_dict(state_dict, strict=False)
 
+    def _gather_zero3_params_for_snapshot(self, model, params) -> None:
+        """Drain in-flight gathers, then collect ZeRO-3 params for a read-only snapshot.
+
+        ``GatheredParameters``' ``__exit__`` partitions everything it gathered, which breaks the
+        adapter/full save in two observed ways: a persist-flagged parameter (under the stage-3
+        persistence threshold, e.g. every LoRA matrix) is still referenced by live submodules, so
+        freeing it raises ``Cannot free a ZeRO-3 parameter while it is still active in
+        submodules``; and parameters an async pre-forward gather left in-flight (the recompute
+        leg of reentrant checkpointing left 51 of them after the last backward) trip the
+        partition assert. The official drain is the parameter offloader's
+        ``partition_all_parameters`` -- its ``release_and_reset_all`` waits every in-flight
+        handle, clears the active-module references and releases all parameters to the
+        partitioned state. A plain synchronous ``all_gather`` then brings the snapshot's own
+        parameters back gathered, and they stay gathered: a snapshot only reads ``.cpu()``
+        copies, and deep speed re-partitions them on the next forward/backward cycle.
+        """
+        engine = _resolve_engine(model)
+        optimizer = getattr(engine, 'optimizer', None)
+        parameter_offload = getattr(optimizer, 'parameter_offload', None)
+        if parameter_offload is None:
+            # An engine shape we have not met: fall back to a synchronous gather with no
+            # re-partition (the old behavior) rather than guessing at internals.
+            zero_params = [p for p in params if hasattr(p, 'ds_id')]
+            if zero_params:
+                zero_params[0].all_gather(param_list=zero_params)
+            return
+        parameter_offload.partition_all_parameters()
+        zero_params = [p for p in params if hasattr(p, 'ds_id')]
+        if zero_params:
+            zero_params[0].all_gather(param_list=zero_params)
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect LoRA parameters, trained modules_to_save copies and their buffers, gathering under ZeRO-3."""
         unwrapped = self.unwrap_model(model)
@@ -505,12 +578,9 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         selected = {n: t for n, t in state.items() if is_saveable_adapter_key(n) and adapter_suffix in n}
 
         if self.is_zero_stage(3):
-            from deepspeed.runtime.zero import GatheredParameters
-
             # ZeRO-3 partitions parameters only; buffers are plain tensors and pass through.
             params = [t for t in selected.values() if isinstance(t, nn.Parameter)]
-            with GatheredParameters(params):
-                return {n: t.cpu() for n, t in selected.items()}
+            self._gather_zero3_params_for_snapshot(model, params)
         return {n: t.cpu() for n, t in selected.items()}
 
     # -- DeepSpeed-specific -------------------------------------------------
