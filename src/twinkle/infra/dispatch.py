@@ -146,7 +146,7 @@ class _SideEffectLazyCollect:
         return getattr(self._base, name)
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first'], Callable],
                   result: List[Any],
                   device_mesh: DeviceMesh = None):
     """Collect results
@@ -187,7 +187,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         if isinstance(result[0], np.ndarray):
             return np.array(flatten)
         return type(result[0])(flatten)
-    elif method in ('avg', 'mean'):
+    elif method == 'mean':
         if isinstance(result[0], dict):
             output = {}
             for key in result[0]:
@@ -742,9 +742,9 @@ def _stash_channels(result: Any, channels: Sequence[Union[int, str]]) -> Any:
     raise TypeError(f'stash requires a tuple or dict return value, got {type(result).__name__}')
 
 
-def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
+def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first'], Callable] = 'none',
                     sync: bool = False,
                     lazy_collect: Optional[bool] = None,
                     timeout: Optional[float] = None,
@@ -773,9 +773,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             'flatten': Return a flattened list
             'mean': Return the mean value of all processes
             'sum': Return the sum value of all processes
-            'first': Return the first worker's result but executed in each process, usually works for scenarios of all-gather.
-            'mean'/'sum': Avg or sum the results.
-            'first': Return the first worker's result, for example, get length
+            'first': Return the first worker's result but executed in each process, usually
+                works for scenarios of all-gather (e.g., get length).
             'last_pp': Return the last pp's result.
             Callable: A callable that handles the collection
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
