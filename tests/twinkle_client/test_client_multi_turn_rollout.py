@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import gc
 import threading
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import replace
@@ -744,3 +745,466 @@ def test_concurrent_policy_capture_and_completed_call_cancel_race():
     later = rollout([trajectory('later')], adapter_name='base', adapter_uri=None)
     assert later[0]['input_ids'] == [3, 30]
     assert policies == [(1, 'policy', 'slow'), (2, 'policy', 'fast'), (3, 'base', None)]
+
+
+def _wait_for_handle(rollout, handle):
+    ticker = threading.Event()
+    for _ in range(1000):
+        completed = rollout.poll([handle])
+        if completed:
+            return completed[0]
+        ticker.wait(0.005)
+    raise AssertionError('episode did not finish')
+
+
+def test_admit_poll_collect_matches_batch_and_preserves_admission_snapshot():
+    sampler = _Sampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+    handle = rollout.admit(
+        _trajectory()['messages'],
+        3,
+        prompt_idx=17,
+        prompt_extras={'task_id': 'task-1'},
+        adapter_path='twinkle://policy-0',
+        policy_version=4,
+    )
+
+    _wait_for_handle(rollout, handle)
+    sample = rollout.collect(handle)
+
+    assert sample.prompt_id == '17'
+    assert sample.policy_version == 4
+    assert sample.version_span == 0
+    assert sample.prompt == _trajectory()['messages']
+    assert sample.extra == {
+        'task_id': 'task-1',
+        'trajectory_idx': 3,
+        'adapter_uri': 'twinkle://policy-0',
+        'submission_id': handle.submission_id,
+    }
+    assert sample.encoded['input_ids'] == [1, 10, 90, 20]
+    assert sample.response_token_ids == [10, 20]
+    assert sample.rollout_logprobs == [-0.1, -0.1]
+    assert sampler.policies == [('', 'twinkle://policy-0', 1), ('', 'twinkle://policy-0', 1)]
+    assert sampler.params[0].logprobs == 1
+    assert rollout.stop(handle.submission_id) is True
+    with pytest.raises(RuntimeError, match='already consumed'):
+        rollout.collect(handle)
+
+
+def test_admit_and_poll_do_not_wait_for_sampler_or_idle_confirmation():
+    sample_started = threading.Event()
+    release_sample = threading.Event()
+    idle_started = threading.Event()
+    release_idle = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            sample_started.set()
+            assert release_sample.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    class Env:
+        def ensure_idle(self):
+            idle_started.set()
+            assert release_idle.wait(timeout=5)
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    assert sample_started.wait(timeout=5)
+    assert rollout.poll([handle]) == []
+    with pytest.raises(RuntimeError, match='not ready'):
+        rollout.collect(handle)
+    release_sample.set()
+    assert idle_started.wait(timeout=5)
+    assert rollout.poll([handle]) == [], 'Future completed before runner finished ensure_idle'
+    release_idle.set()
+    _wait_for_handle(rollout, handle)
+    assert rollout.collect(handle).response_token_ids == [30]
+
+
+def test_failed_collect_preserves_business_error_and_settled_stop_is_idempotent():
+    class EmptySampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            return []
+
+    rollout = ClientMultiTurnRollout(EmptySampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(RuntimeError, match='expected one'):
+        rollout.collect(handle)
+    assert rollout.stop(handle.submission_id) is True
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_uncertain_generation_quarantines_resources_and_caches_stop_error(monkeypatch):
+    sentinel = ConnectionError('client wait expired')
+    close_calls = []
+
+    class FailingSampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            raise sentinel
+
+    class Env:
+        def ensure_idle(self):
+            return None
+
+        def close(self):
+            close_calls.append('close')
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(FailingSampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(ConnectionError) as business_error:
+        rollout.collect(handle)
+    assert business_error.value is sentinel
+    with pytest.raises(RuntimeError, match='unconfirmed') as first:
+        rollout.stop(handle.submission_id)
+    monkeypatch.setattr(rollout, '_drain_entry', lambda entry: (_ for _ in ()).throw(
+        AssertionError('cached uncertainty must not drain again')))
+    with pytest.raises(RuntimeError, match='unconfirmed') as second:
+        rollout.stop(handle.submission_id)
+    assert second.value is first.value
+    with pytest.raises(ValueError, match='still borrowed'):
+        rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    assert close_calls == []
+
+
+def test_settlement_credential_tracks_handle_lifetime():
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    rollout.collect(handle)
+    submission_id = handle.submission_id
+    assert rollout.stop(submission_id) is True
+    del handle
+    gc.collect()
+    assert rollout.stop(submission_id) is False
+
+
+def test_handle_tampering_cross_instance_use_and_unknown_stop_are_rejected():
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), (31, 'stop'))), _Template())
+    handle = rollout.admit(_trajectory()['messages'], policy_version=2)
+    other = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(RuntimeError, match='unknown'):
+        other.poll([handle])
+    handle.policy_version = 99
+    with pytest.raises(RuntimeError, match='metadata was modified'):
+        rollout.poll([handle])
+    handle.policy_version = 2
+    forged = replace(handle, submission_id='forged')
+    with pytest.raises(RuntimeError, match='unknown'):
+        rollout.poll([forged])
+    assert rollout.stop('unknown-submission') is False
+    _wait_for_handle(rollout, handle)
+    rollout.collect(handle)
+
+
+def test_stop_cancels_the_next_turn_and_waits_for_the_inflight_sample():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    sampler = BlockingSampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template(), max_turns=2)
+    handle = rollout.admit(_trajectory()['messages'])
+    assert started.wait(timeout=5)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stopped = pool.submit(rollout.stop, handle.submission_id)
+        assert not stopped.done()
+        release.set()
+        assert stopped.result(timeout=5) is True
+    assert len(sampler.calls) == 1
+
+
+def test_concurrent_stop_shares_one_actual_drain(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    assert started.wait(timeout=5)
+    drain_calls = []
+    original_drain = rollout._drain_entry
+
+    def drain(entry):
+        drain_calls.append(entry.handle.submission_id)
+        return original_drain(entry)
+
+    monkeypatch.setattr(rollout, '_drain_entry', drain)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(rollout.stop, handle.submission_id)
+        second = pool.submit(rollout.stop, handle.submission_id)
+        release.set()
+        assert first.result(timeout=5) is True
+        assert second.result(timeout=5) is True
+    assert drain_calls == [handle.submission_id]
+
+
+def test_collect_loses_to_an_inprogress_stop_without_double_consumption():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    assert started.wait(timeout=5)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stopped = pool.submit(rollout.stop, handle.submission_id)
+        with pytest.raises(RuntimeError, match='being stopped'):
+            rollout.collect(handle)
+        release.set()
+        assert stopped.result(timeout=5) is True
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_idle_failure_is_separate_from_generation_and_remains_quarantined():
+    sentinel = RuntimeError('provider cannot confirm command exit')
+
+    class Env:
+        def ensure_idle(self):
+            raise sentinel
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(RuntimeError, match='unconfirmed') as error:
+        rollout.collect(handle)
+    assert error.value.__cause__ is sentinel
+    with pytest.raises(RuntimeError, match='unconfirmed'):
+        rollout.stop(handle.submission_id)
+    with pytest.raises(ValueError, match='still borrowed'):
+        rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+
+
+def test_admit_threads_tool_schema_into_core():
+    class ToolCaptureTemplate(_Template):
+        seen = None
+
+        def encode_prompt(self, trajectory, **kwargs):
+            self.seen = trajectory.get('tools')
+            return super().encode_prompt(trajectory, **kwargs)
+
+    template = ToolCaptureTemplate()
+    rollout = ClientMultiTurnRollout(_Sampler(), template, tool_manager=_ToolManager(), max_turns=2)
+    schema = _ToolManager.tool_infos()
+    handle = rollout.admit(_trajectory()['messages'], prompt_extras={'tools': schema})
+    _wait_for_handle(rollout, handle)
+    rollout.collect(handle)
+    assert template.seen == schema
+
+
+def test_admit_rejects_conflicting_configuration_before_side_effects():
+    sampler = _Sampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template())
+    with pytest.raises(ValueError, match='num_samples=1'):
+        rollout.admit(_trajectory()['messages'], sampling_params={'num_samples': 2})
+    with pytest.raises(ValueError, match='reserved fields'):
+        rollout.admit(_trajectory()['messages'], prompt_extras={'adapter_uri': 'other'})
+    assert sampler.calls == []
+
+
+def test_streaming_scope_attempts_all_handles_before_abort(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),) * 4), _Template())
+    handles = [rollout.admit(_trajectory()['messages']) for _ in range(4)]
+    for handle in handles:
+        _wait_for_handle(rollout, handle)
+    events = []
+    original = rollout.stop
+
+    def stop(submission_id):
+        events.append(submission_id)
+        if submission_id == handles[0].submission_id:
+            raise RuntimeError('first cleanup failed')
+        return original(submission_id)
+
+    monkeypatch.setattr(rollout, 'stop', stop)
+    driver = type('Driver', (), {'abort': lambda self: events.append('abort')})()
+    with pytest.raises(BaseExceptionGroup, match='streaming cleanup'):
+        with rollout.streaming(driver):
+            pass
+    assert events == [handle.submission_id for handle in handles] + ['abort']
+    with pytest.raises(RuntimeError, match='admission is closed'):
+        rollout.admit(_trajectory()['messages'])
+
+
+def test_streaming_scope_preserves_primary_and_unknown_resources():
+    class FailingSampler:
+        def sample(self, *args, **kwargs):
+            raise ConnectionError('unknown remote generation')
+
+    rollout = ClientMultiTurnRollout(FailingSampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    aborted = []
+    driver = type('Driver', (), {'abort': lambda self: aborted.append(True)})()
+    with pytest.raises(ConnectionError, match='unknown remote') as error:
+        with rollout.streaming(driver):
+            rollout.collect(handle)
+    assert aborted == [True]
+    assert not rollout.is_idle
+    assert any('streaming cleanup' in note for note in error.value.__notes__)
+    assert any(handle.submission_id in note for note in error.value.__notes__)
+    with pytest.raises(BaseExceptionGroup):
+        rollout.drain()
+
+
+def test_drain_waits_for_admission_already_in_progress(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),)), _Template())
+    starting, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    original_start, original_wait = rollout._start, rollout._condition.wait
+
+    def start(*args, **kwargs):
+        starting.set()
+        assert release.wait(timeout=5)
+        return original_start(*args, **kwargs)
+
+    def wait(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(rollout, '_start', start)
+    monkeypatch.setattr(rollout._condition, 'wait', wait)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admitted = pool.submit(rollout.admit, _trajectory()['messages'])
+        assert starting.wait(timeout=5)
+        drained = pool.submit(rollout.drain)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not drained.done()
+        finally:
+            release.set()
+        handle = admitted.result(timeout=5)
+        drained.result(timeout=5)
+    assert rollout.is_idle
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger():
+    import importlib.util
+    from pathlib import Path
+    from twinkle_agentic.envs import EnvTool
+    from twinkle_agentic.tools.tool_manager import ToolManager
+
+    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
+    spec = importlib.util.spec_from_file_location('blackjack_sdk_test', path)
+    recipe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recipe)
+    # Find a deterministic hand for which hit is nonterminal, then stand ends it.
+    for seed in range(100):
+        probe = recipe.BlackjackEnv(seed)
+        probe.reset()
+        continues = not probe.step('play', {'action': 'hit'}).done
+        probe.close()
+        if continues:
+            break
+    else:
+        raise AssertionError('no nonterminal hit hand found')
+    env = recipe.BlackjackEnv(seed)
+    initial = env.reset()
+    tool = EnvTool(env, tool_name='play', parameters=recipe.PLAY_SCHEMA['function']['parameters'])
+    manager = ToolManager([tool])
+
+    class Template(_Template):
+        def append_completion(self, state, tokens, **kwargs):
+            next_state = splice_state(state, tokens, tokens, scored=True, sampled=True)
+            calls = () if tokens == [30] else ({'id': f'play-{tokens[0]}', 'type': 'function',
+                'function': {'name': 'play', 'arguments': {'action': 'hit' if tokens == [10] else 'stand'}}},)
+            response = DecodedResponse(content='play', tool_calls=calls, reasoning_started=False)
+            message = {'role': 'assistant', 'content': 'play', 'tool_calls': list(calls)}
+            return CompletionEncoding(replace(next_state, messages=state.messages + (message,)), response)
+
+    rollout = ClientMultiTurnRollout(_Sampler(((10, 'stop'), (20, 'stop'), (30, 'stop'))), Template(), max_turns=4)
+    driver = type('Driver', (), {'abort': lambda self: None})()
+    try:
+        with rollout.streaming(driver):
+            handle = rollout.admit([{'role': 'user', 'content': initial.observation}],
+                                   tool_manager=manager, prompt_extras={'tools': manager.tool_infos()})
+            _wait_for_handle(rollout, handle)
+            sample = rollout.collect(handle)
+            assert tool.done
+            assert tool.episode_reward in (-1, 0, 1)
+            assert sample.response_token_ids[:2] == [10, 20]
+            assert len(sample.rollout_logprobs) == len(sample.response_token_ids)
+            assert any(message['role'] == 'tool' for message in sample.messages)
+        assert rollout.is_idle
+    finally:
+        env.close()
+
+
+def test_streaming_scope_reports_abort_failure_without_replacing_body_error():
+    class Driver:
+        def abort(self):
+            raise SystemExit('abort failed')
+
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(BaseExceptionGroup) as grouped:
+        with rollout.streaming(Driver()):
+            pass
+    assert any(isinstance(error, SystemExit) for error in grouped.value.exceptions)
+    primary = ValueError('training failed')
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(ValueError) as caught:
+        with rollout.streaming(Driver()):
+            raise primary
+    assert caught.value is primary
+    assert any('abort failed' in note for note in primary.__notes__)
+
+
+def test_drain_uses_immutable_submission_identity_after_handle_tampering(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),)), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    entry = rollout._streaming[handle.submission_id]
+    cancelled = []
+    original = entry.call.execution.cancel
+
+    def cancel():
+        cancelled.append(True)
+        original()
+
+    monkeypatch.setattr(entry.call.execution, 'cancel', cancel)
+    handle.submission_id = 'modified-by-caller'
+    with pytest.raises(RuntimeError, match='unknown'):
+        rollout.poll([handle])
+    rollout.drain()
+    first = len(cancelled)
+    rollout.drain()
+    assert len(cancelled) == first, 'already settled calls must not be drained again'
+    assert rollout.is_idle

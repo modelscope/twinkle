@@ -4,6 +4,8 @@
 Moved with the TransferQueue runtime that consumes them; the live control plane keeps only
 ``RolloutPolicy`` / ``PartitionAdmission`` in ``async_rl/types.py`` -- the multi-tenant run
 identity (``RLContext`` below) has no live consumer and lives here with its archived callers.
+These paper-experiment types remain preserved in ``pipelineTQ/``; their historical entry drift is
+not a supported API and is not shared with the independent CS streaming path.
 """
 
 from __future__ import annotations

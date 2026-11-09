@@ -215,7 +215,8 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 | Task | Example |
 |---|---|
 | Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| Multi-turn code repair with tools (text only) | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
+| Multi-turn code repair with tools (text only, asyncio orchestration) | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
+| Complete-episode ready streaming with an explicit synchronous training loop (StreamingDriver) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. Start the Server
 
@@ -256,10 +257,29 @@ python cookbook/client/async_rl/multi_turn_grpo.py
 
 The model reads files, runs tests and repairs code, then trains on the test results. Each attempt uses an independent workspace; the example handles initialization, scoring and cleanup. For environment setup, see [Agentic RL Deployment and Training](../Agentic-RL-Deployment-and-Training.md).
 
+### 4. Run the Episode-streaming Code Example (Optional)
+
+`streaming_multi_turn_grpo.py` reuses Blackjack from the existing multi-turn examples: the model calls `play(hit/stand)`, the environment returns observations and terminal rewards, and complete groups feed GRPO training and policy publication. OpenEnv/OpenSpiel runs inside the client process; no environment server or generated-code execution is needed.
+
+Install the client environment dependencies, then use the Twinkle server and client settings above:
+
+```bash
+pip install 'openenv==0.11.0' 'open_spiel==2.0.2'
+pip install 'openenv-openspiel-env @ git+https://github.com/huggingface/OpenEnv.git@9c6376390489f28e0e545cf74a277064e7edd52f#subdirectory=envs/openspiel_env'
+python cookbook/client/async_rl/streaming_multi_turn_grpo.py
+```
+
+Group members use the same environment seed, independent environments and different model sampling seeds. Unfinished games and zero-advantage groups are skipped; a short run need not produce an update or increasing reward. `_train_loop` shows training explicitly, with one optimizer step per complete group. Top-level constants control group size, buffering and the update budget.
+
+`rollout.streaming(driver)` closes streaming admission, signals cancellation, attempts to settle every call and then joins the driver. The instance accepts no further streaming admission after exit. Environments remain caller-owned. `rollout.is_idle` reads the SDK's existing execution/resource completion evidence; the example retains the transport and reports failure when execution is unconfirmed.
+
+Sampling stays at `temperature=1`, `top_p=1`, `top_k=-1` and `repetition_penalty=1` to match processed logprobs to raw training logits. The shared `server_config.yaml` still deploys DataPlane and requires the server's `[async-rl]` dependencies.
+
 ### Use Your Own Task
 
 - Math tasks: change the dataset and reward function in the script.
-- Code tasks: edit `TASK` at the top of `multi_turn_grpo.py`, including the candidate file, tests and prompt.
+- Code tasks: edit `TASK` at the top of `multi_turn_grpo.py`.
+- Streaming tool tasks: replace the Blackjack environment, tools and environment reward seam while keeping complete groups, advantages, training and publication.
 - Start with the default training settings; edit the constants at the top of the script when needed. Training logs show rewards and metrics, and LoRA checkpoints are saved.
 
 ## Trainable Multi-turn Rollout (ClientMultiTurnRollout)

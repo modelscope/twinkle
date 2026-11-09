@@ -19,6 +19,7 @@ import inspect
 import json
 import math
 import os
+import threading
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function
@@ -386,6 +387,10 @@ class OpenEnvClient(Env):
         self.reset_kwargs: Dict[str, Any] = dict(reset_kwargs or {})
         self._episode_reward = 0.0
         self._last_result = None
+        self._operation_lock = threading.Lock()
+        self._inflight = False
+        self._uncertain_error: BaseException | None = None
+        self._closed = False
 
         async_client = resolved_cls(
             base_url=base_url,
@@ -432,7 +437,7 @@ class OpenEnvClient(Env):
         self._episode_reward = 0.0
         # The server rebuilds its environment instance on reset, so the
         # session (and its WebSocket) is reused across episodes.
-        result = self._client.reset(**self.reset_kwargs)
+        result = self._invoke(self._client.reset, **self.reset_kwargs)
         self._last_result = result
         return StepResult(
             observation=_format_client_observation(getattr(result, 'observation', None)),
@@ -472,10 +477,35 @@ class OpenEnvClient(Env):
         return tools
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._invoke(self._client.close)
+        self._closed = True
+
+    def ensure_idle(self) -> None:
+        """A successful synchronous reply confirms completion; a failed wait does not."""
+        with self._operation_lock:
+            if self._uncertain_error is not None:
+                raise RuntimeError('OpenEnv execution/close is unconfirmed') from self._uncertain_error
+            if self._inflight:
+                raise RuntimeError('OpenEnv operation is still in flight')
+
+    def _invoke(self, operation, *args, **kwargs):
+        with self._operation_lock:
+            if self._uncertain_error is not None:
+                raise RuntimeError('OpenEnv execution/close is unconfirmed') from self._uncertain_error
+            if self._closed or self._inflight:
+                raise RuntimeError('OpenEnv session is closed or busy')
+            self._inflight = True
         try:
-            self._client.close()
-        except Exception as e:  # noqa # best-effort: the server reaps the session anyway
-            logger.warning(f'OpenEnvClient failed to close session at {self._base_url}: {e}')
+            return operation(*args, **kwargs)
+        except BaseException as error:
+            with self._operation_lock:
+                self._uncertain_error = error
+            raise
+        finally:
+            with self._operation_lock:
+                self._inflight = False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -504,7 +534,7 @@ class OpenEnvClient(Env):
         """
         if isinstance(action, dict):
             action = self._build_action_from_fields(action)
-        result = self._client.step(action)
+        result = self._invoke(self._client.step, action)
         self._last_result = result
         return result
 

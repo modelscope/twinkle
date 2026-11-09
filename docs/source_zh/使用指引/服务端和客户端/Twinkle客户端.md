@@ -214,7 +214,8 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 | 场景 | 示例 |
 |---|---|
 | 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| 带工具调用的多轮代码修复（纯文本） | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
+| 带工具调用的多轮代码修复（纯文本，asyncio 编排） | [multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/multi_turn_grpo.py) |
+| 完整 episode 就绪流与显式同步训练（StreamingDriver） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 
 ### 1. 启动服务端
 
@@ -255,10 +256,29 @@ python cookbook/client/async_rl/multi_turn_grpo.py
 
 示例会让模型读取文件、运行测试并修复代码，再根据测试结果训练。每次尝试使用独立的工作区，初始化、评分和关闭环境都已在示例中处理；环境准备见 [Agentic RL 部署与训练](../Agentic%20RL部署与训练.md)。
 
+### 4. 运行 episode streaming 多轮任务（可选）
+
+`streaming_multi_turn_grpo.py` 复用已有多轮示例的 Blackjack（21 点）任务：模型调用 `play(hit/stand)`，环境返回手牌和最终奖励，再按完整组计算 GRPO 优势、训练并发布新策略。OpenEnv/OpenSpiel 在客户端进程中运行，无需启动环境服务，也不执行模型生成的代码。
+
+安装客户端环境依赖后，沿用上面的 Twinkle 服务和客户端配置：
+
+```bash
+pip install 'openenv==0.11.0' 'open_spiel==2.0.2'
+pip install 'openenv-openspiel-env @ git+https://github.com/huggingface/OpenEnv.git@9c6376390489f28e0e545cf74a277064e7edd52f#subdirectory=envs/openspiel_env'
+python cookbook/client/async_rl/streaming_multi_turn_grpo.py
+```
+
+同组使用相同的环境 seed、独立环境和不同的模型采样 seed。未结束的牌局和整组同分的数据会跳过训练；脚本不保证短运行一定产生更新或 reward 上升。训练循环在 `_train_loop` 中直接展示，每个完整组执行一步；顶部常量控制组大小、缓冲组数和更新预算。
+
+`rollout.streaming(driver)` 负责关闭 streaming admission、广播停止、尝试归集全部调用，再联归 driver；退出后该实例不再接受 streaming admission。环境仍由调用方拥有。`rollout.is_idle` 只读取 SDK 已有的执行/资源结束证据；结果未确认时，示例保留 transport 并报告失败。
+
+脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
+
 ### 修改为自己的任务
 
 - 数学任务：修改脚本中的数据集和奖励函数。
-- 代码任务：修改 `multi_turn_grpo.py` 顶部的 `TASK`，包括待修复文件、测试和提示词。
+- 代码任务：修改 `multi_turn_grpo.py` 顶部的 `TASK`。
+- 流式工具任务：从 Blackjack 示例的环境、工具和环境 reward 接缝替换任务，保留完整组、优势、训练和发布流程。
 - 先使用示例默认训练参数；需要调整时，再修改脚本顶部的配置。训练日志会输出奖励和指标，并保存 LoRA 检查点。
 
 ## 可训练多轮 Rollout（ClientMultiTurnRollout）

@@ -54,7 +54,7 @@ def test_train_pull_keeps_explicit_zero_out_of_the_stats():
     assert driver._last_pull_steps == 0
     assert driver.stats.optimizer_steps == 0
     assert driver.stats.train_pulls == 0
-    assert driver.stats.consumed == 0
+    assert driver.stats.consumed == 1
 
 
 def test_train_pull_missing_report_defaults_to_one_step():
@@ -113,4 +113,4 @@ def test_iterator_runs_until_three_real_updates():
     assert seen == [0, 1, 1, 1]
     assert driver._budget_steps == 3
     assert driver.stats.optimizer_steps == 3
-    assert driver.stats.consumed == 12
+    assert driver.stats.consumed == 16

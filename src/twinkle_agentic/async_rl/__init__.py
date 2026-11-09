@@ -6,11 +6,11 @@ that only needs one primitive must not be forced to import anything heavier. Eac
 imported from its defining submodule on first access instead of eagerly here.
 
 The former TransferQueue runtime (pipeline / workers / scheduler / data_plane / native_tq / the
-``*_sampler_tq`` backends / generation_submissions / context_manager) is archived under ``legacy/``
-for preservation only, not for use: it modelled a server-side multi-tenant context pipeline, which
-this architecture retires -- the streaming driver runs on the client, the server is a stateless
-execution device, and the two never shared state. Nothing outside ``legacy/`` may import from it,
-and the live modules carry no fields or parameters that exist only to serve it.
+``*_sampler_tq`` backends / generation_submissions / context_manager) is preserved under
+``pipelineTQ/`` for paper experiments, not restored as a supported entry point: its historical
+imports and types have drifted. The independent CS streaming path uses ``StreamingDriver`` on the
+client and does not import that runtime. Nothing outside ``pipelineTQ/`` may import from it, and
+the live modules carry no fields or parameters that exist only to serve it.
 """
 
 from __future__ import annotations
