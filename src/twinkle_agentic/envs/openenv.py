@@ -19,6 +19,7 @@ import inspect
 import json
 import math
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function
@@ -119,6 +120,61 @@ def _collect_batch(results, device_mesh=None):
 # ==========================================================================
 
 
+def _is_env_class_name(name: str) -> bool:
+    """Whether a class name names a CONCRETE environment to instantiate.
+
+    The ecosystem mostly uses the full 'Environment' suffix, but the code-action family
+    stops at 'Env' (``PythonCodeActEnv``, ``JuliaCodeActEnv``). The bare suffixes name
+    the base classes themselves, which must never be picked.
+    """
+    return name not in ('Environment', 'Env', 'MCPEnvironment') and name.endswith(('Environment', 'Env'))
+
+
+def _tool_from_action(action_cls: type) -> ToolInfo:
+    """Derive the OpenAI tool schema for an OpenEnv Action class.
+
+    OpenEnv's ``Environment`` interface has no ``tools()`` contract and no official
+    environment implements one, so the embedded adapter falls back to the Action class:
+    every OpenEnv action is a pydantic model whose fields ARE the tool arguments
+    (``step`` builds the action straight from ``action_cls(**arguments)``), so the schema
+    derived here is exactly the arguments the environment will accept. Fields declared on
+    a base class (OpenEnv's ``Action`` carries a framework-side ``metadata``) are dropped:
+    only what the environment's own class declares is a model-facing parameter. The name
+    comes from the class (``CodeAction`` -> ``code_action``) and the description from its
+    docstring, which OpenEnv authors use to document the fields.
+    """
+    inherited = set()
+    for base in action_cls.mro()[1:]:
+        # ``model_fields`` (not ``model_json_schema``): it reads fine on BaseModel itself,
+        # which only carries an empty mapping.
+        fields = getattr(base, 'model_fields', None)
+        if fields:
+            inherited.update(fields)
+    schema = action_cls.model_json_schema()
+    properties = {key: value for key, value in schema.get('properties', {}).items()
+                  if key not in inherited}
+    # pydantic echoes the field names as 'title'; the parameter key already says it.
+    for prop in properties.values():
+        prop.pop('title', None)
+    required = [key for key in schema.get('required', []) if key in properties]
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2',
+                  re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', action_cls.__name__)).lower()
+    description = ' '.join((inspect.getdoc(action_cls) or '').split()) \
+        or f'Invoke a {name} action on the environment.'
+    return {
+        'type': 'function',
+        'function': {
+            'name': name,
+            'description': description,
+            'parameters': {
+                'type': 'object',
+                'properties': properties,
+                'required': required,
+            },
+        },
+    }
+
+
 def _discover_openenv_classes(env_name: str):
     """Auto-discover Environment and Action classes from an OpenEnv package."""
     import pkgutil
@@ -148,8 +204,7 @@ def _discover_openenv_classes(env_name: str):
             mod = importlib.import_module(f'{env_name}.server.{modname}')
             for attr_name in dir(mod):
                 obj = getattr(mod, attr_name)
-                if (isinstance(obj, type) and attr_name.endswith('Environment') and attr_name != 'Environment'
-                        and attr_name != 'MCPEnvironment'):
+                if isinstance(obj, type) and _is_env_class_name(attr_name):
                     env_cls = obj
                     break
             if env_cls:
@@ -157,7 +212,8 @@ def _discover_openenv_classes(env_name: str):
 
     if env_cls is None:
         raise ImportError(f"Cannot discover Environment class in '{env_name}.server'. "
-                          f"Expected a '*Environment' class in a '*_environment.py' module.")
+                          f"Expected a '*Environment' or '*Env' class in a '*_environment.py' "
+                          f"or '*_env.py' module.")
     return env_cls, action_cls
 
 
@@ -185,6 +241,21 @@ class OpenEnv(Env):
         self._env = resolved_cls(**(env_kwargs or {}))
         self._action_cls = _import_env_class(action_cls) if isinstance(action_cls, str) else action_cls
         self._action_mapper = action_mapper
+
+    def tools(self) -> List[ToolInfo]:
+        # Prefer the environment's own advertisement when it has one. OpenEnv's Environment
+        # interface defines no tools() and no official environment implements it, so fall
+        # back to deriving the schema from the Action class (_tool_from_action): its fields
+        # are exactly the arguments step() accepts, which keeps the advertised schema and
+        # the invocation contract from ever drifting apart.
+        inner = getattr(self._env, 'tools', None)
+        if callable(inner):
+            advertised = list(inner())
+            if advertised:
+                return advertised
+        if self._action_cls is not None:
+            return [_tool_from_action(self._action_cls)]
+        return []
 
     def reset(self, trajectory=None) -> StepResult:
         result = self._env.reset()
