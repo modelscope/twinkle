@@ -1073,6 +1073,13 @@ class MultiTurnRollout(Rollout):
         while spent < budget:
             spent += 1
 
+            # 1b. Length budget: the turn's completion budget must still fit under the
+            # template's max_length. Ending here is a truncated episode with the turns
+            # it banked; letting the turn run would die inside the completion append.
+            if ledger.unfit(params):
+                truncated = True
+                break
+
             # 2. One request. The callback chooses the local sampler or the API
             # adapter, but both paths return exactly one SampledSequence.
             try:
