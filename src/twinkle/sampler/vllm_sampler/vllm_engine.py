@@ -392,6 +392,13 @@ class VLLMEngine(BaseSamplerEngine):
             engine_config['enable_return_sampling_mask'] = True
             engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
+        # engine_kwargs are the caller's escape hatch into AsyncEngineArgs: a key the installed
+        # vLLM does not know is a typo'd knob that would otherwise warn and vanish (the filter
+        # below still carries twinkle's own injected keys, which are allowed to warn-and-drop).
+        unknown_user_keys = set(self.engine_kwargs or ()) - set(valid_args)
+        if unknown_user_keys:
+            raise RuntimeError('engine_kwargs contain keys the installed vLLM AsyncEngineArgs does not '
+                               f'know: {sorted(unknown_user_keys)}')
         if backend in ('twinkle_delta_ipc', 'twinkle_delta_hccl') and 'weight_transfer_config' not in valid_args:
             raise RuntimeError('delta_sharded requires vLLM AsyncEngineArgs.weight_transfer_config')
         filtered_engine_config, invalid_args = _filter_engine_config(
