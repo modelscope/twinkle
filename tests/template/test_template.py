@@ -115,6 +115,27 @@ def test_media_bundle_captures_top_level_and_inline_media():
     assert MediaBundle.from_sources(inline).images == ('b.png', )
 
 
+def test_encode_prompt_preserves_metadata_when_encode_consumes_sample():
+    template = object.__new__(Template)
+    template._engine_input_ids = lambda ids: ids
+    template._reasoning_started = lambda ids: False
+
+    def encode(sample, **kwargs):
+        sample.pop('messages')
+        sample.pop('tools')
+        return {'input_ids': [1], 'messages': [], 'tools': []}
+
+    template.encode = encode
+    messages = [{'role': 'user', 'content': 'question'}]
+    tools = [{'type': 'function', 'function': {'name': 'tool', 'parameters': {}}}]
+    sample = {'messages': messages, 'tools': tools}
+
+    encoding = template.encode_prompt(sample)
+
+    assert encoding.state.messages == tuple(messages)
+    assert encoding.state.tools == tuple(tools)
+
+
 def test_render_delta_normalizes_tool_calls_in_history():
 
     class Tokenizer:
