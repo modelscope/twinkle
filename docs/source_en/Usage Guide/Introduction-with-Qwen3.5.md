@@ -552,3 +552,10 @@ base_model = 'Qwen/Qwen3.8-27B'  # Model currently deployed in the official envi
 - If you just want to try Twinkle quickly, use the ModelScope official environment — get your first training run done in 5 minutes.
 
 Twinkle's design philosophy is **to give you the building blocks, not make the decisions for you**. Whether you need maximum performance at scale or maximum convenience via API, there's a solution that fits.
+
+
+## Colocated vLLM full-weight publication
+
+On CUDA, colocated full-weight synchronization pairs each vLLM worker with a training worker by physical device UUID. The receiver finishes loading bucket views and synchronizes device reads before acknowledging reuse of the bucket. Device tensors larger than the transfer bucket can be mapped directly through IPC; CPU initial weights still stage through the device bucket. LoRA accumulation and the non-colocated transport keep their existing ownership rules.
+
+`offload_to_cpu(offload_model=False, offload_optimizer=False)` releases allocator caches without moving parameters. Its optional `gc_min_free_fraction` allows a colocated caller to specify the required free-memory fraction: young cycles are collected each call, while a full collection runs on the first call, every 16 calls, or whenever free CUDA memory is below the reservation. Omitting this argument retains full collection on every call.

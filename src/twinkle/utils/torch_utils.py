@@ -1,3 +1,5 @@
+import functools
+import os
 import socket
 from contextlib import suppress
 from dataclasses import dataclass
@@ -63,6 +65,19 @@ def pad_sequence_to_length(
 
 
 _CHUNKED_SELECTIVE_LOG_SOFTMAX = None
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_cross_entropy():
+    try:
+        from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+    except (ImportError, OSError):
+        return None
+    from twinkle import get_logger
+
+    get_logger().info('Using FlashAttention CE for accelerator selective_log_softmax '
+                      '(FP32 logps, out-of-place backward).')
+    return cross_entropy_loss
 
 
 def _chunked_selective_log_softmax_function():
@@ -172,6 +187,20 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
         pass
 
     vocab_size = logits.shape[-1]
+    # The FlashAttention CE reduction accumulates in FP32 and returns FP32 logps,
+    # including for BF16 inputs. Keep the input intact: callers can still need the
+    # logits for another loss, so in-place CE backward is deliberately disabled.
+    # Entropy, double precision, deterministic mode and non-accelerator builds
+    # retain the portable implementation below.
+    if (logits.is_cuda and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and not return_entropy and logits.stride(-1) == 1
+            and not torch.are_deterministic_algorithms_enabled()
+            and os.environ.get('TWINKLE_DISABLE_FLASH_ATTN_CE', '0') != '1'):
+        cross_entropy = _flash_cross_entropy()
+        if cross_entropy is not None:
+            losses, _ = cross_entropy(
+                logits.reshape(-1, vocab_size), index.reshape(-1), inplace_backward=False)
+            return -losses.reshape(index.shape)
     flat_logits = logits.reshape(-1, vocab_size)
     flat_index = index.reshape(-1)
     compute_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32

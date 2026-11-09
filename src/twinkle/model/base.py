@@ -492,7 +492,8 @@ class TrainableModel(ABC):
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     @timed
-    def offload_to_cpu(self, *, offload_model: bool = True, offload_optimizer: bool = True) -> None:
+    def offload_to_cpu(self, *, offload_model: bool = True, offload_optimizer: bool = True,
+                       gc_min_free_fraction: float | None = None) -> None:
         """Hand this rank's training memory back so a colocated process can use the device.
 
         Colocation -- an online-RL rollout engine, or an in-training generative-eval sampler, sharing
@@ -522,7 +523,10 @@ class TrainableModel(ABC):
         if not offload_model and not offload_optimizer:
             from twinkle.model.offload import record_offload, release_caching_allocator
             record_offload(self.strategy, model=False, optimizer=False)
-            release_caching_allocator()
+            if gc_min_free_fraction is None:
+                release_caching_allocator()
+            else:
+                release_caching_allocator(min_free_fraction=gc_min_free_fraction)
             return
         optimizer = self._colocation_optimizer() if offload_optimizer else None
         if offload_model:
