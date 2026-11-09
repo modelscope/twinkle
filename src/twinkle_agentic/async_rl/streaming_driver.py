@@ -696,8 +696,15 @@ class StreamingDriver:
                         ready.append(record)
                         fresh.append(record)
                         group_counts[group_key] = group_counts.get(group_key, 0) + 1
-                        self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
-                                                   resolved_groups, regen_queue, regen_counts)
+                        # A score worker submits this poll's survivors only after the loop; an
+                        # in-loop barrier would resolve a freshly completed group unscored
+                        # (score_ref is None both before submission and after reap). Defer to the
+                        # post-submission re-probe and the pull boundary's blocking reap; the
+                        # in-loop call stays only for the inline-score seam, which has already
+                        # scored each sample at this point.
+                        if self._score_worker is None:
+                            self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
+                                                       resolved_groups, regen_queue, regen_counts)
                     # Submit this poll's survivors as ONE batched scoring call (lazy: the call returns
                     # a reference, the actors keep scoring while the driver moves on) and probe the
                     # whole buffer non-blockingly: whatever landed re-enters the group barrier.
