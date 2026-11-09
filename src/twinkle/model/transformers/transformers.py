@@ -708,12 +708,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                         len(scheduler.base_lrs))
             return
         scheduler.optimizer = optimizer
-        # ``initial_lr`` is set by LRScheduler.__init__ on the ORIGINAL groups and carried into the
-        # rebuilt ones where the strategy kept the extra keys; the current lr is the pre-step value,
-        # so it is the correct fallback for a group that lost the annotation.
+        # ``initial_lr`` is the annotation LRScheduler.__init__ stamps on the groups it was built over.
+        # A group that lacks it -- e.g. an optimizer installed later through the public set_optimizer,
+        # whose groups the scheduler was never built on -- must NOT fall back to the group's CURRENT lr:
+        # on resume that lr is the restored, already-decayed value, and taking it as the base decays the
+        # schedule a second time (every post-resume lr scaled by last_lr/base_lr). The scheduler's own
+        # base_lrs -- carried from construction or restored from scheduler.pt -- is the authoritative
+        # base, and this branch only runs when the group count is unchanged, so keep it element-wise.
+        prior_base_lrs = scheduler.base_lrs
         scheduler.base_lrs = [
-            group['initial_lr'] if 'initial_lr' in group else group['lr']
-            for group in optimizer.param_groups
+            group['initial_lr'] if 'initial_lr' in group else prior_base
+            for group, prior_base in zip(optimizer.param_groups, prior_base_lrs)
         ]
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
