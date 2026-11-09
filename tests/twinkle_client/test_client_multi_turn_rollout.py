@@ -127,6 +127,37 @@ def test_text_http_multi_turn_preserves_tokens_messages_and_logprobs():
     assert result['truncated'] is False
 
 
+def test_harness_receives_opening_when_sampled_state_omits_metadata():
+    class DroppingStateTemplate(_Template):
+        def append_completion(self, state, tokens, **kwargs):
+            completed = super().append_completion(state, tokens, **kwargs)
+            return CompletionEncoding(replace(completed.state, messages=(), tools=()), completed.response)
+
+    class Harness:
+        def __init__(self):
+            self.calls = []
+
+        def before_generate(self, trajectory):
+            return trajectory
+
+        def after_generate(self, trajectory, decoded, tool_calls):
+            self.calls.append((trajectory['messages'], trajectory['tools']))
+            return {'messages': trajectory['messages'] + [{'role': 'assistant', 'content': decoded}]}
+
+    harness = Harness()
+    rollout = ClientMultiTurnRollout(
+        _Sampler(((20, 'stop'),)), DroppingStateTemplate(), tool_manager=_ToolManager(), harness=harness)
+
+    result = rollout([_trajectory()])[0]
+
+    assert harness.calls == [(_trajectory()['messages'], _ToolManager.tool_infos())]
+    assert result['messages'] == [
+        {'role': 'user', 'content': 'question'},
+        {'role': 'assistant', 'content': 'answer-20'},
+    ]
+    assert result['tools'] == _ToolManager.tool_infos()
+
+
 def test_core_and_wire_characterization_share_scripted_trajectory():
     def wire_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs, **kwargs):
         response = sampler.sample([input_feature], sampling_params=sampling_params)[0]
