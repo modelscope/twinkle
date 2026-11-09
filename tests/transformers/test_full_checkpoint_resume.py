@@ -113,3 +113,56 @@ def test_independent_offload_preserves_optimizer_continuation(
     for parameter, expected_parameter in zip(model.parameters(), reference.parameters()):
         for key, value in optimizer.state[parameter].items():
             torch.testing.assert_close(value, reference_optimizer.state[expected_parameter][key], rtol=0, atol=0)
+
+
+def _rebind_base_lrs(scheduler, target_optimizer):
+    """Run the static rebind and return the scheduler's resulting base_lrs."""
+    group = SimpleNamespace(lr_scheduler=scheduler, _scheduler_spec=None)
+    TransformersModel._rebind_lr_scheduler(group, target_optimizer)
+    return scheduler.base_lrs
+
+
+def test_rebind_keeps_base_lr_when_the_new_optimizer_lacks_initial_lr():
+    """An optimizer installed later (the public set_optimizer) has groups the scheduler was never built
+    over, so they carry no ``initial_lr``. On resume those groups hold the restored, ALREADY-DECAYED lr;
+    adopting it as the base would decay the schedule a second time (every post-resume lr scaled by
+    last_lr/base_lr). The scheduler's own base_lrs is the authoritative base and must be kept."""
+    built_on = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(built_on, lr_lambda=lambda epoch: 1.0)
+    assert scheduler.base_lrs == [0.1]
+    resumed = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.034)  # restored decayed lr
+    assert 'initial_lr' not in resumed.param_groups[0]
+    base_lrs = _rebind_base_lrs(scheduler, resumed)
+    assert base_lrs == [0.1], f'rebind adopted the decayed lr {base_lrs}; the schedule would double-decay'
+
+
+def test_rebind_keeps_base_lr_on_a_fresh_optimizer_whose_lr_equals_the_base():
+    """Control for the case above: a fresh (non-resumed) optimizer's current lr already equals the base,
+    so the old group['lr'] fallback and the new prior-base fallback agree -- the fix changes only the
+    resumed/decayed branch, not this one."""
+    built_on = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(built_on, lr_lambda=lambda epoch: 1.0)
+    fresh = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    assert 'initial_lr' not in fresh.param_groups[0]
+    assert _rebind_base_lrs(scheduler, fresh) == [0.1]
+
+
+def test_rebind_prefers_the_initial_lr_annotation_when_present():
+    """A group that kept the LRScheduler ``initial_lr`` annotation (the normal accelerate-prepare carry,
+    even when the current lr has since decayed) still drives base_lrs -- the fix only changes the
+    missing-annotation fallback."""
+    built_on = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(built_on, lr_lambda=lambda epoch: 1.0)
+    wrapped = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.034)
+    wrapped.param_groups[0]['initial_lr'] = 0.1
+    assert _rebind_base_lrs(scheduler, wrapped) == [0.1]
+
+
+def test_rebind_is_a_noop_when_the_optimizer_is_already_bound():
+    """Rebinding onto the optimizer the scheduler already steps is a no-op -- it must not clobber base_lrs."""
+    built_on = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(built_on, lr_lambda=lambda epoch: 1.0)
+    scheduler.base_lrs = [0.05]  # a value the rebind would overwrite if it did not early-return
+    group = SimpleNamespace(lr_scheduler=scheduler, _scheduler_spec=None)
+    TransformersModel._rebind_lr_scheduler(group, built_on)  # same optimizer object
+    assert scheduler.base_lrs == [0.05]
