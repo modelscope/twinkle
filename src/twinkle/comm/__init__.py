@@ -11,10 +11,18 @@ Typical use::
 
 The backend comes from ``Platform.communicator_backend()`` unless passed explicitly.
 """
-from .base import Communicator, ReduceOp, Rendezvous, Work
-from .registry import available_backends, create_communicator, default_backend, get_communicator_cls, register_backend
+from .base import DEFAULT_TIMEOUT, Communicator, ReduceOp, Rendezvous, Work
+from .registry import (
+                       available_backends,
+                       create_communicator,
+                       default_backend,
+                       get_communicator_cls,
+                       register_backend,
+                       unregister_backend,
+)
 
 __all__ = [
+    'DEFAULT_TIMEOUT',
     'Communicator',
     'ReduceOp',
     'Rendezvous',
@@ -24,4 +32,5 @@ __all__ = [
     'default_backend',
     'get_communicator_cls',
     'register_backend',
+    'unregister_backend',
 ]

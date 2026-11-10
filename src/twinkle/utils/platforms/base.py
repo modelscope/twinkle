@@ -203,7 +203,7 @@ class Platform(ABC):
     @staticmethod
     def communicator_backend() -> str:
         """The ``twinkle.comm`` backend name standalone process groups use on this platform."""
-        return 'nccl'
+        raise NotImplementedError('This platform does not declare a communicator backend')
 
     @staticmethod
     def ray_resources() -> Dict[str, float]:
