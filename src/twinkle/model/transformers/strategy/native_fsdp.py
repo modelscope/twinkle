@@ -166,7 +166,11 @@ class NativeFSDPStrategy(TransformerStrategyBase):
 
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
-                _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
+                # Meta loading materializes shards in _broadcast_sharded_state_dict.
+                # Allocating every EP-local expert here would precede EP-FSDP
+                # sharding and can exceed device memory even when the shards fit.
+                if not use_meta:
+                    _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision, self._mp_overrides)
             logger.info(
                 "FSDP precision: parameter_storage_dtypes=%s, mixed_precision=%s, policy=%s",

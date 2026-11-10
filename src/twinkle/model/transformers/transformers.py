@@ -2185,6 +2185,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
+        if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
+            # Initial adapter snapshots precede the first forward. Materialize on every
+            # rank before state-dict collectives: non-source ranks still hold meta tensors.
+            self._lazy_wrap_model()
         model = self.strategy.unwrap_model(self.model)
         save_kwargs = {
             'safe_serialization': safe_serialization,
