@@ -879,6 +879,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             gather_fn=self.sp_strategy.gather_loss_tensors if self.sp_strategy is not None else None,
             reduce_fn=self.sp_strategy.all_reduce if self.sp_strategy is not None else None)
         status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        optimizer_config.last_forward_training = is_training
         status.inputs = inputs
         status.outputs = outputs
         status.forward_kwargs = forward_kwargs
@@ -1415,7 +1416,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.get_loss(loss_key)
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        status = optimizer_config.train_status if self.model.training else optimizer_config.eval_status
+        is_training = optimizer_config.last_forward_training
+        if is_training is None:
+            is_training = self.model.training
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
