@@ -201,6 +201,11 @@ class Platform(ABC):
         return False
 
     @staticmethod
+    def communicator_backend() -> str:
+        """The ``twinkle.comm`` backend name standalone process groups use on this platform."""
+        return 'nccl'
+
+    @staticmethod
     def ray_resources() -> Dict[str, float]:
         """Accelerator resources that must be registered with ``ray.init`` explicitly.
 
