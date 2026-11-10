@@ -493,10 +493,20 @@ def _register_api_key_gate(app: FastAPI, self_fn: Callable[[], GatewayServer]) -
     @app.middleware('http')
     async def require_api_key(request: Request, call_next):
         gateway = self_fn()
-        if gateway.api_key is not None and request.url.path not in open_paths:
-            denied = _deny_without_key(request, gateway.api_key)
-            if denied is not None:
-                return denied
+        if gateway.api_key is not None:
+            # ``request.url.path`` carries the mount prefix (e.g. ``/api/v1/models``) while
+            # ``open_paths`` are app-relative, so strip the gateway's own route_prefix before the
+            # membership test -- otherwise a non-empty prefix (the default) gates the public
+            # discovery/liveness endpoints too, breaking the OpenAI "discovery is open" convention
+            # and load-balancer health probes.
+            path = request.url.path
+            prefix = (gateway.route_prefix or '').rstrip('/')
+            if prefix and path.startswith(prefix):
+                path = path[len(prefix):] or '/'
+            if path not in open_paths:
+                denied = _deny_without_key(request, gateway.api_key)
+                if denied is not None:
+                    return denied
         return await call_next(request)
 
 
