@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Optional
