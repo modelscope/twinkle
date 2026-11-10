@@ -345,7 +345,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().set_loss(loss_cls, **kwargs)
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self._adapter_context(kwargs.get('adapter_name')):

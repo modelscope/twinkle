@@ -1945,7 +1945,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.set_loss(construct_class(loss_cls, Loss, twinkle.loss, **kwargs), loss_key=loss_key)
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
         """Set the optimizer.
 
