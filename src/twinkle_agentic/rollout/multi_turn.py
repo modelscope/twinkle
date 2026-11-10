@@ -1074,11 +1074,24 @@ class MultiTurnRollout(Rollout):
             spent += 1
 
             # 1b. Length budget: the turn's completion budget must still fit under the
-            # template's max_length. Ending here is a truncated episode with the turns
-            # it banked; letting the turn run would die inside the completion append.
+            # template's max_length. With turns already banked (a multi-turn episode),
+            # ending here is a truncated episode keeping those banked turns. On the FIRST
+            # turn nothing is banked yet, so ending here would emit a zero-response sample
+            # (no labels -> nothing trainable, and it breaks the driver-side length stat and
+            # the worker forward); cap the budget to the room left and generate a truncated
+            # partial response instead. ``capped_turn_params`` returns None only when not even
+            # one token fits (the prompt alone is at/over max_length) -- then end truncated.
+            turn_params = params
             if ledger.unfit(params):
-                truncated = True
-                break
+                if ledger.turns == 0:
+                    capped = ledger.capped_turn_params(params)
+                    if capped is None:
+                        truncated = True
+                        break
+                    turn_params = capped
+                else:
+                    truncated = True
+                    break
 
             # 2. One request. The callback chooses the local sampler or the API
             # adapter, but both paths return exactly one SampledSequence.
@@ -1086,7 +1099,7 @@ class MultiTurnRollout(Rollout):
                 seq = response_callback(
                     self.sampler,
                     self.api,
-                    params,
+                    turn_params,
                     input_feature=ledger.input_feature,
                     rollout_state=ledger.state,
                     adapter_kwargs=adapter_kwargs,
