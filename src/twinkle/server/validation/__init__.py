@@ -17,10 +17,12 @@ Both read *declared* metadata, so neither can reject a valid request. A third,
 heuristic check over passthrough key spellings was implemented and removed for failing
 that bar -- see :mod:`.backend_compat` for the case that killed it.
 """
-from .backend_compat import BackendCapability, assert_request_supported, resolve_backend
+from .backend_compat import (BackendCapability, assert_request_supported, assert_sampler_weights_supported,
+                             resolve_backend)
 
 __all__ = [
     'BackendCapability',
     'assert_request_supported',
+    'assert_sampler_weights_supported',
     'resolve_backend',
 ]

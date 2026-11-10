@@ -344,3 +344,34 @@ async def test_forward_backward_skips_preflight_without_rl_inputs() -> None:
     assert management.preflight_calls == []
     assert len(management.model_calls) == 1
     assert management.model_calls[0][1] == 'training-a'
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('is_sampler', [True, False], ids=['sampler', 'training'])
+async def test_hybrid_sampler_save_is_rejected_before_enqueue(monkeypatch, tmp_path, is_sampler):
+    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    from twinkle.server.exceptions import RequestRejectedError
+    import twinkle.server.model.twinkle_handlers as handlers
+
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    runs = TwinkleTrainingRunManager('token')
+    runs._write_info('training-a', {'base_model': 'test-model', 'is_lora': True})
+    manager = TwinkleCheckpointManager('token', runs)
+    monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
+    service = _SchedulingManagement()
+    service.train_mode = 'hybrid'
+    saved = []
+    service.save = lambda name, output_dir, **kwargs: saved.append(name) or str(tmp_path / name)
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: service)
+    endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/twinkle/save')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.SaveRequest(adapter_name='adapter', name='step', is_sampler=is_sampler, training_id='training-a')
+
+    if is_sampler:
+        with pytest.raises(RequestRejectedError, match='Hybrid'):
+            await endpoint(request, body, service)
+        assert saved == [] and service.scheduled == []
+    else:
+        await endpoint(request, body, service)
+        assert saved == ['step']
