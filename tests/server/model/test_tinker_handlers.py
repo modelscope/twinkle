@@ -352,3 +352,18 @@ async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatc
     if name:
         assert uri == 'twinkle://model1/sampler_weights/step-1'
     assert response.sampling_session_id == 'session-123'
+
+@pytest.mark.asyncio
+async def test_hybrid_save_weights_for_sampler_is_rejected():
+    from twinkle.server.exceptions import RequestRejectedError
+
+    management = _SaveWeightsDummyManagement()
+    management.train_mode = 'hybrid'
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/save_weights_for_sampler')
+    body = types.SaveWeightsForSamplerRequest(model_id='model1', path='step-1')
+    with pytest.raises(RequestRejectedError, match='Hybrid'):
+        await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+    management.model.save.assert_not_called()
+    management.state.create_sampling_session.assert_not_called()

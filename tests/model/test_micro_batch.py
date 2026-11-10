@@ -750,3 +750,33 @@ class TestSelectBatch:
     def test_values_without_shape_pass_through(self):
         assert select_batch({'k': 1}, [0], 3) == {'k': 1}
         assert select_batch(3.5, [0], 3) == 3.5
+
+def test_calculate_loss_reads_the_status_of_the_adapters_own_last_forward():
+    """The module train/eval flag is shared by all tenants; calculate_loss must not follow it.
+
+    Tenant A runs forward_only (eval status) while tenant B's forward_backward has since put the
+    shared module back into train mode; A's calculate_loss still has to read A's eval status.
+    """
+    import inspect
+    import torch
+
+    def finalize(group, is_training, labels):
+        processor = SimpleNamespace(postprocess_outputs=lambda inputs, outputs, **_kwargs: (inputs, outputs))
+        TransformersModel._finalize_forward_outputs(
+            harness, {'labels': labels}, {'logps': torch.zeros_like(labels, dtype=torch.float32)},
+            processor=processor, task='causal_lm', optimizer_config=group, is_training=is_training,
+            forward_kwargs={}, loss_instance=group.loss_instance, return_logits=False, recorded_routing=None)
+
+    def group():
+        return BaseOptimizerGroup(loss_instance=CrossEntropyLoss(), train_status=SimpleNamespace(),
+                                  eval_status=SimpleNamespace(loss_value=0, num_tokens=0.0))
+
+    harness = SimpleNamespace(optimizer_group={'a': group(), 'b': group()}, device_mesh=None, sp_strategy=None,
+                              model=SimpleNamespace(training=False), _get_default_group=lambda: 'a')
+    finalize(harness.optimizer_group['a'], False, torch.tensor([[1, 2, -100]]))
+    harness.model.training = True  # tenant b trained in between
+    harness.optimizer_group['a'].train_status.inputs = None  # a's own train status was cleared by its metric call
+
+    calculate_loss = inspect.unwrap(TransformersModel.calculate_loss)
+    calculate_loss(harness, adapter_name='a')
+    assert harness.optimizer_group['a'].eval_status.num_tokens > 0

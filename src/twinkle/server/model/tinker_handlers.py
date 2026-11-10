@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import submit_training_task
+from twinkle.server.validation import assert_sampler_weights_supported
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.utils.logger import get_logger
 
@@ -227,6 +228,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.SaveWeightsForSamplerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
+        assert_sampler_weights_supported(self)
         token = await self._on_request_start(request)
 
         async def _do_save_for_sampler():

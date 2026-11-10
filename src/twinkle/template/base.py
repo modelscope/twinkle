@@ -56,11 +56,8 @@ class _RegistryParser:
     def _parser(text):
         return ToolCallRegistry.detect_first(text or "")
 
-    # ``tools`` is accepted-and-ignored to conform to swift's ToolParser protocol
-    # (swift.dev.template_contract.output.ToolParser.parse(text, tools=None)), which decode_output
-    # calls as ``parse(content, tools=tools)``. The registry parser detects the wire format from the
-    # text itself, so it -- like any parser whose format carries argument types -- does not need the
-    # tool schemas; the protocol declares ``tools`` optional for exactly this case.
+    # ``tools`` is part of swift's ToolCallParser contract; registry parsers detect the
+    # format from the text alone, so it is accepted and not forwarded.
     def parse(self, text, tools=None):
         parser = self._parser(text)
         return parser.parse(text) if parser else []
