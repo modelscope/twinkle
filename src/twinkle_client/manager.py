@@ -16,6 +16,7 @@ from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientContext, ClientTransport
 from twinkle_client.http.context import (TWINKLE_SERVER_TOKEN, TWINKLE_SERVER_URL, clear_default_transport,
                                          set_default_transport)
+from twinkle_client.operations import _guarded_operation
 
 logger = get_logger()
 
@@ -178,6 +179,9 @@ class TwinkleClient:
 
     def close(self) -> None:
         """Stop owned resources exactly once without affecting another client."""
+        scope = self._transport._operation_scope
+        if scope is not None:
+            scope.close()
         with self._close_lock:
             if self._closed:
                 return
@@ -205,6 +209,7 @@ class TwinkleClient:
         from twinkle_client.model import MultiLoraTransformersModel
         return MultiLoraTransformersModel(model_id, transport=self._transport, **kwargs)
 
+    @_guarded_operation
     def sampler(self, model_id: str, **kwargs: Any):
         """Create a remote sampler bound explicitly to this client."""
         from twinkle_client.sampler import vLLMSampler

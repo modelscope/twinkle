@@ -16,6 +16,7 @@ from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.utils.leases import Leases
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout, SampleHandle
 from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
@@ -368,7 +369,9 @@ class MultiTurnRollout(Rollout):
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: :class:`SamplingParams` for every episode.
         * ``response_callback``: chooses a backend for each assistant turn and
-          returns one :class:`SampledSequence`.
+          returns one :class:`SampledSequence`. An optional
+          ``validate_state(state, input_feature, trajectory_index)`` hook checks
+          transport constraints after opening or appending to the ledger.
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
@@ -378,6 +381,19 @@ class MultiTurnRollout(Rollout):
           for load balancing), aligned with the trajectory batch. Supplying them
           also enables sticky routing. Requires a continuous-work sampler.
     """
+
+    @staticmethod
+    def _coerce_remote_group(*args, **kwargs):
+        """Keep the episode on the process that owns sampler admission.
+
+        ``configure_workers`` records which replicas are ACTIVE on the driver handler.
+        Serialization drops that table and marks the copy so it cannot admit. ``sample()``
+        therefore has to run here; a payload actor would be holding a handler that refuses.
+        """
+        sampler = kwargs.get('sampler', args[0] if args else None)
+        if getattr(sampler, '_sampler_workers', None) is None:
+            return kwargs.get('remote_group')
+        return None
 
     def __init__(
         self,
@@ -870,7 +886,7 @@ class MultiTurnRollout(Rollout):
 
     # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
     # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch="all", collect="none", lazy_collect=False, control=True)
     def abort_all_inflight(self) -> None:
         """Abort every in-flight sampler generation so an in-place republish can resume them.
 
@@ -878,6 +894,8 @@ class MultiTurnRollout(Rollout):
         resumable on the fresh weights. Runs where the sampler handle is reachable --
         on a Ray proxy the driver instance has no sampler attribute, so the decorated
         dispatch is what carries the call to the worker that holds one.
+        This must bypass the generation-drain barrier: the call ends the in-flight
+        work that an ordinary RPC would first wait to finish naturally.
         """
         abort = getattr(getattr(self, "sampler", None), "abort_all_inflight", None)
         if not callable(abort):
@@ -911,6 +929,12 @@ class MultiTurnRollout(Rollout):
         if self.sampler is not None and kwargs.get("allow_partial_rollout", False):
             adapter_kwargs["allow_partial_rollout"] = True
         sampling_params = kwargs.get("sampling_params", self.sampling_params)
+        if isinstance(sampling_params, dict):
+            sampling_params = SamplingParams.from_dict(dict(sampling_params))
+        elif isinstance(sampling_params, SamplingParams):
+            sampling_params = replace(sampling_params)
+        else:
+            raise TypeError("sampling_params must be SamplingParams or a dict")
         if sampling_params.num_samples != 1:
             raise ValueError(f"MultiTurnRollout supports num_samples=1 only, got {sampling_params.num_samples}")
         response_callback = kwargs.get("response_callback", self.response_callback)
@@ -970,12 +994,27 @@ class MultiTurnRollout(Rollout):
             backend=self._template_backend,
         )
 
+    @staticmethod
+    def _lease(pool, execution):
+        if isinstance(pool, Leases):
+            return pool.lease(cancel_event=execution.cancel_event)
+        return pool.lease()
+
+    @staticmethod
+    def _validate_ledger(ledger, ctx: dict[str, Any], index: int) -> None:
+        validate = getattr(ctx["response_callback"], "validate_state", None)
+        if callable(validate):
+            validate(ledger.state, ledger.input_feature, index)
+
     def _run_one(self, trajectory: Trajectory, index: int, ctx: dict[str, Any]) -> Trajectory:
+        execution = ctx["_execution"]
+        execution.checkpoint()
         if self._per_episode_tools:
             # A sandbox env holds one workspace: the trajectory drives alone with its
             # tools bound to the env it leased; the lease blocks when the pool empties
             # (the sandbox's own concurrency bound) and is held for the whole episode.
-            with self.env_pool.lease() as env:
+            with self._lease(self.env_pool, execution) as env:
+                execution.checkpoint()
                 scoped = dict(ctx)
                 scoped["tool_managers"] = [self._tool_manager_for(env, self.tool_plugins)] * len(ctx["tool_managers"])
                 return self._run_with_harness(trajectory, index, scoped)
@@ -987,11 +1026,14 @@ class MultiTurnRollout(Rollout):
         # next one. Anything else is used as passed.
         harness = ctx["harnesses"][index]
         if harness is not None and hasattr(harness, "lease"):
-            with harness.lease() as leased:
+            with self._lease(harness, ctx["_execution"]) as leased:
+                ctx["_execution"].checkpoint()
                 return self._run_episode(trajectory, index, ctx, leased)
         return self._run_episode(trajectory, index, ctx, harness)
 
     def _run_episode(self, trajectory: Trajectory, index: int, ctx: dict[str, Any], harness=None) -> Trajectory:
+        execution = ctx["_execution"]
+        execution.checkpoint()
         tool_manager: ToolManager = ctx["tool_managers"][index]
         followup_fn = ctx["followup_fn"]
         # Each episode owns its metadata; mutating the shared dict would let
@@ -1015,6 +1057,7 @@ class MultiTurnRollout(Rollout):
         if "tools" not in trajectory and tool_manager is not None:
             opening_tools = list(tool_manager.tool_infos() or [])
         ledger.open(trajectory, tools=opening_tools)
+        self._validate_ledger(ledger, ctx, index)
 
         stop_reason: str | None = None
         generation_error: str | None = None
@@ -1054,15 +1097,18 @@ class MultiTurnRollout(Rollout):
             nonlocal followups, budget, params, truncated
             if followup_fn is None or followups >= MAX_FOLLOWUPS:
                 return False
+            execution.checkpoint()
             followup = followup_fn(
                 ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated), followups
             )
+            execution.checkpoint()
             if followup is None:
                 return False
             text, next_params = self._unpack_followup(followup)
             if not ledger.observe([{"role": "user", "content": text}]):
                 truncated = True
                 return False
+            self._validate_ledger(ledger, ctx, index)
             # Follow-up stages are answers, so an API must not see tool schemas.
             ledger.clear_tools()
             followups += 1
@@ -1072,6 +1118,7 @@ class MultiTurnRollout(Rollout):
             return True
 
         while spent < budget:
+            execution.checkpoint()
             spent += 1
 
             # 1b. Length budget: the turn's completion budget must still fit under the
@@ -1097,6 +1144,7 @@ class MultiTurnRollout(Rollout):
             # 2. One request. The callback chooses the local sampler or the API
             # adapter, but both paths return exactly one SampledSequence.
             try:
+                execution.checkpoint()
                 seq = response_callback(
                     self.sampler,
                     self.api,
@@ -1114,10 +1162,12 @@ class MultiTurnRollout(Rollout):
                 generation_error = str(exc)
                 truncated = True
                 break
+            execution.checkpoint()
             if not isinstance(seq, SampledSequence):
                 raise TypeError(f"response_callback must return SampledSequence, got {type(seq).__name__}")
 
             ledger.record(seq)
+            self._validate_ledger(ledger, ctx, index)
             stop_reason = seq.stop_reason
 
             msgs = ledger.messages
@@ -1166,6 +1216,7 @@ class MultiTurnRollout(Rollout):
                     if not ledger.observe([_malformed_tool_message(parse_errors)]):
                         truncated = True
                         break
+                    self._validate_ledger(ledger, ctx, index)
                     continue
                 # The episode is over as far as the model is concerned. Give the
                 # caller one chance to say otherwise -- see ``followup_fn`` for
@@ -1189,7 +1240,9 @@ class MultiTurnRollout(Rollout):
             #    messages the model did not write.
             if tool_manager is None:
                 raise ValueError("the model emitted tool_calls but this trajectory has no ToolManager")
+            execution.checkpoint()
             observations = self._run_tools(tool_manager, tool_calls)
+            execution.checkpoint()
             if self.stop_after_stuck_turns:
                 keys = [_call_key(tc) for tc in tool_calls]
                 all_repeats = bool(keys) and all(k in seen_calls for k in keys)
@@ -1205,6 +1258,8 @@ class MultiTurnRollout(Rollout):
             else:
                 tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
+            if not overflowed:
+                self._validate_ledger(ledger, ctx, index)
             if overflowed:
                 truncated = True
             # Checked after the messages are appended, so the turns that ended
@@ -1225,6 +1280,7 @@ class MultiTurnRollout(Rollout):
         #    consumers (VLLMSampler with ``'input_ids' in inputs``) see an encoded
         #    InputFeature and skip re-encoding. The ledger audits its own account
         #    on the way out -- one logprob per trainable token, or it raises.
+        execution.checkpoint()
         out = ledger.merge(
             trajectory,
             turns=ledger.turns,

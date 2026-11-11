@@ -73,6 +73,19 @@ class TestNormalMode:
         assert b['completion_mask'].shape == b['input_ids'].shape == (2, 3)
         assert b['completion_mask'].tolist() == [[0, 1, 1], [0, 1, 0]]
 
+    def test_megatron_generates_missing_text_position_ids(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
+        proc = InputProcessor(framework='megatron')
+        rows = [
+            {'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]},
+            {'input_ids': [4, 5], 'labels': [-100, 5]},
+        ]
+
+        prepared = proc.prepare_inputs(rows)
+        assert [row['position_ids'].tolist() for row in prepared] == [[[0, 1, 2]], [[0, 1]]]
+        padded = proc.collate_fn(prepared)[0]
+        assert padded['position_ids'].tolist() == [[0, 1, 2], [0, 1, -1]]
+
 
 class TestPaddingFreeMode:
     """padding_free: concatenate multiple samples into single row."""
@@ -85,6 +98,18 @@ class TestPaddingFreeMode:
         b = out[0]
         assert b['input_ids'].shape == (1, 12)
         assert b['labels'].shape == (1, 12)
+
+    def test_megatron_packed_text_positions_restart_per_row(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
+        proc = InputProcessor(framework='megatron', padding_free=True)
+        rows = [
+            {'input_ids': [1, 2, 3], 'labels': [-100, 2, 3]},
+            {'input_ids': [4, 5], 'labels': [-100, 5]},
+        ]
+
+        prepared = proc.prepare_inputs(rows)
+        packed = proc.collate_fn(prepared)[0]
+        assert packed['position_ids'].tolist() == [[0, 1, 2, 0, 1]]
 
     def test_padding_free_unpacks_loss_scale_and_keeps_channels(self):
         proc = InputProcessor(padding_free=True)
@@ -186,6 +211,14 @@ class TestMegatronCausalMask:
 
 class TestMultimodalMode:
     """Multimodal: pixel_values, image_grid_thw."""
+
+    def test_none_multimodal_fields_are_preserved(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
+        proc = InputProcessor()
+        rows = [{'input_ids': [1, 2], 'pixel_values': None, 'image_grid_thw': None}]
+        result = proc.prepare_inputs(rows)
+        assert result[0]['pixel_values'] is None
+        assert result[0]['image_grid_thw'] is None
 
     def test_multimodal_collate(self):
         proc = InputProcessor()

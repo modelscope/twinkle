@@ -206,96 +206,151 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 其余数据处理、训练循环、检查点保存等代码完全相同。
 
-## 可训练多轮 Rollout（ClientMultiTurnRollout）
+(client-async-grpo)=
+## 客户端异步 GRPO
 
-前面的示例都是单轮训练。如果你要做**带工具调用的多轮 agentic RL**（如 GRPO），并且需要产出可直接用于训练的 token 级对齐信息，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它在客户端侧驱动 “采样 → 调用工具 → 拼接上下文 → 再采样” 的多轮循环，每轮采样走 HTTP（`/twinkle/sample`），每条 trajectory 产出带 `logprobs` 的可训练结果，可直接用于 GRPO 等 RL 训练。
+客户端可以在采样的同时进行训练。完成 [Twinkle 安装](../安装.md) 后，选择一个示例，按下面的步骤启动即可：
 
-### 依赖与约束
+| 场景 | 示例 |
+|---|---|
+| 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
+| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
+| E2B sandbox 中的 Blackjack（复用相同训练循环） | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
 
-- **本地 Template**：bridge token 拼接（渲染工具轮 + 下一轮生成提示）需要在客户端本地持有一个 `Template` 实例。
-- **vLLMSampler**：指向服务端 Sampler 服务的客户端采样器。
-- **ToolManager**（可选）：注册你的工具；若某条 trajectory 产生了 tool_calls 但未提供 tool_manager，会在派发时抛 `ValueError`。
-- **`num_samples=1`**：当前每条 trajectory 只采样一次。做 GRPO group 时，把同一个 prompt 复制成 `NUM_GENERATIONS` 条独立 trajectory 即可。
-- **仅限可证明安全的纯文本轨迹**：客户端会逐轮验证 state 不含媒体且 `feature.input_ids == engine_input_ids`。模板可以具备多模态能力；只有当前轨迹实际携带媒体或两种编码不一致时才会抛 `NotImplementedError`，等待服务端 `state_id`。
+### 1. 启动服务端
 
-### 最小示例
+示例使用 Qwen3.5-4B，训练后端为 Transformers，采样后端为 vLLM，需要两张 GPU。准备好本地模型目录后，在仓库根目录执行：
 
-```python
-from peft import LoraConfig
-from twinkle import init_twinkle_client
-from twinkle.advantage import GRPOAdvantage
-from twinkle.data_format import SamplingParams
-from twinkle.template import Qwen3_5Template
-from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.rollout import ClientMultiTurnRollout
-from twinkle_client.sampler import vLLMSampler
-
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-NUM_GENERATIONS = 2   # GRPO group size（rollout 每条采样 num_samples=1）
-
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
-
-# 训练模型（GRPO）：通过当前 client 显式绑定 transport、会话与认证上下文
-model = client.model(MODEL_ID)
-model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
-model.set_loss('GRPOLoss', epsilon=0.2)
-model.set_optimizer('Adam', lr=1e-5)
-model.set_processor('InputProcessor')
-model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# 客户端采样器（HTTP）
-sampler = vLLMSampler(model_id=MODEL_ID)
-sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-# 多轮 rollout：需要本地 Template（bridge 拼接）与 ToolManager
-rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
-rollout_template.truncation_strategy = 'delete'
-tool_manager = ToolManager([MyCalculatorTool()])   # 你的工具
-
-rollout = ClientMultiTurnRollout(
-    sampler=sampler,
-    template=rollout_template,
-    tool_manager=tool_manager,
-    sampling_params=SamplingParams(max_tokens=512, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
-    max_turns=4,
-)
-advantage_fn = GRPOAdvantage()
-
-for step in range(3):
-    # 1. 批量多轮 rollout：每个 prompt 复制成 NUM_GENERATIONS 条 trajectory
-    trajectories = build_trajectories(tool_manager.tool_infos())  # 见 cookbook
-    rolled = rollout(trajectories, tool_manager=tool_manager)
-
-    # 2. 读回 token 级 logprobs（top-1）与 reward
-    all_inputs, all_old_logps = [], []
-    for traj in rolled:
-        all_old_logps.append([lp[0][1] for lp in (traj.get('logprobs') or [])])
-        all_inputs.append(traj)
-    rewards = compute_rewards(rolled)   # 见 cookbook
-
-    # 3. GRPO 优势（组内相对）
-    advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-    # 4. 策略更新
-    model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
-    model.clip_grad_and_step()
+```bash
+pip install -e '.[async-rl,client,server]'
+export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+export CUDA_VISIBLE_DEVICES=0,1
+bash cookbook/client/async_rl/run_server.sh
 ```
 
-### 输出字段
+服务默认监听 `http://127.0.0.1:8000`。如果已有可用的服务端，可以跳过启动步骤；服务配置见 [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)。
 
-每条返回的 trajectory 在原 dict 基础上追加以下顶层字段：
+### 2. 运行单轮数学任务
 
-| 字段 | 含义 |
-|:----|:-----|
-| `messages` | 完整多轮对话（含 assistant 的 tool_calls 与 tool 响应轮） |
-| `logprobs` | 各可训练 token 的 top-1 logprob；本轮未采样 logprobs 时为 `None` |
-| `turns` | 实际经历的轮数（`<= max_turns`） |
-| `stop_reason` | `'stop'` / `'length'` / `'max_turns'` 之一 |
-| `truncated` | 是否因 `max_turns` 或长度上限被截断 |
+保持服务端运行，在另一个终端中从仓库根目录执行：
 
-### 常见错误
+```bash
+export TWINKLE_SERVER_URL=http://127.0.0.1:8000
+export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+python cookbook/client/async_rl/client_orchestrated_grpo.py
+```
 
-- 某条 trajectory 触发了工具调用，但没有提供 `tool_manager` → 抛 `ValueError`。构造时或按调用传入 `tool_manager` 即可。
-- 采样器的网络 / 超时错误会**原样抛出**（不被吞掉），重试、退避请在你的循环外层处理。
+示例默认下载 GSM8K 数据集。离线运行时，额外设置 `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`；连接已有服务端时，将地址和令牌换成对应配置。模板目录应与服务端模型匹配。
 
-完整可运行示例见 `cookbook/client/twinkle/multi_turn_rollout.py`。
+### 3. 运行 Blackjack 流式多轮示例（可选）
+
+`streaming_multi_turn_grpo.py` 复用已有多轮示例的 Blackjack（21 点）任务：模型调用 `play(hit/stand)`，环境返回手牌和最终奖励，再按完整组计算 GRPO 优势、训练并发布新策略。OpenEnv/OpenSpiel 在客户端进程中运行，无需启动环境服务，也不执行模型生成的代码。
+
+`ClientMultiTurnRollout` 控制每条任务的模型/工具对话，`StreamingDriver` 调度并发任务并收集完整训练组；本例没有额外的 Agent harness。进程内 OpenEnv、远程 OpenEnvClient 和 AgentENV 都适配统一的 `Env` 接口，进程/OS 隔离能力取决于具体环境后端及其部署。
+
+安装客户端环境依赖后，沿用上面的 Twinkle 服务和客户端配置：
+
+```bash
+pip install 'openenv==0.11.0' 'open_spiel==2.0.2'
+pip install 'openenv-openspiel-env @ git+https://github.com/huggingface/OpenEnv.git@9c6376390489f28e0e545cf74a277064e7edd52f#subdirectory=envs/openspiel_env'
+python cookbook/client/async_rl/streaming_multi_turn_grpo.py
+```
+
+运行前需要配置与当前分支匹配的 Swift 模板依赖（提供 `swift.dev.template_contract`），并使用与服务端一致的 tokenizer/template。可先检查模板是否能导入；该命令不创建模型或 sandbox：
+
+```bash
+python -c "from twinkle.template import Qwen3_5Template"
+```
+
+如果提示缺少模板契约，应先补齐匹配的 Swift 环境；`[client,e2b]` 选项负责客户端和 E2B 连接依赖，不代替 Swift 环境配置。
+
+同组使用相同的环境 seed、独立环境和不同的模型采样 seed。未结束的牌局和整组同分的数据会跳过训练；脚本不保证短运行一定产生更新或 reward 上升。训练循环在 `_train_loop` 中直接展示，每个完整组执行一步；顶部常量控制组大小、缓冲组数和更新预算。
+
+先读 `train()` 的连接和初始化，再读 `_train_loop()` 的完整组 → 优势计算 → `forward_backward` → `clip_grad_and_step` → 请求发布 → `commit`。`commit(0)` 表示本次没有更新，不消耗训练步数；发布请求在 driver 恢复推进后执行。更换任务时再看 `_build_driver()` 的环境和奖励适配。资源由 SDK 的 `RolloutResources` 作用域管理，示例不需要编写异常收尾逻辑。
+
+`twinkle_client.rollout.training_groups(samples, num_generations=..., drop_truncated=True)` 提供已评分 streaming 批次的通用分组和校验：保留组内样本顺序，跳过不完整或策略混合的组，检查成员、response token/mask/logprob 对齐和有限奖励。返回任何组前会检查整个批次的 rollout 失败，避免失败被跳过规则或更新预算掩盖。`drop_truncated` 默认 `False`；Blackjack 显式设为 `True`，只训练终局牌局。SDK 不负责计算优势、判断零优势或执行更新。批量多轮示例使用 Trajectory 字典和同步批次，继续保留其训练入口，并复用 `RolloutResources` 管理资源。
+
+每次调用 `train()` 都自动生成独立的检查点名称前缀，避免重复运行覆盖 `policy-0` 等快照，无需用户配置。此前缀只用于文件命名，不提供租户隔离，也不控制随机种子或断点恢复。
+
+`rollout.streaming(driver)` 负责关闭批量和 streaming 任务入口、广播停止、尝试排干全部调用，再等待 driver 退出。应使用专用 rollout 实例；退出后该实例不再接受新任务。底层 rollout 默认借用环境，不自动关闭调用方资源；本例在 `RolloutResources(init_twinkle_client, base_url=..., api_key=...)` 中显式传入连接参数；值读取自 `.env` 的 `TWINKLE_SERVER_URL` 和 `TWINKLE_SERVER_TOKEN`。作用域把客户端、rollout 和环境交给 SDK 管理。`own_rollout()` 登记专用 rollout，`own_environment()` 在 `reset()` 前登记环境，初始化失败也可收尾；收集完成后用 `close_environment()` 提前释放该轨迹的环境。退出作用域时 SDK 等待调用、排干 rollout、关闭剩余环境和客户端，处理重复中断并保留原异常。执行状态未确认时保留资源句柄并报告错误，不能按“已经关闭”处理。
+
+`RolloutResources` 会自动为该客户端的模型操作、sampler 创建和配置绑定中断保护，示例直接调用 `model.forward_backward(...)`、`model.clip_grad_and_step()`、`model.save(...)`。主线程在等待期间中断时，SDK 等待已发出的调用返回，完成训练句柄及成功结果登记，再传播中断；受管操作失败或中断后不再接受后续受管操作。它不会自动重发训练操作。`model.completed_step_calls` 记录该 model 对象收到成功回复的 step/clip_grad_and_step 调用次数（不是设备参数变化的证明），`model.last_checkpoint` 保留最近成功的 save 回复，便于中断后查看。采样仍由 rollout 并发执行，不经过训练操作的串行等待器。不在该作用域内的客户端维持原有调用行为。超时、断线或任务失败状态不能证明远端物理执行结束；无法确认时保留相关资源并报告，不自动复用，也不提供远端强制取消。
+
+脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
+
+### 4. 在 E2B 官方 sandbox 中运行同一任务（可选）
+
+`e2b_multi_turn_grpo.py` 用 `AgentEnv` 连接 E2B 官方服务，每条轨迹独占一个 sandbox；游戏历史、发牌和奖励都在 sandbox 中计算。模型仍只看到 `play(hit/stand)`，由相同的 `ClientMultiTurnRollout` 和 `StreamingDriver` 编排。训练循环直接复用上一例的 `train(env_factory=...)`，没有另建训练框架或评分器，也没有额外的 Agent harness。
+
+先按 [AgentEnv 官方 E2B 连通检查](../../组件/Agentic/Envs.md) 验证创建、执行和释放。这一步不需要训练服务，可以先排除密钥、模板和网络问题。
+
+保持前面启动的 Twinkle 服务运行，在仓库根目录的 `.env` 中配置两套服务的凭据。`TWINKLE_SERVER_TOKEN` 用于训练/采样服务，`E2B_API_KEY` 用于云 sandbox，两者不能互换：
+
+```dotenv
+TWINKLE_SERVER_URL=http://127.0.0.1:8000
+TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+TWINKLE_MODEL_ID=Qwen/Qwen3.5-4B
+E2B_API_KEY=your_e2b_api_key
+# 离线客户端还需设置与服务端模型匹配的本地模板目录：
+# TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+```
+
+将地址、令牌和密钥替换为自己的配置，`.env` 不要提交。使用官方服务时，删除 `.env` 中的 `E2B_API_URL`、`E2B_SANDBOX_URL`、`E2B_DOMAIN` 覆盖配置，并确认终端中也没有设置这些变量。然后运行：
+
+```bash
+pip install -e '.[client,e2b]'
+python cookbook/client/async_rl/e2b_multi_turn_grpo.py
+```
+
+默认使用 E2B 的 `base` 模板，在可写的 `/home/user/blackjack` 中安装 `open_spiel==2.0.2` 并上传同目录的 `blackjack_game.py`。客户端无需安装 OpenEnv/OpenSpiel。可通过 `E2B_TEMPLATE` 指定已预装该版本 OpenSpiel 的自定义模板，减少每条轨迹的初始化耗时。默认缓冲最多 12 条轨迹，应与账户的 sandbox 并发额度匹配。
+
+读代码时，按下面三个文件的职责看即可：
+
+直接运行入口即可，示例会组装 rollout 和 driver，首次使用无需手动创建这些组件；环境提供 `system_prompt` 和标准 `Env.tools()` 工具定义，更换任务时再查看 `_build_driver()` 中的 `submit/collect` 两个接缝。
+
+| 文件 | 负责什么 |
+| --- | --- |
+| `streaming_multi_turn_grpo.py` | `train()` 连接服务并建立 rollout/driver；`_train_loop()` 展示优势、反向传播、optimizer step 和策略发布。从环境读取任务提示词和 `tools()`，不定义 Blackjack 规则。 |
+| `e2b_multi_turn_grpo.py` | `E2BBlackjackEnv` 把标准 `reset/step/close` 接口接到 E2B，最后用 `train(env_factory=E2BBlackjackEnv)` 切换环境。 |
+| `blackjack_game.py` | 两个环境共用的 Blackjack 任务定义（`BlackjackTask.system_prompt` / `tools()`），同时也是上传到 sandbox 的游戏程序，调用 OpenSpiel；在 sandbox 的 `game.json` 保存 seed/动作历史，返回手牌、奖励和终态。它不参与训练。 |
+
+运行时：driver 提交独立牌局 → rollout 请求远端 sampler → 模型调用 `play` → AgentEnv 在 E2B 中执行游戏 → 完整组计算优势并训练 → 发布的新 URI 用于后续牌局。同组 seed 相同、环境独立；每条轨迹固定使用同一个策略 URI。
+
+`env_factory` 用于切换同一 Blackjack 任务的本地或 E2B 执行后端；两个后端共用提示词、`play` 工具和奖励规则。修改任务时，先定义环境的提示词、工具与奖励，再调整 `_build_driver()` 的 `submit/collect`，训练主循环可以保留。此示例明确要求一个 `play` 工具；空工具、额外工具或不同工具名会报错，避免静默忽略工具。SDK 的 `ClientMultiTurnRollout` / `ToolManager` 仍支持多工具任务，不受此示例限制。
+
+上手只需先改服务连接配置。需要调节规模时，再改共享训练脚本顶部的 `NUM_GENERATIONS`、`BUFFER_GROUPS`、`MAX_GROUPS`、`MAX_STEPS`：分别控制每组轨迹数、缓冲组数、有限尝试组数、最多更新次数。示例每次拉取一个完整组；整组同分会跳过，因此 `MAX_STEPS` 是上限。缩小 `BUFFER_GROUPS` 可以减少同时持有的 sandbox，代价是较少的采样/训练重叠。
+
+轨迹收集完成后立即关闭其 sandbox；退出时先停止并排干 rollout，再关闭尚未收集的环境。取消采用协作停止，已发出的命令需等待返回。未确认执行结束时保留句柄并报错，sandbox 的 600 秒超时作为兜底，不宣称即时远端中止。该例演示真实 sandbox 工具调用，不执行模型生成的代码。
+
+游戏进程失败或返回损坏结果时会中止训练，不会作为零奖励或普通未完成牌局跳过。模型给出无效工具参数则返回提示，允许其纠正。
+
+| 现象 | 先检查什么 |
+| --- | --- |
+| E2B 鉴权或模板错误 | `.env` 中的 `E2B_API_KEY`、`E2B_TEMPLATE` 和端点覆盖；先单独重跑连通检查。官方默认模板为 `base`。 |
+| sandbox 数量/额度不足 | 调小 `BUFFER_GROUPS`；默认预算为 `3 × 4 = 12` 条轨迹，并检查账户额度。 |
+| 初始化慢 | 默认每条轨迹创建 sandbox 并检查/安装 OpenSpiel；可使用预装依赖且支持该工作目录的 `E2B_TEMPLATE`。 |
+| 连通检查成功，训练连接失败 | 检查 `TWINKLE_SERVER_URL/TOKEN`、服务端模型和本地模板目录；E2B 连通不代表训练服务就绪。 |
+| 运行了牌局但没有 optimizer 更新 | 检查日志中的 `zero advantage` / `truncated`；不要把有限尝试内的合法跳过当作连接失败。 |
+
+### 修改为自己的任务
+
+- 数学任务：修改脚本中的数据集和奖励函数。
+- 流式工具任务：从 Blackjack 示例的环境、工具和环境 reward 接缝替换任务，保留完整组、优势、训练和发布流程。
+- 先使用示例默认训练参数；需要调整时，再修改脚本顶部的配置。训练日志会输出奖励和指标，并保存 LoRA 检查点。
+
+## 可训练多轮 Rollout（ClientMultiTurnRollout）
+
+需要自行编写多轮训练循环时，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它支持纯文本工具调用，返回可直接用于训练的完整轨迹。
+
+在已创建 rollout、轨迹、工具和策略检查点的异步训练循环中：
+
+```python
+rolled = await rollout.acall(
+    trajectories,
+    tool_manager=tool_managers,
+    adapter_uri=policy_uri,
+)
+```
+
+同步调用使用 `rollout(...)`，参数和结果相同。每条轨迹使用独立环境对应的 `ToolManager`；rollout 不会关闭你传入的环境。完整同步示例见 [multi_turn_rollout.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/multi_turn_rollout.py)。

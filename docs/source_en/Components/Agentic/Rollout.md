@@ -122,3 +122,20 @@ When both `sampler` and `api` are supplied, the default is the sampler. Pass `re
 | `length` | Generation reached its token limit. |
 | `max_turns` | Reached the tool-turn limit without a follow-up. |
 | `generation_error` | The external endpoint failed before returning a valid response. |
+
+## Streaming handoffs and weight publication (v5)
+
+`twinkle_agentic.async_rl.StreamingDriver` owns admission, version accounting and completed-record handoffs. The training recipe owns optimizer batch size and publication cadence, requesting a publication with its own callback. The driver does not transfer weights itself.
+
+`buffer_depth` limits in-flight trajectories; `max_rows_per_pull` independently bounds each training handoff. For example, capacity 128 with a pull limit of 64 leaves a batch available for overlap while the recipe trains and publishes after each update. Increasing capacity without bounding the pull can combine completed batches into one handoff.
+
+- `group_pull=True`: the limit must be a positive integer multiple of `lcm(need_rows, num_generations)`. Whole, scored groups remain contiguous; incomplete or pending-score groups stay buffered.
+- `group_pull=False`: the limit must be a positive integer multiple of `need_rows`.
+- `max_rows_per_pull=None`: retain the existing uncapped whole-batch behavior.
+- A custom `assembly_ready` owns its own selection policy and cannot be combined with this limit.
+
+The limit is an upper bound on normal full-batch pulls. Existing finite-stream tail handling is separate and unchanged. Capacity and pull size do not relax policy-version validation.
+
+For in-place weight publication with active partial rollouts, the caller must pause generation, complete weight synchronization, and only then resume generation. `abort_all_inflight` issues interruptions but does not close the retry gate; it is not a safe publication barrier by itself. A failed pause or transfer must propagate without unconditionally resuming generation. An adaptive `ClusterAdapter` owns its existing full publication transaction.
+
+Abort, pause, resume and generation-status methods are explicitly marked `control=True`. This lets them bypass the generation-drain barrier even through a sampler handle serialized into a rollout actor, where the original worker-pool registry is absent. Ordinary lifecycle and weight operations retain their barriers.

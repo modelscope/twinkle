@@ -4,6 +4,8 @@ from typing import Tuple
 
 import torch
 
+_CACHE_RELEASE_COUNT = 0
+
 
 def record_offload(strategy, *, model: bool, optimizer: bool) -> None:
     """Remember which pieces this rank moved, so reload restores only those."""
@@ -11,7 +13,7 @@ def record_offload(strategy, *, model: bool, optimizer: bool) -> None:
     strategy._offloaded_optimizer = bool(optimizer)
 
 
-def release_caching_allocator() -> None:
+def release_caching_allocator(min_free_fraction: float | None = None) -> None:
     """Return unused caching-allocator blocks to the driver.
 
     Colocation can leave the parameters and optimizer resident. The backward peak is still
@@ -21,10 +23,22 @@ def release_caching_allocator() -> None:
     """
     import gc
 
-    gc.collect()
     from twinkle.utils.framework import Torch
 
+    if min_free_fraction is None or not torch.cuda.is_available():
+        gc.collect()
+        Torch.empty_cache()
+        return
+    # A colocated caller supplies the actual rollout reservation plus headroom.
+    # Collect young cycles every round, older cycles periodically or under pressure.
+    global _CACHE_RELEASE_COUNT
+    _CACHE_RELEASE_COUNT += 1
+    gc.collect(0)
     Torch.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    if _CACHE_RELEASE_COUNT % 16 == 1 or free < total * min_free_fraction:
+        gc.collect()
+        Torch.empty_cache()
 
 
 def offload_record(strategy) -> Tuple[bool, bool]:

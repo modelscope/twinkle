@@ -277,14 +277,15 @@ class AgentEnv(Env):
         # Before the setup commands, because they are written against it, and
         # because commands.run(cwd=...) fails outright on a missing directory --
         # a template without this path would otherwise break every call.
-        self.run_command({
-            'command': f'mkdir -p {shlex.quote(self._workspace)} '
-            f'{shlex.quote(_SCRIPT_DIR)}',
-            'cwd': '/'
-        })
+        exit_code, output = self._execute(
+            f'mkdir -p {shlex.quote(self._workspace)} {shlex.quote(_SCRIPT_DIR)}', '/', self._command_timeout)
+        if exit_code != 0:
+            raise RuntimeError(f'could not initialize sandbox {self.sandbox_id}: {output}')
         for cmd in self._setup_commands:
-            result = self.run_command({'command': cmd})
-            setup_output.append(result)
+            exit_code, output = self._execute(cmd, self._workspace, self._command_timeout)
+            if exit_code != 0:
+                raise RuntimeError(f'sandbox {self.sandbox_id} setup failed: {output}')
+            setup_output.append(format_command_output(output, '', exit_code))
         logger.info(f'AgentEnv sandbox created: {self.sandbox_id} (template={self._template})')
         return StepResult(
             observation='\n'.join(setup_output) if setup_output else '',

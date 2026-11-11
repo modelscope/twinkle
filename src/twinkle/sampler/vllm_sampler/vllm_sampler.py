@@ -835,6 +835,29 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    def direct_weight_sync_metadata(self):
+        """Control-only metadata; model tensors never pass through this actor."""
+        device = self.direct_weight_sync_device()
+        if device is None:
+            return None
+        if getattr(self, '_direct_weight_targets', None) is None:
+            self._direct_weight_targets = self._run_in_loop(
+                self.engine.engine.collective_rpc('weight_sync_metadata'))
+        return self._direct_weight_targets
+
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @timed
+    def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False):
+        async def receive():
+            await self.engine.engine.collective_rpc(
+                'update_weights_direct',
+                kwargs={'targets': targets, 'auth_key': auth_key, 'base_sync_done': base_sync_done})
+            if not base_sync_done:
+                self.engine.invalidate_synced_lora()
+
+        self._run_in_loop(receive())
+
     @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     @timed
     def receive_weights(

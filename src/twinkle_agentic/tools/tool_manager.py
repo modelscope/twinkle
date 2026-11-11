@@ -213,7 +213,12 @@ class ToolManager:
                 for i, _name, _args in batched:
                     out[i] = failure
                 return ['' if x is None else x for x in out]
-            for (i, _name, _args), r in zip(batched, results):
+            from twinkle_agentic.envs.env_tool import EnvTool
+
+            for (i, name, _args), r in zip(batched, results):
+                tool = self._tools[name]
+                if isinstance(tool, EnvTool):
+                    tool.last_result = r
                 out[i] = r.observation if hasattr(r, 'observation') else str(r)
             return ['' if x is None else x for x in out]
 
@@ -225,14 +230,19 @@ class ToolManager:
                 out[futs[fut]] = fut.result()
         return ['' if x is None else x for x in out]
 
-    def ensure_idle(self):
-        """所有实际工具线程退出后，还须确认它们使用的远程环境已结束执行。"""
-        seen = set()
+    def bound_envs(self):
+        """Return the distinct environments borrowed by the registered tools."""
+        environments = {}
         for tool in self._tools.values():
             env = getattr(tool, '_env', None)
-            if env is not None and id(env) not in seen:
-                seen.add(id(env))
-                env.ensure_idle()
+            if env is not None:
+                environments[id(env)] = env
+        return tuple(environments.values())
+
+    def ensure_idle(self):
+        """Confirm every distinct borrowed environment has no known active execution."""
+        for env in self.bound_envs():
+            env.ensure_idle()
 
     def _shared_env(self):
         """Return the Env shared by every registered EnvTool, else None."""

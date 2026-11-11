@@ -1421,7 +1421,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         is_default = adapter_name == _default_adapter_name
         # Same pattern family as the transformers backend: LoRA deltas plus the fully trained
         # modules_to_save copies -- missing it here would freeze those copies out of the optimizer.
-        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
+        # The trailing boundary keeps lora_2 from also selecting lora_20..lora_29.
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}(?:\.|$)')
 
         params = {}
         model = self.strategy.unwrap_model(self.model)

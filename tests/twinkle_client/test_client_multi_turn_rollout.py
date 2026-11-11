@@ -1,12 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
+import gc
+import threading
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
 
-from twinkle.template.contract import (CompletionEncoding, DecodedResponse, MediaBundle, PromptEncoding, RolloutState,
-                                       refresh, splice, splice_state)
-from twinkle_client.rollout.multi_turn import ClientMultiTurnRollout
 from twinkle.protocol.types.sampler import SampledSequenceModel, SampleResponseModel
+from twinkle.template.contract import (
+    CompletionEncoding,
+    DecodedResponse,
+    MediaBundle,
+    PromptEncoding,
+    RolloutState,
+    refresh,
+    splice,
+    splice_state,
+)
+from twinkle_client.rollout.multi_turn import ClientMultiTurnRollout
 
 
 class _Template:
@@ -62,9 +74,13 @@ class _Sampler:
     def __init__(self, scripts=((10, 'stop'), (20, 'stop'))):
         self.scripts = list(scripts)
         self.calls = []
+        self.policies = []
+        self.params = []
 
-    def sample(self, features, sampling_params=None):
+    def sample(self, features, sampling_params=None, adapter_name='', adapter_uri=None, num_samples=1):
         self.calls.append(features)
+        self.policies.append((adapter_name, adapter_uri, num_samples))
+        self.params.append(sampling_params)
         token, stop_reason = self.scripts.pop(0)
         responses = []
         for feature in features:
@@ -109,6 +125,37 @@ def test_text_http_multi_turn_preserves_tokens_messages_and_logprobs():
     assert result['truncated'] is False
 
 
+def test_harness_receives_opening_when_sampled_state_omits_metadata():
+    class DroppingStateTemplate(_Template):
+        def append_completion(self, state, tokens, **kwargs):
+            completed = super().append_completion(state, tokens, **kwargs)
+            return CompletionEncoding(replace(completed.state, messages=(), tools=()), completed.response)
+
+    class Harness:
+        def __init__(self):
+            self.calls = []
+
+        def before_generate(self, trajectory):
+            return trajectory
+
+        def after_generate(self, trajectory, decoded, tool_calls):
+            self.calls.append((trajectory['messages'], trajectory['tools']))
+            return {'messages': trajectory['messages'] + [{'role': 'assistant', 'content': decoded}]}
+
+    harness = Harness()
+    rollout = ClientMultiTurnRollout(
+        _Sampler(((20, 'stop'),)), DroppingStateTemplate(), tool_manager=_ToolManager(), harness=harness)
+
+    result = rollout([_trajectory()])[0]
+
+    assert harness.calls == [(_trajectory()['messages'], _ToolManager.tool_infos())]
+    assert result['messages'] == [
+        {'role': 'user', 'content': 'question'},
+        {'role': 'assistant', 'content': 'answer-20'},
+    ]
+    assert result['tools'] == _ToolManager.tool_infos()
+
+
 def test_http_multi_turn_complete_trajectory_golden():
     result = ClientMultiTurnRollout(
         _Sampler(), _Template(), tool_manager=_ToolManager(), max_turns=2)([_trajectory()])[0]
@@ -133,6 +180,9 @@ def test_http_multi_turn_complete_trajectory_golden():
         'turns': 2,
         'stop_reason': 'stop',
         'truncated': False,
+        'stuck_stop': False,
+        'tool_stop': None,
+        'followups': 0,
     }
 
 
@@ -167,17 +217,17 @@ def test_http_multi_turn_requires_new_input_feature():
     class BrokenSampler:
 
         @staticmethod
-        def sample(features, sampling_params=None):
+        def sample(features, sampling_params=None, **kwargs):
             sequence = SampledSequenceModel(
                 stop_reason='stop', tokens=[10], logprobs=[[(10, -0.1)]], decoded='x')
             return [SampleResponseModel(sequences=[sequence])]
 
-    with pytest.raises(RuntimeError, match='batch index 0.*trajectory 0.*new_input_feature'):
+    with pytest.raises(RuntimeError, match='new_input_feature.*trajectory 0'):
         ClientMultiTurnRollout(BrokenSampler(), _Template())([_trajectory()])
 
 
 def test_http_multi_turn_requires_tool_manager_only_when_called():
-    with pytest.raises(ValueError, match='trajectory 0.*tool_manager'):
+    with pytest.raises(ValueError, match='tool_calls.*ToolManager'):
         ClientMultiTurnRollout(_Sampler(), _Template(), max_turns=2)([_trajectory()])
 
 
@@ -190,7 +240,7 @@ def test_http_multi_turn_marks_length_stop_as_truncated():
 
 def test_http_multi_turn_preserves_batch_output_order():
     trajectories = [dict(_trajectory(), sample_id=index) for index in range(4)]
-    results = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())(trajectories)
+    results = ClientMultiTurnRollout(_Sampler(((30, 'stop'), ) * 4), _Template())(trajectories)
     assert [result['sample_id'] for result in results] == [0, 1, 2, 3]
 
 
@@ -226,9 +276,38 @@ def test_http_multi_turn_max_turns_one_truncates_before_tool_dispatch():
     result = ClientMultiTurnRollout(
         _Sampler(((10, 'stop'), )), _Template(), tool_manager=RecordingTools(), max_turns=1)([_trajectory()])[0]
     assert result['turns'] == 1
-    assert result['stop_reason'] == 'max_turns'
+    assert result['stop_reason'] == 'stop'
+    assert result['tool_stop'] == 'max_turns'
     assert result['truncated'] is True
     assert RecordingTools.calls == 0
+
+
+@pytest.mark.parametrize('mode', ['sync', 'async', 'streaming'])
+@pytest.mark.parametrize('first_turn', [True, False])
+def test_http_multi_turn_honors_upstream_length_budget(mode, first_turn):
+    template = _Template()
+    template.max_length = 2 if first_turn else 4
+    params = {'max_tokens': 8 if first_turn else 2}
+    sampler = _Sampler(((20, 'length'), ) if first_turn else ((10, 'stop'), (20, 'stop')))
+    rollout = ClientMultiTurnRollout(
+        sampler, template, tool_manager=_ToolManager(), sampling_params=params, max_turns=3)
+    try:
+        if mode == 'streaming':
+            handle = rollout.admit(_trajectory()['messages'])
+            _wait_for_handle(rollout, handle)
+            sample = rollout.collect(handle)
+            encoded, truncated, logprobs = sample.encoded, sample.truncated, sample.rollout_logprobs
+        else:
+            rows = asyncio.run(rollout.acall([_trajectory()])) if mode == 'async' else rollout([_trajectory()])
+            encoded, truncated, logprobs = rows[0], rows[0]['truncated'], rows[0]['rollout_logprobs']
+        assert len(sampler.calls) == 1
+        assert sampler.params[0].max_tokens == (1 if first_turn else 2)
+        assert encoded['input_ids'] == ([1, 20] if first_turn else [1, 10, 90])
+        assert logprobs == [-0.1]
+        assert truncated
+        assert params == {'max_tokens': 8 if first_turn else 2}
+    finally:
+        rollout.drain()
 
 
 def test_http_multi_turn_propagates_network_error_unchanged():
@@ -240,7 +319,7 @@ def test_http_multi_turn_propagates_network_error_unchanged():
     class FailingSampler:
 
         @staticmethod
-        def sample(features, sampling_params=None):
+        def sample(features, sampling_params=None, **kwargs):
             raise sentinel
 
     with pytest.raises(NetworkError) as error:
@@ -253,3 +332,959 @@ def test_http_multi_turn_validates_public_arguments():
         ClientMultiTurnRollout(object(), None)
     with pytest.raises(ValueError, match='max_turns'):
         ClientMultiTurnRollout(object(), _Template(), max_turns=0)
+
+
+def test_policy_and_sampling_params_are_snapshotted_per_call():
+    sampler = _Sampler(((30, 'stop'), (31, 'stop')))
+    rollout = ClientMultiTurnRollout(
+        sampler, _Template(), adapter_name='trained', adapter_uri='twinkle://policy-0')
+    rollout([_trajectory()])
+    override = {'temperature': 0.25}
+    rollout([_trajectory()], adapter_name='base', adapter_uri=None, sampling_params=override)
+
+    assert sampler.policies == [('trained', 'twinkle://policy-0', 1), ('base', None, 1)]
+    assert sampler.params[0].temperature == 1.0
+    assert sampler.params[1].temperature == 0.25
+    assert override == {'temperature': 0.25}
+
+
+def test_invalid_call_options_are_rejected_before_http():
+    sampler = _Sampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template())
+    with pytest.raises(ValueError, match='unknown.*adapter_path'):
+        rollout([_trajectory()], adapter_path='not-a-cs-option')
+    with pytest.raises(ValueError, match='num_samples=1'):
+        rollout([_trajectory()], sampling_params={'num_samples': 2})
+    with pytest.raises(ValueError, match='tool_manager list length'):
+        rollout([_trajectory()], tool_manager=[])
+    assert sampler.calls == []
+    assert rollout([]) == []
+
+
+def test_sync_and_async_calls_return_the_same_core_trajectory():
+    sync_rollout = ClientMultiTurnRollout(_Sampler(), _Template(), tool_manager=_ToolManager(), max_turns=2)
+    async_rollout = ClientMultiTurnRollout(_Sampler(), _Template(), tool_manager=_ToolManager(), max_turns=2)
+
+    expected = sync_rollout([_trajectory()])
+
+    async def run():
+        return await async_rollout.acall([_trajectory()])
+
+    assert asyncio.run(run()) == expected
+
+
+def test_async_cancellation_drains_http_and_does_not_poison_later_calls():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    sampler = BlockingSampler(((10, 'stop'), (20, 'stop')))
+    rollout = ClientMultiTurnRollout(sampler, _Template())
+
+    async def run():
+        task = asyncio.create_task(rollout.acall([_trajectory()]))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return await rollout.acall([_trajectory()])
+
+    result = asyncio.run(run())
+    assert result[0]['input_ids'] == [1, 20]
+    assert len(sampler.calls) == 2
+
+
+def test_sync_repeated_interrupts_keep_draining_until_core_finishes():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    class InterruptingFuture:
+
+        def __init__(self, future, interrupts):
+            self._future = future
+            self._interrupts = interrupts
+
+        def done(self):
+            return self._future.done()
+
+        def result(self):
+            if self._interrupts:
+                self._interrupts -= 1
+                assert started.wait(timeout=5)
+                raise KeyboardInterrupt
+            return self._future.result()
+
+    sampler = BlockingSampler(((10, 'stop'), (20, 'stop')))
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+    calls = []
+    original_start = rollout._start
+
+    def start(trajectories, kwargs):
+        call = original_start(trajectories, kwargs)
+        calls.append(call)
+        call.future = InterruptingFuture(call.future, interrupts=2)
+        return call
+
+    rollout._start = start
+    outcome = {}
+
+    def run():
+        try:
+            rollout([_trajectory()])
+        except BaseException as error:
+            outcome['error'] = error
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(timeout=5)
+    worker.join(timeout=0.3)
+    assert worker.is_alive(), 'sync call returned before the in-flight sample finished'
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert isinstance(outcome['error'], KeyboardInterrupt)
+    assert calls[0].future._future.done()
+    assert len(sampler.calls) == 1
+
+
+@pytest.mark.parametrize('control_error', [KeyboardInterrupt(), SystemExit(2)])
+def test_sync_completed_future_control_error_is_not_retried_forever(control_error, monkeypatch):
+    from types import SimpleNamespace
+    from twinkle_agentic.rollout.base import _RolloutExecution
+
+    future = Future()
+    future.set_exception(control_error)
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    execution = _RolloutExecution()
+    monkeypatch.setattr(rollout, '_start', lambda *args: SimpleNamespace(future=future, execution=execution))
+    with pytest.raises(type(control_error)) as error:
+        rollout([_trajectory()])
+    assert error.value is control_error
+    assert execution.cancelled
+
+
+def test_duplicate_env_and_bare_harness_are_rejected_before_side_effects():
+    env = object()
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    class Harness:
+        calls = 0
+
+        def before_generate(self, trajectory):
+            type(self).calls += 1
+            return trajectory
+
+    sampler = _Sampler()
+    harness = Harness()
+    rollout = ClientMultiTurnRollout(sampler, _Template())
+    with pytest.raises(ValueError, match='same Env'):
+        rollout([_trajectory(), _trajectory()], tool_manager=[EnvManager(), EnvManager()])
+    with pytest.raises(ValueError, match='same bare harness'):
+        rollout([_trajectory(), _trajectory()], harness=[harness, harness])
+    assert sampler.calls == []
+    assert harness.calls == 0
+
+
+@pytest.mark.parametrize('kind', ['env', 'harness'])
+def test_active_resource_borrow_is_released_only_after_runner_finishes(kind):
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    class Resource:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def before_generate(self, trajectory):
+            return trajectory
+
+        def after_generate(self, context, decoded, tool_calls):
+            return {'messages': context['messages'] + [{'role': 'assistant', 'content': decoded}]}
+
+    class EnvManager(_ToolManager):
+        def bound_envs(self):
+            return (resource,)
+
+    resource = Resource()
+    options = {'tool_manager': EnvManager()} if kind == 'env' else {'harness': resource}
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), (40, 'stop'))), _Template())
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(rollout, [_trajectory()], **options)
+        try:
+            assert started.wait(timeout=5)
+            with pytest.raises(ValueError, match='still borrowed'):
+                rollout([_trajectory()], **options)
+        finally:
+            release.set()
+        assert first.result(timeout=5)[0]['input_ids'] == [1, 30]
+    assert rollout([_trajectory()], **options)[0]['input_ids'] == [1, 40]
+    assert not resource.closed
+
+
+def test_independent_episodes_do_not_wait_for_a_slow_tool_round():
+    started = threading.Event()
+    release = threading.Event()
+    fast_finished = threading.Event()
+
+    class KeyedTemplate(_Template):
+        def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+            encoding = super().encode_prompt(
+                trajectory, backend=backend, add_generation_prompt=add_generation_prompt)
+            token = 1 if trajectory['messages'][0]['content'] == 'slow' else 2
+            state = replace(
+                encoding.state,
+                feature={'input_ids': [token]},
+                engine_input_ids=(token, ),
+            )
+            return PromptEncoding(state)
+
+    class KeyedSampler:
+        def __init__(self):
+            self.calls = {1: 0, 2: 0}
+
+        def sample(self, features, sampling_params=None, **kwargs):
+            feature = features[0]
+            key = feature['input_ids'][0]
+            self.calls[key] += 1
+            if key == 1 and self.calls[key] == 1:
+                started.set()
+                assert release.wait(timeout=5)
+            token = 10 if self.calls[key] == 1 else 20
+            updated = splice(feature, [token], scored=True, sampled=True)
+            sequence = SampledSequenceModel(
+                stop_reason='stop',
+                tokens=[token],
+                logprobs=[[(token, -0.1)]],
+                decoded=f'answer-{token}',
+                new_input_feature=updated,
+            )
+            if key == 2 and self.calls[key] == 2:
+                fast_finished.set()
+            return [SampleResponseModel(sequences=[sequence])]
+
+    rollout = ClientMultiTurnRollout(
+        KeyedSampler(), KeyedTemplate(), tool_manager=_ToolManager(), max_turns=2, concurrency=2)
+    trajectories = [
+        {'messages': [{'role': 'user', 'content': 'slow'}]},
+        {'messages': [{'role': 'user', 'content': 'fast'}]},
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rollout, trajectories)
+        assert started.wait(timeout=5)
+        assert fast_finished.wait(timeout=5)
+        release.set()
+        results = future.result(timeout=5)
+    assert [result['input_ids'][0] for result in results] == [1, 2]
+    assert all(result['turns'] == 2 for result in results)
+
+
+def test_first_episode_error_is_preserved_after_peer_drain():
+    peer_started = threading.Event()
+    failing = threading.Event()
+    release = threading.Event()
+    sentinel = RuntimeError('sample failed')
+
+    class KeyedTemplate(_Template):
+        def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+            encoding = super().encode_prompt(
+                trajectory, backend=backend, add_generation_prompt=add_generation_prompt)
+            token = 1 if trajectory['messages'][0]['content'] == 'slow' else 2
+            state = replace(encoding.state, feature={'input_ids': [token]}, engine_input_ids=(token, ))
+            return PromptEncoding(state)
+
+    class FailingSampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            key = features[0]['input_ids'][0]
+            if key == 2:
+                assert peer_started.wait(timeout=5)
+                failing.set()
+                raise sentinel
+            peer_started.set()
+            assert failing.wait(timeout=5)
+            assert release.wait(timeout=5)
+            feature = features[0]
+            updated = splice(feature, [10], scored=True, sampled=True)
+            sequence = SampledSequenceModel(
+                stop_reason='stop',
+                tokens=[10],
+                logprobs=[[(10, -0.1)]],
+                decoded='late',
+                new_input_feature=updated,
+            )
+            return [SampleResponseModel(sequences=[sequence])]
+
+    rollout = ClientMultiTurnRollout(FailingSampler(), KeyedTemplate(), concurrency=2)
+    trajectories = [
+        {'messages': [{'role': 'user', 'content': 'slow'}]},
+        {'messages': [{'role': 'user', 'content': 'fail'}]},
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rollout, trajectories)
+        assert failing.wait(timeout=5)
+        assert not future.done()
+        release.set()
+        with pytest.raises(RuntimeError) as error:
+            future.result(timeout=5)
+    assert error.value is sentinel
+
+
+def test_cancel_during_followup_prevents_another_generation():
+    followup_started = threading.Event()
+    release = threading.Event()
+    sampler = _Sampler(((30, 'stop'), (40, 'stop')))
+
+    def followup(trajectory, count):
+        followup_started.set()
+        assert release.wait(timeout=5)
+        return 'continue'
+
+    rollout = ClientMultiTurnRollout(sampler, _Template(), followup_fn=followup)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rollout, [_trajectory()])
+        assert followup_started.wait(timeout=5)
+        rollout.cancel()
+        release.set()
+        with pytest.raises(CancelledError):
+            future.result(timeout=5)
+    assert len(sampler.calls) == 1
+
+
+def test_sampler_response_cardinality_and_logprob_alignment_are_validated():
+    class EmptySampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            return []
+
+    with pytest.raises(RuntimeError, match='expected one'):
+        ClientMultiTurnRollout(EmptySampler(), _Template())([_trajectory()])
+
+    class MisalignedSampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            updated = splice(features[0], [10, 11], scored=True, sampled=True)
+            sequence = SampledSequenceModel(
+                stop_reason='stop',
+                tokens=[10, 11],
+                logprobs=[[(10, -0.1)]],
+                decoded='misaligned',
+                new_input_feature=updated,
+            )
+            return [SampleResponseModel(sequences=[sequence])]
+
+    with pytest.raises(RuntimeError, match='logprob'):
+        ClientMultiTurnRollout(MisalignedSampler(), _Template())([_trajectory()])
+
+
+def test_concurrent_policy_capture_and_completed_call_cancel_race():
+    slow_started = threading.Event()
+    release = threading.Event()
+    policies = []
+
+    class KeyedTemplate(_Template):
+        def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+            encoding = super().encode_prompt(
+                trajectory, backend=backend, add_generation_prompt=add_generation_prompt)
+            token = {'slow': 1, 'fast': 2, 'later': 3}[trajectory['messages'][0]['content']]
+            state = replace(encoding.state, feature={'input_ids': [token]}, engine_input_ids=(token, ))
+            return PromptEncoding(state)
+
+    class PolicySampler:
+        @staticmethod
+        def sample(features, sampling_params=None, adapter_name='', adapter_uri=None, num_samples=1):
+            policies.append((features[0]['input_ids'][0], adapter_name, adapter_uri))
+            if adapter_uri == 'slow':
+                slow_started.set()
+                assert release.wait(timeout=5)
+            updated = splice(features[0], [30], scored=True, sampled=True)
+            sequence = SampledSequenceModel(
+                stop_reason='stop',
+                tokens=[30],
+                logprobs=[[(30, -0.1)]],
+                decoded='done',
+                new_input_feature=updated,
+            )
+            return [SampleResponseModel(sequences=[sequence])]
+
+    def trajectory(name):
+        return {'messages': [{'role': 'user', 'content': name}]}
+
+    rollout = ClientMultiTurnRollout(PolicySampler(), KeyedTemplate())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        slow = pool.submit(rollout, [trajectory('slow')], adapter_name='policy', adapter_uri='slow')
+        assert slow_started.wait(timeout=5)
+        fast = rollout([trajectory('fast')], adapter_name='policy', adapter_uri='fast')
+        assert fast[0]['input_ids'] == [2, 30]
+        rollout.cancel()
+        release.set()
+        with pytest.raises(CancelledError):
+            slow.result(timeout=5)
+    later = rollout([trajectory('later')], adapter_name='base', adapter_uri=None)
+    assert later[0]['input_ids'] == [3, 30]
+    assert policies == [(1, 'policy', 'slow'), (2, 'policy', 'fast'), (3, 'base', None)]
+
+
+def _wait_for_handle(rollout, handle):
+    ticker = threading.Event()
+    for _ in range(1000):
+        completed = rollout.poll([handle])
+        if completed:
+            return completed[0]
+        ticker.wait(0.005)
+    raise AssertionError('episode did not finish')
+
+
+def test_admit_poll_collect_matches_batch_and_preserves_admission_snapshot():
+    class ToolCaptureTemplate(_Template):
+        def encode_prompt(self, trajectory, **kwargs):
+            self.seen_tools = trajectory.get('tools')
+            return super().encode_prompt(trajectory, **kwargs)
+
+    sampler, template = _Sampler(), ToolCaptureTemplate()
+    schema = _ToolManager.tool_infos()
+    schema[0]['function']['description'] = 'admission-specific schema'
+    rollout = ClientMultiTurnRollout(sampler, template, tool_manager=_ToolManager(), max_turns=2)
+    handle = rollout.admit(
+        _trajectory()['messages'],
+        3,
+        prompt_idx=17,
+        prompt_extras={'task_id': 'task-1', 'tools': schema},
+        adapter_path='twinkle://policy-0',
+        policy_version=4,
+    )
+
+    _wait_for_handle(rollout, handle)
+    sample = rollout.collect(handle)
+
+    assert template.seen_tools == schema
+    assert sample.prompt_id == '17'
+    assert sample.policy_version == 4
+    assert sample.version_span == 0
+    assert sample.prompt == _trajectory()['messages']
+    assert sample.extra == {
+        'task_id': 'task-1',
+        'tools': schema,
+        'trajectory_idx': 3,
+        'adapter_uri': 'twinkle://policy-0',
+        'submission_id': handle.submission_id,
+    }
+    assert sample.encoded['input_ids'] == [1, 10, 90, 20]
+    assert sample.response_token_ids == [10, 20]
+    assert sample.rollout_logprobs == [-0.1, -0.1]
+    assert sampler.policies == [('', 'twinkle://policy-0', 1), ('', 'twinkle://policy-0', 1)]
+    assert sampler.params[0].logprobs == 1
+    assert rollout.stop(handle.submission_id) is True
+    with pytest.raises(RuntimeError, match='already consumed'):
+        rollout.collect(handle)
+
+
+def test_admit_and_poll_do_not_wait_for_sampler_or_idle_confirmation():
+    sample_started = threading.Event()
+    release_sample = threading.Event()
+    idle_started = threading.Event()
+    release_idle = threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            sample_started.set()
+            assert release_sample.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    class Env:
+        def ensure_idle(self):
+            idle_started.set()
+            assert release_idle.wait(timeout=5)
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    assert sample_started.wait(timeout=5)
+    assert rollout.poll([handle]) == []
+    with pytest.raises(RuntimeError, match='not ready'):
+        rollout.collect(handle)
+    release_sample.set()
+    assert idle_started.wait(timeout=5)
+    assert rollout.poll([handle]) == [], 'Future completed before runner finished ensure_idle'
+    release_idle.set()
+    _wait_for_handle(rollout, handle)
+    assert rollout.collect(handle).response_token_ids == [30]
+
+
+def test_failed_collect_preserves_business_error_and_settled_stop_is_idempotent():
+    class EmptySampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            return []
+
+    rollout = ClientMultiTurnRollout(EmptySampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(RuntimeError, match='expected one'):
+        rollout.collect(handle)
+    assert rollout.stop(handle.submission_id) is True
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_uncertain_generation_quarantines_resources_and_caches_stop_error(monkeypatch):
+    sentinel = ConnectionError('client wait expired')
+    close_calls = []
+
+    class FailingSampler:
+        @staticmethod
+        def sample(features, sampling_params=None, **kwargs):
+            raise sentinel
+
+    class Env:
+        def ensure_idle(self):
+            return None
+
+        def close(self):
+            close_calls.append('close')
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(FailingSampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(ConnectionError) as business_error:
+        rollout.collect(handle)
+    assert business_error.value is sentinel
+    with pytest.raises(RuntimeError, match='unconfirmed') as first:
+        rollout.stop(handle.submission_id)
+    monkeypatch.setattr(rollout, '_drain_entry', lambda entry: (_ for _ in ()).throw(
+        AssertionError('cached uncertainty must not drain again')))
+    with pytest.raises(RuntimeError, match='unconfirmed') as second:
+        rollout.stop(handle.submission_id)
+    assert second.value is first.value
+    with pytest.raises(ValueError, match='still borrowed'):
+        rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    assert close_calls == []
+
+
+def test_settlement_credential_tracks_handle_lifetime():
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    rollout.collect(handle)
+    submission_id = handle.submission_id
+    assert rollout.stop(submission_id) is True
+    del handle
+    gc.collect()
+    assert rollout.stop(submission_id) is False
+
+
+def test_handle_tampering_cross_instance_use_and_unknown_stop_are_rejected():
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), (31, 'stop'))), _Template())
+    handle = rollout.admit(_trajectory()['messages'], policy_version=2)
+    other = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(RuntimeError, match='unknown'):
+        other.poll([handle])
+    handle.policy_version = 99
+    with pytest.raises(RuntimeError, match='metadata was modified'):
+        rollout.poll([handle])
+    handle.policy_version = 2
+    forged = replace(handle, submission_id='forged')
+    with pytest.raises(RuntimeError, match='unknown'):
+        rollout.poll([forged])
+    assert rollout.stop('unknown-submission') is False
+    _wait_for_handle(rollout, handle)
+    rollout.collect(handle)
+
+
+def test_concurrent_stop_waits_once_and_prevents_collection_or_another_turn(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    draining, waiting = threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    sampler = BlockingSampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+    handle = rollout.admit(_trajectory()['messages'])
+    assert started.wait(timeout=5)
+    drain_calls = []
+    original_drain, original_wait = rollout._drain_entry, rollout._condition.wait
+
+    def drain(entry):
+        drain_calls.append(entry.handle.submission_id)
+        draining.set()
+        return original_drain(entry)
+
+    def wait(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(rollout, '_drain_entry', drain)
+    monkeypatch.setattr(rollout._condition, 'wait', wait)
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(rollout.stop, handle.submission_id)
+        second = pool.submit(rollout.stop, handle.submission_id)
+        try:
+            assert draining.wait(timeout=5)
+            assert waiting.wait(timeout=5)
+            assert not first.done() and not second.done()
+            with pytest.raises(RuntimeError, match='being stopped'):
+                rollout.collect(handle)
+        finally:
+            release.set()
+        assert first.result(timeout=5) is True
+        assert second.result(timeout=5) is True
+    assert drain_calls == [handle.submission_id]
+    assert len(sampler.calls) == 1
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_idle_failure_is_separate_from_generation_and_remains_quarantined():
+    sentinel = RuntimeError('provider cannot confirm command exit')
+
+    class Env:
+        def ensure_idle(self):
+            raise sentinel
+
+    class EnvManager(_ToolManager):
+        @staticmethod
+        def bound_envs():
+            return (env, )
+
+    env = Env()
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'), )), _Template())
+    handle = rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+    _wait_for_handle(rollout, handle)
+    with pytest.raises(RuntimeError, match='unconfirmed') as error:
+        rollout.collect(handle)
+    assert error.value.__cause__ is sentinel
+    with pytest.raises(RuntimeError, match='unconfirmed'):
+        rollout.stop(handle.submission_id)
+    with pytest.raises(ValueError, match='still borrowed'):
+        rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
+
+
+def test_admit_rejects_conflicting_configuration_before_side_effects():
+    sampler = _Sampler()
+    rollout = ClientMultiTurnRollout(sampler, _Template())
+    with pytest.raises(ValueError, match='num_samples=1'):
+        rollout.admit(_trajectory()['messages'], sampling_params={'num_samples': 2})
+    with pytest.raises(ValueError, match='reserved fields'):
+        rollout.admit(_trajectory()['messages'], prompt_extras={'adapter_uri': 'other'})
+    assert sampler.calls == []
+
+
+def test_streaming_scope_attempts_all_handles_before_abort(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),) * 4), _Template())
+    handles = [rollout.admit(_trajectory()['messages']) for _ in range(4)]
+    for handle in handles:
+        _wait_for_handle(rollout, handle)
+    events = []
+    original = rollout.stop
+
+    def stop(submission_id):
+        events.append(submission_id)
+        if submission_id == handles[0].submission_id:
+            raise RuntimeError('first cleanup failed')
+        return original(submission_id)
+
+    monkeypatch.setattr(rollout, 'stop', stop)
+    driver = type('Driver', (), {'abort': lambda self: events.append('abort')})()
+    with pytest.raises(BaseExceptionGroup, match='streaming cleanup'):
+        with rollout.streaming(driver):
+            pass
+    assert events == [handle.submission_id for handle in handles] + ['abort']
+    with pytest.raises(RuntimeError, match='admission is closed'):
+        rollout.admit(_trajectory()['messages'])
+
+
+def test_streaming_scope_preserves_primary_and_unknown_resources():
+    class FailingSampler:
+        def sample(self, *args, **kwargs):
+            raise ConnectionError('unknown remote generation')
+
+    rollout = ClientMultiTurnRollout(FailingSampler(), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    aborted = []
+    driver = type('Driver', (), {'abort': lambda self: aborted.append(True)})()
+    with pytest.raises(ConnectionError, match='unknown remote') as error:
+        with rollout.streaming(driver):
+            rollout.collect(handle)
+    assert aborted == [True]
+    assert not rollout.is_idle
+    assert any('streaming cleanup' in note for note in error.value.__notes__)
+    assert any(handle.submission_id in note for note in error.value.__notes__)
+    with pytest.raises(BaseExceptionGroup):
+        rollout.drain()
+
+
+@pytest.mark.parametrize('unknown', [False, True])
+def test_resource_scope_uses_actual_rollout_settlement_before_release(unknown):
+    from types import SimpleNamespace
+
+    from twinkle_client.resources import RolloutResources
+
+    class FailingSampler:
+        def sample(self, *args, **kwargs):
+            raise ConnectionError('unknown remote generation')
+
+    released = []
+    client = SimpleNamespace(close=lambda: released.append('client'))
+    env = SimpleNamespace(ensure_idle=lambda: None, close=lambda: released.append('env'))
+
+    def run():
+        with RolloutResources(lambda: client) as resources:
+            resources.own_environment(env)
+            rollout = resources.own_rollout(ClientMultiTurnRollout(
+                FailingSampler() if unknown else _Sampler(((30, 'stop'),)), _Template()))
+            handle = rollout.admit(_trajectory()['messages'])
+            _wait_for_handle(rollout, handle)
+            rollout.collect(handle)
+            # No driver context was entered: setup itself failed after admission.
+            raise ValueError('driver setup failed')
+
+    if unknown:
+        with pytest.raises(ConnectionError, match='unknown remote') as error:
+            run()
+        assert released == []
+        assert any('resource cleanup' in note for note in error.value.__notes__)
+    else:
+        with pytest.raises(ValueError, match='driver setup failed'):
+            run()
+        assert released == ['env', 'client']
+
+
+def test_drain_waits_for_admission_already_in_progress(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),)), _Template())
+    starting, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    original_start, original_wait = rollout._start, rollout._condition.wait
+
+    def start(*args, **kwargs):
+        starting.set()
+        assert release.wait(timeout=5)
+        return original_start(*args, **kwargs)
+
+    def wait(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(rollout, '_start', start)
+    monkeypatch.setattr(rollout._condition, 'wait', wait)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admitted = pool.submit(rollout.admit, _trajectory()['messages'])
+        assert starting.wait(timeout=5)
+        drained = pool.submit(rollout.drain)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not drained.done()
+        finally:
+            release.set()
+        handle = admitted.result(timeout=5)
+        drained.result(timeout=5)
+    assert rollout.is_idle
+    assert rollout.stop(handle.submission_id) is True
+
+
+def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    from twinkle_agentic.tools.tool_manager import ToolManager
+
+    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
+    monkeypatch.syspath_prepend(str(path.parent))
+    spec = importlib.util.spec_from_file_location('blackjack_sdk_test', path)
+    recipe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recipe)
+    # Find a deterministic hand for which hit is nonterminal, then stand ends it.
+    for seed in range(100):
+        probe = recipe.BlackjackEnv(seed)
+        probe.reset()
+        continues = not probe.step('play', {'action': 'hit'}).done
+        probe.close()
+        if continues:
+            break
+    else:
+        raise AssertionError('no nonterminal hit hand found')
+    env = recipe.BlackjackEnv(seed)
+    initial = env.reset()
+    tool = recipe.EnvTool.from_schemas(env, env.tools())[0]
+    manager = ToolManager([tool])
+
+    class Template(_Template):
+        def append_completion(self, state, tokens, **kwargs):
+            next_state = splice_state(state, tokens, tokens, scored=True, sampled=True)
+            calls = () if tokens == [30] else ({'id': f'play-{tokens[0]}', 'type': 'function',
+                'function': {'name': 'play', 'arguments': {'action': 'hit' if tokens == [10] else 'stand'}}},)
+            response = DecodedResponse(content='play', tool_calls=calls, reasoning_started=False)
+            message = {'role': 'assistant', 'content': 'play', 'tool_calls': list(calls)}
+            return CompletionEncoding(replace(next_state, messages=state.messages + (message,)), response)
+
+    rollout = ClientMultiTurnRollout(_Sampler(((10, 'stop'), (20, 'stop'), (30, 'stop'))), Template(), max_turns=4)
+    driver = type('Driver', (), {'abort': lambda self: None})()
+    try:
+        with rollout.streaming(driver):
+            handle = rollout.admit([{'role': 'user', 'content': initial.observation}],
+                                   tool_manager=manager, prompt_extras={'tools': manager.tool_infos()})
+            _wait_for_handle(rollout, handle)
+            sample = rollout.collect(handle)
+            assert tool.done
+            assert tool.episode_reward in (-1, 0, 1)
+            assert sample.response_token_ids[:2] == [10, 20]
+            assert len(sample.rollout_logprobs) == len(sample.response_token_ids)
+            assert any(message['role'] == 'tool' for message in sample.messages)
+        assert rollout.is_idle
+    finally:
+        env.close()
+
+
+def test_streaming_scope_reports_abort_failure_without_replacing_body_error():
+    class Driver:
+        def abort(self):
+            raise SystemExit('abort failed')
+
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(BaseExceptionGroup) as grouped:
+        with rollout.streaming(Driver()):
+            pass
+    assert any(isinstance(error, SystemExit) for error in grouped.value.exceptions)
+    primary = ValueError('training failed')
+    rollout = ClientMultiTurnRollout(_Sampler(), _Template())
+    with pytest.raises(ValueError) as caught:
+        with rollout.streaming(Driver()):
+            raise primary
+    assert caught.value is primary
+    assert any('abort failed' in note for note in primary.__notes__)
+
+
+def test_drain_uses_immutable_submission_identity_after_handle_tampering(monkeypatch):
+    rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),)), _Template())
+    handle = rollout.admit(_trajectory()['messages'])
+    _wait_for_handle(rollout, handle)
+    entry = rollout._streaming[handle.submission_id]
+    cancelled = []
+    original = entry.call.execution.cancel
+
+    def cancel():
+        cancelled.append(True)
+        original()
+
+    monkeypatch.setattr(entry.call.execution, 'cancel', cancel)
+    handle.submission_id = 'modified-by-caller'
+    with pytest.raises(RuntimeError, match='unknown'):
+        rollout.poll([handle])
+    rollout.drain()
+    first = len(cancelled)
+    rollout.drain()
+    assert len(cancelled) == first, 'already settled calls must not be drained again'
+    assert rollout.is_idle
+
+
+def test_drain_waits_for_batch_calls_and_closes_all_admission(monkeypatch):
+    started, release, cancelling = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((20, 'stop'),)), _Template())
+    with ThreadPoolExecutor(2) as pool:
+        batch = pool.submit(rollout, [_trajectory()])
+        try:
+            assert started.wait(timeout=5)
+            call = next(iter(rollout._active.values()))
+            cancel = call.execution.cancel
+
+            def signal_cancel():
+                cancel()
+                cancelling.set()
+
+            monkeypatch.setattr(call.execution, 'cancel', signal_cancel)
+            draining = pool.submit(rollout.drain)
+            assert cancelling.wait(timeout=2), 'drain did not signal the active batch'
+            assert not draining.done() and not rollout.is_idle
+        finally:
+            release.set()
+        with pytest.raises(CancelledError):
+            batch.result(timeout=5)
+        draining.result(timeout=5)
+    assert rollout.is_idle
+    with pytest.raises(RuntimeError, match='admission is closed'):
+        rollout([_trajectory()])
+
+
+@pytest.mark.parametrize('uncertain', [False, True])
+def test_interrupted_submission_keeps_call_owned_until_the_worker_settles(monkeypatch, uncertain):
+    import twinkle_client.rollout.multi_turn as client_rollout
+
+    started, release, shutting_down = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            if uncertain:
+                raise ConnectionError('remote execution unconfirmed')
+            return super().sample(*args, **kwargs)
+
+    class InterruptedExecutor(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            super().submit(*args, **kwargs)
+            assert started.wait(timeout=5)
+            raise KeyboardInterrupt('interrupted after enqueue')
+
+        def shutdown(self, wait=True, **kwargs):
+            shutting_down.set()
+            return super().shutdown(wait=wait, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((20, 'stop'),)), _Template())
+    monkeypatch.setattr(client_rollout, 'ThreadPoolExecutor', InterruptedExecutor)
+    with ThreadPoolExecutor(1) as pool:
+        batch = pool.submit(rollout, [_trajectory()])
+        try:
+            assert shutting_down.wait(timeout=5)
+            assert not rollout.is_idle, 'queued work lost its owner before physical settlement'
+            assert not batch.done()
+        finally:
+            release.set()
+        with pytest.raises(KeyboardInterrupt, match='after enqueue'):
+            batch.result(timeout=5)
+    if uncertain:
+        assert not rollout.is_idle
+        with pytest.raises(BaseExceptionGroup, match='did not drain'):
+            rollout.drain()
+    else:
+        assert rollout.is_idle

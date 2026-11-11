@@ -36,6 +36,9 @@ class PartialRolloutMixin:
     See the module docstring for the concrete-subclass contract. Everything except the single
     ``_sample_single`` coroutine and the engine's ``abort_request`` is the same regardless of the engine,
     so it is defined once here.
+
+    Control RPCs explicitly bypass generation-drain barriers even on serialized
+    sampler handles, which do not carry the original driver's worker-pool registry.
     """
 
     #: Default resume budget for the core submission path (``_generate_inputs``): how many times an aborted
@@ -118,20 +121,20 @@ class PartialRolloutMixin:
                 logger.warning('partial rollout: failed to abort in-flight request %s: %s', request_id, error)
         return aborted
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, control=True)
     @timed
     def abort_all_inflight(self) -> dict[str, int]:
         """Abort every in-flight generation on this DP worker (called on an in-place weight republish).
 
-        The abort coroutines must run on the engine's own loop, so this schedules ``_abort_all_inflight``
-        there and blocks the actor thread on it -- the same loop/thread split the rest of the submission
-        API uses, and blocking here is what makes the republish wait until no generation is mid-decode
-        before the weights are overwritten.
+        Waits for abort requests to be issued on the engine's own loop. This does not
+        close the retry gate: partial rollouts may immediately start another attempt.
+        Use ``pause_generation`` before an in-place weight transfer, then resume only
+        after that transfer succeeds.
         """
         future = asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop)
         return {'aborted': future.result()}
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, control=True)
     def _generation_count(self):
         """Idle probe input: in-flight engine requests plus active partial-rollout loops on this worker.
 
@@ -181,14 +184,14 @@ class PartialRolloutMixin:
         self._generation_paused = False
         self._generation_resume_gate.set()
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True, control=True)
     @timed
     def pause_generation(self) -> dict[str, int]:
         """Stop decode at a resumable barrier before a shared sampler releases its GPUs."""
         future = asyncio.run_coroutine_threadsafe(self._pause_generation(), self._async_loop)
         return {'aborted': future.result()}
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True, control=True)
     def resume_generation(self) -> None:
         """Release requests paused by :meth:`pause_generation`; idempotent."""
         future = asyncio.run_coroutine_threadsafe(self._resume_generation(), self._async_loop)

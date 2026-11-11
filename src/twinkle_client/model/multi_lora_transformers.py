@@ -17,6 +17,7 @@ from twinkle_client._request_builder import build_request
 from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
+from twinkle_client.operations import _guarded_operation
 
 logger = logging.getLogger('twinkle_client')
 
@@ -70,6 +71,20 @@ class MultiLoraTransformersModel:
         # __init__, so constructing the wrapper performs no network I/O.
         self._created = False
         self._create_lock = threading.Lock()
+        self._completed_step_calls = 0
+        self._last_checkpoint = None
+
+    @property
+    def completed_step_calls(self) -> int:
+        """Successful step/clip_grad_and_step replies on this object, not device-update proof."""
+        with self._training_lock:
+            return self._completed_step_calls
+
+    @property
+    def last_checkpoint(self):
+        """Last successful save response, retained even when the caller's wait is interrupted."""
+        with self._training_lock:
+            return self._last_checkpoint
 
     # ------------------------------------------------------------------ #
     # Request plumbing
@@ -110,6 +125,7 @@ class MultiLoraTransformersModel:
             raise RuntimeError('Create this training with add_adapter_to_model on this object before using it.')
         return {**values, 'adapter_name': name, 'training_id': training_id}
 
+    @_guarded_operation
     def _submit(self, endpoint: str, model_cls, response_cls, **values):
         """Validate once, then send with a stable handle and retry identity."""
         if issubclass(model_cls, model_types.TrainingRequest):
@@ -121,7 +137,13 @@ class MultiLoraTransformersModel:
         body = build_request(model_cls, **values)
         self._ensure_created()
         response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
-        return self._await_task(response, response_cls)
+        result = self._await_task(response, response_cls)
+        with self._training_lock:
+            if endpoint in {'step', 'clip_grad_and_step'}:
+                self._completed_step_calls += 1
+            if endpoint == 'save':
+                self._last_checkpoint = result
+        return result
 
     def _await_task(self, response, model_cls):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer.
@@ -142,6 +164,7 @@ class MultiLoraTransformersModel:
     # Adapter lifecycle
     # ------------------------------------------------------------------ #
 
+    @_guarded_operation
     def add_adapter_to_model(
         self,
         adapter_name: str,
@@ -184,6 +207,7 @@ class MultiLoraTransformersModel:
             with self._training_lock:
                 self._creating.discard(adapter_name)
 
+    @_guarded_operation
     def remove_adapter(self, adapter_name: str | None = None) -> None:
         """Release one client-owned adapter from the training component."""
         name = adapter_name or self.adapter_name

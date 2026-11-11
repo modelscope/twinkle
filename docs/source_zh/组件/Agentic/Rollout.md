@@ -122,3 +122,20 @@ results = rollout(trajectories)
 | `length` | 生成达到 token 上限。 |
 | `max_turns` | 达到工具轮次上限且没有 follow-up。 |
 | `generation_error` | 外部端点未能返回有效响应。 |
+
+## 流式交接与权重发布（v5）
+
+`twinkle_agentic.async_rl.StreamingDriver` 负责准入、版本记账和已完成记录的交接。训练配方负责 optimizer batch 大小和发布时机，通过自己的回调请求发布；driver 不直接传输权重。
+
+`buffer_depth` 限制在途轨迹容量，`max_rows_per_pull` 独立限制每次训练交接大小。例如容量 128、取数上限 64，可以预留下一批生成工作，同时让配方在每次更新后发布权重。只扩大容量而不限制取数，可能把多个已完成批次合并到一次交接。
+
+- `group_pull=True`：上限必须是 `lcm(need_rows, num_generations)` 的正整数倍。完整且完成评分的组保持连续，未完成或等待评分的组继续留在缓冲区。
+- `group_pull=False`：上限必须是 `need_rows` 的正整数倍。
+- `max_rows_per_pull=None`：保留原有的不设上限、按完整批次取数的行为。
+- 自定义 `assembly_ready` 自行负责选择策略，不能同时传入该上限。
+
+该上限约束正常完整批次的交接，有限数据流的尾批处理仍是独立路径，行为不变。容量和取数上限不会放宽策略版本校验。
+
+存在活跃 partial rollout 时，原地发布必须先暂停生成，完成权重同步后再恢复。`abort_all_inflight` 只发出中断，不关闭重试入口，不能单独作为安全发布屏障。暂停或传输失败必须向上传播，不能无条件恢复生成。自适应 `ClusterAdapter` 继续拥有其完整发布事务。
+
+中断、暂停、恢复和生成状态查询显式标记为 `control=True`。即使 sampler handle 被序列化并转发到 rollout actor、缺少原始 worker-pool 注册表，控制指令仍能越过等待生成结束的屏障。普通生命周期和权重操作继续保留屏障。

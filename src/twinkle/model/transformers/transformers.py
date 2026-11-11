@@ -341,14 +341,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if model_loader is not None and model_id is not None:
             # Full takeover: the loader builds the processor, then the pretrained model (its own
             # model_cls, trust_remote_code and dynamic-module handling), then post-processes it
-            # (process_model, e.g. submodel delegation). This bypasses the rank0-broadcast empty-init
-            # optimisation, so it is only taken for a real pretrained load (model_id set); the
-            # blank-model (model_id is None) path below is unchanged.
+            # (process_model, e.g. submodel delegation). Native FSDP's other ranks construct the
+            # same family on meta and receive their parameter shards during wrap_model().
             processor = model_loader.process_tokenizer(model_loader.build_processor(model_id, self.hf_config))
             self._default_tokenizer = processor
-            load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
-            with self.strategy.pretrained_load_context():
-                model = model_loader.build_model(model_id, config=self.hf_config, processor=processor, **load_kwargs)
+            if self._should_init_empty_pretrained_model_on_this_rank():
+                model = self._init_empty_model_from_config(
+                    model_cls, model_loader=model_loader, processor=processor, **kwargs)
+            else:
+                load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
+                with self.strategy.pretrained_load_context():
+                    model = model_loader.build_model(
+                        model_id, config=self.hf_config, processor=processor, **load_kwargs)
             self.model = model_loader.process_model(model)
         elif model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
@@ -529,17 +533,22 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
         if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
             return False
-        local_rank = Platform.get_local_rank()
-        if local_rank < 0:
-            raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')
-        return local_rank != 0
+        return not self.strategy.is_pretrained_loading_source()
 
-    def _init_empty_model_from_config(self, model_cls, **kwargs):
+    def _init_empty_model_from_config(self, model_cls, *, model_loader=None, processor=None, **kwargs):
         from accelerate import init_empty_weights
 
+        logger.info('Initializing model on meta; native FSDP will load parameter shards from the node-local source.')
         config_kwargs = filter_from_config_kwargs(kwargs)
         with init_empty_weights(include_buffers=False):
-            if hasattr(model_cls, 'from_config'):
+            if model_loader is not None:
+                build_from_config = getattr(model_loader, 'build_model_from_config', None)
+                if not callable(build_from_config):
+                    raise ValueError(
+                        f'{type(model_loader).__name__} must implement build_model_from_config() '
+                        'to use memory_efficient_init with native FSDP.')
+                model = build_from_config(self.hf_config, processor=processor, **config_kwargs)
+            elif hasattr(model_cls, 'from_config'):
                 model = model_cls.from_config(self.hf_config, **config_kwargs)
             else:
                 model = model_cls._from_config(self.hf_config, **config_kwargs)
@@ -2031,8 +2040,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
         # Previously the pattern did not match nn.Parameter() weights, causing EP LoRA
-        # parameters to be missed by the optimizer.
-        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
+        # parameters to be missed by the optimizer. The trailing boundary keeps lora_2 from
+        # also selecting lora_20..lora_29 when many adapter slots are resident.
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}(?:\.|$)')
         params = {}
         model = self.strategy.unwrap_model(self.model)
         for name, param in model.named_parameters():
@@ -2185,6 +2195,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
+        if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
+            # Initial adapter snapshots precede the first forward. Materialize on every
+            # rank before state-dict collectives: non-source ranks still hold meta tensors.
+            self._lazy_wrap_model()
         model = self.strategy.unwrap_model(self.model)
         save_kwargs = {
             'safe_serialization': safe_serialization,

@@ -229,8 +229,15 @@ class RLResourceEstimator:
         hidden = int(getattr(config, 'hidden_size', 0) or getattr(config, 'd_model', 0) or 0)
         heads = int(getattr(config, 'num_attention_heads', 0) or 1)
         kv_heads = int(getattr(config, 'num_key_value_heads', 0) or heads)
+        raw_head_dim = getattr(config, 'head_dim', None)
+        try:
+            head_dim = int(raw_head_dim)
+        except (TypeError, ValueError):
+            head_dim = 0
+        if head_dim <= 0:
+            head_dim = hidden // max(1, heads)
         kv_dtype_bytes = self._dtype_bytes(getattr(config, 'torch_dtype', None))
-        kv_bytes = math.ceil(2 * layers * kv_heads * (hidden // heads) * kv_dtype_bytes / model_parallel_width)
+        kv_bytes = math.ceil(2 * layers * kv_heads * head_dim * kv_dtype_bytes / model_parallel_width)
         graph_reserve = 0 if enforce_eager else int(min(1.0, max(0.15, parameter_count / 1e11)) * _GIB)
         return ModelMemoryEstimate(
             parameter_count=parameter_count,
@@ -329,12 +336,20 @@ class RLResourceEstimator:
         kv_budget = budget - memory.weight_bytes - memory.runtime_reserve_bytes - memory.graph_reserve_bytes
         if kv_budget <= 0:
             raise ValueError('sampler KV budget is non-positive after weights and runtime reserves.')
-        max_batched = max(1, math.floor(0.95 * kv_budget / max(1, memory.kv_bytes_per_token)))
-        max_batched = int(overrides.get('max_num_batched_tokens', max_batched))
-        if max_batched < 1:
-            raise ValueError('max_num_batched_tokens must be positive.')
-        max_seqs = max(1, max_batched // max(1, total_p95))
+        # Tokens the KV cache can hold. The scheduler chunk is separate: one forward
+        # should cover a full max_model_len prefill, not the entire cache. Writing the
+        # cache size into max_num_batched_tokens also becomes vLLM's vision-encoder
+        # budget and profiles dozens of max-size images.
+        kv_tokens = max(1, math.floor(0.95 * kv_budget / max(1, memory.kv_bytes_per_token)))
+        context_limit = int(engine_context or 0)
+        if context_limit <= 0:
+            context_limit = int(getattr(hf_config, 'max_position_embeddings', 0) or 0)
         configured_seqs = getattr(rollout_config, 'vllm_max_num_seqs', None) if backend == 'vllm' else None
+        if 'max_num_batched_tokens' in overrides:
+            seq_budget = int(overrides['max_num_batched_tokens'])
+        else:
+            seq_budget = kv_tokens
+        max_seqs = max(1, seq_budget // max(1, total_p95))
         if configured_seqs is not None:
             max_seqs = min(max_seqs, configured_seqs)
         max_seqs = int(overrides.get('max_num_seqs', max_seqs))
@@ -343,6 +358,18 @@ class RLResourceEstimator:
         if configured_seqs is not None and max_seqs > configured_seqs:
             raise ValueError(f'max_num_seqs override {max_seqs} exceeds the configured engine limit '
                              f'{configured_seqs}.')
+        if 'max_num_batched_tokens' in overrides:
+            max_batched = int(overrides['max_num_batched_tokens'])
+        else:
+            # One prefill step may be as long as the context window. Also keep room for
+            # one decode token from every live sequence, which vLLM requires.
+            chunk = kv_tokens if context_limit <= 0 else min(kv_tokens, context_limit)
+            max_batched = min(kv_tokens, max(chunk, max_seqs))
+        if max_batched < 1:
+            raise ValueError('max_num_batched_tokens must be positive.')
+        if max_batched < max_seqs:
+            raise ValueError(f'max_num_batched_tokens={max_batched} is smaller than max_num_seqs={max_seqs}; '
+                             'one scheduler step must hold a decode token from every live sequence.')
 
         sampler_replicas = int(overrides.get('sampler_replicas', 1))
         if sampler_replicas < 1:
@@ -403,7 +430,15 @@ def _hf_config(model_config: Any) -> Any:
         kwargs['revision'] = model_config.model_revision
     if getattr(model_config, 'trust_remote_code', None) is not None:
         kwargs['trust_remote_code'] = model_config.trust_remote_code
-    return AutoConfig.from_pretrained(model_config.model, **kwargs)
+    config = AutoConfig.from_pretrained(model_config.model, **kwargs)
+    # Composite checkpoints (Qwen3.5) keep shape and dtype on text_config. The parent
+    # has neither hidden size nor vocab size, so estimation would refuse the model.
+    text = getattr(config, 'text_config', None)
+    if text is not None and int(getattr(text, 'hidden_size', 0) or 0) > 0:
+        if getattr(text, 'torch_dtype', None) is None and getattr(config, 'torch_dtype', None) is not None:
+            text.torch_dtype = config.torch_dtype
+        return text
+    return config
 
 
 def _prompt_lengths(template: Any, prompt_rows: Sequence[Mapping[str, Any]], limit: int = 2048) -> List[int]:

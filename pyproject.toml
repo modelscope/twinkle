@@ -46,6 +46,10 @@ client = [
   "httpx>=0.25.0",
   "tinker==0.16.1",
 ]
+e2b = [
+  "e2b==2.31.0",
+  "python-dotenv>=1.0",
+]
 server = [
   "redis>=5.0",
   "psutil>=5.9.0",
