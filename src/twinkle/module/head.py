@@ -39,7 +39,11 @@ class SeqClsHead(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 lm_logits: Optional[torch.Tensor] = None,
                 meta: Optional[Dict[str, Any]] = None) -> torch.Tensor:
-        out = self.classifier(hidden_states)
+        # The base model can surface its last hidden states in fp32 (a final-logit upcast) while
+        # align_head placed this non-keep_fp32 head in the backbone dtype (bf16); cast the input to the
+        # classifier's dtype so the readout matmul matches -- the same cast HF's *ForSequenceClassification
+        # does (self.score(pooled.to(self.dtype))). The keep_fp32 heads upcast their inputs themselves.
+        out = self.classifier(hidden_states.to(self.classifier.weight.dtype))
         if self.squeeze_single and out.dim() == 3 and out.shape[-1] == 1:
             out = out[..., 0]
         return out
