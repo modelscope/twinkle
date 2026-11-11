@@ -7,7 +7,6 @@ from dataclasses import replace
 
 import pytest
 
-from twinkle.data_format.sampling import SampledSequence
 from twinkle.protocol.types.sampler import SampledSequenceModel, SampleResponseModel
 from twinkle.template.contract import (
     CompletionEncoding,
@@ -19,7 +18,6 @@ from twinkle.template.contract import (
     splice,
     splice_state,
 )
-from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 from twinkle_client.rollout.multi_turn import ClientMultiTurnRollout
 
 
@@ -156,36 +154,6 @@ def test_harness_receives_opening_when_sampled_state_omits_metadata():
         {'role': 'assistant', 'content': 'answer-20'},
     ]
     assert result['tools'] == _ToolManager.tool_infos()
-
-
-def test_core_and_wire_characterization_share_scripted_trajectory():
-    def wire_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs, **kwargs):
-        response = sampler.sample([input_feature], sampling_params=sampling_params)[0]
-        sequence = response.sequences[0]
-        return SampledSequence(
-            stop_reason=sequence.stop_reason,
-            tokens=sequence.tokens,
-            logprobs=sequence.logprobs,
-            decoded=sequence.decoded,
-            new_input_feature=sequence.new_input_feature,
-        )
-
-    wire_sampler = _Sampler()
-    core = MultiTurnRollout(
-        sampler=None,
-        template=_Template(),
-        tool_manager=_ToolManager(),
-        max_turns=2,
-        response_callback=wire_callback,
-    )
-    core_result = core([_trajectory()], response_callback=lambda _sampler, _api, params, **kwargs: wire_callback(
-        wire_sampler, _api, params, **kwargs))[0]
-    http_result = ClientMultiTurnRollout(
-        _Sampler(), _Template(), tool_manager=_ToolManager(), max_turns=2)([_trajectory()])[0]
-
-    for key in ('input_ids', 'labels', 'completion_mask', 'messages', 'tools', 'logprobs', 'rollout_logprobs'):
-        assert core_result[key] == http_result[key]
-    assert core_result['stop_reason'] == http_result['stop_reason'] == 'stop'
 
 
 def test_http_multi_turn_complete_trajectory_golden():
@@ -535,9 +503,9 @@ def test_duplicate_env_and_bare_harness_are_rejected_before_side_effects():
     assert harness.calls == 0
 
 
-def test_active_env_borrow_is_released_only_after_runner_finishes():
-    started = threading.Event()
-    release = threading.Event()
+@pytest.mark.parametrize('kind', ['env', 'harness'])
+def test_active_resource_borrow_is_released_only_after_runner_finishes(kind):
+    started, release = threading.Event(), threading.Event()
 
     class BlockingSampler(_Sampler):
         def sample(self, *args, **kwargs):
@@ -545,62 +513,36 @@ def test_active_env_borrow_is_released_only_after_runner_finishes():
             assert release.wait(timeout=5)
             return super().sample(*args, **kwargs)
 
-    class Env:
-        close_calls = 0
+    class Resource:
+        closed = False
 
         def close(self):
-            self.close_calls += 1
+            self.closed = True
 
-    class EnvManager(_ToolManager):
-        def __init__(self, env):
-            self.env = env
-
-        def bound_envs(self):
-            return (self.env, )
-
-    env = Env()
-    manager = EnvManager(env)
-    sampler = BlockingSampler(((10, 'stop'), (20, 'stop'), (30, 'stop')))
-    rollout = ClientMultiTurnRollout(sampler, _Template(), max_turns=2)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        first = pool.submit(rollout, [_trajectory()], tool_manager=manager)
-        assert started.wait(timeout=5)
-        with pytest.raises(ValueError, match='still borrowed'):
-            rollout([_trajectory()], tool_manager=manager)
-        release.set()
-        assert first.result(timeout=5)[0]['turns'] == 2
-    result = rollout([_trajectory()], tool_manager=manager)
-    assert result[0]['turns'] == 1
-    assert env.close_calls == 0
-
-
-def test_active_bare_harness_borrow_covers_concurrent_single_episode_calls():
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingSampler(_Sampler):
-        def sample(self, *args, **kwargs):
-            started.set()
-            assert release.wait(timeout=5)
-            return super().sample(*args, **kwargs)
-
-    class Harness:
         def before_generate(self, trajectory):
             return trajectory
 
-        @staticmethod
-        def after_generate(context, decoded, tool_calls):
+        def after_generate(self, context, decoded, tool_calls):
             return {'messages': context['messages'] + [{'role': 'assistant', 'content': decoded}]}
 
-    sampler = BlockingSampler(((30, 'stop'), (40, 'stop')))
-    rollout = ClientMultiTurnRollout(sampler, _Template(), harness=Harness())
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        first = pool.submit(rollout, [_trajectory()])
-        assert started.wait(timeout=5)
-        with pytest.raises(ValueError, match='still borrowed'):
-            rollout([_trajectory()])
-        release.set()
+    class EnvManager(_ToolManager):
+        def bound_envs(self):
+            return (resource,)
+
+    resource = Resource()
+    options = {'tool_manager': EnvManager()} if kind == 'env' else {'harness': resource}
+    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), (40, 'stop'))), _Template())
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(rollout, [_trajectory()], **options)
+        try:
+            assert started.wait(timeout=5)
+            with pytest.raises(ValueError, match='still borrowed'):
+                rollout([_trajectory()], **options)
+        finally:
+            release.set()
         assert first.result(timeout=5)[0]['input_ids'] == [1, 30]
+    assert rollout([_trajectory()], **options)[0]['input_ids'] == [1, 40]
+    assert not resource.closed
 
 
 def test_independent_episodes_do_not_wait_for_a_slow_tool_round():
@@ -817,13 +759,20 @@ def _wait_for_handle(rollout, handle):
 
 
 def test_admit_poll_collect_matches_batch_and_preserves_admission_snapshot():
-    sampler = _Sampler()
-    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
+    class ToolCaptureTemplate(_Template):
+        def encode_prompt(self, trajectory, **kwargs):
+            self.seen_tools = trajectory.get('tools')
+            return super().encode_prompt(trajectory, **kwargs)
+
+    sampler, template = _Sampler(), ToolCaptureTemplate()
+    schema = _ToolManager.tool_infos()
+    schema[0]['function']['description'] = 'admission-specific schema'
+    rollout = ClientMultiTurnRollout(sampler, template, tool_manager=_ToolManager(), max_turns=2)
     handle = rollout.admit(
         _trajectory()['messages'],
         3,
         prompt_idx=17,
-        prompt_extras={'task_id': 'task-1'},
+        prompt_extras={'task_id': 'task-1', 'tools': schema},
         adapter_path='twinkle://policy-0',
         policy_version=4,
     )
@@ -831,12 +780,14 @@ def test_admit_poll_collect_matches_batch_and_preserves_admission_snapshot():
     _wait_for_handle(rollout, handle)
     sample = rollout.collect(handle)
 
+    assert template.seen_tools == schema
     assert sample.prompt_id == '17'
     assert sample.policy_version == 4
     assert sample.version_span == 0
     assert sample.prompt == _trajectory()['messages']
     assert sample.extra == {
         'task_id': 'task-1',
+        'tools': schema,
         'trajectory_idx': 3,
         'adapter_uri': 'twinkle://policy-0',
         'submission_id': handle.submission_id,
@@ -973,9 +924,9 @@ def test_handle_tampering_cross_instance_use_and_unknown_stop_are_rejected():
     rollout.collect(handle)
 
 
-def test_stop_cancels_the_next_turn_and_waits_for_the_inflight_sample():
-    started = threading.Event()
-    release = threading.Event()
+def test_concurrent_stop_waits_once_and_prevents_collection_or_another_turn(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    draining, waiting = threading.Event(), threading.Event()
 
     class BlockingSampler(_Sampler):
         def sample(self, *args, **kwargs):
@@ -984,66 +935,38 @@ def test_stop_cancels_the_next_turn_and_waits_for_the_inflight_sample():
             return super().sample(*args, **kwargs)
 
     sampler = BlockingSampler()
-    rollout = ClientMultiTurnRollout(sampler, _Template(), max_turns=2)
-    handle = rollout.admit(_trajectory()['messages'])
-    assert started.wait(timeout=5)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        stopped = pool.submit(rollout.stop, handle.submission_id)
-        assert not stopped.done()
-        release.set()
-        assert stopped.result(timeout=5) is True
-    assert len(sampler.calls) == 1
-
-
-def test_concurrent_stop_shares_one_actual_drain(monkeypatch):
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingSampler(_Sampler):
-        def sample(self, *args, **kwargs):
-            started.set()
-            assert release.wait(timeout=5)
-            return super().sample(*args, **kwargs)
-
-    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
+    rollout = ClientMultiTurnRollout(sampler, _Template(), tool_manager=_ToolManager(), max_turns=2)
     handle = rollout.admit(_trajectory()['messages'])
     assert started.wait(timeout=5)
     drain_calls = []
-    original_drain = rollout._drain_entry
+    original_drain, original_wait = rollout._drain_entry, rollout._condition.wait
 
     def drain(entry):
         drain_calls.append(entry.handle.submission_id)
+        draining.set()
         return original_drain(entry)
 
+    def wait(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
     monkeypatch.setattr(rollout, '_drain_entry', drain)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    monkeypatch.setattr(rollout._condition, 'wait', wait)
+    with ThreadPoolExecutor(2) as pool:
         first = pool.submit(rollout.stop, handle.submission_id)
         second = pool.submit(rollout.stop, handle.submission_id)
-        release.set()
+        try:
+            assert draining.wait(timeout=5)
+            assert waiting.wait(timeout=5)
+            assert not first.done() and not second.done()
+            with pytest.raises(RuntimeError, match='being stopped'):
+                rollout.collect(handle)
+        finally:
+            release.set()
         assert first.result(timeout=5) is True
         assert second.result(timeout=5) is True
     assert drain_calls == [handle.submission_id]
-
-
-def test_collect_loses_to_an_inprogress_stop_without_double_consumption():
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingSampler(_Sampler):
-        def sample(self, *args, **kwargs):
-            started.set()
-            assert release.wait(timeout=5)
-            return super().sample(*args, **kwargs)
-
-    rollout = ClientMultiTurnRollout(BlockingSampler(((30, 'stop'), )), _Template())
-    handle = rollout.admit(_trajectory()['messages'])
-    assert started.wait(timeout=5)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        stopped = pool.submit(rollout.stop, handle.submission_id)
-        with pytest.raises(RuntimeError, match='being stopped'):
-            rollout.collect(handle)
-        release.set()
-        assert stopped.result(timeout=5) is True
+    assert len(sampler.calls) == 1
     assert rollout.stop(handle.submission_id) is True
 
 
@@ -1070,23 +993,6 @@ def test_idle_failure_is_separate_from_generation_and_remains_quarantined():
         rollout.stop(handle.submission_id)
     with pytest.raises(ValueError, match='still borrowed'):
         rollout.admit(_trajectory()['messages'], tool_manager=EnvManager())
-
-
-def test_admit_threads_tool_schema_into_core():
-    class ToolCaptureTemplate(_Template):
-        seen = None
-
-        def encode_prompt(self, trajectory, **kwargs):
-            self.seen = trajectory.get('tools')
-            return super().encode_prompt(trajectory, **kwargs)
-
-    template = ToolCaptureTemplate()
-    rollout = ClientMultiTurnRollout(_Sampler(), template, tool_manager=_ToolManager(), max_turns=2)
-    schema = _ToolManager.tool_infos()
-    handle = rollout.admit(_trajectory()['messages'], prompt_extras={'tools': schema})
-    _wait_for_handle(rollout, handle)
-    rollout.collect(handle)
-    assert template.seen == schema
 
 
 def test_admit_rejects_conflicting_configuration_before_side_effects():

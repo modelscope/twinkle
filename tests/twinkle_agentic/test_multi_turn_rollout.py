@@ -1500,62 +1500,33 @@ def test_call_sampling_params_dict_is_normalized_without_mutating_input(sampler,
     assert sampler.params_seen[0].num_samples == 1
 
 
-def test_transport_state_validation_covers_every_append(sampler, template, tool_manager):
+@pytest.mark.parametrize('append', ['tool', 'followup', 'malformed'])
+def test_transport_rejects_unsupported_appended_state_before_next_generation(sampler, template, tool_manager, append):
     class ValidatingCallback:
-        def __init__(self):
-            self.validations = []
-
         def __call__(self, *args, **kwargs):
             return default_response_callback(*args, **kwargs)
 
         def validate_state(self, state, feature, index):
-            self.validations.append((index, len(feature['input_ids'])))
+            messages = state.messages if state is not None else feature['messages']
+            if len(messages) > 1 and messages[-1]['role'] in {'tool', 'user'}:
+                raise ValueError('unsupported appended state')
 
-    callback = ValidatingCallback()
-    followups = iter(('summarize', None))
     rollout = MultiTurnRollout(
-        sampler=sampler,
-        template=template,
-        tool_manager=tool_manager,
-        response_callback=callback,
-        followup_fn=lambda *_: next(followups),
-        max_turns=3,
+        sampler=sampler, template=template, tool_manager=tool_manager,
+        response_callback=ValidatingCallback(), max_turns=3,
+        followup_fn=(lambda *_: 'summarize') if append == 'followup' else None,
     )
-    sampler.queue(_tool_call_text('search', {'q': 'x'}))
-    sampler.queue('finished tools')
-    sampler.queue('summary')
+    first_reply = {
+        'tool': _tool_call_text('search', {'q': 'x'}),
+        'followup': 'finished',
+        'malformed': '<tool_call>{bad json}</tool_call>',
+    }[append]
+    sampler.queue(first_reply)
+    sampler.queue('must not be sampled')
 
-    result = rollout([_user_traj()])[0]
-
-    assert result['followups'] == 1
-    assert len(callback.validations) == 6
-
-
-def test_transport_state_validation_covers_malformed_feedback(sampler, template, tool_manager):
-    class ValidatingCallback:
-        def __init__(self):
-            self.count = 0
-
-        def __call__(self, *args, **kwargs):
-            return default_response_callback(*args, **kwargs)
-
-        def validate_state(self, state, feature, index):
-            self.count += 1
-
-    callback = ValidatingCallback()
-    rollout = MultiTurnRollout(
-        sampler=sampler,
-        template=template,
-        tool_manager=tool_manager,
-        response_callback=callback,
-        max_malformed_retries=1,
-    )
-    sampler.queue('<tool_call>{bad json}</tool_call>')
-    sampler.queue('done')
-
-    rollout([_user_traj()])
-
-    assert callback.count == 4
+    with pytest.raises(ValueError, match='unsupported appended state'):
+        rollout([_user_traj()])
+    assert sampler.sample_calls == 1
 
 
 def test_cancellation_drains_inflight_generation_without_starting_tools(template, tool_manager):

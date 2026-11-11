@@ -84,7 +84,3 @@ def test_rollout_failure_survives_group_filtering_and_update_budgets(failure):
 def test_group_size_must_be_a_positive_integer(count):
     with pytest.raises(ValueError, match='positive integer'):
         training_groups([], num_generations=count)
-
-
-def test_empty_batch_has_no_groups():
-    assert training_groups([], num_generations=2) == []

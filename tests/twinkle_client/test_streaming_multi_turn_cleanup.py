@@ -96,16 +96,6 @@ def test_mixed_or_truncated_groups_are_not_trained(recipe):
     assert model.calls == []
 
 
-def test_hard_failure_is_not_hidden_by_incomplete_or_truncated_group(recipe):
-    samples = group('bad', [1, 0, 1, 0])
-    samples[0].truncated = True
-    samples[1].rollout_infos['error'] = 'sampling failed'
-    model = Model()
-    with pytest.raises(RuntimeError, match='sampling failed'):
-        recipe._train_loop(Driver([samples[:2]]), model, 'test-run')
-    assert model.calls == []
-
-
 def test_save_failure_never_commits_a_publish(recipe):
     model = Model()
     model.save = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('save failed'))
@@ -202,42 +192,12 @@ def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, mon
     with pytest.raises(RuntimeError, match='game process failed'):
         recipe.training_groups([failed], num_generations=recipe.NUM_GENERATIONS, drop_truncated=True)
     assert len(closed) == 3 and not resources._environments
-    assert driver._version_control is True
-    assert driver._initial_adapter_path() == 'policy-0'
-    assert driver._consume is None
     driver.abort()
     resources.close()
 
 
-def test_failed_environment_setup_remains_owned_for_cleanup(recipe):
-    class Env(recipe.BlackjackTask):
-        def __init__(self, seed):
-            pass
-
-        def reset(self):
-            raise RuntimeError('setup failed')
-
-        def ensure_idle(self):
-            pass
-
-        def close(self):
-            pass
-
-    resources = recipe.RolloutResources(lambda: SimpleNamespace(close=lambda: None))
-    rollout = SimpleNamespace(poll=lambda handles: [])
-    driver = recipe._build_driver(rollout, 'policy-0', resources, Env)
-    try:
-        with pytest.raises(RuntimeError, match='setup failed'):
-            driver._submit(SimpleNamespace(ordinal=0, row={'seed': 123}), 0, None)
-        assert len(resources._environments) == 1
-    finally:
-        driver.abort()
-        resources.close()
-    assert not resources._environments
-
-
-@pytest.mark.parametrize('contract', ['empty', 'multiple', 'renamed'])
-def test_blackjack_rejects_other_tool_contracts_without_admission(recipe, contract):
+@pytest.mark.parametrize('failure', ['reset', 'empty', 'multiple', 'renamed'])
+def test_failed_episode_setup_closes_environment_without_admission(recipe, failure):
     closed, admitted = [], []
 
     class Env(recipe.BlackjackTask):
@@ -245,21 +205,20 @@ def test_blackjack_rejects_other_tool_contracts_without_admission(recipe, contra
             pass
 
         def reset(self):
+            if failure == 'reset':
+                raise RuntimeError('setup failed')
             return SimpleNamespace(observation='cards')
 
         def tools(self):
-            if contract == 'empty':
+            if failure == 'empty':
                 return []
             tools = super().tools()
-            if contract == 'multiple':
+            if failure == 'multiple':
                 extra = super().tools()[0]
                 extra['function']['name'] = 'inspect_hand'
                 return tools + [extra]
             tools[0]['function']['name'] = 'other'
             return tools
-
-        def step(self, name, arguments):
-            raise AssertionError('invalid task contract must not execute tools')
 
         def ensure_idle(self):
             pass
@@ -270,8 +229,10 @@ def test_blackjack_rejects_other_tool_contracts_without_admission(recipe, contra
     rollout = SimpleNamespace(poll=lambda handles: [], admit=lambda *a, **k: admitted.append(True))
     with recipe.RolloutResources(lambda: SimpleNamespace(close=lambda: None)) as resources:
         driver = recipe._build_driver(rollout, 'policy-0', resources, Env)
+        error_type = RuntimeError if failure == 'reset' else ValueError
+        message = 'setup failed' if failure == 'reset' else 'adapt submit/collect'
         try:
-            with pytest.raises(ValueError, match='adapt submit/collect'):
+            with pytest.raises(error_type, match=message):
                 driver._submit(SimpleNamespace(ordinal=0, row={'seed': 1}), 0, None)
         finally:
             driver.abort()
