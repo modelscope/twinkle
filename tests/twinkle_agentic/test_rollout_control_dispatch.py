@@ -8,6 +8,8 @@ import ray
 
 from twinkle.infra import dispatch
 from twinkle.infra._ray import RayHelper
+from twinkle.infra.worker_pool import WorkerPool
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 
 
@@ -20,7 +22,7 @@ class ReachedTransport(BaseException):
 
 
 @pytest.fixture
-def pending_rollout(monkeypatch):
+def pending_rollout(monkeypatch, request):
     ref = ray.ObjectRef.from_random()
     worker = SimpleNamespace(_actor_id=SimpleNamespace(hex=lambda: "rollout-worker"))
     proxy = SimpleNamespace(
@@ -30,9 +32,12 @@ def pending_rollout(monkeypatch):
         _continous_work_state={
             "lock": threading.RLock(),
             "owners": {ref: ("rollout-worker", 0)},
-            "inflight": {"generate": [ref]},
+            "inflight": {getattr(request, "param", "generate"): [ref]},
         },
     )
+    # A handler serialized into a rollout actor has no original driver's worker registry.
+    # Its real conflict hook therefore conservatively treats pending sampling as conflicting.
+    proxy._worker_call_conflicts = WorkerPool._worker_call_conflicts.__get__(proxy)
     events = []
 
     def wait_for_generation(refs, **kwargs):
@@ -71,3 +76,13 @@ def test_abort_worker_body_preserves_sampler_result():
     result = {"aborted": 7}
     proxy = SimpleNamespace(sampler=SimpleNamespace(abort_all_inflight=lambda: result))
     assert MultiTurnRollout.abort_all_inflight.__wrapped__(proxy) is result
+
+
+@pytest.mark.parametrize("pending_rollout", ["sample"], indirect=True)
+@pytest.mark.parametrize("method", ["abort_all_inflight", "pause_generation", "resume_generation", "_generation_count"])
+def test_relayed_sampler_controls_bypass_pending_sample(pending_rollout, method):
+    proxy, events = pending_rollout
+    assert not hasattr(proxy, "_sampler_workers")
+    with pytest.raises(ReachedTransport):
+        getattr(PartialRolloutMixin, method)(proxy)
+    assert events == [method]
