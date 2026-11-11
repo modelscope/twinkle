@@ -1508,7 +1508,7 @@ def test_transport_state_validation_covers_every_append(sampler, template, tool_
         def __call__(self, *args, **kwargs):
             return default_response_callback(*args, **kwargs)
 
-        def _validate_state(self, state, feature, index):
+        def validate_state(self, state, feature, index):
             self.validations.append((index, len(feature['input_ids'])))
 
     callback = ValidatingCallback()
@@ -1539,7 +1539,7 @@ def test_transport_state_validation_covers_malformed_feedback(sampler, template,
         def __call__(self, *args, **kwargs):
             return default_response_callback(*args, **kwargs)
 
-        def _validate_state(self, state, feature, index):
+        def validate_state(self, state, feature, index):
             self.count += 1
 
     callback = ValidatingCallback()

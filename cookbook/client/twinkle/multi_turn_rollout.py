@@ -31,6 +31,7 @@ from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.envs import EnvTool, OpenEnv
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_client.resources import RolloutResources
 from twinkle_client.rollout import ClientMultiTurnRollout
 
 dotenv.load_dotenv('.env')
@@ -102,45 +103,41 @@ def create_env_tool(env: OpenEnv) -> EnvTool:
 
 
 def prepare_trajectories(
-    n_trajectories: int, ) -> Tuple[List[Dict[str, Any]], List[ToolManager], List[List[EnvTool]], List[OpenEnv]]:
+    n_trajectories: int, resources: RolloutResources,
+) -> Tuple[List[Dict[str, Any]], List[ToolManager], List[List[EnvTool]], List[OpenEnv]]:
     """Create and reset one independent OpenEnv instance per trajectory."""
     trajectories = []
     tool_managers = []
     env_tools_list = []
     environments = []
 
-    try:
-        for _ in range(n_trajectories):
-            env = OpenEnv(
-                env_name=OPENENV_NAME,
-                env_kwargs={'game_name': OPENENV_GAME},
-                action_mapper=blackjack_action_mapper,
-            )
-            environments.append(env)
-            initial_observation = env.reset().observation
+    for _ in range(n_trajectories):
+        env = resources.own_environment(OpenEnv(
+            env_name=OPENENV_NAME,
+            env_kwargs={'game_name': OPENENV_GAME},
+            action_mapper=blackjack_action_mapper,
+        ))
+        environments.append(env)
+        initial_observation = env.reset().observation
 
-            env_tools = [create_env_tool(env)]
-            tool_manager = ToolManager(env_tools)
-            trajectories.append({
-                'messages': [
-                    {
-                        'role': 'system',
-                        'content': SYSTEM_PROMPT
-                    },
-                    {
-                        'role': 'user',
-                        'content': initial_observation
-                    },
-                ],
-                'tools':
-                tool_manager.tool_infos(),
-            })
-            tool_managers.append(tool_manager)
-            env_tools_list.append(env_tools)
-    except Exception:
-        for env in environments:
-            env.close()
-        raise
+        env_tools = [create_env_tool(env)]
+        tool_manager = ToolManager(env_tools)
+        trajectories.append({
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': SYSTEM_PROMPT
+                },
+                {
+                    'role': 'user',
+                    'content': initial_observation
+                },
+            ],
+            'tools':
+            tool_manager.tool_infos(),
+        })
+        tool_managers.append(tool_manager)
+        env_tools_list.append(env_tools)
 
     return trajectories, tool_managers, env_tools_list, environments
 
@@ -152,44 +149,46 @@ def extract_rewards(env_tools_list: List[List[EnvTool]]) -> List[float]:
 
 def train():
     # Step 1: connect to the running Twinkle server.
-    client = init_twinkle_client(
+    with RolloutResources(
+        init_twinkle_client,
         base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
         api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
-    )
+    ) as resources:
+        client = resources.client
+        # The SDK scope guards remote calls and records results before propagating Ctrl+C.
 
-    # Step 2: training model (GRPO), mirroring the ray-local example's config.
-    model = client.model(MODEL_ID)
-    model.add_adapter_to_model(ADAPTER_NAME, LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
-    model.set_loss('GRPOLoss', epsilon=0.2)
-    model.set_optimizer('Adam', lr=LEARNING_RATE)
-    model.set_processor('InputProcessor')
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+        # Step 2: training model (GRPO), mirroring the ray-local example's config.
+        model = client.model(MODEL_ID)
+        model.add_adapter_to_model(ADAPTER_NAME, LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
+        model.set_loss('GRPOLoss', epsilon=0.2)
+        model.set_optimizer('Adam', lr=LEARNING_RATE)
+        model.set_processor('InputProcessor')
+        model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
-    # Step 3: client sampler (HTTP).
-    sampler = client.sampler(MODEL_ID)
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+        # Step 3: client sampler (HTTP).
+        sampler = client.sampler(MODEL_ID)
+        sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
-    # Step 4: multi-turn rollout. Each call receives trajectory-bound ToolManagers
-    # backed by independent OpenEnv instances.
-    rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
-    rollout_template.truncation_strategy = 'delete'
+        # Step 4: multi-turn rollout. Each call receives trajectory-bound ToolManagers
+        # backed by independent OpenEnv instances.
+        rollout_template = Qwen3_5Template(model_id=MODEL_ID, max_length=8192, enable_thinking=False)
+        rollout_template.truncation_strategy = 'delete'
 
-    rollout = ClientMultiTurnRollout(
-        sampler=sampler,
-        template=rollout_template,
-        sampling_params=SamplingParams(
-            max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
-        max_turns=MAX_TURNS,
-    )
+        rollout = resources.own_rollout(ClientMultiTurnRollout(
+            sampler=sampler,
+            template=rollout_template,
+            sampling_params=SamplingParams(
+                max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95),
+            max_turns=MAX_TURNS,
+        ))
 
-    advantage_fn = GRPOAdvantage()
-    policy_uri = model.save(name='policy-0', save_optimizer=False).twinkle_path
+        advantage_fn = GRPOAdvantage()
+        policy_uri = model.save(name='policy-0', save_optimizer=False).twinkle_path
 
-    for step in range(MAX_STEPS):
-        # 1. Reset independent OpenEnv episodes and run the batched rollout.
-        n_trajectories = BATCH_SIZE * NUM_GENERATIONS
-        trajectories, tool_managers, env_tools_list, environments = prepare_trajectories(n_trajectories)
-        try:
+        for step in range(MAX_STEPS):
+            # 1. Reset independent OpenEnv episodes and run the batched rollout.
+            n_trajectories = BATCH_SIZE * NUM_GENERATIONS
+            trajectories, tool_managers, env_tools_list, environments = prepare_trajectories(n_trajectories, resources)
             rolled = rollout(
                 trajectories,
                 tool_manager=tool_managers,
@@ -197,34 +196,27 @@ def train():
                 adapter_uri=policy_uri,
             )
             rewards = extract_rewards(env_tools_list)
-        finally:
             for env in environments:
-                env.ensure_idle()
-                env.close()
+                resources.close_environment(env)
 
-        # 2. Reuse the ledger's sampled-token logprobs without decoding top-k entries.
-        all_inputs: List[Dict[str, Any]] = []
-        all_old_logps: List[List[float]] = []
-        for traj in rolled:
-            all_old_logps.append(traj['rollout_logprobs'])
-            all_inputs.append(traj)
+            # 2. Inspect the batch before computing group-relative advantages.
+            avg_turns = sum(t.get('turns') or 0 for t in rolled) / len(rolled)
+            logger.info(f'[Step {step}] avg_reward={sum(rewards) / len(rewards):.3f} avg_turns={avg_turns:.1f}')
 
-        avg_turns = sum(t.get('turns') or 0 for t in rolled) / len(rolled)
-        logger.info(f'[Step {step}] avg_reward={sum(rewards) / len(rewards):.3f} avg_turns={avg_turns:.1f}')
+            # 3. GRPO advantages (group-relative within NUM_GENERATIONS).
+            advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+            if all(abs(a) < 1e-8 for a in advantages):
+                logger.info(f'[Step {step}] all advantages zero, skipping update')
+                continue
 
-        # 3. GRPO advantages (group-relative within NUM_GENERATIONS).
-        advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-        if all(abs(a) < 1e-8 for a in advantages):
-            logger.info(f'[Step {step}] all advantages zero, skipping update')
-            continue
+            # 4. Policy update over the rolled-out trajectories.
+            model.forward_backward(inputs=rolled, advantages=advantages,
+                                   old_logps=[traj['rollout_logprobs'] for traj in rolled])
+            model.clip_grad_and_step()
+            policy_uri = model.save(name=f'policy-{step + 1}', save_optimizer=False).twinkle_path
+            logger.info(f'[Step {step}] {model.calculate_metric(is_training=True).result}')
 
-        # 4. Policy update over the rolled-out trajectories.
-        model.forward_backward(inputs=all_inputs, advantages=advantages, old_logps=all_old_logps)
-        model.clip_grad_and_step()
-        policy_uri = model.save(name=f'policy-{step + 1}', save_optimizer=False).twinkle_path
-        logger.info(f'[Step {step}] {model.calculate_metric(is_training=True).result}')
-
-    logger.info('Multi-turn rollout example finished.')
+        logger.info('Multi-turn rollout example finished.')
 
 
 if __name__ == '__main__':

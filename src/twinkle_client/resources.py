@@ -1,17 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Scoped ownership of a streaming rollout's client and execution environments."""
+"""Scoped ownership of a multi-turn rollout's client and execution environments."""
 import threading
 import traceback
 
-from .operations import SequentialOperations
+from .operations import SequentialOperations, _OperationScope
 
 
 class RolloutResources:
-    """Create a client and release owned resources after streaming work settles.
+    """Create a client and release owned resources after rollout work settles.
 
     ``with RolloutResources(client_factory) as resources`` creates the client through
-    ``operations``, recording ownership even if the caller is interrupted. Register a
-    dedicated streaming rollout with ``own_rollout`` and unstarted environments with
+    ``operations``, recording ownership even if the caller is interrupted. A real
+    TwinkleClient is bound to this scope: ordinary model calls and sampler setup
+    automatically wait through interrupts and register results before raising.
+    Model methods expose completed_step_calls and last_checkpoint for local accounting.
+    Sampling keeps the rollout's concurrent execution path. An interrupted or failed
+    managed call stops subsequent managed calls; unscoped clients are unchanged.
+
+    Register a dedicated rollout with ``own_rollout`` and unstarted environments with
     ``own_environment`` before resetting them. Existing ``rollout.streaming(driver)``
     still owns the driver's lifetime. This scope also drains the rollout if setup
     fails before that context is entered.
@@ -24,6 +30,7 @@ class RolloutResources:
 
     def __init__(self, client_factory, **client_kwargs):
         self.operations = SequentialOperations()
+        self._operation_scope = _OperationScope(self.operations)
         self.client = None
         self._client_factory = client_factory
         self._client_kwargs = client_kwargs
@@ -42,6 +49,11 @@ class RolloutResources:
             self._entered = True
 
         def own_client(client):
+            from .manager import TwinkleClient
+            if isinstance(client, TwinkleClient):
+                if client.transport._operation_scope is not None:
+                    raise ValueError('client already belongs to a resource scope')
+                client.transport._operation_scope = self._operation_scope
             self.client = client
 
         try:
@@ -52,7 +64,7 @@ class RolloutResources:
         return self
 
     def own_rollout(self, rollout):
-        """Transfer one dedicated streaming rollout to this scope; return it."""
+        """Transfer one dedicated batch or streaming rollout to this scope; return it."""
         with self._lock:
             if not self._accepting:
                 raise RuntimeError('resource scope is closing')
@@ -96,6 +108,11 @@ class RolloutResources:
             if not self._rollout.is_idle:
                 issues.append(RuntimeError('rollout execution is unconfirmed; environments and client retained'))
                 return
+        if self._operation_scope.uncertain_errors:
+            issues.append(BaseExceptionGroup(
+                'remote operation settlement is unconfirmed; environments and client retained',
+                self._operation_scope.uncertain_errors))
+            return
         with self._lock:
             environments = list(self._environments.values())
         for env in environments:

@@ -6,10 +6,10 @@ mock accepts ``**kwargs`` without inspecting anything, so "the mock did not comp
 is evidence of nothing about validation.
 """
 from __future__ import annotations
-from typing import Union, get_args, get_origin
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
+from typing import Union, get_args, get_origin
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS, is_encoded
 from twinkle.processor.base import InputProcessor

@@ -8,16 +8,11 @@ load balancing, pause/resume and node failover are all handled server-side by
 AgentENV's gateway/scheduler/orchestrator. The adapter is a stateless HTTP
 client and can be instantiated directly inside rollout workers.
 
-The same adapter can connect to E2B's official cloud: set E2B_API_KEY,
-leave endpoint overrides unset and use template='base'. That template runs
-as an unprivileged user; choose a writable workspace such as
-'/home/user/blackjack' instead of the AgentENV-oriented '/workspace' default.
-
 Prerequisites (done once, outside training):
     1. Deploy the AgentENV server (single node) or gateway+scheduler cluster.
     2. Build a template, e.g. ``aenv pull ubuntu:22.04 --name my-env``.
-    3. Install the E2B option from the Twinkle checkout:
-       ``pip install -e '.[e2b]'``.
+    3. ``pip install 'e2b>=2.7'`` on the training side (the version that takes
+       the endpoint as an argument rather than only from the environment).
 
 Usage::
 
@@ -86,9 +81,8 @@ def _require_e2b():
     try:
         from e2b import Sandbox
     except ImportError as e:
-        raise ImportError('AgentEnv requires the E2B SDK:\n'
-                          "  From the Twinkle checkout: pip install -e '.[e2b]'\n"
-                          "  SDK only: pip install 'e2b==2.31.0'\n"
+        raise ImportError('AgentEnv requires the E2B SDK to talk to an AgentENV server:\n'
+                          "  pip install 'e2b>=2.7'\n"
                           'Then point it at your deployment via the api_url/api_key/sandbox_url '
                           'arguments, or the E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY '
                           'environment variables.') from e

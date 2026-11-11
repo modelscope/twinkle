@@ -8,6 +8,7 @@ from twinkle.data_format.message import Tool as ToolInfo
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager, _extract_name
 
+
 # ---------------------------------------------------------------------------
 # Mock tools
 # ---------------------------------------------------------------------------

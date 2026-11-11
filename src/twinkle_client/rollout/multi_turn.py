@@ -2,8 +2,8 @@
 """Client-side trainable multi-turn rollout over HTTP."""
 from __future__ import annotations
 import asyncio
-import copy
 import contextlib
+import copy
 import threading
 import traceback
 import uuid
@@ -15,11 +15,11 @@ from typing import Any, Dict, List, Optional
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template.base import Template
-from twinkle_agentic.rollout.base import _RolloutExecution, SampleHandle
+from twinkle_agentic.rollout.base import SampleHandle, _RolloutExecution
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout, RolloutSample, trajectory_to_rollout_sample
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.sampler import vLLMSampler
 from twinkle_client.operations import SequentialOperations
+from twinkle_client.sampler import vLLMSampler
 from ._http_sampler import _HTTPSamplerAdapter
 
 _CALL_OPTIONS = {
@@ -236,7 +236,7 @@ class ClientMultiTurnRollout:
             error.add_note(f'episode business error was: {call.business_error}')
         return error
 
-    def _start(self, trajectories: List[Trajectory], kwargs: Dict[str, Any]) -> _Call:
+    def _start(self, trajectories: List[Trajectory], kwargs: Dict[str, Any], *, admitted=False) -> _Call:
         unknown = set(kwargs) - _CALL_OPTIONS
         if unknown:
             raise ValueError(f'unknown ClientMultiTurnRollout call options: {sorted(unknown)}')
@@ -264,6 +264,9 @@ class ClientMultiTurnRollout:
         executor = ThreadPoolExecutor(max_workers=1)
         call = _Call(execution, env_ids, harness_ids, executor, adapter, envs, bare_harnesses)
         with self._lock:
+            if not self._accepting and not admitted:
+                executor.shutdown(wait=False)
+                raise RuntimeError('rollout admission is closed')
             if any(identity in self._env_borrows for identity in env_ids):
                 executor.shutdown(wait=False)
                 raise ValueError('an Env is still borrowed by another active call on this rollout')
@@ -273,18 +276,32 @@ class ClientMultiTurnRollout:
             self._active[id(execution)] = call
             self._env_borrows.update(dict(zip(env_ids, envs, strict=False)))
             self._harness_borrows.update(dict(zip(harness_ids, bare_harnesses, strict=False)))
-            try:
-                call.future = executor.submit(self._run_call, call, trajectories, core_kwargs)
-            except BaseException:
-                self._active.pop(id(execution), None)
-                for identity in env_ids:
-                    self._env_borrows.pop(identity, None)
-                for identity in harness_ids:
-                    self._harness_borrows.pop(identity, None)
-                executor.shutdown(wait=False)
-                raise
-        call.future.add_done_callback(lambda _future: self._finish(call))
-        return call
+            self._admitting += 1
+        try:
+            call.future = executor.submit(self._run_call, call, trajectories, core_kwargs)
+            call.future.add_done_callback(lambda _future: self._finish(call))
+            return call
+        except BaseException as error:
+            # submit can enqueue work before an interrupt prevents returning its
+            # Future. Keep the call/borrows registered until the executor drains.
+            call.execution.cancel()
+            while True:
+                try:
+                    executor.shutdown(wait=True)
+                    break
+                except (KeyboardInterrupt, SystemExit) as interrupt:
+                    error.add_note(f'interrupted again while draining submission: {interrupt}')
+            if call.future is None:
+                call.future = Future()
+                call.future.set_exception(error)
+            self._finish(call)
+            if not call.settled:
+                error.add_note(str(self._uncertainty_error(call)))
+            raise
+        finally:
+            with self._condition:
+                self._admitting -= 1
+                self._condition.notify_all()
 
     def _finish(self, call: _Call) -> None:
         call.executor.shutdown(wait=False)
@@ -429,7 +446,7 @@ class ClientMultiTurnRollout:
             self._admitting += 1
         call = None
         try:
-            call = self._start([trajectory], kwargs)
+            call = self._start([trajectory], kwargs, admitted=True)
             entry = _StreamingEntry(handle, call, admission)
             with self._condition:
                 if submission_id in self._streaming:
@@ -459,24 +476,33 @@ class ClientMultiTurnRollout:
                 call.future is not None and call.future.done() and call.settled for call in self._active.values())
 
     def drain(self) -> None:
-        """Close streaming admission, signal every episode, then settle all of them.
+        """Close batch and streaming admission, signal every call, then settle it.
 
-        This instance cannot admit more streaming work afterward. User environments
+        This dedicated instance cannot start more work afterward. User environments
         remain borrowed resources: this method never closes or resets them.
         """
         issues = []
         with self._condition:
             self._accepting = False
-            for entry in self._streaming.values():
-                entry.call.execution.cancel()
+            for call in self._active.values():
+                call.execution.cancel()
             while self._admitting:
                 try:
                     self._condition.wait()
                 except (KeyboardInterrupt, SystemExit) as error:
                     issues.append(error)
             entries = list(self._streaming.values())
-            for entry in entries:
-                entry.call.execution.cancel()
+            streaming_calls = {id(entry.call) for entry in entries}
+            batches = [call for call in self._active.values() if id(call) not in streaming_calls]
+            for call in (*batches, *(entry.call for entry in entries)):
+                call.execution.cancel()
+        for call in batches:
+            control_error = self._wait_future(call.future)
+            cleanup_error = self._uncertainty_error(call)
+            if control_error is not None:
+                issues.append(control_error)
+            if cleanup_error is not None:
+                issues.append(cleanup_error)
         for entry in entries:
             try:
                 if self.stop(entry.admission.submission_id) is not True:
@@ -485,7 +511,7 @@ class ClientMultiTurnRollout:
                 error.add_note(f'streaming submission={entry.admission.submission_id}')
                 issues.append(error)
         if issues:
-            raise BaseExceptionGroup('streaming episodes did not drain cleanly', issues)
+            raise BaseExceptionGroup('rollout calls did not drain cleanly', issues)
 
     @contextlib.contextmanager
     def streaming(self, driver):

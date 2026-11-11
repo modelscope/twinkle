@@ -28,7 +28,7 @@ from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.weight_keys import add_base_layer_suffix, is_lora_key, normalize_param_name, print_weight_example
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
+from twinkle.infra import collect_tensor_dict, remote_function
 from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric

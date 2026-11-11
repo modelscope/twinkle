@@ -5,7 +5,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -83,7 +83,7 @@ class _RolloutExecution:
         self.cancel_event.set()
 
     def checkpoint(self) -> None:
-        """Linearize an operation start with cancellation under one lock."""
+        """Reject the next operation after a cooperative stop was requested."""
         with self._lock:
             if self.cancel_event.is_set():
                 raise CancelledError()
@@ -164,7 +164,7 @@ class Rollout(ABC):
 
     # ------------------------------------------------------------------- drive
 
-    def __call__(self, trajectories: list[Trajectory], **kwargs) -> list[Trajectory]:
+    def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
         """Run one episode per trajectory and return them in the input order.
 
         Order is restored from the future map rather than from completion order,
@@ -172,17 +172,16 @@ class Rollout(ABC):
         GRPO group is a slice of this list.
         """
         if isinstance(trajectories, dict):
-            raise TypeError(
-                f"{type(self).__name__}.__call__ expects a List[Trajectory]; wrap a single trajectory as [trajectory]."
-            )
+            raise TypeError(f'{type(self).__name__}.__call__ expects a List[Trajectory]; '
+                            'wrap a single trajectory as [trajectory].')
         trajectories = list(trajectories)
         n = len(trajectories)
         if n == 0:
             return []
 
-        execution = kwargs.pop("_execution", None) or _RolloutExecution()
+        execution = kwargs.pop('_execution', None) or _RolloutExecution()
         ctx = self._resolve_call(kwargs, n)
-        ctx["_execution"] = execution
+        ctx['_execution'] = execution
         outs: list[Trajectory | None] = [None] * n
         workers = min(n, self.concurrency or n)
 
@@ -202,18 +201,15 @@ class Rollout(ABC):
             pool = ThreadPoolExecutor(max_workers=workers)
             futures: dict[Future, int] = {}
             try:
-                try:
-                    for index in range(n):
-                        if execution.cancelled:
-                            break
-                        futures[pool.submit(run_one, index)] = index
-                    for future in as_completed(futures):
-                        try:
-                            outs[futures[future]] = future.result()
-                        except Exception as error:
-                            execution.fail(error)
-                finally:
-                    wait(futures)
+                for index in range(n):
+                    if execution.cancelled:
+                        break
+                    futures[pool.submit(run_one, index)] = index
+                for future in as_completed(futures):
+                    try:
+                        outs[futures[future]] = future.result()
+                    except Exception as error:
+                        execution.fail(error)
             finally:
                 pool.shutdown(wait=True)
 
@@ -223,7 +219,7 @@ class Rollout(ABC):
         execution.checkpoint()
         result: list[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
         if self.tracer is not None:
-            self.tracer.write(result, global_step=kwargs.get("global_step"))
+            self.tracer.write(result, global_step=kwargs.get('global_step'))
         return result
 
     @abstractmethod

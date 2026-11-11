@@ -269,9 +269,13 @@ python -c "from twinkle.template import Qwen3_5Template"
 
 先读 `train()` 的连接和初始化，再读 `_train_loop()` 的完整组 → 优势计算 → `forward_backward` → `clip_grad_and_step` → 请求发布 → `commit`。`commit(0)` 表示本次没有更新，不消耗训练步数；发布请求在 driver 恢复推进后执行。更换任务时再看 `_build_driver()` 的环境和奖励适配。资源由 SDK 的 `RolloutResources` 作用域管理，示例不需要编写异常收尾逻辑。
 
+`twinkle_client.rollout.training_groups(samples, num_generations=..., drop_truncated=True)` 提供已评分 streaming 批次的通用分组和校验：保留组内样本顺序，跳过不完整或策略混合的组，检查成员、response token/mask/logprob 对齐和有限奖励。返回任何组前会检查整个批次的 rollout 失败，避免失败被跳过规则或更新预算掩盖。`drop_truncated` 默认 `False`；Blackjack 显式设为 `True`，只训练终局牌局。SDK 不负责计算优势、判断零优势或执行更新。批量多轮示例使用 Trajectory 字典和同步批次，继续保留其训练入口，并复用 `RolloutResources` 管理资源。
+
 每次调用 `train()` 都自动生成独立的检查点名称前缀，避免重复运行覆盖 `policy-0` 等快照，无需用户配置。此前缀只用于文件命名，不提供租户隔离，也不控制随机种子或断点恢复。
 
-`rollout.streaming(driver)` 负责关闭 streaming admission、广播停止、尝试归集全部调用，再联归 driver；退出后该实例不再接受 streaming admission。底层 rollout 默认借用环境，不自动关闭调用方资源；本例通过 `with RolloutResources(init_twinkle_client) as resources` 显式把客户端、rollout 和环境交给 SDK 管理。`own_rollout()` 登记专用 rollout，`own_environment()` 在 `reset()` 前登记环境，初始化失败也可收尾；收集完成后用 `close_environment()` 提前释放该轨迹的环境。退出作用域时 SDK 等待调用、排干 rollout、关闭剩余环境和客户端，处理重复中断并保留原异常。执行状态未确认时保留资源句柄并报告错误，不能按“已经关闭”处理。
+`rollout.streaming(driver)` 负责关闭批量和 streaming 任务入口、广播停止、尝试排干全部调用，再等待 driver 退出。应使用专用 rollout 实例；退出后该实例不再接受新任务。底层 rollout 默认借用环境，不自动关闭调用方资源；本例在 `RolloutResources(init_twinkle_client, base_url=..., api_key=...)` 中显式传入连接参数；值读取自 `.env` 的 `TWINKLE_SERVER_URL` 和 `TWINKLE_SERVER_TOKEN`。作用域把客户端、rollout 和环境交给 SDK 管理。`own_rollout()` 登记专用 rollout，`own_environment()` 在 `reset()` 前登记环境，初始化失败也可收尾；收集完成后用 `close_environment()` 提前释放该轨迹的环境。退出作用域时 SDK 等待调用、排干 rollout、关闭剩余环境和客户端，处理重复中断并保留原异常。执行状态未确认时保留资源句柄并报告错误，不能按“已经关闭”处理。
+
+`RolloutResources` 会自动为该客户端的模型操作、sampler 创建和配置绑定中断保护，示例直接调用 `model.forward_backward(...)`、`model.clip_grad_and_step()`、`model.save(...)`。主线程在等待期间中断时，SDK 等待已发出的调用返回，完成训练句柄及成功结果登记，再传播中断；受管操作失败或中断后不再接受后续受管操作。它不会自动重发训练操作。`model.completed_step_calls` 记录该 model 对象收到成功回复的 step/clip_grad_and_step 调用次数（不是设备参数变化的证明），`model.last_checkpoint` 保留最近成功的 save 回复，便于中断后查看。采样仍由 rollout 并发执行，不经过训练操作的串行等待器。不在该作用域内的客户端维持原有调用行为。超时、断线或任务失败状态不能证明远端物理执行结束；无法确认时保留相关资源并报告，不自动复用，也不提供远端强制取消。
 
 脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
 

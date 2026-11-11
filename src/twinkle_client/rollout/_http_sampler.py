@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Adapt the existing HTTP sampler to the core multi-turn callback contract."""
 from __future__ import annotations
-
 from typing import Any
 
 from twinkle.data_format.sampling import SampledSequence
@@ -32,7 +31,7 @@ class _HTTPSamplerAdapter:
         **kwargs,
     ) -> SampledSequence:
         del sampler, api, kwargs
-        self._validate_state(rollout_state, input_feature, trajectory_index)
+        self.validate_state(rollout_state, input_feature, trajectory_index)
         adapter_uri = adapter_kwargs.get('adapter_path', self._adapter_uri)
         try:
             responses = self._sampler.sample(
@@ -66,7 +65,7 @@ class _HTTPSamplerAdapter:
         )
 
     @staticmethod
-    def _validate_state(state, feature: dict[str, Any], trajectory_index: int) -> None:
+    def validate_state(state, feature: dict[str, Any], trajectory_index: int) -> None:
         feature_ids = list(feature.get('input_ids') or [])
         if state is None or state.media:
             raise NotImplementedError(

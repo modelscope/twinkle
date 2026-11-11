@@ -12,7 +12,6 @@ import pytest
 
 from twinkle_agentic.rollout.base import SampleHandle
 from twinkle_agentic.rollout.multi_turn import RolloutSample
-from twinkle_client.operations import SequentialOperations
 
 
 @pytest.fixture
@@ -37,12 +36,14 @@ def group(key, rewards):
 class Model:
     def __init__(self):
         self.calls = []
+        self.completed_step_calls = 0
 
     def forward_backward(self, **kwargs):
         self.calls.append(('backward', len(kwargs['inputs'])))
 
     def clip_grad_and_step(self, **kwargs):
         self.calls.append(('step', 1))
+        self.completed_step_calls += 1
 
     def calculate_metric(self, **kwargs):
         return {'loss': 0.5}
@@ -76,11 +77,8 @@ def test_variable_pull_zero_advantage_budget_and_publish(recipe):
         group('a', [1, -1, 1, -1]) + group('b', [1, 1, 1, 1]),
         group('c', [1, 0, 1, 0]) + group('d', [1, -1, 1, -1]),
     ])
-    model, operations = Model(), SequentialOperations()
-    try:
-        recipe._train_loop(driver, model, operations, 'test-run')
-    finally:
-        operations.close()
+    model = Model()
+    recipe._train_loop(driver, model, 'test-run')
     assert driver.commits == [1, 1]
     assert driver.stats.optimizer_steps == 2
     assert driver.published == ['twinkle://test-run-policy-1']
@@ -91,12 +89,9 @@ def test_mixed_or_truncated_groups_are_not_trained(recipe):
     mixed, truncated = group('a', [1, 0, 1, 0]), group('b', [1, 0, 1, 0])
     mixed[-1].policy_version = 1
     truncated[0].truncated = True
-    model, operations = Model(), SequentialOperations()
+    model = Model()
     driver = Driver([mixed + truncated])
-    try:
-        recipe._train_loop(driver, model, operations, 'test-run')
-    finally:
-        operations.close()
+    recipe._train_loop(driver, model, 'test-run')
     assert driver.commits == [0]
     assert model.calls == []
 
@@ -105,21 +100,30 @@ def test_hard_failure_is_not_hidden_by_incomplete_or_truncated_group(recipe):
     samples = group('bad', [1, 0, 1, 0])
     samples[0].truncated = True
     samples[1].rollout_infos['error'] = 'sampling failed'
+    model = Model()
     with pytest.raises(RuntimeError, match='sampling failed'):
-        recipe._validate_group(samples[:2])
+        recipe._train_loop(Driver([samples[:2]]), model, 'test-run')
+    assert model.calls == []
 
 
 def test_save_failure_never_commits_a_publish(recipe):
-    model, operations = Model(), SequentialOperations()
+    model = Model()
     model.save = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('save failed'))
     driver = Driver([group('a', [1, -1, 1, -1])])
-    try:
-        with pytest.raises(RuntimeError, match='save failed'):
-            recipe._train_loop(driver, model, operations, 'test-run')
-    finally:
-        operations.close()
+    with pytest.raises(RuntimeError, match='save failed'):
+        recipe._train_loop(driver, model, 'test-run')
     assert driver.stats.publishes == 0
     assert driver.commits == []
+
+
+def test_later_failure_is_not_hidden_by_the_update_budget(recipe, monkeypatch):
+    monkeypatch.setattr(recipe, 'MAX_STEPS', 1)
+    good, bad = group('a', [1, -1, 1, -1]), group('b', [1, -1, 1, -1])
+    bad[0].rollout_infos['error'] = 'provider failed'
+    model = Model()
+    with pytest.raises(RuntimeError, match='provider failed'):
+        recipe._train_loop(Driver([good + bad]), model, 'test-run')
+    assert model.calls == []
 
 
 def test_blackjack_same_seed_same_initial_state_and_independent_progress(recipe):
@@ -196,7 +200,7 @@ def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, mon
     calls[2][1]['tool_manager']({'function': {'name': 'play', 'arguments': {'action': 'fail'}}})
     failed = driver._collect(h2)
     with pytest.raises(RuntimeError, match='game process failed'):
-        recipe._validate_group([failed])
+        recipe.training_groups([failed], num_generations=recipe.NUM_GENERATIONS, drop_truncated=True)
     assert len(closed) == 3 and not resources._environments
     assert driver._version_control is True
     assert driver._initial_adapter_path() == 'policy-0'
@@ -340,12 +344,10 @@ def test_new_uri_is_used_by_later_groups(recipe):
         groups_per_partition=1, buffer_depth=4, group_pull=True, need_rows=4, version_control=True,
         rollout=rollout, submit=rollout.submit, poll=rollout.poll, collect=rollout.collect,
         initial_adapter_path=lambda: 'policy-0', prune=lambda: None, consume=None, max_steps=2)
-    operations = SequentialOperations()
     try:
-        recipe._train_loop(driver, Model(), operations, 'test-run')
+        recipe._train_loop(driver, Model(), 'test-run')
     finally:
         driver.abort()
-        operations.close()
     assert driver.stats.optimizer_steps == 2
     assert [path for ordinal, path in admitted if ordinal == 1] == ['twinkle://test-run-policy-1'] * 4
 
@@ -375,7 +377,14 @@ def test_complete_train_keeps_configuration_and_closes_client(recipe, monkeypatc
             assert value is driver
             yield value
 
-    monkeypatch.setattr(recipe, 'init_twinkle_client', lambda: client)
+    monkeypatch.setenv('TWINKLE_SERVER_URL', 'http://recipe-server:8000')
+    monkeypatch.setenv('TWINKLE_SERVER_TOKEN', 'recipe-test-token')
+
+    def connect(**kwargs):
+        assert kwargs == {'base_url': 'http://recipe-server:8000', 'api_key': 'recipe-test-token'}
+        return client
+
+    monkeypatch.setattr(recipe, 'init_twinkle_client', connect)
     monkeypatch.setattr(recipe, 'Qwen3_5Template', lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(recipe, 'ClientMultiTurnRollout', lambda *a, **k: Rollout())
     monkeypatch.setattr(recipe, '_build_driver', lambda *a: driver)

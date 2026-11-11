@@ -369,7 +369,9 @@ class MultiTurnRollout(Rollout):
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: :class:`SamplingParams` for every episode.
         * ``response_callback``: chooses a backend for each assistant turn and
-          returns one :class:`SampledSequence`.
+          returns one :class:`SampledSequence`. An optional
+          ``validate_state(state, input_feature, trajectory_index)`` hook checks
+          transport constraints after opening or appending to the ledger.
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
@@ -794,13 +796,8 @@ class MultiTurnRollout(Rollout):
         runs the episode on a daemon-thread Future.
         """
         handle = self._new_handle(
-            prompt,
-            trajectory_idx,
-            prompt_idx=prompt_idx,
-            prompt_extras=prompt_extras,
-            adapter_path=adapter_path,
-            policy_version=policy_version,
-        )
+            prompt, trajectory_idx, prompt_idx=prompt_idx, prompt_extras=prompt_extras,
+            adapter_path=adapter_path, policy_version=policy_version)
         generate_kwargs = dict(
             num_samples=1,
             sampling_params=sampling_params,
@@ -990,7 +987,7 @@ class MultiTurnRollout(Rollout):
 
     @staticmethod
     def _validate_ledger(ledger, ctx: dict[str, Any], index: int) -> None:
-        validate = getattr(ctx["response_callback"], "_validate_state", None)
+        validate = getattr(ctx["response_callback"], "validate_state", None)
         if callable(validate):
             validate(ledger.state, ledger.input_feature, index)
 

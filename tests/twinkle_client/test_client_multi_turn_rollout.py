@@ -1303,3 +1303,82 @@ def test_drain_uses_immutable_submission_identity_after_handle_tampering(monkeyp
     rollout.drain()
     assert len(cancelled) == first, 'already settled calls must not be drained again'
     assert rollout.is_idle
+
+
+def test_drain_waits_for_batch_calls_and_closes_all_admission(monkeypatch):
+    started, release, cancelling = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return super().sample(*args, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((20, 'stop'),)), _Template())
+    with ThreadPoolExecutor(2) as pool:
+        batch = pool.submit(rollout, [_trajectory()])
+        try:
+            assert started.wait(timeout=5)
+            call = next(iter(rollout._active.values()))
+            cancel = call.execution.cancel
+
+            def signal_cancel():
+                cancel()
+                cancelling.set()
+
+            monkeypatch.setattr(call.execution, 'cancel', signal_cancel)
+            draining = pool.submit(rollout.drain)
+            assert cancelling.wait(timeout=2), 'drain did not signal the active batch'
+            assert not draining.done() and not rollout.is_idle
+        finally:
+            release.set()
+        with pytest.raises(CancelledError):
+            batch.result(timeout=5)
+        draining.result(timeout=5)
+    assert rollout.is_idle
+    with pytest.raises(RuntimeError, match='admission is closed'):
+        rollout([_trajectory()])
+
+
+@pytest.mark.parametrize('uncertain', [False, True])
+def test_interrupted_submission_keeps_call_owned_until_the_worker_settles(monkeypatch, uncertain):
+    import twinkle_client.rollout.multi_turn as client_rollout
+
+    started, release, shutting_down = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSampler(_Sampler):
+        def sample(self, *args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            if uncertain:
+                raise ConnectionError('remote execution unconfirmed')
+            return super().sample(*args, **kwargs)
+
+    class InterruptedExecutor(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            super().submit(*args, **kwargs)
+            assert started.wait(timeout=5)
+            raise KeyboardInterrupt('interrupted after enqueue')
+
+        def shutdown(self, wait=True, **kwargs):
+            shutting_down.set()
+            return super().shutdown(wait=wait, **kwargs)
+
+    rollout = ClientMultiTurnRollout(BlockingSampler(((20, 'stop'),)), _Template())
+    monkeypatch.setattr(client_rollout, 'ThreadPoolExecutor', InterruptedExecutor)
+    with ThreadPoolExecutor(1) as pool:
+        batch = pool.submit(rollout, [_trajectory()])
+        try:
+            assert shutting_down.wait(timeout=5)
+            assert not rollout.is_idle, 'queued work lost its owner before physical settlement'
+            assert not batch.done()
+        finally:
+            release.set()
+        with pytest.raises(KeyboardInterrupt, match='after enqueue'):
+            batch.result(timeout=5)
+    if uncertain:
+        assert not rollout.is_idle
+        with pytest.raises(BaseExceptionGroup, match='did not drain'):
+            rollout.drain()
+    else:
+        assert rollout.is_idle

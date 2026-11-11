@@ -230,21 +230,18 @@ class ToolManager:
                 out[futs[fut]] = fut.result()
         return ['' if x is None else x for x in out]
 
-    def _iter_bound_envs(self):
-        seen = set()
-        for tool in self._tools.values():
-            env = getattr(tool, "_env", None)
-            if env is not None and id(env) not in seen:
-                seen.add(id(env))
-                yield env
-
     def bound_envs(self):
         """Return the distinct environments borrowed by the registered tools."""
-        return tuple(self._iter_bound_envs())
+        environments = {}
+        for tool in self._tools.values():
+            env = getattr(tool, '_env', None)
+            if env is not None:
+                environments[id(env)] = env
+        return tuple(environments.values())
 
     def ensure_idle(self):
         """Confirm every distinct borrowed environment has no known active execution."""
-        for env in self._iter_bound_envs():
+        for env in self.bound_envs():
             env.ensure_idle()
 
     def _shared_env(self):

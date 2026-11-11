@@ -12,6 +12,7 @@ from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAdd
 from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
+from twinkle_client.operations import _guarded_operation
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -60,6 +61,7 @@ class vLLMSampler:
         from twinkle_client._future import resolve_response
         return resolve_response(response, model_cls, transport=self._transport)
 
+    @_guarded_operation
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> SamplerAddAdapterResponse:
         """Add a new adapter to the sampler."""
         if isinstance(config, PeftConfig):
@@ -177,17 +179,20 @@ class vLLMSampler:
             num_samples=num_samples,
         )
 
+    @_guarded_operation
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""
         self._transport.post_model(f'{self.server_url}/unload_adapter_paths',
                                    build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
+    @_guarded_operation
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
         """Set the template for encoding trajectories."""
         body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
         response = self._transport.post_model(f'{self.server_url}/set_template', body)
         return SamplerSetTemplateResponse(**response.json())
 
+    @_guarded_operation
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
         from twinkle.protocol.types.model import ApplyPatchRequest

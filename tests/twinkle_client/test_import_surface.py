@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-import subprocess
-import sys
 
 import json
+import subprocess
+import sys
 
 
 def _run_import_probe(source: str) -> dict[str, object]:
