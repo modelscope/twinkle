@@ -694,7 +694,11 @@ class SequenceParallel:
         if self.attn_implementation in FLASH_ATTENTION_IMPLS:
             from transformers.modeling_flash_attention_utils import is_flash_attn_available
             from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
-            device = next(model.parameters()).device.type
+            from twinkle import Platform
+            # The model may still sit on CPU (or meta, under rank0-broadcast loading) here: strategy
+            # placement (Accelerator.prepare / FSDP) runs AFTER this init. Judge the kernel by the
+            # TARGET accelerator, not the pre-placement one.
+            device = Platform.get_platform().device_prefix()
             available = device in ('cuda', 'npu') and (
                 is_flash_attn_2_available() if device == 'cuda' else is_flash_attn_available())
             if self.attn_implementation == 'flash_attention_3':
@@ -703,8 +707,11 @@ class SequenceParallel:
                 raise NotImplementedError(f'SP {self.attn_implementation} kernel unavailable on {device}')
         if self.rp_world_size > 1 and self.attn_implementation == 'sdpa':
             raise NotImplementedError('SDPA does not support derived ring attention')
-        if self.rp_world_size > 1 and next(model.parameters()).device.type != 'cuda':
-            raise NotImplementedError('Derived ring attention requires CUDA FlashAttention kernels')
+        if self.rp_world_size > 1:
+            from twinkle import Platform
+            # Target accelerator, not the pre-placement device the model still sits on here.
+            if Platform.get_platform().device_prefix() != 'cuda':
+                raise NotImplementedError('Derived ring attention requires CUDA FlashAttention kernels')
         self._init_device_mesh(device_mesh)
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches

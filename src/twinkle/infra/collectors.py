@@ -11,7 +11,14 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
         return {}
 
     if len(outputs) == 1:
-        return outputs[0]
+        # A single output still carries the per-micro-batch list-of-tensors shape the multi-output
+        # path below flattens (pad_and_stack) for keys like ``logps``: one worker forwarding a batch
+        # splits it into micro-batches, so a lone worker's frame must merge the same way, or the
+        # first consumer of that key sees a list where every other deployment shape sees a tensor.
+        single = outputs[0]
+        return {key: (pad_and_stack_tensors(value) if isinstance(value, list) and value
+                      and isinstance(value[0], torch.Tensor) else value)
+                for key, value in single.items()}
 
     all_keys = set()
     for d in outputs:

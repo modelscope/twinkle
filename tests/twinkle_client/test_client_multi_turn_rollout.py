@@ -314,6 +314,34 @@ def test_http_multi_turn_max_turns_one_truncates_before_tool_dispatch():
     assert RecordingTools.calls == 0
 
 
+@pytest.mark.parametrize('mode', ['sync', 'async', 'streaming'])
+@pytest.mark.parametrize('first_turn', [True, False])
+def test_http_multi_turn_honors_upstream_length_budget(mode, first_turn):
+    template = _Template()
+    template.max_length = 2 if first_turn else 4
+    params = {'max_tokens': 8 if first_turn else 2}
+    sampler = _Sampler(((20, 'length'), ) if first_turn else ((10, 'stop'), (20, 'stop')))
+    rollout = ClientMultiTurnRollout(
+        sampler, template, tool_manager=_ToolManager(), sampling_params=params, max_turns=3)
+    try:
+        if mode == 'streaming':
+            handle = rollout.admit(_trajectory()['messages'])
+            _wait_for_handle(rollout, handle)
+            sample = rollout.collect(handle)
+            encoded, truncated, logprobs = sample.encoded, sample.truncated, sample.rollout_logprobs
+        else:
+            rows = asyncio.run(rollout.acall([_trajectory()])) if mode == 'async' else rollout([_trajectory()])
+            encoded, truncated, logprobs = rows[0], rows[0]['truncated'], rows[0]['rollout_logprobs']
+        assert len(sampler.calls) == 1
+        assert sampler.params[0].max_tokens == (1 if first_turn else 2)
+        assert encoded['input_ids'] == ([1, 20] if first_turn else [1, 10, 90])
+        assert logprobs == [-0.1]
+        assert truncated
+        assert params == {'max_tokens': 8 if first_turn else 2}
+    finally:
+        rollout.drain()
+
+
 def test_http_multi_turn_propagates_network_error_unchanged():
     class NetworkError(Exception):
         pass

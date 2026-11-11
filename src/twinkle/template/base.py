@@ -56,11 +56,13 @@ class _RegistryParser:
     def _parser(text):
         return ToolCallRegistry.detect_first(text or "")
 
-    def parse(self, text):
+    # ``tools`` is part of swift's ToolCallParser contract; registry parsers detect the
+    # format from the text alone, so it is accepted and not forwarded.
+    def parse(self, text, tools=None):
         parser = self._parser(text)
         return parser.parse(text) if parser else []
 
-    def parse_errors(self, text):
+    def parse_errors(self, text, tools=None):
         parser = self._parser(text)
         return parser.parse_errors(text) if parser else []
 

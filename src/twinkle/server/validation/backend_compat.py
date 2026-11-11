@@ -109,6 +109,24 @@ def assert_backend_fields(service: Any, body: Any) -> None:
             error_code=422)
 
 
+def assert_sampler_weights_supported(service: Any) -> None:
+    """Raise 422 when this deployment cannot hand weights to a shared sampler.
+
+    A Hybrid tenant's sampler weights are a full merged model: the sampler must replace
+    its single shared base model to use them, reloading every weight on each step and
+    each tenant switch, while plain LoRA tenants on the same sampler would then generate
+    from that tenant's base instead of the original one. Until Hybrid exports only its
+    changed layers, sampling-based training (GRPO/RL) with Hybrid is refused here.
+    """
+    if getattr(service, 'train_mode', None) == 'hybrid':
+        raise RequestRejectedError(
+            'Hybrid training does not support saving weights for the sampler on the multi-tenant server, '
+            'so sampling-based training (GRPO/RL) with a Hybrid adapter is not supported. Use a LoRA '
+            'deployment (no `hybrid` section) for GRPO, or save with is_sampler=False to export the merged '
+            'model.',
+            error_code=422)
+
+
 def assert_request_supported(service: Any, body: Any, *, capability: str | None = None) -> None:
     """The single preflight entry point, called from ``run_submit`` before the enqueue.
 

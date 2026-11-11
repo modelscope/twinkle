@@ -1724,6 +1724,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         model_sd_kwargs = model_sd_kwargs or {}
         optim_sd_kwargs = optim_sd_kwargs or {}
 
+        # DDP/FSDP/Float16Module wrappers prepend 'module.' to every sharded key. The checkpoint
+        # contract (legacy save_mcore_checkpoint/load_mcore_checkpoint, mcore->HF conversion) uses
+        # bare mcore names, and both this save path and the resume load template go through here,
+        # so unwrap at the single seam.
+        from megatron.core.utils import unwrap_model
+        model = unwrap_model(model)
+
         state_dict: dict = {
             'checkpoint_version': 3.0,
         }

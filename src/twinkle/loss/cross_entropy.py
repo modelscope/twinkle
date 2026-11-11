@@ -22,6 +22,12 @@ class CrossEntropyLoss(Loss):
         self.dft = dft
         self.probability_weight = probability_weight
         self.label_smoothing = label_smoothing
+        # Smoothing blends in the uniform-target term, which needs the full-vocab distribution:
+        # keep the logits and skip the pre-gathered logps path (pre-gathering's memory saving
+        # holds only for losses that consume gathered logps alone).
+        if label_smoothing:
+            self.require_logits = True
+            self.require_logps = False
 
     def micro_batch_scale(self, inputs, indices):
         if self.reduction == 'sum':

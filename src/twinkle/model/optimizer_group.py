@@ -43,6 +43,9 @@ class BaseOptimizerGroup:
     loss_registry: Dict[str, Loss] = field(default_factory=dict)
     train_status: TrainStatus = None
     eval_status: TrainStatus = None
+    # Which status this group's latest forward recorded into. The module's train/eval flag is shared by
+    # every tenant of a multi-LoRA model, so another tenant's call in between would flip it.
+    last_forward_training: Optional[bool] = None
     template: Template = None
     processor: InputProcessor = None
     gradient_accumulation_steps: int = 1

@@ -426,6 +426,23 @@ def test_vllm_engine_ipc_backend_still_enables_sleep_mode(engine_env):
     assert engine.enable_sleep_mode is True
 
 
+def test_vllm_engine_refuses_engine_kwargs_unknown_to_the_installed_vllm(engine_env):
+    # A typo'd escape-hatch key (real vLLM spells it enable_prefix_cache) used to warn and
+    # vanish inside _filter_engine_config; it must fail loudly instead.
+    engine = _bare_vllm_engine(enable_prefix_cachin=True)
+    with pytest.raises(RuntimeError, match='enable_prefix_cachin'):
+        engine._create_engine()
+
+
+def test_vllm_engine_accepts_engine_kwargs_keys_the_installed_vllm_knows(engine_env):
+    engine = _bare_vllm_engine(model='other-model-id')
+    assert engine._create_engine() == 'engine'
+
+
+def test_vllm_engine_builds_with_empty_engine_kwargs(engine_env):
+    assert _bare_vllm_engine()._create_engine() == 'engine'
+
+
 def test_vllm_engine_hccl_backend_requires_weight_transfer_config_support(engine_env, monkeypatch):
     import sys
 

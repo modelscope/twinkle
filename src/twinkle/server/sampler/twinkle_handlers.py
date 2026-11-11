@@ -302,7 +302,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         token = await self._on_request_start(request)
         if not self.data_plane.enabled:
             raise EndpointUnavailableError('sample_to_data_plane requires data_plane_url')
-        if not callable(getattr(self.sampler, 'submit', None)):
+        # The deployment contract (sampler/app.py): only the *_async variants carry the
+        # non-blocking submit/pause/stop interface this endpoint drives. submit() itself lives on
+        # the Sampler base class, so a callable() probe was always True -- it admitted plain
+        # vllm/sglang (which the contract says cannot back the data plane) and admitted torch,
+        # which then failed inside the task instead of as a 4xx admission error here.
+        if getattr(self, 'sampler_type', None) not in ('vllm_async', 'sglang_async'):
             raise EndpointUnavailableError('sampler_type must be vllm_async or sglang_async')
 
         adapter_path = None

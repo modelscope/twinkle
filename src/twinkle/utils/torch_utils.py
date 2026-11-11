@@ -472,6 +472,57 @@ def stateless_init_process_group(
     return communicator
 
 
+def ensure_default_process_group(force: bool = False, should_bind_device_id=None) -> bool:
+    """Initialise the default torch.distributed process group if nothing has yet.
+
+    The single lazy-init seam shared by the model base and any pre-model consumer
+    (dataset assembly that must broadcast before a model exists): the platform
+    handling -- HCCL socket-env injection for multi-job NPU runs, device-id
+    binding, and the unbound-default-PG cleanup -- lives here exactly once.
+
+    ``force`` inits even at world_size==1 (mcore's ``initialize_model_parallel``
+    asserts an initialised group; a single-rank torchrun broadcast needs one too).
+    ``should_bind_device_id`` overrides the platform's device-binding decision
+    for the default PG (callable taking the backend name). Returns True when
+    this call initialised the group.
+    """
+    import os
+
+    import torch
+    import torch.distributed as dist
+
+    from .platforms import Platform
+
+    if dist.is_initialized() or not (force or Platform.get_world_size() > 1):
+        return False
+    Torch.set_device()
+    backend = Platform.device_backend()
+    if Platform.get_platform().ensures_socket_env():
+        # Multi-job NPU runs: HCCL default ports collide (bind/listen failures);
+        # inject deterministic per-job port ranges before PG init.
+        from .platforms import ensure_hccl_socket_env
+
+        ensure_hccl_socket_env(int(os.environ.get('MASTER_PORT', '29500')))
+    init_kwargs = {
+        'backend': backend,
+        'init_method': 'env://',
+        'rank': Platform.get_rank(),
+        'world_size': Platform.get_world_size(),
+    }
+    bind = (should_bind_device_id(backend) if should_bind_device_id is not None
+            else Platform.get_platform().binds_device_id_to_process_group())
+    if bind:
+        init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+    dist.init_process_group(**init_kwargs)
+    if Platform.get_platform().requires_unbound_default_pg():
+        default_pg = dist.distributed_c10d._get_default_group()
+        if getattr(default_pg, 'bound_device_id', None) is not None:
+            # A bound device id propagates into later subgroup creation (Gloo DP
+            # groups on NPU) or splits a backend cannot perform (XPU); clear it.
+            default_pg.bound_device_id = None
+    return True
+
+
 def _representable_pad_value(dtype: 'torch.dtype', pad_value: float) -> float:
     """Clamp *pad_value* into the range *dtype* can actually hold (no-op for float / bool).
 

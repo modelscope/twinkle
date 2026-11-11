@@ -98,6 +98,9 @@ class _Service(SamplerManagement):
     def __init__(self, *, timeout=2, limit=128):
         self.model_id = 'mock-model'
         self.replica_id = 'sampler-test'
+        # sample_to_data_plane admits only the *_async sampler types (the deployment contract
+        # its guard enforces); this fake stands in for one.
+        self.sampler_type = 'vllm_async'
         self.state = _State()
         self.sampler = _Sampler()
         self.sampling_guard = SamplerConcurrency()

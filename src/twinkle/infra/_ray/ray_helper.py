@@ -320,32 +320,63 @@ class RayHelper:
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod
-    def do_get_and_collect(args, kwargs):
-        """Collect `LazyCollect` in each arg."""
-        new_args = []
-        for arg in args:
-            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
-                arg = arg()
-            new_args.append(arg)
+    def _resolve_arg_refs(value: Any) -> Any:
+        """Materialise remote handles (ObjectRef / LazyCollect) anywhere inside an argument value.
 
-        new_kwargs = {}
-        for key in list(kwargs.keys()):
-            value = kwargs[key]
-            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
-                value = value()
-            new_kwargs[key] = value
+        Ray dereferences only refs passed at the TOP level of an actor call; a handle nested in a
+        list element, a dict value or a dataclass field rides through to the worker as a handle.
+        The stash protocol hands consumers exactly those shapes -- a ``[sample.encoded, ...]``
+        list, a ``RolloutSample`` whose ``encoded`` field is a ref, a ``scored`` dict of lazy
+        forward handles -- and the worker-side unpacking is where every one of them turns back
+        into a value. This is what lets a component method body read its arguments as plain
+        single-process data: remote-function's boundary absorbs the whole stash protocol, and no
+        component ever resolves a handle itself.
+        """
+        import ray
+        from dataclasses import fields, is_dataclass, replace
+        if isinstance(value, ray.ObjectRef):
+            return ray.get(value)
+        if callable(value) and getattr(value, '_is_lazy_collect', False):
+            return value()
+        if isinstance(value, list):
+            return [RayHelper._resolve_arg_refs(item) for item in value]
+        if isinstance(value, tuple):
+            resolved = tuple(RayHelper._resolve_arg_refs(item) for item in value)
+            return type(value)(*resolved) if hasattr(type(value), '_fields') else resolved
+        if isinstance(value, dict):
+            return {key: RayHelper._resolve_arg_refs(item) for key, item in value.items()}
+        if is_dataclass(value) and not isinstance(value, type):
+            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name))
+                                     for field in fields(value)})
+        return value
+
+    @staticmethod
+    def do_get_and_collect(args, kwargs):
+        """Materialise every remote handle the arguments carry, wherever it is nested."""
+        new_args = [RayHelper._resolve_arg_refs(arg) for arg in args]
+        new_kwargs = {key: RayHelper._resolve_arg_refs(value) for key, value in kwargs.items()}
         return new_args, new_kwargs
 
     @staticmethod
     def has_ref(args, kwargs) -> bool:
-        for arg in args:
-            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
+        """Whether any argument carries a remote handle, at any nesting depth."""
+        import ray
+        from dataclasses import fields, is_dataclass
+
+        def _carries_ref(value) -> bool:
+            if isinstance(value, ray.ObjectRef):
                 return True
-        for key in list(kwargs.keys()):
-            value = kwargs[key]
-            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
+            if callable(value) and getattr(value, '_is_lazy_collect', False):
                 return True
-        return False
+            if isinstance(value, (list, tuple)):
+                return any(_carries_ref(item) for item in value)
+            if isinstance(value, dict):
+                return any(_carries_ref(item) for item in value.values())
+            if is_dataclass(value) and not isinstance(value, type):
+                return any(_carries_ref(getattr(value, field.name)) for field in fields(value))
+            return False
+
+        return any(_carries_ref(arg) for arg in args) or any(_carries_ref(value) for value in kwargs.values())
 
     @staticmethod
     def create_workers(worker_cls: Type[T],
@@ -454,21 +485,19 @@ class RayHelper:
                     'num_cpus': 0.01,
                 }
 
-                # The placement group already reserves a GPU worker's full
-                # allocation and ``CUDA_VISIBLE_DEVICES`` above pins that actor
-                # to the ranks selected by DeviceGroup.  Do not additionally
-                # request a fractional Ray GPU resource for CUDA workers.
+                # The placement group already reserves a worker's full
+                # accelerator allocation and the visible-device env above pins
+                # that actor to the ranks selected by DeviceGroup.  Do not
+                # additionally request a fractional Ray accelerator resource
+                # (GPU, or the custom NPU resource).
                 #
                 # With a fractional request, Ray translates the placement-group
-                # GPU id through the already narrowed visible-device list.  For
-                # the second GPU that becomes index 1 into ``['1']``, killing
-                # the worker in ``set_visible_accelerator_ids`` before its
-                # constructor runs.  The CPU claim and placement-group strategy
-                # are sufficient to place the actor in the GPU-owning bundle.
-                if device_type != 'GPU':
-                    # Use a custom resource key for non-GPU accelerators
-                    # (for example, NPU).
-                    worker_options['resources'] = {device_type: 0.01}
+                # device id through the already narrowed visible-device list.
+                # For a group that does not start at device 0 (e.g. NPUs 2,3
+                # next to a sampler on 0,1) that becomes index 2 into ``['2']``,
+                # killing the worker in ``set_visible_accelerator_ids`` before
+                # its constructor runs.  The CPU claim and placement-group
+                # strategy are sufficient to place the actor in the owning bundle.
 
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency

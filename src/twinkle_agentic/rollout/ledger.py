@@ -213,6 +213,47 @@ class TurnLedger:
             return False
         return len(self._pif.get("input_ids") or []) >= self.max_tokens
 
+    def unfit(self, params: Any) -> bool:
+        """Would this turn's completion budget overrun the template's ``max_length``?
+
+        The sampler caps a TURN at its own ``max_tokens``; nothing caps the EPISODE at
+        ``max_length`` before an append runs out of room. Checked before each turn so a
+        budget that no longer fits ends the episode as truncated -- with the turns it
+        already banked -- instead of dying inside the append. A dict or object
+        ``params`` both work; one without ``max_tokens`` (an API default) is not
+        checkable and answers False.
+        """
+        max_length = getattr(self.template, "max_length", None)
+        turn_budget = params.get("max_tokens") if isinstance(params, dict) else getattr(params, "max_tokens", None)
+        if max_length is None or turn_budget is None:
+            return False
+        return len(self._pif.get("input_ids") or []) + int(turn_budget) > max_length
+
+    def capped_turn_params(self, params: Any) -> Any | None:
+        """Cap the turn's completion budget to the room left under ``max_length``.
+
+        :meth:`unfit` answers whether the FULL turn budget overruns ``max_length``. When it
+        does on the FIRST turn (nothing banked yet), ending the episode there emits a
+        zero-response sample: no labels, so nothing trainable, and it breaks the driver-side
+        length statistic and the worker forward (under ray the sample's ``encoded`` is an
+        ObjectRef the driver must not dereference). Capping the budget to the remaining room
+        yields a truncated partial response instead -- the standard "``max_length`` truncates
+        the generation" semantics. Returns the capped params, or ``None`` when not even one
+        token fits (the prompt alone is at/over ``max_length``: a degenerate sample with
+        nothing trainable, which the caller ends truncated rather than forcing a generation).
+        """
+        max_length = getattr(self.template, "max_length", None)
+        turn_budget = params.get("max_tokens") if isinstance(params, dict) else getattr(params, "max_tokens", None)
+        if max_length is None or turn_budget is None:
+            return None
+        room = int(max_length) - len(self._pif.get("input_ids") or [])
+        if room <= 0:
+            return None
+        capped = min(int(turn_budget), room)
+        if isinstance(params, dict):
+            return {**params, "max_tokens": capped}
+        return replace(params, max_tokens=capped)
+
     # ------------------------------------------------------- text operations
     #
     # The loop needs three things that only the template knows how to do: read a
@@ -603,6 +644,10 @@ class MessageLedger:
 
     def full(self) -> bool:
         """Never full: there is no token budget at the message level."""
+        return False
+
+    def unfit(self, params: Any) -> bool:
+        """Never unfit: a message-level episode has no token ids to budget against."""
         return False
 
     # ------------------------------------------------------- text operations

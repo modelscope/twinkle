@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
-from twinkle import Platform, remote_function, torch_util
+from twinkle import Platform, remote_function
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
@@ -614,33 +614,7 @@ class TrainableModel(ABC):
         (the ray worker env carries MASTER_ADDR/PORT/RANK/WORLD_SIZE for every
         group size; torchrun does the same locally).
         """
-        import torch
-        import torch.distributed as dist
-        if not dist.is_initialized() and (force or Platform.get_world_size() > 1):
-            torch_util.set_device()
-            backend = Platform.device_backend()
-            if Platform.get_platform().ensures_socket_env():
-                # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
-                # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
-                # Keep training-side HCCL sockets on a per-job port layout to
-                # avoid collisions with other jobs on the same host.
-                from twinkle.utils.platforms import ensure_hccl_socket_env
-                master_port = int(os.environ.get('MASTER_PORT', '29500'))
-                ensure_hccl_socket_env(master_port)
-            init_kwargs = {
-                'backend': backend,
-                'init_method': 'env://',
-                'rank': Platform.get_rank(),
-                'world_size': Platform.get_world_size(),
-            }
-            if self._should_bind_device_id_for_process_group(backend):
-                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
-            dist.init_process_group(**init_kwargs)
-            if Platform.get_platform().requires_unbound_default_pg():
-                default_pg = dist.distributed_c10d._get_default_group()
-                if getattr(default_pg, 'bound_device_id', None) is not None:
-                    # A bound device id propagates into later subgroup creation
-                    # (Gloo DP groups on NPU) or triggers a communicator split
-                    # the backend cannot perform (XPU). Clear it before
-                    # Megatron creates its subgroups.
-                    default_pg.bound_device_id = None
+        from twinkle.utils.torch_utils import ensure_default_process_group
+
+        ensure_default_process_group(
+            force=force, should_bind_device_id=self._should_bind_device_id_for_process_group)

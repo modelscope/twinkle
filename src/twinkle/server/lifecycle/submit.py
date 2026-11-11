@@ -13,6 +13,7 @@ from fastapi import Request
 from typing import TYPE_CHECKING, Any
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
+from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.base import FieldRole, fields_with_role
 from twinkle.protocol.types.data import export_batch
 from twinkle.protocol.types.lifecycle import TaskEnvelope
@@ -178,7 +179,12 @@ async def run_submit(
     async def _task():
         if assert_resource:
             self.assert_resource_exists(adapter_name)
-        return await backend_call(self, body, adapter_name, token)
+        # Enforce the contract above that backend_call yields a JSON-safe result: the
+        # value is stored verbatim as the future result and later serialized into a
+        # TaskEnvelope over HTTP, where a raw torch.Tensor (the split-path forward /
+        # calculate_loss outputs) fails pydantic. json_safe is idempotent, so handlers
+        # that already convert (data-plane, sampler) pass through unchanged.
+        return json_safe(await backend_call(self, body, adapter_name, token))
 
     # ---- Idempotent dedup: a client-supplied seq_id makes a retried stateful op
     # apply at most once. Claim (session_id, adapter, seq_id) -> request_id atomically

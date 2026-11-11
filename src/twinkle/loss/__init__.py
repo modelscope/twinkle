@@ -34,6 +34,10 @@ torch_loss_mapping = {
     'gkd': GKDLoss,
     # RL losses
     'grpo': GRPOLoss,
+    # Registered by name for the webui loss component, which constructs straight out of this
+    # registry (the PPO preset ships kind='ppo'). The dev recipes themselves resolve PPO policy
+    # training to GRPOLoss (swift/dev/loss/configure.py _RL_LOSS_NAME) -- different entry points,
+    # both intentional.
     'ppo': PPOLoss,
     'ppo_value': PPOValueLoss,
     'gspo': GSPOLoss,

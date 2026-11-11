@@ -575,7 +575,7 @@ class StreamingDriver:
                         self.stats.publish_time += time.perf_counter() - _t
                         self._finish_publish(window, new_path)
                         self.stats.publishes += 1
-                        self._drop_stale(ready, group_counts)
+                        self._drop_stale(ready, group_counts, group_prompt, resolved_groups)
                         # Drop published artifacts no live version, in-flight pin or buffered sample still
                         # references (runs AFTER the stale scan, which released the dropped pins).
                         self._prune()
@@ -696,8 +696,15 @@ class StreamingDriver:
                         ready.append(record)
                         fresh.append(record)
                         group_counts[group_key] = group_counts.get(group_key, 0) + 1
-                        self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
-                                                   resolved_groups, regen_queue, regen_counts)
+                        # A score worker submits this poll's survivors only after the loop; an
+                        # in-loop barrier would resolve a freshly completed group unscored
+                        # (score_ref is None both before submission and after reap). Defer to the
+                        # post-submission re-probe and the pull boundary's blocking reap; the
+                        # in-loop call stays only for the inline-score seam, which has already
+                        # scored each sample at this point.
+                        if self._score_worker is None:
+                            self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
+                                                       resolved_groups, regen_queue, regen_counts)
                     # Submit this poll's survivors as ONE batched scoring call (lazy: the call returns
                     # a reference, the actors keep scoring while the driver moves on) and probe the
                     # whole buffer non-blockingly: whatever landed re-enters the group barrier.
@@ -733,7 +740,7 @@ class StreamingDriver:
                         # per-sample rule it is the guarantee that the pulled prefix is fully scored.
                         self._reap_scores(records, blocking=True)
                     _t = time.perf_counter()
-                    self._train_pull(records, ready, group_counts)
+                    self._train_pull(records, ready, group_counts, group_prompt, resolved_groups)
                     iteration_pending = not self._iterating or self._iteration_committed
                     train_now = time.perf_counter()
                     # Fold the bubble ratio at the pull boundary, where the pairing is exact: the
@@ -801,7 +808,9 @@ class StreamingDriver:
     # --- internals ---------------------------------------------------------------------------------------
 
     def _train_pull(self, records: List[BufferRecord], ready: List[BufferRecord],
-                    group_counts: Optional[Dict[str, int]] = None) -> None:
+                    group_counts: Optional[Dict[str, int]] = None,
+                    group_prompt: Optional[Dict[str, Any]] = None,
+                    resolved_groups: Optional[set] = None) -> None:
         """Remove one pulled batch from the buffer, train it, and account the steps it reports.
 
         ``self._last_pull_steps`` carries the consume return back to the caller (0 when the consumer
@@ -809,12 +818,20 @@ class StreamingDriver:
         released here: each record's version pin was already released when its trajectory was COLLECTED
         (the pin guards the SAMPLER-side adapter path, and training reads the samples in-process), so a
         record leaving the buffer is pure bookkeeping. A pulled group is complete (``assembly_ready`` pulls
-        whole groups for a group consumer), so its ``group_counts`` entry is dropped with it.
+        whole groups for a group consumer) and now TERMINAL -- it will never be re-collected, regenerated
+        or barrier-checked again -- so all of its per-group bookkeeping is dropped with it: ``group_counts``
+        (the intra-group barrier count), ``group_prompt`` (the regenerate re-admission prompt, already read
+        by the time a group is terminal) and ``resolved_groups`` (the once-per-group barrier guard). Pruning
+        only ``group_counts`` would leave the other two growing by one entry per group for the whole run.
         """
         for record in records:
             ready.remove(record)
             if group_counts is not None:
                 group_counts.pop(record.group_key, None)
+            if group_prompt is not None:
+                group_prompt.pop(record.group_key, None)
+            if resolved_groups is not None:
+                resolved_groups.discard(record.group_key)
         steps = self._consume_batch(records)
         # None means the consumer did not report a count. An explicit 0 is a real report.
         steps = 1 if steps is None else int(steps)
@@ -951,7 +968,9 @@ class StreamingDriver:
         self._prompt_seq += 1
         return ref
 
-    def _drop_stale(self, ready: List[BufferRecord], group_counts: Optional[Dict[str, int]] = None) -> None:
+    def _drop_stale(self, ready: List[BufferRecord], group_counts: Optional[Dict[str, int]] = None,
+                    group_prompt: Optional[Dict[str, Any]] = None,
+                    resolved_groups: Optional[set] = None) -> None:
         """Post-publish stale scan: drop every BUFFERED sample whose version lag exceeds the bound.
 
         This is the SECOND of the two staleness guards -- the first drops a straggler AT COLLECT, before
@@ -960,7 +979,10 @@ class StreamingDriver:
         but group-sound: every trajectory of a group is admitted back-to-back under one pinned policy, so
         siblings share one version and a stale group is dropped whole across this scan. No pin is released
         here -- a collected record's pin was already released at collect. ``group_counts`` is decremented
-        for each dropped record so the group barrier never fires on a group the scan has thinned out.
+        for each dropped record so the group barrier never fires on a group the scan has thinned out; when
+        the last sibling drops the group is TERMINAL (fully gone from the buffer, never re-collected), so its
+        ``group_prompt`` and ``resolved_groups`` entries are dropped with it -- mirroring :meth:`_train_pull`
+        so a stale-dropped group does not leak per-group bookkeeping either.
         """
         current = self._current_version()
         kept: List[BufferRecord] = []
@@ -973,6 +995,10 @@ class StreamingDriver:
                         group_counts[record.group_key] = remaining
                     else:
                         group_counts.pop(record.group_key, None)
+                        if group_prompt is not None:
+                            group_prompt.pop(record.group_key, None)
+                        if resolved_groups is not None:
+                            resolved_groups.discard(record.group_key)
             else:
                 kept.append(record)
         ready[:] = kept

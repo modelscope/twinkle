@@ -167,7 +167,15 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _get_lr(self):
         if self.optimizer is not None:
             _lrs = []
-            _default_lr = self.optimizer.defaults.get('lr')
+            # DeepSpeed's engine optimizer (and accelerate's wrapper around it) exposes the
+            # learning rate through get_lr(), not torch's `defaults` dict.
+            _default_lr = None
+            defaults = getattr(self.optimizer, 'defaults', None)
+            if isinstance(defaults, dict):
+                _default_lr = defaults.get('lr')
+            if _default_lr is None and hasattr(self.optimizer, 'get_lr'):
+                _lrs = list(self.optimizer.get_lr())
+                return _lrs
             for param_group in self.optimizer.param_groups:
                 _lrs.append(param_group.get('lr', _default_lr))
             return _lrs
@@ -624,6 +632,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # into the exception string and that dump swallows the real traceback.
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
+    def _fill_deepspeed_auto(self, kwargs: Dict[str, Any]) -> None:
+        """Give a DeepSpeed strategy the call's batch geometry before the first wrap.
+
+        The forward kwargs carry micro_batch_size (default: the whole submitted unit) and the
+        optimizer group holds the configured gradient_accumulation_steps; the strategy needs
+        both to resolve its config's "auto" placeholders before zero.Init / prepare run.
+        """
+        fill = getattr(self.strategy, 'fill_auto', None)
+        if fill is None:
+            return
+        micro_batch_size = kwargs.get('micro_batch_size')
+        if micro_batch_size is None:
+            inputs = kwargs.get('inputs')
+            micro_batch_size = len(inputs) if isinstance(inputs, (list, tuple)) else 1
+        ga = None
+        for group in self.optimizer_group.values():
+            ga = getattr(group, 'gradient_accumulation_steps', None)
+            if ga:
+                break
+        fill(int(micro_batch_size), int(ga or 1))
+
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
@@ -639,6 +668,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 self.model = result[0]
                 for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
                     optimizer_group.optimizer = optimizer
+                    self._rebind_lr_scheduler(optimizer_group, optimizer)
                     self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
@@ -648,6 +678,48 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 else:
                     self.model = result
             self._model_wrapped = True
+
+    @staticmethod
+    def _rebind_lr_scheduler(optimizer_group: OptimizerGroup, optimizer: Optimizer) -> None:
+        """Put a group's LR scheduler onto the optimizer the wrap actually installed.
+
+        ``set_lr_scheduler`` builds the scheduler on the pre-wrap optimizer, but a strategy may hand
+        back one whose param groups differ: DeepSpeed's engine drops groups with no parameters (a
+        LoRA run's all-frozen weight-decay group). This is the accelerate-prepare contract: once the
+        model/optimizer pair is prepared, the scheduler follows the optimizer that actually steps --
+        REBUILT from its construction spec when the group count changed (a LambdaLR-style scheduler
+        keeps one lambda per original group, so rebinding ``base_lrs`` alone still misaligns), and
+        merely re-bound when the wrapped optimizer kept the same groups. A wrap that returns the
+        same optimizer object (DDP and friends) is a no-op; the rebuild happens before any step, so
+        a fresh scheduler state is exactly the state the run starts from anyway.
+        """
+        scheduler = getattr(optimizer_group, 'lr_scheduler', None)
+        if scheduler is None or scheduler.optimizer is optimizer:
+            return
+        spec = getattr(optimizer_group, '_scheduler_spec', None)
+        if spec is not None and len(optimizer.param_groups) != len(scheduler.base_lrs):
+            scheduler_cls, spec_kwargs = spec
+            rebuilt = construct_class(
+                scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler],
+                optimizer=optimizer, **spec_kwargs)
+            optimizer_group.lr_scheduler = rebuilt
+            logger.info('rebuilt the lr scheduler on the wrapped optimizer: %s param group(s) survived '
+                        'the wrap (the scheduler was built on %s).', len(optimizer.param_groups),
+                        len(scheduler.base_lrs))
+            return
+        scheduler.optimizer = optimizer
+        # ``initial_lr`` is the annotation LRScheduler.__init__ stamps on the groups it was built over.
+        # A group that lacks it -- e.g. an optimizer installed later through the public set_optimizer,
+        # whose groups the scheduler was never built on -- must NOT fall back to the group's CURRENT lr:
+        # on resume that lr is the restored, already-decayed value, and taking it as the base decays the
+        # schedule a second time (every post-resume lr scaled by last_lr/base_lr). The scheduler's own
+        # base_lrs -- carried from construction or restored from scheduler.pt -- is the authoritative
+        # base, and this branch only runs when the group count is unchanged, so keep it element-wise.
+        prior_base_lrs = scheduler.base_lrs
+        scheduler.base_lrs = [
+            group['initial_lr'] if 'initial_lr' in group else prior_base
+            for group, prior_base in zip(optimizer.param_groups, prior_base_lrs)
+        ]
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
@@ -807,6 +879,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             gather_fn=self.sp_strategy.gather_loss_tensors if self.sp_strategy is not None else None,
             reduce_fn=self.sp_strategy.all_reduce if self.sp_strategy is not None else None)
         status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        optimizer_config.last_forward_training = is_training
         status.inputs = inputs
         status.outputs = outputs
         status.forward_kwargs = forward_kwargs
@@ -892,6 +965,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
+        self._fill_deepspeed_auto(kwargs)
         self._lazy_wrap_model()
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
@@ -1094,6 +1168,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
         kwargs.pop('compute_loss', None)
+        self._fill_deepspeed_auto(kwargs)
         self._lazy_wrap_model()
         self.model.eval()
         with torch.no_grad():
@@ -1341,7 +1416,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.get_loss(loss_key)
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        status = optimizer_config.train_status if self.model.training else optimizer_config.eval_status
+        is_training = optimizer_config.last_forward_training
+        if is_training is None:
+            is_training = self.model.training
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
@@ -1871,7 +1949,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.set_loss(construct_class(loss_cls, Loss, twinkle.loss, **kwargs), loss_key=loss_key)
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
         """Set the optimizer.
 
@@ -1992,6 +2070,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler],
                                     **kwargs)
         optimizer_config.lr_scheduler = scheduler
+        # The wrap may need to rebuild the scheduler on the optimizer a strategy installs (see
+        # _rebind_lr_scheduler): remember the spec exactly as it was constructed.
+        optimizer_config._scheduler_spec = (
+            scheduler_cls, {key: value for key, value in kwargs.items() if key != 'optimizer'})
 
     @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
@@ -2104,6 +2186,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
+        if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
+            # Initial adapter snapshots precede the first forward. Materialize on every
+            # rank before state-dict collectives: non-source ranks still hold meta tensors.
+            self._lazy_wrap_model()
         model = self.strategy.unwrap_model(self.model)
         save_kwargs = {
             'safe_serialization': safe_serialization,
@@ -2332,10 +2418,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
         if strict and not os.path.exists(optimizer_path):
-            raise FileNotFoundError(optimizer_path)
+            raise FileNotFoundError(
+                f'{optimizer_path} is missing although trainer_state.json marks a full checkpoint: '
+                'resuming would silently train on with a fresh optimizer. Restore the file from a '
+                'healthy copy, or start a new run from the weights with the model-only load path '
+                '(e.g. --resume_only_model true).')
         if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
-            logger.warning(
-                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
+            raise FileNotFoundError(
+                f'{scheduler_path} is missing although trainer_state.json marks a full checkpoint: '
+                'resuming would silently apply a fresh lr schedule. Restore the file from a healthy '
+                'copy, or start a new run from the weights with the model-only load path '
+                '(e.g. --resume_only_model true).')
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
@@ -2436,7 +2529,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         adapter_name = adapter_name or self._get_default_group()
         optimizer_config = self.optimizer_group[adapter_name]
-        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+        # A full resume promised by trainer_state.json must really restore the optimizer and lr
+        # schedule: a checkpoint missing those would otherwise train on with silently reset state
+        # while reporting the saved step counter. strict raises on each missing piece; the lenient
+        # ``load(load_optimizer=...)`` path keeps its skip-if-missing contract.
+        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name, strict=True)
         scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
         if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
             self._load_scaler_state(scaler_path, adapter_name=adapter_name)

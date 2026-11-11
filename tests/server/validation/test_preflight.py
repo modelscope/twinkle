@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, run_submit
-from twinkle.server.validation import BackendCapability, assert_request_supported
+from twinkle.server.validation import BackendCapability, assert_request_supported, assert_sampler_weights_supported
 from twinkle.server.validation.backend_compat import resolve_backend
 from twinkle.protocol.types import model as model_types
 
@@ -242,3 +242,23 @@ def test_plugin_identifiers_are_not_forwarded_as_kwargs():
 
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__, '-v']))
+
+# --------------------------------------------------------------------------- #
+# Sampler weights from a Hybrid deployment
+# --------------------------------------------------------------------------- #
+
+
+def test_hybrid_deployment_refuses_sampler_weights():
+    deployment = _Deployment('transformers')
+    deployment.train_mode = 'hybrid'
+    with pytest.raises(RequestRejectedError) as raised:
+        assert_sampler_weights_supported(deployment)
+    assert raised.value.error_code == 422
+    assert 'GRPO' in str(raised.value)
+
+
+@pytest.mark.parametrize('train_mode', ['lora', 'full'])
+def test_lora_and_full_deployments_serve_sampler_weights(train_mode):
+    deployment = _Deployment('transformers')
+    deployment.train_mode = train_mode
+    assert_sampler_weights_supported(deployment)

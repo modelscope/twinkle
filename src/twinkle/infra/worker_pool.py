@@ -387,7 +387,7 @@ class WorkerPool:
         lock = getattr(self, '_worker_lock', None)
         with (lock if lock is not None else nullcontext()):
             for worker_id in worker_ids:
-                _sticky_drop_worker(worker_id)
+                _sticky_drop_worker(self, worker_id)
             if hasattr(self, '_sampler_workers'):
                 for worker_id in worker_ids:
                     self._sampler_workers.pop(worker_id, None)

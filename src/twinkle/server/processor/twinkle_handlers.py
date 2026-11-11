@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
@@ -48,9 +49,13 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         class_type = body.class_type
         _kwargs = dict(body.init_kwargs)
 
-        assert processor_type_name in _PROCESSOR_TYPES, f'Invalid processor type: {processor_type_name}'
+        # Request-body-decidable rejections (4xx, no task record), not asserts: python -O strips
+        # asserts, and even with them on the failure shape was AssertionError -> 500.
+        if processor_type_name not in _PROCESSOR_TYPES:
+            raise RequestRejectedError(f'Invalid processor type: {processor_type_name}')
         processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
-        assert hasattr(processor_module, class_type), f'Class {class_type} not found in {processor_type_name}'
+        if not hasattr(processor_module, class_type):
+            raise RequestRejectedError(f'Class {class_type} not found in {processor_type_name}')
 
         token = get_token_from_request(request)
         session_id = get_session_id_from_request(request)

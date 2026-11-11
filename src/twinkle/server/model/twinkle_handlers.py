@@ -27,7 +27,7 @@ from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, input_metrics, run_submit, to_backend_inputs
 from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
                                                     resolve_data_plane_model_inputs, select_output_rows)
-from twinkle.server.validation import BackendCapability
+from twinkle.server.validation import BackendCapability, assert_sampler_weights_supported
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -480,6 +480,8 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             twinkle_path, checkpoint_dir = await save_checkpoint(adapter_name, body.name, save_weights)
             return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
 
+        if body.is_sampler:
+            assert_sampler_weights_supported(self)
         return await run_submit(self, request, body, task_type='save', backend_call=_call)
 
     @app.post('/twinkle/load', response_model=types.TaskEnvelope)
