@@ -9,3 +9,6 @@ from .tq_fields import (REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIELDS, TRANS
                         columns_to_tq_fields, rows_to_tq_fields)
 from .trajectory import (Trajectory, attach_user_data, ground_truth, last_assistant_text, msg_content_text,
                          pack_user_data, pack_value, user_data_get)
+
+# A collated batch contains placeholder media whose aligned features must contribute zero.
+VISION_DUMMY_FLAG = "_vision_keepalive_dummy"
