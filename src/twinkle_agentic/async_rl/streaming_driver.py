@@ -147,6 +147,8 @@ class StreamingDriver:
     regime knobs (``max_staleness``; ``num_generations`` trajectories per prompt; ``groups_per_partition``
     = the groups one publish cycle is expected to train, used as the window's sizing declaration;
     ``buffer_depth`` = the in-flight + ready backpressure cap in samples), and the data-plane seams.
+    ``max_rows_per_pull`` optionally limits each built-in pull to whole training quanta, keeping
+    prefetched batches separate so the recipe can publish between optimizer updates.
     ``version_control=True`` selects the RL regime (the driver builds its own version ledger); False
     is the infer regime: the driver then pins the version at 0 with no windows and no pins, and
     never publishes, so it carries no RL scaffolding.
@@ -172,6 +174,7 @@ class StreamingDriver:
                  rollout: Optional[Rollout] = None,
                  group_pull: Optional[bool] = None,
                  need_rows: Optional[int] = None,
+                 max_rows_per_pull: int | None = None,
                  version_control: bool = False,
                  consume: Optional[Callable[[List[BufferRecord]], Optional[int]]] = None,
                  group_key: Optional[Callable[[Any], str]] = None,
@@ -225,10 +228,21 @@ class StreamingDriver:
             raise ValueError(f'group_pull={group_pull!r} needs need_rows (train_batch_size * ga) to size a pull')
         if need_rows is not None and need_rows <= 0:
             raise ValueError(f'need_rows must be positive, got {need_rows}')
+        # A prefetch window can contain multiple completed batches. Bound each handoff when
+        # the recipe must train/publish after one batch, rather than draining that window.
+        if max_rows_per_pull is not None:
+            if group_pull is None or need_rows is None or assembly_ready is not None:
+                raise ValueError('max_rows_per_pull requires a built-in group_pull rule and need_rows.')
+            if num_generations <= 0:
+                raise ValueError(f'num_generations must be positive, got {num_generations}')
+            import math
+            quantum = math.lcm(need_rows, num_generations) if group_pull else need_rows
+            if max_rows_per_pull < quantum or max_rows_per_pull % quantum:
+                raise ValueError(f'max_rows_per_pull must be a positive multiple of the pull quantum {quantum}.')
         if assembly_ready is None and group_pull:
-            assembly_ready = self._make_group_pull_rule(num_generations, need_rows)
+            assembly_ready = self._make_group_pull_rule(num_generations, need_rows, max_rows_per_pull)
         if assembly_ready is None and group_pull is False:
-            assembly_ready = self._make_no_group_pull_rule(need_rows)
+            assembly_ready = self._make_no_group_pull_rule(need_rows, max_rows_per_pull)
         # The scoring collaborator takes ONE parameter with two mutually-exclusive shapes: a LOCAL
         # callable (single sample in, replacement sample or None out -- the lightweight rule channel,
         # applied per trajectory inside the collection loop) or a remote score worker handle (batch in,
@@ -364,7 +378,9 @@ class StreamingDriver:
         self._idle_at_pull = 0.0
 
     @staticmethod
-    def _make_group_pull_rule(num_generations: int, need_rows: int) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
+    def _make_group_pull_rule(
+        num_generations: int, need_rows: int, max_rows_per_pull: int | None = None
+    ) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
         """Pull whole groups only, a lcm(need_rows, num_generations) quantum, group-contiguous.
 
         Group-relative consumers (GRPO/RFT) normalise each consecutive block of
@@ -390,6 +406,8 @@ class StreamingDriver:
             complete = [key for key in order if counts[key] >= num_generations and not pending.get(key)]
             groups_per_pull = need_rows // math.gcd(num_generations, need_rows)
             n_pull = groups_per_pull * (len(complete) // groups_per_pull)
+            if max_rows_per_pull is not None:
+                n_pull = min(n_pull, max_rows_per_pull // num_generations)
             if n_pull < 1:
                 return None
             selected = complete[:n_pull]
@@ -406,7 +424,9 @@ class StreamingDriver:
         return _rule
 
     @staticmethod
-    def _make_no_group_pull_rule(need_rows: int) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
+    def _make_no_group_pull_rule(
+        need_rows: int, max_rows_per_pull: int | None = None
+    ) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
         """Pull the buffer prefix in whole need_rows multiples (per-sample consumers).
 
         PPO / distillation score each sample independently, so there is no group
@@ -417,7 +437,10 @@ class StreamingDriver:
         def _rule(buffer: List[BufferRecord]) -> Optional[List[BufferRecord]]:
             if len(buffer) < need_rows:
                 return None
-            return buffer[:(len(buffer) // need_rows) * need_rows]
+            n_pull = (len(buffer) // need_rows) * need_rows
+            if max_rows_per_pull is not None:
+                n_pull = min(n_pull, max_rows_per_pull)
+            return buffer[:n_pull]
 
         return _rule
 

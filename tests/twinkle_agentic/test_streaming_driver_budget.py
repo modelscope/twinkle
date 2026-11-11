@@ -3,6 +3,8 @@
 
 import types
 
+import pytest
+
 from twinkle_agentic.async_rl.streaming_driver import BufferRecord, RolloutPolicy, StreamingDriver
 
 
@@ -226,3 +228,28 @@ def test_drop_stale_partial_drop_keeps_group_bookkeeping():
     assert group_counts == {'g': 1}        # decremented, not popped
     assert set(group_prompt) == {'g'}      # NOT pruned (a sibling is still buffered)
     assert resolved_groups == {'g'}        # NOT pruned
+
+
+@pytest.mark.parametrize('group_pull,cap,expected', [(True, 12, 12), (False, 4, 4)])
+def test_capped_pull_retains_prefetched_records(group_pull, cap, expected):
+    records = [BufferRecord(sample=object(), version=0, group_key=str(i // 3)) for i in range(24)]
+    driver = _driver(
+        num_generations=3, need_rows=4, group_pull=group_pull,
+        assembly_ready=None, max_rows_per_pull=cap, buffer_depth=24,
+    )
+    selected = driver._assembly_ready(records)
+    assert len(selected) == expected
+    assert len(records) == 24
+    uncapped = _driver(num_generations=3, need_rows=4, group_pull=group_pull, assembly_ready=None)
+    assert len(uncapped._assembly_ready(records)) == 24
+
+
+@pytest.mark.parametrize('cap', [0, 8, 13])
+def test_group_pull_cap_requires_complete_training_and_generation_quanta(cap):
+    with pytest.raises(ValueError, match='pull quantum 12'):
+        _driver(num_generations=3, need_rows=4, group_pull=True, assembly_ready=None, max_rows_per_pull=cap)
+
+
+def test_custom_pull_rule_cannot_silently_ignore_a_cap():
+    with pytest.raises(ValueError, match='built-in group_pull'):
+        _driver(max_rows_per_pull=4)
