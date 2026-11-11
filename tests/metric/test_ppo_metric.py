@@ -9,6 +9,8 @@ reported numbers against hand-computed values, so the mask alignment (``ignore_i
 prompt positions dropped), the clipping flag, explained variance and the multi
 micro-batch cursor are all pinned by behaviour rather than by inspection.
 """
+import math
+
 import pytest
 import torch
 
@@ -165,6 +167,17 @@ class TestPPOValueMetric:
         m.reset()
         assert m.records == []
 
+    def test_one_dimensional_labels_and_values_are_promoted(self):
+        m = _no_dist_metric(PPOValueMetric)
+        labels = torch.tensor([-100, -100, 10, 11])
+        values = torch.tensor([0., 0., 1., 3.])
+        old = torch.zeros(1, 4)
+        returns = torch.tensor([[0., 0., 1., 3.]])
+        m.accumulate({'labels': labels}, {'values': values}, old_values=old, returns=returns)
+        result = m.calculate()
+        assert result['train/value_mean'] == pytest.approx(2.0)
+        assert result['train/explained_variance'] == pytest.approx(1.0)
+
 
 # ---------------------------------------------------------------------------
 # PPOMetric (policy panel; pure rename subclass of GRPOMetric)
@@ -183,6 +196,18 @@ class TestPPOMetric:
         result = m.calculate()
         assert 'train/policy_confidence' in result
         assert 'train/mean_new_logp' in result
+
+    def test_reports_hand_computed_policy_panel(self):
+        # Two response tokens with logps -1 and -2: mean_new_logp -1.5, and the policy
+        # confidence is exp(-1.5). This pins PPOMetric's numbers independently of GRPO.
+        m = _no_dist_metric(PPOMetric)
+        labels = torch.tensor([[-100, -100, 10, 11]])
+        logps = torch.tensor([[0.0, 0.0, -1.0, -2.0]])
+        m.accumulate({'labels': labels}, {'logps': logps})
+        result = m.calculate()
+        assert result['train/mean_new_logp'] == pytest.approx(-1.5)
+        assert result['train/policy_confidence'] == pytest.approx(math.exp(-1.5))
+        assert result['train/n_trainable_tokens'] == 2
 
     def test_matches_grpo_on_identical_input(self):
         # PPOMetric overrides nothing, so for identical input it must report exactly the
