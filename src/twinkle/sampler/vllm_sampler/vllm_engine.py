@@ -3,7 +3,6 @@ import asyncio
 import contextlib
 import inspect
 import os
-import re
 import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -14,7 +13,6 @@ from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, Sample
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
-from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
 
@@ -127,6 +125,16 @@ def _copy_sampling_mask(mask, num_tokens: int, required: bool) -> Optional[Sampl
 
     _validate_sampling_mask_csr(token_ids, offsets, num_tokens)
     return SamplingMask(token_ids=token_ids, offsets=offsets)
+
+
+def _token_sampling_params(sampling_params, **kwargs):
+    params = sampling_params.to_vllm(**kwargs)
+    # Twinkle's logprobs=1 returns only the sampled token; vLLM calls that 0.
+    if sampling_params.logprobs == 1:
+        params.logprobs = 0
+    if not params.stop and not getattr(params, 'bad_words', None):
+        params.detokenize = False
+    return params
 
 
 def _set_sampling_replay_output_kind(vllm_params, enable_sampling_replay: bool) -> None:
@@ -297,17 +305,8 @@ class VLLMEngine(BaseSamplerEngine):
         # ``list_loras()`` per request.
         self._synced_lora_request: Optional[Any] = None
 
-        # Long-lived device IPC bucket reused across all update_weights()
-        # calls. Allocating a new IPC buffer (and hence a new IPC handle)
-        # per sync forces every worker to create a new device IPC mapping via
-        # the reducer callable because PyTorch's ``shared_cache`` cannot
-        # hit on unseen storage handles. The driver reclaims those mappings
-        # lazily, which is the root cause of the slow GPU memory drift we
-        # observed under frequent LoRA syncs. By pinning a single buffer
-        # and its handle we guarantee the worker-side cache always hits.
-        self._ipc_buffer: Optional[torch.Tensor] = None
-        self._ipc_handle: Any = None
-        self._ipc_buffer_size: int = 0
+        # The sender owns the reusable bucket and IPC handle across updates.
+        self._weight_sender = None
 
         # Initialize engine
         self.engine = self._create_engine()
@@ -488,7 +487,7 @@ class VLLMEngine(BaseSamplerEngine):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0
         logprobs = sampling_params.logprobs or 0
-        vllm_params = sampling_params.to_vllm(**kwargs)
+        vllm_params = _token_sampling_params(sampling_params, **kwargs)
         _set_sampling_replay_output_kind(vllm_params, self.enable_sampling_replay)
 
         # Build request
@@ -941,262 +940,14 @@ class VLLMEngine(BaseSamplerEngine):
             all_keys.update(r)
         return list(all_keys)
 
-    async def update_weights(
-        self,
-        weights,
-        peft_config: Optional[dict] = None,
-        base_sync_done: bool = False,
-        bucket_size_mb: int = 2048,
-        **kwargs,
-    ) -> None:
-        """Update model weights via ZMQ + device IPC to worker extension.
+    async def update_weights(self, weights, **kwargs) -> None:
+        """Stream local/checkpoint-engine weights through the shared IPC sender."""
+        from .weight_transfer import VLLMWeightSender
 
-        Accepts **either** a ``dict[str, Tensor]`` (legacy) **or** an async
-        generator / sync generator of ``(name, tensor)`` pairs (streaming).
-
-        The streaming path avoids accumulating a full model copy on GPU:
-        tensors are consumed one-by-one from the generator, copied into a
-        device IPC bucket, and flushed to the vLLM worker subprocess when the
-        bucket is full.
-
-        Args:
-            weights: Weights to transfer.  ``dict[str, Tensor]`` or
-                ``(Async)Generator[tuple[str, Tensor], ...]``.
-            peft_config: PEFT config dict for LoRA adapter loading.
-            base_sync_done: If True with peft_config, load as LoRA adapter.
-            bucket_size_mb: Size of transfer bucket in MB.
-        """
-        import asyncio
-        import gc
-        import time
-        import zmq
-        from vllm.platforms import current_platform
-
-        start_time = time.time()
-
-        # Normalise *weights* into an async iterator regardless of input type.
-        if isinstance(weights, dict):
-
-            async def _dict_iter():
-                for item in weights.items():
-                    yield item
-
-            weight_aiter = _dict_iter()
-        elif hasattr(weights, '__aiter__'):
-            weight_aiter = weights.__aiter__()
-        else:
-            # sync generator / iterable
-            async def _sync_iter():
-                for item in weights:
-                    yield item
-
-            weight_aiter = _sync_iter()
-
-        # Peek first tensor to detect device (supported accelerator → IPC, CPU → SHM).
-        try:
-            first_name, first_tensor = await weight_aiter.__anext__()
-        except StopAsyncIteration:
-            logger.warning('update_weights called with empty weights')
-            return
-
-        use_device_ipc = first_tensor.is_cuda
-        if first_tensor.device.type == 'npu':
-            use_device_ipc = Platform.get_platform().supports_device_ipc()
-        use_shm = not use_device_ipc
-
-        # Use a per-sync unique IPC endpoint to avoid cross-actor collisions
-        # when multiple sampler actors share the same device UUID.
-        device_uuid = Platform.get_vllm_device_uuid(0)
-        sync_id = uuid.uuid4().hex
-        zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}-{os.getpid()}-{sync_id}.sock'
-
-        env_bucket_mb = os.environ.get('TWINKLE_VLLM_BUCKET_SIZE_MB')
-        if env_bucket_mb is not None:
-            bucket_size_mb = int(env_bucket_mb)
-        if bucket_size_mb <= 0:
-            raise ValueError(f'bucket_size_mb must be > 0, got {bucket_size_mb}')
-
-        bucket_size = bucket_size_mb << 20
-        lora_mode = bool(base_sync_done and peft_config)
-
-        # Create transfer buffer
-        buffer = None
-        shm = None
-
-        if use_device_ipc:
-            # Register the platform's tensor reducer (no-op where the CUDA one is builtin).
-            Platform.get_platform().ensure_ipc_reducer()
-            from torch.multiprocessing.reductions import reduce_tensor
-
-            # Reuse a long-lived IPC bucket whenever the requested size
-            # fits. The handle is produced once and shipped to every
-            # subsequent sync so each worker's ``shared_cache`` stays warm
-            # and no new device IPC mapping is created per sync.
-            need_realloc = (
-                self._ipc_buffer is None or self._ipc_buffer_size < bucket_size
-                or self._ipc_buffer.device != first_tensor.device)
-            if need_realloc:
-                # Drop the old handle/buffer before allocating a bigger one
-                # so we do not briefly hold both and double the peak usage.
-                self._ipc_buffer = None
-                self._ipc_handle = None
-                self._ipc_buffer_size = 0
-                self._ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
-                self._ipc_handle = reduce_tensor(self._ipc_buffer)
-                self._ipc_buffer_size = bucket_size
-            buffer = self._ipc_buffer
-            ipc_handle = self._ipc_handle
-        else:
-            from multiprocessing import shared_memory
-            shm_name = f'twinkle_weights_{uuid.uuid4().hex}'
-            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=bucket_size)
-            buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
-
-        # Setup ZMQ socket FIRST (bind before worker connects)
-        zmq_ctx = zmq.Context()
-        socket = zmq_ctx.socket(zmq.REQ)
-        zmq_timeout_s = get_timeout_s_from_env('TWINKLE_VLLM_IPC_TIMEOUT_S', 300)
-        configure_zmq_socket(socket, timeout_ms=zmq_timeout_s * 1000, linger=0)
-        socket.bind(zmq_handle)
-
-        loop = asyncio.get_running_loop()
-
-        # Non-blocking ZMQ helpers — run blocking socket ops in the
-        # default executor so the event loop stays responsive.  This is
-        # critical when TP > 1: collective_rpc is an async task on the
-        # same loop, and blocking socket.recv() would prevent it from
-        # being scheduled, causing a deadlock.
-        def _zmq_send_recv(payload, where: str):
-            try:
-                socket.send_pyobj(payload)
-                return socket.recv()
-            except zmq.error.Again as e:
-                raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) during {where} on {zmq_handle}') from e
-
-        n_weights = 0
-        worker_task: Optional['asyncio.Future'] = None
-        try:
-            # Launch worker side concurrently
-            worker_task = asyncio.ensure_future(
-                self.engine.collective_rpc(
-                    'update_weights_from_ipc',
-                    kwargs={
-                        'peft_config': peft_config,
-                        'base_sync_done': base_sync_done,
-                        'use_shm': use_shm,
-                        'zmq_handle': zmq_handle,
-                    },
-                ))
-
-            # Send IPC/SHM handle, wait for worker ready (non-blocking)
-            handle_payload = ipc_handle if use_device_ipc else {'name': shm_name, 'size': bucket_size}
-            await loop.run_in_executor(None, _zmq_send_recv, handle_payload, 'handle handshake')
-
-            # Stream weights into buckets and send to worker
-            async def _chain_first():
-                """Re-inject the peeked first tensor, then yield the rest."""
-                yield first_name, first_tensor
-                async for item in weight_aiter:
-                    yield item
-
-            offset = 0
-            bucket_meta: list[dict] = []
-            current_expert_layer: Optional[str] = None
-
-            def _get_expert_layer_prefix(weight_name: str) -> Optional[str]:
-                m = re.match(r'^(.*\.mlp\.experts)\.\d+\.', weight_name)
-                return m.group(1) if m else None
-
-            async def _flush_bucket(is_last: bool) -> None:
-                nonlocal offset, bucket_meta, current_expert_layer
-                if not bucket_meta and not is_last:
-                    return
-                if buffer.device.type != 'cpu':
-                    Torch.synchronize()
-                await loop.run_in_executor(
-                    None,
-                    _zmq_send_recv,
-                    {
-                        'bucket_meta': bucket_meta,
-                        'is_last': is_last,
-                    },
-                    'final bucket' if is_last else 'bucket flush',
-                )
-                offset = 0
-                bucket_meta = []
-                current_expert_layer = None
-
-            async for name, weight in _chain_first():
-                if use_shm and weight.device.type != 'cpu':
-                    weight = weight.cpu()
-                if not weight.is_contiguous():
-                    weight = weight.contiguous()
-
-                weight_u8 = weight.view(-1).view(torch.uint8)
-                total_nbytes = int(weight_u8.numel())
-                expert_layer_prefix = _get_expert_layer_prefix(name) if lora_mode else None
-                if lora_mode and offset > 0:
-                    # Keep each expert layer in an isolated bucket to avoid sending
-                    # partial expert-layer weights.
-                    if current_expert_layer != expert_layer_prefix:
-                        await _flush_bucket(is_last=False)
-                if lora_mode:
-                    current_expert_layer = expert_layer_prefix
-
-                chunk_offset = 0
-                while chunk_offset < total_nbytes:
-                    if offset >= bucket_size:
-                        await _flush_bucket(is_last=False)
-
-                    chunk_nbytes = min(bucket_size - offset, total_nbytes - chunk_offset)
-                    buffer[offset:offset + chunk_nbytes].copy_(
-                        weight_u8[chunk_offset:chunk_offset + chunk_nbytes],
-                        non_blocking=True,
-                    )
-                    bucket_meta.append({
-                        'name': name,
-                        'shape': weight.shape,
-                        'dtype': weight.dtype,
-                        'offset': offset,
-                        'nbytes': chunk_nbytes,
-                        'chunk_offset': chunk_offset,
-                        'total_nbytes': total_nbytes,
-                    })
-                    offset += chunk_nbytes
-                    chunk_offset += chunk_nbytes
-                n_weights += 1
-
-            # Send last bucket
-            await _flush_bucket(is_last=True)
-
-            # Wait for worker to finish loading
-            await worker_task
-        finally:
-            # Clean up — always release resources regardless of exceptions
-            if worker_task is not None and not worker_task.done():
-                worker_task.cancel()
-                with contextlib.suppress(BaseException):
-                    await worker_task
-            socket.close()
-            zmq_ctx.term()
-            if zmq_handle.startswith('ipc://'):
-                ipc_path = zmq_handle[len('ipc://'):]
-                try:
-                    if os.path.exists(ipc_path):
-                        os.remove(ipc_path)
-                except OSError:
-                    pass
-            del buffer
-            if shm is not None:
-                shm.close()
-                shm.unlink()
-                del shm
-            gc.collect()
-
-        elapsed = time.time() - start_time
-        mode = 'LoRA' if base_sync_done and peft_config else 'base'
-        logger.info(f'Updated {n_weights} {mode} weights via '
-                    f"{'IPC' if use_device_ipc else 'SHM'} in {elapsed:.2f}s")
+        sender = getattr(self, '_weight_sender', None)
+        if sender is None:
+            sender = self._weight_sender = VLLMWeightSender(self.engine)
+        await sender.update_weights(weights, **kwargs)
 
     async def shutdown(self) -> None:
         """Shutdown the vLLM engine and release all resources.
@@ -1208,9 +959,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         logger.info('Shutting down VLLMEngine...')
 
-        self._ipc_buffer = None
-        self._ipc_handle = None
-        self._ipc_buffer_size = 0
+        self._weight_sender = None
 
         if self.engine is not None:
             try:

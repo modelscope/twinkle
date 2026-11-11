@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
+import os
 import threading
 from contextlib import contextmanager
 from time import perf_counter
 from typing import List, Literal, Optional
 
-from twinkle.infra import get_worker_id
-
 from twinkle import Platform, get_logger
+from twinkle.infra import get_worker_id
 from .base import CheckpointEngine
 from .delta import DeltaSyncConfig, resolve_delta_engine_cls
 from .mixin import CheckpointEngineMixin
@@ -319,6 +319,8 @@ class CheckpointEngineManager:
         if self.mode == 'naive':
             self._sync_weights_naive(merge_and_sync)
             return
+        if self._sync_weights_direct_vllm(merge_and_sync):
+            return
 
         self._activate_checkpoint_channel()
         model_metadata = self.model.prepare_checkpoint_engine([True]
@@ -366,6 +368,55 @@ class CheckpointEngineManager:
             self.base_sync_done = True
             if not merge_and_sync:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    def _sync_weights_direct_vllm(self, merge_and_sync):
+        """Colocated full-weight path: trainer bucket -> vLLM TP workers.
+
+        LoRA-only updates, non-CUDA platforms and other sampler backends retain
+        the existing checkpoint-engine protocol. Physical UUIDs, rather than
+        inferred rank strides, also cover explicit/shared receiver subsets.
+        """
+        if (self.mode != 'colocate' or not merge_and_sync
+                or os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
+                or not hasattr(self.sampler, 'direct_weight_sync_metadata')
+                or not hasattr(self.model, 'direct_weight_sync_device')):
+            return False
+        replicas = self._sampler_call('direct_weight_sync_metadata')
+        if not isinstance(replicas, list) or not replicas or any(target is None for target in replicas):
+            return False
+        targets = [target for replica in replicas for target in (replica if isinstance(replica, list) else [replica])]
+        devices = self.model.direct_weight_sync_device()
+        receiver_devices = [target['device_uuid'] for target in targets]
+        if len(set(receiver_devices)) != len(receiver_devices):
+            raise ValueError('Direct vLLM receivers must have unique physical device UUIDs.')
+        if any(devices.count(device) != 1 for device in receiver_devices):
+            raise ValueError('Each direct vLLM receiver must share exactly one trainer device.')
+        if self.colocate_trainer_ranks is not None:
+            leaders = [replica[0] if isinstance(replica, list) else replica for replica in replicas]
+            actual = tuple(devices.index(target['device_uuid']) for target in leaders)
+            if actual != self.colocate_trainer_ranks:
+                raise ValueError('Direct vLLM receiver devices disagree with colocate_trainer_ranks.')
+        self._ensure_model_keys()
+        sender = self.model.send_weights_to_vllm(
+            targets, channel=self.channel, auth_key=self._auth_key,
+            base_sync_done=self.base_sync_done, model_keys=self._model_keys)
+        receiver = self._sampler_call(
+            'receive_weights_direct', targets, auth_key=self._auth_key, base_sync_done=self.base_sync_done)
+        error = None
+        for pending in (sender, receiver):
+            try:
+                pending()
+            except BaseException as failure:
+                # Collect both futures even on failure: explicit-lazy exclusive
+                # calls hold their configuration lock until collection.
+                if error is None:
+                    error = failure
+        if error is not None:
+            raise error
+        self.base_sync_done = True
+        logger.info('Direct colocated weight sync completed: %s vLLM workers (per-device trainer -> worker IPC).',
+                    len(targets))
+        return True
 
     def _prepare_delta_transport(self):
         capabilities = self.sampler.validate_delta_sampler(self.delta_config)

@@ -112,6 +112,49 @@ class TestPadSequenceToLength:
 
 class TestSelectiveLogSoftmax:
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason='Flash CE requires CUDA')
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    def test_flash_ce_forward_backward_and_shared_logits(self, dtype, monkeypatch):
+        from twinkle.utils.torch_utils import _flash_cross_entropy
+
+        if _flash_cross_entropy() is None:
+            pytest.skip('FlashAttention CE is unavailable')
+        monkeypatch.delenv('TWINKLE_DISABLE_FLASH_ATTN_CE', raising=False)
+        torch.manual_seed(42)
+        actual = torch.randn(2, 7, 4096, dtype=dtype, device='cuda', requires_grad=True)
+        with torch.no_grad():
+            actual[0, 0, 0] = 100.0
+            actual[0, 0, 1] = -0.3
+        reference = actual.detach().float().requires_grad_(True)
+        original = actual.detach().clone()
+        labels = torch.randint(4096, (2, 7), device='cuda')
+        labels[0, 0] = 1
+        logps = selective_log_softmax(actual, labels)
+        expected = reference.log_softmax(-1).gather(-1, labels[..., None]).squeeze(-1)
+        # A second branch uses the same logits: in-place CE backward would corrupt
+        # it (or trip an autograd version check) even though the main CE loss works.
+        (logps.mean() + 0.01 * actual.float().square().mean()).backward()
+        (expected.mean() + 0.01 * reference.square().mean()).backward()
+        assert logps.dtype == torch.float32
+        assert torch.allclose(logps, expected, atol=2e-5, rtol=2e-5)
+        assert torch.allclose(actual.grad.float(), reference.grad, atol=1e-4, rtol=1e-2)
+        assert torch.equal(actual.detach(), original)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA dispatch test')
+    def test_flash_ce_fallback_for_entropy_and_disable_switch(self, monkeypatch):
+        from twinkle.utils import torch_utils
+
+        def must_not_run():
+            pytest.fail('Flash CE must not be selected for this call')
+
+        monkeypatch.setattr(torch_utils, '_flash_cross_entropy', must_not_run)
+        logits = torch.randn(3, 20, device='cuda', requires_grad=True)
+        labels = torch.randint(20, (3,), device='cuda')
+        logps, entropy = selective_log_softmax(logits, labels, return_entropy=True)
+        (logps + entropy).sum().backward()
+        monkeypatch.setenv('TWINKLE_DISABLE_FLASH_ATTN_CE', '1')
+        assert selective_log_softmax(logits, labels).dtype == torch.float32
+
     def test_matches_naive_implementation(self):
         torch.manual_seed(42)
         logits = torch.randn(4, 20)

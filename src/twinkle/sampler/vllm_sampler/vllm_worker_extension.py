@@ -202,6 +202,24 @@ class TwinkleWorkerExtension:
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
 
+    def weight_sync_metadata(self):
+        """One endpoint per physical worker, cached across full-weight publications."""
+        if getattr(self, '_weight_sync_target', None) is None:
+            import uuid
+            device = getattr(self, 'device', None) or torch.device(Torch.get_device(self.local_rank))
+            self._weight_sync_target = {
+                'device_uuid': Platform.get_vllm_device_uuid(device.index),
+                'endpoint': f'ipc:///tmp/twinkle-direct-{uuid.uuid4().hex}.sock',
+            }
+        return self._weight_sync_target
+
+    def update_weights_direct(self, targets, auth_key='', base_sync_done=False):
+        target = next(row for row in targets
+                      if row['device_uuid'] == self.weight_sync_metadata()['device_uuid'])
+        return self.update_weights_from_ipc(
+            zmq_handle=target['endpoint'], auth_key=auth_key,
+            base_sync_done=base_sync_done, independent=True)
+
     @streaming_weight_sync()
     def update_weights_from_ipc(
         self,
@@ -209,6 +227,8 @@ class TwinkleWorkerExtension:
         base_sync_done: bool = False,
         use_shm: bool = False,
         zmq_handle: Optional[str] = None,
+        auth_key: str = '',
+        independent: bool = False,
     ) -> None:
         """Receive and load weights via ZMQ + device IPC/SHM.
 
@@ -217,10 +237,11 @@ class TwinkleWorkerExtension:
         in buckets over a ZMQ REQ/REP channel backed by device IPC
         (accelerator tensors) or shared memory (CPU tensors).
 
-        For TP > 1, only TP rank 0 communicates with the VLLMEngine over
+        In the shared-bucket path, only TP rank 0 communicates with the VLLMEngine over
         ZMQ.  It broadcasts the IPC handle and bucket metadata to other
         ranks via ``torch.distributed``, so every rank can read the shared
-        buffer and call ``load_weights`` for its own TP shard.
+        buffer and call ``load_weights`` for its own TP shard. ``independent=True``
+        instead connects each worker to its own colocated sender.
 
         Args:
             peft_config: If provided with base_sync_done, loads as LoRA.
@@ -230,6 +251,8 @@ class TwinkleWorkerExtension:
         """
         import torch.distributed as dist
         import zmq
+
+        from twinkle.checkpoint_engine.zmq_auth import recv_auth_pyobj
 
         if self.device is None:
             # fix: In some worker paths, omitting local_rank can pick the wrong device / trigger get_device arg issues.
@@ -247,7 +270,12 @@ class TwinkleWorkerExtension:
         except Exception:
             pass
 
-        is_driver = (tp_rank == 0)
+        # Per-worker direct senders use local IPC and need no TP control collectives.
+        if independent:
+            tp_size = 1
+        is_driver = independent or (tp_rank == 0)
+        borrow_bucket = (independent and not use_shm and not (peft_config and base_sync_done)
+                         and getattr(self, '_quant_reload_state', None) is None)
 
         if tp_size > 1:
             # Use vLLM's built-in TP cpu group for object broadcasts.
@@ -286,7 +314,7 @@ class TwinkleWorkerExtension:
 
         if is_driver:
             try:
-                comm_metadata = socket.recv_pyobj()
+                comm_metadata = recv_auth_pyobj(socket, auth_key)
             except zmq.error.Again as e:
                 raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting handle on {endpoint}') from e
         else:
@@ -294,6 +322,12 @@ class TwinkleWorkerExtension:
 
         if tp_size > 1:
             comm_metadata = _broadcast_obj(comm_metadata)
+
+        if isinstance(comm_metadata, dict) and comm_metadata.get('empty') is True:
+            if is_driver:
+                socket.send(b'')
+                socket.close()
+            return
 
         if not use_shm:
             handle = comm_metadata
@@ -338,7 +372,7 @@ class TwinkleWorkerExtension:
             # Only the driver receives bucket metadata from VLLMEngine.
             if is_driver:
                 try:
-                    metadata = socket.recv_pyobj()
+                    metadata = recv_auth_pyobj(socket, auth_key)
                 except zmq.error.Again as e:
                     raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting bucket metadata on {endpoint}') from e
             else:
@@ -365,6 +399,10 @@ class TwinkleWorkerExtension:
                 dtype = meta['dtype']
                 shape = meta['shape']
                 shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
+                if meta.get('handle') is not None:
+                    tensor = _rebuild_ipc(meta['handle'], self.device.index)
+                    weights.append((name, tensor))
+                    continue
                 offset = int(meta['offset'])
                 full_size = int(dtype.itemsize * shape.numel())
                 nbytes = int(meta.get('nbytes', full_size))
@@ -378,7 +416,9 @@ class TwinkleWorkerExtension:
                         cpu_u8 = raw_u8.clone()
                         tensor = cpu_u8.view(dtype=dtype).view(shape)
                     else:
-                        tensor = raw_u8.view(dtype=dtype).view(shape).clone()
+                        tensor = raw_u8.view(dtype=dtype).view(shape)
+                        if not borrow_bucket:
+                            tensor = tensor.clone()
                     weights.append((name, tensor))
                     continue
 
@@ -412,14 +452,23 @@ class TwinkleWorkerExtension:
                     if use_shm:
                         tensor = assembled
                     else:
-                        tensor = assembled.clone()
+                        tensor = assembled if borrow_bucket else assembled.clone()
                     weights.append((name, tensor))
                     del partial_tensors[name]
+
+            if borrow_bucket:
+                # The sender may overwrite its bucket as soon as it gets the ACK.
+                # Finish loading views (including asynchronous copies) BEFORE that ACK.
+                self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
 
             # Wait for this worker's own clones out of the shared buffer. Pass the device
             # explicitly: TP workers inherit the actor's LOCAL_RANK, so the default would
             # point at the wrong card.
             Torch.synchronize(self.device)
+            if borrow_bucket:
+                # Keep direct IPC mappings alive until queued device copies finish.
+                weights.clear()
+                tensor = assembled = raw_u8 = state = None
 
             # Every rank must finish reading before the driver acks: the ack lets the
             # sender overwrite the buffer with the next bucket.
@@ -431,8 +480,12 @@ class TwinkleWorkerExtension:
 
             if lora_mode:
                 lora_bucket_accum.extend(weights)
-            else:
+            elif not borrow_bucket:
                 self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+                if independent:
+                    # Quantized loaders may enqueue reads of direct IPC tensors.
+                    # Keep those mappings alive until their reads have completed.
+                    Torch.synchronize(self.device)
             del weights
 
             if metadata['is_last']:
@@ -446,6 +499,8 @@ class TwinkleWorkerExtension:
                         peft_config=peft_config,
                         base_sync_done=base_sync_done,
                     )
+                    if independent:
+                        Torch.synchronize(self.device)
                 break
 
         partial_tensors.clear()
@@ -470,9 +525,10 @@ class TwinkleWorkerExtension:
                 except BufferError as e:
                     logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
             del shm
-        gc.collect()
+        if not independent:
+            gc.collect()
+            Torch.empty_cache()
         Torch.ipc_collect()
-        Torch.empty_cache()
 
     def load_synced_weights(
         self,

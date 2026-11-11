@@ -136,6 +136,8 @@ class CheckpointEngineMixin:
         if self._checkpoint_engine_key in keys:
             self._checkpoint_engine = None
             self._checkpoint_engine_key = None
+        if backend in (None, 'ipc'):
+            (getattr(self, '_direct_vllm_senders', None) or {}).pop(channel, None)
 
     def _get_weight_generator(self, adapter_name=None, base_sync_done=False, merge_and_sync=False,
                               model_keys=None, **kwargs):
@@ -167,6 +169,61 @@ class CheckpointEngineMixin:
         raise NotImplementedError(
             f'{type(self).__name__} does not hold local weight shards: implement _get_local_state_dict '
             'on the class that receives EMA updates (see TransformersModel / MegatronModel).')
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    def direct_weight_sync_device(self):
+        """Physical identity used to pair a colocated sender with a vLLM receiver."""
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return Platform.get_vllm_device_uuid(torch.cuda.current_device())
+
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @timed
+    def send_weights_to_vllm(self, targets, *, channel='default', auth_key='',
+                             base_sync_done=False, model_keys=None):
+        """Stream full weights straight to vLLM, bypassing the sampler's data plane.
+
+        Every rank must consume the export generator, even those without a local
+        receiver: FSDP/TP export can contain collectives across all training ranks.
+        """
+        import torch
+
+        from twinkle.sampler.vllm_sampler.weight_transfer import VLLMWeightSender
+
+        device = self.direct_weight_sync_device()
+        target = next((row for row in targets if row['device_uuid'] == device), None)
+        weights = self._get_weight_generator(
+            base_sync_done=base_sync_done, merge_and_sync=True, model_keys=model_keys)
+        if target is None:
+            for _name, _tensor in weights:
+                pass
+            return
+        senders = getattr(self, '_direct_vllm_senders', None)
+        if senders is None:
+            senders = self._direct_vllm_senders = {}
+        sender = senders.setdefault(channel, VLLMWeightSender())
+        transfer_device = torch.device('cuda', torch.cuda.current_device())
+
+        # A Ray actor already has an asyncio loop. Keep the streaming exporter
+        # and its bucket handshakes on a dedicated thread, as send_weights does.
+        errors = []
+
+        def send():
+            try:
+                asyncio.run(sender.update_weights(
+                    weights, base_sync_done=base_sync_done,
+                    zmq_handle=target['endpoint'], auth_key=auth_key, device=transfer_device,
+                    direct_large_tensors=True))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
 
     @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     def send_weights(
