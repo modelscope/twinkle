@@ -277,7 +277,15 @@ class WorkerPool:
 
     @property
     def inflight_count(self):
-        return sum(self.worker_inflight(self.worker_ids()))
+        """In-flight sample calls.
+
+        ``inflight`` is the retired submit/collect ledger. The live ``sample()`` path
+        holds ``dispatching`` for the whole call, so a count of only ``inflight`` stays 0
+        and the scaler never sees load.
+        """
+        with self._worker_lock:
+            return sum(worker.inflight + worker.dispatching
+                       for worker in self._sampler_workers.values())
 
     def workers_idle(self, worker_ids):
         """Check control state only -- an actor is retired without reading generation output."""
