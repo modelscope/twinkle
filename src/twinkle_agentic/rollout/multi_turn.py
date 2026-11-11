@@ -870,7 +870,7 @@ class MultiTurnRollout(Rollout):
 
     # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
     # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch="all", collect="none", lazy_collect=False, control=True)
     def abort_all_inflight(self) -> None:
         """Abort every in-flight sampler generation so an in-place republish can resume them.
 
@@ -878,6 +878,8 @@ class MultiTurnRollout(Rollout):
         resumable on the fresh weights. Runs where the sampler handle is reachable --
         on a Ray proxy the driver instance has no sampler attribute, so the decorated
         dispatch is what carries the call to the worker that holds one.
+        This must bypass the generation-drain barrier: the call ends the in-flight
+        work that an ordinary RPC would first wait to finish naturally.
         """
         abort = getattr(getattr(self, "sampler", None), "abort_all_inflight", None)
         if not callable(abort):
