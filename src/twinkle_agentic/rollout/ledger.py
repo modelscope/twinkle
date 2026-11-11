@@ -335,6 +335,7 @@ class TurnLedger:
                 f"new_input_feature.input_ids for {self.label}; "
                 f"cannot continue multi-turn."
             )
+        messages, tools = self.messages, self.tools
         sampled_feature = _to_plain(dict(seq.new_input_feature))
         new_state = getattr(seq, "new_state", None)
         if new_state is not None:
@@ -345,6 +346,15 @@ class TurnLedger:
                 raise RuntimeError("sampler new_input_feature disagrees with RolloutState token accounting.")
             self._state = completion.state
         self._pif = sampled_feature
+        if len(self.messages) < len(messages) + 1:
+            current_messages = messages + [{'role': 'assistant', 'content': seq.decoded or ''}]
+            self._pif['messages'] = current_messages
+            if self._state is not None:
+                self._state = replace(self._state, messages=tuple(current_messages))
+        if not self.tools and tools:
+            self._pif['tools'] = tools
+            if self._state is not None:
+                self._state = replace(self._state, tools=tuple(tools))
         self._turns += 1
         self._extend_logprobs(seq)
         # The sampler's per-token sampling support set (sampling replay); banked per turn,

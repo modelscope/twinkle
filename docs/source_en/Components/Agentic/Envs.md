@@ -208,22 +208,62 @@ See [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployme
 
 ## AgentEnv: Firecracker microVM Sandboxes
 
-`AgentEnv` is a client-side `Env` over an [AgentENV](https://github.com/kvcache-ai/AgentENV) deployment, which runs Firecracker microVM sandboxes behind an E2B-compatible HTTP API. One sandbox is created per episode, giving the model **real operating-system semantics**: a genuine CPython interpreter, a writable filesystem, subprocesses, and `pip install`.
+`AgentEnv` uses the E2B SDK to operate remote sandboxes. It supports both **E2B's official cloud service** and a self-hosted [AgentENV](https://github.com/kvcache-ai/AgentENV) deployment. The official service needs no AgentENV gateway or client-side KVM setup. `reset()` creates a separate sandbox, `step()` executes tools, and `close()` releases it. Commands, files and subprocesses run remotely.
 
 Compared with the OpenEnv adapters:
 
 | | `OpenEnvClient` | `AgentEnv` |
 |---|---|---|
-| Isolation | Process / container | microVM (KVM), destroyed on teardown |
-| Executor | smolagents AST interpreter | Real CPython |
-| Memory per environment | KBs | ~1GB |
-| Files / pip / subprocesses | Not supported | Supported |
-| Transport | Persistent WebSocket | Stateless HTTP (E2B SDK) |
-| Prerequisites | An OpenEnv service | AgentENV server + a built template + `/dev/kvm`, kernel 6.8+ |
+| Isolation | Depends on the environment-server deployment | Provided by the sandbox provider |
+| Executor | Depends on the environment, such as a game or code executor | Real sandbox processes |
+| Memory per environment | Depends on the implementation | Depends on the provider / template |
+| Files / pip / subprocesses | Depend on the environment and exposed tools | Available through the SDK |
+| Transport | Persistent WebSocket | HTTP (E2B SDK) |
+| Prerequisites | An OpenEnv service | Official E2B account and key, or a self-hosted AgentENV service and template |
 
 OpenEnv's `coding_env` runs on smolagents' `LocalPythonExecutor`, **an AST interpreter rather than an OS-level sandbox**. It does not handle `decorator_list` at all, so **decorators are silently ignored**: `@patch` has no effect, the test does not error, and the reward comes out as a plausible-looking wrong number. Such silent errors are harder to diagnose than a crash. It is a good fit for enforcing an import allowlist, but not for executing adversarial code. When tests rely on decorators, or the model must write files, install packages, or spawn subprocesses, use `AgentEnv`.
 
-Three things must be in place before training (all one-time, outside the training loop): the AgentENV server is deployed, a template is built (`aenv pull ubuntu:22.04 --name my-env`), and `pip install 'e2b>=2.7'` has been run on the training side (2.7 is the first version that takes the endpoint as an argument rather than only from the environment).
+### Connect to official E2B
+
+From the repository root, select the `e2b` extra. It includes the validated E2B SDK and `python-dotenv` for loading `.env`:
+
+```bash
+pip install -e '.[e2b]'
+```
+
+Put the key in `.env` in the working directory and keep that file out of Git:
+
+```dotenv
+E2B_API_KEY=your_e2b_api_key
+```
+
+Leave `E2B_API_URL`, `E2B_SANDBOX_URL` and `E2B_DOMAIN` unset. Also omit the `api_url` / `sandbox_url` arguments so the SDK selects the official control and sandbox endpoints.
+
+First check create → execute → release independently. This needs neither a Twinkle training server nor a GPU:
+
+```python
+from dotenv import load_dotenv
+from twinkle_agentic.envs import AgentEnv
+
+load_dotenv('.env')
+env = AgentEnv(template='base', workspace='/home/user/twinkle', sandbox_timeout=180)
+try:
+    env.reset()
+    code, output = env.run_script('print("hello from E2B")')
+    if code != 0:
+        raise RuntimeError(output)
+    print(output.strip())
+finally:
+    env.close()
+```
+
+The official `base` template uses an unprivileged user. Use a writable directory such as `/home/user/twinkle` rather than copying `/workspace` from a self-hosted AgentENV example. Directory initialization or `setup_commands` failures raise; the caller remains responsible for closing an already-created sandbox.
+
+Once connected, follow the [E2B Blackjack training example in the client guide](../../Usage%20Guide/Server%20and%20Client/Twinkle-Client.md). Each trajectory gets a separate sandbox running the game; training and policy publication still run on the Twinkle server.
+
+### Connect to self-hosted AgentENV
+
+This route requires deploying AgentENV, building a template (for example, `aenv pull ubuntu:22.04 --name my-env`) and installing a compatible E2B SDK. Use the template, endpoints and authentication configured for your deployment; they are separate from the official E2B cloud settings.
 
 ```python
 from twinkle_agentic.envs import AgentEnv
@@ -233,24 +273,26 @@ env = AgentEnv(
     api_url='http://10.0.0.5:8000',        # Server or gateway; falls back to E2B_API_URL
     sandbox_timeout=600,                   # Must outlast one episode plus any test replay
 )
-env.reset()                                # Boots a fresh sandbox; the scheduler picks the node
-result = env.step('run_command', {'command': 'python -c "print(1 + 1)"'})
-print(result.observation)                  # '2'
-env.close()                                # Kills the sandbox
+try:
+    env.reset()                            # Boots a fresh sandbox; the scheduler picks the node
+    result = env.step('run_command', {'command': 'python -c "print(1 + 1)"'})
+    print(result.observation)              # '2'
+finally:
+    env.close()
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `template` | `str` | AgentENV template name/ID. Required — build it first via `aenv build` / `aenv pull`. |
-| `api_url` | `str` | Server or gateway base URL. Falls back to `E2B_API_URL`. |
-| `api_key` | `str` | Any non-empty string works, since AgentENV performs no authorization. Falls back to `E2B_API_KEY`, defaulting to `'dummy'`. |
+| `template` | `str` | Required provider template name/ID. The official example uses `base`; self-hosted AgentENV uses your own template. |
+| `api_url` | `str` | Self-hosted server / gateway URL. When omitted, the SDK uses its environment settings or official default. |
+| `api_key` | `str` | Explicit argument, then `E2B_API_KEY`. The adapter retains a `'dummy'` fallback, but official E2B requires a valid real key; self-hosted authentication depends on the deployment. |
 | `sandbox_url` | `str` | The data plane, for a deployment whose sandbox gateway answers on a different host than the API. Defaults to `api_url`. |
-| `sandbox_timeout` | `int` | Sandbox idle timeout in seconds, default 300. Idle sandboxes are **paused**, not killed, and auto-resume on access. |
+| `sandbox_timeout` | `int` | Sandbox timeout passed to the provider, in seconds; default 300. Pause/termination behavior depends on the provider. Do not assume automatic recovery; explicitly call `close()`. |
 | `command_timeout` | `int` | Per-command timeout in seconds, default 120. |
 | `setup_commands` | `List[str]` | Commands run once after each `reset`; their output becomes the reset observation. |
 | `sandbox_envs` | `Dict[str, str]` | Environment variables injected into the sandbox. |
 | `metadata` | `Dict[str, str]` | Sandbox metadata, visible in the list APIs — useful for tagging a run name or trajectory id. |
-| `refresh_timeout` | `bool` | Extend the timeout after every step, default `True`, so long episodes are not paused mid-flight. |
+| `refresh_timeout` | `bool` | Extend the timeout after every step, default `True`, to avoid expiry during long episodes. |
 | `include_default_tools` | `bool` | Expose the built-in `run_command` / `write_file` / `read_file`, default `True`. |
 
 ### Registering task tools
@@ -284,11 +326,11 @@ Additional capabilities:
 - `sandbox` / `sandbox_id`: the underlying E2B handle (giving access to PTY, file watching, and similar) and the current sandbox id.
 - Observations are truncated to 32K characters to keep a runaway command from blowing up the context.
 
-**Error handling and rewards**: `step` never raises. Tool errors come back as `observation='Error: ...'` with `done=False`, letting the rollout loop continue or the model recover, bounded by `max_turns`. The sandbox produces no reward — `evaluate` returns zeros by default — so score trajectories in the training loop, or subclass and override `step` / `evaluate`.
+**Error handling and rewards**: base `AgentEnv.step` returns ordinary tool errors as observations so the model can recover; initialization failures raise. `ensure_idle()` rejects resource reuse when remote completion is unknown. Task environments should also distinguish invalid model actions from infrastructure failures: E2B Blackjack aborts training on a failed game process rather than assigning a zero reward. `AgentEnv.evaluate` defaults to zero; tasks may provide environment rewards through `StepResult.reward` or use a separate scorer.
 
-**Concurrency**: unlike `OpenEnv` / `EnvPool`, `AgentEnv` is deliberately **not** a `@remote_class`. Sandbox placement, load balancing, pause/resume, and node failover are all handled server-side by AgentENV's gateway/scheduler/orchestrator, so the adapter is a stateless HTTP client that can be instantiated directly inside rollout workers. Do **not** wrap it in `EnvPool`. Because `reset()` blocks on a network call while a sandbox boots, create trajectories concurrently from a thread pool.
+**Concurrency**: `AgentEnv` is not a `@remote_class`; sandbox scheduling belongs to the connected provider. Give each concurrent trajectory its own instance. Do **not** put it in `EnvPool`, which serves embedded OpenEnv instances. `reset()` is a synchronous network call; account for initialization time as control-thread overhead rather than model-generation time.
 
-The primary capacity constraint is memory: concurrent sandboxes equal `batch_size x num_generations`, and each consumes the template's `--memory-mb` (the cookbook builds with `--memory-mb 1024`). See [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md) for the deployment steps, memory budget, and troubleshooting.
+Capacity depends on the scheduler's in-flight/buffer budget and the provider's concurrency, memory and billing quotas. The E2B streaming example defaults to `BUFFER_GROUPS × NUM_GENERATIONS = 12` sandboxes. Self-hosted AgentENV also requires checking template memory settings; see [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md).
 
 ## EnvPool: Distributed Environment Pool
 

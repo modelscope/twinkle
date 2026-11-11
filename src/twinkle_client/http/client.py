@@ -120,6 +120,7 @@ class ClientTransport:
         self._closed = False
         self._published = False
         self._capabilities: object | None = None
+        self._operation_scope = None
 
     @property
     def context(self) -> ClientContext:
@@ -194,10 +195,13 @@ class ClientTransport:
         self._ensure_open()
         if isinstance(data, (bytes, bytearray, memoryview)):
             raise TwinkleClientValidationError('Binary request bodies are not supported by this transport')
+        payload = to_wire_value(json_data or {})
+        if self._operation_scope is not None:
+            self._operation_scope.note_request(path_or_url)
         response = self._session.post(
             self.url(path_or_url),
             headers=self._headers(headers),
-            json=to_wire_value(json_data or {}),
+            json=payload,
             data=data,
             timeout=self._request_timeout(timeout),
         )
@@ -212,10 +216,13 @@ class ClientTransport:
         from twinkle_client._request_builder import request_json
         self._ensure_open()
         request_headers = {'content-type': 'application/json', **dict(headers or {})}
+        payload = request_json(body)
+        if self._operation_scope is not None:
+            self._operation_scope.note_request(path_or_url)
         response = self._session.post(
             self.url(path_or_url),
             headers=self._headers(request_headers),
-            data=request_json(body),
+            data=payload,
             timeout=self._request_timeout(timeout),
         )
         return _handle_response(response)

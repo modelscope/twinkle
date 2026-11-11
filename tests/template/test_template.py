@@ -67,6 +67,23 @@ def test_reasoning_state_comes_from_tokens_not_enable_flag():
     assert not template._reasoning_started(template.tokenizer.encode('plain prompt'))
 
 
+def test_append_feature_accepts_wire_shaped_batched_token_type_ids():
+    """The server-side append must preserve [1, T] after an HTTP sampler round trip."""
+    template = object.__new__(Template)
+    template.finalize_appended_features = lambda features: features
+    feature = {
+        'input_ids': [1, 2, 3],
+        'labels': [-100, -100, -100],
+        'completion_mask': [0, 0, 0],
+        'mm_token_type_ids': [[0, 0, 0]],
+    }
+
+    result = template._append_feature(feature, [4, 5])
+
+    assert result['mm_token_type_ids'].tolist() == [[0, 0, 0, 0, 0]]
+    assert feature['mm_token_type_ids'] == [[0, 0, 0]]
+
+
 def test_generic_template_infers_media_types_from_config_and_processor():
     template = object.__new__(Template)
     template.config = type('Config', (), {'image_token_id': 1, 'video_token_id': 2})()
@@ -96,6 +113,27 @@ def test_media_bundle_captures_top_level_and_inline_media():
     }
     assert MediaBundle.from_sources(top_level).images == ('a.png', )
     assert MediaBundle.from_sources(inline).images == ('b.png', )
+
+
+def test_encode_prompt_preserves_metadata_when_encode_consumes_sample():
+    template = object.__new__(Template)
+    template._engine_input_ids = lambda ids: ids
+    template._reasoning_started = lambda ids: False
+
+    def encode(sample, **kwargs):
+        sample.pop('messages')
+        sample.pop('tools')
+        return {'input_ids': [1], 'messages': [], 'tools': []}
+
+    template.encode = encode
+    messages = [{'role': 'user', 'content': 'question'}]
+    tools = [{'type': 'function', 'function': {'name': 'tool', 'parameters': {}}}]
+    sample = {'messages': messages, 'tools': tools}
+
+    encoding = template.encode_prompt(sample)
+
+    assert encoding.state.messages == tuple(messages)
+    assert encoding.state.tools == tuple(tools)
 
 
 def test_render_delta_normalizes_tool_calls_in_history():

@@ -5,7 +5,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -60,6 +60,40 @@ class SampleHandle:
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, SampleHandle) and self.submission_id == other.submission_id
+
+
+class _RolloutExecution:
+    """Process-local cooperative stop state for one blocking rollout call."""
+
+    def __init__(self) -> None:
+        self.cancel_event = threading.Event()
+        self._lock = threading.Lock()
+        self._first_error: BaseException | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    @property
+    def first_error(self) -> BaseException | None:
+        with self._lock:
+            return self._first_error
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def checkpoint(self) -> None:
+        """Reject the next operation after a cooperative stop was requested."""
+        with self._lock:
+            if self.cancel_event.is_set():
+                raise CancelledError()
+
+    def fail(self, error: BaseException) -> None:
+        with self._lock:
+            cooperative = isinstance(error, (CancelledError, InterruptedError)) and self.cancel_event.is_set()
+            if self._first_error is None and not cooperative:
+                self._first_error = error
+            self.cancel_event.set()
 
 
 class Rollout(ABC):
@@ -145,20 +179,45 @@ class Rollout(ABC):
         if n == 0:
             return []
 
+        execution = kwargs.pop('_execution', None) or _RolloutExecution()
         ctx = self._resolve_call(kwargs, n)
-        outs: List[Optional[Trajectory]] = [None] * n
+        ctx['_execution'] = execution
+        outs: list[Trajectory | None] = [None] * n
         workers = min(n, self.concurrency or n)
-        if workers == 1:
-            # No pool for a single episode: a thread would only make the
-            # traceback of a failing one harder to read.
-            outs = [self._run_one(trajectories[i], i, ctx) for i in range(n)]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(self._run_one, trajectories[i], i, ctx): i for i in range(n)}
-                for fut in as_completed(futures):
-                    outs[futures[fut]] = fut.result()
 
-        result: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
+        def run_one(index: int) -> Trajectory:
+            execution.checkpoint()
+            try:
+                return self._run_one(trajectories[index], index, ctx)
+            except Exception as error:
+                execution.fail(error)
+                raise
+
+        if workers == 1:
+            for index in range(n):
+                execution.checkpoint()
+                outs[index] = run_one(index)
+        else:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            futures: dict[Future, int] = {}
+            try:
+                for index in range(n):
+                    if execution.cancelled:
+                        break
+                    futures[pool.submit(run_one, index)] = index
+                for future in as_completed(futures):
+                    try:
+                        outs[futures[future]] = future.result()
+                    except Exception as error:
+                        execution.fail(error)
+            finally:
+                pool.shutdown(wait=True)
+
+        error = execution.first_error
+        if error is not None:
+            raise error
+        execution.checkpoint()
+        result: list[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
         if self.tracer is not None:
             self.tracer.write(result, global_step=kwargs.get('global_step'))
         return result

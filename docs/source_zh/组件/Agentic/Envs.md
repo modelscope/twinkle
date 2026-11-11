@@ -208,22 +208,62 @@ results = rollout(trajectories)
 
 ## AgentEnv：Firecracker microVM 沙箱
 
-`AgentEnv` 是面向 [AgentENV](https://github.com/kvcache-ai/AgentENV) 部署的客户端 `Env`，后者在 E2B 兼容的 HTTP API 之后运行 Firecracker microVM 沙箱。每个 episode 创建一个沙箱，为模型提供**真实的操作系统语义**：真 CPython 解释器、可写文件系统、子进程、`pip install`。
+`AgentEnv` 通过 E2B SDK 操作远端沙箱，既可连接 **E2B 官方云服务**，也可连接自建的 [AgentENV](https://github.com/kvcache-ai/AgentENV)。官方服务不要求你部署 AgentENV gateway，也不要求客户端具备 KVM。`reset()` 创建独立沙箱，`step()` 执行工具，`close()` 释放沙箱；命令、文件和子进程都在远端执行。
 
 与 OpenEnv 适配器的差异：
 
 | | `OpenEnvClient` | `AgentEnv` |
 |---|---|---|
-| 隔离 | 进程 / 容器 | microVM（KVM），销毁即清零 |
-| 执行器 | smolagents AST 解释器 | 真 CPython |
-| 单环境内存 | KB | ~1GB |
-| 文件 / pip / 子进程 | 不支持 | 支持 |
-| 传输 | 长连接 WebSocket | 无状态 HTTP（E2B SDK）|
-| 前置条件 | 一个 OpenEnv 服务 | AgentENV 服务端 + 已构建的模板 + `/dev/kvm`、内核 6.8+ |
+| 隔离 | 取决于环境服务的部署 | 由沙箱 provider 提供 |
+| 执行器 | 取决于具体环境，如游戏或代码执行器 | 沙箱中的真实进程 |
+| 单环境内存 | 取决于环境实现 | 取决于 provider / 模板配置 |
+| 文件 / pip / 子进程 | 取决于环境实现和暴露的工具 | SDK 提供这些能力 |
+| 传输 | 长连接 WebSocket | HTTP（E2B SDK）|
+| 前置条件 | 一个 OpenEnv 服务 | 官方 E2B 账户和密钥，或自建 AgentENV 服务和模板 |
 
 OpenEnv 的 `coding_env` 底层是 smolagents 的 `LocalPythonExecutor`，**一个 AST 解释器，而非操作系统级沙箱**。它对 `decorator_list` 没有任何处理，**装饰器会被静默忽略**——`@patch` 不生效、测试不报错，reward 产出一个形式正常的错误数值。这类隐形错误比崩溃难以定位。它适用于约束「仅允许 import 白名单」，不适用于执行对抗性代码。当测试依赖装饰器，或模型需要写文件、装包、开子进程时，使用 `AgentEnv`。
 
-训练前需具备三个条件（均为一次性工作，在训练循环之外完成）：AgentENV 服务端已部署、模板已构建（`aenv pull ubuntu:22.04 --name my-env`）、训练侧已执行 `pip install 'e2b>=2.7'`（2.7 起 SDK 才支持将端点作为参数传入，而非只能从环境变量读）。
+### 连接 E2B 官方服务
+
+在仓库根目录选择 `e2b` 可选依赖，它会一起安装已验证版本的 E2B SDK 和读取 `.env` 所需的 `python-dotenv`：
+
+```bash
+pip install -e '.[e2b]'
+```
+
+在运行目录的 `.env` 中设置密钥，文件不要提交到 Git：
+
+```dotenv
+E2B_API_KEY=your_e2b_api_key
+```
+
+使用官方服务时，保持 `E2B_API_URL`、`E2B_SANDBOX_URL`、`E2B_DOMAIN` 未设置，也不要手动传入 `api_url` / `sandbox_url`。让 SDK 选择官方控制面和沙箱地址。
+
+先单独检查“创建 → 执行 → 释放”，这一步不需要 Twinkle 训练服务或 GPU：
+
+```python
+from dotenv import load_dotenv
+from twinkle_agentic.envs import AgentEnv
+
+load_dotenv('.env')
+env = AgentEnv(template='base', workspace='/home/user/twinkle', sandbox_timeout=180)
+try:
+    env.reset()
+    code, output = env.run_script('print("hello from E2B")')
+    if code != 0:
+        raise RuntimeError(output)
+    print(output.strip())
+finally:
+    env.close()
+```
+
+官方 `base` 模板以普通用户运行，示例使用可写的 `/home/user/twinkle`；不要直接沿用自建 AgentENV 示例的 `/workspace`。初始化目录或 `setup_commands` 失败会抛出异常，调用方仍负责关闭已创建的沙箱。
+
+连通后，可运行 [客户端指引中的 E2B Blackjack 多轮训练示例](../../使用指引/服务端和客户端/Twinkle客户端.md)。它为每条轨迹创建一个 sandbox，游戏程序在 sandbox 中运行；训练和策略发布仍由 Twinkle 服务执行。
+
+### 连接自建 AgentENV
+
+这条路径才需要预先部署 AgentENV、构建模板（例如 `aenv pull ubuntu:22.04 --name my-env`），并安装兼容的 E2B SDK。模板名、端点和鉴权以你自己的部署为准；不要将这些配置套用到 E2B 官方云。
 
 ```python
 from twinkle_agentic.envs import AgentEnv
@@ -233,24 +273,26 @@ env = AgentEnv(
     api_url='http://10.0.0.5:8000',        # server 或 gateway；缺省读 E2B_API_URL
     sandbox_timeout=600,                   # 需大于单个 episode 加测试回放的耗时
 )
-env.reset()                                # 启动一个新沙箱，由 scheduler 选节点
-result = env.step('run_command', {'command': 'python -c "print(1 + 1)"'})
-print(result.observation)                  # '2'
-env.close()                                # 销毁沙箱
+try:
+    env.reset()                            # 启动一个新沙箱，由 scheduler 选节点
+    result = env.step('run_command', {'command': 'python -c "print(1 + 1)"'})
+    print(result.observation)              # '2'
+finally:
+    env.close()
 ```
 
 | 参数 | 类型 | 说明 |
 |-----------|------|-------------|
-| `template` | `str` | AgentENV 模板名/ID。必填——需先通过 `aenv build` / `aenv pull` 构建。 |
-| `api_url` | `str` | server 或 gateway 的基础 URL。缺省读 `E2B_API_URL`。 |
-| `api_key` | `str` | AgentENV 不做任何鉴权，任意非空字符串均可。缺省读 `E2B_API_KEY`，默认 `'dummy'`。 |
+| `template` | `str` | provider 的模板名/ID，必填。官方示例使用 `base`；自建 AgentENV 使用自行构建的模板。 |
+| `api_url` | `str` | 自建 server / gateway 的基础 URL。省略时交给 SDK 读取环境变量或使用官方默认地址。 |
+| `api_key` | `str` | 优先使用显式参数，再读 `E2B_API_KEY`。SDK 适配器保留 `'dummy'` 回退，但官方 E2B 必须使用真实有效密钥；自建部署的鉴权由其配置决定。 |
 | `sandbox_url` | `str` | 数据面地址，用于沙箱 gateway 与 API 不在同一主机的部署。缺省等于 `api_url`。 |
-| `sandbox_timeout` | `int` | 沙箱空闲超时（秒），默认 300。空闲沙箱会被**pause 而非销毁**，访问时自动恢复。 |
+| `sandbox_timeout` | `int` | 传给 provider 的沙箱超时秒数，默认 300。暂停或终止行为由 provider 决定，不应假设都能自动恢复；程序应主动 `close()`。 |
 | `command_timeout` | `int` | 单条命令超时（秒），默认 120。 |
 | `setup_commands` | `List[str]` | 每次 `reset` 后执行一次的命令，输出作为 reset 的 observation。 |
 | `sandbox_envs` | `Dict[str, str]` | 注入沙箱的环境变量。 |
 | `metadata` | `Dict[str, str]` | 沙箱元数据，在 list 接口中可见——适合标记运行名或轨迹 id。 |
-| `refresh_timeout` | `bool` | 每次 step 后延长超时，默认 `True`，避免长 episode 中途被 pause。 |
+| `refresh_timeout` | `bool` | 每次 step 后延长超时，默认 `True`，避免长 episode 中途到期。 |
 | `include_default_tools` | `bool` | 是否暴露内置的 `run_command` / `write_file` / `read_file`，默认 `True`。 |
 
 ### 注册任务工具
@@ -284,11 +326,11 @@ env.register_tool(submit_schema, _submit)      # 两者均返回 self，可链�
 - `sandbox` / `sandbox_id`：底层 E2B 句柄（可访问 PTY、文件 watch 等能力）与当前沙箱 id。
 - observation 默认截断到 32K 字符，避免失控的命令输出冲爆上下文。
 
-**错误处理与奖励**：`step` 不抛异常。工具错误以 `observation='Error: ...'` 且 `done=False` 的形式返回，使 rollout 循环可以继续、模型有机会自行恢复，重试次数由 `max_turns` 约束。沙箱本身不产生奖励（`evaluate` 默认返回 0），打分应在训练循环中完成，或子类化重载 `step` / `evaluate`。
+**错误处理与奖励**：基础 `AgentEnv.step` 将常规工具错误作为观察返回，让模型有机会恢复；初始化失败则直接抛出。远端执行是否结束未知时，`ensure_idle()` 拒绝复用资源。任务环境还应区分模型的无效操作与基础设施失败：E2B Blackjack 示例会让游戏进程失败中止训练，不会把它当作零奖励。`AgentEnv.evaluate` 默认返回 0；任务可以通过 `StepResult.reward` 提供环境奖励，或另行评分。
 
-**并发**：与 `OpenEnv` / `EnvPool` 不同，`AgentEnv` 有意**不**使用 `@remote_class`。沙箱的调度落位、负载均衡、pause/resume 与节点故障转移均由 AgentENV 的 gateway/scheduler/orchestrator 在服务端完成，因此该适配器是无状态 HTTP 客户端，可直接在 rollout worker 内实例化。**不要**将其放入 `EnvPool`。由于 `reset()` 会阻塞在启动沙箱的网络调用上，应用线程池并发创建轨迹。
+**并发**：`AgentEnv` 不使用 `@remote_class`；沙箱的调度由所连接的 provider 服务管理。每条并发轨迹使用独立实例，**不要**放入只服务嵌入式 OpenEnv 的 `EnvPool`。`reset()` 是同步网络调用，初始化耗时应计入控制线程开销；不要把它计作模型生成时间。
 
-主要的容量约束是内存：并发沙箱数等于 `batch_size x num_generations`，每个占用模板的 `--memory-mb`（cookbook 构建时使用 `--memory-mb 1024`）。部署步骤、内存预算与故障排查见[Agentic RL 部署与训练](../../使用指引/Agentic%20RL部署与训练.md)。
+容量取决于调度器的在途/缓冲预算及 provider 的并发、内存和费用额度。E2B 流式示例默认预算为 `BUFFER_GROUPS × NUM_GENERATIONS = 12` 个 sandbox；自建 AgentENV 则还需核对模板的内存配置。自建部署步骤见[Agentic RL 部署与训练](../../使用指引/Agentic%20RL部署与训练.md)。
 
 ## EnvPool：分布式环境池
 

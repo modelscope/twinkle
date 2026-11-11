@@ -156,6 +156,8 @@ class InputProcessor:
                 elif (isinstance(value, list)) and key in ("completion_mask", "mm_token_type_ids", "routed_experts"):
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
+                    if value is None:
+                        continue
                     if not isinstance(value[0], torch.Tensor):
                         value = [torch.tensor(v) for v in value]
                         value = torch.cat(value, dim=0)
@@ -164,6 +166,11 @@ class InputProcessor:
                     if value.dim() == 1:
                         value = value.unsqueeze(0)
                 _input[key] = value
+            if self.framework == 'megatron' and _input.get('position_ids') is None:
+                input_ids = _input.get('input_ids')
+                if input_ids is not None:
+                    _input['position_ids'] = torch.arange(
+                        input_ids.shape[-1], device=input_ids.device).unsqueeze(0)
             return _input
 
         return [to_tensor(_input) for _input in inputs]

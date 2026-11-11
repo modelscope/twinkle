@@ -84,9 +84,10 @@ def train():
 
     # Step 5: training loop. task='reranker' returns one score per pair.
     for step in range(MAX_STEPS):
-        output = model.forward_backward(inputs=batch, task='reranker')
+        model.forward_backward(inputs=batch, task='reranker')
         model.clip_grad_and_step(max_grad_norm=1.0)
-        logger.info(f'Step {step}: loss={output.result["loss"]:.4f}')
+        metric = model.calculate_metric(is_training=True)
+        logger.info(f'Step {step}: {metric.result}')
 
     # Step 6: relevant documents should now score higher, then save the adapter.
     scores = model.forward_only(inputs=batch, task='reranker', return_logits=True).result['logits']
