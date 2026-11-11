@@ -253,3 +253,25 @@ def test_group_pull_cap_requires_complete_training_and_generation_quanta(cap):
 def test_custom_pull_rule_cannot_silently_ignore_a_cap():
     with pytest.raises(ValueError, match='built-in group_pull'):
         _driver(max_rows_per_pull=4)
+
+
+@pytest.mark.parametrize('cap', [True, 12.0, '12'])
+def test_pull_cap_rejects_non_integer_counts_before_iteration(cap):
+    with pytest.raises(TypeError, match='integer trajectory count'):
+        _driver(num_generations=3, need_rows=4, group_pull=True, assembly_ready=None, max_rows_per_pull=cap)
+
+
+def test_capped_group_pull_preserves_siblings_and_pending_score_barrier():
+    # Completion order is interleaved; one otherwise complete group is still being scored.
+    records = [BufferRecord(sample=object(), version=0, group_key=key)
+               for key in ('a', 'b', 'c', 'a', 'b', 'c')]
+    records[0].score_ref = object()
+    driver = _driver(num_generations=2, need_rows=2, group_pull=True, assembly_ready=None,
+                     max_rows_per_pull=2, buffer_depth=6)
+    selected = driver._assembly_ready(records)
+    assert selected == [records[1], records[4]]
+    assert len(records) == 6
+    remaining = [record for record in records if record not in selected]
+    assert driver._assembly_ready(remaining) == [records[2], records[5]]
+    records[0].score_ref = None
+    assert driver._assembly_ready(remaining) == [records[0], records[3]]

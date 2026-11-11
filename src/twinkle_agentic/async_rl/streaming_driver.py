@@ -233,6 +233,8 @@ class StreamingDriver:
         if max_rows_per_pull is not None:
             if group_pull is None or need_rows is None or assembly_ready is not None:
                 raise ValueError('max_rows_per_pull requires a built-in group_pull rule and need_rows.')
+            if isinstance(max_rows_per_pull, bool) or not isinstance(max_rows_per_pull, int):
+                raise TypeError('max_rows_per_pull must be an integer trajectory count.')
             if num_generations <= 0:
                 raise ValueError(f'num_generations must be positive, got {num_generations}')
             import math
@@ -1278,8 +1280,8 @@ class StreamingDriver:
     def request_publish(self, push: Optional[Callable[[Any], Optional[str]]] = None) -> None:
         """Signal that the just-trained weights should be published at the next pass boundary.
 
-        ``push(window) -> Optional[str]`` is the CALLER's weight sync: it aborts any
-        in-flight generation and overwrites the sampler's weights (in-place, returning ``None``), or saves a
+        ``push(window) -> Optional[str]`` is the CALLER's weight sync: it pauses generation,
+        overwrites the sampler's weights and resumes only on success (in-place, returning ``None``), or saves a
         new adapter snapshot (returning its path). Omitting ``push`` selects the default built from
         ``snapshot_model`` (:meth:`_default_publish_push`); :attr:`no_push` is the explicit no-op for a
         caller that already pushed the weights itself. The driver does NOT store it and does NOT decide

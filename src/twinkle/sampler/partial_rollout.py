@@ -126,10 +126,10 @@ class PartialRolloutMixin:
     def abort_all_inflight(self) -> dict[str, int]:
         """Abort every in-flight generation on this DP worker (called on an in-place weight republish).
 
-        The abort coroutines must run on the engine's own loop, so this schedules ``_abort_all_inflight``
-        there and blocks the actor thread on it -- the same loop/thread split the rest of the submission
-        API uses, and blocking here is what makes the republish wait until no generation is mid-decode
-        before the weights are overwritten.
+        Waits for abort requests to be issued on the engine's own loop. This does not
+        close the retry gate: partial rollouts may immediately start another attempt.
+        Use ``pause_generation`` before an in-place weight transfer, then resume only
+        after that transfer succeeds.
         """
         future = asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop)
         return {'aborted': future.result()}
