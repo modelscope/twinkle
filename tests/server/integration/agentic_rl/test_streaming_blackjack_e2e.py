@@ -35,9 +35,30 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     from twinkle_client.sampler.vllm_sampler import vLLMSampler
 
     path = Path(__file__).parents[4] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
+    monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('streaming_blackjack_e2e', path)
     recipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(recipe)
+    e2b_envs, e2b_sandboxes = [], []
+    if os.environ.get('TWINKLE_TEST_E2B') == '1':
+        env_spec = importlib.util.spec_from_file_location(
+            'e2b_blackjack_recipe', path.with_name('e2b_multi_turn_grpo.py'))
+        env_recipe = importlib.util.module_from_spec(env_spec)
+        env_spec.loader.exec_module(env_recipe)
+
+        class TracedE2BEnv(env_recipe.E2BBlackjackEnv):
+            def __init__(self, seed):
+                super().__init__(seed)
+                e2b_envs.append(self)
+
+            def reset(self, trajectory=None):
+                result = super().reset(trajectory)
+                e2b_sandboxes.append(self.sandbox)
+                return result
+
+        monkeypatch.setattr(recipe, 'BlackjackEnv', TracedE2BEnv)
+        recipe.BUFFER_GROUPS = 2
+        recipe.MAX_GROUPS = 8  # Bound cloud usage; passing still requires updates, publication and new-policy sampling.
     # Leave an update beyond the first bufferful so stopping cannot skip publication.
     recipe.MAX_STEPS = recipe.BUFFER_GROUPS + 1
     saved, requests, training = [], [], []
@@ -83,6 +104,11 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     monkeypatch.setattr(MultiLoraTransformersModel, 'forward_backward', backward)
     monkeypatch.setattr(MultiLoraTransformersModel, 'clip_grad_and_step', step)
     recipe.train()
+
+    if e2b_envs:
+        assert all(env.sandbox_id is None for env in e2b_envs), 'A trajectory retained its E2B sandbox'
+        assert all(not sandbox.is_running() for sandbox in e2b_sandboxes), 'An E2B sandbox is still running'
+        record_property('released_e2b_sandboxes', len(e2b_sandboxes))
 
     assert steps > 0, 'No nonzero-advantage group completed an optimizer update'
     assert steps <= recipe.MAX_STEPS

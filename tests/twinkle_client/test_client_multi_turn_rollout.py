@@ -1116,6 +1116,42 @@ def test_streaming_scope_preserves_primary_and_unknown_resources():
         rollout.drain()
 
 
+@pytest.mark.parametrize('unknown', [False, True])
+def test_resource_scope_uses_actual_rollout_settlement_before_release(unknown):
+    from types import SimpleNamespace
+
+    from twinkle_client.resources import RolloutResources
+
+    class FailingSampler:
+        def sample(self, *args, **kwargs):
+            raise ConnectionError('unknown remote generation')
+
+    released = []
+    client = SimpleNamespace(close=lambda: released.append('client'))
+    env = SimpleNamespace(ensure_idle=lambda: None, close=lambda: released.append('env'))
+
+    def run():
+        with RolloutResources(lambda: client) as resources:
+            resources.own_environment(env)
+            rollout = resources.own_rollout(ClientMultiTurnRollout(
+                FailingSampler() if unknown else _Sampler(((30, 'stop'),)), _Template()))
+            handle = rollout.admit(_trajectory()['messages'])
+            _wait_for_handle(rollout, handle)
+            rollout.collect(handle)
+            # No driver context was entered: setup itself failed after admission.
+            raise ValueError('driver setup failed')
+
+    if unknown:
+        with pytest.raises(ConnectionError, match='unknown remote') as error:
+            run()
+        assert released == []
+        assert any('resource cleanup' in note for note in error.value.__notes__)
+    else:
+        with pytest.raises(ValueError, match='driver setup failed'):
+            run()
+        assert released == ['env', 'client']
+
+
 def test_drain_waits_for_admission_already_in_progress(monkeypatch):
     rollout = ClientMultiTurnRollout(_Sampler(((30, 'stop'),)), _Template())
     starting, release, waiting = threading.Event(), threading.Event(), threading.Event()
@@ -1147,12 +1183,13 @@ def test_drain_waits_for_admission_already_in_progress(monkeypatch):
     assert rollout.stop(handle.submission_id) is True
 
 
-def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger():
+def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger(monkeypatch):
     import importlib.util
     from pathlib import Path
     from twinkle_agentic.tools.tool_manager import ToolManager
 
     path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
+    monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('blackjack_sdk_test', path)
     recipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(recipe)
@@ -1168,7 +1205,7 @@ def test_blackjack_tool_actions_flow_through_http_adapter_and_ledger():
         raise AssertionError('no nonterminal hit hand found')
     env = recipe.BlackjackEnv(seed)
     initial = env.reset()
-    tool = env.play_tool()
+    tool = recipe.EnvTool.from_schemas(env, env.tools())[0]
     manager = ToolManager([tool])
 
     class Template(_Template):

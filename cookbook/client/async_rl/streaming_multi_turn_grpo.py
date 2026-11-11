@@ -3,16 +3,17 @@
 
 Reuses the embedded OpenEnv/OpenSpiel game from client/twinkle/multi_turn_rollout.py.
 No environment server, generated-code execution or custom verifier is needed.
-MultiTurnRollout owns the model/tool loop; no external Agent harness is used.
+Start with train() for setup and _train_loop() for the training steps.
+Use e2b_multi_turn_grpo.py to run the same game inside E2B sandboxes.
 """
 from __future__ import annotations
-
-import json
 import math
 import os
 import uuid
 
 import dotenv
+import json
+from blackjack_game import BlackjackTask
 from peft import LoraConfig
 
 from twinkle import get_logger, init_twinkle_client
@@ -22,7 +23,7 @@ from twinkle.template import Qwen3_5Template
 from twinkle_agentic.async_rl import StreamingDriver
 from twinkle_agentic.envs import EnvTool, OpenEnv
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.operations import SequentialOperations
+from twinkle_client.resources import RolloutResources
 from twinkle_client.rollout import ClientMultiTurnRollout
 
 dotenv.load_dotenv('.env')
@@ -30,23 +31,15 @@ logger = get_logger()
 MODEL_ID = 'ms://' + os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
 ADAPTER_NAME = 'streaming-blackjack'
-RUN_ID = f'blackjack-{uuid.uuid4().hex[:12]}'
 NUM_GENERATIONS = 4
-TRAIN_BATCH_GROUPS = 1
 BUFFER_GROUPS = 3
-# Leave enough finite draws for sampling to continue after the first publish.
-MAX_GROUPS = 16
-MAX_STEPS = 2
-MAX_STALENESS = 1
+MAX_GROUPS = 16  # Finite prompt-group attempts, including skipped groups.
+MAX_STEPS = 2  # Optimizer-update budget; a short run may use fewer steps.
+MAX_STALENESS = 1  # Allow samples from at most one published policy behind.
 BASE_SEED = 20261109
 
-SYSTEM_PROMPT = (
-    'Play Blackjack. Use play(action="hit") to draw or play(action="stand") to stop. '
-    'Try to get close to 21 without going over; an ace counts as 1 or 11. '
-    'After the game ends, give a short final answer without more tool calls.')
 
-
-class BlackjackEnv(OpenEnv):
+class BlackjackEnv(BlackjackTask, OpenEnv):
     """Existing game with readable cards and an episode-local chance RNG."""
 
     def __init__(self, seed):
@@ -59,13 +52,6 @@ class BlackjackEnv(OpenEnv):
     @staticmethod
     def _action(tool_name, arguments):
         return {'action_id': {'hit': 0, 'stand': 1}[arguments['action']], 'game_name': 'blackjack'}
-
-    def play_tool(self):
-        return EnvTool(self, tool_name='play', description='Take the next Blackjack action.', parameters={
-            'type': 'object',
-            'properties': {'action': {'type': 'string', 'enum': ['hit', 'stand']}},
-            'required': ['action'],
-        })
 
     @staticmethod
     def _describe(result):
@@ -86,43 +72,52 @@ class BlackjackEnv(OpenEnv):
         return self._describe(super().step(tool_name, arguments))
 
 
-def _identity_sampling_params(seed=None):
+def _grpo_sampling_params(seed=None):
     # Shared processed-logprobs must match raw training logits.
     return SamplingParams(max_tokens=256, seed=seed, temperature=1.0, top_p=1.0,
                           top_k=-1, repetition_penalty=1.0, logprobs=1, num_samples=1)
 
 
-def _build_driver(rollout, initial_uri):
+def _build_driver(rollout, initial_uri, resources, env_factory=None):
+    """Adapt Blackjack to the driver; env_factory selects the game's execution backend."""
     episodes = {}  # Reward access only; SDK owns handles, admission and draining.
+    env_factory = env_factory or BlackjackEnv
 
     def submit(ref, trajectory_idx, policy):
         # Equal chance seeds within a group; separate model seeds allow exploration.
-        env = BlackjackEnv(ref.row['seed'])
+        env = resources.own_environment(env_factory(ref.row['seed']))
         initial = env.reset()
-        tool = env.play_tool()
+        tools = EnvTool.from_schemas(env, env.tools())
+        if len(tools) != 1 or tools[0].tool_info()['function']['name'] != 'play':
+            raise ValueError('Blackjack expects a single play tool; adapt submit/collect for a different task')
+        tool = tools[0]
         manager = ToolManager([tool])
         handle = rollout.admit(
-            [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': initial.observation}],
+            [{'role': 'system', 'content': env.system_prompt}, {'role': 'user', 'content': initial.observation}],
             trajectory_idx, prompt_idx=ref.ordinal,
-            sampling_params=_identity_sampling_params(BASE_SEED + ref.ordinal * NUM_GENERATIONS + trajectory_idx),
+            sampling_params=_grpo_sampling_params(BASE_SEED + ref.ordinal * NUM_GENERATIONS + trajectory_idx),
             prompt_extras={'tools': manager.tool_infos()}, tool_manager=manager,
             adapter_path=policy.adapter_path, policy_version=policy.version)
-        episodes[handle.submission_id] = tool
+        episodes[handle.submission_id] = (env, tool)
         return handle
 
     def collect(handle):
         sample = rollout.collect(handle)
-        tool = episodes.pop(handle.submission_id)
+        env, tool = episodes.pop(handle.submission_id)
         # Answering without finishing the game is not a successful episode.
         sample.truncated = sample.truncated or not tool.done
         sample.orm_reward = [tool.episode_reward]
+        if tool.last_result is not None and tool.last_result.info.get('error'):
+            sample.rollout_infos['error'] = tool.last_result.info['error']
+        resources.close_environment(env)
         return sample
 
     return StreamingDriver(
         prompt_stream=[{'seed': BASE_SEED + index} for index in range(MAX_GROUPS)],
         num_generations=NUM_GENERATIONS,
-        group_pull=True, need_rows=TRAIN_BATCH_GROUPS * NUM_GENERATIONS,
-        groups_per_partition=TRAIN_BATCH_GROUPS, buffer_depth=BUFFER_GROUPS * NUM_GENERATIONS,
+        # Pull one complete group for each training iteration.
+        group_pull=True, need_rows=NUM_GENERATIONS,
+        groups_per_partition=1, buffer_depth=BUFFER_GROUPS * NUM_GENERATIONS,
         rollout=rollout, submit=submit, collect=collect,
         version_control=True, initial_adapter_path=lambda: initial_uri, max_staleness=MAX_STALENESS,
         # No snapshot_model: the driver leaves server checkpoints untouched.
@@ -150,7 +145,8 @@ def _validate_group(group):
     return None
 
 
-def _training_groups(samples, advantage_fn):
+def _complete_groups(samples):
+    """Keep complete, single-policy groups; invalid rollout data fails loudly."""
     groups = {}
     for sample in samples:
         groups.setdefault(sample.group_key, []).append(sample)
@@ -159,24 +155,21 @@ def _training_groups(samples, advantage_fn):
         if reason:
             logger.info(f'skip group={group[0].group_key}: {reason}')
             continue
-        advantages = advantage_fn([s.orm_reward[0] for s in group],
-                                  num_generations=NUM_GENERATIONS, scale='group').tolist()
-        if any(abs(value) > 1e-8 for value in advantages):
-            yield group, advantages
-        else:
-            logger.info(f'skip group={group[0].group_key}: zero advantage')
+        yield group
 
 
-def _train_loop(driver, model, operations):
+def _train_loop(driver, model, operations, checkpoint_prefix):
+    """Complete groups -> GRPO advantages -> backward/step -> publish -> acknowledge."""
     confirmed_steps = 0
     advantage_fn = GRPOAdvantage()
 
-    def updated(_result):
+    def record_step(_result):
+        # Count a confirmed update even if the caller is interrupted while waiting.
         nonlocal confirmed_steps
         confirmed_steps += 1
 
     def publish(_window):
-        name = f'{RUN_ID}-policy-{driver.stats.publishes + 1}'
+        name = f'{checkpoint_prefix}-policy-{driver.stats.publishes + 1}'
         saved = operations.run(model.save, name, save_optimizer=False)
         logger.info(f'published {saved.twinkle_path}')
         return saved.twinkle_path
@@ -184,15 +177,20 @@ def _train_loop(driver, model, operations):
     try:
         for samples in driver:
             steps = 0
-            for group, advantages in _training_groups(samples, advantage_fn):
+            for group in _complete_groups(samples):
                 if confirmed_steps >= MAX_STEPS:
                     logger.info('remaining groups dropped: update budget reached')
                     break
+                rewards = [sample.orm_reward[0] for sample in group]
+                advantages = advantage_fn(rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+                if not any(abs(value) > 1e-8 for value in advantages):
+                    logger.info(f'skip group={group[0].group_key}: zero advantage')
+                    continue
                 operations.run(model.forward_backward, inputs=[s.encoded for s in group],
                                advantages=advantages, old_logps=[s.rollout_logprobs for s in group])
-                operations.run(model.clip_grad_and_step, max_grad_norm=1.0, on_result=updated)
+                operations.run(model.clip_grad_and_step, max_grad_norm=1.0, on_result=record_step)
                 steps += 1
-                logger.info(f'step={confirmed_steps} rewards={[s.orm_reward[0] for s in group]} '
+                logger.info(f'step={confirmed_steps} rewards={rewards} '
                             f'metrics={operations.run(model.calculate_metric, is_training=True)}')
             if steps and confirmed_steps < MAX_STEPS:
                 driver.request_publish(publish)
@@ -201,15 +199,17 @@ def _train_loop(driver, model, operations):
         logger.info(f'confirmed_steps={confirmed_steps} committed_steps={driver.stats.optimizer_steps}')
 
 
-def train():
-    operations, clients = SequentialOperations(), []
-    rollout = None
-    primary, issues = None, []
-    try:
-        client = operations.run(init_twinkle_client, on_result=clients.append)
+def train(env_factory=None):
+    """Run training with a Blackjack Env exposing system_prompt, tools(), reset() and step()."""
+    # Automatic checkpoint names only: this is not a tenant/session ID or a sampling seed.
+    checkpoint_prefix = f'blackjack-{uuid.uuid4().hex[:12]}'
+    with RolloutResources(init_twinkle_client) as resources:
+        client, operations = resources.client, resources.operations
+        # 1. Connect to the training model and sampling model on the same server.
         model = operations.run(client.model, MODEL_ID)
         sampler = operations.run(client.sampler, MODEL_ID)
-        operations.run(model.add_adapter_to_model, ADAPTER_NAME, LoraConfig(target_modules='all-linear', r=8, lora_alpha=32))
+        operations.run(model.add_adapter_to_model, ADAPTER_NAME,
+                       LoraConfig(target_modules='all-linear', r=8, lora_alpha=32))
         operations.run(model.set_loss, 'GRPOLoss', epsilon=0.2, beta=0.0)
         operations.run(model.set_optimizer, 'Adam', lr=2e-5)
         operations.run(model.set_processor, 'InputProcessor')
@@ -217,33 +217,14 @@ def train():
         operations.run(sampler.set_template, 'Qwen3_5Template', model_id=TEMPLATE_MODEL_ID, enable_thinking=False)
         template = operations.run(Qwen3_5Template, model_id=TEMPLATE_MODEL_ID, max_length=4096, enable_thinking=False)
         template.truncation_strategy = 'delete'
-        initial = operations.run(model.save, f'{RUN_ID}-policy-0', save_optimizer=False)
-        rollout = ClientMultiTurnRollout(sampler, template, adapter_name=ADAPTER_NAME,
-                                       sampling_params=_identity_sampling_params(), max_turns=12,
-                                       max_trajectory_tokens=4096)
-        # SDK owns cancellation/draining; the training steps stay visible above.
-        with rollout.streaming(_build_driver(rollout, initial.twinkle_path)) as driver:
-            _train_loop(driver, model, operations)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        try:
-            operations.close()
-        except BaseException as error:
-            issues.append(error)
-        if clients and (rollout is None or rollout.is_idle):
-            try:
-                clients[0].close()
-            except BaseException as error:
-                issues.append(error)
-        elif clients:
-            issues.append(RuntimeError('rollout execution is unconfirmed; transport retained'))
-        if primary is not None:
-            for issue in issues:
-                primary.add_note(f'cleanup: {issue}')
-        elif issues:
-            raise BaseExceptionGroup('client cleanup failed', issues)
+        # 2. Freeze policy-0; every trajectory uses one immutable policy URI.
+        initial = operations.run(model.save, f'{checkpoint_prefix}-policy-0', save_optimizer=False)
+        rollout = resources.own_rollout(ClientMultiTurnRollout(
+            sampler, template, adapter_name=ADAPTER_NAME, sampling_params=_grpo_sampling_params(),
+            max_turns=12, max_trajectory_tokens=4096))
+        # 3. The driver yields complete groups; the SDK drains rollout on exit.
+        with rollout.streaming(_build_driver(rollout, initial.twinkle_path, resources, env_factory)) as driver:
+            _train_loop(driver, model, operations, checkpoint_prefix)
 
 
 if __name__ == '__main__':

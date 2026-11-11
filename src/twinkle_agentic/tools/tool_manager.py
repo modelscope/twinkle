@@ -213,7 +213,12 @@ class ToolManager:
                 for i, _name, _args in batched:
                     out[i] = failure
                 return ['' if x is None else x for x in out]
-            for (i, _name, _args), r in zip(batched, results):
+            from twinkle_agentic.envs.env_tool import EnvTool
+
+            for (i, name, _args), r in zip(batched, results):
+                tool = self._tools[name]
+                if isinstance(tool, EnvTool):
+                    tool.last_result = r
                 out[i] = r.observation if hasattr(r, 'observation') else str(r)
             return ['' if x is None else x for x in out]
 

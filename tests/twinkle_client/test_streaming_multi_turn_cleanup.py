@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Streaming training and embedded Blackjack, without a model service."""
-import importlib.util
 import contextlib
+import importlib.util
 import subprocess
 import sys
 import threading
@@ -10,14 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle_agentic.rollout.multi_turn import RolloutSample
 from twinkle_agentic.rollout.base import SampleHandle
+from twinkle_agentic.rollout.multi_turn import RolloutSample
 from twinkle_client.operations import SequentialOperations
 
 
 @pytest.fixture
-def recipe():
+def recipe(monkeypatch):
     path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
+    monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('streaming_blackjack_recipe', path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -77,12 +78,12 @@ def test_variable_pull_zero_advantage_budget_and_publish(recipe):
     ])
     model, operations = Model(), SequentialOperations()
     try:
-        recipe._train_loop(driver, model, operations)
+        recipe._train_loop(driver, model, operations, 'test-run')
     finally:
         operations.close()
     assert driver.commits == [1, 1]
     assert driver.stats.optimizer_steps == 2
-    assert driver.published == [f'twinkle://{recipe.RUN_ID}-policy-1']
+    assert driver.published == ['twinkle://test-run-policy-1']
     assert [call for call in model.calls if call[0] == 'step'] == [('step', 1), ('step', 1)]
 
 
@@ -93,7 +94,7 @@ def test_mixed_or_truncated_groups_are_not_trained(recipe):
     model, operations = Model(), SequentialOperations()
     driver = Driver([mixed + truncated])
     try:
-        recipe._train_loop(driver, model, operations)
+        recipe._train_loop(driver, model, operations, 'test-run')
     finally:
         operations.close()
     assert driver.commits == [0]
@@ -114,7 +115,7 @@ def test_save_failure_never_commits_a_publish(recipe):
     driver = Driver([group('a', [1, -1, 1, -1])])
     try:
         with pytest.raises(RuntimeError, match='save failed'):
-            recipe._train_loop(driver, model, operations)
+            recipe._train_loop(driver, model, operations, 'test-run')
     finally:
         operations.close()
     assert driver.stats.publishes == 0
@@ -127,6 +128,11 @@ def test_blackjack_same_seed_same_initial_state_and_independent_progress(recipe)
         initial = a.reset()
         assert initial.observation == b.reset().observation
         assert 'Your cards:' in initial.observation
+        assert a.system_prompt == b.system_prompt
+        tools = a.tools()
+        assert tools[0]['function']['name'] == 'play'
+        tools[0]['function']['parameters']['properties']['action']['enum'].append('cheat')
+        assert b.tools()[0]['function']['parameters']['properties']['action']['enum'] == ['hit', 'stand']
         result = a.step('play', {'action': 'stand'})
         assert result.done
         assert result.reward in (-1, 0, 1)
@@ -138,9 +144,9 @@ def test_blackjack_same_seed_same_initial_state_and_independent_progress(recipe)
 
 
 def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, monkeypatch):
-    seeds, calls = [], []
+    seeds, calls, closed = [], [], []
 
-    class Env(recipe.BlackjackEnv):
+    class Env(recipe.BlackjackTask):
         def __init__(self, seed):
             seeds.append(seed)
 
@@ -149,10 +155,15 @@ def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, mon
 
         def step(self, name, arguments):
             from twinkle_agentic.envs.base import StepResult
+            if arguments.get('action') == 'fail':
+                return StepResult(observation='failed', info={'error': 'game process failed'})
             return StepResult(observation='game over', done=True, reward=-1)
 
         def ensure_idle(self):
             pass
+
+        def close(self):
+            closed.append(self)
 
     class Rollout:
         def admit(self, prompt, trajectory_idx, **kwargs):
@@ -167,24 +178,128 @@ def test_driver_uses_environment_reward_and_rejects_unfinished_games(recipe, mon
             return group('a', [0, 0, 0, 0])[int(handle.submission_id)]
 
     monkeypatch.setattr(recipe, 'BlackjackEnv', Env)
-    driver = recipe._build_driver(Rollout(), 'policy-0')
+    resources = recipe.RolloutResources(lambda: SimpleNamespace(close=lambda: None))
+    driver = recipe._build_driver(Rollout(), 'policy-0', resources)
     ref = SimpleNamespace(ordinal=0, row={'seed': 123})
     policy = SimpleNamespace(adapter_path='policy-0', version=0)
     h0, h1 = driver._submit(ref, 0, policy), driver._submit(ref, 1, policy)
     assert seeds == [123, 123]
     assert calls[0][0] == calls[1][0]
+    assert calls[0][1]['tool_manager'].tool_infos() == recipe.BlackjackTask().tools()
     assert calls[0][1]['sampling_params'].seed != calls[1][1]['sampling_params'].seed
     calls[0][1]['tool_manager']({'function': {'name': 'play', 'arguments': {'action': 'stand'}}})
     assert driver._collect(h0).orm_reward == [-1]
     assert driver._collect(h1).truncated
+    assert len(closed) == 2
+    assert not resources._environments
+    h2 = driver._submit(ref, 2, policy)
+    calls[2][1]['tool_manager']({'function': {'name': 'play', 'arguments': {'action': 'fail'}}})
+    failed = driver._collect(h2)
+    with pytest.raises(RuntimeError, match='game process failed'):
+        recipe._validate_group([failed])
+    assert len(closed) == 3 and not resources._environments
     assert driver._version_control is True
     assert driver._initial_adapter_path() == 'policy-0'
     assert driver._consume is None
     driver.abort()
+    resources.close()
+
+
+def test_failed_environment_setup_remains_owned_for_cleanup(recipe):
+    class Env(recipe.BlackjackTask):
+        def __init__(self, seed):
+            pass
+
+        def reset(self):
+            raise RuntimeError('setup failed')
+
+        def ensure_idle(self):
+            pass
+
+        def close(self):
+            pass
+
+    resources = recipe.RolloutResources(lambda: SimpleNamespace(close=lambda: None))
+    rollout = SimpleNamespace(poll=lambda handles: [])
+    driver = recipe._build_driver(rollout, 'policy-0', resources, Env)
+    try:
+        with pytest.raises(RuntimeError, match='setup failed'):
+            driver._submit(SimpleNamespace(ordinal=0, row={'seed': 123}), 0, None)
+        assert len(resources._environments) == 1
+    finally:
+        driver.abort()
+        resources.close()
+    assert not resources._environments
+
+
+@pytest.mark.parametrize('contract', ['empty', 'multiple', 'renamed'])
+def test_blackjack_rejects_other_tool_contracts_without_admission(recipe, contract):
+    closed, admitted = [], []
+
+    class Env(recipe.BlackjackTask):
+        def __init__(self, seed):
+            pass
+
+        def reset(self):
+            return SimpleNamespace(observation='cards')
+
+        def tools(self):
+            if contract == 'empty':
+                return []
+            tools = super().tools()
+            if contract == 'multiple':
+                extra = super().tools()[0]
+                extra['function']['name'] = 'inspect_hand'
+                return tools + [extra]
+            tools[0]['function']['name'] = 'other'
+            return tools
+
+        def step(self, name, arguments):
+            raise AssertionError('invalid task contract must not execute tools')
+
+        def ensure_idle(self):
+            pass
+
+        def close(self):
+            closed.append(self)
+
+    rollout = SimpleNamespace(poll=lambda handles: [], admit=lambda *a, **k: admitted.append(True))
+    with recipe.RolloutResources(lambda: SimpleNamespace(close=lambda: None)) as resources:
+        driver = recipe._build_driver(rollout, 'policy-0', resources, Env)
+        try:
+            with pytest.raises(ValueError, match='adapt submit/collect'):
+                driver._submit(SimpleNamespace(ordinal=0, row={'seed': 1}), 0, None)
+        finally:
+            driver.abort()
+    assert admitted == [] and len(closed) == 1
+
+
+@pytest.mark.parametrize('response', [(1, 'game process failed'), (0, 'invalid JSON')])
+def test_e2b_process_failure_is_retained_instead_of_becoming_zero_reward(recipe, monkeypatch, response):
+    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/e2b_multi_turn_grpo.py'
+    spec = importlib.util.spec_from_file_location('e2b_recipe', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv('E2B_API_KEY', 'unit-test-key')
+    env = module.E2BBlackjackEnv(42)
+    commands = []
+    env.run_script = lambda *a, **k: (commands.append(a) or response)
+    tool = recipe.EnvTool.from_schemas(env, env.tools())[0]
+    from twinkle_agentic.tools.tool_manager import ToolManager
+
+    manager = ToolManager([tool])
+    assert [item['function']['name'] for item in manager.tool_infos()] == ['play']
+    call = {'function': {'name': 'play', 'arguments': {'action': 'stand'}}}
+    manager.call_many([call, call])
+    assert tool.last_result.info['error']
+    assert not tool.done
+    assert len(commands) == 1  # An infrastructure failure stays failed, even if the model retries.
 
 
 def test_streaming_import_does_not_load_tq(recipe):
     code = '''import importlib.abc, importlib.util, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
 class BlockTQ(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname in {'transfer_queue', 'tensordict'} or fullname.startswith('twinkle_agentic.async_rl.pipelineTQ'):
@@ -227,12 +342,12 @@ def test_new_uri_is_used_by_later_groups(recipe):
         initial_adapter_path=lambda: 'policy-0', prune=lambda: None, consume=None, max_steps=2)
     operations = SequentialOperations()
     try:
-        recipe._train_loop(driver, Model(), operations)
+        recipe._train_loop(driver, Model(), operations, 'test-run')
     finally:
         driver.abort()
         operations.close()
     assert driver.stats.optimizer_steps == 2
-    assert [path for ordinal, path in admitted if ordinal == 1] == [f'twinkle://{recipe.RUN_ID}-policy-1'] * 4
+    assert [path for ordinal, path in admitted if ordinal == 1] == ['twinkle://test-run-policy-1'] * 4
 
 
 def test_complete_train_keeps_configuration_and_closes_client(recipe, monkeypatch):
@@ -252,6 +367,9 @@ def test_complete_train_keeps_configuration_and_closes_client(recipe, monkeypatc
     class Rollout:
         is_idle = True
 
+        def drain(self):
+            pass
+
         @contextlib.contextmanager
         def streaming(self, value):
             assert value is driver
@@ -264,8 +382,14 @@ def test_complete_train_keeps_configuration_and_closes_client(recipe, monkeypatc
     recipe.train()
     assert closed == [True]
     assert driver.commits == [1]
-    assert [name for action, name in model.calls if action == 'save'] == [
-        f'{recipe.RUN_ID}-policy-0', f'{recipe.RUN_ID}-policy-1']
+    names = [name for action, name in model.calls if action == 'save']
+    prefix = names[0].removesuffix('-policy-0')
+    assert prefix.startswith('blackjack-')
+    assert names == [f'{prefix}-policy-0', f'{prefix}-policy-1']
+    # Reusing the imported recipe starts a new run, not another policy-0 at the old URI.
+    recipe.train()
+    later = [name for action, name in model.calls if action == 'save'][2:]
+    assert len(later) == 2 and set(names).isdisjoint(later)
 
 
 def test_other_episode_progresses_while_training_waits_for_commit(recipe):
