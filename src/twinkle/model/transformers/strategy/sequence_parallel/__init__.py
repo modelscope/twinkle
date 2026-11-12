@@ -608,6 +608,8 @@ class SequenceParallel:
             if attention_mask is None:
                 batch_size = 1
             else:
+                if attention_mask.dim() != 2:
+                    raise ValueError('SP MoE auxiliary loss requires a 2D attention mask')
                 batch_size = attention_mask.shape[0]
 
             assert router_logits[0].shape[0] % batch_size == 0
@@ -623,10 +625,19 @@ class SequenceParallel:
                 _gathered_logits.append(_bs_logits)
             router_logits = torch.stack(_gathered_logits, dim=0)
             if attention_mask is not None:
-                # The HF auxiliary loss consumes the global padded mask after this hook.
-                # Keep router rows in the same layout, including masked padding rows.
-                if attention_mask.dim() != 2 or router_logits.shape[2] != attention_mask.shape[-1]:
-                    raise ValueError('SP router logits must align with the global 2D attention mask')
+                # Text inputs expose the padded mask; deferred multimodal inputs
+                # retain the original mask outside the text forward boundary.
+                if router_logits.shape[2] != attention_mask.shape[-1] and self.real_position_ids is not None:
+                    positions = self.real_position_ids
+                    # Remove only SP-added padding, keeping the batch's own masked
+                    # positions. Ring padding can occur between packed sequences.
+                    indices = torch.arange(positions.shape[-1], device=positions.device).expand_as(positions)
+                    indices = self.pad(indices, padding_value=-1, position_ids=positions)
+                    router_logits = router_logits[:, :, indices[0] >= 0, :]
+                if router_logits.shape[2] != attention_mask.shape[-1]:
+                    raise ValueError(
+                        f'SP router sequence length {router_logits.shape[2]} must match '
+                        f'attention mask length {attention_mask.shape[-1]}')
             elif self.real_position_ids is not None:
                 # Packed batches have no mask; remove SP padding, including Ring gaps.
                 positions = self.pad(self.real_position_ids, padding_value=-1,
