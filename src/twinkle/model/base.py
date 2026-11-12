@@ -478,6 +478,38 @@ class TrainableModel(ABC):
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
 
+    # Shared by backend subclasses, including those with independent constructors.
+    _dp_balance_backend = None
+    _dp_balance_enabled = True
+
+    def _init_dp_balance(self, enabled: bool = True) -> None:
+        self._dp_balance_enabled = bool(enabled)
+        self._dp_balance_off = not enabled
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def _dp_balance_spec(self, adapter_name: str | None = None, loss_key: str | None = None) -> dict[str, Any]:
+        """What the driver needs to plan a DP-balanced order for ``forward_backward`` / ``forward_only``."""
+        from twinkle.loss.base import dp_balance_group_size
+        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
+        try:
+            group_size = dp_balance_group_size(optimizer_config.get_loss(loss_key))
+        except ValueError:
+            # The call itself will fail on this loss_key; nothing tells which samples belong together.
+            group_size = None
+        text_config = self.hf_config.get_text_config() if hasattr(self.hf_config, 'get_text_config') else self.hf_config
+        return {
+            'enabled': getattr(self, '_dp_balance_enabled', True),
+            'padding_free': bool(getattr(optimizer_config.processor, 'padding_free', False)),
+            'hidden_size': getattr(text_config, 'hidden_size', None),
+            'group_size': group_size,
+            'backend': self._dp_balance_backend,
+            'variable_seq_lengths': getattr(self, 'variable_seq_lengths', True),
+            'sequence_multiple': (2 * (self.device_mesh.cp_world_size or 1)
+                                  if (self.device_mesh.cp_world_size or 1) > 1 else
+                                  (self.device_mesh.tp_world_size or 1)
+                                  if self.device_mesh.sequence_parallel else 1),
+        }
+
     def _dp_balance_call(self, method: str, args: tuple, kwargs: Dict[str, Any]):
         """Driver side of ``remote_function(dp_balance=True)``.
 
@@ -491,15 +523,15 @@ class TrainableModel(ABC):
         mesh = getattr(self, 'device_mesh', None)
         if mesh is None or mesh.data_world_size <= 1:
             return None
-        lengths = call_lengths(args, kwargs)
-        if lengths is None:
-            return None
         spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
         if not spec['enabled']:
             # Fixed at construction, so later calls skip the blocking spec round trip.
             self._dp_balance_off = True
             return None
         if spec['group_size'] is None:
+            return None
+        lengths = call_lengths(args, kwargs)
+        if lengths is None:
             return None
         plan = plan_call(lengths, mesh.data_world_size, spec, kwargs)
         if plan is None:
@@ -517,9 +549,15 @@ class TrainableModel(ABC):
         send every per-sample output back to the rank that holds its input. Each decision below is made
         alike on all ranks, from configuration or gathered data, so the collectives never diverge.
         """
+        original_run = run
+
+        def run(*call_args, **call_kwargs):
+            call_kwargs.pop('input_lengths', None)
+            return original_run(*call_args, **call_kwargs)
+
         import torch.distributed as dist
         from .dp_balance import call_leaves, call_lengths, exchange_call, leaf_layout, plan_call, restore_rank_outputs
-        from .dp_balance import to_cpu
+        from .dp_balance import normalize_rank_output, to_cpu
         mesh = getattr(self, 'device_mesh', None)
         if (getattr(self, '_dp_balance_off', False) or mesh is None or mesh.data_world_size <= 1
                 or not dist.is_initialized()
@@ -553,6 +591,8 @@ class TrainableModel(ABC):
         rank_leaves = all_gather(to_cpu(call_leaves(args, kwargs)))
         args, kwargs = exchange_call(plan, rank_leaves, mesh.data_rank, args, kwargs)
         output = run(*args, **dict(kwargs, _dp_balance=balance))
+        if spec.get('backend') == 'megatron':
+            output = normalize_rank_output(output, len(lengths))
         return restore_rank_outputs(output, all_gather(to_cpu(output)), plan, mesh.data_rank)
     def upload_to_hub(self,
                       checkpoint_dir: str,

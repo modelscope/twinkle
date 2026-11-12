@@ -50,8 +50,6 @@ class TransformersModel:
   约束：生效的`output_dtype`必须与`param_dtype`一致（或缺省），否则构造时抛出`ValueError`——两者不一致会在FSDP单元边界引入dtype转换，梯度检查点重算时张量dtype不一致会导致训练报错；`reduce_dtype`只作用于梯度归约，不受该约束。
 - grad_scaler_config: PyTorch的grad_scaler初始化配置，参见：[PyTorch的GradScaler构造](https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/grad_scaler.py#L25)
 - memory_efficient_init: 是否启用FSDP内存高效初始化。启用后仅rank 0加载完整权重，其余rank通过广播获取分片参数，降低初始化阶段的内存和显存峰值。默认`False`。注意：该优化目前仅适用于 transformers <= 4.57.6；对于 transformers >= 5.0.0，可能会导致负面性能影响。
-- dp_balance: 是否均衡各DP rank的计算量，默认`True`。Ray模式下，`forward_backward` / `forward_only`把batch切给各DP rank之前，driver会重排batch，使每个rank样本数不变、计算量接近（用与worker相同的micro-batch规划来估算）。每个样本对应的参数（`old_logps`、`advantages`等）随之一起重排，返回的输出会还原为调用方的顺序。local（torchrun）模式下每个rank只持有自己那份数据，各rank会先汇总序列长度、用同样的方法规划，再互换样本，算完把每个样本的输出送回持有它的rank。仅对样本在等大小rank之间移动时梯度权重不变的loss配置启用均衡，其他loss保持原始切分。训练指标会多出`dp_balance/*`（均衡前后的负载不均衡度、各rank token数、micro-batch数和padding比例）。支持的安全配置包括普通GRPO、PPO sequence-mean、CE sum和BNPO global。成对或分组的loss会保持组内样本在一起（`dp_balance_group_size`：不带辅助SFT的DPO、SimPO和reward loss为2，不带KL的REAL为`num_generations`）。按rank局部token求均值的loss（包括PPO token-mean、BNPO micro、CE mean和蒸馏）、依赖batch统计的目标以及未声明支持的自定义loss会跳过均衡。
-  不带micro-batch的`forward_only`重排后，按样本的loss参数应传给`forward_only`，随后使用相同`loss_key`的`calculate_loss`会复用这些已对齐的参数。`calculate_loss`会拒绝新传入的list、tuple、非标量Tensor/数组及嵌套batch数据。带micro-batch的`forward_only`重排后，因缓存仅包含最后一个micro-batch，不支持单独调用`calculate_loss`；完整训练batch请使用`forward_backward`。设为`False`则保持原始切分。
 - kwargs:
   - 如果你不希望传递模型config字段，可以把零星的配置从这里放置进去。后续这些参数会传递到`from_pretrained`或者`from_config`中。
 
@@ -84,3 +82,5 @@ for data in dataloader:
 对于全参训练，恢复模型权重时需要在创建 `TransformersModel` 时直接把 checkpoint 路径传给 `model_id`，例如 `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`，随后再调用 `resume_from_checkpoint(...)` 恢复优化器和训练进度。
 
 如果需要完整的断点续训流程，包括 dataloader 跳过已消费数据的逻辑，建议直接参考 `cookbook/transformers/fsdp2.py`。
+
+DP 负载均衡由 TrainableModel 统一实现，默认 `dp_balance=True`；详见[公共设计与适用条件](DPBalance.md)。

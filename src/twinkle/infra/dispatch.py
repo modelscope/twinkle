@@ -770,7 +770,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     replay: bool = False,
                     worker_selector: Optional[str] = None,
                     stash: Optional[Sequence[Union[int, str]]] = None,
-                    dp_balance: bool = False):
+                    dp_balance: bool | None = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -834,11 +834,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             whole. The caller's collect then materialises only the rest of the container, and the
             next remote call dereferences the stashed references at its worker. Local mode has no
             remote path, so the natural value passes through untouched.
-        dp_balance: Only with ``dispatch='slice_dp'``. Before slicing, the driver asks the instance's
+        dp_balance: Only with ``dispatch='slice_dp'``. None automatically enables the
+            TrainableModel hook for forward_only/forward_backward, including subclass overrides. Before slicing, the driver asks the instance's
             ``_dp_balance_call(name, args, kwargs)`` for a ``DPBalancePlan`` that evens out the
             per-rank workload, reorders the batch-aligned arguments with it, and puts the
-            batch-aligned fields of the collected result back in the caller's order. Calls whose
-            arguments hold object refs are dispatched unchanged. In local mode, where each rank holds
+            batch-aligned fields of the collected result back in the caller's order. Lists of
+            per-sample object refs may carry input_lengths metadata; only rank-local refs are resolved
+            at the workers. Opaque whole-batch refs without a safe alignment contract are unchanged. In local mode, where each rank holds
             only its own slice, the instance's ``_dp_balance_local(run, args, kwargs)`` runs the call
             instead and swaps samples between the ranks.
 
@@ -880,6 +882,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
+                balance_enabled = (dp_balance if dp_balance is not None else
+                                   func.__name__ in ('forward_only', 'forward_backward'))
                 worker_ids = kwargs.pop('_worker_ids', None)
                 dispatch_context = kwargs.pop('_dispatch_context', None)
                 session_ids = kwargs.pop('_session_ids', None)
@@ -908,9 +912,16 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         raise ValueError(f'{func.__name__}: no in-flight request for sticky key '
                                          f'{_sticky_key_value!r}')
                 if infra._mode == 'local':
-                    balance_local = getattr(self, '_dp_balance_local', None) if dp_balance else None
-                    if balance_local is not None and dispatch == 'slice_dp':
-                        return balance_local(functools.partial(func, self), args, kwargs)
+                    balance_local = getattr(self, '_dp_balance_local', None) if balance_enabled else None
+                    if (balance_local is not None and dispatch == 'slice_dp'
+                            and not getattr(self, '_dp_balance_running', False)):
+                        self._dp_balance_running = True
+                        try:
+                            return balance_local(functools.partial(func, self), args, kwargs)
+                        finally:
+                            self._dp_balance_running = False
+                    if balance_enabled:
+                        kwargs.pop('input_lengths', None)
                     return func(self, *args, **kwargs)
                 elif infra._mode == 'ray':
                     check_unsafe(*args, **kwargs)
@@ -918,23 +929,28 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         # This is the worker
                         from ._ray import RayHelper
                         if RayHelper.has_ref(args, kwargs):
-                            # In this case, driver dispatch is all, redispatch here
+                            # Planned calls already carry a rank-local shard; only resolve its refs.
+                            # Unplanned opaque calls still materialize and redispatch here.
+                            pre_sliced = '_dp_balance' in kwargs
                             args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                            if dispatch_context is None:
-                                world_size = Platform.get_world_size()
-                                rank = Platform.get_rank()
-                                workers = _get_workers([None] * world_size, execute)
-                                local_dispatch = dispatch
-                                local_mesh = device_mesh
-                            else:
-                                world_size, rank, subset = dispatch_context
-                                workers = [None] * world_size
-                                local_dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
-                                                  if subset and dispatch == 'slice_dp' else dispatch)
-                                local_mesh = None if subset else device_mesh
-                            _workers_and_args = _dispatch_args(
-                                workers, local_dispatch, execute, local_mesh, args, kwargs)
-                            _, args, kwargs = _workers_and_args[rank]
+                            if not pre_sliced:
+                                if dispatch_context is None:
+                                    world_size = Platform.get_world_size()
+                                    rank = Platform.get_rank()
+                                    workers = _get_workers([None] * world_size, execute)
+                                    local_dispatch = dispatch
+                                    local_mesh = device_mesh
+                                else:
+                                    world_size, rank, subset = dispatch_context
+                                    workers = [None] * world_size
+                                    local_dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
+                                                      if subset and dispatch == 'slice_dp' else dispatch)
+                                    local_mesh = None if subset else device_mesh
+                                _workers_and_args = _dispatch_args(
+                                    workers, local_dispatch, execute, local_mesh, args, kwargs)
+                                _, args, kwargs = _workers_and_args[rank]
+                        if balance_enabled:
+                            kwargs.pop('input_lengths', None)
                         result = func(self, *args, **kwargs)
                         if isinstance(result, Future):
                             # A worker method may hand back a plain Future (an engine-side async
@@ -1020,15 +1036,18 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                                            _rgt,
                                                            on_dispatched=_finish_dispatch, session_ids=session_ids)
                         _call_collect = collect
-                        if (dp_balance and _dispatch == 'slice_dp' and not _subset
-                                and not RayHelper.has_ref(args, kwargs)):
+                        _balanced_dispatch = False
+                        if balance_enabled and _dispatch == 'slice_dp' and not _subset:
                             balance_call = getattr(self, '_dp_balance_call', None)
                             balanced = balance_call(func.__name__, args, kwargs) if balance_call else None
                             if balanced is not None:
+                                _balanced_dispatch = True
                                 _plan, args, kwargs = balanced
                                 if _plan is not None:
                                     _call_collect = _collect_in_input_order(collect, _plan)
-                        if RayHelper.has_ref(args, kwargs):
+                        if balance_enabled:
+                            kwargs.pop('input_lengths', None)
+                        if RayHelper.has_ref(args, kwargs) and not _balanced_dispatch:
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
                             _workers_and_args = [

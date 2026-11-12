@@ -35,7 +35,6 @@ from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, Sampl
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
-from twinkle.loss.base import dp_balance_group_size
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.state_dict_utils import normalize_adapter_keys
@@ -255,6 +254,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     If model_id is passed in, `from_pretrained` will be used, else `__init__` will be used.
     """
 
+    _dp_balance_backend = 'transformers'
+
     @overload
     def __init__(self, *, model_cls: Type[PreTrainedModel], config: PretrainedConfig, remote_group, **kwargs) -> None:
         ...
@@ -302,7 +303,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self._default_tokenizer = None
         self.device_mesh = device_mesh
         # Read through _dp_balance_spec: reorder slice_dp batches to even out DP workloads.
-        self._dp_balance_enabled = dp_balance
+        self._init_dp_balance(dp_balance)
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
@@ -1092,7 +1093,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
     # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
     # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, dp_balance=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
@@ -1725,7 +1726,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             **kwargs,
         )
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, dp_balance=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     @timed
     def forward_backward(
         self,
@@ -2653,23 +2654,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.require_finalized('calculate metrics')
         return optimizer_config.calculate_metrics(is_training)
-
-    @remote_function(execute='first', collect='first', lazy_collect=False)
-    def _dp_balance_spec(self, adapter_name: Optional[str] = None, loss_key: Optional[str] = None) -> Dict[str, Any]:
-        """What the driver needs to plan a DP-balanced order for ``forward_backward`` / ``forward_only``."""
-        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
-        try:
-            group_size = dp_balance_group_size(optimizer_config.get_loss(loss_key))
-        except ValueError:
-            # The call itself will fail on this loss_key; nothing tells which samples belong together.
-            group_size = None
-        text_config = self.hf_config.get_text_config() if hasattr(self.hf_config, 'get_text_config') else self.hf_config
-        return {
-            'enabled': getattr(self, '_dp_balance_enabled', False),
-            'padding_free': bool(getattr(optimizer_config.processor, 'padding_free', False)),
-            'hidden_size': getattr(text_config, 'hidden_size', None),
-            'group_size': group_size,
-        }
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'

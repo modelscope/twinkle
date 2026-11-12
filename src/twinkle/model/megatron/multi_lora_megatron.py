@@ -91,8 +91,10 @@ class MultiLoraMegatronModel(MegatronModel):
         task: Optional[str] = None,
         task_head_loader: Optional[tuple] = None,
         num_labels: Optional[int] = None,
+        dp_balance: bool = True,
         **kwargs,
     ):
+        self._init_dp_balance(dp_balance)
         requires('megatron_core')
         new_special_tokens = kwargs.pop('new_special_tokens', None)
         if new_special_tokens:

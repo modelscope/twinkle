@@ -28,3 +28,5 @@ class MultiLoraMegatronModel:
 正因如此，用户的r必须要小于等于max_r的配置，在实际训练时仅会使用lora的部分rank参与计算。
 
 MultiLoraMegatronModel支持`@remote_class`注解，并且支持device_mesh，这意味着它可以运行在ray的worker中。
+
+DP 负载均衡由 TrainableModel 统一实现，默认 `dp_balance=True`；详见[公共设计与适用条件](DPBalance.md)。

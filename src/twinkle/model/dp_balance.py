@@ -175,31 +175,90 @@ def call_lengths(args: tuple, kwargs: dict[str, Any]) -> list[int] | None:
     if kwargs.get("return_logits"):
         # Raw logits of packed inputs are laid out per rank, so they cannot be put back in order.
         return None
-    if not isinstance(inputs, list) or not inputs or not all(
-        isinstance(model_input, dict) and "input_ids" in model_input for model_input in inputs
-    ):
-        # Trajectories, packed rows and group rows: their lengths are only known after encoding.
+    if not isinstance(inputs, list) or not inputs:
         return None
     if not batch_aligned(args, kwargs, len(inputs)):
-        # slice_dp also slices this list on its own, so its entries cannot be matched to samples.
+        return None
+    # Lists of per-sample ObjectRefs can be permuted without fetching their payloads. A whole
+    # tensor hidden behind one ref cannot: its shape/alignment are unknown, so skip that call.
+    import sys
+    ray = sys.modules.get('ray')
+
+    def opaque(value):
+        if ray is not None and isinstance(value, ray.ObjectRef):
+            return True
+        if isinstance(value, dict):
+            return any(opaque(item) for item in value.values())
+        if isinstance(value, list):
+            return False  # the list itself is the batch axis; its elements travel together
+        return callable(value) and getattr(value, '_is_lazy_collect', False)
+
+    if any(opaque(value) for value in (*args, *kwargs.values())):
+        return None
+    supplied = kwargs.get('input_lengths')
+    if supplied is not None:
+        if not isinstance(supplied, list) or len(supplied) != len(inputs):
+            raise ValueError('input_lengths must contain one sequence length per input')
+        lengths = [int(length) for length in supplied]
+        if any(length <= 0 for length in lengths):
+            raise ValueError('input_lengths must be positive')
+        return lengths
+    if not all(isinstance(item, dict) and 'input_ids' in item for item in inputs):
         return None
     return [sequence_length(model_input) for model_input in inputs]
 
 
+def _estimate_megatron_ranks(rank_lengths, *, micro_batch_size, padding_free, variable_seq_lengths,
+                            sequence_multiple, workload_fn):
+    """Mirror InputProcessor.collate_fn's fixed consecutive Megatron micro-batches and CP/SP padding."""
+    workloads, tokens, computed_tokens = [], [], []
+    for lengths in rank_lengths:
+        rounded = [((length + sequence_multiple - 1) // sequence_multiple) * sequence_multiple for length in lengths]
+        workload = computed = 0
+        for start in range(0, len(lengths), micro_batch_size):
+            batch = rounded[start:start + micro_batch_size]
+            if padding_free:
+                workload += sum(workload_fn(length) for length in batch)
+                computed += sum(batch)
+            else:
+                width = max(batch) if variable_seq_lengths else max(rounded)
+                workload += len(batch) * workload_fn(width)
+                computed += len(batch) * width
+        workloads.append(workload)
+        tokens.append(sum(lengths))
+        computed_tokens.append(computed)
+    return _RankEstimate(workloads, tokens, computed_tokens, len(rank_lengths[0]) // micro_batch_size)
+
+
 def plan_call(lengths: list[int], dp_size: int, spec: dict[str, Any], kwargs: dict[str, Any]) -> DPBalancePlan | None:
     """Plan a call from the model's ``_dp_balance_spec``, or None when the call keeps its order untouched."""
+    if spec.get('backend', 'transformers') not in ('transformers', 'megatron'):
+        return None
     workload_fn = estimate_workload
     if spec["hidden_size"] is not None:
         workload_fn = functools.partial(estimate_workload, hidden_size=spec["hidden_size"])
     try:
+        config = MicroBatchConfig.from_kwargs(dict(kwargs))
+        rank_estimator = None
+        if spec.get('backend') == 'megatron':
+            # Keep every DP replica's schedule identical. Short tails have different sample weights
+            # in mcore's per-micro-batch mean path; dynamic batching is not this backend's contract.
+            if len(lengths) % dp_size or (config is not None and config.dynamic_batching):
+                return None
+            rank_size = len(lengths) // dp_size
+            size = config.micro_batch_size if config is not None else min(2, rank_size)
+            if not size or rank_size % size or size % spec['group_size']:
+                return None
+            rank_estimator = functools.partial(
+                _estimate_megatron_ranks, micro_batch_size=size, padding_free=spec['padding_free'],
+                variable_seq_lengths=spec.get('variable_seq_lengths', True),
+                sequence_multiple=spec.get('sequence_multiple', 1), workload_fn=workload_fn)
+        elif spec['group_size'] > 1 and config is not None:
+            if config.dynamic_batching or config.micro_batch_size % spec['group_size']:
+                return None
         plan = plan_dp_balance_for_lengths(
-            lengths,
-            dp_size,
-            padding_free=spec["padding_free"],
-            micro_batch_config=MicroBatchConfig.from_kwargs(dict(kwargs)),
-            group_size=spec["group_size"],
-            workload_fn=workload_fn,
-        )
+            lengths, dp_size, padding_free=spec['padding_free'], micro_batch_config=config,
+            group_size=spec['group_size'], workload_fn=workload_fn, rank_estimator=rank_estimator)
     except ValueError:
         # Options or batch shapes the model itself rejects; let it report them.
         return None
@@ -348,6 +407,26 @@ def _restore_rank(value: Any, rank_values: list[Any], sources: list[tuple[int, i
     return pad_and_stack_tensors([rank_values[rank][row : row + 1] for rank, row in sources]).to(value.device)
 
 
+def normalize_rank_output(output: Any, size: int) -> Any:
+    """Merge Megatron's micro-batch logps before local per-sample output restoration.
+
+    Ray's collector already performs this merge. Keep the worker's metric cache untouched by
+    returning a shallow copy, and only merge tensors whose rows cover this complete rank shard.
+    """
+    import torch
+
+    from twinkle.utils import pad_and_stack_tensors
+
+    if isinstance(output, dict):
+        logps = output.get('logps')
+        if (isinstance(logps, list) and logps and all(isinstance(item, torch.Tensor) and item.ndim >= 2
+                                                    for item in logps)
+                and sum(item.shape[0] for item in logps) == size):
+            output = copy.copy(output)
+            output['logps'] = pad_and_stack_tensors(logps)
+    return output
+
+
 def restore_rank_outputs(output: Any, rank_outputs: list[Any], plan: DPBalancePlan, data_rank: int) -> Any:
     """Put this rank's own samples' per-sample outputs back, fetched from the ranks that computed them.
 
@@ -409,6 +488,7 @@ def plan_dp_balance_for_lengths(
     micro_batch_config: MicroBatchConfig | None = None,
     group_size: int = 1,
     workload_fn: WorkloadFn = estimate_workload,
+    rank_estimator: Callable | None = None,
 ) -> DPBalancePlan:
     """Same as :func:`plan_dp_balance`, for samples given by their sequence lengths."""
     lengths = [int(length) for length in lengths]
@@ -452,7 +532,8 @@ def plan_dp_balance_for_lengths(
             [lengths[index] for index in order[rank * rank_size : (rank + 1) * rank_size]] for rank in range(dp_size)
         ]
         try:
-            estimates[name] = order, _estimate_ranks(rank_lengths, micro_batch_config, padding_free, workload_fn)
+            estimates[name] = order, (rank_estimator(rank_lengths) if rank_estimator is not None else
+                                      _estimate_ranks(rank_lengths, micro_batch_config, padding_free, workload_fn))
         except ValueError:
             # The model rejects this layout too (for example a sequence over max_tokens_per_micro_batch).
             continue

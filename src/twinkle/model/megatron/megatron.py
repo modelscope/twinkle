@@ -147,6 +147,7 @@ _default_adapter_name = ''
 class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrainerMixin,
                    MegatronDeltaBackend):
 
+    _dp_balance_backend = 'megatron'
     _mcore_async_queue = None
 
     def __init__(
@@ -168,8 +169,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         align_grad_reduce: bool = True,
         nccl_comm_warmup: bool = False,
         attn_impl: Optional[str] = None,
+        dp_balance: bool = True,
         **kwargs,
     ):
+        self._init_dp_balance(dp_balance)
         requires('megatron_core')
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
@@ -560,6 +563,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         optimizer_config = self.optimizer_group[adapter_name]
+        balance = kwargs.pop('_dp_balance', None)
+        if balance is not None and not forward_only:
+            optimizer_config.record_dp_balance(balance['metrics'])
         loss_instance = optimizer_config.get_loss(loss_key)
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
