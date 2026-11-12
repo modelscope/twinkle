@@ -222,21 +222,72 @@ ADAPTER_NAME = 'default'
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 def create_dataset():
-    """Create a prompt-only dataset for on-policy distillation.
+    """Create a prompt-only dataset for on-policy distillation."""
 
-    The dataset only contains prompts; the student model generates completions
-    on-the-fly. The teacher model computes logprobs on student-generated
-    sequences.
-    """
-    dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(10000)))
-    dataset.set_template(
-        'Template', model_id=STUDENT_MODEL_ID, max_length=MAX_LENGTH_SEQ,
-        enable_thinking=False,
+    # Load raw GSM8K data.
+    raw_dataset = Dataset(
+        DatasetMeta(
+            DATASET_ID,
+            subset_name='main',
+            split='train',
+        )
     )
-    dataset.encode(load_from_cache_file=True)
+
+    # Convert question into standard chat messages.
+    # Ground-truth answers are intentionally excluded.
+    raw_rows = raw_dataset.dataset
+    sample_count = min(10000, len(raw_rows))
+
+    prompt_data = []
+
+    for index in range(sample_count):
+        question = raw_rows[index].get('question')
+
+        if not question:
+            continue
+
+        prompt_data.append({
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': str(question),
+                }
+            ]
+        })
+
+    if not prompt_data:
+        raise RuntimeError("No valid GSM8K prompts were loaded.")
+
+    logger.info(
+        f'Loaded {len(prompt_data)} GSM8K prompts '
+        f'(ground-truth answers excluded)'
+    )
+
+    # Build an in-memory Twinkle dataset.
+    dataset = Dataset(
+        DatasetMeta(data=prompt_data)
+    )
+
+    dataset.set_template(
+        'Template',
+        model_id=STUDENT_MODEL_ID,
+        max_length=MAX_LENGTH_SEQ,
+        enable_thinking=False,
+        text_only=True,
+        trust_remote_code=True,
+    )
+
+    # Append assistant generation prompt for on-policy sampling.
+    dataset.encode(
+        add_generation_prompt=True,
+        load_from_cache_file=False,
+    )
+
+    logger.info(
+        f'Encoded on-policy dataset: {len(dataset)} samples'
+    )
+
     return dataset
-
-
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def prepare_teacher_inputs_from_student_gen(

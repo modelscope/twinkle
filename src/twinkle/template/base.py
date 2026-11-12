@@ -55,8 +55,14 @@ class Template:
                  **kwargs):
         self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
-        if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')) or os.path.exists(
-                os.path.join(model_id, 'processor_config.json')):
+        text_only = kwargs.pop('text_only', False)
+
+        has_processor_config = (
+            os.path.exists(os.path.join(model_id, 'preprocessor_config.json'))
+            or os.path.exists(os.path.join(model_id, 'processor_config.json'))
+        )
+
+        if has_processor_config and not text_only:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
         else:
